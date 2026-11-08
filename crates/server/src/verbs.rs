@@ -5881,7 +5881,21 @@ fn create_work(
   // floor is recorded below, in this transaction.
   let (green_id, base, minted) = match state.work_home.admitted.take() {
     Some(Ok(admitted)) => (to_db_volume(green), admitted.base, Some(admitted.id)),
-    Some(Err(refusal)) => return refused(refusal),
+    Some(Err(refusal)) => {
+      // The owner refused it, so the name and the id it held go back.
+      if let Err(e) = settle_creation(state, name) {
+        return refused(refusal_of_db(&e));
+      }
+      return refused(refusal);
+    }
+    None if owner_of(green) != state.partition => {
+      // A green on another shard is admitted through its owner (`crate::work_home`); a creation that reaches here
+      // did not ask, because its name is held.
+      return refused(match name_held(state, name) {
+        Some(existing) => Refusal::AlreadyExists { existing },
+        None => Refusal::NotFound,
+      });
+    }
     None => {
       let green_id =
         match crate::merge_service::require_green(state, principal, green, "create_work") {
@@ -5896,11 +5910,19 @@ fn create_work(
       (green_id, engine.head(), None)
     }
   };
-  if let Some(existing) = name_held(state, name) {
+  // An admitted work holds its own name while it waits (A-247): that is its own hold, released here.
+  if let Some(existing) = name_held(state, name)
+    && Some(to_db_volume(existing)) != minted
+  {
     if let Some(id) = minted {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(Refusal::AlreadyExists { existing });
+  }
+  if minted.is_some()
+    && let Err(e) = settle_creation(state, name)
+  {
+    return refused(refusal_of_db(&e));
   }
   let Some(id) = minted.or_else(|| fresh_volume_id(state)) else {
     return refused(ids_exhausted());
@@ -6715,6 +6737,27 @@ fn submit(
   settle_submit(state, work_id, green_id, reply)
 }
 
+/// Ends the work creation pending under `name` (A-247), in the running verb's transaction.
+pub(crate) fn settle_creation(
+  state: &mut ShardState,
+  name: &str,
+) -> Result<(), slates_db::DbError> {
+  if state.db.partition().pending_creation(name).is_none() {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::WorkCreationSettled {
+        name: name.to_owned(),
+      },
+      now,
+    )
+    .map(|_| ())
+}
+
 /// Clears `work`'s pending submit (A-247), in the transaction that settles its verdict.
 fn settle_pending(state: &mut ShardState, work: DbVolumeId) -> Result<(), slates_db::DbError> {
   if state.db.partition().pending_submit(work).is_none() {
@@ -7383,6 +7426,12 @@ pub(crate) fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
       partition
         .name_alias(name)
         .map(|alias| to_wire_volume(alias.volume))
+    })
+    .or_else(|| {
+      // A work being admitted by its green's owner holds its name meanwhile (A-247).
+      partition
+        .pending_creation(name)
+        .map(|pending| to_wire_volume(pending.work))
     })
 }
 

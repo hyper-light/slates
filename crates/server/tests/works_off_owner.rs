@@ -776,6 +776,85 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
   daemon.stop();
 }
 
+/// Shape: the creations sent at once in the concurrent-creation test: below a client's 32 requests in flight with the
+/// repeated name beside them, and enough that several are parked together.
+const AT_ONCE: usize = 24;
+
+/// A-247 "Creation". Do: send, without waiting, `AT_ONCE` creations of works whose names all hash to one partition that
+/// is not the green's, then once more a name already sent. Expect: every creation answered with its own id and every
+/// work usable (an edit and a submit accepted), the repeated name refused `AlreadyExists`. An id minted for an
+/// admission was this transaction's sequence, which a parked verb never consumed, so creations parked in one step were
+/// given one id, queued behind it, and looped the shard.
+#[test]
+fn works_created_at_once_off_their_greens_shard_get_their_own_ids() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "at-once");
+  let mut client = connect(&instance);
+  let green = client.create_green("at-once-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "at-once-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"....").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let partition = owner_of_name(&off_owner_name(green, "at-once"), usize::from(MANY_SHARDS));
+  let names: Vec<String> = (0u32..)
+    .map(|n| format!("at-once-{n}"))
+    .filter(|name| owner_of_name(name, usize::from(MANY_SHARDS)) == partition)
+    .take(AT_ONCE)
+    .collect();
+  let sent: Vec<RequestId> = names
+    .iter()
+    .chain(names.first())
+    .map(|name| {
+      client
+        .begin(&RequestBody::CreateWork {
+          green,
+          name: name.clone(),
+        })
+        .unwrap()
+    })
+    .collect();
+  let (repeated, created) = sent.split_last().unwrap();
+  let replies: Vec<ReplyBody> = created
+    .iter()
+    .map(|id| reply_of(&mut client, *id))
+    .collect();
+  let started = Instant::now();
+  let repeat = loop {
+    match client.poll_reply(*repeated) {
+      Ok(None) => {
+        assert!(started.elapsed() < WAIT, "the repeated name is answered");
+        std::thread::yield_now();
+      }
+      other => break other,
+    }
+  };
+  let mut works = Vec::new();
+  for reply in &replies {
+    let ReplyBody::WorkCreated { id, .. } = reply else {
+      panic!("a creation answers its work: {reply:?}");
+    };
+    works.push(*id);
+  }
+  let distinct: std::collections::BTreeSet<_> = works.iter().map(|work| work.bytes).collect();
+  assert_eq!(distinct.len(), AT_ONCE, "every work has its own id");
+  assert!(
+    matches!(
+      repeat,
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
+    ),
+    "a name sent twice is held once: {repeat:?}"
+  );
+  for (index, work) in works.iter().enumerate() {
+    client
+      .edit(*work, &format!("own-{index}"), 0, 0, b"mine")
+      .unwrap();
+    assert!(matches!(
+      client.submit(*work).unwrap(),
+      Submitted::Accepted(_)
+    ));
+  }
+  drop(client);
+  daemon.stop();
+}
+
 /// One step of a generated history.
 #[derive(Clone, Debug)]
 enum Step {

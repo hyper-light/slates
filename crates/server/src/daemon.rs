@@ -4847,6 +4847,7 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
     );
   }
   rebuild_remote_works(origin, shards).await;
+  drop_pending_creations(origin, shards).await;
   let floors = reconcile_work_floors(origin, shards).await;
   if floors > 0 {
     slates_machine::log_line!(
@@ -4905,6 +4906,35 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
       )
       .await;
     }
+  }
+}
+
+/// Ends every work creation a restart caught waiting for its green's owner (A-247): its name and id go back, and the
+/// client's retry, finding no completion, creates it afresh. Any floor its admission left is dropped by the reconcile
+/// after, its work never having been made.
+async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    let _ = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| {
+        let names: Vec<String> = s
+          .db
+          .partition()
+          .pending_creations()
+          .map(|pending| pending.name.clone())
+          .collect();
+        for name in names {
+          s.db.begin();
+          let settled = crate::verbs::settle_creation(s, &name);
+          if settled.is_err() || s.db.commit(&mut s.segment).is_err() {
+            crate::verbs::reconcile_unpublished_effects(s);
+          }
+        }
+      },
+      LIVENESS_BUDGET_NS,
+    )
+    .await;
   }
 }
 

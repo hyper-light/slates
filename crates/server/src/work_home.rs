@@ -47,6 +47,8 @@ pub(crate) const ANSWERED_LATE: &str = "merge.work.answered_late";
 /// Format: a work's pending submit settled ahead of another verb of the work (A-247), the non-vacuity count of
 /// [`settle_pending_first`].
 pub(crate) const PENDING_SETTLED_FIRST: &str = "merge.work.pending_settled_first";
+/// Format: a pending submit run again that did not reach the owner, so the verb behind it was answered retryable.
+const PENDING_STUCK: &str = "merge.work.pending_stuck";
 /// Format: a pending submit whose request could not be decoded; the work's verbs then run as though it had none.
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
 /// Format: a verb refused because the shard's parked verbs are at their bound.
@@ -132,6 +134,9 @@ pub(crate) struct WorkHome {
   parked: usize,
   /// The work whose parked verb is being resumed now: it may park again at the front of its own queue.
   resuming: Option<DbVolumeId>,
+  /// The pending submits already run again in this resume pass: one that ran and is still pending was not answered by
+  /// the owner, and running it again in the same pass would loop.
+  settling: Vec<(u64, u32, u32)>,
   /// What the owner answered for the verb now running: a base the verb reads.
   pub(crate) fetched: Option<FetchedBase>,
   /// … a verdict the verb settles.
@@ -175,6 +180,7 @@ enum Need {
   Admit {
     green: DbVolumeId,
     id: DbVolumeId,
+    name: String,
   },
 }
 
@@ -377,10 +383,10 @@ pub(crate) fn gate(
   body: RequestBody,
 ) -> Gate {
   if let RequestBody::CreateWork { green, name } = &body {
-    let need = create_need(state, crate::verbs::to_db_volume(*green), name);
-    return match need {
-      None => Gate::Run(body),
-      Some(need) => park(state, client_id, principal, body, None, Some(need)),
+    return match create_need(state, crate::verbs::to_db_volume(*green), name) {
+      Ok(None) => Gate::Run(body),
+      Ok(Some(need)) => park(state, client_id, principal, body, None, Some(need)),
+      Err(refusal) => Gate::Answer(crate::verbs::refused(refusal)),
     };
   }
   let Some((work, _green)) = remote_work(state, &body) else {
@@ -420,17 +426,57 @@ fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -
 
 /// A work's creation on its own partition needs the green's owner when the green lives elsewhere; with the green here,
 /// or the name already held, it runs, and its own checks answer.
-fn create_need(state: &mut ShardState, green: DbVolumeId, name: &str) -> Option<Need> {
+fn create_need(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  name: &str,
+) -> Result<Option<Need>, Refusal> {
   let owner = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
   if state.greens.contains_key(&green)
     || state.work_home.admitted.is_some()
-    || crate::verbs::name_held(state, name).is_some()
     || crate::verbs::shard_of_partition(state, owner).is_none()
   {
-    return None;
+    return Ok(None);
   }
-  let id = crate::verbs::fresh_volume_id(state)?;
-  Some(Need::Admit { green, id })
+  let Some((origin, id)) = state.current_request else {
+    return Ok(None);
+  };
+  let key = (origin, id.client, id.sequence);
+  // This request's own creation, its admission lost or its daemon restarted: asked again under the same id.
+  if let Some(pending) = state.db.partition().pending_creation(name) {
+    if (pending.origin, pending.client, pending.sequence) == key {
+      return Ok(Some(Need::Admit {
+        green,
+        id: pending.work,
+        name: name.to_owned(),
+      }));
+    }
+    return Ok(None);
+  }
+  if crate::verbs::name_held(state, name).is_some() {
+    return Ok(None);
+  }
+  // The id is this transaction's own sequence, which the pending record's entry consumes, so no other volume of the
+  // partition is given it while the owner is asked (two creations parked in one step were given one id, and their
+  // queue looped: 9.7 cores for 900 s at 3,000 clients).
+  let work = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+  let record = slates_db::catalog::PendingCreationRecord {
+    name: name.to_owned(),
+    work,
+    origin,
+    client: id.client,
+    sequence: id.sequence,
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::WorkCreationPending { record }, now)
+    .map_err(|e| crate::error::refusal_of_db(&e))?;
+  Ok(Some(Need::Admit {
+    green,
+    id: work,
+    name: name.to_owned(),
+  }))
 }
 
 /// Parks the running verb, behind its work's other verbs unless it is being resumed, and starts its ask when it is the
@@ -554,6 +600,25 @@ fn settle_pending_first(
     .map(|(origin, id)| (origin, id.client, id.sequence));
   if running == Some(pending_key) || state.work_home.by_request.contains_key(&pending_key) {
     return None;
+  }
+  // Run again in this pass and still pending: it did not reach the owner. The verb is answered retryable, unrecorded,
+  // rather than parked behind it again (which looped the pass on one shard for good: 9.7 cores for 900 s at 3,000
+  // clients), and the next verb of the work tries again.
+  if state.work_home.settling.contains(&pending_key) {
+    state.count(PENDING_STUCK, 1);
+    if state.refusals.get(PENDING_STUCK) == Some(&1) {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a pending submit of a work was run again and not settled: {:?}",
+        state.partition,
+        <RequestBody as slates_wire::Wire>::from_bytes(&pending.body).map(|body| format!(
+          "{body:?}"
+        )
+        .chars()
+        .take(160)
+        .collect::<String>())
+      );
+    }
+    return Some(refuse_unrecorded(state));
   }
   let Ok(pending_body) = <RequestBody as slates_wire::Wire>::from_bytes(&pending.body) else {
     state.count(PENDING_UNREADABLE, 1);
@@ -791,16 +856,33 @@ async fn ask(
       .await
       .map(Answered::Rebased),
     ),
-    Need::Admit { green, id: work } => to_asked(
-      call_within(
-        here,
-        owner,
-        move |s| crate::verbs::owner_admit(s, &principal, green, work),
-        deadline,
+    Need::Admit {
+      green,
+      id: work,
+      name,
+    } => {
+      // Only a creation whose pending record committed goes to the owner (`create_need`).
+      let staged = state::with_state(|s| {
+        s.db
+          .partition()
+          .pending_creation(&name)
+          .is_some_and(|pending| pending.work == work)
+      })
+      .unwrap_or(false);
+      if !staged {
+        return Asked::Unanswered;
+      }
+      to_asked(
+        call_within(
+          here,
+          owner,
+          move |s| crate::verbs::owner_admit(s, &principal, green, work),
+          deadline,
+        )
+        .await
+        .map(Answered::Admitted),
       )
-      .await
-      .map(Answered::Admitted),
-    ),
+    }
   }
 }
 
@@ -927,6 +1009,12 @@ fn answer_overloaded(state: &mut ShardState, _work: DbVolumeId, head: ParkedVerb
 
 /// Runs a work's parked verbs from the oldest, until one needs the owner again or none is left.
 fn resume(state: &mut ShardState, work: DbVolumeId) {
+  resume_pass(state, work);
+  state.work_home.settling.clear();
+}
+
+/// One pass of [`resume`].
+fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
   loop {
     let Some(queue) = state.work_home.queues.get_mut(&work) else {
       return;
@@ -948,6 +1036,16 @@ fn resume(state: &mut ShardState, work: DbVolumeId) {
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
     home.parked = home.parked.saturating_sub(1);
+    let verb_key = (verb.origin, verb.id.client, verb.id.sequence);
+    if state
+      .db
+      .partition()
+      .pending_submit(work)
+      .is_some_and(|pending| (pending.origin, pending.client, pending.sequence) == verb_key)
+    {
+      state.work_home.settling.push(verb_key);
+    }
+    let home = &mut state.work_home;
     home.fetched = fetched;
     home.verdict = verdict;
     home.rebased = rebased;

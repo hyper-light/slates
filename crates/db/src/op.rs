@@ -422,6 +422,16 @@ pub enum Op {
     /// The version the work is based on.
     base: u64,
   },
+  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
+  WorkCreationPending {
+    /// The creation.
+    record: crate::catalog::PendingCreationRecord,
+  },
+  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
+  WorkCreationSettled {
+    /// The name.
+    name: String,
+  },
   /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
   WorkSubmitPending {
     /// The submit.
@@ -555,6 +565,8 @@ impl Op {
       Op::NameAliasReleased { .. } => "name_alias_released",
       Op::WorkFloorSet { .. } => "work_floor_set",
       Op::WorkFloorDropped { .. } => "work_floor_dropped",
+      Op::WorkCreationPending { .. } => "work_creation_pending",
+      Op::WorkCreationSettled { .. } => "work_creation_settled",
       Op::WorkSubmitPending { .. } => "work_submit_pending",
       Op::WorkSubmitSettled { .. } => "work_submit_settled",
       Op::AttachmentRenewed { .. } => "attachment_renewed",

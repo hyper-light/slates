@@ -146,6 +146,8 @@ pub struct PartitionSnapshot {
   pub work_floors: Vec<crate::catalog::WorkFloorRecord>,
   /// Each work's submit awaiting its settle (A-247; appended).
   pub pending_submits: Vec<crate::catalog::PendingSubmitRecord>,
+  /// Each work's creation awaiting its admission (A-247; appended).
+  pub pending_creations: Vec<crate::catalog::PendingCreationRecord>,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -257,6 +259,8 @@ pub struct Partition {
   work_floors: BTreeMap<(VolumeId, VolumeId), u64>,
   /// Each work's submit awaiting its settle, at most one a work (A-247).
   pending_submits: BTreeMap<VolumeId, crate::catalog::PendingSubmitRecord>,
+  /// Each work's creation awaiting its admission, by name (A-247).
+  pending_creations: BTreeMap<String, crate::catalog::PendingCreationRecord>,
   /// How many works hold each version of each green, so a green's reachable floor is one look-up per verdict rather
   /// than a walk of its works (A-247: a green with 10,000 works is judged once per accept).
   work_floor_counts: BTreeMap<(VolumeId, u64), u64>,
@@ -319,6 +323,7 @@ impl Partition {
       name_aliases: BTreeMap::new(),
       work_floors: BTreeMap::new(),
       pending_submits: BTreeMap::new(),
+      pending_creations: BTreeMap::new(),
       work_floor_counts: BTreeMap::new(),
       expired_attachments: std::collections::VecDeque::new(),
       nfs_instance: 0,
@@ -489,6 +494,16 @@ impl Partition {
       .map(|((_, base), _)| *base)
   }
 
+  /// The work creation pending under `name`, when there is one (A-247).
+  pub fn pending_creation(&self, name: &str) -> Option<&crate::catalog::PendingCreationRecord> {
+    self.pending_creations.get(name)
+  }
+
+  /// Every work creation pending on this partition (A-247).
+  pub fn pending_creations(&self) -> impl Iterator<Item = &crate::catalog::PendingCreationRecord> {
+    self.pending_creations.values()
+  }
+
   /// The work's submit awaiting its settle, when it has one (A-247).
   pub fn pending_submit(&self, work: VolumeId) -> Option<&crate::catalog::PendingSubmitRecord> {
     self.pending_submits.get(&work)
@@ -536,6 +551,29 @@ impl Partition {
           })
         }
       }
+      // A name is held once on its partition: by a volume, an alias, or one pending creation.
+      Op::WorkCreationPending { record } => {
+        let held = self
+          .volume_by_name(&record.name)
+          .map(|volume| volume.id)
+          .or_else(|| self.name_alias(&record.name).map(|alias| alias.volume))
+          .or_else(|| {
+            self
+              .pending_creations
+              .get(&record.name)
+              .filter(|pending| *pending != record)
+              .map(|pending| pending.work)
+          });
+        match held {
+          Some(existing) => Err(DbError::AlreadyExists {
+            existing: existing.bytes,
+          }),
+          None if self.pending_creations.len() >= self.caps.volumes => Err(DbError::Capacity {
+            table: "pending work creations",
+          }),
+          None => Ok(()),
+        }
+      }
       Op::WorkSubmitPending { record } => match self.pending_submits.get(&record.work) {
         Some(pending) if pending != record => Err(DbError::AlreadyExists {
           existing: record.work.bytes,
@@ -560,6 +598,14 @@ impl Partition {
       }
       Op::WorkSubmitSettled { work } => {
         self.pending_submits.remove(work);
+      }
+      Op::WorkCreationPending { record } => {
+        self
+          .pending_creations
+          .insert(record.name.clone(), record.clone());
+      }
+      Op::WorkCreationSettled { name } => {
+        self.pending_creations.remove(name);
       }
       _ => {}
     }
@@ -1153,7 +1199,9 @@ impl Partition {
       Op::WorkFloorSet { .. }
       | Op::WorkFloorDropped { .. }
       | Op::WorkSubmitPending { .. }
-      | Op::WorkSubmitSettled { .. } => self.check_work_record(op),
+      | Op::WorkSubmitSettled { .. }
+      | Op::WorkCreationPending { .. }
+      | Op::WorkCreationSettled { .. } => self.check_work_record(op),
       Op::NameAliasReserved { .. }
       | Op::NameAliasConfirmed { .. }
       | Op::NameAliasReleased { .. }
@@ -1505,7 +1553,9 @@ impl Partition {
       Op::WorkFloorSet { .. }
       | Op::WorkFloorDropped { .. }
       | Op::WorkSubmitPending { .. }
-      | Op::WorkSubmitSettled { .. } => {
+      | Op::WorkSubmitSettled { .. }
+      | Op::WorkCreationPending { .. }
+      | Op::WorkCreationSettled { .. } => {
         self.apply_work_floor(op);
         Ok(())
       }
@@ -1982,6 +2032,7 @@ impl Partition {
       name_aliases: self.name_aliases.values().cloned().collect(),
       work_floors: self.work_floors().collect(),
       pending_submits: self.pending_submits.values().cloned().collect(),
+      pending_creations: self.pending_creations.values().cloned().collect(),
       expired_attachments: self.expired_attachments.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
@@ -2111,6 +2162,10 @@ impl Partition {
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
+    for pending in &snapshot.pending_creations {
+      p.pending_creations
+        .insert(pending.name.clone(), pending.clone());
+    }
     for pending in &snapshot.pending_submits {
       p.pending_submits.insert(pending.work, pending.clone());
     }

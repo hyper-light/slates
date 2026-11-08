@@ -1034,6 +1034,22 @@ pub struct NameAliasRecord {
   pub confirmed: bool,
 }
 
+/// A work being created on its name's partition while its green's owner admits it (A-247): the id it was given, which
+/// this record's own log entry consumes so no other volume is given it, and the name it holds meanwhile.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PendingCreationRecord {
+  /// The name.
+  pub name: String,
+  /// The work's id.
+  pub work: VolumeId,
+  /// The completion key's origin.
+  pub origin: u64,
+  /// The completion key's client.
+  pub client: u32,
+  /// The completion key's sequence.
+  pub sequence: u32,
+}
+
 /// A work's submit that went to its green's owner and whose answer the work has not yet settled (A-247): kept on the
 /// work's partition from the ask until the settle, so no other verb of the work runs between the owner's verdict and
 /// the work's reset, across a lost answer or a restart. The request is kept whole, to be run again under its own key
