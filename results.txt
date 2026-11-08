@@ -1,0 +1,53 @@
+runner windows-11-arm, Sun Nov  8 22:22:53 UTC 2026
+fix f0c3c365 merge: origin/main fb435eac into the A-223 branch -- takes main's own virtiof
+red 83381720 diag only (A-223, step 1): main fb435eac plus A-223's two failing tests, with
+== fmt exit 0
+slates-wire-derive            0       0  ok
+unsafe: ok
+version: ok (0.1.0 in Cargo.toml; the Python wheel derives it through maturin; @hyper-light/slates and its 7 platform packages pinned to it)
+toolchain: every pin names 1.98.1
+capabilities: ok (15 rows, each proof a runnable test)
+== xtask check exit 0
+== clippy crates exit 0
+== clippy cli exit 0
+test switches::tests::a_blocked_thread_switched_and_a_running_one_did_not ... ok
+test result: ok. 65 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.36s
+test attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it ... ok
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+== tests merged exit 0
+test wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement ... FAILED
+thread 'wake::tests::a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement' (3080) panicked at crates\machine\src\wake.rs:933:7:
+WakeLatency { mean_ns: 1872, mean_lower_ns: 1531, mean_upper_ns: 2238, p50_ns: 700, p99_ns: 15100, sd_ns: 4508, samples: 640, same_cpu_samples: 0, rounds: 5, rounds_agree: Some(true), placement: Pinned, asleep_confirmed: false, quick: true }
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.57s
+== red wake exit 101
+test attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it ... FAILED
+thread 'attribution::tests::a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it' (10532) panicked at crates\rt\src\attribution.rs:453:5:
+None → None
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+== red attribution exit 101
