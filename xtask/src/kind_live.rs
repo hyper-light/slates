@@ -168,6 +168,7 @@ fn profile(lane: &Lane, name: &str, shaping: Option<&Shaping>) -> Result<String,
     .map(|index| lane.pod(index))
     .collect();
   let volume = create_live_volume(lane, &owner)?;
+  lane.share_with_pods(&owner, &volume)?;
   let count = writes_for(name);
   let wrote = run_probe(
     lane,
