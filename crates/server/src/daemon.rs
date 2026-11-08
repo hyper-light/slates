@@ -5,7 +5,7 @@
 
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(unix)]
 use slates_anchor::ENV_NFS_LISTENER;
@@ -2475,17 +2475,15 @@ impl Daemon {
       identities.sort_unstable();
       identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
         |(index, bytes)| {
-          slates_merge::engine::Increment::decode(bytes)
-            .ok()
-            .map(|increment| {
-              (
-                u64::try_from(index)
-                  .unwrap_or(u64::MAX)
-                  .saturating_add(held)
-                  .saturating_add(1),
-                increment.id,
-              )
-            })
+          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+            (
+              u64::try_from(index)
+                .unwrap_or(u64::MAX)
+                .saturating_add(held)
+                .saturating_add(1),
+              entry.increment.id,
+            )
+          })
         },
       ));
       identities
@@ -2654,10 +2652,108 @@ impl Daemon {
   pub fn give_back_recovery_on_every_shard(&self) -> Result<u64, ObserveError> {
     let mut returned = 0u64;
     for shard in self.shards.iter().copied() {
-      let bytes = self.observe(Some(shard), return_dead_recovery)?;
-      returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+      // Slice after slice, as the idle tick takes them (one quantum a step), until nothing is left.
+      loop {
+        let (bytes, more) = self.observe(Some(shard), return_dead_recovery)?;
+        returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        if !more {
+          break;
+        }
+      }
     }
     Ok(returned)
+  }
+
+  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's reap tick does
+  /// (`return_dead_recovery`, A-226), timing each step on the shard thread's own CPU clock, which a loaded host does
+  /// not inflate: the bytes given back, the steps, the CPU each step held its shard, and the step quantum the shard
+  /// holds its work to. `None` for the CPU where the shard's thread clock cannot be read (Windows' thread times tick
+  /// at about 15.6 ms, too coarse to time a step by).
+  pub fn give_back_recovery_by_steps(&self) -> Result<GiveBackSteps, ObserveError> {
+    let mut report = GiveBackSteps {
+      returned: 0,
+      steps: 0,
+      step_cpu_ns: Some(Vec::new()),
+      quantum_ns: 0,
+    };
+    for shard in self.shards.iter().copied() {
+      loop {
+        let (bytes, more, cpu_ns, quantum_ns) = self.observe(Some(shard), |s| {
+          let cpu = || {
+            registry::with_current(|ctx| ctx.id)
+              .and_then(registry::holder_of)
+              .and_then(registry::shard_cpu)
+              .filter(|_| cfg!(unix))
+              .map(|reading| reading.spent_ns)
+          };
+          let before = cpu();
+          let (bytes, more) = return_dead_recovery(s);
+          let after = cpu();
+          let quantum = futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
+          (
+            bytes,
+            more,
+            before
+              .zip(after)
+              .map(|(before, after)| after.saturating_sub(before)),
+            quantum,
+          )
+        })?;
+        report.returned = report
+          .returned
+          .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        report.steps = report.steps.saturating_add(1);
+        report.step_cpu_ns = report
+          .step_cpu_ns
+          .take()
+          .zip(cpu_ns)
+          .map(|(mut steps, step)| {
+            steps.push(step);
+            steps
+          });
+        report.quantum_ns = report.quantum_ns.max(quantum_ns);
+        if !more {
+          break;
+        }
+      }
+    }
+    if let Some(steps) = report.step_cpu_ns.as_mut() {
+      steps.sort_unstable();
+    }
+    Ok(report)
+  }
+
+  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a reap tick does, from a page
+  /// slice and over the whole of that memory as after a restart, with `neighbour` another task taking turns on the
+  /// shard the whole time: how many idle steps it took, `None` if the shard could not be asked or did not finish within
+  /// the budget. A neighbour that allocates nothing looks idle to the arena, as a granted landing does (A-226). The
+  /// answer comes through an atomic, because asking the shard for it would itself be another task on the shard.
+  pub fn give_back_beside(&self, neighbour: bool) -> Option<u64> {
+    let shard = self.shards.first().copied();
+    GIVE_BACK_PROBE.store(GIVE_BACK_PROBE_RUNNING, Ordering::Release);
+    self
+      .observe(shard, move |s| {
+        // Only a shard with a committed image has dead memory to give back.
+        let _ = crate::verbs::publish_shard(s);
+        s.journal.forget_what_was_given_back();
+        s.give_back_slice_bytes = 0;
+        s.purge_seen_allocations = s.store.content.arena().allocations();
+        if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
+          let _ = futures::detach(task);
+        }
+      })
+      .ok()?;
+    let started = slates_machine::clock::monotonic_ns();
+    loop {
+      let steps = GIVE_BACK_PROBE.load(Ordering::Acquire);
+      if steps != GIVE_BACK_PROBE_RUNNING {
+        return Some(steps);
+      }
+      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
+        return None;
+      }
+      std::thread::yield_now();
+    }
   }
 
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
@@ -3579,6 +3675,7 @@ fn init_shard(
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
+    give_back_slice_bytes: 0,
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -4046,17 +4143,90 @@ async fn seal_idle_content() {
 
 /// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
 #[cfg(target_os = "linux")]
-fn purge_write_log(s: &mut ShardState) -> usize {
-  match (s.content.as_mut(), s.write_log.as_mut()) {
-    (Some(object), Some(log)) => log.purge(object),
-    _ => 0,
-  }
+fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
+  let slice = give_back_slice(s);
+  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let purged = match (s.content.as_mut(), s.write_log.as_mut()) {
+    (Some(object), Some(log)) => log.purge(object, slice),
+    _ => crate::write_log::Purged::default(),
+  };
+  learn_give_back_rate(s, purged.walked, started);
+  (purged.bytes, purged.more)
 }
 
 /// No write log off Linux (A-63 logs the FUSE mount's writes).
 #[cfg(not(target_os = "linux"))]
-fn purge_write_log(_s: &mut ShardState) -> usize {
-  0
+fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
+  (0, false)
+}
+
+/// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time
+/// (`give_back_slice_bytes`), at least a page, so a step holds the shard about one quantum whatever the memory.
+fn give_back_slice(s: &ShardState) -> usize {
+  let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
+  s.give_back_slice_bytes.max(page)
+}
+
+/// Learns the next give-back slice from this step's: `walked` bytes since `started` (the shard clock), scaled to one
+/// step quantum. A step that walked nothing teaches nothing.
+fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
+  if walked == 0 {
+    return;
+  }
+  let quantum = futures::step_budget_ns()
+    .unwrap_or(s.config.runtime.step_budget_ns)
+    .max(1);
+  let took = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock)
+    .saturating_sub(started)
+    .max(1);
+  let per_quantum = u128::try_from(walked)
+    .unwrap_or(u128::MAX)
+    .saturating_mul(u128::from(quantum))
+    .checked_div(u128::from(took))
+    .unwrap_or(0);
+  s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
+}
+
+/// The idle steps taken so far on this shard.
+fn idle_ticks(s: &ShardState) -> u64 {
+  s.refusals.get(TICKS_IDLE).copied().unwrap_or(0)
+}
+
+/// Format: [`GIVE_BACK_PROBE`] while a probed give-back runs.
+const GIVE_BACK_PROBE_RUNNING: u64 = u64::MAX;
+/// Test support ([`Daemon::give_back_beside`]): the steps a probed give-back took, or [`GIVE_BACK_PROBE_RUNNING`].
+static GIVE_BACK_PROBE: AtomicU64 = AtomicU64::new(GIVE_BACK_PROBE_RUNNING);
+
+/// [`Daemon::give_back_beside`]'s task on the shard.
+async fn probe_give_back(neighbour: bool) {
+  if neighbour && let Ok(task) = futures::spawn(a_neighbour_taking_turns()) {
+    let _ = futures::detach(task);
+  }
+  let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
+  purge_if_idle().await;
+  let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
+  GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
+}
+
+/// Takes a turn on the shard until the probed give-back has finished, allocating nothing.
+async fn a_neighbour_taking_turns() {
+  while GIVE_BACK_PROBE.load(Ordering::Acquire) == GIVE_BACK_PROBE_RUNNING {
+    futures::yield_now().await;
+  }
+}
+
+/// What [`Daemon::give_back_recovery_by_steps`] measured (test support, A-226).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GiveBackSteps {
+  /// Recovery bytes given back over every shard.
+  pub returned: u64,
+  /// The give-back steps taken.
+  pub steps: u64,
+  /// The CPU each step held its shard, nanoseconds, off the shard thread's own clock, sorted; `None` where it cannot be
+  /// read.
+  pub step_cpu_ns: Option<Vec<u64>>,
+  /// The step quantum the shards hold their work to, nanoseconds (the largest over the shards).
+  pub quantum_ns: u64,
 }
 
 /// Counter: content bytes an idle shard gave back to the OS (A-105).
@@ -4065,41 +4235,57 @@ pub const CONTENT_PURGED: &str = "content.purged_bytes";
 /// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
 pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 
-/// Gives back an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than the
-/// committed one, and its delta log past the tail, each only as far as it was written since its last give-back
-/// (`Journal::dead_ranges`, A-226), so a give-back costs what the publications since wrote. A busy shard never runs
-/// this, so its next checkpoint and deltas write into resident pages; an idle one stops holding up to two dead images.
-/// A range the object refuses stays owed and is asked for at the next give-back. The bytes given back.
-fn return_dead_recovery(s: &mut ShardState) -> usize {
+/// Gives back one slice of an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than
+/// the committed one, and its delta log past the tail, each only as far as it was written since its last give-back
+/// (`Journal::dead_ranges`, A-226), taken from the top of each down so the journal can record a slice at a time. A
+/// slice is the bytes the OS gave back in one step quantum the last time, measured here (`give_back_slice`), so a
+/// give-back of memory a predecessor may have written (18 GB a shard on a 128 GiB Mac) holds the shard one quantum a
+/// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
+/// next give-back. The bytes given back, and whether any is left.
+fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
     slots_end.saturating_sub(slots_start),
     log_end.saturating_sub(log_start),
   ) else {
-    return 0;
+    return (0, false);
   };
+  let slice = give_back_slice(s);
+  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
   let Some(object) = s.content.as_mut() else {
-    return 0;
+    return (0, false);
   };
-  let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<usize> {
-    if len == 0 {
-      return Some(0);
+  let mut left = slice;
+  // The top `left` bytes of `(offset, len)` within the region at `base`: given back, the offset they start at (what
+  // the journal records), and the bytes the object took. `None` when the object refused.
+  let mut give_back = |base: usize, (offset, len): (usize, usize)| -> Option<(usize, usize)> {
+    let piece = len.min(left);
+    let from = offset.saturating_add(len).saturating_sub(piece);
+    if piece == 0 {
+      return Some((from, 0));
     }
-    object.discard(base.checked_add(offset)?, len).ok()
+    let bytes = object.discard(base.checked_add(from)?, piece).ok()?;
+    left = left.saturating_sub(piece);
+    Some((from, bytes))
   };
   let stale_slot = give_back(slots_start, dead.stale_slot);
   let log_past_tail = give_back(log_start, dead.log_past_tail);
-  s.journal
-    .given_back(stale_slot.is_some(), log_past_tail.is_some());
+  s.journal.given_back_from(
+    stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
+    log_past_tail.map(|(from, _)| from),
+  );
+  learn_give_back_rate(s, slice.saturating_sub(left), started);
   let returned = stale_slot
-    .unwrap_or(0)
-    .saturating_add(log_past_tail.unwrap_or(0));
+    .map_or(0, |(_, bytes)| bytes)
+    .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
   s.count(
     RECOVERY_RETURNED,
     u64::try_from(returned).unwrap_or(u64::MAX),
   );
-  returned
+  let more = stale_slot.is_some_and(|(from, _)| from > dead.stale_slot.0)
+    || log_past_tail.is_some_and(|(from, _)| from > dead.log_past_tail.0);
+  (returned, more)
 }
 
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
@@ -4137,14 +4323,18 @@ async fn purge_if_idle() {
         .content
         .arena_mut()
         .purge_keeping(slice_blocks, &keep);
-      let log = if purged.more {
-        0
+      let (log, recovery_left) = if purged.more {
+        (0, false)
       } else {
-        purge_write_log(s).saturating_add(return_dead_recovery(s))
+        let (recovery, recovery_left) = return_dead_recovery(s);
+        let (log, log_left) = purge_write_log(s);
+        (log.saturating_add(recovery), recovery_left || log_left)
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
-      if purged.more {
+      // The give-backs' slices come before the reserve's refill (A-226 after A-214): while any is left, the next turn
+      // gives back another.
+      if purged.more || recovery_left {
         return Some(true);
       }
       let pages = s.config.prefault_slice_pages();
@@ -4159,9 +4349,25 @@ async fn purge_if_idle() {
     if step != Some(true) {
       return;
     }
+    // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
+    // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
+    // as a granted landing does, and a step of a whole quantum between each of its short ones made it 4 to 5 times
+    // slower under load (A-226). The poll this replaced stays gone: a step is no longer than it was.
+    let polls_before = futures::polls_so_far();
     futures::yield_now().await;
+    let others_ran = polls_before
+      .zip(futures::polls_so_far())
+      .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
+    if others_ran {
+      let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
+      return;
+    }
   }
 }
+
+/// Counter: give-backs that left the rest for the next reap tick because another task ran on the shard (A-226), the
+/// non-vacuity count of the check in [`purge_if_idle`].
+pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
 /// Counter: reap ticks whose idle sweep sealed content, and so published and left the purge for a later tick (A-105).
 pub const TICKS_SEALING: &str = "content.ticks.sealing";

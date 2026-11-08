@@ -7870,6 +7870,26 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
 
+> **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
+> checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
+> which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
+> unreadable (every restart of the load harness's state, 2026-11-08).
+> - The durable entry is now the increment as submitted, byte for byte, then the effects its verdict resolved it to
+>   (content by reference to its post-state; a splice whose ops were not mapped by its path alone), then a digest.
+>   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
+>   of a checkpoint no longer matters to replay, and a straggler pins nothing.
+> - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
+>   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+> - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
+>   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
+>   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
+>   next recorded identity, not at its own version (an identity at every f = 0 accept cost 287-363 µs against a
+>   35-42 µs verdict). The oracle (`crates/merge/tests/chain_replay.rs`) compares identity at every version.
+> - Cost: 789 bytes an entry against the increment's 611 (+29%), and 4-5 µs on the p50 of an accept over a base behind
+>   the head (32 to 36-37 µs; p99 within noise). Layout 6; a version-5 segment is refused, and a green already fenced
+>   by a wrong checkpoint stays fenced.
+>   (`docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.)
+
 > **Status (2026-11-06, A-238: a green's chain is checkpointed at its reachable floor).** The partition kept
 > every accepted increment for good, and the "fold into checkpoint deltas" below had no durable form.
 > - Now, after each accept, the owner checkpoints the chain at the floor. The floor is the oldest version a live work
@@ -14591,8 +14611,28 @@ Status: built 2026-11-06.
   limit): paced p99 before 12.3 to 39.2 ms at load 52 to 82 (149 and 234 ms in round 1, 142 to 361 ms at load 95),
   after 6.8 to 29.2 ms (54 and 94 ms in one run); unpaced p99 before 0.64 to 32 ms, after 0.43 to 6.8 ms. That load
   dominates both arms' tails, so the latency rows are informational and the CPU count is the measurement.
-- Owed: a boot's two whole give-backs a shard (memories this journal did not write) still hold the shard 12 to 43 ms
-  each. They should be given back in slices under the step quantum, from a measured discard rate (GAPS).
+- Sliced (2026-11-06, the supervisor's item 3): a give-back no longer takes a region whole in one step. Each idle step
+  gives back one slice from the top of each region down, and the journal records it (`Journal::given_back_from`).
+  The slice is what the OS gave back in one step quantum the previous step, measured by each step for the next
+  (`give_back_slice`, `learn_give_back_rate`; a page the first time). `purge_if_idle` yields between slices while any
+  is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
+  ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
+  (`JournalStep::GiveBack { quarters }`). The test of the shard held is
+  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
+  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+- The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
+  area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
+  records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
+  a call from the same measured slice. Failing first: `a_purge_gives_back_only_what_the_log_wrote_since_its_last`
+  (12,288 bytes, the 16 KiB log's whole area, after one 15-byte record; Linux 6.19.10).
+
+- **A give-back makes way (amended 2026-11-08, reland-a207's measurement).** Sliced give-backs (a30e4209) took one step per
+  yield for as long as the arena allocated nothing, and a granted landing allocates nothing. So under load the landing
+  and the give-back took turns, one short landing step for each whole quantum of give-back: 2,859 to 4,965 give-back
+  steps ran through each landing. Now a task that ran across the yield ends the give-back for this reap tick
+  (`purge_if_idle`; `content.give_back.left_for_next_tick`), so a landing pays for at most one step a tick. An idle shard
+  still goes on to the end. Measured in BENCHMARKS ("A give-back makes way"): landing median 21.5 s -> 4.2 s, the base's
+  own 4.2 s, 8 interleaved rounds each. Proven by `a_give_back_leaves_the_rest_for_the_next_tick_when_another_task_is_running`.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
@@ -15988,6 +16028,27 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-257 — A green's chain entry records what its verdict resolved, and recovery applies it (accepted and built 2026-11-08)
+
+A checkpoint at the reachable floor (A-238) can pass the base of an entry left in the chain, and recovery, which judged
+each entry again at its base, refused it and fenced the green. Holding the checkpoint below every retained base never
+folds under steady concurrency; carrying the deltas down to it is not enough, since a verdict reads files' lengths and
+bytes at the base. So the decision is recorded where it is made: the verdict at accept is the guard, the entry its
+result, and recovery applies it (`crates/db/src/partition.rs`'s guard-then-apply). The merge record's inputs stay the
+increment, so holders keep their independent judgement. Integrity at f = 0 between checkpoints is the entry's digest;
+the head identity is compared at checkpoints, holder-bound versions and recorded heads.
+
+Applied in the same change to:
+- §4.16: its status ("Commit").
+- GAPS: the load-test blockquote (W3's recovery).
+- `crates/merge`: `chain_entry.rs` (new), `Green::submit_resolved`, `Green::apply_recorded`, `Checkpoint::head_check`
+  (encoding version 2).
+- `crates/server`: `verbs::submit`, `record_accepted`, `replay_green`, the takeover's chain; `merge_service::inputs_of`,
+  `checkpoint_green_when`, `record_goes_to_holders`, `GreenFence::IdentityDiverged` (and `NotAccepted` removed).
+- `crates/anchor`: `LAYOUT_VERSION` 6.
+- Tests: `crates/merge/tests/chain_replay.rs` (new), `crates/server/tests/green_checkpoint.rs`.
+- Bug record: `docs/bugs/2026-11-08-a-checkpoint-passed-a-retained-entrys-base-and-recovery-fenced-the-green.md`.
 
 ### A-252 — A request waiting for a version to commit is a typed durable state, so a resend after a restart never runs again (accepted and built 2026-11-08, fixtures' primary-kill rung; supervisor's two changes to the first cut)
 
