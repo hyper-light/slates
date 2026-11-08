@@ -97,7 +97,9 @@ fn refused(setting: &str, e: rustix::io::Errno) -> Failure {
   ))
 }
 
-#[cfg(test)]
+// Unix only: Windows has no core-size limit to set, and `exclude_from_dumps` is a recorded no-op there (GAPS,
+// `8a-win-dumps`). Ungated, this test kept the `slates` binary's tests from compiling on Windows.
+#[cfg(all(test, unix))]
 mod tests {
   use super::*;
 

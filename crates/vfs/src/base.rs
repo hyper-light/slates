@@ -419,6 +419,11 @@ pub struct BasePlane {
   large_class_bytes: u64,
   /// Listings by directory inode number.
   pub(crate) listings: BTreeMap<InodeNo, Listing>,
+  /// The base directories a recovery could not reacquire as the ones the image recorded (§4.8's failure matrix): gone
+  /// from the disk, unreadable, or another directory at the path. Their untouched entries refuse `BaseUnavailable`
+  /// while the volume's own entries in them serve; each keeps its record, so the next image carries it and a later
+  /// recovery tries again. Disjoint from [`Self::listings`]; bounded by the image's directories.
+  pub(crate) unavailable: BTreeMap<InodeNo, UnavailableDir>,
   /// Witnesses by inode number, versioned by epoch so a snapshot reads its own (A-48).
   witnesses: Versioned<InodeNo, Witness>,
   /// Where on the disk each witness was taken: the base directory's inode number and the
@@ -465,6 +470,31 @@ pub struct BasePlane {
   stale_since: BTreeMap<InodeNo, u64>,
 }
 
+/// A base directory a recovery could not reacquire ([`BasePlane::unavailable`]): its recorded source and fingerprint,
+/// kept for the next image, and the errno its untouched entries are refused with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableDir {
+  pub(crate) source: Vec<String>,
+  pub(crate) fingerprint: Fingerprint,
+  pub(crate) errno: i32,
+}
+
+/// Format: the errno a base directory that is no longer the recorded one is refused with, `ENOENT` (2 on Linux and
+/// macOS, and Windows' `ERROR_FILE_NOT_FOUND`): the directory the image recorded is not there, whether removed or
+/// replaced by another at the path (§4.8, A-153).
+pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
+
+/// The errno a base directory recovery could not reopen is refused with: the host's own, or [`GONE_DIRECTORY_ERRNO`]
+/// when the host says only that it is not there as a directory.
+pub(crate) fn unavailable_errno(error: HostError) -> i32 {
+  match error {
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
+    HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
+      GONE_DIRECTORY_ERRNO
+    }
+  }
+}
+
 impl BasePlane {
   /// Queues `file`, forgotten by a reclaim with no host, to be closed when the next overlay borrow ends.
   pub(crate) fn queue_close(&mut self, file: HostFile) {
@@ -490,6 +520,7 @@ impl BasePlane {
       facts: config.facts,
       large_class_bytes: config.large_class_bytes,
       listings,
+      unavailable: BTreeMap::new(),
       witnesses: Versioned::default(),
       witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
@@ -521,6 +552,12 @@ impl BasePlane {
   /// The hint sequence now (see [`Overlay::take_stale_base_entries`]).
   pub fn hint_seq(&self) -> u64 {
     self.hint_seq
+  }
+
+  /// How many base directories a recovery could not reacquire, whose untouched entries refuse `BaseUnavailable`
+  /// ([`Self::unavailable`]).
+  pub fn unavailable_dirs(&self) -> usize {
+    self.unavailable.len()
   }
 
   /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
@@ -1092,6 +1129,33 @@ impl Overlay<'_> {
     self.vol
   }
 
+  /// [`Volume::snapshot_is_complete`], judged with the host: a merged directory whose listing this daemon has not read
+  /// since a recovery (each is read again on first use, A-153) is read now from the host, uncached, so the snapshot is
+  /// judged by what its directories hold, not by a plane that has not listed them yet. Uncached, so a recovered
+  /// directory's first listing still renumbers its untouched entries where it is meant to (A-151). A directory recovery
+  /// could not reacquire refuses `BaseUnavailable`. Until 2026-11-08 a pinned overlay's snapshot was refused as a green's
+  /// base after any restart (`ConsistentBaseUnavailable`).
+  pub fn snapshot_is_complete(&mut self, store: &Store, id: SnapshotId) -> Result<bool, VfsError> {
+    let host = &mut *self.host;
+    let vol = &*self.vol;
+    vol.snapshot_is_complete_under(store, id, &mut |no| {
+      let Some(plane) = vol.base_plane() else {
+        return Ok(None);
+      };
+      if let Some(names) = plane.listed_names(no) {
+        return Ok(Some(names));
+      }
+      if let Some(gone) = plane.unavailable.get(&no) {
+        return Err(VfsError::BaseUnavailable(gone.errno));
+      }
+      let Some(listing) = plane.listings.get(&no) else {
+        return Ok(None);
+      };
+      let entries = host.list(listing.dir).map_err(host_refusal)?;
+      Ok(Some(entries.into_iter().map(|entry| entry.name).collect()))
+    })
+  }
+
   fn plane(&mut self) -> Result<&mut BasePlane, VfsError> {
     self.vol.base.as_mut().ok_or(VfsError::NotOverlay)
   }
@@ -1119,6 +1183,9 @@ impl Overlay<'_> {
     let policy = self.vol.policy;
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
     let listing = plane
       .listings
       .get_mut(&dir_no)
@@ -1515,9 +1582,16 @@ impl Overlay<'_> {
     no: InodeNo,
   ) -> Result<crate::volume::Observed, VfsError> {
     self.follow_live_disk(store, no)?;
-    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`).
+    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`). A directory recovery could not
+    // reacquire keeps the count it was recovered with: it is the volume's own node, which holds its overlay entries and
+    // answers for itself, while only its untouched base entries refuse (§4.8's failure matrix).
     if let Body::Directory(dir) = self.vol.inode(store, no)?.body
       && store.dirs.get(dir)?.base == BaseDirState::Merged
+      && !self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|plane| plane.unavailable.contains_key(&no))
     {
       self.load_listing(store, dir)?;
     }
@@ -1683,11 +1757,13 @@ impl Overlay<'_> {
   }
 
   fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
-    self
-      .vol
-      .base
-      .as_ref()
-      .and_then(|b| b.listings.get(&dir_no))
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
+    plane
+      .listings
+      .get(&dir_no)
       .map(|l| l.dir)
       .ok_or(VfsError::NotOverlay)
   }

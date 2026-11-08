@@ -18,10 +18,11 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_rt::shard::ShardId;
+use slates_rt::{RunState, SlotHolder};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -45,7 +46,7 @@ fn daemon(name: &str) -> (Daemon, ShardId, ShardId) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-liveness-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("liveness-{name}")),
     },
   )
   .unwrap();
@@ -59,14 +60,28 @@ fn beat(daemon: &Daemon) -> u64 {
   daemon.segment().supervision().unwrap().heartbeat_ns()
 }
 
-/// Waits until the daemon has beaten twice, so a test starts from a beating daemon.
-fn beating(daemon: &Daemon) {
+/// Waits until the daemon serves and has beaten twice, so a test starts from a booted, beating daemon; the returned
+/// connection is held for the test, so no client's reap runs inside it. The beat starts before the boot's client-id
+/// recovery asks every shard (`control_loop`), and a connection is accepted only after it, so a beat alone let a test's
+/// block land inside the boot, which then refused the boot (`liveness-repro.log` on adacachy, 2026-11-07).
+fn beating(daemon: &Daemon) -> slates_ipc::Connected {
   let started = Instant::now();
+  let serving = loop {
+    match slates_ipc::connect(daemon.instance()) {
+      Ok(connected) => break connected,
+      Err(slates_ipc::IpcError::DaemonUnavailable { .. }) => {
+        assert!(started.elapsed() < WINDOW * 10, "the daemon began serving");
+        wait(SAMPLE);
+      }
+      Err(refused) => panic!("the daemon refused a client: {refused}"),
+    }
+  };
   let first = beat(daemon);
   while beat(daemon) == first || beat(daemon) == 0 {
     assert!(started.elapsed() < WINDOW * 10, "the daemon began beating");
     wait(SAMPLE);
   }
+  serving
 }
 
 /// Waits `span` on the test thread (a channel nobody sends on, as the lint wall wants).
@@ -128,8 +143,8 @@ fn spin_for(burst: Duration) {
 /// the whole poll.
 #[test]
 fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
-  let (daemon, control, _) = daemon("starved");
-  beating(&daemon);
+  let (daemon, control, _) = daemon("starved-poll");
+  let _serving = beating(&daemon);
   let span = WINDOW + WINDOW / 2;
   let worker = on_shard(&daemon, control, move || {
     let started = Instant::now();
@@ -150,16 +165,30 @@ fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
   daemon.stop();
 }
 
-/// A-228, §4.14. Do: on the shard that is not the control shard, block one poll with no CPU for three windows (a
-/// deadlock, or a host call that does not return), noting when the block began on the shard. Expect: the beat stops — a
-/// gap of a whole window — no later than a window and three beats after the block began. Before A-228 the control shard
-/// went on beating, so the anchor never saw the wedged shard. The stop is timed from the block's own start, since under
-/// load the observation reaches the shard some time after it is sent, and the beat resumes once the block ends, so only
-/// the first window-long gap counts.
-#[test]
-fn a_wedged_shard_stops_the_beat() {
-  let (daemon, _, other) = daemon("wedged");
-  beating(&daemon);
+/// Blocks a shard's poll on a channel nobody sends on for `held`: no CPU and never runnable.
+fn block_on_a_channel(held: Duration) {
+  wait(held);
+}
+
+/// Blocks a shard's poll in a real read of a pipe, which a helper thread writes to after `held`.
+fn block_in_a_read(held: Duration) {
+  use std::io::{Read, Write};
+  let (mut reader, mut writer) = std::io::pipe().unwrap();
+  std::thread::spawn(move || {
+    wait(held);
+    writer.write_all(b"x").unwrap();
+  });
+  let mut byte = [0_u8];
+  reader.read_exact(&mut byte).unwrap();
+}
+
+/// Runs `block` for three windows as one poll on the shard that is not the control shard, noting when the block began
+/// on the shard, and holds the beat to stopping — a gap of a whole window — no later than a window and three beats after
+/// the block began. The stop is timed from the block's own start, since under load the observation reaches the shard
+/// some time after it is sent, and the beat resumes once the block ends, so only the first window-long gap counts.
+fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
+  let (daemon, _, other) = daemon(name);
+  let _serving = beating(&daemon);
   let held = WINDOW * 3;
   let base = Instant::now();
   let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
@@ -168,14 +197,23 @@ fn a_wedged_shard_stops_the_beat() {
       u64::try_from(base.elapsed().as_micros()).unwrap().max(1),
       Ordering::Release,
     );
-    let (_hold, rx) = std::sync::mpsc::channel::<()>();
-    let _ = rx.recv_timeout(held);
+    block(held);
   });
-  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one.
+  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one. The watch lasts
+  // until the block ends, timed from the block's own start: under load the observation reached the shard 1.05 s and
+  // 1.39 s after `base`, and a watch of `held` from `base` ended before the window-long gap could be seen, though the
+  // beat had stopped 0.97 s and 1.00 s after the block began (2 of 10 runs at load 126–147 on adacachy, 2026-11-07).
+  // A block that never began ends the watch once its observation has answered.
   let mut last = beat(&daemon);
   let mut last_seen = base.elapsed();
   let mut stopped_at = None;
-  while base.elapsed() < held {
+  loop {
+    let answered = worker.is_finished();
+    let began = began_us.load(Ordering::Acquire);
+    let block_over = began > 0 && base.elapsed() >= Duration::from_micros(began) + held;
+    if block_over || (began == 0 && answered) {
+      break;
+    }
     wait(SAMPLE);
     let now = beat(&daemon);
     if now != last {
@@ -198,10 +236,309 @@ fn a_wedged_shard_stops_the_beat() {
     )
   });
   let after = stopped_at.saturating_sub(began);
-  println!("wedged shard: the block began {began:?} in, and the beat stopped {after:?} after it");
+  println!(
+    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it"
+  );
   assert!(
     after <= WINDOW + BEAT * 3,
     "the beat stopped {after:?} after the shard wedged, past a window and three beats"
+  );
+  daemon.stop();
+}
+
+/// A-228, §4.14. Do: on the shard that is not the control shard, block one poll with no CPU for three windows (a
+/// deadlock, or a host call that does not return). Expect: the beat stops within a window and three beats of the block.
+/// Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
+#[test]
+fn a_wedged_shard_stops_the_beat() {
+  a_blocked_shard_stops_the_beat("wedged", block_on_a_channel);
+}
+
+/// A-228, §4.14, the stuck extreme of starved-is-not-stuck. Do: block one poll in a real syscall, a read of a pipe nobody
+/// writes, for three windows. Expect: the beat stops within a window and three beats of the block: the scheduler never
+/// sees the thread runnable, so a shard stuck in the kernel is still found.
+#[test]
+fn a_shard_blocked_in_a_syscall_stops_the_beat() {
+  a_blocked_shard_stops_the_beat("syscall", block_in_a_read);
+}
+
+/// Shape: spinners on the starved shard's CPU. Linux: 63, the most measured, which held a SCHED_IDLE thread off its CPU
+/// for 5.7 s (CachyOS 7.3) and 7.9 s (Fedora 6.19) of 8 s; 4 and 16 left it 0.4-5.1 s.
+#[cfg(target_os = "linux")]
+fn spinners_wanted() -> usize {
+  63
+}
+
+/// Shape: four TIME_CRITICAL spinners on its CPU held an IDLE-priority thread off it for all of 8.9 s (Windows x86_64).
+#[cfg(windows)]
+fn spinners_wanted() -> usize {
+  4
+}
+
+/// Shape: two spinners a CPU, as the busy-machine test runs. macOS has no way to pin them beside the shard.
+#[cfg(target_os = "macos")]
+fn spinners_wanted() -> usize {
+  std::thread::available_parallelism().map_or(1, usize::from) * 2
+}
+
+/// Lowers the calling thread (a shard's) as far as an unprivileged thread can and pins it to the CPU it is on; that CPU.
+/// The policy stays for the thread's life: an unprivileged thread cannot leave SCHED_IDLE, and the test's daemon stops.
+#[cfg(target_os = "linux")]
+fn starve_this_thread() -> usize {
+  // SAFETY: takes no argument and returns the calling thread's CPU.
+  let cpu = usize::try_from(unsafe { libc::sched_getcpu() }).unwrap();
+  pin_to(cpu);
+  let param = libc::sched_param { sched_priority: 0 };
+  // SAFETY: pid 0 names the calling thread; `param` is this frame's own, and is read for the call only.
+  let status = unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &raw const param) };
+  assert_eq!(status, 0, "SCHED_IDLE needs no privilege");
+  cpu
+}
+
+/// Keeps the calling thread (a spinner) on `cpu`, at normal priority, ahead of a SCHED_IDLE thread there.
+#[cfg(target_os = "linux")]
+fn outrank_on(cpu: usize) {
+  pin_to(cpu);
+}
+
+#[cfg(target_os = "linux")]
+fn pin_to(cpu: usize) {
+  let mut set = rustix::thread::CpuSet::new();
+  set.set(cpu);
+  rustix::thread::sched_setaffinity(None, &set).unwrap();
+}
+
+/// Lowers the calling thread (a shard's) to IDLE priority with its boosts off and pins it to the CPU it is on; that CPU.
+#[cfg(windows)]
+fn starve_this_thread() -> usize {
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentProcessorNumber, GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost,
+    THREAD_PRIORITY_IDLE,
+  };
+  // SAFETY: takes no argument and returns the calling thread's processor.
+  let cpu = unsafe { GetCurrentProcessorNumber() } as usize;
+  pin_to(cpu);
+  // SAFETY: the pseudo-handle names the calling thread, alive for the calls.
+  unsafe {
+    assert_ne!(
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE),
+      0
+    );
+    assert_ne!(SetThreadPriorityBoost(GetCurrentThread(), 1), 0);
+  }
+  cpu
+}
+
+/// Puts the calling thread (a spinner) on `cpu` at TIME_CRITICAL priority.
+#[cfg(windows)]
+fn outrank_on(cpu: usize) {
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+  };
+  pin_to(cpu);
+  // SAFETY: the pseudo-handle names the calling thread, alive for the call.
+  let raised = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+  assert_ne!(raised, 0);
+}
+
+#[cfg(windows)]
+fn pin_to(cpu: usize) {
+  use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+  // SAFETY: the pseudo-handle names the calling thread, alive for the call.
+  let previous = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << cpu) };
+  assert_ne!(previous, 0);
+}
+
+/// Lowers the calling thread (a shard's) to the background QoS class. macOS has no CPU to name; the answer is 0.
+#[cfg(target_os = "macos")]
+fn starve_this_thread() -> usize {
+  // SAFETY: changes the calling thread's own QoS class; the arguments are plain values.
+  let status =
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) };
+  assert_eq!(status, 0);
+  0
+}
+
+/// Raises the calling thread (a spinner) to the user-interactive QoS class.
+#[cfg(target_os = "macos")]
+fn outrank_on(_cpu: usize) {
+  // SAFETY: changes the calling thread's own QoS class; the arguments are plain values.
+  let status = unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+  };
+  assert_eq!(status, 0);
+}
+
+/// Where this platform's scheduler reader gets its answer (`slates_rt::thread_clock` says why).
+fn scheduler_source() -> &'static str {
+  if cfg!(target_os = "linux") {
+    "/proc task stat state and schedstat run-queue wait"
+  } else if cfg!(windows) {
+    "NtQuerySystemInformation thread state, no wait time kept"
+  } else {
+    "thread_basic_info run_state, no wait time kept"
+  }
+}
+
+/// What the scheduler reader said of the shard over a watch, asked once a beat as the watchdog asks.
+#[derive(Default)]
+struct SchedulerSeen {
+  runnable: u32,
+  blocked: u32,
+  unread: u32,
+  waited_first_ns: Option<u64>,
+  waited_last_ns: Option<u64>,
+}
+
+impl SchedulerSeen {
+  fn look(&mut self, holder: SlotHolder) {
+    match slates_rt::registry::shard_run_readings(&[holder])
+      .pop()
+      .flatten()
+    {
+      None => self.unread += 1,
+      Some(reading) => {
+        match reading.state {
+          RunState::Runnable => self.runnable += 1,
+          RunState::Blocked => self.blocked += 1,
+        }
+        self.waited_first_ns = self.waited_first_ns.or(reading.waited_ns);
+        self.waited_last_ns = reading.waited_ns.or(self.waited_last_ns);
+      }
+    }
+  }
+}
+
+/// What a watch of a starved shard saw.
+struct Starving {
+  largest_gap: Duration,
+  longest_flat: Duration,
+  scheduler: SchedulerSeen,
+}
+
+/// Watches the beat and the shard's own CPU clock together, for three windows at the least and on until the clock has
+/// stood still for `flat_enough` or `bound` passes: the largest gap between beats, the clock's longest standstill, and
+/// what the scheduler reader said meanwhile.
+fn watch_starving(
+  daemon: &Daemon,
+  holder: SlotHolder,
+  flat_enough: Duration,
+  bound: Duration,
+) -> Starving {
+  let progress = || slates_rt::registry::shard_cpu(holder).map(|reading| reading.progress);
+  let least = WINDOW * 3;
+  let started = Instant::now();
+  let mut last_beat = beat(daemon);
+  let mut last_beat_seen = Instant::now();
+  let mut largest_gap = Duration::ZERO;
+  let mut last_progress = progress();
+  let mut progressed = Instant::now();
+  let mut longest_flat = Duration::ZERO;
+  let mut scheduler = SchedulerSeen::default();
+  let mut last_asked = Instant::now();
+  while started.elapsed() < bound && (started.elapsed() < least || longest_flat < flat_enough) {
+    wait(SAMPLE);
+    if last_asked.elapsed() >= BEAT {
+      last_asked = Instant::now();
+      scheduler.look(holder);
+    }
+    let now = beat(daemon);
+    if now != last_beat {
+      last_beat = now;
+      last_beat_seen = Instant::now();
+    }
+    largest_gap = largest_gap.max(last_beat_seen.elapsed());
+    let reading = progress();
+    if reading != last_progress {
+      last_progress = reading;
+      progressed = Instant::now();
+    }
+    longest_flat = longest_flat.max(progressed.elapsed());
+  }
+  Starving {
+    largest_gap,
+    longest_flat,
+    scheduler,
+  }
+}
+
+/// A-228, §4.14, fixtures' false kills at CPUWeight=1, the starved extreme of starved-is-not-stuck. Do: lower the shard
+/// that is not the control shard as far as an unprivileged thread can, spin one poll on it without yielding, and keep it
+/// off its CPU with higher-priority spinners there, until its own clock has stood still long enough that the old rule
+/// withholds the beat for a whole window (two windows and three beats) and three windows have passed. Expect: the beat
+/// never gaps a window: the thread is runnable throughout. Linux and Windows must see that flat window, or the test
+/// fails saying it did not starve; macOS' scheduler will not hold a thread off for that long on demand (1.1 s at best,
+/// 0-0.1 s at more spinners), so there it prints what it saw and holds only the beat.
+#[test]
+fn a_shard_starved_off_its_cpu_keeps_the_beat() {
+  let (daemon, _, other) = daemon("starved");
+  let _serving = beating(&daemon);
+  let on_cpu = &*Box::leak(Box::new(AtomicUsize::new(usize::MAX)));
+  let running = &*Box::leak(Box::new(AtomicBool::new(true)));
+  let worker = on_shard(&daemon, other, move || {
+    on_cpu.store(starve_this_thread(), Ordering::Release);
+    while running.load(Ordering::Relaxed) {
+      std::hint::spin_loop();
+    }
+  });
+  let waited = Instant::now();
+  while on_cpu.load(Ordering::Acquire) == usize::MAX {
+    assert!(waited.elapsed() < WINDOW * 10, "the poll reached its shard");
+    wait(SAMPLE);
+  }
+  let cpu = on_cpu.load(Ordering::Acquire);
+  let spinners: Vec<_> = (0..spinners_wanted())
+    .map(|_| {
+      std::thread::spawn(move || {
+        outrank_on(cpu);
+        while running.load(Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      })
+    })
+    .collect();
+  let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  let must_starve = !cfg!(target_os = "macos");
+  let flat_enough = WINDOW * 2 + BEAT * 3;
+  let bound = if must_starve { WINDOW * 10 } else { WINDOW * 3 };
+  let started = Instant::now();
+  let Starving {
+    largest_gap,
+    longest_flat,
+    scheduler,
+  } = watch_starving(&daemon, holder, flat_enough, bound);
+  running.store(false, Ordering::Relaxed);
+  for spinner in spinners {
+    spinner.join().unwrap();
+  }
+  worker.join().unwrap();
+  println!(
+    "starved shard: {} spinners, its CPU clock stood still for {longest_flat:?} at most in {:?}; largest beat gap \
+     {largest_gap:?}",
+    spinners_wanted(),
+    started.elapsed()
+  );
+  println!(
+    "scheduler reader: {}; asked once a beat: runnable {}, blocked {}, unread {}; run-queue wait first {:?} ns, last \
+     {:?} ns",
+    scheduler_source(),
+    scheduler.runnable,
+    scheduler.blocked,
+    scheduler.unread,
+    scheduler.waited_first_ns,
+    scheduler.waited_last_ns
+  );
+  if must_starve {
+    assert!(
+      longest_flat >= flat_enough,
+      "did not starve: the shard's CPU clock stood still for {longest_flat:?} at most, under the {flat_enough:?} that \
+       tests the rule"
+    );
+  }
+  assert!(
+    largest_gap < WINDOW,
+    "the beat stopped for {largest_gap:?} while the shard was starved (its CPU clock stood still for {longest_flat:?}): \
+     a starved shard was judged stuck"
   );
   daemon.stop();
 }
@@ -213,7 +550,7 @@ fn a_wedged_shard_stops_the_beat() {
 #[test]
 fn a_spinning_shard_stops_the_beat() {
   let (daemon, _, other) = daemon("spinning");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let bound = WINDOW * 10;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
   let worker = on_shard(&daemon, other, move || {
@@ -252,7 +589,7 @@ fn a_spinning_shard_stops_the_beat() {
 #[test]
 fn a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat() {
   let (daemon, control, _) = daemon("slow");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let worker = on_shard(&daemon, control, move || {
     let (_hold, rx) = std::sync::mpsc::channel::<()>();
     let _ = rx.recv_timeout(WINDOW / 2);
@@ -272,7 +609,7 @@ fn a_slow_blocking_call_shorter_than_a_window_does_not_stop_the_beat() {
 #[test]
 fn a_daemon_beside_two_spinners_a_core_keeps_beating() {
   let (daemon, _, _) = daemon("busy");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let cpus = std::thread::available_parallelism().map_or(1, usize::from);
   let stop = &*Box::leak(Box::new(AtomicBool::new(false)));
   let spinners: Vec<_> = (0..cpus * 2)
@@ -346,7 +683,7 @@ fn a_stopping_daemon_role() {
     return;
   }
   let (daemon, _control, other) = daemon("stopping");
-  beating(&daemon);
+  let _serving = beating(&daemon);
   let held: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
   let poll = on_shard(&daemon, other, move || {
     held.store(true, Ordering::Release);

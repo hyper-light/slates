@@ -60,6 +60,8 @@ const EAGAIN: i32 = 11;
 const ENOENT: i32 = 2;
 /// Format: EPERM, operation not permitted.
 const EPERM: i32 = 1;
+/// Format: EROFS, a read-only file system: a change asked of an attachment that may not write, or of a snapshot.
+const EROFS: i32 = 30;
 /// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107), and a Windows
 /// DAX ask naming a process that does not hold its stream (plan G-shards-windows step 5).
 pub const EACCES: i32 = 13;
@@ -653,6 +655,7 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::FileTooLarge => EFBIG,
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
+    VfsError::ReadOnly => EROFS,
     VfsError::LinkProtected => EACCES,
     VfsError::SpecialFileOperation => EOPNOTSUPP,
     VfsError::NoAttribute => ENODATA,
@@ -679,7 +682,7 @@ pub fn dax_refused_errno(refused: &slates_bridge_core::dax_backing::Refused) -> 
     Refused::Unreachable(e) | Refused::Witness(e) => errno(e.clone()),
     Refused::NotAFile { directory: true } => EISDIR,
     Refused::NotAFile { directory: false } => EINVAL,
-    Refused::ReadOnly => EPERM,
+    Refused::ReadOnly => EROFS,
     Refused::Budget => ENOMEM,
     Refused::Object => EIO,
   }
@@ -691,7 +694,7 @@ pub fn dax_failure_errno(failure: &slates_bridge_core::dax_backing::Failure) -> 
   use slates_bridge_core::dax_backing::Failure;
   match failure {
     Failure::Object => EIO,
-    Failure::ReadOnly => EPERM,
+    Failure::ReadOnly => EROFS,
     Failure::Volume(e) => errno(e.clone()),
   }
 }

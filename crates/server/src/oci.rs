@@ -222,8 +222,14 @@ mod tests {
     green_chain_bytes: 1,
   };
   /// Shape: the mounting user and another.
-  const OWNER: Principal = Principal::Uid { uid: 1000 };
-  const STRANGER: Principal = Principal::Uid { uid: 1001 };
+  const OWNER: Principal = Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1000,
+  };
+  const STRANGER: Principal = Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1001,
+  };
   /// Shape: the FUSE mount's attachment id, and an id no record holds.
   const MOUNTED: u64 = 7;
   const UNKNOWN: u64 = 9;
@@ -484,7 +490,7 @@ mod tests {
       } else {
         AttachForm::FuseMount { path: POINT.to_owned() }
       };
-      let principal = if other_principal { Principal::Uid { uid: 1001 } } else { OWNER };
+      let principal = if other_principal { Principal::Uid { host: slates_db::HostId(0), uid: 1001 } } else { OWNER };
       let snapshot = record_snapshot.then_some(SnapshotId { value: 1 });
       partition
         .apply(&Op::AttachmentAdded {

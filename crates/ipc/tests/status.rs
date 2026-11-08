@@ -54,6 +54,7 @@ fn report() -> ReplyBody {
       log_lines_refused: 101,
       anchor_log_lines_refused: 103,
       dumps_local_full: true,
+      anchor: 97,
       fleet: FleetReport {
         host: 19,
         f: 0,
@@ -120,6 +121,8 @@ fn report() -> ReplyBody {
           due_ns: 181,
           stated: 191,
         },
+        peers_in_contact: 3,
+        peers_unmeshed: 1,
       },
     }),
   }

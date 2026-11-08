@@ -492,7 +492,7 @@ impl<'b> Export<'b> {
     // The caller's uid is the enrolled subject's; a subject that is not a Unix user owns nothing and
     // is judged by the other class of every object.
     let caller_uid = match &subject {
-      Principal::Uid { uid } => *uid,
+      Principal::Uid { uid, .. } => *uid,
       _ => access::INVALID_UID,
     };
     let mut owned = Attachments::new();
@@ -525,7 +525,7 @@ impl<'b> Export<'b> {
     attachment: AttachmentId,
   ) -> Export<'b> {
     let caller_uid = match &subject {
-      Principal::Uid { uid } => *uid,
+      Principal::Uid { uid, .. } => *uid,
       _ => access::INVALID_UID,
     };
     let fsid = first_word(&volume.bytes);
@@ -3042,6 +3042,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
     VfsError::NotPermitted => Nfsstat3::Perm,
+    // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
+    // `Nfsstat4::of_v3`).
+    VfsError::ReadOnly => Nfsstat3::Rofs,
     VfsError::LinkProtected => Nfsstat3::Acces,
     VfsError::SpecialFileOperation => Nfsstat3::Notsupp,
     VfsError::Invalid | VfsError::InvalidName => Nfsstat3::Inval,

@@ -71,7 +71,7 @@ fn a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-snapland-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "snapland"),
     },
   )
   .unwrap();
@@ -136,7 +136,7 @@ fn a_landing_of_an_overlay_into_its_base_serves_both_files_afterwards() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-ovland-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "ovland"),
     },
   )
   .unwrap();
@@ -202,7 +202,7 @@ fn a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-ovlarge-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "ovlarge"),
     },
   )
   .unwrap();

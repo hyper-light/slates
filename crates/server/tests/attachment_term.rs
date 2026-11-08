@@ -36,7 +36,7 @@ fn a_cli_attachment_lives_its_term_renewed_by_use_and_is_refused_as_expired_afte
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-term-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "term"),
     },
   )
   .unwrap();

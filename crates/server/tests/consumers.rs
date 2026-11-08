@@ -34,7 +34,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-consumers-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("consumers-{name}")),
     },
   )
   .unwrap();
@@ -78,7 +78,7 @@ fn channel_principal(daemon: &Daemon, client_id: u32) -> slates_db::catalog::Pri
 /// The account a consumer of `channel`'s host account is enrolled under: the channel's uid.
 fn own_account(channel: &slates_db::catalog::Principal) -> u32 {
   match channel {
-    slates_db::catalog::Principal::Uid { uid } => *uid,
+    slates_db::catalog::Principal::Uid { uid, .. } => *uid,
     other => panic!("a channel authenticated as something other than a host account: {other:?}"),
   }
 }
@@ -111,7 +111,11 @@ fn a_consumer_of_the_channels_own_account_attests_and_holds_only_what_is_shared_
   owner
     .share(
       volume,
-      Principal::Consumer { account, consumer },
+      Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       Rights {
         read: true,
         write: false,

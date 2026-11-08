@@ -131,7 +131,7 @@ fn start(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();

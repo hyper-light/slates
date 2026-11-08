@@ -78,6 +78,17 @@ struct Words {
   seq_base: u64,
 }
 
+/// A word of a ring's header that releasing its log stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingWord {
+  /// The offset of the first record.
+  Head,
+  /// The offset past the last record.
+  Tail,
+  /// The sequence of the record at the head.
+  SequenceBase,
+}
+
 /// A log ring: a log region or the audit region.
 pub struct LogRing {
   kind: RegionKind,
@@ -265,32 +276,37 @@ impl LogRing {
     Ok(())
   }
 
-  /// Releases every record with a sequence below `up_to_seq` (after a snapshot covering them
-  /// was published): the head walks forward over verified records.
-  pub fn trim(&self, segment: &AnchorSegment, up_to_seq: u64) -> Result<u64, DbError> {
-    let w = self.words(segment)?;
-    let mut at = w.head;
-    let mut seq = w.seq_base;
-    let mut released = 0u64;
-    while at < w.tail && seq < up_to_seq {
-      let (_, _, size) = self.record_at(segment, w, at, seq)?;
-      at = at.saturating_add(size);
-      seq = seq.saturating_add(1);
-      released = released.saturating_add(size);
-    }
+  /// Releases the whole log once a snapshot covering it published, the next record taking sequence `next_seq`. A
+  /// snapshot is written from the partition, so what it covers is dead: this reads no record, and costs the same however
+  /// long the log. It walked and decoded every record to reach the tail, so one commit's poll paid for a whole snapshot
+  /// interval (654 ms over 1,000,000 records in release, 14.9 s in debug), and a damaged dead record refused the snapshot
+  /// (`docs/bugs/2026-11-08-a-snapshot-decoded-the-log-it-released.md`).
+  ///
+  /// The next record starts again at the ring's first byte, so a long run keeps one snapshot interval's pages backed, not
+  /// the whole ring's (A-71). The sequence, then the head, then the tail: a crash after the head's store leaves the head
+  /// at the first byte under the old tail, where the record found carries an earlier sequence than `next_seq`, so replay
+  /// cuts it as torn and the tail with it, an empty ring at the snapshot, as intended.
+  pub fn release_all(&self, segment: &AnchorSegment, next_seq: u64) -> Result<(), DbError> {
     let words = segment.ring_words(self.kind)?;
-    words[3].store(seq, Ordering::Release);
-    if at == w.tail {
-      // Emptied: the next record starts again at the ring's first byte, so a long run keeps one snapshot interval's
-      // pages backed, not the whole ring's (A-71). Head first: a crash between the two stores leaves the head at the
-      // first byte under the old tail, where the record found carries an earlier sequence than `seq`, so replay
-      // cuts it as torn and the tail with it — an empty ring at the snapshot, as intended.
-      words[0].store(0, Ordering::Release);
-      words[1].store(0, Ordering::Release);
-    } else {
-      words[0].store(at, Ordering::Release);
+    for (word, value) in Self::release_stores(next_seq) {
+      let at = match word {
+        RingWord::Head => words[0],
+        RingWord::Tail => words[1],
+        RingWord::SequenceBase => words[3],
+      };
+      at.store(value, Ordering::Release);
     }
-    Ok(released)
+    Ok(())
+  }
+
+  /// The stores of [`LogRing::release_all`], in the order it makes them: what a crash between any two leaves is what a
+  /// recovery must take back to the snapshot, and a test crashes at each (`crates/db/tests/snapshot_cost.rs`).
+  pub fn release_stores(next_seq: u64) -> [(RingWord, u64); 3] {
+    [
+      (RingWord::SequenceBase, next_seq),
+      (RingWord::Head, 0),
+      (RingWord::Tail, 0),
+    ]
   }
 }
 

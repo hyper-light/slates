@@ -88,6 +88,10 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     self.inner.awaits_publication()
   }
 
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError> {
+    self.inner.authorize_change(cx)
+  }
+
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
     self.inner.lookup(parent, cx, name)
   }

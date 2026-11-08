@@ -1911,3 +1911,150 @@ fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
   let (code, _, err) = run(&instance, &["detach", &attachment]);
   assert_eq!(code, 0, "detach: {err}");
 }
+
+/// Changes the drive at `path`'s file in each of the ways a read-only file system refuses: an overwrite, a create
+/// beside it, a directory, a deletion. The Win32 errors, in that order.
+#[allow(clippy::disallowed_methods)]
+fn changes_through_drive(path: &str) -> [Option<i32>; 4] {
+  let beside = format!("{path}.new");
+  let dir = format!("{path}.dir");
+  [
+    std::fs::write(path, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::write(&beside, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::create_dir(&dir)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::remove_file(path)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+  ]
+}
+
+/// GAPS (2026-11-08): a read-only attachment is a read-only file system on every transport. WinFsp reports the volume
+/// read-only (`ReadOnlyVolume`) and a change that reaches the mount is answered `STATUS_MEDIA_WRITE_PROTECTED`, which
+/// Win32 names `ERROR_WRITE_PROTECT`. Do: mount a volume read-only; through the drive overwrite `file.bin`, create a file
+/// beside it, make a directory, delete `file.bin`. Expect each refused `ERROR_WRITE_PROTECT`, and `file.bin` reading its
+/// first bytes still.
+#[test]
+fn a_read_only_drive_refuses_every_change_as_write_protected() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("rodrive", b'A');
+  let write_protect = i32::try_from(windows_sys::Win32::Foundation::ERROR_WRITE_PROTECT).unwrap();
+  assert_eq!(
+    changes_through_drive(&fixture.file),
+    [Some(write_protect); 4],
+    "every change through the read-only drive is refused as write-protected"
+  );
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+}
+
+/// Shape: the WinFsp drives the unmount test mounts beside the volume recovery cannot rebuild, so the scan meets the
+/// refused volume whichever place the catalog's order gives it.
+const HEALTHY_DRIVES: usize = 2;
+
+/// Waits until a successor of `killed` has adopted `drives` held drives.
+fn wait_for_adoptions(instance: &str, killed: u32, drives: u64) {
+  let started = Instant::now();
+  while !(daemon_pid(instance).is_some_and(|pid| pid != killed)
+    && counter(instance, "winfsp.adopted") >= drives)
+  {
+    assert!(
+      started.elapsed() < WAIT_FOR,
+      "no successor adopted the {drives} held drives"
+    );
+    pause();
+  }
+}
+
+/// Bug (GAPS, A-227's sweep, 2026-11-06): Windows `slates unmount` asked each volume's status in turn and stopped at the
+/// first refusal, so one volume recovery could not rebuild kept every drive from being unmounted by its letter. Do:
+/// create a volume over a host directory and mount two more at drives; remove the directory and kill the daemon, so its
+/// successor serves both held drives and cannot rebuild the first volume. Expect: `slates unmount` of each drive
+/// succeeds and the drive goes, and each names the volume it could not ask on standard error with its refusal's kind,
+/// `NotRecovered`, the one its own status gives (naming the missing base).
+#[test]
+fn unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("unmountbad");
+  let _anchor = start_anchor(&instance);
+  let base = format!(
+    "{}\\unmountbad-{}\\base",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  cmd(&["mkdir", &base]);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "unrebuilt",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let unrebuilt = value_of(&out, "id");
+  let drives = mount_healthy_drives(&instance);
+  cmd(&["rmdir", &base]);
+  let killed = daemon_pid(&instance).unwrap();
+  kill_daemon(killed);
+  wait_for_adoptions(&instance, killed, u64::try_from(HEALTHY_DRIVES).unwrap());
+  let (code, _, err) = run(&instance, &["status", &unrebuilt]);
+  assert_ne!(
+    code, 0,
+    "recovery could not rebuild the volume whose base is gone"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "the listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  let kind = "NotRecovered";
+  for drive in &drives {
+    unmount_naming_the_unasked(&instance, drive, kind);
+  }
+}
+
+/// Creates [`HEALTHY_DRIVES`] volumes and mounts each at a free drive, ready, returning the drives.
+fn mount_healthy_drives(instance: &str) -> Vec<String> {
+  let mut drives = Vec::new();
+  for index in 0..HEALTHY_DRIVES {
+    let name = format!("healthy{index}");
+    let (code, out, err) = run(instance, &["volume", "create", &name, "--bounded", "64MiB"]);
+    assert_eq!(code, 0, "{err}");
+    let drive = free_drive_letter();
+    let (code, _, err) = run(instance, &["mount", &value_of(&out, "id"), &drive]);
+    assert_eq!(code, 0, "mount: {err}");
+    wait_ready(&format!("{drive}\\"));
+    drives.push(drive);
+  }
+  drives
+}
+
+/// `slates unmount` of the healthy `drive` succeeds, the drive goes, and standard error names the volume the scan could
+/// not ask (`unrebuilt`) by its refusal's `kind`.
+fn unmount_naming_the_unasked(instance: &str, drive: &str, kind: &str) {
+  let (code, _, err) = run(instance, &["unmount", drive]);
+  assert_eq!(
+    code, 0,
+    "the healthy drive {drive} is unmounted beside the unrebuilt volume: {err}"
+  );
+  assert!(
+    err.contains("volume unrebuilt") && err.contains(kind),
+    "the unmount of {drive} names the volume it could not ask, by its refusal ({kind}): {err}"
+  );
+  assert!(drive_goes(drive), "the drive {drive} goes");
+}

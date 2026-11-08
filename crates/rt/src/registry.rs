@@ -551,6 +551,32 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
   .and_then(crate::thread_clock::read)
 }
 
+/// What the scheduler says of each shard `holders` name at this instant, in their order (`crate::thread_clock`'s note
+/// says what each platform reads): `None` for one whose registration no longer holds its slot, whose thread recorded no
+/// clock, or where the platform reads nothing. A batch, since Windows reads the whole system's threads at once. With
+/// [`shard_cpu`] over a window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
+pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_clock::RunReading>> {
+  let handles: Vec<u64> = holders
+    .iter()
+    .map(|holder| {
+      with_entry(holder.shard, |entry| {
+        (entry.holder() == *holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+      })
+      .flatten()
+      .unwrap_or(0)
+    })
+    .collect();
+  crate::thread_clock::run_readings(&handles)
+}
+
+/// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).
+pub fn shard_run_state(holder: SlotHolder) -> Option<crate::thread_clock::RunState> {
+  shard_run_readings(&[holder])
+    .pop()
+    .flatten()
+    .map(|reading| reading.state)
+}
+
 /// Release the reader pin even when a test callback unwinds.
 struct Reader<'a>(&'a AtomicU32);
 impl Drop for Reader<'_> {

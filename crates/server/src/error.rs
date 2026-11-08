@@ -126,6 +126,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::Destroying => Refusal::Destroying,
     VfsError::Archived => Refusal::Archived,
     VfsError::PolicyMismatch => Refusal::PolicyMismatch,
+    // A read-only attachment's or a snapshot view's change, on the wire as the read-only volume it is.
+    VfsError::ReadOnly => Refusal::ReadOnlyVolume,
     VfsError::BaseUnavailable(errno) => Refusal::BaseUnavailable {
       path: String::new(),
       errno: *errno,
