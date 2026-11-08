@@ -72,6 +72,33 @@
 >     run of it.
 > - **Owed:** the table as a `cargo xtask` doc-truth check, so a target no lane runs fails CI.
 
+> **A snapshot's release decoded the log it covered (found and fixed 2026-11-08, §4.3, §4.8).** One commit's poll walked and
+> decoded every record since the last snapshot only to reach the tail: 654 ms over 1,000,000 records in release and 14.9 s in
+> debug. Since A-243 the interval is about a recovery budget of replay work, so the walk could take about that budget. It is
+> now three stores and reads no record, 28 µs in release at the same size, and a crash at every store is tested
+> (`docs/bugs/2026-11-08-a-snapshot-decoded-the-log-it-released.md`).
+
+> **A checkpoint costs the whole shard in one verb's poll (found and measured 2026-11-08, OPEN; held for raft's recovery-format
+> work, §4.3 "Bounded work everywhere", §4.8).** A mutating verb's barrier is usually a delta, whose cost is its changes. Once
+> the deltas since the last checkpoint reach its size, or the log has no room, that verb's publish is a checkpoint of every
+> volume (`publish_checkpoint`, `encode_image_into`): the whole head, never a delta, inside the one poll.
+> - Measured (`a_barriers_cost_against_the_shards_size`, an ignored measurement in `crates/server/src/verbs.rs`; one volume on
+>   one shard, this Mac at load 5, three release runs):
+>
+>   | files | checkpoint, release | checkpoint, debug | delta, release (median) | delta, debug (median) | deltas between checkpoints |
+>   |---|---|---|---|---|---|
+>   | 1,000 | 96-118 µs | 1.4-1.9 ms | 2 µs | 62-64 µs | 570-633 |
+>   | 4,000 | 389-503 µs | 5.3-6.1 ms | 2 µs | 60-61 µs | 2,275-2,528 |
+>   | 16,000 | 1.8-2.2 ms | 22-25 ms | 2 µs | 61 µs | 9,094-10,107 |
+>
+>   Linear in files, 96-137 ns a file in release and 1,336-1,909 in debug. The file's bytes add 10-20 % (64 B against 16 KiB).
+>   So about 110 ms per million files per shard in release, in one poll,
+>   amortized over about 0.6 small writes per file.
+> - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
+>   format raft-5's incremental held image is changing, and two format changes at once would collide. Owed when that lands:
+>   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
+>   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
+
 > **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
 > whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
 > name could be created twice (bug record of 2026-09-13).
