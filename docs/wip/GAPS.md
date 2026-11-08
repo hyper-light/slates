@@ -87,6 +87,15 @@
 > The resumed holder was not yet counting: its catch-up (an install, after 2 s away) or the owner's redial of its
 > session. A passing run prints no counters, so which is not known (the diag runs' stuck-write watcher,
 > diag-live-durability-38, dumps only from 3 s). Before the merge 1 of 6 runs had one too (2.6 s, no refusal).
+> **Open (live-durability, 2026-11-07; cause unknown, a lost wakeup until shown otherwise): a write answered 16 s after
+> both candidates were back.** One rolling partition run at d26f35d1 (diag-live-durability-37, tip-x86 run 1): a
+> partitioned 0.15–2.15 s, c 2.34–4.34 s; a write sent at 2.34 s as c stopped took 20.07 s, answered near 22.4 s; no
+> refusal, no holder transition, the holders recorded, the fleet converged, NoLoss and Agreement held. The owner's
+> period resolves every waiter each period (`live_ship::period`), so either a gate of `answerable` stayed shut (the head
+> placed, the holder set recorded, the candidates' keys covered, the whole entry durable) or the period did not run.
+> raft-chaos's lead, unconfirmed: a record-plane round bounded by the slowest path's tail, which a 2 s stop inflates to
+> about 20 s, holding a gate's record unplaced. Not seen again in 220 runs since (diag-live-durability-38 to -42 and 20
+> on the Mac); the diag runs' watcher samples for it and must name the parked waiter and its gate.
 > **Open (raft-chaos, 2026-11-07; cause unknown): a live takeover over KIND's lossy WAN path never finished.** At
 > e140ca3a, 1 of 4 runs of the KIND lane's live takeover under 80 ms ± 20 ms with 1 % loss (raft-chaos's diag-41, the
 > tip plus a counter only) found no survivor serving the volume within `TAKEOVER_WAIT` (120 s, `xtask/src/kind.rs`);
