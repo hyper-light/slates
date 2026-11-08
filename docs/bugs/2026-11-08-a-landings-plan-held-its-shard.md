@@ -57,3 +57,10 @@ snapshot's log walk is a real defect, fixed separately, but 30 of 124 waits stil
 `return_dead_recovery`, reached from `reap_loop`'s tick through `seal_idle_content` and `purge_if_idle`, 115 to 171 ms of
 CPU in one poll. Perf's slicing of that give-back (`a30e4209` on `agents/perf-b3`) took it to 0 of 411 named waits at 100
 ms or more, the highest 78 ms, on the same test beside the same 144 spinners.
+
+That slicing has a cost this test measured and its owner has: a granted landing is about five times slower under the same
+load with `a30e4209` than without (median 20.9 s against 4.3 s, 8 runs each alternated at load 60 to 209), and landings
+past the test's 60 s grant term come back `partial`. A landing allocates no content, so the shard looked idle and the
+give-back took 2,859 to 4,965 steps through each landing (perf's measure). `c2d87528` on `agents/perf-b3` gives way to
+whatever else the shard is running: the same comparison gave a median of 4.2 s against the base's 5.9 s, and a per-task
+CPU timer found no `reap_loop` poll of 20 ms or more in 4 runs, against one of 121 to 175 ms in each of the base's 4.
