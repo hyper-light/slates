@@ -51,14 +51,20 @@ Tests: the window's unit tests; `a_wait_and_its_transaction_are_one_durable_step
 before the commit neither is there, after it the wait survives recovery and its completion replaces it); the owed
 model gains a wait step, so random acknowledgement orders with recoveries hold that a waiting request is never `New`.
 
-## What a takeover does
+## What a takeover does (open and owed, A-255)
 
 `a_submit_resent_after_its_owner_was_taken_over_is_not_applied_again`: the owner dies for good after the version
-committed. Nothing runs twice (the head stays 1). The resend is refused `OwnerUnreachable`, retryable: the work lived on
-the dead owner and is not taken over, and completion records stay where their calls were served (A-127), so nothing
-can name the version. The client's outcome is unknown until it reads the green, which the load harness's oracle does.
-Naming the version would need the merge record to carry the request's key and a work's requests to route to the
-green's successor: its own amendment, not done here.
+committed. Nothing runs twice (the head stays 1), and the resend is refused `OwnerUnreachable` without end, so the client
+never learns its version. That is not what the design promises: §4.16's failure matrix has a green's owner loss Masked
+after takeover, and §4.8's walk-through has retries return their original completion records from the new owner. It is
+owed as A-255: the submit's completion carried in the merge record (RIFL ties a completion record to the object it
+modified; D-15, to be verified against the paper), and the resend reaching the green's successor.
+
+Why nothing runs twice meanwhile, by test (`a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend`):
+a work's head can never reach a holder. `Snapshot` refuses a work (`Unsupported`), `LiveShip` finds no store slot for one
+(`NotFound`), and the seal schedule places only a head those make (`sealable_head` wants an epoch above 0, and only
+`Snapshot` and a takeover's own materialization advance one). So a takeover has no work to bring back, and a submit of
+it sent to the successor is refused, not run.
 
 ## A note on the first rung
 

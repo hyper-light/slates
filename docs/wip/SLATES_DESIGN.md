@@ -5794,8 +5794,8 @@ failure.
 > again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so
 > the window answers `Seen::Awaiting` (never `New`) across any restart: the resend joins the wait, or is answered its
 > version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
-> client acknowledges it. After a takeover the resend is refused retryable: nothing runs twice, and the version cannot be
-> named, since completion records stay where their calls were served (A-127).
+> client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
+> named, short of the failure matrix's Masked: owed as A-255 (GAPS).
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -15662,7 +15662,8 @@ Applied in the same change to:
   - It counts toward the client's bound and leaves when its completion replaces it or the client acknowledges it.
   - It is a type, not reply bytes, so no reply encoding can be mistaken for it, and recovery and snapshots carry it by
     type.
-  - After a takeover the resend is refused retryable: exactly-once holds, and the version cannot be named (A-127).
+  - After a takeover the resend is refused retryable and nothing runs twice, but the version is not named. That falls
+    short of §4.16's failure matrix (Masked after takeover) and is owed as A-255, not accepted here.
 - **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
   the rung's 109 to 4,261 oracle failures fall to 0, five runs of five.
 

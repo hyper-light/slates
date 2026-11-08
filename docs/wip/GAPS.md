@@ -14,10 +14,18 @@
 > again as a new version: 4,261 oracle failures on fixtures' 1,000-client primary kill, 83 versions no client was told.
 > The accept now records, in the same transaction as the version's append, a typed `Seen::Awaiting` (`Op::CompletionAwaiting`,
 > carried through snapshots), so a resend joins the wait or is answered its version, never run again. The rung after it:
-> five runs, oracle 0, 13.1 to 13.9 s. Owed: after a takeover the resend is refused `OwnerUnreachable` (nothing runs
-> twice), since a dead owner's work is not taken over and its records stay where they were served (A-127); naming the
-> version there would need the merge record to carry the request's key.
+> five runs, oracle 0, 13.1 to 13.9 s.
 > `docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`.
+>
+> **Open and owed (A-255 reserved): after a takeover the resend is never answered its version.** It is refused
+> `OwnerUnreachable` without end, and §4.16's failure matrix promises otherwise ("Green owner loss in a fleet: Degraded
+> for the membership horizon, then Masked after takeover on a candidate that holds the ledger"), as do T-8.11 and §4.8's
+> walk-through ("its retries return their original completion records" from the new owner). Owed: the merge record
+> carries the submit's completion, as RIFL ties a completion record to the object it modified (D-15; to be verified
+> against the paper before A-255 relies on it), and the resend reaches the green's successor. Nothing runs twice
+> meanwhile: `a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend` (`fleet.rs`) holds that a
+> work never comes back on a successor, because `Snapshot` refuses a work, `LiveShip` finds no store slot for one, and
+> the seal schedule needs a head only those make, so a takeover has no work to run a resend against.
 
 > **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
 > Commit, §4.10 retention; A-244).** A-235 left five hops a version (the inputs' offer

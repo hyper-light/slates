@@ -13438,6 +13438,125 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   );
 }
 
+/// Shape: how long a test watches for a work's head to be placed: several of the owner's seal rounds.
+const WORK_SEAL_WATCH: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+
+/// §4.16 "Commit", A-252: "nothing runs twice after a takeover" rests on a work never coming back on a successor, since
+/// a work come back with no completion record would run a resend again, and an older one would make a different
+/// increment and so a second version. Do: three nodes at `f = 1`; on a, a green and a work; through b's client an edit
+/// and a submit, answered version 1; try every way a work's head could reach a holder (`Snapshot`, `LiveShip`, the seal
+/// schedule over several of its rounds); a dies and a survivor takes the green over; ask the successor for the work and
+/// resend the submit under its id. Expect: the snapshot and the live-shipping refused, the head never placed, the
+/// successor not serving the work, the resend not run (the green holds one version).
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "placed-work");
+  edit_work(&mut owner_client, work, 0, "hello");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let first = owner_client.call(&submit);
+  let snapshot = owner_client.call(&RequestBody::Snapshot { volume: work });
+  let shipped = owner_client.call(&RequestBody::LiveShip {
+    volume: work,
+    live_shipped: true,
+  });
+  let object = ObjectId(work.bytes);
+  let survivors_then: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_until(&survivors_then, WORK_SEAL_WATCH, || {
+    daemons[0].fleet_head_placed(object)
+  });
+  drop(survivors_then);
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let green_object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], green_object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  drop(survivors);
+  let mut reader = Client::connect(daemons[successor_index].instance());
+  let status = reader.call(&RequestBody::Status { volume: work });
+  let again = reader.call(&submit);
+  let head = reader.call(&RequestBody::Versions { green });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "snapshot {snapshot:?}; live-ship {shipped:?}; head placed {placed}; successor's status {status:?}; submit there \
+     {again:?}; head {head:?}"
+  );
+  assert_eq!(
+    first,
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the submit committed at version 1"
+  );
+  assert!(
+    matches!(
+      snapshot,
+      ReplyBody::Refused {
+        refusal: Refusal::Unsupported { .. }
+      }
+    ),
+    "a work's head cannot be made by a snapshot: {snapshot:?}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::Refused { .. }),
+    "a work cannot be live-shipped: {shipped:?}"
+  );
+  assert!(!placed, "the seal schedule never placed the work's head");
+  assert!(
+    caught_up,
+    "both holders held version 1 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 1"
+  );
+  assert!(
+    !matches!(status, ReplyBody::Status { .. }),
+    "the successor does not serve the work: {status:?}"
+  );
+  assert!(
+    !matches!(
+      again,
+      ReplyBody::Submitted {
+        version: Some(_),
+        ..
+      }
+    ),
+    "a submit of the work is not run on the successor: {again:?}"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "nothing ran again: the green holds the one version"
+  );
+}
+
 /// Shape: how long a resend is sent again while refused retryable: five liveness budgets, past a takeover's settling.
 const RESEND_RETRY_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
 
