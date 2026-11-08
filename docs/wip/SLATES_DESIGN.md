@@ -7635,6 +7635,29 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-07, A-246: a restarted owner re-enqueues its chain's records).**
+> The pending merge records and the submits waiting on them live in memory, and a restarted owner rebuilt each green from
+> its chain without them. So a version appended before the crash and not yet committed at `f + 1` was never shipped
+> again, and its retried submit waited forever. Goal 4's primary-kill rung at 1,000 clients found it: versions 507 to
+> 514 on the green, no client told
+> (`docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`). Now the restart's replay
+> returns each version's record fields, with the green's head identity at that version, and the owner re-enqueues
+> them. A holder that already holds a version acknowledges it again at no cost. A takeover keeps its own path.
+
+> **Status (2026-11-07, A-244: a version commits in one exchange).** A-235 still put a
+> version's inputs through the content exchange (an offer, then the transfer) and shipped its record after, each behind
+> its own wake of the record plane: five hops, so one submit at `f = 1` took 6.7 ms at p50 quiet and 15 ms at load 130
+> (`docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`). Now a record ships with its inputs while a
+> target lacks them, as one merge shipment: the record, then the content exchange's offer and chunks, which the holder
+> serves through the content plane's own path before it recomputes and accepts. One acknowledgement places both. The
+> separate inputs put is gone: "placed before referenced" holds by construction, since a holder accepts a record only
+> once it holds the inputs it names. A holder's retention rule now reads the one ledger position a held input can be
+> named by (its version's) rather than decoding the whole ledger per held manifest, which had made each put quadratic
+> in the green's history (`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`). 500 sequential
+> submits at `f = 1`, release, adacachy at load about 10: p50 265 µs, p99 731 µs, p999 and max 1.13 ms. Still owed:
+> a smaller per-version cost (the median of 50 submits grows from 116 µs to 473 µs across 500 versions), and more than
+> one version to a holder per pass.
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -15351,6 +15374,49 @@ Applied in the same change to: §4.7 (data model, wake strategy, status); `slate
 and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
 `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
 different layout versions refuse each other by name; no consensus rule or capability changes.
+
+### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
+
+AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
+submits waiting on them were in memory only, and a restart rebuilt greens from their chains without them, so a version
+appended before a crash and not yet placed was never shipped again. Replace that: the restart's replay of each green
+(`verbs::replay_green`) yields every replayed version's record fields with the green's head identity there. Those are
+version 0 when no checkpoint stands for it, then each chain entry. The owner enqueues them as pending records, placed
+from the configuration it holds when it ships. A holder that already applied a version re-acknowledges it from its
+acceptor, so re-shipping what was already placed costs one exchange a version and changes nothing.
+
+Rejected:
+- Persisting each record's placement. That is a durable write per commit, to save a re-ship only after a restart.
+- Asking the holders for their heads before shipping. That is a new exchange whose answer the re-acknowledgement
+  already gives.
+- Re-enqueueing on a takeover too. A takeover adopts its placed head under the promotion epoch and keeps that path.
+
+Applied in the same change to: §4.16 (Commit status); `slates-server` (`verbs::replay_green`, `rebuild_green`,
+`rebuild_recovered`; `merge_service::ReplayedVersion`, `enqueue_recovered_record`, `enqueue_record_with`); the fleet
+test; GAPS. Evidence: `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`. No wire,
+layout or capability change.
+
+### A-244 — A merge record carries its inputs, so a version commits in one exchange (accepted 2026-11-07)
+
+A-235 woke the record plane per event, but a version still crossed five hops: a nudge, the inputs' offer, their transfer,
+a second nudge, the record. A submit at `f = 1` cost 6.7 ms at p50 quiet, against goal 4's 1 ms. Replace the separate
+inputs put. A record ships with its inputs whenever a target lacks them, as one merge shipment on the record's own
+stream: the record, then the content exchange's offer and every chunk. The holder serves the content frames through the
+content plane's own path (authority, retention at the door, the verified hold), then recomputes and accepts. Its one
+acknowledgement binds the record and places the inputs. Placed-before-referenced holds by construction, because a
+holder that does not hold the inputs a record names refuses it (`merge.inputs_unheld`). Also: a holder's retention rule
+reads only the ledger position at the sequence a held input was placed for, since a green's inputs are placed at their
+version's sequence. Rejected: keeping the put and sending it concurrently with the record, which is two paths for one
+fact and a record that can reach a holder before its inputs do. Also rejected: a larger content window, which leaves
+the second nudge and the second exchange.
+
+Applied in the same change to: §4.16 (Commit status); §4.10 content retention (the module doc); `slates-cluster`
+(`commit_record_sent_as`); `slates-db` (`Acceptor::value_at`); `slates-server` (`merge_service::carries_inputs`,
+`encode_shipment`, `decode_shipment`, `ship_record`, `fold_acknowledgements`, `INPUTS_CARRIED`, the removal of
+`put_inputs`; `fleet::serve_merge_shipment`, `serve_content_request`; `content_retention::named`); the fleet and unit
+tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
+`docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
+shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 

@@ -1526,6 +1526,15 @@ impl Acceptor {
       .map(|(&(_, sequence), (_, value))| (sequence, value.as_slice()))
   }
 
+  /// The value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup, where
+  /// [`Acceptor::values`] walks every position the object holds.
+  pub fn value_at(&self, object: ObjectId, sequence: u64) -> Option<&[u8]> {
+    self
+      .accepted
+      .get(&(object, sequence))
+      .map(|(_, value)| value.as_slice())
+  }
+
   /// Every accepted value of `object`, in sequence order (a ledger's whole history).
   pub fn values(&self, object: ObjectId) -> impl Iterator<Item = &[u8]> + '_ {
     self
