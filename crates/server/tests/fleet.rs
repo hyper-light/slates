@@ -23,10 +23,6 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
-// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
-// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
-#![cfg(unix)]
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +49,9 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
+// The virtio-fs guest device is Unix-only: its loop rides the runtime's Unix descriptor readiness
+// (`slates_server::virtiofs` is `cfg(unix)`, §4.6 A-9), so the guest test and its fixtures are too.
+#[cfg(unix)]
 use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
   create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode_status,
@@ -12475,6 +12474,7 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
 
 /// Shape: heartbeats a guest's requests are watched for after the owner's lease lapsed — several of the
 /// intervals the fenced loop re-asks at, so a loop that served under the lapse would have answered them.
+#[cfg(unix)]
 const GUEST_HELD_HEARTBEATS: u64 = 5;
 
 /// AUD-29-83 (§4.8 "Leases and reads", R8): the guest device answers to the same owner lease as the NFS live
@@ -12486,6 +12486,8 @@ const GUEST_HELD_HEARTBEATS: u64 = 5;
 /// lease refusals were counted, and the hangup ended the loop although its requests were held. Before, the
 /// guest path checked only that the volume's slot existed and served both.
 #[test]
+// Unix-only: the virtio-fs guest device (see `use common::guest` above).
+#[cfg(unix)]
 fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];

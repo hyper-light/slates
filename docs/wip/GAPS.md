@@ -19,6 +19,45 @@
 > `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
 > `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`.
 
+> **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
+> the workspace (319: lib, bin and tests) against the lanes that run it.
+> - **Now run on both Windows lanes:** `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its
+>   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests join it with the
+>   Windows landing writer (two landing tests fail there until it lands; the step is `agents/release-wincov-lib`). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
+>   42340483175, 2026-11-07), the fleet suite passed whole on both architectures: 85 passed, 3 ignored, in 418 s
+>   (x86_64) and 365 s (arm64). This was with liveness's UDP-reset fix merged in.
+> - **Open: six fleet tests fail on jupiter** (Windows x86_64, 32 logical CPUs, 128 GB, other projects running,
+>   2026-11-06/07), though they pass on the runners:
+>   - `a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor` and
+>     `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green`: both holders never
+>     recomputed version 3 (after 1,685 s and 1,015 s).
+>   - `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region`: the mirror lag never reached 0
+>     (691.7 s after 697 s).
+>   - `a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted`: the test process
+>     aborted, "memory allocation of 2233991168 bytes failed" (0xC0000409). This is the commit-limit oversubscription
+>     recorded for the client binary: every in-process daemon sizes itself from the whole machine.
+>   - `a_settled_fleet_admits_a_create_on_every_node`: three of its five nodes refused the create,
+>     `BudgetExceeded { available: 44252790784 }`.
+>   - `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`: the hedged seal was placed after 20.57 s, against
+>     a 20 s window.
+>
+>   The logs are on jupiter under `C:\Users\corph\slates-wincov-each` and `slates-wincov-rest`. Handed to their owners
+>   through the supervisor.
+> - **Built for Windows by no lane:** the `slates` binary's unit tests and `slates-bridge-fuse`'s `abi` test did not
+>   compile there (fixed). Three `slates-cli` benchmark examples still do not compile (`nfs_writeback_ab`,
+>   `nfs_large_write`, `vfs_tails`), and `bridge-virtiofs`'s device and `land_bench` warn there (open).
+> - **Run by no lane on a platform they build for (open), with the cheapest lane for each:**
+>   - `slates-cli`'s `held_rendezvous`, `merge_kill`, `nfs_held` (ubuntu, macOS): every test skips without
+>     `SLATES_TEST_CLI`; add them to `gates`' CLI step.
+>   - `live_fleet`: no lane sets `SLATES_TEST_CLI` for it; a Linux step in `gates` on main and the nightly.
+>   - `live_chaos`: the nightly on ubuntu, after `ulimit -n "$(ulimit -Hn)"` (a systemd unit's 1,024 descriptors failed
+>     it).
+>   - ubuntu arm64: 299 of 304 targets; one `cargo test --workspace` step in `linux-arm64`.
+>   - Windows x64 and arm64: 217 and 216 of 258 targets (the pure crates among them); one `cargo test --workspace --lib
+>     --bins --tests --exclude slates-cli -- --test-threads=1` step in `windows-nightly` and `windows-arm64`, after a jupiter
+>     run of it.
+> - **Owed:** the table as a `cargo xtask` doc-truth check, so a target no lane runs fails CI.
+
 > **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
 > whose name hashed to another partition than its origin's was unreachable by name over the mount transport, and its
 > name could be created twice (bug record of 2026-09-13).
