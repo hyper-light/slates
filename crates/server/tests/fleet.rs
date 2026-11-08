@@ -14801,6 +14801,83 @@ fn assert_sealed_heads_cover_every_survivor(heads: Option<(bool, Vec<Option<Head
   }
 }
 
+/// A forward read through the one node left of a formed three-node fleet, of a volume whose owner that node holds dead
+/// with no peer left to answer a location round, `failover_slo_ns` applied to that node first when given: the reply, and
+/// how many polls the location budget spent (`fleet.owner_location.retried`).
+fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64) {
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("no-owner-to-find")) else {
+    panic!("setup: the volume was not created on A");
+  };
+  share_with_fleet(&mut owner_client, id, &daemons);
+  drop(owner_client);
+  let survivor = daemons.remove(1);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  survivor
+    .observe_peer_dead(hosts[0], FALSE_DEATH_INCARNATION)
+    .expect("the owner is held dead on the survivor");
+  if let Some(slo) = failover_slo_ns {
+    survivor
+      .observation(
+        Some(survivor.shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        move |state: &mut slates_server::state::ShardState| state.config.failover_slo_ns = slo,
+      )
+      .unwrap()
+      .wait()
+      .expect("the ceiling is set on the survivor's control shard");
+  }
+  let retried = |daemon: &Daemon| {
+    daemon.fleet_refusals().map_or(0, |counters| {
+      counters
+        .get("fleet.owner_location.retried")
+        .copied()
+        .unwrap_or(0)
+    })
+  };
+  let before = retried(&survivor);
+  let reply = Client::connect(survivor.instance()).call(&RequestBody::Status { volume: id });
+  let polls = retried(&survivor).saturating_sub(before);
+  survivor.stop();
+  (reply, polls)
+}
+
+/// §4.8 "Lookup", the other side of the location budget counted in polls (`verbs::LOCATION_POLLS`): a forward whose
+/// owner cannot be found still ends. Do: read a volume through a node that holds its owner dead, with no peer left to
+/// answer a location round. Expect: the read is refused, having retried the location at least once and no more than the
+/// budget's polls (each round here waits its peers out, so the failover SLO ends it first). A counter, so the bound
+/// holds whatever a loaded machine does to the time each poll takes.
+#[test]
+fn a_forward_with_no_owner_to_find_is_refused_within_its_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls) = read_with_no_owner_to_find(None);
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert!(
+    (1..=slates_server::verbs::LOCATION_POLLS).contains(&polls),
+    "the location was retried within its budget's polls ({polls}): {reply:?}"
+  );
+}
+
+/// The ceiling on the same budget: one location round can wait a liveness budget for peers that do not answer, so the
+/// polls alone could run a hundred times that; the operator's failover SLO ends the wait. Do: the same read with the
+/// node's SLO at one nanosecond. Expect: refused at its first look at the ceiling, with no poll spent.
+#[test]
+fn the_failover_slo_ends_a_forwards_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls) = read_with_no_owner_to_find(Some(1));
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert_eq!(polls, 0, "the ceiling ended the budget at once: {reply:?}");
+}
+
 /// Shape: the forwarded calls the false-death recovery test times, one false death each.
 const FALSE_DEATH_TRIALS: u32 = 5;
 
