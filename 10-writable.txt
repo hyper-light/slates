@@ -1,0 +1,9 @@
+native-linux-fuse fsstress: limited | 
+native-linux-fuse fsx: limited | 0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+native-linux-fuse pjdfstest: limited | 1800 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+native-linux-nfs4 fsstress: ran | 
+native-linux-nfs4 fsx: ran | 0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+native-linux-nfs4 pjdfstest: ran | 1799 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+oci-linux fsstress: ran | 
+oci-linux fsx: ran | 
+oci-linux pjdfstest: ran | 1798 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent

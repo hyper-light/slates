@@ -1,0 +1,151 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded errno v0.3.14
+  Downloaded time-core v0.1.9
+  Downloaded bitflags v2.13.1
+  Downloaded cc v1.4.5
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded num-conv v0.2.2
+  Downloaded toml_datetime v0.6.11
+  Downloaded toml_write v0.1.2
+  Downloaded serde_spanned v0.6.9
+  Downloaded powerfmt v0.2.0
+  Downloaded cpufeatures v0.3.1
+  Downloaded itoa v1.0.18
+  Downloaded dunce v1.0.5
+  Downloaded cmake v0.1.58
+  Downloaded equivalent v1.0.2
+  Downloaded jobserver v0.1.35
+  Downloaded arrayvec v0.7.8
+  Downloaded deranged v0.5.8
+  Downloaded shlex v2.0.1
+  Downloaded zeroize v1.9.0
+  Downloaded zmij v1.0.23
+  Downloaded zstd v0.13.3
+  Downloaded pkg-config v0.3.34
+  Downloaded fs_extra v1.3.0
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded quote v1.0.47
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded toml v0.8.23
+  Downloaded constant_time_eq v0.4.2
+  Downloaded yasna v0.5.2
+  Downloaded zstd-safe v7.3.0
+  Downloaded lz4_flex v0.11.6
+  Downloaded memmap2 v0.9.11
+  Downloaded twox-hash v2.1.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde_core v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded rcgen v0.13.2
+  Downloaded toml_edit v0.22.27
+  Downloaded serde_derive v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded indexmap v2.14.2
+  Downloaded unicode-normalization v0.1.25
+  Downloaded hashbrown v0.17.1
+  Downloaded serde_json v1.0.151
+  Downloaded winnow v0.7.15
+  Downloaded blake3 v1.8.7
+  Downloaded time v0.3.55
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling libc v0.2.189
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling pkg-config v0.3.34
+   Compiling serde v1.0.229
+   Compiling syn v3.0.5
+   Compiling zmij v1.0.23
+   Compiling arrayvec v0.7.8
+   Compiling jobserver v0.1.35
+   Compiling cfg-if v1.0.4
+   Compiling cpufeatures v0.3.1
+   Compiling constant_time_eq v0.4.2
+   Compiling cc v1.4.5
+   Compiling serde_json v1.0.151
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling rustix v1.1.4
+   Compiling cmake v0.1.58
+   Compiling blake3 v1.8.7
+   Compiling serde_derive v1.0.229
+   Compiling fs_extra v1.3.0
+   Compiling bitflags v2.13.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling dunce v1.0.5
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling memmap2 v0.9.11
+   Compiling syn v2.0.119
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling zstd-safe v7.3.0
+   Compiling zeroize v1.9.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling num-conv v0.2.2
+   Compiling hashbrown v0.17.1
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling equivalent v1.0.2
+   Compiling deranged v0.5.8
+   Compiling time-core v0.1.9
+   Compiling powerfmt v0.2.0
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling time v0.3.55
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling indexmap v2.14.2
+   Compiling tinyvec v1.13.2
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling unicode-normalization v0.1.25
+   Compiling yasna v0.5.2
+   Compiling toml_edit v0.22.27
+   Compiling rustls-pki-types v1.15.1
+   Compiling slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+   Compiling slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+   Compiling toml v0.8.23
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+   Compiling rcgen v0.13.2
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling xtask v0.1.0 (/home/runner/work/slates/slates/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 48.38s
+     Running `target/debug/xtask conformance run --suite fsx --records target/rw/records --scratch target/rw/scratch --keep`
+conformance: wrote target/rw/records/native-linux-fuse.fsx.json
+conformance: native-linux-fuse × fsx: LIMITED(adapter: a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS); not covered: the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`); 10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/native-linux-fuse
+conformance: wrote target/rw/records/native-linux-nfs4.fsx.json
+conformance: native-linux-nfs4 × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/native-linux-nfs4
+conformance: wrote target/rw/records/oci-linux.fsx.json
+conformance: oci-linux × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/oci-linux

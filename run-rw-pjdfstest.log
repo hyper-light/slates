@@ -1,0 +1,22 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/xtask conformance run --suite pjdfstest --records target/rw/records --scratch target/rw/scratch --keep`
+conformance: wrote target/rw/records/native-linux-fuse.pjdfstest.json
+conformance: native-linux-fuse × pjdfstest: LIMITED(adapter: a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS); not covered: the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane (`oci-linux`, `slates mount --shared` with `user_allow_other`); 238 files, 8798 cases: 6970 passed, 1800 failed (1800 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/native-linux-fuse
+conformance: wrote target/rw/records/native-linux-nfs4.pjdfstest.json
+conformance: native-linux-nfs4 × pjdfstest: RAN(238 files, 8798 cases: 6971 passed, 1799 failed (1799 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/native-linux-nfs4
+conformance: wrote target/rw/records/oci-linux.pjdfstest.json
+conformance: oci-linux × pjdfstest: RAN(238 files, 8798 cases: 6972 passed, 1798 failed (1798 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 28 todo; 2026-11-08; Ubuntu 24.04.5 LTS)
+conformance: scratch kept at /home/runner/work/slates/slates/target/rw/scratch/oci-linux
