@@ -688,7 +688,14 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let work = session.workdir("pjd")?;
   let (as_root, runner) = pjdfstest_runner(run.root_available, this_user());
   let probe = if run.options.read_only {
-    Some(read_only_probe(&session, &work, &tree.binary, as_root)?)
+    // The Linux lane named FUSE mounts the daemon's export with NFSv3 (`slates::LINUX_NFS_OPTIONS`).
+    let nfs3 = run.transport == Transport::NativeLinuxFuse;
+    Some(read_only_probe(
+      &session,
+      &work,
+      &tree.binary,
+      (as_root, nfs3),
+    )?)
   } else {
     None
   };
@@ -773,15 +780,46 @@ const READ_ONLY_PROBE: &[(&str, &[&str])] = &[
 
 /// Format: what each of [`READ_ONLY_PROBE`]'s calls must answer.
 const READ_ONLY_ANSWER: &str = "EROFS";
+/// Format: the probe's file whose calls open an existing file, the only calls NFSv3 cannot answer [`READ_ONLY_ANSWER`].
+const OPEN_OF_A_FILE: &str = "open/14.t";
+/// Format: what NFSv3 answers an open of an existing file through a read attachment, at its limit: v3 has no OPEN, so the
+/// Linux client decides the open from ACCESS, and a write right the server withholds becomes `EACCES` (Linux
+/// `fs/nfs/dir.c` `nfs_do_access`); a server cannot answer ACCESS with an error instead, since the client asks every
+/// right in one call and caches the answer, so its reads and lookups would fail too. Every change that reaches the
+/// server still answers [`READ_ONLY_ANSWER`] (slabs' reading of v6.8, agreed as the v3 limit, 2026-11-08).
+const NFS3_OPEN_LIMIT: &str = "EACCES";
+
+/// How the read-only probe judges one call's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+  /// It answered [`READ_ONLY_ANSWER`].
+  ReadOnly,
+  /// An open of an existing file over NFSv3 answered [`NFS3_OPEN_LIMIT`], the most v3 can say.
+  Nfs3OpenLimit,
+  /// Anything else: a miss.
+  Missed,
+}
+
+/// The verdict on the probe's call from pjdfstest's `file` that answered `answer`, over NFSv3 when `nfs3`.
+fn probe_verdict(file: &str, answer: &str, nfs3: bool) -> ProbeVerdict {
+  if answer == READ_ONLY_ANSWER {
+    ProbeVerdict::ReadOnly
+  } else if nfs3 && file == OPEN_OF_A_FILE && answer == NFS3_OPEN_LIMIT {
+    ProbeVerdict::Nfs3OpenLimit
+  } else {
+    ProbeVerdict::Missed
+  }
+}
 
 /// Runs [`READ_ONLY_PROBE`] in `work`, under the session's read-only mount, over a tree made first through its writable
 /// one, with pjdfstest's helper `helper` (as root when `as_root`, so no ownership check refuses first): the note that
-/// says how many calls answered [`READ_ONLY_ANSWER`] and what each other one answered.
+/// says how many calls answered [`READ_ONLY_ANSWER`], how many opens met NFSv3's limit (`nfs3`, [`NFS3_OPEN_LIMIT`]), and
+/// what each other one answered.
 fn read_only_probe(
   session: &Session,
   work: &Path,
   helper: &Path,
-  as_root: bool,
+  (as_root, nfs3): (bool, bool),
 ) -> Result<String, Failure> {
   let writable = session
     .writable(work)
@@ -796,6 +834,7 @@ fn read_only_probe(
     super::slates::visible(&work.join("ro").join(made))?;
   }
   let mut others = Vec::new();
+  let mut at_limit = 0usize;
   for (file, call) in READ_ONLY_PROBE {
     let mut command = if as_root {
       let mut sudo = Command::new("sudo");
@@ -811,15 +850,30 @@ fn read_only_probe(
       .unwrap_or_default()
       .trim()
       .to_owned();
-    if answer != READ_ONLY_ANSWER {
-      others.push(format!("{file} `{}` answered {answer:?}", call.join(" ")));
+    match probe_verdict(file, &answer, nfs3) {
+      ProbeVerdict::ReadOnly => {}
+      ProbeVerdict::Nfs3OpenLimit => at_limit = at_limit.saturating_add(1),
+      ProbeVerdict::Missed => {
+        others.push(format!("{file} `{}` answered {answer:?}", call.join(" ")))
+      }
     }
   }
   let note = format!(
     "read-only probe, pjdfstest's {READ_ONLY_ANSWER} cases over a read attachment: {} of {} answered \
-     {READ_ONLY_ANSWER}{}",
-    READ_ONLY_PROBE.len().saturating_sub(others.len()),
+     {READ_ONLY_ANSWER}{}{}",
+    READ_ONLY_PROBE
+      .len()
+      .saturating_sub(others.len())
+      .saturating_sub(at_limit),
     READ_ONLY_PROBE.len(),
+    if at_limit == 0 {
+      String::new()
+    } else {
+      format!(
+        "; {at_limit} opens of an existing file answered {NFS3_OPEN_LIMIT}, NFSv3's limit (no OPEN: the client decides \
+         an open from ACCESS)"
+      )
+    },
     if others.is_empty() {
       String::new()
     } else {
@@ -925,6 +979,36 @@ pub(crate) fn judged_pjdfstest(
 
 #[cfg(test)]
 mod tests {
+
+  /// The read-only probe's judgement (slabs' fix, 2026-11-08). Do: judge an `EROFS`, an NFSv3 open of an existing file
+  /// answering `EACCES`, the same over NFSv4, an NFSv3 create answering `EACCES`, and an open answering success. Expect:
+  /// `EROFS` is read-only everywhere; `EACCES` at open is NFSv3's limit there alone, never over v4 and never for a call
+  /// that reaches the server (a create); success is a miss on both.
+  #[test]
+  fn the_read_only_probe_counts_nfs3s_open_limit_apart_from_a_miss() {
+    use super::{ProbeVerdict, probe_verdict};
+    assert_eq!(
+      probe_verdict("open/14.t", "EROFS", true),
+      ProbeVerdict::ReadOnly
+    );
+    assert_eq!(
+      probe_verdict("mkdir/09.t", "EROFS", false),
+      ProbeVerdict::ReadOnly
+    );
+    assert_eq!(
+      probe_verdict("open/14.t", "EACCES", true),
+      ProbeVerdict::Nfs3OpenLimit
+    );
+    assert_eq!(
+      probe_verdict("open/14.t", "EACCES", false),
+      ProbeVerdict::Missed
+    );
+    assert_eq!(
+      probe_verdict("open/15.t", "EACCES", true),
+      ProbeVerdict::Missed
+    );
+    assert_eq!(probe_verdict("open/14.t", "0", true), ProbeVerdict::Missed);
+  }
 
   /// CI run 42395077767's record of a failed fsx run held replay lines only, and its `-P` files stayed in the runner's
   /// scratch. Do: build the pinned fsx, run it with the harness's own arguments on a plain directory of the build
