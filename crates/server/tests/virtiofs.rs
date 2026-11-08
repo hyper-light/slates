@@ -151,7 +151,10 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
   let (outcome, errors) = run_guest(
     &daemon,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     |kick_write, call_read| {
       Box::pin(async move {
         let created = round_trip(
@@ -252,6 +255,7 @@ fn a_guest_whose_consumer_has_no_rights_is_refused_every_effect() {
     panic!("the volume was not created");
   };
   let foreign = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
     uid: my_uid().wrapping_add(1),
   };
   let (outcome, error) = run_guest(&daemon, id, foreign, |kick_write, call_read| {
@@ -298,7 +302,10 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   let (outcome, errors) = run_guest(
     &first,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     |kick_write, call_read| {
       Box::pin(async move {
         let created = round_trip(
@@ -393,7 +400,11 @@ fn a_consumers_revocation_stops_its_guest_device() {
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: true,
@@ -407,7 +418,11 @@ fn a_consumers_revocation_stops_its_guest_device() {
   let guest = common::guest::start_guest(
     &daemon,
     id,
-    Principal::Consumer { account, consumer },
+    Principal::Consumer {
+      host: slates_db::HostId(common::this_host()),
+      account,
+      consumer,
+    },
     slates_server::virtiofs::GuestView::default(),
     move |kick_write, call_read| {
       Box::pin(async move {
@@ -575,7 +590,10 @@ fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
     panic!("the volume was not created");
   };
   let (snapshot, private) = shared_private_and_a_snapshot(&daemon, &mut client, id, "viewed");
-  let me = Principal::Uid { uid: my_uid() };
+  let me = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
+    uid: my_uid(),
+  };
   let subtree = slates_server::virtiofs::GuestView {
     subtree: Some("/shared".to_owned()),
     snapshot: None,
@@ -1776,7 +1794,11 @@ mod vhost_form {
     owner
       .share(
         volume,
-        slates_client::Principal::Consumer { account, consumer },
+        slates_client::Principal::Consumer {
+          host: common::this_host(),
+          account,
+          consumer,
+        },
         slates_client::Rights {
           read: true,
           write: false,
@@ -2589,7 +2611,10 @@ fn a_guest_device_is_recorded_its_snapshot_view_advances_and_its_detach_ends_it(
   let guest = common::guest::start_guest(
     &daemon,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     slates_server::virtiofs::GuestView {
       subtree: None,
       snapshot: Some(first),
@@ -2647,7 +2672,10 @@ fn a_dead_daemons_guest_record_is_ended_by_recovery() {
   let guest = common::guest::start_guest(
     &first,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     slates_server::virtiofs::GuestView::default(),
     move |kick_write, _call_read| {
       Box::pin(async move {
@@ -2818,7 +2846,10 @@ fn a_volume_destroyed_under_its_guest_devices_ends_them_cleanly() {
     let guest = common::guest::start_guest(
       &daemon,
       id,
-      Principal::Uid { uid: my_uid() },
+      Principal::Uid {
+        host: slates_db::HostId(common::this_host()),
+        uid: my_uid(),
+      },
       slates_server::virtiofs::GuestView {
         subtree: None,
         snapshot,

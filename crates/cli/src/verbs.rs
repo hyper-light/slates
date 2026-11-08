@@ -1576,9 +1576,22 @@ fn emit_share(
   rights: Rights,
   json: bool,
 ) -> Result<(), ClientError> {
+  // A principal with no host named is this daemon's own host's (A-237).
+  let here = match principal {
+    SharePrincipal::Uid { host: Some(_), .. } | SharePrincipal::Consumer { host: Some(_), .. } => 0,
+    _ => client.daemon_status()?.anchor,
+  };
   let principal = match principal {
-    SharePrincipal::Uid(uid) => Principal::Uid { uid: *uid },
-    SharePrincipal::Consumer { account, consumer } => Principal::Consumer {
+    SharePrincipal::Uid { uid, host } => Principal::Uid {
+      host: host.unwrap_or(here),
+      uid: *uid,
+    },
+    SharePrincipal::Consumer {
+      account,
+      consumer,
+      host,
+    } => Principal::Consumer {
+      host: host.unwrap_or(here),
       account: account.unwrap_or_else(current_account),
       consumer: *consumer,
     },
@@ -2531,6 +2544,9 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     report.fleet.takeovers_pending,
     report.fleet.configuration_version
   );
+  // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
+  // (`slates share ID uid:N@ANCHOR`).
+  out.push_str(&format!("anchor: {}\n", report.anchor));
   let root: String = report
     .seal
     .root_id
@@ -2657,6 +2673,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     out.push_str(&format!(
       "shard {} registry_attachments: {}\n",
       shard.partition, shard.registry_attachments
+    ));
+    let snapshots = &shard.snapshots;
+    out.push_str(&format!(
+      "shard {} snapshots: taken={} written={} longest_ns={} log_appended={} tail_bytes={} tail_replay_ns={} \
+       budget_ns={} floor_bytes={}\n",
+      shard.partition,
+      snapshots.snapshots,
+      snapshots.bytes_written,
+      snapshots.longest_ns,
+      snapshots.log_bytes_appended,
+      snapshots.tail_bytes,
+      snapshots.tail_replay_ns,
+      snapshots.budget_ns,
+      snapshots.floor_bytes
     ));
     for live in &shard.live {
       out.push_str(&format!(

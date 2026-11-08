@@ -24,6 +24,10 @@ windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_Fil
 # The purge client's process (A-190 moved out of the daemon, §4.6): its spawn into a kill-on-close job and its pipe.
 slates-ipc = { workspace = true }
 
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the purge slot's interleaving model (A-249, AC-0.7).
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [target.'cfg(windows)'.dev-dependencies]
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }

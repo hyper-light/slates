@@ -11849,3 +11849,46 @@ minute idle, either build).
 
 By the rule (loaded p99 and max keep the gain; loaded p50 not worse than base beyond the spread), no slice is taken,
 and A-224 is measured and rejected.
+
+### The load test's quiet arm after its walls: 3,000 and 10,000 clients on one node (2026-11-07, agents/loadtest-scale)
+
+The same command (`rung.sh` / `rung-ab.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files
+<0.8 n> --per-connection 32 --rounds 3 --reply-patience 60 --think-us 0`, think time 0 named), against a single-node
+`slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple silicon), release binaries (LTO) of
+agents/loadtest-scale-1. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**3,000 clients, A/B of the history (A-242).** Main 4326a9d8 (3 runs) and W3 888e3ae3 (3 runs, interleaved), then W2
+26c0eff4 (2 runs). Load 1.9 to 13. Milliseconds, `SubmitAccepted`:
+
+| Build | Wall s | Accepted | `BudgetExceeded` | p50 | p99 | max | Peak RSS GB |
+|---|---|---|---|---|---|---|---|
+| main 4326a9d8 | 80.9 / 83.1 / 87.3 | 3,786 / 3,740 / 3,743 | 2,416 / 2,419 / 2,410 | 679 / 717 / 659 | 1,368 / 1,354 / 1,572 | 1,560 / 1,510 / 1,758 | 10.96 / 7.02 / 19.61 |
+| W3 888e3ae3 | 72.2 / 77.0 / 104.7 | 3,729 / 3,753 / 3,768 | 2,417 / 2,456 / 2,440 | 639 / 584 / 915 | 1,072 / 1,516 / 1,731 | 1,221 / 1,797 / 1,998 | 21.0 / 15.97 / 16.95 |
+| W2 26c0eff4 | 39.5 / 35.4 | 9,000 / 9,000 | 0 / 0 | 136 / 123 | 264 / 219 | 338 / 256 | 2.91 / 5.15 |
+
+The peak RSS of one build ranges 7 to 21 GB across runs (macOS keeps freed large blocks resident), so it is no
+measure of W3 against main. W2 took every version where the others refused about 2,400 at the retention cap, in half
+the wall.
+
+**10,000 clients, accac5c5** (main ecb86b4f with A-238, the retry hold, A-242, the kept-forward wake, the verdict's
+history walk and A-243), one run, load 4.1 before and 21.7 after, 313 connections. Before these the rung did not finish
+in 30 minutes. Milliseconds:
+
+| Kind | Count | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|
+| CreateWork | 10,000 | 98.6 | 906.7 | 920.8 | 924.6 |
+| Edit | 1,488,140 | 85.7 | 337.9 | 853.4 | 1,042.7 |
+| SubmitAccepted | 26,598 | 50.0 | 214.3 | 355.9 | 798.3 |
+| SubmitConflict | 111,708 | 81.4 | 306.4 | 421.4 | 1,017.3 |
+| ReadHead | 1,405,676 | 92.2 | 275.3 | 413.5 | 1,045.1 |
+| Rebase | 498,562 | 89.5 | 267.1 | 407.9 | 1,038.1 |
+| Destroy | 10,000 | 39.9 | 165.3 | 290.4 | 405.8 |
+
+- **Wall:** 75.9 s.
+- **Correctness:** the oracle and every own file had 0 failures, 0 unknown outcomes, 0 reconnects.
+- **Starved:** 1,204 agents gave up after the harness's conflict-resolution bound: 10,000 agents over 8,000 hot files.
+- **Backpressure:** 2,463,549 requests refused `AcknowledgementOwed` and sent again (a multiplexed connection's older
+  request holds its acknowledgement), owed a look before 100,000.
+- **Daemon:** peak RSS 3.28 GB; CPU 15 min 48 s in the 75.9 s, about 12.5 cores.
+- **The 1 ms bound:** at think time 0 the closed-loop latency is Little's law over the green's one owner shard, p50
+  50 ms at 10,000 clients; W1 (a green's works off its owner) is the lever.
