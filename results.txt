@@ -1,0 +1,1807 @@
+runner ubuntu-latest, 4 CPUs, Sun Nov  8 02:48:08 UTC 2026, head 4d78661fb48ffeefd64e0fe0134338d75ba7652c
+spinners 8
+== run 1 at 02:48:08, load 1.76 2.02 0.99
+DIAG formation took 1.02272677s
+DIAG settlement took 1.846214756s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["14016735729371810781", "12501558572056015913", "4578384956986826191", "10845236547597542902", "2426458876174188542"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-6489; council seats at ["chaos-fresh-member-c-6489", "chaos-fresh-member-d-6489", "chaos-fresh-member-e-6489"]
+slates daemon: fleet node `c` of `slates-fleet`: member 9048697125047503481 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 2.003718799s
+DIAG settlement took 1.164527161s
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-6489 replaced by a fresh member, rejoined at 7.114959356s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-e-6489", "chaos-fresh-member-c-6489"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-6489 stopped at 11.434172506s
+chaos a member that never held the log at a takeover: 187 writes acknowledged; owner crashed; holders chaos-fresh-member-e-6489 (with the log) and chaos-fresh-member-c-6489 (stale)
+slates-cluster: fleet: HostId(2426458876174188542) holds HostId(2472409867442682369) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 5237 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3342 steps and 3401 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 19 timers, waited 0 times, spawned 14 tasks and finished 14; 17 tasks live; its longest poll is 17 ms and its timer overrun 0 ms
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6489 adopted the registers; chaos-fresh-member-e-6489 stopped for 3s
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6489 took the volume over while the holder of the log was stopped
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-6489 served the volume after 74.675137ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-6489", "chaos-fresh-member-e-6489"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-6489 holds a copy fenced below 2: LiveState { holding: true, head: Some(192), durable: None, owed: false, epoch: Some(1), identity: Some(\"ed53f39e6f371bf3d770dc89329c30f803c99d220f5e22dda215ced2551bda22\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-c-6489 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-6489; council seats at ["chaos-fresh-member-c-6489", "chaos-fresh-member-d-6489", "chaos-fresh-member-e-6489"]
+  chaos-fresh-member-c-6489 replaced by a fresh member, rejoined at 7.114959356s
+  the owner's holders once settled: ["chaos-fresh-member-e-6489", "chaos-fresh-member-c-6489"]
+  chaos-fresh-member-c-6489 stopped at 11.434172506s
+  187 writes acknowledged; owner crashed; holders chaos-fresh-member-e-6489 (with the log) and chaos-fresh-member-c-6489 (stale)
+  chaos-fresh-member-b-6489 adopted the registers; chaos-fresh-member-e-6489 stopped for 3s
+  chaos-fresh-member-b-6489 took the volume over while the holder of the log was stopped
+  NoLoss (a takeover without the log's holder): held
+  decisive true; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-b-6489 served the volume after 74.675137ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-6489", "chaos-fresh-member-e-6489"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-6489 holds a copy fenced below 2: LiveState { holding: true, head: Some(192), durable: None, owed: false, epoch: Some(1), identity: Some(\"ed53f39e6f371bf3d770dc89329c30f803c99d220f5e22dda215ced2551bda22\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-c-6489 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 66.36s
+
+== run 1 exit 0
+== run 2 at 02:49:15, load 9.88 4.49 1.92
+DIAG formation took 840.848793ms
+DIAG settlement took 1.5185276s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["8411176319263673066", "5862347227461983985", "12794467221257101049", "7037976636101081988", "5706440753144242227"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-8028; council seats at ["chaos-fresh-member-b-8028", "chaos-fresh-member-d-8028", "chaos-fresh-member-e-8028"]
+slates daemon: fleet node `b` of `slates-fleet`: member 10559898617806863453 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 1.704265407s
+DIAG settlement took 2.397972442s
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-8028 replaced by a fresh member, rejoined at 10.339829297s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-e-8028", "chaos-fresh-member-c-8028"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-8028 stopped at 15.201910656s
+chaos a member that never held the log at a takeover: 161 writes acknowledged; owner crashed; holders chaos-fresh-member-e-8028 (with the log) and chaos-fresh-member-c-8028 (stale)
+slates-cluster: fleet: HostId(7037976636101081988) holds HostId(12794467221257101049) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(6909397056193291289) holds HostId(12794467221257101049) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-8028 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-8028 served the volume after 403.462432ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-8028"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-8028 holds a copy fenced below 2: LiveState { holding: true, head: Some(169), durable: None, owed: false, epoch: Some(1), identity: Some(\"97183e62629241713dab0dc71016aeb17f050b0da98564600763f549ad1f6d8f\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-c-8028 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-8028; council seats at ["chaos-fresh-member-b-8028", "chaos-fresh-member-d-8028", "chaos-fresh-member-e-8028"]
+  chaos-fresh-member-b-8028 replaced by a fresh member, rejoined at 10.339829297s
+  the owner's holders once settled: ["chaos-fresh-member-e-8028", "chaos-fresh-member-c-8028"]
+  chaos-fresh-member-c-8028 stopped at 15.201910656s
+  161 writes acknowledged; owner crashed; holders chaos-fresh-member-e-8028 (with the log) and chaos-fresh-member-c-8028 (stale)
+  chaos-fresh-member-e-8028 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-e-8028 served the volume after 403.462432ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-d-8028"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-c-8028 holds a copy fenced below 2: LiveState { holding: true, head: Some(169), durable: None, owed: false, epoch: Some(1), identity: Some(\"97183e62629241713dab0dc71016aeb17f050b0da98564600763f549ad1f6d8f\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-c-8028 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 70.87s
+
+== run 2 exit 0
+== run 3 at 02:50:27, load 13.47 6.89 2.97
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 15093823
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 110096823
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 18
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 17
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 11642077
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 12663267
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 21019208
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 26750669
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_max_ns: 1080701
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_ns: 1080701
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.lends: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.returns: 1
+  shard 0 refused diag.link.16419410892462531335.dial.attempts: 1
+  shard 0 refused diag.link.16419410892462531335.dial.enrolled: 1
+  shard 0 refused diag.link.16419410892462531335.dial.established: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_max_ns: 11644492
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_ns: 11644492
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.untagged.stale_returns: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_max_ns: 620500
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_ns: 620500
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.lends: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.returns: 1
+  shard 0 refused diag.link.17539389155729462001.dial.attempts: 1
+  shard 0 refused diag.link.17539389155729462001.dial.enrolled: 1
+  shard 0 refused diag.link.17539389155729462001.dial.established: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_max_ns: 1026059
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_ns: 1026059
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_max_ns: 5741169
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_ns: 5741169
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 249075
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 249075
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 8623208
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 8623208
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 20811372
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 306639933
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 56
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 56
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.held_max_ns: 12035127
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.held_ns: 44914859
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.lends: 6
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.returns: 6
+  shard 0 refused fleet.discovery.deadline: 1
+  shard 0 refused fleet.discovery.invalidated: 1
+  shard 0 refused fleet.discovery.pages: 240
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 1
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 143
+  shard 0 refused fleet.plane.announce_lends: 9
+  shard 0 refused fleet.plane.announcements_sent: 9
+  shard 0 refused fleet.report.sent: 1
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 live held aebbe2fbf00c675f0000000000000023 head=142 durable=none owed=false epoch=1 identity=93b71f0eb96ba3bff03ded602edb52632c2da189a37fb111f17a872c85da512a fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-d-10106 (status exit 0; live Some([LiveState { holding: true, head: Some(63), durable: None, owed: false, epoch: Some(1), identity: Some("5d11b9d26e8b4a5579d11e6ea678b24e6bfdbcd18bdef7ded88fb492c66fe6b8"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12423917740952588850
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 23
+  fleet_settled_generation: 21
+  fleet_neighbourhood_generation: 21
+  fleet_council_leads: false
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 21561545
+  fleet_council_rtt_spread_ns: 16866444
+  fleet_council_samples: 758
+  fleet_council_term: 2
+  fleet_council_priority_ns: 4023559
+  fleet_council_priority_spread_ns: 16099008
+  fleet_council_rank: 0
+  fleet_council_leader_lease: true
+  fleet_council_pre_elections: 0
+  fleet_council_elections: 0
+  fleet_council_pre_votes_granted: 0
+  fleet_council_pre_votes_refused: 0
+  fleet_council_refused_role: 0
+  fleet_council_refused_leased: 23
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 5854680686530464061 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 5854680686530464061: lent=false cwnd=130934 srtt_ns=4065324 pto_ns=17341016 spurious_losses=0 persistent_collapses=0 consumed=4454 mtu=65496
+  fleet_session 9243114246494466095: lent=false cwnd=130934 srtt_ns=3520251 pto_ns=11799715 spurious_losses=0 persistent_collapses=0 consumed=2644 mtu=65496
+  fleet_session 10909914209790205707: lent=false cwnd=130934 srtt_ns=3011365 pto_ns=16753601 spurious_losses=0 persistent_collapses=0 consumed=4586 mtu=65496
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_max_ns: 454611
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_ns: 454611
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.lends: 1
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.returns: 1
+  shard 0 refused diag.link.10368397891868631024.dial.attempts: 1
+  shard 0 refused diag.link.10368397891868631024.dial.enrolled: 1
+  shard 0 refused diag.link.10368397891868631024.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_max_ns: 2477354
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_ns: 2477354
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.lends: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.returns: 1
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_max_ns: 12769172
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_ns: 12769172
+  shard 0 refused diag.link.10909914209790205707.ask_pages.lends: 1
+  shard 0 refused diag.link.10909914209790205707.ask_pages.returns: 1
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_max_ns: 2173796
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_ns: 3688970
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.lends: 2
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.returns: 2
+  shard 0 refused diag.link.10909914209790205707.dial.attempts: 2
+  shard 0 refused diag.link.10909914209790205707.dial.enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.dial.failed: 1
+  shard 0 refused diag.link.10909914209790205707.dial.not_enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_max_ns: 20090073
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_ns: 256223595
+  shard 0 refused diag.link.10909914209790205707.discovery_page.lends: 70
+  shard 0 refused diag.link.10909914209790205707.discovery_page.returns: 70
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_max_ns: 6885199
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_ns: 13662561
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_max_ns: 8778421
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_ns: 12771932
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_max_ns: 1827769
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_ns: 1827769
+  shard 0 refused diag.link.10909914209790205707.request_peer.lends: 1
+  shard 0 refused diag.link.10909914209790205707.request_peer.returns: 1
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_max_ns: 17301190
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_ns: 87436714
+  shard 0 refused diag.link.10909914209790205707.send_council_report.lends: 10
+  shard 0 refused diag.link.10909914209790205707.send_council_report.returns: 10
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 452096
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 452096
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_max_ns: 6255963
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_ns: 6732334
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 16155756
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 188041830
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 30
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 29
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 6876032
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 18838422
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 8772640
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 17086052
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_max_ns: 10030349
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_ns: 10030349
+  shard 0 refused diag.link.12590906754936366943.request_peer.lends: 1
+  shard 0 refused diag.link.12590906754936366943.request_peer.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 436646
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 436646
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_max_ns: 615952
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_ns: 615952
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.lends: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 15782221
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 100958820
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 17
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 16
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 6878748
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 18845346
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 8767270
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 17079480
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_max_ns: 1541273
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_ns: 1541273
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.lends: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.returns: 1
+  shard 0 refused diag.link.16419410892462531335.dial.attempts: 1
+  shard 0 refused diag.link.16419410892462531335.dial.enrolled: 1
+  shard 0 refused diag.link.16419410892462531335.dial.established: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 582329
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 582329
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 12119564
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 12119564
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_max_ns: 16591143
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_ns: 30101477
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.lends: 2
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.returns: 2
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 20108619
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 326354325
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 61
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 61
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_max_ns: 15658790
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_ns: 15658790
+  shard 0 refused diag.link.5854680686530464061.request_peer.lends: 1
+  shard 0 refused diag.link.5854680686530464061.request_peer.returns: 1
+  shard 0 refused diag.link.5854680686530464061.send_council_report.held_max_ns: 10102863
+  shard 0 refused diag.link.5854680686530464061.send_council_report.held_ns: 36516346
+  shard 0 refused diag.link.5854680686530464061.send_council_report.lends: 6
+  shard 0 refused diag.link.5854680686530464061.send_council_report.returns: 6
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_max_ns: 504944
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_ns: 949735
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_max_ns: 12624759
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_ns: 22185470
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.dial.attempts: 4
+  shard 0 refused diag.link.9243114246494466095.dial.enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.dial.established: 2
+  shard 0 refused diag.link.9243114246494466095.dial.failed: 2
+  shard 0 refused diag.link.9243114246494466095.dial.not_enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.dropped: 1
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_max_ns: 29191273
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_ns: 363135300
+  shard 0 refused diag.link.9243114246494466095.discovery_page.lends: 74
+  shard 0 refused diag.link.9243114246494466095.discovery_page.returns: 73
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_max_ns: 6890119
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_ns: 18860003
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_max_ns: 8783640
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_ns: 17098975
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_max_ns: 7393711
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_ns: 7393711
+  shard 0 refused diag.link.9243114246494466095.request_peer.lends: 1
+  shard 0 refused diag.link.9243114246494466095.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_max_ns: 17298745
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_ns: 58367738
+  shard 0 refused diag.link.9243114246494466095.send_council_report.lends: 5
+  shard 0 refused diag.link.9243114246494466095.send_council_report.returns: 5
+  shard 0 refused fleet.discovery.invalidated: 3
+  shard 0 refused fleet.discovery.pages: 262
+  shard 0 refused fleet.link.invalid.believed_dead: 2
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 2
+  shard 0 refused fleet.live.held: 64
+  shard 0 refused fleet.plane.announce_lends: 10
+  shard 0 refused fleet.plane.announcements_sent: 10
+  shard 0 refused fleet.report.sent: 11
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 live held aebbe2fbf00c675f0000000000000023 head=63 durable=none owed=false epoch=1 identity=5d11b9d26e8b4a5579d11e6ea678b24e6bfdbcd18bdef7ded88fb492c66fe6b8 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-e-10106 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10909914209790205707
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 23
+  fleet_settled_generation: 21
+  fleet_neighbourhood_generation: 21
+  fleet_council_leads: true
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 25546166
+  fleet_council_rtt_spread_ns: 18667212
+  fleet_council_samples: 1631
+  fleet_council_term: 2
+  fleet_council_priority_ns: 2256714
+  fleet_council_priority_spread_ns: 8893216
+  fleet_council_rank: 0
+  fleet_council_leader_lease: false
+  fleet_council_pre_elections: 1
+  fleet_council_elections: 1
+  fleet_council_pre_votes_granted: 1
+  fleet_council_pre_votes_refused: 0
+  fleet_council_refused_role: 23
+  fleet_council_refused_leased: 0
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 5854680686530464061 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 5854680686530464061: lent=false cwnd=130934 srtt_ns=4325811 pto_ns=20715619 spurious_losses=0 persistent_collapses=0 consumed=42156 mtu=65496
+  fleet_session 9243114246494466095: lent=false cwnd=130934 srtt_ns=4182102 pto_ns=17630574 spurious_losses=0 persistent_collapses=0 consumed=4328 mtu=65496
+  fleet_session 12423917740952588850: lent=false cwnd=130934 srtt_ns=1864761 pto_ns=10696041 spurious_losses=0 persistent_collapses=0 consumed=45769 mtu=65496
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_max_ns: 4422673
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_ns: 4422673
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.lends: 1
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.returns: 1
+  shard 0 refused diag.link.10368397891868631024.dial.attempts: 1
+  shard 0 refused diag.link.10368397891868631024.dial.enrolled: 1
+  shard 0 refused diag.link.10368397891868631024.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_max_ns: 1405089
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_ns: 1405089
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.lends: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.returns: 1
+  shard 0 refused diag.link.12423917740952588850.ask_pages.held_max_ns: 14266763
+  shard 0 refused diag.link.12423917740952588850.ask_pages.held_ns: 14266763
+  shard 0 refused diag.link.12423917740952588850.ask_pages.lends: 1
+  shard 0 refused diag.link.12423917740952588850.ask_pages.returns: 1
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_max_ns: 12486360
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_ns: 12991455
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12423917740952588850.dial.attempts: 2
+  shard 0 refused diag.link.12423917740952588850.dial.enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.dial.failed: 1
+  shard 0 refused diag.link.12423917740952588850.dial.not_enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_max_ns: 20260459
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_ns: 307695144
+  shard 0 refused diag.link.12423917740952588850.discovery_page.lends: 67
+  shard 0 refused diag.link.12423917740952588850.discovery_page.returns: 67
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_max_ns: 22031731
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_ns: 1960536672
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.lends: 374
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.out_for.discovery_page: 3
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.returns: 374
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_max_ns: 6489791
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_ns: 12690660
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_max_ns: 16849287
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_ns: 22871154
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_max_ns: 3901202
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_ns: 3901202
+  shard 0 refused diag.link.12423917740952588850.request_peer.lends: 1
+  shard 0 refused diag.link.12423917740952588850.request_peer.returns: 1
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_max_ns: 12915355
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_ns: 21769442
+  shard 0 refused diag.link.12423917740952588850.send_council_report.lends: 2
+  shard 0 refused diag.link.12423917740952588850.send_council_report.returns: 2
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_max_ns: 407112
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_ns: 407112
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.lends: 1
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.returns: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 14419743
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 14419743
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.ask_pages.held_max_ns: 307545
+  shard 0 refused diag.link.12590906754936366943.ask_pages.held_ns: 4675523
+  shard 0 refused diag.link.12590906754936366943.ask_pages.lends: 32
+  shard 0 refused diag.link.12590906754936366943.ask_pages.returns: 32
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_max_ns: 4165706
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_ns: 4651514
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 20890390
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 190371130
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 27
+  shard 0 refused diag.link.12590906754936366943.discovery_page.out_for.ask_pages: 9
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 26
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 6484291
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 12698234
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 16856270
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 22865853
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_max_ns: 9281289
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_ns: 9281289
+  shard 0 refused diag.link.12590906754936366943.request_peer.lends: 1
+  shard 0 refused diag.link.12590906754936366943.request_peer.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 13305168
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 13305168
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_max_ns: 6029599
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_ns: 6029599
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.lends: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 19290795
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 64484351
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 14
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 13
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 6494150
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 12702252
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 16850850
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 22863569
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_max_ns: 982467
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_ns: 982467
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.lends: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.returns: 1
+  shard 0 refused diag.link.17539389155729462001.dial.attempts: 1
+  shard 0 refused diag.link.17539389155729462001.dial.enrolled: 1
+  shard 0 refused diag.link.17539389155729462001.dial.established: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 5566192
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 5566192
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 10927727
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 10927727
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.ask_pages.held_max_ns: 11975044
+  shard 0 refused diag.link.5854680686530464061.ask_pages.held_ns: 46401942
+  shard 0 refused diag.link.5854680686530464061.ask_pages.lends: 9
+  shard 0 refused diag.link.5854680686530464061.ask_pages.returns: 9
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_max_ns: 10492459
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_ns: 15145080
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.lends: 2
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.returns: 2
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 16107937
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 375531087
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 60
+  shard 0 refused diag.link.5854680686530464061.discovery_page.out_for.drive_council_replication: 4
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 60
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.held_max_ns: 22028675
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.held_ns: 1957103976
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.lends: 366
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.out_for.discovery_page: 2
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.returns: 366
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_max_ns: 888471
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_ns: 888471
+  shard 0 refused diag.link.5854680686530464061.request_peer.lends: 1
+  shard 0 refused diag.link.5854680686530464061.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_max_ns: 7942477
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_ns: 13061630
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_max_ns: 8562744
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_ns: 9994993
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.dial.attempts: 4
+  shard 0 refused diag.link.9243114246494466095.dial.enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.dial.established: 2
+  shard 0 refused diag.link.9243114246494466095.dial.failed: 2
+  shard 0 refused diag.link.9243114246494466095.dial.not_enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.dropped: 1
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_max_ns: 19137363
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_ns: 381385311
+  shard 0 refused diag.link.9243114246494466095.discovery_page.lends: 71
+  shard 0 refused diag.link.9243114246494466095.discovery_page.returns: 70
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_max_ns: 6494650
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_ns: 12701721
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_max_ns: 16845240
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_ns: 22865273
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_max_ns: 1874706
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_ns: 1874706
+  shard 0 refused diag.link.9243114246494466095.request_peer.lends: 1
+  shard 0 refused diag.link.9243114246494466095.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_max_ns: 15721096
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_ns: 37501881
+  shard 0 refused diag.link.9243114246494466095.send_council_report.lends: 3
+  shard 0 refused diag.link.9243114246494466095.send_council_report.returns: 3
+  shard 0 refused fleet.discovery.invalidated: 3
+  shard 0 refused fleet.discovery.pages: 249
+  shard 0 refused fleet.link.invalid.believed_dead: 2
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 2
+  shard 0 refused fleet.plane.announce_lends: 10
+  shard 0 refused fleet.plane.announcements_sent: 10
+  shard 0 refused fleet.report.sent: 9
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 refused fleet.takeover.lost: 4
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-10106; council seats at ["chaos-fresh-member-c-10106", "chaos-fresh-member-d-10106", "chaos-fresh-member-e-10106"]
+  chaos-fresh-member-b-10106 replaced by a fresh member, rejoined at 7.604725856s
+  the owner's holders once settled: ["chaos-fresh-member-b-10106", "chaos-fresh-member-c-10106"]
+  chaos-fresh-member-c-10106 stopped at 12.472496821s
+  135 writes acknowledged; owner crashed; holders chaos-fresh-member-b-10106 (with the log) and chaos-fresh-member-c-10106 (stale)
+  no survivor adopted the registers; the survivors:
+--- chaos-fresh-member-b-10106 (status exit 0; live Some([LiveState { holding: true, head: Some(147), durable: None, owed: false, epoch: Some(1), identity: Some("6e4e06fd5639acb10a86444332381fdbd4be5e3ef73a96ac6a340c51409a03d6"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 5854680686530464061
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 23
+  fleet_settled_generation: 8
+  fleet_neighbourhood_generation: 8
+  fleet_council_leads: false
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 25406914
+  fleet_council_rtt_spread_ns: 20392040
+  fleet_council_samples: 1133
+  fleet_council_term: 2
+  fleet_council_priority_ns: 4165686
+  fleet_council_priority_spread_ns: 20376944
+  fleet_council_rank: 0
+  fleet_council_leader_lease: true
+  fleet_council_pre_elections: 0
+  fleet_council_elections: 0
+  fleet_council_pre_votes_granted: 0
+  fleet_council_pre_votes_refused: 0
+  fleet_council_refused_role: 0
+  fleet_council_refused_leased: 0
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 5854680686530464061 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 9243114246494466095: lent=false cwnd=130934 srtt_ns=3503145 pto_ns=17111957 spurious_losses=0 persistent_collapses=0 consumed=2634 mtu=65496
+  fleet_session 10909914209790205707: lent=false cwnd=130934 srtt_ns=5938485 pto_ns=30065661 spurious_losses=0 persistent_collapses=0 consumed=10858 mtu=65496
+  fleet_session 12423917740952588850: lent=false cwnd=130934 srtt_ns=3524279 pto_ns=21810967 spurious_losses=0 persistent_collapses=0 consumed=9872 mtu=65496
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_max_ns: 24656980
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_ns: 24656980
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.lends: 1
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.returns: 1
+  shard 0 refused diag.link.10368397891868631024.dial.attempts: 1
+  shard 0 refused diag.link.10368397891868631024.dial.enrolled: 1
+  shard 0 refused diag.link.10368397891868631024.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_max_ns: 8718778
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_ns: 8718778
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.lends: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.returns: 1
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_max_ns: 8202991
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_ns: 17927387
+  shard 0 refused diag.link.10909914209790205707.ask_pages.lends: 3
+  shard 0 refused diag.link.10909914209790205707.ask_pages.returns: 3
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_max_ns: 11977018
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_ns: 23127311
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.lends: 2
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.returns: 2
+  shard 0 refused diag.link.10909914209790205707.dial.attempts: 2
+  shard 0 refused diag.link.10909914209790205707.dial.enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.dial.failed: 1
+  shard 0 refused diag.link.10909914209790205707.dial.not_enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_max_ns: 17312121
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_ns: 348995834
+  shard 0 refused diag.link.10909914209790205707.discovery_page.lends: 61
+  shard 0 refused diag.link.10909914209790205707.discovery_page.out_for.drive_learner_fetch: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.returns: 61
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_max_ns: 17105402
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_ns: 73757085
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.lends: 16
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.out_for.discovery_page: 1
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.returns: 16
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_max_ns: 14939947
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_ns: 14939947
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_max_ns: 10700972
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_ns: 10700972
+  shard 0 refused diag.link.10909914209790205707.request_peer.lends: 1
+  shard 0 refused diag.link.10909914209790205707.request_peer.returns: 1
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_max_ns: 18048682
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_ns: 22040858
+  shard 0 refused diag.link.10909914209790205707.send_council_report.lends: 2
+  shard 0 refused diag.link.10909914209790205707.send_council_report.returns: 2
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_max_ns: 13052829
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_ns: 13052829
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.lends: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.returns: 1
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_max_ns: 14478183
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_ns: 18186454
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12423917740952588850.dial.attempts: 2
+  shard 0 refused diag.link.12423917740952588850.dial.enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.dial.failed: 1
+  shard 0 refused diag.link.12423917740952588850.dial.not_enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_max_ns: 23030855
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_ns: 393970828
+  shard 0 refused diag.link.12423917740952588850.discovery_page.lends: 61
+  shard 0 refused diag.link.12423917740952588850.discovery_page.returns: 61
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_max_ns: 17107106
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_ns: 75299770
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.lends: 17
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.returns: 17
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_max_ns: 14947260
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_ns: 14947260
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_max_ns: 12940249
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_ns: 12940249
+  shard 0 refused diag.link.12423917740952588850.request_peer.lends: 1
+  shard 0 refused diag.link.12423917740952588850.request_peer.returns: 1
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_max_ns: 18051388
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_ns: 22038675
+  shard 0 refused diag.link.12423917740952588850.send_council_report.lends: 2
+  shard 0 refused diag.link.12423917740952588850.send_council_report.returns: 2
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 17156759
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 17156759
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 15589461
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 87183282
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 19
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 18
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 13664202
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 13664202
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 14941739
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 14941739
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 24271649
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 24271649
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.13069900790431088743.drive_learner_fetch.held_max_ns: 11527217
+  shard 0 refused diag.link.13069900790431088743.drive_learner_fetch.held_ns: 11527217
+  shard 0 refused diag.link.13069900790431088743.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.13069900790431088743.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.13069900790431088743.drive_root_learner_fetch.held_max_ns: 9266692
+  shard 0 refused diag.link.13069900790431088743.drive_root_learner_fetch.held_ns: 9266692
+  shard 0 refused diag.link.13069900790431088743.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.13069900790431088743.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_max_ns: 8937045
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_ns: 8937045
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.lends: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.returns: 1
+  shard 0 refused diag.link.16419410892462531335.dial.attempts: 1
+  shard 0 refused diag.link.16419410892462531335.dial.enrolled: 1
+  shard 0 refused diag.link.16419410892462531335.dial.established: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_max_ns: 11523059
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_ns: 11523059
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.held_max_ns: 9269677
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.held_ns: 9269677
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_max_ns: 12423773
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_ns: 12423773
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.lends: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.returns: 1
+  shard 0 refused diag.link.17539389155729462001.dial.attempts: 1
+  shard 0 refused diag.link.17539389155729462001.dial.enrolled: 1
+  shard 0 refused diag.link.17539389155729462001.dial.established: 1
+  shard 0 refused diag.link.17539389155729462001.discovery_page.held_max_ns: 17681942
+  shard 0 refused diag.link.17539389155729462001.discovery_page.held_ns: 17681942
+  shard 0 refused diag.link.17539389155729462001.discovery_page.lends: 1
+  shard 0 refused diag.link.17539389155729462001.discovery_page.returns: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_max_ns: 11517830
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_ns: 11517830
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_max_ns: 9272633
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_ns: 9272633
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_max_ns: 7788899
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_ns: 9902922
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.dial.attempts: 4
+  shard 0 refused diag.link.9243114246494466095.dial.enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.dial.established: 2
+  shard 0 refused diag.link.9243114246494466095.dial.failed: 2
+  shard 0 refused diag.link.9243114246494466095.dial.not_enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.dropped: 1
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_max_ns: 23045202
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_ns: 303560594
+  shard 0 refused diag.link.9243114246494466095.discovery_page.lends: 61
+  shard 0 refused diag.link.9243114246494466095.discovery_page.out_for.drive_learner_fetch: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.returns: 60
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_max_ns: 17102638
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_ns: 59529935
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.lends: 4
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.out_for.discovery_page: 1
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.returns: 4
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_max_ns: 14936109
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_ns: 14936109
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.returns: 1
+  shard 0 refused fleet.discovery.invalidated: 2
+  shard 0 refused fleet.discovery.pages: 212
+  shard 0 refused fleet.link.invalid.believed_dead: 2
+  shard 0 refused fleet.link.out_of_contact: 2
+  shard 0 refused fleet.live.held: 88
+  shard 0 refused fleet.plane.announce_lends: 9
+  shard 0 refused fleet.plane.announcements_sent: 9
+  shard 0 refused fleet.report.sent: 2
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 refused fleet.takeover.stale_configuration: 2
+  shard 0 live held aebbe2fbf00c675f0000000000000023 head=147 durable=none owed=false epoch=1 identity=6e4e06fd5639acb10a86444332381fdbd4be5e3ef73a96ac6a340c51409a03d6 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-c-10106 (status exit 0; live Some([LiveState { holding: true, head: Some(142), durable: None, owed: false, epoch: Some(1), identity: Some("93b71f0eb96ba3bff03ded602edb52632c2da189a37fb111f17a872c85da512a"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 9243114246494466095
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 13
+  fleet_settled_generation: 3
+  fleet_neighbourhood_generation: 3
+  fleet_council_leads: false
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 27573839
+  fleet_council_rtt_spread_ns: 23405684
+  fleet_council_samples: 927
+  fleet_council_term: 2
+  fleet_council_priority_ns: 3938008
+  fleet_council_priority_spread_ns: 13894816
+  fleet_council_rank: 0
+  fleet_council_leader_lease: false
+  fleet_council_pre_elections: 23
+  fleet_council_elections: 1
+  fleet_council_pre_votes_granted: 0
+  fleet_council_pre_votes_refused: 46
+  fleet_council_refused_role: 0
+  fleet_council_refused_leased: 0
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 5854680686530464061: lent=false cwnd=130934 srtt_ns=5827765 pto_ns=30397893 spurious_losses=0 persistent_collapses=0 consumed=3122 mtu=65496
+  fleet_session 10909914209790205707: lent=false cwnd=130934 srtt_ns=2677725 pto_ns=17558713 spurious_losses=0 persistent_collapses=0 consumed=14584 mtu=65496
+  fleet_session 12423917740952588850: lent=false cwnd=130934 srtt_ns=3099518 pto_ns=18865386 spurious_losses=0 persistent_collapses=0 consumed=14516 mtu=65496
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_max_ns: 11670621
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_ns: 11670621
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.lends: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.returns: 1
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_max_ns: 2516978
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_ns: 4427041
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.lends: 2
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.returns: 2
+  shard 0 refused diag.link.10909914209790205707.dial.attempts: 2
+  shard 0 refused diag.link.10909914209790205707.dial.enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.dial.failed: 1
+  shard 0 refused diag.link.10909914209790205707.dial.not_enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_max_ns: 17937389
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_ns: 299512798
+  shard 0 refused diag.link.10909914209790205707.discovery_page.lends: 63
+  shard 0 refused diag.link.10909914209790205707.discovery_page.out_for.drive_council_replication: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.returns: 63
+  shard 0 refused diag.link.10909914209790205707.drive_council_replication.held_max_ns: 26761774
+  shard 0 refused diag.link.10909914209790205707.drive_council_replication.held_ns: 990220789
+  shard 0 refused diag.link.10909914209790205707.drive_council_replication.lends: 92
+  shard 0 refused diag.link.10909914209790205707.drive_council_replication.out_for.discovery_page: 2
+  shard 0 refused diag.link.10909914209790205707.drive_council_replication.returns: 92
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_max_ns: 2012925
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_ns: 2012925
+  shard 0 refused diag.link.10909914209790205707.request_peer.lends: 1
+  shard 0 refused diag.link.10909914209790205707.request_peer.returns: 1
+  shard 0 refused diag.link.10909914209790205707.take_campaign_sessions.held_max_ns: 12926731
+  shard 0 refused diag.link.10909914209790205707.take_campaign_sessions.held_ns: 122757153
+  shard 0 refused diag.link.10909914209790205707.take_campaign_sessions.lends: 23
+  shard 0 refused diag.link.10909914209790205707.take_campaign_sessions.returns: 23
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_max_ns: 436777
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_ns: 436777
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.lends: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.returns: 1
+  shard 0 refused diag.link.12423917740952588850.dial.attempts: 2
+  shard 0 refused diag.link.12423917740952588850.dial.enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.dial.failed: 1
+  shard 0 refused diag.link.12423917740952588850.dial.not_enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_max_ns: 18996975
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_ns: 301497837
+  shard 0 refused diag.link.12423917740952588850.discovery_page.lends: 67
+  shard 0 refused diag.link.12423917740952588850.discovery_page.out_for.drive_council_replication: 1
+  shard 0 refused diag.link.12423917740952588850.discovery_page.returns: 67
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_max_ns: 26766042
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_ns: 990106049
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.lends: 92
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.out_for.discovery_page: 1
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.returns: 92
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_max_ns: 11651535
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_ns: 11651535
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_max_ns: 21048513
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_ns: 21048513
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_max_ns: 12929096
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_ns: 122713215
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.lends: 23
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.returns: 23
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 3857396
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 3857396
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_max_ns: 6593684
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_ns: 7579648
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 16692170
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 182130997
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 27
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 26
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 11639232
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 12672334
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 21015310
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 26754626
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_max_ns: 3004620
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_ns: 3004620
+  shard 0 refused diag.link.12590906754936366943.request_peer.lends: 1
+  shard 0 refused diag.link.12590906754936366943.request_peer.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 665815
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 665815
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_max_ns: 600102
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_ns: 600102
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.lends: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 15093823
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 110096823
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 18
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 17
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 11642077
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 12663267
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 21019208
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 26750669
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_max_ns: 1080701
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_ns: 1080701
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.lends: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.returns: 1
+  shard 0 refused diag.link.16419410892462531335.dial.attempts: 1
+  shard 0 refused diag.link.16419410892462531335.dial.enrolled: 1
+  shard 0 refused diag.link.16419410892462531335.dial.established: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_max_ns: 11644492
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.held_ns: 11644492
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.16419410892462531335.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.16419410892462531335.untagged.stale_returns: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_max_ns: 620500
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_ns: 620500
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.lends: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.returns: 1
+  shard 0 refused diag.link.17539389155729462001.dial.attempts: 1
+  shard 0 refused diag.link.17539389155729462001.dial.enrolled: 1
+  shard 0 refused diag.link.17539389155729462001.dial.established: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_max_ns: 1026059
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.held_ns: 1026059
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_learner_fetch.returns: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_max_ns: 5741169
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.held_ns: 5741169
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.lends: 1
+  shard 0 refused diag.link.17539389155729462001.drive_root_learner_fetch.returns: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 249075
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 249075
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 8623208
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 8623208
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 20811372
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 306639933
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 56
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 56
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.held_max_ns: 12035127
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.held_ns: 44914859
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.lends: 6
+  shard 0 refused diag.link.5854680686530464061.drive_root_replication.returns: 6
+  shard 0 refused fleet.discovery.deadline: 1
+  shard 0 refused fleet.discovery.invalidated: 1
+  shard 0 refused fleet.discovery.pages: 240
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 1
+  shard 0 refused fleet.link.stale_return: 1
+  shard 0 refused fleet.live.held: 143
+  shard 0 refused fleet.plane.announce_lends: 9
+  shard 0 refused fleet.plane.announcements_sent: 9
+  shard 0 refused fleet.report.sent: 1
+  shard 0 refused fleet.seal.pair_served: 6
+  shard 0 live held aebbe2fbf00c675f0000000000000023 head=142 durable=none owed=false epoch=1 identity=93b71f0eb96ba3bff03ded602edb52632c2da189a37fb111f17a872c85da512a fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-d-10106 (status exit 0; live Some([LiveState { holding: true, head: Some(63), durable: None, owed: false, epoch: Some(1), identity: Some("5d11b9d26e8b4a5579d11e6ea678b24e6bfdbcd18bdef7ded88fb492c66fe6b8"), fence: 1, holders: [], moving_to: [], recorded: [] }])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 12423917740952588850
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 2
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 23
+  fleet_settled_generation: 21
+  fleet_neighbourhood_generation: 21
+  fleet_council_leads: false
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 21561545
+  fleet_council_rtt_spread_ns: 16866444
+  fleet_council_samples: 758
+  fleet_council_term: 2
+  fleet_council_priority_ns: 4023559
+  fleet_council_priority_spread_ns: 16099008
+  fleet_council_rank: 0
+  fleet_council_leader_lease: true
+  fleet_council_pre_elections: 0
+  fleet_council_elections: 0
+  fleet_council_pre_votes_granted: 0
+  fleet_council_pre_votes_refused: 0
+  fleet_council_refused_role: 0
+  fleet_council_refused_leased: 23
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 5854680686530464061 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 5854680686530464061: lent=false cwnd=130934 srtt_ns=4065324 pto_ns=17341016 spurious_losses=0 persistent_collapses=0 consumed=4454 mtu=65496
+  fleet_session 9243114246494466095: lent=false cwnd=130934 srtt_ns=3520251 pto_ns=11799715 spurious_losses=0 persistent_collapses=0 consumed=2644 mtu=65496
+  fleet_session 10909914209790205707: lent=false cwnd=130934 srtt_ns=3011365 pto_ns=16753601 spurious_losses=0 persistent_collapses=0 consumed=4586 mtu=65496
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_max_ns: 454611
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_ns: 454611
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.lends: 1
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.returns: 1
+  shard 0 refused diag.link.10368397891868631024.dial.attempts: 1
+  shard 0 refused diag.link.10368397891868631024.dial.enrolled: 1
+  shard 0 refused diag.link.10368397891868631024.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_max_ns: 2477354
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.held_ns: 2477354
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.lends: 1
+  shard 0 refused diag.link.10909914209790205707.announce_epochs.returns: 1
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_max_ns: 12769172
+  shard 0 refused diag.link.10909914209790205707.ask_pages.held_ns: 12769172
+  shard 0 refused diag.link.10909914209790205707.ask_pages.lends: 1
+  shard 0 refused diag.link.10909914209790205707.ask_pages.returns: 1
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_max_ns: 2173796
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.held_ns: 3688970
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.lends: 2
+  shard 0 refused diag.link.10909914209790205707.deliver_pairs.returns: 2
+  shard 0 refused diag.link.10909914209790205707.dial.attempts: 2
+  shard 0 refused diag.link.10909914209790205707.dial.enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.dial.established: 1
+  shard 0 refused diag.link.10909914209790205707.dial.failed: 1
+  shard 0 refused diag.link.10909914209790205707.dial.not_enrolled: 1
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_max_ns: 20090073
+  shard 0 refused diag.link.10909914209790205707.discovery_page.held_ns: 256223595
+  shard 0 refused diag.link.10909914209790205707.discovery_page.lends: 70
+  shard 0 refused diag.link.10909914209790205707.discovery_page.returns: 70
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_max_ns: 6885199
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.held_ns: 13662561
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.10909914209790205707.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_max_ns: 8778421
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.held_ns: 12771932
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.10909914209790205707.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_max_ns: 1827769
+  shard 0 refused diag.link.10909914209790205707.request_peer.held_ns: 1827769
+  shard 0 refused diag.link.10909914209790205707.request_peer.lends: 1
+  shard 0 refused diag.link.10909914209790205707.request_peer.returns: 1
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_max_ns: 17301190
+  shard 0 refused diag.link.10909914209790205707.send_council_report.held_ns: 87436714
+  shard 0 refused diag.link.10909914209790205707.send_council_report.lends: 10
+  shard 0 refused diag.link.10909914209790205707.send_council_report.returns: 10
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 452096
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 452096
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_max_ns: 6255963
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_ns: 6732334
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 16155756
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 188041830
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 30
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 29
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 6876032
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 18838422
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 8772640
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 17086052
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_max_ns: 10030349
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_ns: 10030349
+  shard 0 refused diag.link.12590906754936366943.request_peer.lends: 1
+  shard 0 refused diag.link.12590906754936366943.request_peer.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 436646
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 436646
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_max_ns: 615952
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_ns: 615952
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.lends: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 15782221
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 100958820
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 17
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 16
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 6878748
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 18845346
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 8767270
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 17079480
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_max_ns: 1541273
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.held_ns: 1541273
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.lends: 1
+  shard 0 refused diag.link.16419410892462531335.announce_epochs.returns: 1
+  shard 0 refused diag.link.16419410892462531335.dial.attempts: 1
+  shard 0 refused diag.link.16419410892462531335.dial.enrolled: 1
+  shard 0 refused diag.link.16419410892462531335.dial.established: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 582329
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 582329
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 12119564
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 12119564
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.out_for.discovery_page: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_max_ns: 16591143
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_ns: 30101477
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.lends: 2
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.returns: 2
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 20108619
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 326354325
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 61
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 61
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_max_ns: 15658790
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_ns: 15658790
+  shard 0 refused diag.link.5854680686530464061.request_peer.lends: 1
+  shard 0 refused diag.link.5854680686530464061.request_peer.returns: 1
+  shard 0 refused diag.link.5854680686530464061.send_council_report.held_max_ns: 10102863
+  shard 0 refused diag.link.5854680686530464061.send_council_report.held_ns: 36516346
+  shard 0 refused diag.link.5854680686530464061.send_council_report.lends: 6
+  shard 0 refused diag.link.5854680686530464061.send_council_report.returns: 6
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_max_ns: 504944
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_ns: 949735
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_max_ns: 12624759
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_ns: 22185470
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.dial.attempts: 4
+  shard 0 refused diag.link.9243114246494466095.dial.enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.dial.established: 2
+  shard 0 refused diag.link.9243114246494466095.dial.failed: 2
+  shard 0 refused diag.link.9243114246494466095.dial.not_enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.dropped: 1
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_max_ns: 29191273
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_ns: 363135300
+  shard 0 refused diag.link.9243114246494466095.discovery_page.lends: 74
+  shard 0 refused diag.link.9243114246494466095.discovery_page.returns: 73
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_max_ns: 6890119
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_ns: 18860003
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.lends: 3
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.returns: 3
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_max_ns: 8783640
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_ns: 17098975
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.lends: 3
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.returns: 3
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_max_ns: 7393711
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_ns: 7393711
+  shard 0 refused diag.link.9243114246494466095.request_peer.lends: 1
+  shard 0 refused diag.link.9243114246494466095.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_max_ns: 17298745
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_ns: 58367738
+  shard 0 refused diag.link.9243114246494466095.send_council_report.lends: 5
+  shard 0 refused diag.link.9243114246494466095.send_council_report.returns: 5
+  shard 0 refused fleet.discovery.invalidated: 3
+  shard 0 refused fleet.discovery.pages: 262
+  shard 0 refused fleet.link.invalid.believed_dead: 2
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 2
+  shard 0 refused fleet.live.held: 64
+  shard 0 refused fleet.plane.announce_lends: 10
+  shard 0 refused fleet.plane.announcements_sent: 10
+  shard 0 refused fleet.report.sent: 11
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 live held aebbe2fbf00c675f0000000000000023 head=63 durable=none owed=false epoch=1 identity=5d11b9d26e8b4a5579d11e6ea678b24e6bfdbcd18bdef7ded88fb492c66fe6b8 fence=1 holders=none moving_to=none recorded=none
+--- chaos-fresh-member-e-10106 (status exit 0; live Some([])):
+  anchor_hold_refusals: 0
+  anchor_log_lines_refused: 0
+  fleet_host: 10909914209790205707
+  fleet_host_epoch: 1
+  fleet_members: 5854680686530464061 9243114246494466095 10909914209790205707 12423917740952588850
+  fleet_peers_probed: 3
+  fleet_held_records: 0
+  fleet_takeovers_pending: 0
+  fleet_configuration_version: 23
+  fleet_settled_generation: 21
+  fleet_neighbourhood_generation: 21
+  fleet_council_leads: true
+  fleet_council_base_periods: 10
+  fleet_council_span_periods: 10
+  fleet_council_rtt_tail_ns: 25546166
+  fleet_council_rtt_spread_ns: 18667212
+  fleet_council_samples: 1631
+  fleet_council_term: 2
+  fleet_council_priority_ns: 2256714
+  fleet_council_priority_spread_ns: 8893216
+  fleet_council_rank: 0
+  fleet_council_leader_lease: false
+  fleet_council_pre_elections: 1
+  fleet_council_elections: 1
+  fleet_council_pre_votes_granted: 1
+  fleet_council_pre_votes_refused: 0
+  fleet_council_refused_role: 23
+  fleet_council_refused_leased: 0
+  fleet_council_refused_term: 0
+  fleet_council_refused_log: 0
+  fleet_council_voters: 3
+  fleet_council_joint: false
+  fleet_council_voter_ids: 5854680686530464061 10909914209790205707 12423917740952588850
+  fleet_peers_in_contact: 3
+  fleet_peers_unmeshed: 0
+  fleet_session 5854680686530464061: lent=false cwnd=130934 srtt_ns=4325811 pto_ns=20715619 spurious_losses=0 persistent_collapses=0 consumed=42156 mtu=65496
+  fleet_session 9243114246494466095: lent=false cwnd=130934 srtt_ns=4182102 pto_ns=17630574 spurious_losses=0 persistent_collapses=0 consumed=4328 mtu=65496
+  fleet_session 12423917740952588850: lent=false cwnd=130934 srtt_ns=1864761 pto_ns=10696041 spurious_losses=0 persistent_collapses=0 consumed=45769 mtu=65496
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_max_ns: 4422673
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.held_ns: 4422673
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.lends: 1
+  shard 0 refused diag.link.10368397891868631024.announce_epochs.returns: 1
+  shard 0 refused diag.link.10368397891868631024.dial.attempts: 1
+  shard 0 refused diag.link.10368397891868631024.dial.enrolled: 1
+  shard 0 refused diag.link.10368397891868631024.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_max_ns: 1405089
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.held_ns: 1405089
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.lends: 1
+  shard 0 refused diag.link.12423917740952588850.announce_epochs.returns: 1
+  shard 0 refused diag.link.12423917740952588850.ask_pages.held_max_ns: 14266763
+  shard 0 refused diag.link.12423917740952588850.ask_pages.held_ns: 14266763
+  shard 0 refused diag.link.12423917740952588850.ask_pages.lends: 1
+  shard 0 refused diag.link.12423917740952588850.ask_pages.returns: 1
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_max_ns: 12486360
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.held_ns: 12991455
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12423917740952588850.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12423917740952588850.dial.attempts: 2
+  shard 0 refused diag.link.12423917740952588850.dial.enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.dial.established: 1
+  shard 0 refused diag.link.12423917740952588850.dial.failed: 1
+  shard 0 refused diag.link.12423917740952588850.dial.not_enrolled: 1
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_max_ns: 20260459
+  shard 0 refused diag.link.12423917740952588850.discovery_page.held_ns: 307695144
+  shard 0 refused diag.link.12423917740952588850.discovery_page.lends: 67
+  shard 0 refused diag.link.12423917740952588850.discovery_page.returns: 67
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_max_ns: 22031731
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.held_ns: 1960536672
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.lends: 374
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.out_for.discovery_page: 3
+  shard 0 refused diag.link.12423917740952588850.drive_council_replication.returns: 374
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_max_ns: 6489791
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.held_ns: 12690660
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.12423917740952588850.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_max_ns: 16849287
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.held_ns: 22871154
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.12423917740952588850.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_max_ns: 3901202
+  shard 0 refused diag.link.12423917740952588850.request_peer.held_ns: 3901202
+  shard 0 refused diag.link.12423917740952588850.request_peer.lends: 1
+  shard 0 refused diag.link.12423917740952588850.request_peer.returns: 1
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_max_ns: 12915355
+  shard 0 refused diag.link.12423917740952588850.send_council_report.held_ns: 21769442
+  shard 0 refused diag.link.12423917740952588850.send_council_report.lends: 2
+  shard 0 refused diag.link.12423917740952588850.send_council_report.returns: 2
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_max_ns: 407112
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.held_ns: 407112
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.lends: 1
+  shard 0 refused diag.link.12423917740952588850.take_campaign_sessions.returns: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_max_ns: 14419743
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.held_ns: 14419743
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.lends: 1
+  shard 0 refused diag.link.12590906754936366943.announce_epochs.returns: 1
+  shard 0 refused diag.link.12590906754936366943.ask_pages.held_max_ns: 307545
+  shard 0 refused diag.link.12590906754936366943.ask_pages.held_ns: 4675523
+  shard 0 refused diag.link.12590906754936366943.ask_pages.lends: 32
+  shard 0 refused diag.link.12590906754936366943.ask_pages.returns: 32
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_max_ns: 4165706
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.held_ns: 4651514
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.lends: 2
+  shard 0 refused diag.link.12590906754936366943.deliver_pairs.returns: 2
+  shard 0 refused diag.link.12590906754936366943.dial.attempts: 2
+  shard 0 refused diag.link.12590906754936366943.dial.enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.dial.established: 1
+  shard 0 refused diag.link.12590906754936366943.dial.failed: 1
+  shard 0 refused diag.link.12590906754936366943.dial.not_enrolled: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.dropped: 1
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_max_ns: 20890390
+  shard 0 refused diag.link.12590906754936366943.discovery_page.held_ns: 190371130
+  shard 0 refused diag.link.12590906754936366943.discovery_page.lends: 27
+  shard 0 refused diag.link.12590906754936366943.discovery_page.out_for.ask_pages: 9
+  shard 0 refused diag.link.12590906754936366943.discovery_page.returns: 26
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_max_ns: 6484291
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.held_ns: 12698234
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_max_ns: 16856270
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.held_ns: 22865853
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.12590906754936366943.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_max_ns: 9281289
+  shard 0 refused diag.link.12590906754936366943.request_peer.held_ns: 9281289
+  shard 0 refused diag.link.12590906754936366943.request_peer.lends: 1
+  shard 0 refused diag.link.12590906754936366943.request_peer.returns: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_max_ns: 13305168
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.held_ns: 13305168
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.lends: 1
+  shard 0 refused diag.link.13069900790431088743.announce_epochs.returns: 1
+  shard 0 refused diag.link.13069900790431088743.dial.attempts: 1
+  shard 0 refused diag.link.13069900790431088743.dial.enrolled: 1
+  shard 0 refused diag.link.13069900790431088743.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_max_ns: 6029599
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.held_ns: 6029599
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.lends: 1
+  shard 0 refused diag.link.16262110511526451519.announce_epochs.returns: 1
+  shard 0 refused diag.link.16262110511526451519.dial.attempts: 2
+  shard 0 refused diag.link.16262110511526451519.dial.enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.dial.established: 1
+  shard 0 refused diag.link.16262110511526451519.dial.failed: 1
+  shard 0 refused diag.link.16262110511526451519.dial.not_enrolled: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.dropped: 1
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_max_ns: 19290795
+  shard 0 refused diag.link.16262110511526451519.discovery_page.held_ns: 64484351
+  shard 0 refused diag.link.16262110511526451519.discovery_page.lends: 14
+  shard 0 refused diag.link.16262110511526451519.discovery_page.returns: 13
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_max_ns: 6494150
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.held_ns: 12702252
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_max_ns: 16850850
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.held_ns: 22863569
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.16262110511526451519.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_max_ns: 982467
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.held_ns: 982467
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.lends: 1
+  shard 0 refused diag.link.17539389155729462001.announce_epochs.returns: 1
+  shard 0 refused diag.link.17539389155729462001.dial.attempts: 1
+  shard 0 refused diag.link.17539389155729462001.dial.enrolled: 1
+  shard 0 refused diag.link.17539389155729462001.dial.established: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_max_ns: 5566192
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.held_ns: 5566192
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.lends: 1
+  shard 0 refused diag.link.17546846934701830575.announce_epochs.returns: 1
+  shard 0 refused diag.link.17546846934701830575.dial.attempts: 1
+  shard 0 refused diag.link.17546846934701830575.dial.enrolled: 1
+  shard 0 refused diag.link.17546846934701830575.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_max_ns: 10927727
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.held_ns: 10927727
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.lends: 1
+  shard 0 refused diag.link.5854680686530464061.announce_epochs.returns: 1
+  shard 0 refused diag.link.5854680686530464061.ask_pages.held_max_ns: 11975044
+  shard 0 refused diag.link.5854680686530464061.ask_pages.held_ns: 46401942
+  shard 0 refused diag.link.5854680686530464061.ask_pages.lends: 9
+  shard 0 refused diag.link.5854680686530464061.ask_pages.returns: 9
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_max_ns: 10492459
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.held_ns: 15145080
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.lends: 2
+  shard 0 refused diag.link.5854680686530464061.deliver_pairs.returns: 2
+  shard 0 refused diag.link.5854680686530464061.dial.attempts: 2
+  shard 0 refused diag.link.5854680686530464061.dial.enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.dial.established: 1
+  shard 0 refused diag.link.5854680686530464061.dial.failed: 1
+  shard 0 refused diag.link.5854680686530464061.dial.not_enrolled: 1
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_max_ns: 16107937
+  shard 0 refused diag.link.5854680686530464061.discovery_page.held_ns: 375531087
+  shard 0 refused diag.link.5854680686530464061.discovery_page.lends: 60
+  shard 0 refused diag.link.5854680686530464061.discovery_page.out_for.drive_council_replication: 4
+  shard 0 refused diag.link.5854680686530464061.discovery_page.returns: 60
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.held_max_ns: 22028675
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.held_ns: 1957103976
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.lends: 366
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.out_for.discovery_page: 2
+  shard 0 refused diag.link.5854680686530464061.drive_council_replication.returns: 366
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_max_ns: 888471
+  shard 0 refused diag.link.5854680686530464061.request_peer.held_ns: 888471
+  shard 0 refused diag.link.5854680686530464061.request_peer.lends: 1
+  shard 0 refused diag.link.5854680686530464061.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_max_ns: 7942477
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.held_ns: 13061630
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.announce_epochs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_max_ns: 8562744
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.held_ns: 9994993
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.lends: 2
+  shard 0 refused diag.link.9243114246494466095.deliver_pairs.returns: 2
+  shard 0 refused diag.link.9243114246494466095.dial.attempts: 4
+  shard 0 refused diag.link.9243114246494466095.dial.enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.dial.established: 2
+  shard 0 refused diag.link.9243114246494466095.dial.failed: 2
+  shard 0 refused diag.link.9243114246494466095.dial.not_enrolled: 2
+  shard 0 refused diag.link.9243114246494466095.discovery_page.dropped: 1
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_max_ns: 19137363
+  shard 0 refused diag.link.9243114246494466095.discovery_page.held_ns: 381385311
+  shard 0 refused diag.link.9243114246494466095.discovery_page.lends: 71
+  shard 0 refused diag.link.9243114246494466095.discovery_page.returns: 70
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_max_ns: 6494650
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.held_ns: 12701721
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.lends: 2
+  shard 0 refused diag.link.9243114246494466095.drive_learner_fetch.returns: 2
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_max_ns: 16845240
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.held_ns: 22865273
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.lends: 2
+  shard 0 refused diag.link.9243114246494466095.drive_root_learner_fetch.returns: 2
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_max_ns: 1874706
+  shard 0 refused diag.link.9243114246494466095.request_peer.held_ns: 1874706
+  shard 0 refused diag.link.9243114246494466095.request_peer.lends: 1
+  shard 0 refused diag.link.9243114246494466095.request_peer.returns: 1
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_max_ns: 15721096
+  shard 0 refused diag.link.9243114246494466095.send_council_report.held_ns: 37501881
+  shard 0 refused diag.link.9243114246494466095.send_council_report.lends: 3
+  shard 0 refused diag.link.9243114246494466095.send_council_report.returns: 3
+  shard 0 refused fleet.discovery.invalidated: 3
+  shard 0 refused fleet.discovery.pages: 249
+  shard 0 refused fleet.link.invalid.believed_dead: 2
+  shard 0 refused fleet.link.invalid.member_changed: 1
+  shard 0 refused fleet.link.out_of_contact: 2
+  shard 0 refused fleet.plane.announce_lends: 10
+  shard 0 refused fleet.plane.announcements_sent: 10
+  shard 0 refused fleet.report.sent: 9
+  shard 0 refused fleet.seal.pair_served: 8
+  shard 0 refused fleet.takeover.lost: 4
+  the registers' takeover: 1 violations
+
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (10107) panicked at crates/cli/tests/live_chaos.rs:1179:5:
+chaos a member that never held the log at a takeover: the registers' takeover: no survivor adopted the volume's registers within the fleet wait
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+--
+    a_member_that_never_held_the_log_never_stands_in_for_its_holder
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 62.05s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-cli --test live_chaos`
+== run 3 exit 101
+== run 4 at 02:51:29, load 14.84 8.61 3.81
+DIAG formation took 1.283286923s
+DIAG settlement took 1.001094484s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["8989765913194720665", "15247840909194512413", "4226198698028355492", "1465547001022816740", "3441086892927412517"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-11845; council seats at ["chaos-fresh-member-c-11845", "chaos-fresh-member-d-11845", "chaos-fresh-member-e-11845"]
+slates daemon: fleet node `b` of `slates-fleet`: member 8837890342528522210 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 2.084979949s
+DIAG settlement took 436.20167ms
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-11845 replaced by a fresh member, rejoined at 6.819439931s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-d-11845", "chaos-fresh-member-b-11845"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-11845 stopped at 10.425299711s
+chaos a member that never held the log at a takeover: 206 writes acknowledged; owner crashed; holders chaos-fresh-member-d-11845 (with the log) and chaos-fresh-member-b-11845 (stale)
+slates-cluster: fleet: HostId(4226198698028355492) holds HostId(6210124762732932241) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 5228 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2416 steps and 2454 polls (1 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 17 timers, waited 0 times, spawned 5 tasks and finished 5; 17 tasks live; its longest poll is 26 ms and its timer overrun 1 ms
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-11845 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-11845 served the volume after 316.579467ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-11845"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-b-11845 holds a copy fenced below 2: LiveState { holding: true, head: Some(208), durable: None, owed: false, epoch: Some(1), identity: Some(\"366fbcdbad09eefbbe46b32ff524eef2d7fb9ed34069d7015895f3fee71a8612\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-b-11845 keeps its copy", "chaos-fresh-member-c-11845 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-11845; council seats at ["chaos-fresh-member-c-11845", "chaos-fresh-member-d-11845", "chaos-fresh-member-e-11845"]
+  chaos-fresh-member-b-11845 replaced by a fresh member, rejoined at 6.819439931s
+  the owner's holders once settled: ["chaos-fresh-member-d-11845", "chaos-fresh-member-b-11845"]
+  chaos-fresh-member-b-11845 stopped at 10.425299711s
+  206 writes acknowledged; owner crashed; holders chaos-fresh-member-d-11845 (with the log) and chaos-fresh-member-b-11845 (stale)
+  chaos-fresh-member-d-11845 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-d-11845 served the volume after 316.579467ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-11845"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-b-11845 holds a copy fenced below 2: LiveState { holding: true, head: Some(208), durable: None, owed: false, epoch: Some(1), identity: Some(\"366fbcdbad09eefbbe46b32ff524eef2d7fb9ed34069d7015895f3fee71a8612\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-b-11845 keeps its copy", "chaos-fresh-member-c-11845 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 63.36s
+
+== run 4 exit 0
+== run 5 at 02:52:33, load 15.62 10.14 4.68
+DIAG formation took 997.195753ms
+DIAG settlement took 1.458107109s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["3922759039812834690", "13756062844528031778", "9459454504017744097", "15381318548050833372", "5314185121256703016"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-b-13531; council seats at ["chaos-fresh-member-a-13531", "chaos-fresh-member-c-13531", "chaos-fresh-member-e-13531"]
+slates daemon: fleet node `d` of `slates-fleet`: member 15057479706238317329 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 1.0181398s
+DIAG settlement took 1.68396965s
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-13531 replaced by a fresh member, rejoined at 6.991893463s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-a-13531", "chaos-fresh-member-d-13531"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-13531 stopped at 10.769982918s
+chaos a member that never held the log at a takeover: 209 writes acknowledged; owner crashed; holders chaos-fresh-member-a-13531 (with the log) and chaos-fresh-member-d-13531 (stale)
+slates-cluster: fleet: HostId(9459454504017744097) holds HostId(14612851742157573765) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(9459454504017744097) holds HostId(14612851742157573765) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13531 adopted the registers; chaos-fresh-member-a-13531 stopped for 3s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13531 took the volume over while the holder of the log was stopped
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 1 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-13531 served the volume after 434.953855ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-a-13531"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-d-13531 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-b-13531; council seats at ["chaos-fresh-member-a-13531", "chaos-fresh-member-c-13531", "chaos-fresh-member-e-13531"]
+  chaos-fresh-member-d-13531 replaced by a fresh member, rejoined at 6.991893463s
+  the owner's holders once settled: ["chaos-fresh-member-a-13531", "chaos-fresh-member-d-13531"]
+  chaos-fresh-member-d-13531 stopped at 10.769982918s
+  209 writes acknowledged; owner crashed; holders chaos-fresh-member-a-13531 (with the log) and chaos-fresh-member-d-13531 (stale)
+  chaos-fresh-member-e-13531 adopted the registers; chaos-fresh-member-a-13531 stopped for 3s
+  chaos-fresh-member-e-13531 took the volume over while the holder of the log was stopped
+  NoLoss (a takeover without the log's holder): held
+  decisive true; phase one waited for the holders 1 times while the holder was stopped
+  chaos-fresh-member-e-13531 served the volume after 434.953855ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-a-13531"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies dropped holders still keep: ["chaos-fresh-member-d-13531 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 67.12s
+
+== run 5 exit 0
+== run 6 at 02:53:41, load 15.68 11.33 5.47
+DIAG formation took 1.196239569s
+DIAG settlement took 1.003200241s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["5164898453876375454", "380459050178368442", "8468985928886117218", "4451700765262904088", "15381033175835655190"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-c-15296; council seats at ["chaos-fresh-member-a-15296", "chaos-fresh-member-b-15296", "chaos-fresh-member-d-15296"]
+slates daemon: fleet node `e` of `slates-fleet`: member 5544182925860979138 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 1.158195456s
+DIAG settlement took 2.384029374s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-15296 replaced by a fresh member, rejoined at 9.258279037s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-b-15296", "chaos-fresh-member-a-15296"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-a-15296 stopped at 15.085685307s
+chaos a member that never held the log at a takeover: 147 writes acknowledged; owner crashed; holders chaos-fresh-member-b-15296 (with the log) and chaos-fresh-member-a-15296 (stale)
+slates daemon: the control shard's beat task ran 5276 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4070 steps and 4102 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 16 timers, waited 0 times, spawned 8 tasks and finished 7; 18 tasks live; its longest poll is 20 ms and its timer overrun 5 ms
+slates-cluster: fleet: HostId(4451700765262904088) holds HostId(5164898453876375454) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-15296 adopted the registers; chaos-fresh-member-b-15296 stopped for 3s
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-15296 took the volume over while the holder of the log was stopped
+chaos a member that never held the log at a takeover: decisive true; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-15296 served the volume after 436.850745ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-b-15296"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-a-15296 holds a copy fenced below 2: LiveState { holding: true, head: Some(154), durable: None, owed: false, epoch: Some(1), identity: Some(\"412b17b08a1b5542817c1558f5924ea68246855b998ff06c62977f2636dde001\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-a-15296 keeps its copy", "chaos-fresh-member-d-15296 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-c-15296; council seats at ["chaos-fresh-member-a-15296", "chaos-fresh-member-b-15296", "chaos-fresh-member-d-15296"]
+  chaos-fresh-member-e-15296 replaced by a fresh member, rejoined at 9.258279037s
+  the owner's holders once settled: ["chaos-fresh-member-b-15296", "chaos-fresh-member-a-15296"]
+  chaos-fresh-member-a-15296 stopped at 15.085685307s
+  147 writes acknowledged; owner crashed; holders chaos-fresh-member-b-15296 (with the log) and chaos-fresh-member-a-15296 (stale)
+  chaos-fresh-member-e-15296 adopted the registers; chaos-fresh-member-b-15296 stopped for 3s
+  chaos-fresh-member-e-15296 took the volume over while the holder of the log was stopped
+  NoLoss (a takeover without the log's holder): held
+  decisive true; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-e-15296 served the volume after 436.850745ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-b-15296"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-a-15296 holds a copy fenced below 2: LiveState { holding: true, head: Some(154), durable: None, owed: false, epoch: Some(1), identity: Some(\"412b17b08a1b5542817c1558f5924ea68246855b998ff06c62977f2636dde001\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-a-15296 keeps its copy", "chaos-fresh-member-d-15296 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 75.09s
+
+== run 6 exit 0
+== run 7 at 02:54:57, load 15.48 12.35 6.29
+DIAG formation took 405.636554ms
+DIAG settlement took 1.321170356s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["16205665455531544049", "10731568873160442587", "10274131728047961081", "11422408401132269835", "4362398650403756035"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-17393; council seats at ["chaos-fresh-member-b-17393", "chaos-fresh-member-c-17393", "chaos-fresh-member-e-17393"]
+slates daemon: fleet node `b` of `slates-fleet`: member 2812353256550248792 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 1.689148978s
+DIAG settlement took 1.971250488s
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-17393 replaced by a fresh member, rejoined at 8.880180465s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-c-17393", "chaos-fresh-member-d-17393"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-d-17393 stopped at 14.661239218s
+chaos a member that never held the log at a takeover: 169 writes acknowledged; owner crashed; holders chaos-fresh-member-c-17393 (with the log) and chaos-fresh-member-d-17393 (stale)
+slates-server: a client's claim was refused: send refused (code Some(32)) (first occurrence; later ones are counted)
+slates daemon: the control shard's beat task ran 5263 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 17 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 12 timers, waited 3 times, spawned 5 tasks and finished 5; 17 tasks live; its longest poll is 19 ms and its timer overrun 0 ms
+--
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-17393 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-c-17393 served the volume after 179.970568ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-17393"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-17393 holds a copy fenced below 2: LiveState { holding: true, head: Some(176), durable: None, owed: false, epoch: Some(1), identity: Some(\"0c0889bab06ff743f50b7facdbf2e8dc585832edf32112002f03dc03d2a0c2ec\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-b-17393 keeps its copy", "chaos-fresh-member-d-17393 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-17393; council seats at ["chaos-fresh-member-b-17393", "chaos-fresh-member-c-17393", "chaos-fresh-member-e-17393"]
+  chaos-fresh-member-b-17393 replaced by a fresh member, rejoined at 8.880180465s
+  the owner's holders once settled: ["chaos-fresh-member-c-17393", "chaos-fresh-member-d-17393"]
+  chaos-fresh-member-d-17393 stopped at 14.661239218s
+  169 writes acknowledged; owner crashed; holders chaos-fresh-member-c-17393 (with the log) and chaos-fresh-member-d-17393 (stale)
+  chaos-fresh-member-c-17393 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-c-17393 served the volume after 179.970568ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-e-17393"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-d-17393 holds a copy fenced below 2: LiveState { holding: true, head: Some(176), durable: None, owed: false, epoch: Some(1), identity: Some(\"0c0889bab06ff743f50b7facdbf2e8dc585832edf32112002f03dc03d2a0c2ec\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-b-17393 keeps its copy", "chaos-fresh-member-d-17393 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 67.77s
+
+== run 7 exit 0
+== run 8 at 02:56:05, load 15.70 13.13 7.01
+DIAG formation took 943.148539ms
+DIAG settlement took 1.493217434s
+chaos: fleet fresh-member (Bare) formed and settled: hosts ["15675781643894848146", "8994174028843800847", "10776146296291310417", "2008684383290287423", "10403994540337556726"]
+chaos a member that never held the log at a takeover: owner chaos-fresh-member-a-19288; council seats at ["chaos-fresh-member-b-19288", "chaos-fresh-member-d-19288", "chaos-fresh-member-e-19288"]
+slates daemon: fleet node `b` of `slates-fleet`: member 9763096595653524726 with 4 peer(s) at f = 1
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+--
+DIAG formation took 2.478986457s
+DIAG settlement took 686.108462ms
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-19288 replaced by a fresh member, rejoined at 9.363209701s
+chaos a member that never held the log at a takeover: the owner's holders once settled: ["chaos-fresh-member-b-19288", "chaos-fresh-member-e-19288"]
+chaos a member that never held the log at a takeover: chaos-fresh-member-e-19288 stopped at 16.736381853s
+slates-cluster: fleet: HostId(6281102543411352331) holds HostId(10403994540337556726) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates daemon: the control shard's beat task ran 5246 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 6465 steps and 6511 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 16 timers, waited 0 times, spawned slates-cluster: fleet: 9HostId tasks and finished (96281102543411352331; )17 holds  tasks live; its longest poll is HostId23( ms and its timer overrun 1040399454033755672614) ms alive: 
+--
+chaos a member that never held the log at a takeover: 138 writes acknowledged; owner crashed; holders chaos-fresh-member-b-19288 (with the log) and chaos-fresh-member-e-19288 (stale)
+slates-cluster: fleet: HostId(2008684383290287423) holds HostId(10403994540337556726) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:618:8
+slates-cluster: fleet: HostId(2008684383290287423) holds HostId(10403994540337556726) alive: Some(MemberState { liveness: Dead, incarnation: 0 }) -> MemberState { liveness: Alive, incarnation: 1 }, folded at crates/server/src/member_task.rs:718:9
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-19288 adopted the registers; it holds the log itself, so this run cannot show the defect
+chaos a member that never held the log at a takeover: decisive false; phase one waited for the holders 0 times while the holder was stopped
+chaos a member that never held the log at a takeover: chaos-fresh-member-b-19288 served the volume after 86.743868ms
+chaos a member that never held the log at a takeover: the successor's recorded and active holders among the survivors: ["chaos-fresh-member-c-19288"]
+chaos a member that never held the log at a takeover: copies on members no longer holders, at the takeover: ["chaos-fresh-member-e-19288 holds a copy fenced below 2: LiveState { holding: true, head: Some(147), durable: None, owed: false, epoch: Some(1), identity: Some(\"af4279339234db9ec0f8d904759412ff784d74ae78038fbae9806242eca61ff1\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+chaos a member that never held the log at a takeover: copies dropped holders still keep: ["chaos-fresh-member-d-19288 keeps its copy", "chaos-fresh-member-e-19288 keeps its copy"]
+chaos a member that never held the log at a takeover:
+  owner chaos-fresh-member-a-19288; council seats at ["chaos-fresh-member-b-19288", "chaos-fresh-member-d-19288", "chaos-fresh-member-e-19288"]
+  chaos-fresh-member-b-19288 replaced by a fresh member, rejoined at 9.363209701s
+  the owner's holders once settled: ["chaos-fresh-member-b-19288", "chaos-fresh-member-e-19288"]
+  chaos-fresh-member-e-19288 stopped at 16.736381853s
+  138 writes acknowledged; owner crashed; holders chaos-fresh-member-b-19288 (with the log) and chaos-fresh-member-e-19288 (stale)
+  chaos-fresh-member-b-19288 adopted the registers; it holds the log itself, so this run cannot show the defect
+  decisive false; phase one waited for the holders 0 times while the holder was stopped
+  chaos-fresh-member-b-19288 served the volume after 86.743868ms
+  NoLoss (successor): held
+  the successor's recorded and active holders among the survivors: ["chaos-fresh-member-c-19288"]
+  StaleNeverCommits (the counted holders' fences): held
+  copies on members no longer holders, at the takeover: ["chaos-fresh-member-e-19288 holds a copy fenced below 2: LiveState { holding: true, head: Some(147), durable: None, owed: false, epoch: Some(1), identity: Some(\"af4279339234db9ec0f8d904759412ff784d74ae78038fbae9806242eca61ff1\"), fence: 1, holders: [], moving_to: [], recorded: [] }"]
+  copies dropped holders still keep: ["chaos-fresh-member-d-19288 keeps its copy", "chaos-fresh-member-e-19288 keeps its copy"]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 72.02s
+
+== run 8 exit 0
