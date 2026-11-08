@@ -1,0 +1,23 @@
+tested c6c07afce9cdb86cfee52af0add0f28f28fcc461 variant after on x86_64, 4 cpus
+admitted exit 0 101s
+  admitted: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  admitted: 20704 of 20704 answered: 20396 served, 0 Overloaded, the last 36.71390623s after the hold; control tasks refused 0
+silent exit 0 3s
+held exit 0 96s
+fleet-forward exit 0 181s
+rt exit 0 11s
+transport exit 0 15s
+wire exit 0 4s
+db exit 101 5s
+  db: error[E0063]: missing field `live_holders` in initializer of `PolicyRecord`
+  db:    --> crates/db/tests/snapshot_cadence.rs:103:13
+  db: error: could not compile `slates-db` (test "snapshot_cadence") due to 1 previous error
+server-lib exit 0 16s
+server exit 0 54s
+client exit 0 50s
+cli exit 0 33s
+harness exit 0 152s
+clippy exit 101 32s
+  clippy: error[E0063]: missing field `live_holders` in initializer of `slates_db::catalog::PolicyRecord`
+  clippy:    --> crates/db/tests/snapshot_cadence.rs:103:13
+  clippy: error: could not compile `slates-db` (test "snapshot_cadence") due to 1 previous error
