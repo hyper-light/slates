@@ -1,0 +1,13 @@
+tested 9597c836fb8d8e4e17024b59a3491950b7c8985a variant after on aarch64, 4 cpus
+catalog exit 101 491s
+  catalog: thread 'a_works_catalog_is_placed_like_a_plain_volumes' (5395) panicked at crates/server/tests/fleet.rs:13484:3:
+  catalog: test a_works_catalog_is_placed_like_a_plain_volumes ... FAILED
+  catalog: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 109 filtered out; finished in 407.81s
+  catalog: error: test failed, to rerun pass `-p slates-server --test fleet`
+takeover exit 101 9s
+  takeover: thread 'a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version' (5518) panicked at crates/server/tests/fleet.rs:13717:3:
+  takeover:   left: Refused { refusal: OwnerUnreachable { region: 0 } }
+  takeover:  right: Submitted { version: Some(1), conflicts: [] }
+  takeover: test a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version ... FAILED
+  takeover: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 109 filtered out; finished in 8.97s
+  takeover: error: test failed, to rerun pass `-p slates-server --test fleet`
