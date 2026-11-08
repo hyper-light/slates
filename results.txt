@@ -1,0 +1,15 @@
+tested 48f492f15de59f6b4da9bf64ed8f3788c9dec8cf variant after on x86_64, 4 cpus
+burst exit 101 168s
+  burst: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  burst: 20704 of 20704 answered: 16505 served, 0 Overloaded, the last 71.955794928s after the hold; control tasks refused 0
+  burst: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5680) panicked at crates/server/tests/fleet.rs:5509:3:
+  burst: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  burst: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 114 filtered out; finished in 76.08s
+  burst: error: test failed, to rerun pass `-p slates-server --test fleet`
+burst-again exit 101 65s
+  burst-again: b: clients_per_shard 2583 slots 32 shards 2 tasks_per_shard 10344 lane bound 165312; 647 clients x 32 forwards
+  burst-again: 20704 of 20704 answered: 12647 served, 0 Overloaded, the last 60.46758353s after the hold; control tasks refused 0
+  burst-again: thread 'a_silent_owner_leaves_no_forward_the_lane_admitted_unrun' (5722) panicked at crates/server/tests/fleet.rs:5509:3:
+  burst-again: test a_silent_owner_leaves_no_forward_the_lane_admitted_unrun ... FAILED
+  burst-again: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 114 filtered out; finished in 64.53s
+  burst-again: error: test failed, to rerun pass `-p slates-server --test fleet`
