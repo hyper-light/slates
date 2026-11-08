@@ -2296,7 +2296,7 @@ impl<'b> Export<'b> {
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     // A block or character device is read whole, as any MKNOD is, then refused after the name and the directory are
-    // checked (A-263). Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
+    // checked (A-268). Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
     let kind = match args.u32().map(Ftype3::from_wire) {
       Ok(Some(Ftype3::Fifo)) => Some(Kind::Fifo),
       Ok(Some(Ftype3::Sock)) => Some(Kind::Socket),
@@ -2352,7 +2352,7 @@ impl<'b> Export<'b> {
     )
   }
 
-  /// The answer to a MKNOD of a block or character device (§4.6 A-26, A-263): slates makes no device nodes, so it is
+  /// The answer to a MKNOD of a block or character device (§4.6 A-26, A-268): slates makes no device nodes, so it is
   /// refused as a local file system that cannot hold one refuses it, in the order Linux's `vfs_mknod` takes its checks.
   /// A taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so the server must
   /// say so); a directory the caller may not write is `NFS3ERR_ACCES`; then `NFS3ERR_PERM`, which a client reports as

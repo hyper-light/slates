@@ -787,7 +787,7 @@ fn sparse_seek_and_copy(root: &Path) {
   std::fs::remove_file(&sparse).unwrap();
 }
 
-/// A-26, A-263: through the kernel's own client, `mknod` of a character and a block device as root fails with `EPERM`
+/// A-26, A-268: through the kernel's own client, `mknod` of a character and a block device as root fails with `EPERM`
 /// ("Operation not permitted"), what a local file system that holds no device nodes answers. It ran as root because a
 /// client without `CAP_MKNOD` refuses before it asks the server. Before, the server's `NFS4ERR_BADTYPE` reached the
 /// program as the client's internal errno 527 ("Unknown error 527").

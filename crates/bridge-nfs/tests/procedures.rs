@@ -1850,7 +1850,7 @@ fn lookup_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> u32 {
   XdrReader::new(&reply).u32().unwrap()
 }
 
-/// AC-3.10 / A-26, A-263. Do: MKNOD a block and a character device as root. Expect: `NFS3ERR_PERM`, which a client
+/// AC-3.10 / A-26, A-268. Do: MKNOD a block and a character device as root. Expect: `NFS3ERR_PERM`, which a client
 /// reports as `EPERM`, what `mknod(2)` answers for "the filesystem ... does not support the type of node requested",
 /// and no name made. Before, the answer was `NFS3ERR_BADTYPE`, which the Linux client turns into its internal
 /// `EBADTYPE`, errno 527, and every program printed "Unknown error 527".
@@ -1875,7 +1875,7 @@ fn a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses
   }
 }
 
-/// A-263. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not write the root,
+/// A-268. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not write the root,
 /// MKNOD a device in it. Expect: `NFS3ERR_EXIST` for the taken name and `NFS3ERR_ACCES` for the directory, each before
 /// the device's own refusal, in the order Linux's `vfs_mknod` takes them (the lookup, then `may_create`, then the node
 /// type). An exclusive create over NFS skips the client's own lookup, so the server is the one that must say the name

@@ -12048,7 +12048,7 @@ Status: built 2026-10-05 (condition 4).
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
   writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-263).
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268).
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -16091,7 +16091,7 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
 
-### A-263 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
 `docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
 (`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
@@ -16100,6 +16100,10 @@ Applied in the same change to: A-26 (its device refusal's answer), the condition
   maps both to its internal `EBADTYPE`, errno 527, which reached every program as "Unknown error 527": 331 cases of a
   full pjdfstest run over NFSv4, and the same over NFSv3 (CI run 42498995934 and a CachyOS run, 2026-11-08). It was
   also answered before the name was looked at.
+- **Why EPERM.** On a local Linux file system a device node needs privilege (`CAP_MKNOD`, checked in `vfs_mknod`), and
+  slates never holds privilege (R10), so `EPERM` is what a local file system gives this same caller. RFC 1813's
+  `BADTYPE` describes a server that lacks the type, which is not slates' reason, and Linux turns it into a
+  kernel-internal errno that leaks to programs.
 - **The rule.** Slates makes no device nodes (A-26), so it answers as a local file system that cannot hold one, in the
   order Linux's `vfs_mknod` checks: a taken name is `EXIST` (an exclusive create over NFS skips the client's own lookup,
   so only the server can say so), a directory the caller may not write is `ACCES`, then `PERM`, which a client reports

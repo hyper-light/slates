@@ -3709,7 +3709,7 @@ fn lookupp_names_the_parent_and_is_noent_at_the_root() {
   );
 }
 
-/// A-26, A-263. Do: CREATE a character device and a block device in the root through NFSv4, then CREATE a directory
+/// A-26, A-268. Do: CREATE a character device and a block device in the root through NFSv4, then CREATE a directory
 /// and a character device of the directory's name. Expect: each device is `NFS4ERR_PERM` (a client's `EPERM`, what a
 /// local file system that holds no device nodes answers `mknod`), and the taken name is `NFS4ERR_EXIST` first. Before,
 /// both were `NFS4ERR_BADTYPE`, which the Linux client turns into its internal `EBADTYPE`, errno 527.
