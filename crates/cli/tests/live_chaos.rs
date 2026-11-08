@@ -345,12 +345,15 @@ fn wait_formed(instances: &[String], members: usize) -> Vec<String> {
   }
 }
 
-/// Waits until every node in `instances` has settled at its own neighbourhood generation (the fleet's objects re-placed
-/// onto the neighbourhood after a membership change), judged by progress ([`FrozenWindow`]).
+/// Waits until every node in `instances` holds the fleet's newest configuration and has settled at its own neighbourhood
+/// generation (the fleet's objects re-placed onto the neighbourhood after a membership change), judged by progress
+/// ([`FrozenWindow`]). Settled at its own generation alone certifies a learner left behind: in each of four runs that
+/// lost the takeover after this wait, one learner sat at configuration 7 or 8, settled == neighbourhood at 3 or 4,
+/// while the council was at 19–24 (diag-live-fixes-34 runs 1 and 3, -35 runs 5 and 8; live-fixes, 2026-11-08).
 fn wait_neighbourhood_settled(instances: &[String]) {
   let mut window = FrozenWindow::new();
   loop {
-    let views: Vec<(Option<u64>, Option<u64>)> = instances
+    let views: Vec<(Option<u64>, Option<u64>, Option<u64>)> = instances
       .iter()
       .map(|instance| {
         let (_, out, _) = run(instance, &["status"]);
@@ -363,22 +366,26 @@ fn wait_neighbourhood_settled(instances: &[String]) {
         (
           read("fleet_settled_generation"),
           read("fleet_neighbourhood_generation"),
+          read("fleet_configuration_version"),
         )
       })
       .collect();
+    // The configuration's version is the council's, one count for the whole fleet, so every node must reach the newest
+    // any node holds.
+    let newest = views.iter().filter_map(|(_, _, version)| *version).max();
     // Each node settled at its own neighbourhood generation. The generations are each node's own count and differ
     // between nodes in a settled fleet (3, 8 and 11 side by side in diag-31), so they are not compared across nodes; a
     // node retired while away is kept out by the stale holder's short stop instead.
-    if views
-      .iter()
-      .all(|(settled, neighbourhood)| settled.is_some() && settled == neighbourhood)
-    {
+    if views.iter().all(|(settled, neighbourhood, version)| {
+      settled.is_some() && settled == neighbourhood && version.is_some() && *version == newest
+    }) {
       return;
     }
     if !window.moving(&format!("{views:?}")) {
       // What the stuck node reported and shipped toward its new cohort (live-fixes, 2026-11-07).
       panic!(
-        "every neighbourhood settled, or kept changing, within each fleet wait: {views:?}\n{}",
+        "every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet \
+         wait (settled, neighbourhood, configuration version): {views:?}\n{}",
         diagnosis(instances, "")
       );
     }
