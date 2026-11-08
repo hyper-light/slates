@@ -1,0 +1,66 @@
+name: DIAG raft-chaos record-session lending through formation under load (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. The tree: live-durability's lanes, live-fixes' joint holder
+# transition, and A-240 (phase one counting the recorded holders; heads, then the adopted holder's log; a new shipper
+# starting from the recorded set). Three jobs, each publishing its results to a branch by git push (read with git
+# fetch, no API call): the KIND live leg; the five-node fresh-member flow x5; the kill-at-acknowledgement flow x3.
+
+on:
+  push:
+    branches: [diag-raft-chaos-formation-49]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  flows:
+    name: Flow ${{ matrix.flow.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        flow:
+          - { name: fresh-member, test: a_member_that_never_held_the_log_never_stands_in_for_its_holder, runs: "1 2 3 4 5 6 7 8", file: live_chaos }
+          - { name: kill-at-ack, test: a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor, runs: "1 2 3", file: live_chaos }
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates --test live_chaos --test live_fleet
+      - name: The flow
+        run: |
+          R=../results.txt
+          echo "runner ubuntu-latest, $(nproc) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          # Load: two busy loops a CPU for the whole step, as live-fixes' 36 spinners on an 18-core Mac.
+          SPIN=$((2 * $(nproc)))
+          for i in $(seq $SPIN); do (while :; do :; done) & done
+          echo "spinners $SPIN" >> $R
+          for run in ${{ matrix.flow.runs }}; do
+            echo "== run $run at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" | tee -a $R
+            status=0
+            timeout 1200 cargo test --release --locked -p slates-cli --test ${{ matrix.flow.file }} -- --nocapture --test-threads=1 --exact ${{ matrix.flow.test }} > ../run.log 2>&1 || status=$?
+            grep -E -A2 '^chaos|panicked|violat|FAILED|test result|^  |^---|within each fleet wait|live fence|^DIAG' ../run.log | cut -c1-900 | tail -1500 >> $R
+            echo "== run $run exit $status" | tee -a $R
+          done
+          jobs -p | xargs -r kill || true
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-formation-49 ${{ matrix.flow.name }} results"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-formation-49-${{ matrix.flow.name }}"
