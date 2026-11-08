@@ -1019,11 +1019,20 @@ impl Endpoint {
             }
             continue;
           }
-          // A later fragment of that same retransmit: nothing more to answer, and bounded with the others.
+          // A later fragment of that same retransmit is as much a sign the peer is asking as its first, which a
+          // constrained path may have dropped: it is answered at the same pace, and bounded with the others.
           crate::flight::Reassembly::RepeatRest => {
             partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
               return Err(self.stalled(HandshakeStall::Fragments));
+            }
+            let now = now_ns();
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
             }
             continue;
           }
