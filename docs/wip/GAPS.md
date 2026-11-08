@@ -14292,7 +14292,7 @@ because sixteen daemons share the test process, and was the second partition.
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
 
-### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-244)
+### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-250)
 
 `a_member_down_through_a_voters_restart_is_still_taken_over` (`crates/cli/tests/live_fleet.rs`) stops a voter and
 restarts it warm, then kills the owner of a volume. It failed for two causes in turn (adacachy):

@@ -1,7 +1,7 @@
 # A holder restarted warm lost its copies' routing, and refused their successor's adoption
 
 **Found:** 2026-11-07, by `a_member_down_through_a_voters_restart_is_still_taken_over` in
-`crates/cli/tests/live_fleet.rs` (agents/raft-6). Once the restarted leader could retire the dead owner at f + 1
+`crates/cli/tests/live_fleet.rs` (agents/raft-6). Amendment: A-250 (§4.8 "Promotion and takeover"). Once the restarted leader could retire the dead owner at f + 1
 votes (caf06d71), the test still failed in 1 of about 3 runs: no survivor served the owner's volume within the fleet
 wait.
 

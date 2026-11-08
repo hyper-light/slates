@@ -5239,7 +5239,7 @@ integration still require the A-9 tests.
 > `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits` (CLI), and
 > `a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it`.
 
-> **Status (2026-11-07, A-244, the supervisor's decision "A's tracking with B's confirmation";
+> **Status (2026-11-07, A-250, the supervisor's decision "A's tracking with B's confirmation";
 > `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`).** A member that dies while a voter
 > restarts is now taken over. Two corrections:
 > - **Who declares a death.** The council's leader retires a member only once `f + 1` voters hold it dead, its own
@@ -14860,7 +14860,7 @@ Applied in the same change to:
   - A base-seeded green's origin is held as chunks beside the head copy (W4, reland-a207's).
   - Greens merged before the fix may hold zeros a run after a length change put there.
 
-### A-244 — A member's death is retired at f + 1 voters, configured members are watched after a restart, and a restored copy is routed (accepted and built 2026-11-07, the supervisor's decision "A's tracking with B's confirmation")
+### A-250 — A member's death is retired at f + 1 voters, configured members are watched after a restart, and a restored copy is routed (accepted and built 2026-11-07, the supervisor's decision "A's tracking with B's confirmation")
 
 Applied in the same change to:
 - §4.8 "Promotion and takeover": a status note.
