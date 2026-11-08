@@ -429,4 +429,30 @@ mod tests {
       Attribution::NoClock
     );
   }
+
+  /// A-223, §4.3 (the online estimate's unslept filter, by use): do read the calling thread's switch count, block the
+  /// thread for a millisecond, and read it again. Expect, on every platform whose shards judge a kicked park by it
+  /// (Linux, and Windows since A-223), a count that rose: the block switched the thread out, which is how `note_wake`
+  /// tells a park that slept from one whose wait found the kick pending. macOS counts none and skips loudly. Before
+  /// A-223 Windows read none, so a kick landing between the wait's entry and its block was learned as a wake of
+  /// 0.6–0.8 µs (jupiter, 2026-11-05).
+  #[test]
+  #[cfg_attr(miri, ignore)] // no switch count under Miri
+  #[allow(clippy::disallowed_methods)] // the test blocks the thread on purpose: the block is what is counted.
+  fn a_thread_that_blocked_reads_a_higher_switch_count_where_shards_judge_their_wakes_by_it() {
+    let judged = cfg!(any(target_os = "linux", windows));
+    let before = voluntary_switches_now();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let after = voluntary_switches_now();
+    if !judged {
+      eprintln!(
+        "skipped: this OS counts no per-thread switches; its kicked parks are judged by their stamps alone"
+      );
+      return;
+    }
+    assert!(
+      matches!((before, after), (Some(before), Some(after)) if after > before),
+      "{before:?} → {after:?}"
+    );
+  }
 }

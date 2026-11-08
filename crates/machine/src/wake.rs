@@ -901,8 +901,10 @@ mod tests {
   /// this machine: the probe reports a mean inside its interval from its rounds, with the median and p99
   /// beside it. Where the OS pins and the fastest class has two cores (Linux, Windows) the pair was pinned
   /// and every kept wake crossed CPUs — so the handoff the old probe mixed in cannot enter; where it can
-  /// query a thread's state (Linux, macOS) every waiter was confirmed asleep before its wake. The calling
-  /// thread gets its mask back (the core matrix's rule).
+  /// query a thread's state (Linux, macOS) or watch its cycle count stand still (Windows) every waiter
+  /// was confirmed asleep before its wake. The calling thread gets its mask back (the core matrix's
+  /// rule). Windows is held to it too (A-223): its probe once let the waiter's own announcement stand
+  /// in, and measured 0.6–0.8 µs, a waiter caught before it slept.
   #[test]
   fn a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement() {
     let facts = Facts::query();
@@ -927,7 +929,7 @@ mod tests {
       // probe kept or dropped ran on one CPU.
       assert_eq!(w.same_cpu_samples, 0, "{w:?}");
     }
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
       assert!(w.asleep_confirmed, "{w:?}");
     }
   }
