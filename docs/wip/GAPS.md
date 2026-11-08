@@ -50,13 +50,16 @@
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
 > **Fixed (live-durability, 2026-11-08): the transport fell a session to the 1,200-byte MTU floor on loss every size
-> suffered (§4.10a, RFC 8899 §4.3).** Three consecutive above-floor losses, or three probe timeouts while a full-size
-> packet was out, declared a black hole, so a SIGSTOPped peer or a burst a full receive buffer dropped left a loopback
-> session at the floor. The rolling partition flow's resumed candidates ran there (diag-live-durability-42 and -43: MTU
-> 65,496 to 1,200, then a catch-up too slow to converge). Now loss and silence only make the size suspect: the session
-> sends at the floor and probes at the size, which stands at one acknowledged probe, and only `MAX_PROBES` lost probes
-> at it while the floor's packets cross are a black hole. `a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu`
-> and `a_burst_that_loses_every_size_keeps_the_path_mtu` were red before; the shrink test is green on both. Bug record
+> suffered (A-253, §4.10a, RFC 8899 §4.3).** Three consecutive above-floor losses, or three probe timeouts while a
+> full-size packet was out, declared a black hole, so a SIGSTOPped peer or a burst a full receive buffer dropped left a
+> loopback session at the floor. The rolling partition flow's resumed candidates ran there (diag-live-durability-42 and
+> -43: MTU 65,496 to 1,200, then a catch-up too slow to converge). Now loss and silence only make the size suspect: the
+> session sends at the floor and probes at the size, which stands at one acknowledged probe, and only `MAX_PROBES` lost
+> probes at it while the floor's packets cross are a black hole.
+> `a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu` and `a_burst_that_loses_every_size_keeps_the_path_mtu`
+> were red before; the shrink test is green on both. Rolling partition, 60 runs: 89 falls to the floor on main
+> (diag-live-durability-48), 87 suspicions and no black hole on the fix (-51). The stall rate is unchanged within what
+> 60 runs can show (0 stalls against 1, at about 1 in 100). Bug record
 > `docs/bugs/2026-11-08-a-session-fell-to-the-mtu-floor-on-loss-every-size-suffered.md`.
 
 > **Fixed (live-fixes, 2026-11-07): a live write counted durable on too few holders when the owner fell outside its own

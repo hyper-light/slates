@@ -13621,6 +13621,9 @@ Applied in the same change to:
 - **A probe timeout counts toward no black hole.** A stopped peer acknowledges nothing at any size, so it declares no
   probe lost and never makes one. Three timeouts still start the confirmation; one does not (a single timeout was enough
   in the first cut: at least 1,230 and 1,525 suspicions in 30 partition runs per arch, diag-live-durability-49).
+- **Measured.** Rolling partition, 60 runs on each build: 89 falls to the floor on the old rule (diag-live-durability-48);
+  87 suspicions and no black hole on this rule (-51), every suspicion by probe timeout. No session of those runs lost
+  its size. The stall rate is unchanged within what 60 runs can show (0 stalls against 1, at about 1 in 100).
 
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
