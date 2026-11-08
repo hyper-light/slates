@@ -1378,7 +1378,9 @@ fn resolve_refusal(error: &dns::DnsError) -> &'static str {
 /// `client` is driven one `establish` step **on its same socket** (kept for a retry on failure, so the
 /// peer's pinned `accept` completes rather than a fresh-port re-dial being ignored — the establishment
 /// fragility that flaked both the probe mesh's formation and the record plane's takeover under load), and a
-/// client that was consumed but whose session was then lost is rebuilt. Returns the updated `(client, session)`.
+/// client that was consumed but whose session was then lost is rebuilt, its handshake run in the same call. Built in
+/// one call and driven in the next, every redial waited a whole link period first: a median of 101 ms over 487 redials
+/// (diag-live-durability-50), on the way of every resumed peer's catch-up. Returns the updated `(client, session)`.
 async fn establish_session(
   client: Option<Endpoint>,
   session: Option<Endpoint>,
@@ -1392,6 +1394,10 @@ async fn establish_session(
   if session.is_some() {
     return (client, session);
   }
+  let client = match client {
+    Some(endpoint) => Some(endpoint),
+    None => client_for(identity, name, (address, plane), certificate, resolver).await,
+  };
   match client {
     Some(mut endpoint) => match endpoint.establish().await {
       Ok(()) => (None, Some(endpoint)),
@@ -1429,10 +1435,7 @@ async fn establish_session(
         (None, None)
       }
     },
-    None => (
-      client_for(identity, name, (address, plane), certificate, resolver).await,
-      None,
-    ),
+    None => (None, None),
   }
 }
 
@@ -4845,6 +4848,7 @@ async fn enroll_record_session(
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
     });
+    crate::live_ship::holder_reached(peer_host);
   }
 }
 
@@ -8072,6 +8076,70 @@ mod tests {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
     Endpoint::client(socket, peer, &identity, &der, "fleet", fleet_shape()).unwrap()
+  }
+
+  /// A record link's redial (A-200's rolling partition flow): do call [`establish_session`] once with no client, to a
+  /// port nothing is bound to. Expect the call that builds the endpoint to run its first handshake too, a budget spent
+  /// before it returns. Before, the build and the handshake were separate calls a link period apart: 100.3 ms at the
+  /// tenth percentile and 100.9 to 101.9 ms at the median over 487 redials (diag-live-durability-50), on the path of every
+  /// resumed peer's catch-up.
+  #[test]
+  fn a_redial_starts_its_handshake_in_the_call_that_builds_it() {
+    let config = slates_rt::runtime::RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 64,
+      timers_per_shard: 64,
+      ring_entries: 64,
+      step_budget_ns: 1_000_000_000,
+      timer_tick_ns: 100_000,
+      batch: 64,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    };
+    let mut sim = slates_rt::sim::SimRuntime::new(&config, 1).unwrap();
+    let shard = sim.shard_ids()[0];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    sim
+      .spawn_on(shard, async move {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["fleet".to_owned()])
+          .unwrap()
+          .self_signed(&key)
+          .unwrap();
+        let der = certificate.der().clone();
+        let identity = Identity::from_der(
+          der.clone(),
+          rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        );
+        let kept = slates_rt::registry::with_current(|context| context.keep(identity))
+          .unwrap()
+          .unwrap();
+        let address = NodeAddress::Ip(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
+        let (client, session) = establish_session(
+          None,
+          None,
+          kept,
+          "fleet",
+          (&address, crate::deploy::Plane::Record),
+          &der,
+          None,
+        )
+        .await;
+        let _ = result_tx.send((
+          client.map(|dial| dial.handshake_budgets_spent()),
+          session.is_some(),
+        ));
+      })
+      .unwrap();
+    sim.run_until_idle();
+    assert_eq!(
+      result_rx.try_recv().unwrap(),
+      (Some(1), false),
+      "the dial is kept with its first handshake budget spent (the peer is silent), no session"
+    );
   }
 
   /// AC-8.1 (§4.8 "Deployment", task #22; docs/bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md):

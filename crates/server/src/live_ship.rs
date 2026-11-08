@@ -68,6 +68,10 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
+/// Counter: an install built to send a holder, the volume's whole state copied on the owner's shard.
+const LIVE_INSTALL_BUILT: &str = "fleet.live.install_built";
+/// Counter: an install a holder applied (its log replaced by the owner's whole state).
+const LIVE_INSTALL_TAKEN: &str = "fleet.live.install_taken";
 /// Counter: entries appended to a live volume's log on this owner shard.
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
@@ -195,6 +199,11 @@ pub(crate) struct LiveVolume {
   /// The holders a lane is shipping to now, each with when it began ([`dispatch`]): at most one lane a holder, so the
   /// messages a holder lacks queue here, not as tasks waiting for its one session.
   lanes: BTreeMap<HostId, u64>,
+  /// The holders whose last lane ended unanswered: nothing is built for them until the record period retries or their
+  /// session is back ([`holder_reached`]). A publication built their messages anyway, and the lane ended at once for want
+  /// of a session, so it was never busy: an install a write, a whole-volume clone on this shard each (a median of 2,396
+  /// and 2,769 a run, 10.9 GB, against about 3.5 served, `live_chaos`'s rolling partition, diag-live-durability-54).
+  unreachable: Vec<HostId>,
   /// The holders known to hold a version of the volume's catalog, which a holder's bound is derived from
   /// ([`hold_bound`]): every holder any of the catalog's placements named, kept. Bounded by the candidates.
   catalogued: Vec<HostId>,
@@ -892,6 +901,7 @@ pub(crate) fn published(
       fenced: None,
       kept: 0,
       lanes: BTreeMap::new(),
+      unreachable: Vec::new(),
       catalogued: Vec::new(),
       recorded: None,
       recording: None,
@@ -1503,12 +1513,13 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
     .collect();
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
+  let mut installs_built = 0_u64;
   let targets: Vec<HostId> = live.shipper.targets().collect();
   for holder in &targets {
     // A holder that has not acknowledged the volume's catalog refuses the log (its bound is the catalog's size,
     // `hold_bound`): the record plane places the catalog there first, re-shipped each period, and the next dispatch after
     // that ships it the log.
-    if !catalogued.contains(holder) || busy.contains(holder) {
+    if !catalogued.contains(holder) || busy.contains(holder) || live.unreachable.contains(holder) {
       continue;
     }
     match live.shipper.pending(*holder) {
@@ -1523,31 +1534,10 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
         }
       }
       Next::Install => {
-        let Some((head, payload)) = &live.whole else {
-          stale_checkpoint = true;
-          continue;
-        };
-        if live
-          .shipper
-          .held_by(*holder)
-          .is_some_and(|held| held.rank() >= head.rank())
-        {
-          stale_checkpoint = true;
-          continue;
-        }
-        let install = Install {
-          owner: live.shipper.owner(),
-          object,
-          epoch: live.shipper.epoch(),
-          head: *head,
-          state: payload.clone(),
-        };
-        sends.push(Send {
-          object,
-          holder: *holder,
-          stream: slates_cluster::live::LIVE_STATE_STREAM,
-          bytes: install.encode(),
-        });
+        let (send, stale) = install_for(live, object, *holder);
+        stale_checkpoint |= stale;
+        installs_built = installs_built.saturating_add(u64::from(send.is_some()));
+        sends.extend(send);
       }
       Next::Nothing | Next::Fenced(_) => {}
     }
@@ -1555,7 +1545,43 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   if stale_checkpoint {
     live.owes_image = true;
   }
+  if installs_built > 0 {
+    state.count(LIVE_INSTALL_BUILT, installs_built);
+  }
   sends
+}
+
+/// The install to send `holder`, and whether the image is too old for it. `None` and not stale while a fresh image is on
+/// its way ([`send_to_reached`]): one sent now would land the holder behind the tail. `None` and stale when there is no
+/// image, or the holder already holds what it carries.
+fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<Send>, bool) {
+  if live.owes_image {
+    return (None, false);
+  }
+  let Some((head, payload)) = &live.whole else {
+    return (None, true);
+  };
+  if live
+    .shipper
+    .held_by(holder)
+    .is_some_and(|held| held.rank() >= head.rank())
+  {
+    return (None, true);
+  }
+  let install = Install {
+    owner: live.shipper.owner(),
+    object,
+    epoch: live.shipper.epoch(),
+    head: *head,
+    state: payload.clone(),
+  };
+  let send = Send {
+    object,
+    holder,
+    stream: slates_cluster::live::LIVE_STATE_STREAM,
+    bytes: install.encode(),
+  };
+  (Some(send), false)
 }
 
 /// The candidates the latest placement of `object`'s catalog record names: holders that take its live log ([`hold_bound`]
@@ -1630,9 +1656,9 @@ fn lane_expiry_ns() -> u64 {
 }
 
 /// A lane to `holder` has ended for `objects`: each volume's lane is closed, and what the holder lacks now is sent at
-/// once when it `answered` ([`dispatch`]). A holder that did not answer is left to the next publication or the record
-/// period: sent again at once, a holder with no link (dropped to be dialed afresh) would end each new lane at once and
-/// loop between the shards at their speed.
+/// once when it `answered` ([`dispatch`]). A holder that did not answer is left unreachable until the record period
+/// retries it or its session is back ([`holder_reached`]): sent again at once, a holder with no link (dropped to be
+/// dialed afresh) would end each new lane at once and loop between the shards at their speed.
 fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, answered: bool) {
   let mut sends = Vec::new();
   for object in objects {
@@ -1640,6 +1666,12 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
       continue;
     };
     live.lanes.remove(&holder);
+    live
+      .unreachable
+      .retain(|unreachable| *unreachable != holder);
+    if !answered {
+      live.unreachable.push(holder);
+    }
     // Only the ended holder's own messages, and only when it answered: every other holder is sent its own when its lane
     // ends, a publication comes or the record period runs. Sent what every other holder lacked, two holders with no link
     // (both stopped) each ended its lane at once and sent the other's, back and forth at the shards' speed (1,658
@@ -1651,6 +1683,54 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
           .filter(|send| send.holder == holder),
       );
     }
+  }
+  dispatch(state, sends);
+}
+
+/// `holder`'s record session is established again (on the control shard): every shard sends it what it lacks at once,
+/// not at the next record period, so a resumed holder's catch-up does not wait on the period. An install it is owed waits
+/// for a fresh image ([`send_to_reached`]).
+pub(crate) fn holder_reached(holder: HostId) {
+  let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
+    return;
+  };
+  for shard in shards {
+    crate::xshard::run_on_counted(origin, shard, move |s| send_to_reached(s, holder));
+  }
+}
+
+/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]). A holder owed an
+/// install while the image is behind the log waits for one made at the log's head: the next publication makes it, or the
+/// record period for an idle writer ([`refresh_image`]). The image a holder fell behind on was a median of 1,332 and
+/// 1,395 entries old when last built, while an install's own transit added 0 or 1, so it landed past the retained tail
+/// and took a second whole install (`live_chaos`'s rolling partition, diag-live-durability-54).
+fn send_to_reached(state: &mut ShardState, holder: HostId) {
+  let volumes: Vec<[u8; 16]> = state
+    .live
+    .shipping
+    .iter_mut()
+    .filter_map(|(volume, live)| {
+      let stale = live
+        .whole
+        .as_ref()
+        .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
+      if stale && live.shipper.pending(holder) == Next::Install {
+        live.owes_image = true;
+      }
+      let was = live.unreachable.contains(&holder);
+      live
+        .unreachable
+        .retain(|unreachable| *unreachable != holder);
+      (was && live.fenced.is_none()).then_some(*volume)
+    })
+    .collect();
+  let mut sends = Vec::new();
+  for volume in volumes {
+    sends.extend(
+      pending_sends(state, volume)
+        .into_iter()
+        .filter(|send| send.holder == holder),
+    );
   }
   dispatch(state, sends);
 }
@@ -2035,6 +2115,10 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       for volume in &volumes {
         let id = slates_db::catalog::VolumeId { bytes: *volume };
         follow_candidates(s, *volume);
+        // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
+        if let Some(live) = s.live.shipping.get_mut(volume) {
+          live.unreachable.clear();
+        }
         // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
         // neighbourhood settles, a pair delivered): answered here at the latest.
         resolve(s, *volume);
@@ -2209,11 +2293,15 @@ pub(crate) fn serve_install(
         held.bytes = 0;
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
-        Ok(Some(head))
+        Ok((Some(head), true))
       }
-      Admitted::Held => Ok(held.replica.head()),
+      Admitted::Held => Ok((held.replica.head(), false)),
     }
   });
+  if matches!(reply, Ok((_, true))) {
+    state.count(LIVE_INSTALL_TAKEN, 1);
+  }
+  let reply = reply.map(|(head, _)| head);
   match &reply {
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
