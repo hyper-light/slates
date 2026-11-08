@@ -855,6 +855,13 @@
 
 
 
+> **Runtime: a shard's scheduling slice measured and rejected (A-224, 2026-11-08, agents/perf).** Under the
+> controlled load, a short EEVDF slice asked by each shard thread cut arm64's loaded p99 4 times (26.6 to 6.0 ms
+> median) and its max 5 times, and x86_64's max by about half. Every slice tried also had loaded p50 excursions of
+> 0.8 to 4.0 ms beyond base's spread (base 12 to 21 µs), on both runners, so none is taken (BENCHMARKS, "A shard's
+> scheduling slice, measured and rejected"). **Open:** the loaded Linux tail itself (p99 6 to 27 ms under two spinners
+> a core), and why a sliced shard's median request waited milliseconds in some rounds.
+>
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported

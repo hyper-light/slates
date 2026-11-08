@@ -13921,6 +13921,36 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
+### A-224 — A shard thread's scheduling slice: measured and rejected (2026-11-08; the supervisor's decisions of 2026-11-06 and 2026-11-07)
+Applied in the same change to: BENCHMARKS ("A shard's scheduling slice, measured and rejected"), GAPS. No code: the
+built change stays on agents/perf-2 (`7c04f873`, the runtime's request; `0d8a61d9`, the harness's sweep) for the
+record, and nothing of it is on main.
+
+Status: measured and rejected 2026-11-08.
+- What was tried. Each shard thread asks the fair scheduler for a short EEVDF slice as it starts (`sched_setattr(2)`'s
+  `sched_runtime` for a `SCHED_OTHER` thread, Linux 6.12+). The thread keeps its policy and nice, so no privilege is
+  needed: proven as uid 1000, CapEff 0, `Nice=19`, on Linux 6.19.10, `Held(100000)`. A shorter slice gives a woken
+  shard an earlier virtual deadline, so under oversubscription it runs before threads that never sleep.
+- The rule it was judged by (the supervisor): loaded p99 and max keep the gain, and loaded p50 is not worse than base
+  beyond the spread. The load: two spinners a core on two CPUs, a sibling fsync writer, 256 MB. Interleaved, on CI's
+  Linux 7.0 runners (x86_64 and arm64).
+- What it bought. On arm64, the loaded accept p99 fell from 22 to 35 ms (median 26.6) to 2.2 to 9.0 ms (median 6.0)
+  with the kernel's minimum, 100 µs, and the max from 29 to 39 ms to 3.9 to 12 ms. On x86_64 the max fell from 10.6
+  to 21 ms to 7.7 to 12.2 ms, but the p99 barely moved (median 6.0 to 5.2 ms). Quiet runs, paced and unpaced, were
+  even.
+- What it cost, and why it is rejected. Every slice tried had loaded p50 excursions of 0.8 to 4.0 ms in some
+  rounds, beyond base's spread:
+  - x86_64: base 12 to 14 µs; 100 µs reached 1,852 µs (accept); step budget × 32 (206 µs) 826 µs.
+  - arm64 conflict: base 15 to 21 µs; 100 µs reached 4,015 µs; 234 µs reached 3,785 µs.
+  - arm64 accept at 234 µs: a median p50 of 2,048 µs.
+  - The sweep before it (diag-perf-7, eight slices derived from each runner: none, the kernel's minimum, the step
+    budget doubled from × 16 to × 256, the kernel's default) showed the same excursions in four other slice arms, and
+    none in base.
+  No slice keeps the gain within the p50 rule, so none is taken.
+- Not established, and what would reopen it: why a sliced shard's median request waits milliseconds in some
+  rounds. A candidate, unproven: EEVDF's lag, which lets a short-slice thread that ran ahead wait out its peers'
+  slices. A slice that keeps the p50 (or a client that can ask for its own) would need the same rule met.
+
 ### A-228 — A daemon's liveness is judged in its shards' own CPU time, by an owned watchdog thread (accepted and built 2026-11-06)
 Applied in the same change to: §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs` (new),
 `crates/server/src/daemon.rs` (`Daemon::start`, `stop_parts`, `control_loop`, `heartbeat_loop`), `crates/cli/src/anchor.rs`

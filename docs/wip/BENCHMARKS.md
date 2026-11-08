@@ -11815,3 +11815,37 @@ canonicalize.
   against main's 11 to 12. On the quiet CI runners above, the sliced walk took 1.1 to 1.9 times main's one poll. Main's
   number is a poll that held the shard throughout.
 - Every run's harness ended with 0 oracle failures.
+
+## A shard's scheduling slice, measured and rejected (A-224; 2026-11-06 to 2026-11-08)
+
+CI's Linux runners (`ubuntu-latest`, x86_64; `ubuntu-24.04-arm`, arm64; kernel 7.0.0-1017-azure), from diagnostics
+branches never merged (`diag-perf-*`). Loaded = the supervisor's controlled load: `systemd-run --user --scope -p
+AllowedCPUs=0-1 -p MemoryMax=256M`, two spinning threads a core, a sibling `dd conv=fsync` writer. Harness:
+`edit_merge_bench` (agents/perf-2 `82e1f011`), `--loaded-only --spinners-per-core 2 --client-spin-ns default
+--shard-slice-ns N --files 10 --form accept --form conflict`. The in-process daemon's shards ask for slice N as they
+start; N = 0 asks nothing. Quiet: `--quiet-only`, paced (`--pause-ns 2000000`) and unpaced. Each invocation is 3 runs
+× up to 1,000 samples.
+
+The confirmation run (diag-perf-9, run 42423446888, 2026-11-07 22:40 to 23:38 UTC; six interleaved rounds an arm).
+Ranges over the six rounds, loaded, 10 files; medians in parentheses:
+
+| Runner, arm | accept p50 µs | accept p99 ms | accept max ms | conflict p50 µs | conflict p99 ms |
+|---|---|---|---|---|---|
+| x86_64, none | 12–13 | 1.02–13.34 (5.95) | 10.6–21.0 (17.5) | 13–14 | 1.05–9.50 (6.01) |
+| x86_64, kernel minimum 100 µs | **16–1,852** | 4.00–6.49 (5.22) | 7.7–12.2 (9.4) | **16–17** | 4.17–7.87 (6.33) |
+| x86_64, step budget × 32, 206 µs | **14–826** | 3.99–6.97 (6.27) | 8.0–10.9 (9.9) | 13–16 | 4.15–6.83 (5.22) |
+| arm64, none | 35–2,063 (80) | 22.00–34.99 (26.57) | 29.1–39.1 (37.1) | 15–21 | 14.80–35.00 (25.98) |
+| arm64, kernel minimum 100 µs | 86–1,994 (152) | 2.15–9.00 (6.02) | 3.9–12.0 (7.0) | **15–4,015** | 2.83–9.00 (4.90) |
+| arm64, step budget × 32, 234 µs | **19–3,911 (2,048)** | 2.52–9.01 (9.00) | 4.2–12.0 (10.8) | **15–3,785** | 3.26–9.00 (9.00) |
+
+Bold: a loaded p50 beyond base's spread. Quiet, every arm, both runners: accept p99 0.02 to 0.13 ms, even. The run
+before it (diag-perf-7, run 42328692666, three rounds) swept eight slices each runner derived: none, the kernel's
+minimum, the step budget (8.27 µs x86_64, 7.02 µs arm64) × 16 to × 256, and the kernel's default (2.25 ms). Slices
+above × 32 lost the gain (arm64 p99 10 to 26 ms at × 64 to the default), and the p50 excursions (2.0 to 7.4 ms on
+arm64) appeared in four slice arms and in none of base's rounds. The runtime's own A/B (diag-perf-6, run 42188445711,
+base `20c74c56` against `7c04f873` asking 100 µs) had shown the same: arm64 p99 13–25 to 6.7–9.0 ms, x86_64
+overlapping, the arm64 p50 3.8 to 4.0 ms in some rounds, and nothing at rest (657 voluntary switches and 4 CPU ticks a
+minute idle, either build).
+
+By the rule (loaded p99 and max keep the gain; loaded p50 not worse than base beyond the spread), no slice is taken,
+and A-224 is measured and rejected.
