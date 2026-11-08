@@ -1,0 +1,49 @@
+name: DIAG live-fixes a restarted holder's Unauthorized refusals (not for main)
+
+on:
+  push:
+    branches: [diag-live-fixes-49]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  measure:
+    name: Restarted holder on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p slates-cli --bin slates --test live_fleet
+      - name: The flow
+        run: |
+          R=../results.txt
+          echo "head $(git rev-parse HEAD), $(nproc) CPUs" > $R
+          for run in 1 2 3 4 5 6 7 8; do
+            status=0
+            timeout 300 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 --exact diag_a_restarted_holder_refuses_records_before_relearning > ../run.log 2>&1 || status=$?
+            echo "== run $run exit $status" | tee -a $R
+            grep -E 'diag-restart|panicked|^test result' ../run.log | cut -c1-2500 >> $R || true
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-49 results"
+          git push -q origin "HEAD:refs/heads/diag-live-fixes-results-49"
