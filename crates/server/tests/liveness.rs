@@ -313,20 +313,16 @@ fn outrank_on(cpu: usize) {
   };
   pin_to(cpu);
   // SAFETY: the pseudo-handle names the calling thread, alive for the call.
-  assert_ne!(
-    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) },
-    0
-  );
+  let raised = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+  assert_ne!(raised, 0);
 }
 
 #[cfg(windows)]
 fn pin_to(cpu: usize) {
   use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
   // SAFETY: the pseudo-handle names the calling thread, alive for the call.
-  assert_ne!(
-    unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << cpu) },
-    0
-  );
+  let previous = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << cpu) };
+  assert_ne!(previous, 0);
 }
 
 /// Lowers the calling thread (a shard's) to the background QoS class. macOS has no CPU to name; the answer is 0.
