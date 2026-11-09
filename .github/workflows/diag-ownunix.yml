@@ -1,0 +1,61 @@
+name: DIAG the Unix own-mount landing test at this tree, Linux and macOS (not for main)
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-ownunix-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  ownunix:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build the test first
+        id: build
+        run: cargo test -p slates-cli --locked --test cli --no-run
+      - name: The own-mount landing test, bounded
+        id: own
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        shell: bash
+        run: |
+          cargo test -p slates-cli --locked --test cli -- --test-threads=1 --nocapture --exact \
+            a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open > own.log 2>&1
+      - name: Publish
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "$(git log -1 --format='%h %s' HEAD~1 | cut -c1-110) on ${{ matrix.runner }}"
+            echo "steps: build ${{ steps.build.outcome }}, test ${{ steps.own.outcome }}"
+            grep -aE '^test |^test result|panicked at|SKIP|skipping|refused as|OwnMount|LandingTarget|TargetUnavailable' own.log 2>/dev/null | cut -c1-400 | head -20
+            echo "--- the log's last lines"
+            tail -n 8 own.log 2>/dev/null | cut -c1-300
+          } > results.txt
+          git config user.name diag; git config user.email diag@invalid
+          tree=$(printf '100644 blob %s\tresults.txt\n' "$(git hash-object -w results.txt)" | git mktree)
+          commit=$(git commit-tree "$tree" -m ownunix)
+          git push -f origin "$commit:refs/heads/diag-winfsp-bench-ownunix-results-${{ github.run_id }}-${{ github.ref_name }}-${{ matrix.runner }}"
