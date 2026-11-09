@@ -588,6 +588,8 @@ pub struct Observed {
   pub attrs: Attrs,
   /// The change counter: it moves on every change to the object and never repeats.
   pub change: u64,
+  /// The Windows attribute bits kept beside the mode (A-262).
+  pub windows: crate::inode::WindowsAttributes,
 }
 
 /// A `readdir` row.
@@ -1110,6 +1112,7 @@ impl Volume {
       kind: inode.kind,
       attrs: inode.attrs,
       change: inode.version,
+      windows: inode.windows,
     })
   }
 
@@ -1708,6 +1711,9 @@ impl Volume {
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
+    if kind == Kind::File {
+      inode.windows = crate::inode::WindowsAttributes::new_file();
+    }
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     let child = match kind {
@@ -2653,6 +2659,35 @@ impl Volume {
     if mode & ALL_WRITE_BITS != ALL_WRITE_BITS {
       store.recall_gate.recall_on_write_restricted(no.0);
     }
+    Ok(())
+  }
+
+  /// The Windows attribute bits kept beside inode `no`'s mode (A-262; [`crate::inode::WindowsAttributes`]).
+  pub fn windows_attributes(
+    &self,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode(store, no)?.windows)
+  }
+
+  /// Sets the Windows attribute bits kept beside the mode (A-262; [`crate::inode::WindowsAttributes`]), as a
+  /// `SetFileAttributes` or a create's attributes ask. Copy-on-write; the change time advances, as NTFS advances it.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    self.namespace_inode(store, no)?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.windows = attributes;
+    inode.stamp_change(now);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
     Ok(())
   }
 
@@ -5481,7 +5516,7 @@ impl Volume {
   /// Each recorded attachment holding references, with its share by inode and how many of those references are open
   /// handles, in owner and inode order: what the recovery image carries, so a surviving attachment's kernel references
   /// and opens are given back to it after a restart (A-61, A-152). An owner this process alone knows is left out: its
-  /// references die with the process.
+  /// references die with the process. So are NFSv4 state's holds (A-260), whose record is the partition's journal.
   pub(crate) fn attachment_references(&self) -> Vec<crate::recover::AttachmentReferences> {
     self
       .attachment_refs
@@ -5498,7 +5533,7 @@ impl Volume {
             })
             .collect(),
         }),
-        RefOwner::Process(_) => None,
+        RefOwner::Process(_) | RefOwner::NfsState(_) => None,
       })
       .collect()
   }
@@ -5515,10 +5550,11 @@ impl Volume {
   }
 
   /// Settles references after a recovery (A-61): every recorded attachment whose record did not survive
-  /// (`survives` answers false for its id) gives its share back, and every orphan then left with no reference is
-  /// reclaimed — its last holder died with the process — except while a mount in `held_mounts`, one that survived the
-  /// takeover holding a kernel's handles, may still hold it through a handle no publication counted (U10): those are
-  /// named first ([`Volume::hold_detached_for`]). Returns the owners swept and the orphans reclaimed.
+  /// (`survives` answers false for its id) gives its share back, as do NFSv4 state's holds made through one (A-260),
+  /// and every orphan then left with no reference is reclaimed — its last holder died with the process — except while
+  /// a mount in `held_mounts`, one that survived the takeover holding a kernel's handles, may still hold it through a
+  /// handle no publication counted (U10): those are named first ([`Volume::hold_detached_for`]). Returns the owners
+  /// swept and the orphans reclaimed.
   pub fn settle_recovered_references(
     &mut self,
     store: &mut Store,
@@ -5532,7 +5568,9 @@ impl Volume {
       .attachment_refs
       .keys()
       .filter(|owner| match owner {
-        RefOwner::Attachment(id) => !survives(*id),
+        // NFSv4 state's holds were taken again from the partition's journal before this settle (A-260): they stay
+        // while their attachment's record does.
+        RefOwner::Attachment(id) | RefOwner::NfsState(id) => !survives(*id),
         RefOwner::Process(_) => true,
       })
       .copied()
