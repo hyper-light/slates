@@ -1,0 +1,94 @@
+name: diag-liveness-a223-window-rules
+
+# Diagnostics only, never on main (A-223, the supervisor's window-rule decision): main against three rules on the branch
+# (843cc514 plus a diagnostic selector): the x100 baseline (mean x100), option 2 (max(F, the boot probe's floor)) and
+# option 3 (the live floor x100, capped at 4F); F = 50 us. Two shards; quiet and two spinning shell loops per logical
+# CPU; three rounds, the arms alternating. Results go to diag-results/liveness-35-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  RULES_SHA: f4f48b1b601cf36181fc95541586ff41f4e73b82
+  MAIN_SHA: 1c49c33f459561bc4c1fc90859f473a5253fbc2c
+
+jobs:
+  arms:
+    name: A-223 window rules (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build both trees
+        run: |
+          set +e +o pipefail
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          mkdir -p ../arms
+          for tree in main rules; do
+            case $tree in main) sha=$MAIN_SHA;; rules) sha=$RULES_SHA;; esac
+            git worktree add "../src-$tree" "$sha" > /dev/null 2>&1
+            ( cd "../src-$tree" && CARGO_TARGET_DIR="../target-$tree" cargo build --release --locked -p slates-client --example provision_bench ) > ../build-$tree.log 2>&1 || { echo "== build $tree failed" | tee -a ../results.txt; grep -E '^error' -A6 ../build-$tree.log | head -30 >> ../results.txt; exit 1; }
+            cp "../target-$tree/release/examples/provision_bench$ext" "../arms/bench-$tree$ext"
+            ( cd "../src-$tree" && git log -1 --format="tree $tree %h %s" | cut -c1-90 ) | tee -a ../results.txt
+          done
+      - name: The arms, quiet and loaded, three rounds, alternating
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          export PROVISION_BENCH_SHARDS=2
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              for arm in main mean boot capped; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round=$round arm=$arm at $(date -u +%H:%M:%S)" | tee -a $R
+                if [ $arm = main ]; then B="../arms/bench-main$ext"; unset SLATES_DIAG_WINDOW_RULE; else B="../arms/bench-rules$ext"; export SLATES_DIAG_WINDOW_RULE=$arm; fi
+                timeout 1500 "$B" > ../run.log 2>&1; status=$?
+                unset SLATES_DIAG_WINDOW_RULE
+                for p in $pids; do kill "$p" 2>/dev/null; done
+                wait 2>/dev/null
+                grep -E 'provisioning histogram|_cpu_|spinning_1 parks|parked_1 parks|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|panicked' ../run.log | cut -c1-600 | tee -a $R
+                echo "== exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-35-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-35 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
