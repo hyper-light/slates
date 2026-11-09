@@ -1,0 +1,215 @@
+## image: ubuntu26 20261101.186.1
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+VERSION_ID="26.04"
+7.0.0-1019-azure
+## fusermount3
+-rwsr-xr-x 1 root root 39376 Mar 21  2026 /usr/bin/fusermount3
+fusermount3 version: 3.18.2
+## aa-status
+apparmor module is loaded.
+185 profiles are loaded.
+108 profiles are in enforce mode.
+   /usr/bin/man
+   /usr/lib/snapd/snap-confine
+   /usr/sbin/chronyd
+   /usr/sbin/mysqld
+   :glycin:bwrap
+   :glycin:loaders
+   alsamixer
+   babeld
+   bfdd
+   bgpd
+   bwrap
+   dig
+   dnstracer
+   docker-default
+   eigrpd
+   fabricd
+   fusermount3
+   gs
+   hostname
+   iotop-c
+   ipa_verify
+   irssi
+   isisd
+   john
+   ldpd
+   linux-boot-prober
+   locale
+   locale//compressor
+   lsb_release
+   lsblk
+   lsusb
+   man_filter
+   man_groff
+   mbsync
+   mosquitto
+   nc.openbsd
+   nhrpd
+   notify-send
+   nslookup
+   nvidia_modprobe
+   nvidia_modprobe//kmod
+   os-prober
+   ospf6d
+   ospfd
+   passt
+   pasta
+   pathd
+   pbrd
+   pim6d
+   pimd
+   plasmashell
+   plasmashell//QtWebEngineProcess
+   pollinate
+   proftpd
+   qpdf
+   ripd
+   ripngd
+## profiles naming fusermount
+/etc/apparmor.d/fusermount3
+#### /etc/apparmor.d/fusermount3
+abi <abi/5.0>,
+include <tunables/global>
+
+@{fuse_types} = {fuse,fuse.*,fuseblk,fusectl}
+profile fusermount3 /usr/bin/fusermount3 {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+
+  capability sys_admin,
+  capability dac_read_search,
+  # Denials newly generated between 3.14 and 3.17 (LP: #2122161)
+  # Flatpak seems to work fine without these capabilities, so don't grant
+  # them unless actual functionality breakage is caused elsewhere
+  # capability dac_override,
+  # capability setuid,
+
+  # Allow both rw and ro type mounts (e.g. AppImage uses ro)
+  #MS_DIRSYNC, MS_NOATIME, MS_NODIRATIME, MS_NOEXEC, MS_SYNCHRONOUS, MS_NOSYMFOLLOW
+  # Below broad mount flags should be revisited once we have rule delegation
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> @{HOME}/**/,
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /mnt/{,**/},
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> @{run}/user/@{uid}/**/,
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /media/**/,
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /tmp/**/,
+  # Cern VM fs is special and only uses these exact flags
+  mount fstype=@{fuse_types} options=(nosuid,nodev,ro) -> /cvmfs/**/,
+
+  umount @{HOME}/**/,
+  umount /mnt/{,**/},
+  umount @{run}/user/@{uid}/**/,
+  umount /media/**/,
+  umount /tmp/**/,
+  umount /cvmfs/**/,
+
+  # Flatpak's default cache directory where it mounts a revokefs-fuse
+  mount fstype=fuse options=(nosuid,nodev,rw) /dev/fuse -> /var/tmp/flatpak-cache-*/**/,
+  mount fstype=fuse.revokefs-fuse options=(nosuid,nodev,rw) revokefs-fuse -> /var/tmp/flatpak-cache-*/**/,
+  umount /var/tmp/flatpak-cache-*/**/,
+
+  # flatpak-builder uses rofiles-fuse
+  mount fstype=fuse.rofiles-fuse options=(nosuid,nodev,rw) {rofiles-fuse,/dev/fuse} -> /var/tmp/test-flatpak-*/**/,
+  umount /var/tmp/test-flatpak-*/**/,
+
+  /dev/fuse rw,
+
+  # needed since libfuse 3.17.1-rc0 (LP: #2111845)
+  /usr/bin/mount ix,
+  /usr/bin/umount ix,
+
+  # Rules needed by umount, until we can make a separate umount profile
+  # First encountered with LP: #2122161
+  @{run}/mount/utab r,
+  @{run}/mount/utab.act wk,
+  @{run}/mount/utab.event w,
+  @{run}/mount/utab.lock rwk,
+
+  @{etc_ro}/fuse.conf r,
+  @{etc_ro}/fuse3.conf r,
+
+  /etc/machine-id r,
+
+  @{PROC}/@{pid}/{mounts,mountinfo} r,
+
+  @{exec_path} mr,
+
+  include if exists <local/fusermount3>
+}
+
+# vim:ft=apparmor
+## fuse.conf
+
+
+
+
+bindfs: /usr/bin/bindfs
+## host, as runner
+### host /tmp/x: bindfs /etc /tmp/x
+fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+### exit 4
+[   25.908540] audit: type=1400 audit(1794257641.347:192): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   25.908558] audit: type=1400 audit(1794257641.347:193): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053214] audit: type=1400 audit(1794257641.492:194): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053227] audit: type=1400 audit(1794257641.492:195): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+### host /srv/x: bindfs /etc /srv/x
+fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+### exit 4
+[   25.908540] audit: type=1400 audit(1794257641.347:192): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   25.908558] audit: type=1400 audit(1794257641.347:193): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053214] audit: type=1400 audit(1794257641.492:194): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053227] audit: type=1400 audit(1794257641.492:195): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+### host /home/runner/work/slates/slates/target/tmp/x: bindfs /etc /home/runner/work/slates/slates/target/tmp/x
+fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
+### exit 4
+[   25.908540] audit: type=1400 audit(1794257641.347:192): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   25.908558] audit: type=1400 audit(1794257641.347:193): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053214] audit: type=1400 audit(1794257641.492:194): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053227] audit: type=1400 audit(1794257641.492:195): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+## container (rust:1.98.1, the live-guest image's base), as root, with the lane's options
+Unable to find image 'rust:1.98.1' locally
+1.98.1: Pulling from library/rust
+6eefb2f5d3e9: Pulling fs layer
+ed8a5e9f2f6f: Pulling fs layer
+38985a14f2b1: Pulling fs layer
+42f0cc32f2e3: Pulling fs layer
+e7272a918094: Pulling fs layer
+b9cfe81e8cec: Download complete
+a90298135267: Download complete
+6eefb2f5d3e9: Download complete
+42f0cc32f2e3: Download complete
+38985a14f2b1: Download complete
+ed8a5e9f2f6f: Download complete
+e7272a918094: Download complete
+6eefb2f5d3e9: Pull complete
+42f0cc32f2e3: Pull complete
+38985a14f2b1: Pull complete
+e7272a918094: Pull complete
+ed8a5e9f2f6f: Pull complete
+Digest: sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+Status: Downloaded newer image for rust:1.98.1
+unconfined
+
+### container /src/target/tmp/c
+### exit 0
+mounted at /src/target/tmp/c
+fusermount3: failed to unmount /src/target/tmp/c: Permission denied
+### container /tmp/c
+### exit 0
+mounted at /tmp/c
+### container /mnt/c
+### exit 0
+mounted at /mnt/c
+## kernel log after the container
+[   10.452734] audit: type=1400 audit(1794257625.892:191): apparmor="STATUS" operation="profile_load" profile="unconfined" name="docker-default" pid=1648 comm="apparmor_parser"
+[   25.908540] audit: type=1400 audit(1794257641.347:192): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   25.908558] audit: type=1400 audit(1794257641.347:193): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2603 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053214] audit: type=1400 audit(1794257641.492:194): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   26.053227] audit: type=1400 audit(1794257641.492:195): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=2608 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[   46.101239] audit: type=1400 audit(1794257661.541:196): apparmor="DENIED" operation="umount" class="mount" profile="fusermount3" name="/src/target/tmp/c/" pid=2907 comm="fusermount3"
+[   46.108892] audit: type=1400 audit(1794257661.549:197): apparmor="DENIED" operation="capable" class="cap" profile="fusermount3" pid=2914 comm="fusermount3" capability=1  capname="dac_override"
+[   46.109011] audit: type=1400 audit(1794257661.549:198): apparmor="DENIED" operation="capable" class="cap" profile="fusermount3" pid=2915 comm="fusermount3" capability=7  capname="setuid"
+[   46.110195] audit: type=1400 audit(1794257661.550:199): apparmor="DENIED" operation="mkdir" class="file" profile="fusermount3" name="/run/mount/" pid=2915 comm="umount" requested_mask="c" denied_mask="c" fsuid=0 ouid=0
+[   46.116926] audit: type=1400 audit(1794257661.557:200): apparmor="DENIED" operation="capable" class="cap" profile="fusermount3" pid=2920 comm="fusermount3" capability=1  capname="dac_override"
+[   46.117068] audit: type=1400 audit(1794257661.557:201): apparmor="DENIED" operation="capable" class="cap" profile="fusermount3" pid=2921 comm="fusermount3" capability=7  capname="setuid"
+[   46.118236] audit: type=1400 audit(1794257661.558:202): apparmor="DENIED" operation="mkdir" class="file" profile="fusermount3" name="/run/mount/" pid=2921 comm="umount" requested_mask="c" denied_mask="c" fsuid=0 ouid=0
