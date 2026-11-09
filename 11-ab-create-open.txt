@@ -1,0 +1,9 @@
+## run 1 of 3, 2026-11-09T23:46:00Z
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 32.1 µs, p99 62.0 µs, p999 180.9 µs, max 1186.7 µs over 7759 probes; 41.0 s). Each cell: p50 · p99 · p999 · max, µs.
+| create | 691.1 · 1553.4 · 34064.1 · 155362.4 | 682.0 · 1538.3 · 33262.3 · 98654.2 |
+| open | 99.3 · 208.7 · 27875.6 · 34091.6 | 96.7 · 196.9 · 555.5 · 39439.4 |
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 35.0 µs, p99 75.7 µs, p999 3186.0 µs, max 162623.5 µs over 44444 probes; 245.7 s). Each cell: p50 · p99 · p999 · max, µs.
+| create | 1661.3 · 98501.5 · 165284.7 · 417872.3 | 1715.2 · 96376.7 · 167087.0 · 200029.5 |
+| open | 226.6 · 740.1 · 82288.9 · 139640.8 | 239.3 · 1650.3 · 65279.2 · 167774.2 |
+## run 1 of 3 done, 2026-11-09T23:50:59Z
+exit 127
