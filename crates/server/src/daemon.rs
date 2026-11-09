@@ -2890,6 +2890,10 @@ impl Daemon {
   pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       s.injected_deaf_session = Some(peer);
+      // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
+      // too, and their recovery would read as this one's.
+      s.dead_session_dropped_at.clear();
+      s.dead_session_recovered_ns = None;
     })
   }
 
