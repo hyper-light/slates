@@ -1,0 +1,57 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running tests\winfsp_semantics.rs (target\debug\deps\winfsp_semantics-50f0d4b5298bb9c8.exe)
+
+running 10 tests
+test a_directory_holding_a_file_is_not_removed ... slates-server: shard 1 initialized in 4146 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 2281 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 168 µs yielding)
+slates-server: shard 0 initialized in 13018 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11569 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 175 µs yielding)
+slates-winfsp: reply spin window = 22600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_file_shrunk_then_extended_by_its_end_reaches_the_size ... slates-server: shard 1 initialized in 2853 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1582 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 1 µs, 122 µs yielding)
+slates-server: shard 0 initialized in 13014 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11648 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 1 µs, 171 µs yielding)
+slates-winfsp: reply spin window = 16900 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_file_shrunk_then_extended_by_zero_writes_reaches_the_size ... slates-server: shard 1 initialized in 3533 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 1788 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 124 µs yielding)
+slates-server: shard 0 initialized in 13692 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11736 µs, the most CPU in one 15625 µs, ending at unit 1 (a slice's floor 0 µs, 150 µs yielding)
+slates-winfsp: reply spin window = 22100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete ... slates-server: shard 1 initialized in 2961 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1353 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 1 µs, 116 µs yielding)
+slates-server: shard 0 initialized in 12513 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 11183 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 1 µs, 151 µs yielding)
+slates-winfsp: reply spin window = 16700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_files_creation_time_set_through_the_drive_is_kept ... slates-server: shard 1 initialized in 2744 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1365 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 118 µs yielding)
+slates-server: shard 0 initialized in 11618 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10408 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 155 µs yielding)
+slates-winfsp: reply spin window = 21500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_files_write_and_access_times_set_through_the_drive_are_kept ... slates-server: shard 0 initialized in 12525 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10858 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 311 µs yielding)
+slates-winfsp: reply spin window = 20200 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_move_asked_to_replace_a_directory_is_refused ... slates-server: shard 1 initialized in 2503 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1205 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 110 µs yielding)
+slates-server: shard 0 initialized in 11241 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 10242 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 143 µs yielding)
+slates-winfsp: reply spin window = 6100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files ... slates-server: shard 1 initialized in 2959 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1682 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 137 µs yielding)
+slates-server: shard 0 initialized in 12354 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11049 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 176 µs yielding)
+slates-winfsp: reply spin window = 659100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test an_open_that_truncates_leaves_the_file_empty ... slates-server: shard 1 initialized in 3110 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1765 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 129 µs yielding)
+slates-server: shard 0 initialized in 13758 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 12319 µs, the most CPU in one 15625 µs, ending at unit 3 (a slice's floor 0 µs, 209 µs yielding)
+slates-winfsp: reply spin window = 20100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+test symbolic_links_made_through_the_drive_are_followed_and_read_back ... slates-server: shard 1 initialized in 2657 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 1471 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 133 µs yielding)
+slates-server: shard 0 initialized in 12839 µs, 15625 µs of its CPU, in 7 slices of 6 units; the longest slice 11543 µs, the most CPU in one 15625 µs, ending at unit 2 (a slice's floor 0 µs, 153 µs yielding)
+slates-winfsp: reply spin window = 585500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 608.23s
+
+exit 0
