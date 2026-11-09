@@ -206,6 +206,16 @@
 > whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
 > mismatch.
 
+> **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
+> predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
+> keeps its anchor. Every pair it was sent was refused (1,583 of 1,583, diag-live-durability-72). On main the
+> predecessor's pair was counted for it, so writes went on, but the replacement could open no key it was sent: the
+> likely root of the store-destroyed takeover's mode A. On A-271's tree every write to its volumes waited (48 of 48
+> runs). The cached key now carries the member it was learned from (`fleet::kept_recipient`, red with the member ignored).
+> A sweep of every map keyed by anchor or certificate in `fleet`, the transport and `seal_keys` found no other keeping
+> anything from a lost store (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
+> The flow-level reproduction is re-run with A-271 once this lands.
+
 > **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
 > A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
 > what it had learned, and confirmed its share. The retirement was then pruned, `RegionalConfiguration::lineage` read
