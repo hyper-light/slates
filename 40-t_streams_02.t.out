@@ -1,0 +1,252 @@
+# t/streams/02.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 b3a141c2401a20f30dd552e1b32792dd4a6803c9248b29f2244337f92c5382f4
+ok 1 - expect "CreateFile 00000014 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+not ok 2 - expect "FindStreams 00000014" 0 - got ERROR_INVALID_PARAMETER
+not ok 3 - testeval(len(s) == 1)
+not ok 4 - testeval("::$DATA" in s)
+ok 5 - expect "DeleteFile 00000014" 0
+ok 6 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+not ok 7 - expect "CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 8 - expect "CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 9 - expect "FindStreams 00000014" 0 - got ERROR_FILE_NOT_FOUND
+not ok 10 - testeval(len(s) == 3)
+not ok 11 - testeval("::$DATA" in s)
+not ok 12 - testeval(":foo:$DATA" in s)
+not ok 13 - testeval(":bar:$DATA" in s)
+not ok 14 - expect "DeleteFile 00000014" 0 - got ERROR_FILE_NOT_FOUND
+ok 15 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+not ok 16 - expect "CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 17 - expect "CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 18 - expect "FindStreams 00000014" 0 - got ERROR_FILE_NOT_FOUND
+not ok 19 - testeval(len(s) == 3)
+not ok 20 - testeval("::$DATA" in s)
+not ok 21 - testeval(":foo:$DATA" in s)
+not ok 22 - testeval(":bar:$DATA" in s)
+not ok 23 - expect "DeleteFile 00000014" 0 - got ERROR_FILE_NOT_FOUND
+ok 24 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+ok 25 - expect "CreateDirectory 00000014 0" 0
+not ok 26 - expect "FindStreams 00000014" ERROR_HANDLE_EOF - got ERROR_INVALID_PARAMETER
+ok 27 - expect "RemoveDirectory 00000014" 0
+ok 28 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+ok 29 - expect "CreateDirectory 00000014 0" 0
+not ok 30 - expect "CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 31 - expect "CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 32 - expect "FindStreams 00000014" 0 - got ERROR_INVALID_PARAMETER
+not ok 33 - testeval(len(s) == 2)
+not ok 34 - testeval(":foo:$DATA" in s)
+not ok 35 - testeval(":bar:$DATA" in s)
+ok 36 - expect "RemoveDirectory 00000014" 0
+ok 37 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+ok 38 - expect "CreateDirectory 00000014 0" 0
+not ok 39 - expect "CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 40 - expect "CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 41 - expect "FindStreams 00000014" 0 - got ERROR_INVALID_PARAMETER
+not ok 42 - testeval(len(s) == 2)
+not ok 43 - testeval(":foo:$DATA" in s)
+not ok 44 - testeval(":bar:$DATA" in s)
+ok 45 - expect "RemoveDirectory 00000014" 0
+ok 46 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+not ok 47 - expect "CreateFile 00000014:strm0 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 48 - expect "CreateFile 00000014:strm1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 49 - expect "CreateFile 00000014:strm2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 50 - expect "CreateFile 00000014:strm3 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 51 - expect "CreateFile 00000014:strm4 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 52 - expect "CreateFile 00000014:strm5 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 53 - expect "CreateFile 00000014:strm6 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 54 - expect "CreateFile 00000014:strm7 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 55 - expect "CreateFile 00000014:strm8 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 56 - expect "CreateFile 00000014:strm9 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 57 - expect "CreateFile 00000014:strm10 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 58 - expect "CreateFile 00000014:strm11 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 59 - expect "CreateFile 00000014:strm12 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 60 - expect "CreateFile 00000014:strm13 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 61 - expect "CreateFile 00000014:strm14 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 62 - expect "CreateFile 00000014:strm15 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 63 - expect "CreateFile 00000014:strm16 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 64 - expect "CreateFile 00000014:strm17 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 65 - expect "CreateFile 00000014:strm18 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 66 - expect "CreateFile 00000014:strm19 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 67 - expect "CreateFile 00000014:strm20 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 68 - expect "CreateFile 00000014:strm21 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 69 - expect "CreateFile 00000014:strm22 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 70 - expect "CreateFile 00000014:strm23 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 71 - expect "CreateFile 00000014:strm24 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 72 - expect "CreateFile 00000014:strm25 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 73 - expect "CreateFile 00000014:strm26 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 74 - expect "CreateFile 00000014:strm27 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 75 - expect "CreateFile 00000014:strm28 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 76 - expect "CreateFile 00000014:strm29 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 77 - expect "CreateFile 00000014:strm30 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 78 - expect "CreateFile 00000014:strm31 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 79 - expect "CreateFile 00000014:strm32 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 80 - expect "CreateFile 00000014:strm33 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 81 - expect "CreateFile 00000014:strm34 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 82 - expect "CreateFile 00000014:strm35 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 83 - expect "CreateFile 00000014:strm36 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 84 - expect "CreateFile 00000014:strm37 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 85 - expect "CreateFile 00000014:strm38 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 86 - expect "CreateFile 00000014:strm39 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 87 - expect "CreateFile 00000014:strm40 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 88 - expect "CreateFile 00000014:strm41 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 89 - expect "CreateFile 00000014:strm42 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 90 - expect "CreateFile 00000014:strm43 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 91 - expect "CreateFile 00000014:strm44 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 92 - expect "CreateFile 00000014:strm45 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 93 - expect "CreateFile 00000014:strm46 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 94 - expect "CreateFile 00000014:strm47 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 95 - expect "CreateFile 00000014:strm48 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 96 - expect "CreateFile 00000014:strm49 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 97 - expect "CreateFile 00000014:strm50 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 98 - expect "CreateFile 00000014:strm51 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 99 - expect "CreateFile 00000014:strm52 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 100 - expect "CreateFile 00000014:strm53 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 101 - expect "CreateFile 00000014:strm54 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 102 - expect "CreateFile 00000014:strm55 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 103 - expect "CreateFile 00000014:strm56 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 104 - expect "CreateFile 00000014:strm57 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 105 - expect "CreateFile 00000014:strm58 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 106 - expect "CreateFile 00000014:strm59 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 107 - expect "CreateFile 00000014:strm60 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 108 - expect "CreateFile 00000014:strm61 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 109 - expect "CreateFile 00000014:strm62 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 110 - expect "CreateFile 00000014:strm63 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 111 - expect "CreateFile 00000014:strm64 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 112 - expect "CreateFile 00000014:strm65 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 113 - expect "CreateFile 00000014:strm66 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 114 - expect "CreateFile 00000014:strm67 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 115 - expect "CreateFile 00000014:strm68 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 116 - expect "CreateFile 00000014:strm69 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 117 - expect "CreateFile 00000014:strm70 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 118 - expect "CreateFile 00000014:strm71 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 119 - expect "CreateFile 00000014:strm72 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 120 - expect "CreateFile 00000014:strm73 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 121 - expect "CreateFile 00000014:strm74 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 122 - expect "CreateFile 00000014:strm75 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 123 - expect "CreateFile 00000014:strm76 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 124 - expect "CreateFile 00000014:strm77 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 125 - expect "CreateFile 00000014:strm78 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 126 - expect "CreateFile 00000014:strm79 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 127 - expect "CreateFile 00000014:strm80 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 128 - expect "CreateFile 00000014:strm81 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 129 - expect "CreateFile 00000014:strm82 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 130 - expect "CreateFile 00000014:strm83 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 131 - expect "CreateFile 00000014:strm84 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 132 - expect "CreateFile 00000014:strm85 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 133 - expect "CreateFile 00000014:strm86 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 134 - expect "CreateFile 00000014:strm87 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 135 - expect "CreateFile 00000014:strm88 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 136 - expect "CreateFile 00000014:strm89 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 137 - expect "CreateFile 00000014:strm90 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 138 - expect "CreateFile 00000014:strm91 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 139 - expect "CreateFile 00000014:strm92 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 140 - expect "CreateFile 00000014:strm93 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 141 - expect "CreateFile 00000014:strm94 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 142 - expect "CreateFile 00000014:strm95 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 143 - expect "CreateFile 00000014:strm96 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 144 - expect "CreateFile 00000014:strm97 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 145 - expect "CreateFile 00000014:strm98 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 146 - expect "CreateFile 00000014:strm99 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 147 - expect "FindStreams 00000014" 0 - got ERROR_FILE_NOT_FOUND
+not ok 148 - testeval(len(s) == 101)
+not ok 149 - testeval(":strm%s:$DATA" % i in s)
+not ok 150 - testeval(":strm%s:$DATA" % i in s)
+not ok 151 - testeval(":strm%s:$DATA" % i in s)
+not ok 152 - testeval(":strm%s:$DATA" % i in s)
+not ok 153 - testeval(":strm%s:$DATA" % i in s)
+not ok 154 - testeval(":strm%s:$DATA" % i in s)
+not ok 155 - testeval(":strm%s:$DATA" % i in s)
+not ok 156 - testeval(":strm%s:$DATA" % i in s)
+not ok 157 - testeval(":strm%s:$DATA" % i in s)
+not ok 158 - testeval(":strm%s:$DATA" % i in s)
+not ok 159 - testeval(":strm%s:$DATA" % i in s)
+not ok 160 - testeval(":strm%s:$DATA" % i in s)
+not ok 161 - testeval(":strm%s:$DATA" % i in s)
+not ok 162 - testeval(":strm%s:$DATA" % i in s)
+not ok 163 - testeval(":strm%s:$DATA" % i in s)
+not ok 164 - testeval(":strm%s:$DATA" % i in s)
+not ok 165 - testeval(":strm%s:$DATA" % i in s)
+not ok 166 - testeval(":strm%s:$DATA" % i in s)
+not ok 167 - testeval(":strm%s:$DATA" % i in s)
+not ok 168 - testeval(":strm%s:$DATA" % i in s)
+not ok 169 - testeval(":strm%s:$DATA" % i in s)
+not ok 170 - testeval(":strm%s:$DATA" % i in s)
+not ok 171 - testeval(":strm%s:$DATA" % i in s)
+not ok 172 - testeval(":strm%s:$DATA" % i in s)
+not ok 173 - testeval(":strm%s:$DATA" % i in s)
+not ok 174 - testeval(":strm%s:$DATA" % i in s)
+not ok 175 - testeval(":strm%s:$DATA" % i in s)
+not ok 176 - testeval(":strm%s:$DATA" % i in s)
+not ok 177 - testeval(":strm%s:$DATA" % i in s)
+not ok 178 - testeval(":strm%s:$DATA" % i in s)
+not ok 179 - testeval(":strm%s:$DATA" % i in s)
+not ok 180 - testeval(":strm%s:$DATA" % i in s)
+not ok 181 - testeval(":strm%s:$DATA" % i in s)
+not ok 182 - testeval(":strm%s:$DATA" % i in s)
+not ok 183 - testeval(":strm%s:$DATA" % i in s)
+not ok 184 - testeval(":strm%s:$DATA" % i in s)
+not ok 185 - testeval(":strm%s:$DATA" % i in s)
+not ok 186 - testeval(":strm%s:$DATA" % i in s)
+not ok 187 - testeval(":strm%s:$DATA" % i in s)
+not ok 188 - testeval(":strm%s:$DATA" % i in s)
+not ok 189 - testeval(":strm%s:$DATA" % i in s)
+not ok 190 - testeval(":strm%s:$DATA" % i in s)
+not ok 191 - testeval(":strm%s:$DATA" % i in s)
+not ok 192 - testeval(":strm%s:$DATA" % i in s)
+not ok 193 - testeval(":strm%s:$DATA" % i in s)
+not ok 194 - testeval(":strm%s:$DATA" % i in s)
+not ok 195 - testeval(":strm%s:$DATA" % i in s)
+not ok 196 - testeval(":strm%s:$DATA" % i in s)
+not ok 197 - testeval(":strm%s:$DATA" % i in s)
+not ok 198 - testeval(":strm%s:$DATA" % i in s)
+not ok 199 - testeval(":strm%s:$DATA" % i in s)
+not ok 200 - testeval(":strm%s:$DATA" % i in s)
+not ok 201 - testeval(":strm%s:$DATA" % i in s)
+not ok 202 - testeval(":strm%s:$DATA" % i in s)
+not ok 203 - testeval(":strm%s:$DATA" % i in s)
+not ok 204 - testeval(":strm%s:$DATA" % i in s)
+not ok 205 - testeval(":strm%s:$DATA" % i in s)
+not ok 206 - testeval(":strm%s:$DATA" % i in s)
+not ok 207 - testeval(":strm%s:$DATA" % i in s)
+not ok 208 - testeval(":strm%s:$DATA" % i in s)
+not ok 209 - testeval(":strm%s:$DATA" % i in s)
+not ok 210 - testeval(":strm%s:$DATA" % i in s)
+not ok 211 - testeval(":strm%s:$DATA" % i in s)
+not ok 212 - testeval(":strm%s:$DATA" % i in s)
+not ok 213 - testeval(":strm%s:$DATA" % i in s)
+not ok 214 - testeval(":strm%s:$DATA" % i in s)
+not ok 215 - testeval(":strm%s:$DATA" % i in s)
+not ok 216 - testeval(":strm%s:$DATA" % i in s)
+not ok 217 - testeval(":strm%s:$DATA" % i in s)
+not ok 218 - testeval(":strm%s:$DATA" % i in s)
+not ok 219 - testeval(":strm%s:$DATA" % i in s)
+not ok 220 - testeval(":strm%s:$DATA" % i in s)
+not ok 221 - testeval(":strm%s:$DATA" % i in s)
+not ok 222 - testeval(":strm%s:$DATA" % i in s)
+not ok 223 - testeval(":strm%s:$DATA" % i in s)
+not ok 224 - testeval(":strm%s:$DATA" % i in s)
+not ok 225 - testeval(":strm%s:$DATA" % i in s)
+not ok 226 - testeval(":strm%s:$DATA" % i in s)
+not ok 227 - testeval(":strm%s:$DATA" % i in s)
+not ok 228 - testeval(":strm%s:$DATA" % i in s)
+not ok 229 - testeval(":strm%s:$DATA" % i in s)
+not ok 230 - testeval(":strm%s:$DATA" % i in s)
+not ok 231 - testeval(":strm%s:$DATA" % i in s)
+not ok 232 - testeval(":strm%s:$DATA" % i in s)
+not ok 233 - testeval(":strm%s:$DATA" % i in s)
+not ok 234 - testeval(":strm%s:$DATA" % i in s)
+not ok 235 - testeval(":strm%s:$DATA" % i in s)
+not ok 236 - testeval(":strm%s:$DATA" % i in s)
+not ok 237 - testeval(":strm%s:$DATA" % i in s)
+not ok 238 - testeval(":strm%s:$DATA" % i in s)
+not ok 239 - testeval(":strm%s:$DATA" % i in s)
+not ok 240 - testeval(":strm%s:$DATA" % i in s)
+not ok 241 - testeval(":strm%s:$DATA" % i in s)
+not ok 242 - testeval(":strm%s:$DATA" % i in s)
+not ok 243 - testeval(":strm%s:$DATA" % i in s)
+not ok 244 - testeval(":strm%s:$DATA" % i in s)
+not ok 245 - testeval(":strm%s:$DATA" % i in s)
+not ok 246 - testeval(":strm%s:$DATA" % i in s)
+not ok 247 - testeval(":strm%s:$DATA" % i in s)
+not ok 248 - testeval(":strm%s:$DATA" % i in s)
+not ok 249 - expect "DeleteFile 00000014" 0 - got ERROR_FILE_NOT_FOUND
+ok 250 - expect "FindStreams 00000014" ERROR_FILE_NOT_FOUND
+1..250

@@ -1,0 +1,47 @@
+# t/base/04.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 4480fcaab742123b4ce22acf00b2ee214da3198a57c1c32e77ee9f98bafa00c6
+ok 1 - expect "CreateDirectory 00000005 0" 0
+ok 2 - expect "CreateFile 00000005\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 3 - expect "CreateFile 00000005\baz GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_READONLY 0" 0
+ok 4 - expect "MoveFileEx 00000005\foo 00000005\bar 0" 0
+ok 5 - expect "GetFileInformation 00000005\foo" ERROR_FILE_NOT_FOUND
+ok 6 - expect "GetFileInformation 00000005\bar" 0
+ok 7 - expect "MoveFileEx 00000005\bar 00000005\baz 0" ERROR_ALREADY_EXISTS
+ok 8 - expect "GetFileInformation 00000005\bar" 0
+ok 9 - expect "GetFileInformation 00000005\baz" 0
+ok 10 - expect "MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING" ERROR_ACCESS_DENIED
+ok 11 - expect "SetFileAttributes 00000005\baz FILE_ATTRIBUTE_NORMAL" 0
+ok 12 - expect "MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING" 0
+ok 13 - expect "GetFileInformation 00000005\bar" ERROR_FILE_NOT_FOUND
+ok 14 - expect "GetFileInformation 00000005\baz" 0
+ok 15 - expect "DeleteFile 00000005\baz" 0
+ok 16 - expect "RemoveDirectory 00000005" 0
+ok 17 - expect "CreateDirectory 00000005 0" 0
+ok 18 - expect "CreateDirectory 00000005\foo 0" 0
+ok 19 - expect "CreateDirectory 00000005\baz 0" 0
+ok 20 - expect "MoveFileEx 00000005\foo 00000005\bar 0" 0
+ok 21 - expect "GetFileInformation 00000005\foo" ERROR_FILE_NOT_FOUND
+ok 22 - expect "GetFileInformation 00000005\bar" 0
+ok 23 - expect "MoveFileEx 00000005\bar 00000005\baz 0" ERROR_ALREADY_EXISTS
+ok 24 - expect "GetFileInformation 00000005\bar" 0
+ok 25 - expect "GetFileInformation 00000005\baz" 0
+ok 26 - expect "MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING" ERROR_ACCESS_DENIED
+ok 27 - expect "GetFileInformation 00000005\bar" 0
+ok 28 - expect "GetFileInformation 00000005\baz" 0
+ok 29 - expect "RemoveDirectory 00000005\baz" 0
+ok 30 - expect "MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING" 0
+ok 31 - expect "GetFileInformation 00000005\bar" ERROR_FILE_NOT_FOUND
+ok 32 - expect "GetFileInformation 00000005\baz" 0
+ok 33 - expect "RemoveDirectory 00000005\baz" 0
+ok 34 - expect "RemoveDirectory 00000005" 0
+ok 35 - expect "CreateDirectory 00000005 0" 0
+ok 36 - expect "CreateDirectory 00000005\foo 0" 0
+ok 37 - expect "CreateDirectory 00000005\bar 0" 0
+ok 38 - expect "CreateFile 00000005\foo\hello GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 39 - expect "MoveFileEx 00000005\foo\hello 00000005\bar\world 0" 0
+ok 40 - expect "GetFileInformation 00000005\foo\hello" ERROR_FILE_NOT_FOUND
+ok 41 - expect "GetFileInformation 00000005\bar\world" 0
+ok 42 - expect "DeleteFile 00000005\bar\world" 0
+ok 43 - expect "RemoveDirectory 00000005\bar" 0
+ok 44 - expect "RemoveDirectory 00000005\foo" 0
+ok 45 - expect "RemoveDirectory 00000005" 0
+1..45

@@ -1,0 +1,17 @@
+# t/base/01.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 08a40af704003632a1db28ded4705ea2960057f3ca528ac1c111028bf262ca25
+ok 1 - expect "CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0" 0
+ok 2 - expect "GetFileInformation 00000002" (r[0]["FileAttributes"] == 0x20) - result [CreationTime="2026-11-09T21:07:18Z" FileAttributes=0x20 FileIndex=0x1000000000009 FileSize=0x0 LastAccessTime="2026-11-09T21:07:18Z" LastWriteTime="2026-11-09T21:07:18Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 3 - expect "CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0" 0
+ok 4 - expect "GetFileInformation 00000002" (r[0]["FileAttributes"] == 0x21) - result [CreationTime="2026-11-09T21:07:18Z" FileAttributes=0x21 FileIndex=0x1000000000009 FileSize=0x0 LastAccessTime="2026-11-09T21:07:18Z" LastWriteTime="2026-11-09T21:07:18Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 5 - expect "SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL" 0
+ok 6 - expect "CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_SYSTEM 0" 0
+ok 7 - expect "GetFileInformation 00000002" (r[0]["FileAttributes"] == 0x24) - result [CreationTime="2026-11-09T21:07:18Z" FileAttributes=0x24 FileIndex=0x1000000000009 FileSize=0x0 LastAccessTime="2026-11-09T21:07:18Z" LastWriteTime="2026-11-09T21:07:18Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 8 - expect "SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL" 0
+ok 9 - expect "CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_HIDDEN 0" 0
+ok 10 - expect "GetFileInformation 00000002" (r[0]["FileAttributes"] == 0x22) - result [CreationTime="2026-11-09T21:07:18Z" FileAttributes=0x22 FileIndex=0x1000000000009 FileSize=0x0 LastAccessTime="2026-11-09T21:07:18Z" LastWriteTime="2026-11-09T21:07:18Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 11 - expect "DeleteFile 00000002" 0
+ok 12 - expect "CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0" 0
+ok 13 - expect "DeleteFile 00000002" ERROR_ACCESS_DENIED
+ok 14 - expect "SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL" 0
+ok 15 - expect "DeleteFile 00000002" 0
+1..15

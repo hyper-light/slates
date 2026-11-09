@@ -1,0 +1,15 @@
+# t/base/05.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 6cf2e237456f3e91924125db35b6977b690d80182d4e04c4db3a574473b1cfc0
+ok 1 - expect "CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0" 0
+ok 2 - expect "GetFileInformation 00000006" (r[0]["FileSize"] == 0) - result [CreationTime="2026-11-09T21:07:20Z" FileAttributes=0x20 FileIndex=0x100000000001d FileSize=0x0 LastAccessTime="2026-11-09T21:07:20Z" LastWriteTime="2026-11-09T21:07:20Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 3 - expect "SetEndOfFile 00000006 42" 0
+ok 4 - expect "GetFileInformation 00000006" (r[0]["FileSize"] == 42) - result [CreationTime="2026-11-09T21:07:20Z" FileAttributes=0x20 FileIndex=0x100000000001d FileSize=0x2a LastAccessTime="2026-11-09T21:07:20Z" LastWriteTime="2026-11-09T21:07:20Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 5 - expect "SetEndOfFile 00000006 13" 0
+ok 6 - expect "GetFileInformation 00000006" (r[0]["FileSize"] == 13) - result [CreationTime="2026-11-09T21:07:20Z" FileAttributes=0x20 FileIndex=0x100000000001d FileSize=0xd LastAccessTime="2026-11-09T21:07:20Z" LastWriteTime="2026-11-09T21:07:20Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 7 - expect "DeleteFile 00000006" 0
+ok 8 - expect "CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0" 0
+ok 9 - expect "SetEndOfFile 00000006 42" 0
+ok 10 - expect "GetFileInformation 00000006" (r[0]["FileSize"] == 42) - result [CreationTime="2026-11-09T21:07:20Z" FileAttributes=0x20 FileIndex=0x100000000001e FileSize=0x2a LastAccessTime="2026-11-09T21:07:20Z" LastWriteTime="2026-11-09T21:07:20Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 11 - expect "CreateFile 00000006 GENERIC_WRITE 0 0 TRUNCATE_EXISTING 0 0" 0
+ok 12 - expect "GetFileInformation 00000006" (r[0]["FileSize"] == 0) - result [CreationTime="2026-11-09T21:07:20Z" FileAttributes=0x20 FileIndex=0x100000000001e FileSize=0x0 LastAccessTime="2026-11-09T21:07:20Z" LastWriteTime="2026-11-09T21:07:20Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 13 - expect "DeleteFile 00000006" 0
+1..13

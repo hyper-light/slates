@@ -1,0 +1,41 @@
+# t/streams/03.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 d36ceb03cb4d85876c65fe78d8950a76da2e516f12223b9646556363fb4fe04b
+not ok 1 - expect "CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 2 - expect "GetFileSecurity 00000015 DACL_SECURITY_INFORMATION" 0 - got ERROR_FILE_NOT_FOUND
+not ok 3 - expect "GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION" 0 - got ERROR_INVALID_NAME
+not ok 4 - expect "SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)" 0 - got ERROR_INVALID_NAME
+not ok 5 - expect "GetFileSecurity 00000015 DACL_SECURITY_INFORMATION" 0 - got ERROR_FILE_NOT_FOUND
+not ok 6 - expect "GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION" 0 - got ERROR_INVALID_NAME
+not ok 7 - expect "DeleteFile 00000015" 0 - got ERROR_FILE_NOT_FOUND
+not ok 8 - expect "CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 9 - expect "CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0" 0 - got ERROR_FILE_NOT_FOUND
+not ok 10 - expect "CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0" 0 - got ERROR_INVALID_NAME
+not ok 11 - expect "SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)" 0 - got ERROR_FILE_NOT_FOUND
+not ok 12 - expect "CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0" ERROR_ACCESS_DENIED - got ERROR_FILE_NOT_FOUND
+not ok 13 - expect "CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0" ERROR_ACCESS_DENIED - got ERROR_INVALID_NAME
+not ok 14 - expect "DeleteFile 00000015" 0 - got ERROR_FILE_NOT_FOUND
+ok 15 - expect "CreateDirectory 00000015 D:P(A;;GA;;;WD)" 0
+not ok 16 - expect "CreateFile 00000015:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 17 - expect "GetFileSecurity 00000015 DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+not ok 18 - expect "GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION" 0 - got ERROR_INVALID_NAME
+not ok 19 - expect "SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)" 0 - got ERROR_INVALID_NAME
+not ok 20 - expect "GetFileSecurity 00000015 DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)(A;;FR;;;SY)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+not ok 21 - expect "GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION" 0 - got ERROR_INVALID_NAME
+ok 22 - expect "RemoveDirectory 00000015" 0
+ok 23 - expect "CreateDirectory 00000015 D:P(A;;GA;;;WD)" 0
+ok 24 - expect "CreateFile 00000015\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0" 0
+not ok 25 - expect "CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0" ERROR_ACCESS_DENIED - got ERROR_INVALID_NAME
+ok 26 - expect "SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)" 0
+not ok 27 - expect "CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0" 0 - got ERROR_INVALID_NAME
+ok 28 - expect "SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)" 0
+ok 29 - expect "SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)" 0
+not ok 30 - expect "DeleteFile 00000015\foobar:strm" ERROR_ACCESS_DENIED - got ERROR_INVALID_NAME
+ok 31 - expect "SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRSD;;;WD)" 0
+not ok 32 - expect "DeleteFile 00000015\foobar:strm" 0 - got ERROR_INVALID_NAME
+ok 33 - expect "SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)" 0
+not ok 34 - expect "CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0" 0 - got ERROR_INVALID_NAME
+not ok 35 - expect "DeleteFile 00000015\foobar:strm" ERROR_ACCESS_DENIED - got ERROR_INVALID_NAME
+ok 36 - expect "SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)" 0
+not ok 37 - expect "DeleteFile 00000015\foobar:strm" 0 - got ERROR_INVALID_NAME
+ok 38 - expect "DeleteFile 00000015\foobar" 0
+ok 39 - expect "RemoveDirectory 00000015" 0
+1..39

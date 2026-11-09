@@ -1,0 +1,21 @@
+# t/streams/01.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 fc70867d59b505974ffb93d398aee394134881fbd0e911ce24d6820ce50d5d7f
+not ok 1 - expect "CreateDirectory 00000013:foo 0" ERROR_DIRECTORY - got ERROR_INVALID_NAME
+ok 2 - expect "CreateDirectory 00000013 0" 0
+ok 3 - expect "CreateDirectory 00000013 0" ERROR_ALREADY_EXISTS
+not ok 4 - expect "CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+not ok 5 - expect "CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" ERROR_FILE_EXISTS - got ERROR_INVALID_NAME
+ok 6 - expect "GetFileInformation 00000013" 0
+not ok 7 - expect "GetFileInformation 00000013:foo" 0 - got ERROR_INVALID_NAME
+not ok 8 - testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+not ok 9 - expect "RemoveDirectory 00000013:foo" ERROR_DIRECTORY - got ERROR_INVALID_NAME
+not ok 10 - expect "DeleteFile 00000013:foo" 0 - got ERROR_INVALID_NAME
+not ok 11 - expect "DeleteFile 00000013:foo" ERROR_FILE_NOT_FOUND - got ERROR_INVALID_NAME
+ok 12 - expect "RemoveDirectory 00000013" 0
+ok 13 - expect "RemoveDirectory 00000013" ERROR_FILE_NOT_FOUND
+ok 14 - expect "CreateDirectory 00000013 0" 0
+not ok 15 - expect "CreateFile 00000013:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0 - got ERROR_INVALID_NAME
+ok 16 - expect "GetFileInformation 00000013" 0
+not ok 17 - expect "GetFileInformation 00000013:foo" 0 - got ERROR_INVALID_NAME
+not ok 18 - testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+ok 19 - expect "RemoveDirectory 00000013" 0
+1..19

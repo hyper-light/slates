@@ -1,0 +1,40 @@
+     Running `target\debug\xtask.exe conformance run --suite winfstest --records target/rec --scratch target/scr --keep`
+winfstest: unlisted failure t/reparse/02.t:15
+winfstest: unlisted failure t/reparse/02.t:16
+winfstest: unlisted failure t/streams/04.t:10
+winfstest: unlisted failure t/streams/04.t:11
+winfstest: unlisted failure t/streams/04.t:12
+winfstest: unlisted failure t/streams/04.t:13
+winfstest: unlisted failure t/streams/04.t:14
+winfstest: unlisted failure t/streams/04.t:15
+winfstest: unlisted failure t/streams/04.t:16
+winfstest: unlisted failure t/streams/04.t:17
+winfstest: unlisted failure t/streams/04.t:19
+winfstest: unlisted failure t/streams/04.t:20
+winfstest: unlisted failure t/streams/04.t:21
+winfstest: unlisted failure t/streams/04.t:22
+winfstest: unlisted failure t/streams/04.t:23
+winfstest: unlisted failure t/streams/04.t:24
+winfstest: unlisted failure t/streams/04.t:25
+winfstest: unlisted failure t/streams/04.t:26
+winfstest: unlisted failure t/streams/04.t:29
+winfstest: unlisted failure t/streams/04.t:30
+winfstest: unlisted failure t/streams/04.t:31
+winfstest: unlisted failure t/streams/04.t:32
+winfstest: unlisted failure t/streams/04.t:33
+winfstest: unlisted failure t/streams/04.t:38
+winfstest: unlisted failure t/streams/04.t:39
+winfstest: unlisted failure t/streams/04.t:40
+winfstest: unlisted failure t/streams/04.t:41
+winfstest: unlisted failure t/streams/04.t:45
+winfstest: unlisted failure t/streams/04.t:46
+winfstest: unlisted failure t/streams/04.t:47
+winfstest: listed but now passing t/reparse/02.t:1
+winfstest: listed but now passing t/reparse/03.t:1
+winfstest: listed but now passing t/streams/04.t:9
+conformance: wrote target/rec\native-windows-winfsp.winfstest.json
+conformance: native-windows-winfsp × winfstest: RAN(20 files, 733 cases: 351 passed, 382 failed (352 expected, 30 unexpected, 3 listed-now-passing), 0 needs-root, 0 todo; 2026-11-09; Microsoft Windows [Version 10.0.26100.33674])
+conformance: scratch kept at \\?\D:\a\slates\slates\target\scr\native-windows-winfsp
+xtask: winfstest over native-windows-winfsp did not meet its verdict (the record was written)
+error: process didn't exit successfully: `target\debug\xtask.exe conformance run --suite winfstest --records target/rec --scratch target/scr --keep` (exit code: 1)
+exit 1

@@ -1,0 +1,20 @@
+# t/base/03.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 f75cba61239badc357262fcc98bad483092d31437ae2aca07008182888c934c1
+ok 1 - expect "CreateDirectory 00000004 0" 0
+ok 2 - expect "CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 3 - expect "RemoveDirectory 00000004" ERROR_DIR_NOT_EMPTY
+ok 4 - expect "RemoveDirectory 00000004\foo" ERROR_DIRECTORY
+ok 5 - expect "DeleteFile 00000004\foo" 0
+ok 6 - expect "RemoveDirectory 00000004" 0
+ok 7 - expect "CreateDirectory 00000004 0" 0
+ok 8 - expect "CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 9 - expect "CreateFile 00000004\bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 10 - expect "FindFiles 00000004\*" 0
+ok 11 - testeval(len(s) == 4)
+ok 12 - testeval("." in s)
+ok 13 - testeval(".." in s)
+ok 14 - testeval("foo" in s)
+ok 15 - testeval("bar" in s)
+ok 16 - expect "DeleteFile 00000004\bar" 0
+ok 17 - expect "DeleteFile 00000004\foo" 0
+ok 18 - expect "RemoveDirectory 00000004" 0
+1..18

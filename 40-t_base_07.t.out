@@ -1,0 +1,13 @@
+# t/base/07.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 8d96716a8500197a4460bc75b8a1b57423546c050450a7b6225dd89a834b7ee6
+ok 1 - expect "CreateFile 00000008 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0" 0
+ok 2 - expect "GetFileInformation 00000008" (r[0]["FileAttributes"] == 0x20) - result [CreationTime="2026-11-09T21:07:21Z" FileAttributes=0x20 FileIndex=0x1000000000020 FileSize=0x0 LastAccessTime="2026-11-09T21:07:21Z" LastWriteTime="2026-11-09T21:07:21Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 3 - expect "SetFileAttributes 00000008 FILE_ATTRIBUTE_READONLY" 0
+ok 4 - expect "GetFileInformation 00000008" (r[0]["FileAttributes"] == 0x1) - result [CreationTime="2026-11-09T21:07:21Z" FileAttributes=0x1 FileIndex=0x1000000000020 FileSize=0x0 LastAccessTime="2026-11-09T21:07:21Z" LastWriteTime="2026-11-09T21:07:21Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 5 - expect "SetFileAttributes 00000008 FILE_ATTRIBUTE_SYSTEM" 0
+ok 6 - expect "GetFileInformation 00000008" (r[0]["FileAttributes"] == 0x4) - result [CreationTime="2026-11-09T21:07:21Z" FileAttributes=0x4 FileIndex=0x1000000000020 FileSize=0x0 LastAccessTime="2026-11-09T21:07:21Z" LastWriteTime="2026-11-09T21:07:21Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 7 - expect "SetFileAttributes 00000008 FILE_ATTRIBUTE_HIDDEN" 0
+ok 8 - expect "GetFileInformation 00000008" (r[0]["FileAttributes"] == 0x2) - result [CreationTime="2026-11-09T21:07:21Z" FileAttributes=0x2 FileIndex=0x1000000000020 FileSize=0x0 LastAccessTime="2026-11-09T21:07:21Z" LastWriteTime="2026-11-09T21:07:21Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 9 - expect "SetFileAttributes 00000008 FILE_ATTRIBUTE_ARCHIVE" 0
+ok 10 - expect "GetFileInformation 00000008" (r[0]["FileAttributes"] == 0x20) - result [CreationTime="2026-11-09T21:07:21Z" FileAttributes=0x20 FileIndex=0x1000000000020 FileSize=0x0 LastAccessTime="2026-11-09T21:07:21Z" LastWriteTime="2026-11-09T21:07:21Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 11 - expect "DeleteFile 00000008" 0
+1..11

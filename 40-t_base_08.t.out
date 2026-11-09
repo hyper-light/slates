@@ -1,0 +1,21 @@
+# t/base/08.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 44d0bbcc2e3b6c4e9202e0544bfe0f33d4f441fce7ae97361a39e48e0cf80ee6
+# expect_task "CreateFile 00000009 GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 1 - expect_task "CreateFile 00000009 GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 2 - expect "CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0" 0
+ok 3 - expect "DeleteFile 00000009" 0
+ok 4 - expect "CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0" ERROR_ACCESS_DENIED
+ok 5 - expect "CreateDirectory 00000009 0" 0
+# expect_task "CreateFile 00000009\foo GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 6 - expect_task "CreateFile 00000009\foo GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 7 - expect "DeleteFile 00000009\foo" 0
+ok 8 - expect "FindFiles 00000009\*" 0
+ok 9 - testeval(len(s) == 3)
+ok 10 - testeval("." in s)
+ok 11 - testeval(".." in s)
+ok 12 - testeval("foo" in s)
+ok 13 - expect "FindFiles 00000009\*" 0
+ok 14 - testeval(len(s) == 2)
+ok 15 - testeval("." in s)
+ok 16 - testeval(".." in s)
+ok 17 - expect "RemoveDirectory 00000009" 0
+1..17

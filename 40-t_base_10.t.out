@@ -1,0 +1,26 @@
+# t/base/10.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 e9fe95f3c1a13a73e753bf731d8237fe95a1164c2338db1430aaba221d75863d
+ok 1 - expect "CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+not ok 2 - expect "GetFileSecurity 0000000b DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+ok 3 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)" 0
+not ok 4 - expect "GetFileSecurity 0000000b DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)(A;;FR;;;SY)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+ok 5 - expect "DeleteFile 0000000b" 0
+ok 6 - expect "CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 7 - expect "CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0" 0
+ok 8 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)" 0
+not ok 9 - expect "CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0" ERROR_ACCESS_DENIED - got 0
+ok 10 - expect "DeleteFile 0000000b" 0
+ok 11 - expect "CreateDirectory 0000000b D:P(A;;GA;;;WD)" 0
+not ok 12 - expect "GetFileSecurity 0000000b DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+ok 13 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)" 0
+not ok 14 - expect "GetFileSecurity 0000000b DACL_SECURITY_INFORMATION" (r[0]["Sddl"] == "D:P(A;;FA;;;WD)(A;;FR;;;SY)") - result [Sddl="D:NO_ACCESS_CONTROL"]
+ok 15 - expect "RemoveDirectory 0000000b" 0
+ok 16 - expect "CreateDirectory 0000000b D:P(A;;FR;;;WD)" 0
+not ok 17 - expect "CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0" ERROR_ACCESS_DENIED - got 0
+ok 18 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)" 0
+not ok 19 - expect "CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0" 0 - got ERROR_FILE_EXISTS
+ok 20 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)" 0
+not ok 21 - expect "DeleteFile 0000000b\foobar" ERROR_ACCESS_DENIED - got 0
+ok 22 - expect "SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)" 0
+not ok 23 - expect "DeleteFile 0000000b\foobar" 0 - got ERROR_FILE_NOT_FOUND
+ok 24 - expect "RemoveDirectory 0000000b" 0
+1..24
