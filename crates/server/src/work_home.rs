@@ -104,6 +104,9 @@ pub(crate) enum RebaseAnswer {
     changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The operations restated over the head.
     journal: Vec<VolumeOp>,
+    /// The base entries at the head of every path the restated journal names, for a work that composes its own
+    /// increment (A-247), so its next submit does not fetch them; empty for a work on the green's shard.
+    entries: BTreeMap<String, slates_merge::increment::Base>,
   },
   /// A conflict or a refusal: the reply, with the work unchanged.
   Reply(ReplyBody),

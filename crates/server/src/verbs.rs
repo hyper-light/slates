@@ -7122,11 +7122,25 @@ fn map_rebase(
       version,
       changed,
       journal,
-    } => RebaseAnswer::Rebased {
-      version,
-      changed,
-      journal,
-    },
+    } => {
+      // A work that composed its own increment composes its next one too: it is given the entries it will need.
+      let entries = if sealed.composed.is_some() {
+        journal
+          .iter()
+          .flat_map(VolumeOp::names)
+          .flatten()
+          .map(|path| (path.to_owned(), engine.path_base(version, path)))
+          .collect()
+      } else {
+        std::collections::BTreeMap::new()
+      };
+      RebaseAnswer::Rebased {
+        version,
+        changed,
+        journal,
+        entries,
+      }
+    }
     slates_merge::engine::Rebased::Conflict { windows } => {
       RebaseAnswer::Reply(ReplyBody::Rebased {
         version: None,
@@ -7153,16 +7167,22 @@ fn settle_rebase(
   green_id: DbVolumeId,
   answer: crate::work_home::RebaseAnswer,
 ) -> ReplyBody {
-  let (version, changed, journal) = match answer {
+  let (version, changed, journal, entries) = match answer {
     crate::work_home::RebaseAnswer::Rebased {
       version,
       changed,
       journal,
-    } => (version, changed, journal),
+      entries,
+    } => (version, changed, journal, entries),
     crate::work_home::RebaseAnswer::Reply(reply) => return reply,
   };
   let changed = crate::work_files::WorkFiles::from_changed(changed);
-  let wanted = crate::work_charge::footprint(&changed, &journal);
+  let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
+    entries
+      .iter()
+      .map(|(path, base)| crate::work_charge::base_footprint(path, base))
+      .fold(0, u64::saturating_add),
+  );
   let op = restatement(
     work_id,
     &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
@@ -7185,7 +7205,7 @@ fn settle_rebase(
     w.files = changed;
     w.base_version = version;
     w.journal = journal;
-    w.entries.clear();
+    w.entries = entries;
     w.revision = w.revision.wrapping_add(1);
   }
   // The work's base rose, so the reachable floor may have: the owner's floor moves, folds the green's histories to it
