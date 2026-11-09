@@ -1,0 +1,2 @@
+native-linux-fuse pjdfstest: limited | 1800 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+native-linux-nfs4 pjdfstest: ran | 1798 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
