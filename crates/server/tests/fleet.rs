@@ -13220,9 +13220,14 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
 /// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
 /// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
 /// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
-/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
-/// every submit accepted, each as the next version, and the median answered within one coordinator period
-/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another. Expect every submit
+/// accepted, each as the next version, and, judged in the daemon's own terms rather than by a wall bound, most versions
+/// placed at the quorum in the same coordinator period they were enqueued in
+/// (`merge.placed_within_period` against `merge.placed_after_periods`, the coordinator's own period count): an
+/// accepted version wakes the record plane, which ships it between periods, so its answer does not wait for one. Before
+/// A-235 every version was placed only after a period began (its inputs put at one, its record at the next). A busy
+/// machine stretches every period and every exchange alike, so the judgement holds under load, where a fixed 100 ms
+/// bound did not (a median of 909 ms under 36 spinners, 2026-11-07).
 #[test]
 fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
   /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
@@ -13283,10 +13288,26 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
     unheld, 0,
     "no holder refused a record for want of inputs it was counted holding: {counters:?}"
   );
+  let owner_count = |name: &str| {
+    counters
+      .first()
+      .into_iter()
+      .flatten()
+      .filter(|(counter, _)| counter == name)
+      .map(|(_, count)| *count)
+      .sum::<u64>()
+  };
+  let within = owner_count("merge.placed_within_period");
+  let after = owner_count("merge.placed_after_periods");
   assert!(
-    median < Duration::from_nanos(HEARTBEAT_NS),
-    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
-    HEARTBEAT_NS / 1_000_000
+    within + after >= SUBMITS,
+    "every version's placement was judged ({within} within its period, {after} after periods, of {SUBMITS} submits): \
+     {counters:?}"
+  );
+  assert!(
+    within > after,
+    "most versions placed without waiting for the coordinator's period: {within} within the period they were enqueued \
+     in, {after} only after a period began; answers {waits:?}"
   );
 }
 
@@ -17141,6 +17162,161 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
       .iter()
       .all(|reply| matches!(reply, ReplyBody::Created { .. })),
     "every node of the settled fleet admits a create: {replies:?}"
+  );
+}
+
+/// Shape: how long after its owner's restart a read through b may take to reach the new process once b's session to
+/// the old one is reset (A-261): the reset itself is a round trip, then one heartbeat for b's link task to come round
+/// to the dropped link, a dial and a discovery page, all well inside one liveness budget. loadtest-scale's lane-side
+/// bound for the same case, with no reset, is two budgets (its `DEAD_SESSION_BOUND`).
+const RESET_LANE_BOUND: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+
+/// A-261 (RFC 9000 §10.3), loadtest-scale's primary-kill case (2026-11-08): a primary restarted under the same member id
+/// left the client node's record session to it in place, lent and dead, for 25 to 135 s. With stateless reset the
+/// restarted process answers the first packet on that session with a reset ending in the token its identity issued
+/// for it, and b drops the link and dials the new process. Do: three nodes; a volume owned by a, read through b; restart
+/// a with its identity on its ports; read through b until a answers. Expect: b counted the reset
+/// (`fleet.link.peer_reset`), and the first read to reach the restarted a came within [`RESET_LANE_BOUND`].
+#[test]
+#[ignore = "A-261: parked until it holds its own precondition (b still holding its session to the old a at the restart); on a Mac at load 46-48 it failed 2 of 3 with 0 resets while b reached the restarted a in 207-263 ms, its session lent or replaced first; GAPS A-261"]
+#[allow(clippy::cognitive_complexity)]
+fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["reset-lane-a", "reset-lane-b", "reset-lane-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("reset-lane-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(&format!("reset-lane-{node}-{pid}"), profile, &configs[node])
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "reset-lane", &daemons);
+  let mut probe = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let resets_before = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap();
+  drop(owner);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let restarted = Instant::now();
+  let mut answers = Vec::new();
+  let mut reset_seen = None;
+  let reached = loop {
+    let reply = probe.call(&read);
+    if reset_seen.is_none()
+      && refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() > resets_before
+    {
+      reset_seen = Some(restarted.elapsed());
+    }
+    let from_b = matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::OwnerUnreachable { .. } | Refusal::HomedElsewhere { .. }
+      }
+    );
+    answers.push((restarted.elapsed(), reply));
+    if !from_b {
+      break Some(restarted.elapsed());
+    }
+    if restarted.elapsed() > 10 * RESET_LANE_BOUND {
+      break None;
+    }
+  };
+  let resets = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() - resets_before;
+  let counters: Vec<(&str, u64)> = daemons[1]
+    .fleet_refusals()
+    .unwrap()
+    .into_iter()
+    .filter(|(name, _)| name.starts_with("fleet.forward") || name.starts_with("fleet.link"))
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "the first read through b to reach the restarted a came {reached:?} after its restart, b's reset seen by {reset_seen:?} \
+     ({resets} resets; {} answers before, the last {:?}); b's forward and link counters {counters:?}",
+    answers.len().saturating_sub(1),
+    answers.last()
+  );
+  assert!(
+    routed,
+    "b routed the volume to a before the restart: {last:?}"
+  );
+  assert!(
+    resets >= 1,
+    "b's session to the old a was reset: {counters:?}"
+  );
+  let reached = reached.unwrap_or_else(|| {
+    panic!(
+      "no read through b reached the restarted a within {:?}: {answers:?}",
+      10 * RESET_LANE_BOUND
+    )
+  });
+  assert!(
+    reached <= RESET_LANE_BOUND,
+    "a read through b reached the restarted a {reached:?} after its restart, past {RESET_LANE_BOUND:?}"
   );
 }
 
