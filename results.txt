@@ -1,0 +1,333 @@
+runner ubuntu-latest, 4 CPUs, Mon Nov  9 20:56:29 UTC 2026, tip 95018796, sample 4
+before ../t-before/release/deps/live_chaos-d1ed9741d5b7cf39
+== pair 1 arm before at 20:56:31, load 2.70 1.77 0.77
+DIAG formation took 2.392526273s
+DIAG settlement took 3.063115642s
+DIAG formation took 5.104125507s
+DIAG settlement took 6.760626835s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.665801772s
+  the stale holder stayed stopped 1.665801772s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 139.29s
+DIAG dials formation t=0.0s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.5s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.5s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.5s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.5s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.5s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 3
+DIAG dials formation t=0.0s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 1; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 3
+DIAG dials settlement t=0.0s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 9; fleet.seal.pair_no_session: 2; fleet.ship.catalog.no_session: 4
+DIAG dials settlement t=0.0s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.4s chaos-fresh-member-a-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 3
+DIAG dials settlement t=3.4s chaos-fresh-member-b-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 9; fleet.seal.pair_no_session: 2; fleet.ship.catalog.no_session: 4
+DIAG dials settlement t=3.4s chaos-fresh-member-c-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=3.4s chaos-fresh-member-d-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1606368787599395876 1733996470152335668 2477206965639935574; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.4s chaos-fresh-member-e-6183: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_council_voter_ids: 1606368787599395876; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+== pair 1 arm before exit 0, load 16.93 8.31 3.37
+== pair 2 arm before at 20:58:53, load 15.98 8.25 3.38
+DIAG formation took 2.752334019s
+DIAG settlement took 3.462534493s
+DIAG formation took 14.772154774s
+DIAG settlement took 3.231069129s
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (8960) panicked at crates/cli/tests/live_chaos.rs:457:7:
+every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet wait (settled, neighbourhood, configuration version): [(Some(10), Some(10), Some(13)), (Some(4), Some(4), Some(8)), (Some(10), Some(10), Some(13)), (Some(4), Some(4), Some(8)), (Some(10), Some(10), Some(13))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 101.41s
+DIAG dials formation t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 4; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 0; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 4
+DIAG dials formation t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1; fleet.live.no_session: 3; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=5.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 0; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 4; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials formation t=5.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials formation t=9.9s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials formation t=9.9s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials formation t=9.9s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 5; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials formation t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 4; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 0; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 4
+DIAG dials formation t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1; fleet.live.no_session: 3; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=5.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 0; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 4; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials formation t=5.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials formation t=9.9s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 3381249329354801925 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials formation t=9.9s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials formation t=9.9s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-b-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 5; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-c-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-d-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3381249329354801925; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-8959: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+  fleet_configuration_version: 13
+  fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981
+  shard 0 refused fleet.seal.pair_no_session: 1
+  fleet_configuration_version: 8
+  fleet_council_voter_ids: 3381249329354801925
+  shard 0 refused fleet.live.no_session: 11
+  shard 0 refused fleet.ship.catalog.no_session: 1
+  shard 0 refused fleet.ship.head.no_session: 1
+  fleet_configuration_version: 13
+  fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981
+  shard 0 refused fleet.seal.pair_no_session: 11
+  fleet_configuration_version: 8
+  fleet_council_voter_ids: 3381249329354801925
+  fleet_configuration_version: 13
+  fleet_council_voter_ids: 5766184453815963677 5987914979653783763 9439221460946101981
+  shard 0 refused fleet.seal.pair_no_session: 9
+== pair 2 arm before exit 101, load 22.04 12.41 5.36
+== pair 3 arm before at 21:00:36, load 21.47 12.45 5.41
+DIAG formation took 2.409942986s
+DIAG settlement took 3.147146997s
+DIAG formation took 4.739212557s
+DIAG settlement took 3.258732423s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.622943809s
+  the stale holder stayed stopped 1.622943809s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 124.76s
+DIAG dials formation t=0.0s chaos-fresh-member-a-11703: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-11703: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-a-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-b-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-c-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-d-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-e-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-11703: members 4; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-b-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 4
+DIAG dials formation t=0.0s chaos-fresh-member-d-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 2
+DIAG dials formation t=0.0s chaos-fresh-member-e-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-b-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5475353177590644988; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 7; fleet.ship.catalog.no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-e-11703: members 5; fleet_peers_probed: 4; fleet_configuration_version: 14; fleet_council_voter_ids: 5475353177590644988 10380400192467099522 13288575394346568221; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 3 arm before exit 0, load 18.33 14.65 7.14
+== pair 4 arm before at 21:02:43, load 18.33 14.65 7.14
+DIAG formation took 2.63586521s
+DIAG settlement took 3.219882298s
+DIAG formation took 4.460713236s
+DIAG settlement took 3.206943117s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.674750898s
+  the stale holder stayed stopped 1.674750898s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 134.27s
+DIAG dials formation t=0.0s chaos-fresh-member-a-14303: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-a-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-b-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-c-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-d-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-e-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-14303: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-14303: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.live.no_session: 5
+DIAG dials formation t=0.0s chaos-fresh-member-c-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 1; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 9
+DIAG dials settlement t=0.0s chaos-fresh-member-c-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 560138012157639670 1303555199760884077 6788818003649731459; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-14303: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 560138012157639670; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 4 arm before exit 0, load 17.94 16.30 8.80
+== pair 5 arm before at 21:04:59, load 17.94 16.30 8.80
+DIAG formation took 2.528672948s
+DIAG settlement took 3.554269125s
+DIAG formation took 5.012973782s
+DIAG settlement took 6.820944515s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.90882417s
+  the stale holder stayed stopped 1.90882417s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 125.86s
+DIAG dials formation t=0.0s chaos-fresh-member-a-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-b-16938: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-a-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-b-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-d-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-16938: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials formation t=0.0s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 10; fleet.ship.head.no_session: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-16938: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 4
+DIAG dials settlement t=0.0s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 13; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-d-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761 13711214634008079865 15309053132012944711; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.5s chaos-fresh-member-c-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 15; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 2
+DIAG dials settlement t=3.5s chaos-fresh-member-e-16938: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_council_voter_ids: 9231365332249242761; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+== pair 5 arm before exit 0, load 18.61 17.46 10.20
+== pair 6 arm before at 21:07:07, load 18.24 17.41 10.22
+DIAG formation took 2.488804425s
+DIAG settlement took 3.038814952s
+DIAG formation took 4.762183577s
+DIAG settlement took 3.243857087s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.597685123s
+  the stale holder stayed stopped 1.597685123s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 92.39s
+DIAG dials formation t=0.0s chaos-fresh-member-a-19650: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-19650: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 3593915950895511735; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-a-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-b-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-c-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-d-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.6s chaos-fresh-member-e-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-19650: members 4; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-b-19650: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 3
+DIAG dials formation t=0.0s chaos-fresh-member-d-19650: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-19650: members 5; fleet_peers_probed: 2; fleet_configuration_version: 8; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-b-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3593915950895511735; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 5; fleet.ship.catalog.no_session: 1; fleet.ship.head.no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-19650: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_council_voter_ids: 3593915950895511735 7632000644607477047 7744587739438331554; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+== pair 6 arm before exit 0, load 19.23 18.14 11.16
+== pair 7 arm before at 21:08:42, load 18.73 18.06 11.17
+DIAG formation took 2.322176164s
+DIAG settlement took 1.499913934s
+DIAG formation took 4.752521103s
+DIAG settlement took 3.016546391s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.681912152s
+  the stale holder stayed stopped 1.681912152s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 119.77s
+DIAG dials formation t=0.0s chaos-fresh-member-a-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 3609685941671555675; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 3609685941671555675; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_council_voter_ids: 3609685941671555675; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-21807: members 4; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-21807: members 5; fleet_peers_probed: 2; fleet_configuration_version: 8; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 10; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.live.no_session: 8
+DIAG dials settlement t=0.0s chaos-fresh-member-b-21807: members 5; fleet_peers_probed: 3; fleet_configuration_version: 10; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-c-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-21807: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_council_voter_ids: 3609685941671555675 5137477591179136014 6953926261227448204; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 7 arm before exit 0, load 18.70 18.58 12.22
+== pair 8 arm before at 21:10:43, load 18.70 18.58 12.22
+DIAG formation took 2.208942762s
+DIAG settlement took 1.394284938s
+DIAG formation took 4.496838025s
+DIAG settlement took 5.872341614s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.580316951s
+  the stale holder stayed stopped 1.580316951s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 95.60s
+DIAG dials formation t=0.0s chaos-fresh-member-a-24492: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-24492: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids:; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-24492: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-24492: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.live.no_session: 7
+DIAG dials formation t=0.0s chaos-fresh-member-c-24492: members 5; fleet_peers_probed: 1; fleet_configuration_version: 8; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 3; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-24492: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 7
+DIAG dials settlement t=0.0s chaos-fresh-member-c-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 2
+DIAG dials settlement t=2.6s chaos-fresh-member-a-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_council_voter_ids: 1888877440603354753 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 1
+DIAG dials settlement t=2.6s chaos-fresh-member-b-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.live.no_session: 8
+DIAG dials settlement t=2.6s chaos-fresh-member-c-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1888877440603354753 4085391051802887952 6937811801368508291 7852712407841942391; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=2.6s chaos-fresh-member-d-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 14; fleet_council_voter_ids: 1888877440603354753 4085391051802887952 6937811801368508291; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.6s chaos-fresh-member-e-24492: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_council_voter_ids: 1888877440603354753; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.seal.pair_no_session: 4
+== pair 8 arm before exit 0, load 19.29 19.01 13.01
