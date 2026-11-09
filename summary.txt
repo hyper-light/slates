@@ -1,0 +1,27 @@
+run 42514235415 commit 0ed0454af1dd697371be7454b497f9bef8d9d308 ubuntu-latest runs=success
+== out/anchor-1.log
+a start held off its CPU: its clock stood still 2.904186165s at most in 3.005601975s; starved at 20 looks; stuck []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.01s
+== out/anchor-2.log
+a start held off its CPU: its clock stood still 3.007073039s at most in 3.00812981s; starved at 20 looks; stuck []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.01s
+== out/anchor-3.log
+a start held off its CPU: its clock stood still 3.004713958s at most in 3.005787788s; starved at 20 looks; stuck []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.01s
+== out/liveness-1.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.008100562s at most in 3.010161581s; largest beat gap 92.370107ms; the watchdog looked 30 times and withheld the beat at 0
+.spinning shard: a window of its CPU (1.00390245s) took 1.961512566s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 1.999652032s
+.observation of a starved shard: its CPU clock stood still for 3.001928814s at most; answered Ok(42) 3.003430757s after it was asked, against a budget of 1s
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.62s
+== out/liveness-2.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.005395327s at most in 3.006894251s; largest beat gap 100.929397ms; the watchdog looked 30 times and withheld the beat at 0
+.spinning shard: a window of its CPU (1.008679313s) took 1.984987847s of wall; 1 beat(s) after; the beat stopped true; its CPU by the end 2.02791707s
+.observation of a starved shard: its CPU clock stood still for 3.003243789s at most; answered Ok(42) 3.004975248s after it was asked, against a budget of 1s
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.40s
+== out/liveness-3.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.007368512s at most in 3.009320289s; largest beat gap 93.80407ms; the watchdog looked 30 times and withheld the beat at 0
+spinning shard: a window of its CPU (1.001051701s) took 1.910910808s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 2.009072403s
+.observation of a starved shard: its CPU clock stood still for 3.003310808s at most; answered Ok(42) 3.00502759s after it was asked, against a budget of 1s
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.36s
+== out/thread-clock.log
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.02s
