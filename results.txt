@@ -1,0 +1,73 @@
+green on ubuntu-latest, 4 CPUs, pinned to CPU 0 with 2 spinners, Mon Nov  9 18:44:30 UTC 2026, head d75c9ce7c7d1c929c34f93f2d8a7fc75547098f5
+== run 1 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.13s
+
+== run 1 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.12s
+
+== run 1 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.42s
+
+== run 1 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.91s
+
+== run 2 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.53s
+
+== run 2 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 7.76s
+
+== run 2 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 4.83s
+
+== run 2 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.81s
+
+== run 3 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.18s
+
+== run 3 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 7.00s
+
+== run 3 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.17s
+
+== run 3 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.82s
+
+== run 4 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 7.57s
+
+== run 4 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 4.92s
+
+== run 4 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.14s
+
+== run 4 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.60s
+
+== run 5 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.03s
+
+== run 5 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.49s
+
+== run 5 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 6.23s
+
+== run 5 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.52s
+
+== run 6 a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 4.65s
+
+== run 6 a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 8.45s
+
+== run 6 a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 7.54s
+
+== run 6 a_learner_fetches_the_councils_committed_configuration_over_the_transport exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 5.66s
+
