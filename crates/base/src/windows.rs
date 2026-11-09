@@ -395,7 +395,8 @@ fn fingerprint_of_handle(
       info.ftLastWriteTime.dwLowDateTime,
     ),
     ctime_ns: change_time,
-    mode: posix_mode(&attribute_tag_of(handle)?),
+    // NTFS keeps no POSIX mode: DrvFs's mapping, with the attribute bits apart (A-262).
+    mode: crate::windows_mode_and_bits(info.dwFileAttributes).0,
     // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
     uid: 0,
     gid: 0,
@@ -405,42 +406,8 @@ fn fingerprint_of_handle(
       info.ftCreationTime.dwHighDateTime,
       info.ftCreationTime.dwLowDateTime,
     ),
+    windows: crate::windows_mode_and_bits(info.dwFileAttributes).1,
   })
-}
-
-/// Format: the POSIX type bits of a directory, a regular file and a symbolic link (`S_IFDIR`, `S_IFREG`, `S_IFLNK`).
-const S_IFDIR: u32 = 0o040_000;
-/// Format: `S_IFREG`.
-const S_IFREG: u32 = 0o100_000;
-/// Format: `S_IFLNK`.
-const S_IFLNK: u32 = 0o120_000;
-/// Format: the permissions a Windows directory is shown with (Windows keeps no POSIX mode; the owner's access is
-/// decided by the DACL, which slates does not translate).
-const DIR_PERMISSIONS: u32 = 0o755;
-/// Format: the permissions a writable Windows file is shown with.
-const FILE_PERMISSIONS: u32 = 0o644;
-/// Format: the permissions a read-only Windows file (`FILE_ATTRIBUTE_READONLY`) is shown with: no write bit, the one
-/// permission Windows keeps on the file itself, and the one the landing writes back (`slates-land`'s `set_mode`).
-const READ_ONLY_PERMISSIONS: u32 = 0o444;
-/// Format: the permissions a link is shown with, as POSIX shows every symbolic link.
-const LINK_PERMISSIONS: u32 = 0o777;
-
-/// A Windows entry's mode in POSIX form, as every host's fingerprint carries it (the Unix host's is `st_mode`): its
-/// type from its attributes and reparse tag, and the permissions above. Before 2026-10-26 the fingerprint carried the
-/// raw attributes, so the landing read a witnessed directory as a file (`TypeChanged`) and the archive bit a rename
-/// sets read as a changed mode (G-shards-windows step 5, A-180).
-fn posix_mode(info: &FILE_ATTRIBUTE_TAG_INFO) -> u32 {
-  if redirects(info) {
-    S_IFLNK | LINK_PERMISSIONS
-  } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-    S_IFDIR | DIR_PERMISSIONS
-  } else if info.FileAttributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY
-    != 0
-  {
-    S_IFREG | READ_ONLY_PERMISSIONS
-  } else {
-    S_IFREG | FILE_PERMISSIONS
-  }
 }
 
 /// A `FILETIME` as nanoseconds since the Unix epoch, the domain every host's fingerprints are in.

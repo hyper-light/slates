@@ -57,6 +57,41 @@ pub(crate) fn one_entry<'name>(name: &'name str, breaks: &[char]) -> Result<&'na
   Ok(name)
 }
 
+/// The POSIX mode and the kept Windows attribute bits a Windows base entry reports, from its attribute word
+/// `attributes` (`dwFileAttributes`; A-262). NTFS keeps no POSIX mode, so the mode is WSL DrvFs's mapping, with the file
+/// type a Unix host's `st_mode` carries: a reparse point is a symlink (`S_IFLNK`, `0o777`), a directory `S_IFDIR` with
+/// `0o755`, any other file `S_IFREG` with `0o644`, its write bits cleared when it is `READONLY` (a file's read-only state
+/// is its mode). The bits are those [`slates_vfs::inode::WindowsAttributes::kept`] keeps for the entry's kind: a
+/// directory's `READONLY` among them, a file's not. Before A-262 the attribute word itself was reported as the mode, so
+/// an ordinary file (`ARCHIVE`, `0x20`) read as mode `0o040`.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_mode_and_bits(attributes: u32) -> (u32, u16) {
+  use slates_vfs::inode::{Kind, WindowsAttributes};
+  /// Format: `FILE_ATTRIBUTE_READONLY`, `FILE_ATTRIBUTE_DIRECTORY` and `FILE_ATTRIBUTE_REPARSE_POINT`.
+  const READONLY: u32 = 0x1;
+  const DIRECTORY: u32 = 0x10;
+  const REPARSE_POINT: u32 = 0x400;
+  /// Format: the POSIX file-type bits (`S_IFLNK`, `S_IFDIR`, `S_IFREG`).
+  const S_IFLNK: u32 = 0o120_000;
+  const S_IFDIR: u32 = 0o040_000;
+  const S_IFREG: u32 = 0o100_000;
+  /// Format: DrvFs's permissions: a symlink's, a directory's, a writable file's and a read-only file's.
+  const LINK_PERMISSIONS: u32 = 0o777;
+  const DIR_PERMISSIONS: u32 = 0o755;
+  const FILE_PERMISSIONS: u32 = 0o644;
+  const READ_ONLY_PERMISSIONS: u32 = 0o444;
+  let (mode, kind) = if attributes & REPARSE_POINT != 0 {
+    (S_IFLNK | LINK_PERMISSIONS, Kind::Symlink)
+  } else if attributes & DIRECTORY != 0 {
+    (S_IFDIR | DIR_PERMISSIONS, Kind::Dir)
+  } else if attributes & READONLY != 0 {
+    (S_IFREG | READ_ONLY_PERMISSIONS, Kind::File)
+  } else {
+    (S_IFREG | FILE_PERMISSIONS, Kind::File)
+  };
+  (mode, WindowsAttributes::kept(attributes, kind).bits())
+}
+
 #[cfg(unix)]
 pub use unix::OsHost;
 #[cfg(windows)]
@@ -101,6 +136,19 @@ pub enum FsKind {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-262. Do: map the attribute words of an ordinary file (`ARCHIVE`), a hidden read-only file, a hidden read-only
+  /// directory, and a directory symlink (a reparse point with the directory bit). Expect: `S_IFREG | 0o644` with
+  /// `ARCHIVE` kept; `S_IFREG | 0o444` with `HIDDEN | ARCHIVE` kept (the file's read-only state is its mode); `S_IFDIR |
+  /// 0o755` with `READONLY | HIDDEN` kept; `S_IFLNK | 0o777`. Before, the word itself was the mode (`0x20` read as
+  /// `0o040`), so an ordinary file read as one its owner may not write.
+  #[test]
+  fn a_windows_entrys_mode_is_drvfs_mapping_and_its_bits_are_kept_apart() {
+    assert_eq!(windows_mode_and_bits(0x20), (0o100_644, 0x20));
+    assert_eq!(windows_mode_and_bits(0x1 | 0x2 | 0x20), (0o100_444, 0x22));
+    assert_eq!(windows_mode_and_bits(0x10 | 0x1 | 0x2), (0o040_755, 0x3));
+    assert_eq!(windows_mode_and_bits(0x400 | 0x10), (0o120_777, 0));
+  }
 
   /// §4.5's racy rule rests on this table, so the table is pinned here — in particular the arm every
   /// filesystem **not** in `fs_kind`'s match takes. Do: ask for each class's granularity. Expect: the

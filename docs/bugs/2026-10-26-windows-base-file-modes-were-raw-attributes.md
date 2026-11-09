@@ -35,3 +35,10 @@ on jupiter.
 
 `fingerprint_of_handle` is the only place a Windows fingerprint is made (`entry_fingerprint`, `fstat`, `list` and
 `fingerprint_dir` all call it).
+
+## Superseded (2026-11-09)
+
+Main fixed the same fault as A-262 (`windows_mode_and_bits` in `crates/base/src/lib.rs`, DrvFs's mapping with the
+attribute bits kept apart). Merging main `1c49c33f` into the Windows writer's branch kept that mapping alone and removed
+this record's `posix_mode`, so the base has one. They differ on a reparse point that does not redirect (a cloud
+placeholder, a deduplicated file): this record's read the tag and showed a regular file, A-262's shows a link (GAPS).

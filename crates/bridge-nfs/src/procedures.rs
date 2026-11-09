@@ -177,6 +177,11 @@ pub mod extension {
   /// Format: one READDIR page encoded at the directory's owner (RFC 8881 §18.23; A-95). Arguments:
   /// `crate::v4::listing::PageRequest`. Result: the NFSv4 status, then (when it is OK) the READDIR4resok body.
   pub const READDIR4: u32 = 1054;
+  /// Format: whether the export may change anything (§4.6 "A read-only attachment is a read-only file system"), asked
+  /// by an NFSv4 OPEN for writing before its access check, so a read-only attachment's open answers `NFS4ERR_ROFS`
+  /// rather than the `NFS4ERR_ACCESS` a denied ACCESS bit would give. Arguments: a file handle. Result: the NFSv3
+  /// status, `NFS3ERR_ROFS` for a read-only attachment or a snapshot's view.
+  pub const CHANGE_ALLOWED: u32 = 1056;
   /// Format: drop a destroyed session's call records at an owner (A-127), sent to every owner (no file handle).
   /// Arguments: the client id and the session id (16 bytes). Result: the status (`NFS4ERR_DELAY` when the drop could
   /// not be made durable, so the sender keeps it queued).
@@ -864,6 +869,7 @@ impl<'b> Export<'b> {
       | extension::STATE_CHECK
       | extension::STATE_DELEGRETURN => Some(self.file_state(procedure, args)),
       extension::READDIR4 => Some(self.readdir_v4(args)),
+      extension::CHANGE_ALLOWED => Some(self.change_allowed(args)),
       _ => None,
     }
   }
@@ -975,10 +981,39 @@ impl<'b> Export<'b> {
     let requested = args.u32().map_err(|_| Nfsstat3::Inval)?;
     let identity = self.resolve_handle(&handle)?;
     let node = self.attrs_of(&identity)?;
-    Ok((
-      self.fattr3(&node),
-      granted_access(&self.caller, &node, requested),
-    ))
+    let mut granted = granted_access(&self.caller, &node, requested);
+    // A read-only attachment changes nothing, whatever the mode allows: the kernel decides an NFSv3 open from this
+    // reply alone (v3 has no OPEN), so a write bit granted here was an open for writing granted (GAPS, 2026-11-08).
+    if self.change_refusal().is_some() {
+      granted &= !(ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE);
+    }
+    Ok((self.fattr3(&node), granted))
+  }
+
+  /// The NFSv3 refusal of any change through this export (`Bridge::authorize_change`), or `None` when it may change.
+  fn change_refusal(&self) -> Option<Nfsstat3> {
+    match self.op_context() {
+      Err(e) => Some(nfsstat_of(&e)),
+      Ok(cx) => self
+        .bridge
+        .authorize_change(&cx)
+        .err()
+        .map(|e| nfsstat_of(&e)),
+    }
+  }
+
+  /// [`extension::CHANGE_ALLOWED`]: the NFSv3 status of a change through this export, before any change is named.
+  pub fn change_allowed(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    let status = match Nfsfh3::decode(args) {
+      Err(_) => Nfsstat3::Badhandle,
+      Ok(handle) => match self.resolve_handle(&handle) {
+        Err(status) => status,
+        Ok(_) => self.change_refusal().unwrap_or(Nfsstat3::Ok),
+      },
+    };
+    status.encode(&mut writer);
+    writer.into_bytes()
   }
 
   /// NFSPROC3_READ: read up to `count` bytes at `offset` from the file a handle names, over the
@@ -1175,6 +1210,15 @@ impl<'b> Export<'b> {
         return writer.into_bytes();
       }
     };
+    // A change through a read-only attachment is refused as one before its state id is judged: an open for reading
+    // whose truncation (`O_RDONLY|O_TRUNC`) arrives as a SETATTR under its read state id answered the state id's
+    // `NFS4ERR_ACCESS` rather than `NFS4ERR_ROFS` (GAPS, 2026-11-08).
+    if !matches!(want, IoWant::Read)
+      && let Some(refusal) = self.change_refusal()
+    {
+      writer.u32(crate::v4::Nfsstat4::of_v3(refusal).wire());
+      return writer.into_bytes();
+    }
     // The acting caller, read before the file state is borrowed: a state id authorizes only the
     // principal that made it (`v4::files::FileState::check_io`).
     let acting = self.caller.uid;
@@ -1937,6 +1981,8 @@ impl<'b> Export<'b> {
         ctime: None,
         // Nor a birth time.
         btime: None,
+        // No Windows attribute bits either: only the WinFsp drive sets them (A-262).
+        windows: None,
       },
       explicit_times,
     ))
@@ -2293,9 +2339,12 @@ impl<'b> Export<'b> {
       Ok(n) => n.to_owned(),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
+    // A block or character device is read whole, as any MKNOD is, then refused after the name and the directory are
+    // checked (A-268). Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
     let kind = match args.u32().map(Ftype3::from_wire) {
-      Ok(Some(Ftype3::Fifo)) => Kind::Fifo,
-      Ok(Some(Ftype3::Sock)) => Kind::Socket,
+      Ok(Some(Ftype3::Fifo)) => Some(Kind::Fifo),
+      Ok(Some(Ftype3::Sock)) => Some(Kind::Socket),
+      Ok(Some(Ftype3::Blk | Ftype3::Chr)) => None,
       Ok(_) => return (Nfsstat3::Badtype, None, Wcc::default()),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
@@ -2303,6 +2352,10 @@ impl<'b> Export<'b> {
       Ok(decoded) => decoded,
       Err(status) => return (status, None, Wcc::default()),
     };
+    // A device's `specdata3`, its major and minor numbers: read so a truncated request is refused as one.
+    if kind.is_none() && (args.u32().is_err() || args.u32().is_err()) {
+      return (Nfsstat3::Inval, None, Wcc::default());
+    }
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
       Err(status) => return (status, None, Wcc::default()),
@@ -2313,6 +2366,9 @@ impl<'b> Export<'b> {
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: adding an entry needs write and search permission on the directory.
+    let Some(kind) = kind else {
+      return self.refuse_device_node(&dir_identity, parent, &cx, &name);
+    };
     let dir_pre = match self.writable_directory(&dir_identity) {
       Ok(node) => Some(self.wcc_attr(&node)),
       Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
@@ -2338,6 +2394,39 @@ impl<'b> Export<'b> {
       post_changes,
       explicit_times,
     )
+  }
+
+  /// The answer to a MKNOD of a block or character device (§4.6 A-26, A-268): slates makes no device nodes, so it is
+  /// refused as a local file system that cannot hold one refuses it, in the order Linux's `vfs_mknod` takes its checks.
+  /// A taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so the server must
+  /// say so); a directory the caller may not write is `NFS3ERR_ACCES`; then `NFS3ERR_PERM`, which a client reports as
+  /// `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
+  /// requested". It was `NFS3ERR_BADTYPE`, the status RFC 1813 §3.3.11 names, which the Linux client turns into its
+  /// internal `EBADTYPE` (errno 527) and every program prints as an unknown error.
+  fn refuse_device_node(
+    &mut self,
+    dir_identity: &FileHandle,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
+    let dir_pre = match self.writable_directory(dir_identity) {
+      Ok(node) => Some(self.wcc_attr(&node)),
+      Err((status, dir_post)) => {
+        // A taken name is told before the directory's permission, as a lookup comes before `may_create`.
+        let status = if self.bridge.lookup(parent, cx, name).is_ok() {
+          Nfsstat3::Exist
+        } else {
+          status
+        };
+        return (status, None, self.refused(dir_post));
+      }
+    };
+    let status = match self.bridge.lookup(parent, cx, name) {
+      Ok(_) => Nfsstat3::Exist,
+      Err(_) => Nfsstat3::Perm,
+    };
+    (status, None, self.wcc_after(dir_pre, dir_identity))
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
