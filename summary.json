@@ -1,0 +1,22 @@
+{
+  "guard": {
+    "result": "success",
+    "outputs": {}
+  },
+  "build": {
+    "result": "success",
+    "outputs": {}
+  },
+  "build-musl": {
+    "result": "success",
+    "outputs": {}
+  },
+  "assemble": {
+    "result": "success",
+    "outputs": {}
+  },
+  "publish": {
+    "result": "skipped",
+    "outputs": {}
+  }
+}
