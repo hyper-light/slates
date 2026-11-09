@@ -45,11 +45,11 @@ step lands with the writer (`agents/release-wincov-lib`).
 
 - **Fixed here:** the `slates` binary's unit tests named `rustix::process` (`crates/cli/src/dumps.rs`, 6 errors), and
   `slates-bridge-fuse`'s `abi` test named `rustix::param` (2 errors). Both now build for Windows (each gate says why).
-- **Open:** three `slates-cli` benchmark examples do not compile for Windows (`nfs_writeback_ab`, `nfs_large_write`,
-  `vfs_tails`: `slates_bridge_nfs`, `rustix::fs`, `rustix::time`). `cargo test -p slates-cli` builds examples, so a Windows
-  lane must select `--lib --bins --tests` until they are gated.
-- **Open (warnings, an error under `-D warnings`):** `crates/bridge-virtiofs/src/device.rs` (`opcode` unused, `DaxServed`
-  never used) and `crates/land/examples/land_bench.rs` (two unused imports), on Windows only.
+- **Fixed 2026-11-08:** three `slates-cli` benchmark examples did not compile for Windows (`nfs_writeback_ab`,
+  `nfs_large_write`, `vfs_tails`: `slates_bridge_nfs`, `rustix::fs`, `rustix::time`). Each is now a paired `main` whose
+  Windows arm says why it is Unix only. `land_bench`'s Unix-only items are `cfg(unix)`. `bridge-virtiofs`'s Windows
+  warnings were fixed meanwhile. `cargo xwin clippy --workspace --examples -D warnings` is clean, and the Windows lanes
+  now lint `slates-cli` and `slates-land` with `--all-targets`, so the next such example fails CI.
 
 ## The gaps, and the cheapest lane for each
 
