@@ -1,0 +1,15 @@
+run 42508255276 commit e5ded5fe7df05d341c985ede3e3eca7ad7a29999 macos-latest runs=success
+== out/liveness-1.log
+starved shard: 6 spinners at nice 0, its CPU clock stood still for 276.656958ms at most in 3.021294792s; largest beat gap 160.352125ms; the watchdog looked 20 times and withheld the beat at 0
+spinning shard: a window of its CPU (1.020826s) took 1.057283708s of wall; 1 beat(s) after; the beat stopped true; its CPU by the end 2.073096s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.10s
+== out/liveness-2.log
+starved shard: 6 spinners at nice 0, its CPU clock stood still for 189.7405ms at most in 3.022760334s; largest beat gap 159.665083ms; the watchdog looked 20 times and withheld the beat at 0
+spinning shard: a window of its CPU (1.034886s) took 1.075504958s of wall; 1 beat(s) after; the beat stopped true; its CPU by the end 2.074767s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.42s
+== out/liveness-3.log
+starved shard: 6 spinners at nice 0, its CPU clock stood still for 2.9253195s at most in 3.061532833s; largest beat gap 150.526041ms; the watchdog looked 20 times and withheld the beat at 0
+spinning shard: a window of its CPU (1.004314s) took 1.018725083s of wall; 1 beat(s) after; the beat stopped true; its CPU by the end 2.105319s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.22s
+== out/pollers.log
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
