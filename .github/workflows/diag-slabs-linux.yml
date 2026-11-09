@@ -1,0 +1,76 @@
+name: "DIAG slabs -- the helper-policy test from the helper's label, the 26.04 host as the runner user and the container as root (not for main)"
+
+# Runs a_mount_the_helpers_apparmor_profile_refuses_names_the_profile (crates/cli/tests/cli.rs) in two legs on the
+# ubuntu-26.04 runner image: on the host as the runner's user, with the refused point a directory made and chowned with
+# sudo under /srv (outside fusermount3's profile) and the allowed one in the build output under $HOME; and in the
+# live-guest lane's old container as root, bound at /src, the refused point in /src/target/tmp and the allowed one under
+# /mnt. A skip in either leg is a failure of the lane: the test must run.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  legs:
+    name: the helper-policy legs on the runner image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The host leg, as the runner user
+        shell: bash
+        timeout-minutes: 50
+        run: |
+          set +e
+          {
+            echo "## image: ${ImageOS:-?} ${ImageVersion:-?}"
+            refused=/srv/slates-refused-$$; allowed="$GITHUB_WORKSPACE/target/tmp/slates-allowed-$$"
+            sudo mkdir -p "$refused"; sudo chown "$(id -u):$(id -g)" "$refused"; mkdir -p "$allowed"
+            SLATES_TEST_CLI=1 SLATES_TEST_HELPER_POLICY_REFUSED="$refused" SLATES_TEST_HELPER_POLICY_ALLOWED="$allowed" \
+              cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture \
+              a_mount_the_helpers_apparmor_profile_refuses_names_the_profile
+            echo "## host leg exit $?"
+          } 2>&1 | grep -v "^slates daemon: [a-z_0-9]* = " | tee -a own.txt
+          exit 0
+      - name: The container leg, as root
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set +e
+          {
+            docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+              --device /dev/fuse --cap-add SYS_ADMIN -v "$PWD":/src -w /src rust:1.98.1 sh -c '
+                apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq fuse3 >/dev/null 2>&1
+                mkdir -p /src/target/tmp/slates-refused /mnt/slates-allowed
+                SLATES_TEST_CLI=1 SLATES_TEST_HELPER_POLICY_REFUSED=/src/target/tmp/slates-refused \
+                  SLATES_TEST_HELPER_POLICY_ALLOWED=/mnt/slates-allowed CARGO_TARGET_DIR=/src/target/container \
+                  cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture \
+                  a_mount_the_helpers_apparmor_profile_refuses_names_the_profile
+                echo "## container leg exit $?"'
+          } 2>&1 | grep -v "^slates daemon: [a-z_0-9]* = " | tee -a own.txt
+          exit 0
+      - name: Publish
+        if: always()
+        shell: bash
+        run: |
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          touch own.txt; blob=$(git hash-object -w own.txt); tree=$(printf '100644 blob %s\town.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+      - name: No leg skipped
+        if: always()
+        shell: bash
+        run: "! grep -q 'SKIP' own.txt"
