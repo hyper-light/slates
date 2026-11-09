@@ -8626,6 +8626,28 @@ in order, up to the last whole record's size, and appended them as the credit fr
 
 Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
 
+### The council's voter change after a candidate's node is replaced (§4.8; 2026-11-09, diag-live-durability-71)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, main 80be552a. **Flow:**
+a three-node anchored fleet; one candidate's node is killed and a fresh one started in its place (a new member id),
+quiet or under the write stream. Every node's status is polled every 10 ms for `fleet_council_joint` and the voter
+ids. Joint closed means every node reports no joint configuration, with the new id seated and the old one gone. 8
+runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the kill.
+
+| arch, load | answered → joint entered | joint open (entered → closed everywhere) | kill → closed |
+|---|---|---|---|
+| x86, quiet | median 1.90 s, max 2.61 s | median 0.21 s, max 0.35 s | median 2.16 s, max 2.88 s |
+| x86, loaded | median 1.93 s, max 2.87 s | median 0.15 s, max 0.33 s | median 2.17 s, max 3.32 s |
+| arm, quiet | median 1.91 s, max 2.30 s | median 0.21 s, max 0.22 s | median 2.15 s, max 2.56 s |
+| arm, loaded | median 2.00 s, max 4.02 s | median 0.22 s, max 1.18 s | median 2.23 s, max 5.26 s |
+
+**Reading.** The joint follows the replacement's catch-up on the council log, about 0.2 s. The ~1.9 s before it opens
+is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
+dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
+that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
+for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+it in 6 of 6 x86 runs.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
