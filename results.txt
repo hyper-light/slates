@@ -1,0 +1,43 @@
+leg floor-on-arm, 4 CPUs, Mon Nov  9 15:46:13 UTC 2026, tree 85322039ee35abf19f9765628d42c2a58db8f1ce
+== release build exit 0
+   r1 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (6162) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r1 counts: installs 0 taken 0 images 1 why 0
+== run 1 exit 101
+   r2 LD-LANE install wall_ns 1794239439596689224 holder 5516905236332730486 bytes 259780 budget_ns 30000000000 took_ns 2226861 answered true cut false
+   r2 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (6759) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r2 counts: installs 1 taken 1 images 1 why 1
+== run 2 exit 101
+   r3 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (7424) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r3 counts: installs 0 taken 0 images 1 why 0
+== run 3 exit 101
+   r4 LD-LANE install wall_ns 1794239458929046649 holder 14437862218109985891 bytes 121636 budget_ns 30000000000 took_ns 9831810 answered true cut false
+   r4 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (8015) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r4 counts: installs 1 taken 1 images 2 why 1
+== run 4 exit 101
+   r5 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (8624) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r5 counts: installs 0 taken 0 images 1 why 0
+== run 5 exit 101
+   r6 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (9227) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r6 counts: installs 0 taken 0 images 0 why 0
+== run 6 exit 101
+   r7 LD-LANE install wall_ns 1794239487766548365 holder 413813571466804400 bytes 74144 budget_ns 30000000000 took_ns 2362670 answered true cut false
+   r7 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (9827) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r7 counts: installs 1 taken 1 images 2 why 1
+== run 7 exit 101
+   r8 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (10416) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r8 counts: installs 0 taken 0 images 0 why 0
+== run 8 exit 101
+   r9 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (11002) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r9 counts: installs 0 taken 0 images 1 why 0
+== run 9 exit 101
+   r10 LD-LANE install wall_ns 1794239516669718718 holder 5420359752947316848 bytes 246816 budget_ns 30000000000 took_ns 1969110 answered true cut false
+   r10 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (11581) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r10 counts: installs 1 taken 1 images 1 why 1
+== run 10 exit 101
+   r11 LD-LANE install wall_ns 1794239526184003082 holder 1240662319224948254 bytes 225236 budget_ns 30000000000 took_ns 2735271 answered true cut false
+   r11 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (12175) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r11 counts: installs 1 taken 1 images 1 why 1
+== run 11 exit 101
+   r12 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (12788) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+   r12 counts: installs 0 taken 0 images 1 why 0
+== run 12 exit 101
