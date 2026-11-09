@@ -317,6 +317,10 @@ jobs:
       # The socket route's DAX in QEMU (A-189): `slates vhost-user` hands QEMU 11.1's generic vhost-user device the
       # end of slates' own device, whose shared-memory region is the guest's DAX window; the guest is the static
       # probe, and every test of tests/guest_vhost.rs runs. The rig's `slates mount`s need FUSE in the container.
+      # The workspace is bound at /mnt/src, not /src: Ubuntu 26.04's AppArmor profile for /usr/bin/fusermount3 (enforced
+      # by the host's kernel even for the container's own fusermount3, under `apparmor=unconfined`) allows FUSE mounts
+      # only under $HOME, /mnt, /media, /tmp and /run/user/UID, and the rig's mount points live in the build output
+      # (CARGO_TARGET_TMPDIR), so they must lie under one of them (diag-slabs-51, run 42695696906; docs/cli.md).
       - name: slates' own device with DAX in QEMU
         shell: bash
         run: |
@@ -324,13 +328,13 @@ jobs:
           docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             --device /dev/fuse --cap-add SYS_ADMIN \
             $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
-            -v "$PWD":/src -w /src slates-guest sh -c \
+            -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
             'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
              RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
                --bin slates-guest-probe --target "$host" --target-dir target/probe; \
              SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
              SLATES_GUEST_KERNEL=/guest/vmlinuz \
-             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
              cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
           # The image provides the whole environment, so a skip is a vacuous pass and fails.
           if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
@@ -346,12 +350,12 @@ jobs:
           docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             --device /dev/fuse --cap-add SYS_ADMIN \
             $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
-            -v "$PWD":/src -w /src slates-guest sh -c \
+            -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
             'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
              SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
              SLATES_GUEST_KERNEL=/guest/vmlinuz \
              SLATES_GUEST_MODULES="/lib/modules/$(ls /lib/modules | head -1)" \
-             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
              cargo test -p slates-cli --test guest_image -- --nocapture --test-threads=1' 2>&1 | tee guest-image.log
           if grep -q "SKIP" guest-image.log; then echo "an image test was skipped"; exit 1; fi
           grep -q "test result: ok. 7 passed" guest-image.log
