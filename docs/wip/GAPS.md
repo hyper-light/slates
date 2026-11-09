@@ -158,6 +158,15 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
+> waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
+> whose answers a queue held back 1.1 to 2.0 s apart. The transport now makes the one judgement,
+> `Endpoint::peer_silent_past(floor)`: an answer owed and nothing authenticated back for max(floor, three probe
+> timeouts each at least the initial one; RFC 9002 §7.6.1, §6.2.2). A gone peer is judged at 2,008 ms against its
+> 1,998 ms duration. A peer behind a queue, its answers up to 4.09 s apart, is never judged silent. An idle session
+> owes nothing and is never silent. On loopback a stopped peer is judged about 2 s into its silence, not 1 s
+> (fleet-transport §5 status; tests in `crates/transport/tests/exchanges.rs`).
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
