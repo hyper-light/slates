@@ -16281,21 +16281,25 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
     set needs (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_ATTRIBUTES`, or a generic or maximum right granting
     one; `Request::could_become_a_link`). Every other open costs no token query. The receiver reads the token's
     privileges while WinFsp keeps it live, and keeps the open as one that may make a link if the token holds the
-    privilege (`crate::dispatcher::may_link`). That table is bounded by the drive's open table, since each entry is one
+    privilege enabled, as NTFS's check asks (`crate::dispatcher::may_link`). That table is bounded by the drive's open table, since each entry is one
     of its live opens, and an entry is dropped at its Close; an open a successor restored after a takeover has none, and
     is judged unprivileged unless Developer Mode is on.
   - A symbolic link's set or delete is allowed if its open was kept so, or if Developer Mode is on, read from the registry
     at the set. Otherwise it answers `STATUS_PRIVILEGE_NOT_HELD`, which Windows reports as `ERROR_PRIVILEGE_NOT_HELD`,
     NTFS's answer.
   - Stated deviations from NTFS. (a) WinFsp never passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file
-    system, so under Developer Mode the drive allows a caller who did not pass it, where NTFS refuses it. (b) A token that
-    holds the privilege disabled is allowed, as its holder could enable it, where NTFS asks that it be enabled at the
-    set. (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT` or a write access, or through one a
+    system, so under Developer Mode the drive allows a caller who did not pass it, where NTFS refuses it. (b) The privilege
+    must be enabled in the token at the open, where NTFS asks it enabled at the set. `CreateSymbolicLinkW` enables it
+    around its whole operation, before its create, so on that path the two agree; a program that never enables it is
+    refused, as on NTFS. Only a program that enables it after its open and before its `FSCTL_SET_REPARSE_POINT` is
+    refused where NTFS allows it: stricter, and safe (`a_raw_link_set_needs_the_privilege_enabled_at_its_open`).
+    (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT` or a write access, or through one a
     successor restored after a takeover (which kept no token), is judged as one without the privilege: allowed under
     Developer Mode alone.
   - Measured on the runner by `a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode` (`ERROR_PRIVILEGE_NOT_HELD`,
     no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
-    `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag`: PENDING-PRIVILEGE. An NTFS control (the same token
+    `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag` and
+    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`: PENDING-PRIVILEGE. An NTFS control (the same token
     and flag on the runner's own disk, Developer Mode on and off): PENDING-NTFS. The daemon holds no privilege (R10).
 - **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
   its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a

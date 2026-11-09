@@ -80,10 +80,14 @@ pub const STATUS_PRIVILEGE_NOT_HELD: Ntstatus = Ntstatus(0xC000_0061);
 /// a `LUID` (`LowPart`, four bytes; `HighPart`, four) and its `Attributes` (four).
 const PRIVILEGE_ENTRY: usize = 3 * size_of::<u32>();
 
-/// Whether a token's privileges (`GetTokenInformation(TokenPrivileges)`'s bytes) hold the privilege `luid` names, enabled
-/// or not: a holder may enable it, as `CreateSymbolicLinkW` does for an administrator, whose token holds
-/// `SeCreateSymbolicLinkPrivilege` disabled (A-275). A short or malformed buffer holds nothing.
-pub fn holds_privilege(token_privileges: &[u8], luid: u32) -> bool {
+/// Format: `SE_PRIVILEGE_ENABLED` (`winnt.h`), the attribute of a privilege enabled in the token.
+const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+
+/// Whether a token's privileges (`GetTokenInformation(TokenPrivileges)`'s bytes) hold the privilege `luid` names enabled,
+/// as NTFS's check asks (`SeSinglePrivilegeCheck`). `CreateSymbolicLinkW` enables `SeCreateSymbolicLinkPrivilege` around
+/// its whole operation, before its create, so on that path the token read at the create shows it enabled; a holder that
+/// never enables it is refused, as NTFS refuses it (A-275). A short or malformed buffer holds nothing.
+pub fn holds_enabled_privilege(token_privileges: &[u8], luid: u32) -> bool {
   let Some((count, entries)) = token_privileges.split_first_chunk::<{ size_of::<u32>() }>() else {
     return false;
   };
@@ -91,7 +95,10 @@ pub fn holds_privilege(token_privileges: &[u8], luid: u32) -> bool {
   let (entries, _) = entries.as_chunks::<PRIVILEGE_ENTRY>();
   entries.iter().take(count).any(|entry| {
     let (luid_parts, _) = entry.as_chunks::<{ size_of::<u32>() }>();
-    matches!(luid_parts, [low, high, _] if u32::from_le_bytes(*low) == luid && u32::from_le_bytes(*high) == 0)
+    matches!(luid_parts, [low, high, attributes]
+      if u32::from_le_bytes(*low) == luid
+        && u32::from_le_bytes(*high) == 0
+        && u32::from_le_bytes(*attributes) & SE_PRIVILEGE_ENABLED != 0)
   })
 }
 
@@ -480,29 +487,37 @@ mod tests {
     bytes
   }
 
-  /// A-275 (who may make a link). Do: ask whether tokens hold `SeCreateSymbolicLinkPrivilege` (LUID 35): one holding it
-  /// enabled, one holding it disabled (an administrator's, before `CreateSymbolicLinkW` enables it), one without it,
-  /// one claiming more entries than it carries, and a truncated one. Expect: held, held, not, not, not.
+  /// A-275 (who may make a link, NTFS's check). Do: ask whether tokens hold `SeCreateSymbolicLinkPrivilege` (LUID 35)
+  /// enabled: one holding it enabled, one enabled by default too (attributes 3), one holding it disabled (an
+  /// administrator's before `CreateSymbolicLinkW` enables it), one without it, one claiming more entries than it carries,
+  /// and a truncated one. Expect: yes, yes, then no for each of the rest.
   #[test]
-  fn a_token_holds_the_link_privilege_enabled_or_not() {
+  fn a_token_holds_the_link_privilege_only_enabled() {
     const LINK: u32 = 35;
-    assert!(holds_privilege(
+    assert!(holds_enabled_privilege(
       &token_privileges(&[(23, 3), (LINK, 2)]),
       LINK
     ));
-    assert!(holds_privilege(&token_privileges(&[(LINK, 0)]), LINK));
-    assert!(!holds_privilege(
-      &token_privileges(&[(23, 3), (19, 0)]),
+    assert!(holds_enabled_privilege(
+      &token_privileges(&[(LINK, 3)]),
+      LINK
+    ));
+    assert!(
+      !holds_enabled_privilege(&token_privileges(&[(LINK, 0)]), LINK),
+      "held, disabled"
+    );
+    assert!(!holds_enabled_privilege(
+      &token_privileges(&[(23, 3), (19, 2)]),
       LINK
     ));
     let mut overclaimed = token_privileges(&[(23, 3)]);
     overclaimed[..4].copy_from_slice(&9u32.to_le_bytes());
-    assert!(!holds_privilege(&overclaimed, LINK));
-    assert!(!holds_privilege(
+    assert!(!holds_enabled_privilege(&overclaimed, LINK));
+    assert!(!holds_enabled_privilege(
       &token_privileges(&[(LINK, 2)])[..10],
       LINK
     ));
-    assert!(!holds_privilege(&[], LINK));
+    assert!(!holds_enabled_privilege(&[], LINK));
   }
 
   #[test]

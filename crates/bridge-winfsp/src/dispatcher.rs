@@ -116,7 +116,7 @@ fn creator_may_link(request: &Request<'_>) -> Result<bool, WinFspError> {
     .flat_map(|word| word.to_ne_bytes())
     .take(usize::try_from(returned).unwrap_or(0))
     .collect();
-  Ok(crate::symlink::holds_privilege(
+  Ok(crate::symlink::holds_enabled_privilege(
     &bytes,
     u32::try_from(windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE)
       .unwrap_or(0),

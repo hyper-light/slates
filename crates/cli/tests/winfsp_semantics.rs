@@ -966,10 +966,10 @@ fn a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_fla
 /// FILE_SPECIAL_ACCESS)`.
 const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 
-/// Enables `SeCreateSymbolicLinkPrivilege` in this process's token, as a program that sets a link's reparse buffer
-/// through `FSCTL_SET_REPARSE_POINT` itself must on NTFS: an administrator's token holds it disabled, and
-/// `CreateSymbolicLinkW` enables it for its own call.
-fn enable_link_privilege() {
+/// Enables (or disables) `SeCreateSymbolicLinkPrivilege` in this process's token, as a program that sets a link's
+/// reparse buffer through `FSCTL_SET_REPARSE_POINT` itself must enable it on NTFS: an administrator's token holds it
+/// disabled, and `CreateSymbolicLinkW` enables it only around its own call.
+fn set_link_privilege(enabled: bool) {
   use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
   use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -997,7 +997,7 @@ fn enable_link_privilege() {
       PrivilegeCount: 1,
       Privileges: [LUID_AND_ATTRIBUTES {
         Luid: luid,
-        Attributes: SE_PRIVILEGE_ENABLED,
+        Attributes: if enabled { SE_PRIVILEGE_ENABLED } else { 0 },
       }],
     };
     assert_ne!(
@@ -1019,12 +1019,11 @@ fn enable_link_privilege() {
 /// a program that writes the reparse buffer itself does: `CreateSymbolicLinkW` turns a rooted target into an absolute
 /// one, so it never makes this form. The buffer is MS-FSCC 2.1.2.4's, built field by field: the tag, the data length, the
 /// substitute and print names (the same), and `SYMLINK_FLAG_RELATIVE`.
-fn set_root_relative_link(path: &str, rooted: &str) {
+fn set_root_relative_link(path: &str, rooted: &str) -> Result<(), i32> {
   use std::os::windows::fs::OpenOptionsExt;
-  use std::os::windows::io::AsRawHandle;
   use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
   let name: Vec<u8> = rooted.encode_utf16().flat_map(u16::to_le_bytes).collect();
-  let name_len = u16::try_from(name.len()).unwrap();
+  let name_len = u16::try_from(name.len()).map_err(|_| -1)?;
   let mut buffer = Vec::new();
   buffer.extend_from_slice(&0xA000_000Cu32.to_le_bytes());
   buffer.extend_from_slice(&(12 + 2 * name_len).to_le_bytes());
@@ -1040,28 +1039,33 @@ fn set_root_relative_link(path: &str, rooted: &str) {
     .create_new(true)
     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
     .open(path)
-    .unwrap();
+    .map_err(|error| error.raw_os_error().unwrap_or(-1))?;
+  set_reparse_point(&file, &buffer)
+}
+
+/// `FSCTL_SET_REPARSE_POINT` of `buffer` on `file`: Ok, or the Win32 error it set.
+fn set_reparse_point(file: &std::fs::File, buffer: &[u8]) -> Result<(), i32> {
+  use std::os::windows::io::AsRawHandle;
+  let length = u32::try_from(buffer.len()).map_err(|_| -1)?;
   let mut returned = 0u32;
-  enable_link_privilege();
   // SAFETY: the handle is the open file's; the input is the live buffer of its stated length, and there is no output.
   let set = unsafe {
     windows_sys::Win32::System::IO::DeviceIoControl(
       file.as_raw_handle(),
       FSCTL_SET_REPARSE_POINT,
       buffer.as_ptr().cast(),
-      u32::try_from(buffer.len()).unwrap(),
+      length,
       std::ptr::null_mut(),
       0,
       &mut returned,
       std::ptr::null_mut(),
     )
   };
-  assert_ne!(
-    set,
-    0,
-    "FSCTL_SET_REPARSE_POINT: {}",
-    std::io::Error::last_os_error()
-  );
+  if set != 0 {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+  }
 }
 
 /// A-275's stated difference (a link relative to the drive's root). Do: under the drive, put `\x\y` ("at the root") and
@@ -1081,7 +1085,8 @@ fn a_link_relative_to_the_drives_root_follows_its_directory_when_moved() {
   }
   std::fs::write(drive.path("x\\y"), b"at the root").unwrap();
   std::fs::write(drive.path("a\\x\\y"), b"under a").unwrap();
-  set_root_relative_link(&drive.path("a\\b\\link"), "\\x\\y");
+  set_link_privilege(true);
+  set_root_relative_link(&drive.path("a\\b\\link"), "\\x\\y").unwrap();
   assert_eq!(
     std::fs::read(drive.path("a\\b\\link")).unwrap(),
     b"at the root"
@@ -1096,4 +1101,41 @@ fn a_link_relative_to_the_drives_root_follows_its_directory_when_moved() {
     b"under a",
     "moved a directory deeper, the link reaches what its path names from there, not the root's \\x\\y"
   );
+}
+
+/// A-275 (who may make a link, NTFS's check: the privilege enabled). Do: on the drive, as the test's administrator with
+/// `SeCreateSymbolicLinkPrivilege` held but disabled throughout, open a new file as a reparse point and set a symbolic
+/// link's buffer on it with `FSCTL_SET_REPARSE_POINT`; then the same with the privilege enabled before the open. Expect,
+/// outside Developer Mode, `ERROR_PRIVILEGE_NOT_HELD` with it disabled, as NTFS refuses it, and the link made with it
+/// enabled; under Developer Mode both made (A-275's deviation (a)).
+#[test]
+fn a_raw_link_set_needs_the_privilege_enabled_at_its_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let developer = developer_mode();
+  let drive = Drive::mount("enabled");
+  std::fs::create_dir(drive.path("x")).unwrap();
+  std::fs::write(drive.path("x\\y"), b"at the root").unwrap();
+  set_link_privilege(false);
+  let disabled = set_root_relative_link(&drive.path("disabled-link"), "\\x\\y");
+  set_link_privilege(true);
+  let enabled = set_root_relative_link(&drive.path("enabled-link"), "\\x\\y");
+  eprintln!(
+    "A-275 a raw link set, Developer Mode {developer}: privilege disabled {disabled:?}, enabled {enabled:?}"
+  );
+  assert_eq!(enabled, Ok(()), "enabled before its open, the link is made");
+  if developer {
+    assert_eq!(
+      disabled,
+      Ok(()),
+      "under Developer Mode, made (A-275's deviation (a))"
+    );
+  } else {
+    assert_eq!(
+      disabled,
+      Err(ERROR_PRIVILEGE_NOT_HELD),
+      "held but disabled, refused as NTFS refuses it"
+    );
+  }
 }
