@@ -12268,6 +12268,67 @@ end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
   so `operation SubmitAccepted` and `operation SubmitConflict` compare with their `latency` rows; the comparison owed
   above uses them.
 
+**End to end and at equal offered load, on main db9c514e (2026-11-09, the supervisor's two deciding measurements).**
+Main db9c514e against agents/perf-w1 88a6f6e5 (main merged in), each with the owner-CPU diagnostic
+(`tools/owner_cpu_patch.py`), one harness in both (W1's `load_bench.rs`, filing operations by outcome; `cmp` identical).
+The anchor recipe (`rung.sh`: a single-node anchored daemon over the 7.4-rc1 kernel tree, `--hot-files` 0.8 n
+`--per-connection 32 --rounds 3 --reply-patience 60`), interleaved by `tools/ab-e2e.sh <tag> <clients> 5 <main think>
+<W1 think>`, 5 rounds an arm, adas-mac-studio.local-2 (32 CPUs, macOS), 15:21 to 15:28, load 4.4 to 25.6 (others' agents
+started during it), oracle 0 in all 50 runs, `resent` 0 in all. p99 in milliseconds, per attempt / end to end (first send
+to final answer, resends included); one number where the two are equal.
+
+| 3,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 4,856, 4,531, 4,782, 4,510, 4,593 | 13,368, 13,072, 13,814, 13,538, 11,366 |
+| dropped replies / `AcknowledgementOwed` resends | 4,250 / 28,686; 4,252 / 26,835; 4,202 / 27,969; 4,422 / 27,285; 4,301 / 26,137 | 0 / 0 in every run |
+| SubmitAccepted | 39.8/65.6, 56.9/68.8, 43.9/71.2, 47.1/69.1, 45.6/68.7 | 56.7, 58.1, 56.4, 58.6, 64.7 |
+| SubmitConflict | 40.5/106.1, 58.0/114.2, 45.5/100.7, 48.0/117.9, 46.1/127.5 | 63.8, 64.5, 62.0, 66.2, 67.9 |
+| Rebase | 40.3/62.9, 64.9/68.7, 60.1/70.4, 48.7/69.0, 46.5/67.0 | 57.7, 58.0, 58.3, 55.9, 66.6 |
+| Edit | 58.5/80.5, 65.5/85.0, 60.5/82.3, 62.8/84.1, 61.1/81.4 | 46.1, 49.0, 44.9, 48.2, 60.6 |
+| Cycle | 403.0, 428.7, 382.3, 439.7, 375.9 | 238.6, 244.7, 232.6, 239.1, 268.6 |
+| owner µs a verdict / a rebase | 47.8–49.8 / 26.5–27.8 | 21.0–24.5 / 11.9–14.2 |
+
+| 1,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 6,047, 6,257, 5,993, 6,496, 6,422 | 12,961, 13,694, 13,224, 12,995, 13,971 |
+| dropped / resends | 0 / 0 in every run | 0 / 0 in every run |
+| SubmitAccepted | 33.8, 32.3, 37.5, 32.5, 32.4 | 43.9, 39.2, 37.0, 38.9, 34.9 |
+| SubmitConflict | 33.8, 32.6, 37.6, 32.5, 33.5 | 44.3, 39.6, 37.0, 39.4, 35.8 |
+| Rebase | 22.3, 22.8, 37.4, 20.7, 21.3 | 44.0, 39.4, 36.9, 39.3, 35.7 |
+| Cycle | 102.5, 90.8, 104.8, 90.4, 80.9 | 91.3, 93.8, 90.0, 95.4, 87.9 |
+
+Equal offered load: main unpaced, W1's clients paced to main's verdict rate (`--think-us` 6,000 at 1,000 clients, found
+by trying 6,000, 9,000 and 12,000: 6,238, 4,066 and 3,196 verdicts a second; 19,000 at 3,000, as before). The 3,000-client
+set ran twice: in the first, W1's fifth round met the load's rise from 19 to 25 and read 181.1 ms accepted, 264.9
+conflict, 122.4 rebase; the second set, all ten runs, is below, and that excursion did not recur in it.
+
+| equal load | main | W1 |
+|---|---|---|
+| 1,000: verdicts a second | 6,229, 6,571, 6,276, 6,497, 6,174 | 5,796, 6,212, 6,004, 6,055, 6,144 |
+| 1,000: SubmitAccepted | 34.0, 28.7, 31.1, 30.9, 34.3 | 32.3, 26.3, 23.8, 15.1, 13.9 |
+| 1,000: SubmitConflict | 34.7, 29.7, 31.8, 32.4, 34.8 | 27.6, 14.9, 26.5, 24.2, 16.5 |
+| 1,000: Rebase | 21.9, 20.5, 21.2, 21.1, 35.0 | 35.1, 30.7, 32.7, 26.5, 26.3 |
+| 1,000: Cycle | 94.1, 94.0, 82.8, 79.2, 95.6 | 76.0, 68.7, 71.2, 65.4, 66.0 |
+| 3,000: verdicts a second | 4,833, 4,615, 4,659, 4,728, 4,766 | 4,631, 4,956, 4,832, 4,808, 4,802 |
+| 3,000: dropped / resends | 4,106 / 28,984; 4,474 / 27,986; 4,293 / 28,079; 4,283 / 28,995; 4,326 / 28,365 | 0 / 0 in every run |
+| 3,000: SubmitAccepted | 40.8/68.6, 45.7/70.2, 44.7/72.8, 44.1/70.3, 41.5/84.9 | 24.2, 22.1, 23.0, 21.8, 22.3 |
+| 3,000: SubmitConflict | 41.7/99.0, 60.8/105.3, 45.6/109.9, 49.3/103.4, 41.0/120.6 | 35.3, 35.2, 32.8, 33.5, 34.3 |
+| 3,000: Rebase | 41.7/67.9, 64.1/66.9, 57.1/71.1, 58.5/70.1, 41.5/69.8 | 4.3, 6.2, 5.0, 4.0, 5.2 |
+| 3,000: Cycle | 399.0, 391.7, 400.6, 406.4, 418.3 | 148.2, 149.0, 147.8, 150.2, 147.3 |
+
+- **End to end, the verdict is better on W1 wherever main drops replies.** At 3,000 clients main drops 4,106 to 4,474
+  replies a run and is refused `AcknowledgementOwed` 25,868 to 28,995 times, each sent again. Its accepted submit reads
+  39.8–56.9 ms per attempt and 65.6–84.9 end to end, and its conflicting submit 40.5–61.0 per attempt and 99.0–127.5 end
+  to end. W1 drops and resends nothing, so its two figures are one: 56.4–64.7 accepted and 62.0–67.9 conflicting,
+  unpaced, at 2.3 to 3.1 times main's verdicts a second (the figures span all three 3,000-client sets).
+- **At equal offered load W1's verdicts are faster at both sizes**, and so is the cycle; at 3,000 clients every verb is.
+- **One verb is worse at equal load: the rebase at 1,000 clients**, 26.3–35.1 ms against main's 20.5–35.0 (the rounds'
+  medians 30.7 against 21.2). Unpaced at 1,000 clients, where main drops nothing, W1's submit and rebase are worse too
+  (accepted 34.9–43.9 against 32.3–37.5; rebase 35.7–44.0 against 20.7–37.4), at 2.0 to 2.3 times main's verdicts a second, and
+  its cycle is even (medians 91.3 against 90.8). A rebase from a work's shard crosses to the owner and waits in the
+  ask batch; on main it runs where its work is. That is the next lever's target: the rebase mapped on the work's shard.
+- The owner's CPU a verdict is 21.0–26.9 µs on W1 against 37.6–50.9 on main, and a rebase 11.9–14.7 against 25.8–27.8.
+
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
 **What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
