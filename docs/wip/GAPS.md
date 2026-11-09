@@ -5828,8 +5828,18 @@ round asked no one and it waited out a whole election timeout. No late grant was
 **Open (A-251, raft-chaos): a holder's page can leave out a copy it holds and still count as its promise.** A successor counts a
 complete answer as a promise for every object not listed, so an omitted copy reads as a copy not held, and an older record can
 be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
-`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). Still owed: the counting rule as a pure
-`crates/db` function with a paged model and an omission nemesis, then a per-object question by name, then the process test.
+`docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). **Step (a), built:** the counting rule is
+`slates_db::takeover::readiness`, and `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover with an omission
+nemesis. Over 2,000 histories today's rule lost 216 committed records with the nemesis on and none with it off; A-251's
+by-name rule lost none. **Step (b), built:** a successor asks by name for what a member's complete pages did not list,
+a holder answers from its own records with no routing filter, and the successor counts under
+`CountingRule::NamedAnswer`. **The names, folded into (b):** an object that every holder leaves out was never learned
+(664 committed objects unlearned over 1,000 histories). A holder now lists a copy by one rule with no routing in it: the
+line of its authority, or of the owner an install moved that authority from (shape (i): 0 lost, none of the asker's own
+objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
+"the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
+**Owed, after raft-7 (A-270) lands:** the held image carrying `Acceptor::moved_from`, with the next image version and an
+old image refused typed; until then a warm restart forgets an earlier move. (d), the process test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

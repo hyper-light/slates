@@ -9676,6 +9676,169 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
   );
 }
 
+/// A-251 (d), the process test (§4.8 "Promotion and takeover"; NoLoss): a takeover adopts a committed head that a holder
+/// left out of its pages because its routing lost the copy, the warm-restart case of
+/// `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md` (A-250 restores routing on a warm restart, so
+/// the loss is injected). Do: three nodes at f = 1; on a, volumes until one's successor is c and one's is b, each first
+/// head placed on all three; then c refuses a's records, and each volume's second head commits on a and b alone; a stops,
+/// and b forgets both volumes' routing and lineage. Expect: each volume is served, and its takeover adopted the second
+/// head, which c, holding only the first before, then holds (the successor re-commits the adopted record through its
+/// placement):
+/// - the volume whose successor is c: b, its routing gone, lists its copy by the authority it was written under
+///   (A-251 (b), shape (i));
+/// - the volume whose successor is b: b learns its own copy the same way, not through routing.
+///
+/// On the rule before A-251 (b) (diag-62, 15 of 15 runs) neither volume was served within the deadline: b's forgotten
+/// routing left its acceptors unreconciled, and the successor's adoption through b went unplaced every period.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let survivors = [hosts[1], hosts[2]];
+  let mut client = Client::connect(daemons[0].instance());
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  // Per successor, the volume and its first snapshot.
+  let mut volumes: std::collections::BTreeMap<HostId, (VolumeId, SnapshotId)> =
+    std::collections::BTreeMap::new();
+  for attempt in 0..SUCCESSOR_SEARCH {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("left-out-{attempt}"))) else {
+      panic!("create on the owner")
+    };
+    share_with_fleet(&mut client, id, &daemons);
+    let ReplyBody::Snapshotted { id: first, .. } =
+      client.call(&RequestBody::Snapshot { volume: id })
+    else {
+      panic!("snapshot on the owner")
+    };
+    let object = ObjectId(id.bytes);
+    assert!(
+      poll_snapshot_placed(&observed, &mut client, id, first),
+      "volume {attempt}'s first head placed"
+    );
+    assert!(
+      poll_until(&observed, PLACEMENT_DEADLINE, || {
+        Ok(
+          daemons[1].held_position(object)?.is_some()
+            && daemons[2].held_position(object)?.is_some(),
+        )
+      }),
+      "both survivors hold volume {attempt}'s first head"
+    );
+    let successor = rendezvous_first(&survivors, object).unwrap();
+    volumes.entry(successor).or_insert((id, first));
+    if volumes.len() == survivors.len() {
+      break;
+    }
+  }
+  assert_eq!(volumes.len(), 2, "a volume for each successor: {volumes:?}");
+  // The second heads reach a and b only.
+  daemons[2].inject_record_refusal(&[hosts[0]]).unwrap();
+  let mut positions = Vec::new();
+  for (successor, (id, _)) in &volumes {
+    let ReplyBody::Snapshotted { id: second, .. } =
+      client.call(&RequestBody::Snapshot { volume: *id })
+    else {
+      panic!("second snapshot on the owner")
+    };
+    assert!(
+      poll_snapshot_placed(&observed, &mut client, *id, second),
+      "the second head committed on a and b"
+    );
+    let object = ObjectId(id.bytes);
+    let held = (
+      daemons[1].held_position(object).unwrap(),
+      daemons[2].held_position(object).unwrap(),
+    );
+    positions.push((*successor, held));
+  }
+  drop(client);
+  // The owner dies, and b's routing loses both copies.
+  daemons.remove(0).stop();
+  for (id, _) in volumes.values() {
+    daemons[0]
+      .forget_object_routing(ObjectId(id.bytes))
+      .unwrap();
+  }
+  let survivors_observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut clients: Vec<Client> = daemons
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
+  let mut heads: std::collections::BTreeMap<VolumeId, String> = std::collections::BTreeMap::new();
+  let served = poll_until(&survivors_observed, SERVE_DEADLINE, || {
+    heads.clear();
+    let mut all = true;
+    for (id, _) in volumes.values() {
+      let reports: Vec<slates_ipc::protocol::StatusReport> = clients
+        .iter_mut()
+        .filter_map(
+          |client| match client.call(&RequestBody::Status { volume: *id }) {
+            ReplyBody::Status { report } => Some(*report),
+            _ => None,
+          },
+        )
+        .collect();
+      heads.insert(
+        *id,
+        format!(
+          "{:?}",
+          reports.iter().map(|report| report.head).collect::<Vec<_>>()
+        ),
+      );
+      all &= !reports.is_empty();
+    }
+    Ok(all)
+  });
+  // The adopted head, as c holds it: c held only the first head, so it holds the second only if the successor adopted
+  // the second and re-committed it through c, whichever survivor is the successor. Polled, since a re-commit can land
+  // after the volume is first served.
+  let mut adopted = std::collections::BTreeMap::new();
+  let _ = poll_until(&survivors_observed, PLACEMENT_DEADLINE, || {
+    adopted.clear();
+    for (id, _) in volumes.values() {
+      adopted.insert(*id, daemons[1].held_position(ObjectId(id.bytes))?);
+    }
+    Ok(adopted.values().all(|position| *position >= Some(2)))
+  });
+  drop(clients);
+  let counters: Vec<_> = daemons
+    .iter()
+    .map(|daemon| {
+      daemon.fleet_refusals().map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(name, _)| name.starts_with("fleet.takeover"))
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "held positions (successor, (b, c)) before the death: {positions:?}; c's after the takeover {adopted:?}; served \
+     {served}; counters {counters:?}"
+  );
+  assert!(
+    positions
+      .iter()
+      .all(|(_, (b, c))| *b == Some(2) && *c == Some(1)),
+    "b holds each volume's second head and c only its first: {positions:?}"
+  );
+  assert!(
+    served,
+    "every volume served within {SERVE_DEADLINE:?}: {heads:?}"
+  );
+  for (id, position) in &adopted {
+    assert_eq!(
+      *position,
+      Some(2),
+      "volume {id:?}'s takeover adopted its second head, which c then holds, not the first: {adopted:?}"
+    );
+  }
+}
+
 /// Creates, snapshots and places volumes on `daemons[0]` — each head held by `daemons[1]` — until one's
 /// successor among the two survivors is each of them (at most [`SUCCESSOR_SEARCH`]): the volumes and their
 /// successors. The successor is the one rendezvous ranks first among the owner's surviving cohort, which in a
