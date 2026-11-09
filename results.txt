@@ -1,0 +1,13 @@
+4147768 diag mutation: the Unix writer reports OwnMount as Unavailable (never main) on macos-latest
+steps: build success, test success
+test a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open ... slates anchor: instance cli-ownland-17830 up; daemon pid 17940; 1 shards
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.68s
+--- the log's last lines
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance cli-ownland-17830 serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 103451 µs, 24971 µs of its CPU, in 7 slices of 6 units; the longest slice 72965 µs, the most CPU in one 19011 µs, ending at unit 2 (a slice's floor 2 µs, 4864 µs yielding)
+slates daemon: the anchor is gone; leaving
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.68s
+
