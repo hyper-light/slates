@@ -1,0 +1,46 @@
+red on macos-latest, 3 CPUs, Mon Nov  9 20:08:25 UTC 2026, head 25eda1d16d63ad9825734d8307cac0b4192d39a1
+== run 1 a_heal_leaves_the_head_naming_holders_that_hold_the_content exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 14.20s
+
+== run 1 a_heal_republishes_the_head_once_a_named_holder_has_left exit 101
+thread 'a_heal_republishes_the_head_once_a_named_holder_has_left' (25447) panicked at crates/server/tests/fleet.rs:9952:9:
+setup: placed=true, every survivor holds the head=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_heal_republishes_the_head_once_a_named_holder_has_left ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 116 filtered out; finished in 405.77s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 1 a_holder_that_lost_placed_content_is_repaired_by_the_healer exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 11.50s
+
+== run 2 a_heal_leaves_the_head_naming_holders_that_hold_the_content exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 14.23s
+
+== run 2 a_heal_republishes_the_head_once_a_named_holder_has_left exit 101
+thread 'a_heal_republishes_the_head_once_a_named_holder_has_left' (48453) panicked at crates/server/tests/fleet.rs:9952:9:
+setup: placed=true, every survivor holds the head=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_heal_republishes_the_head_once_a_named_holder_has_left ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 116 filtered out; finished in 403.88s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 2 a_holder_that_lost_placed_content_is_repaired_by_the_healer exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 11.24s
+
+== run 3 a_heal_leaves_the_head_naming_holders_that_hold_the_content exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 13.82s
+
+== run 3 a_heal_republishes_the_head_once_a_named_holder_has_left exit 101
+thread 'a_heal_republishes_the_head_once_a_named_holder_has_left' (70760) panicked at crates/server/tests/fleet.rs:9952:9:
+setup: placed=true, every survivor holds the head=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_heal_republishes_the_head_once_a_named_holder_has_left ... FAILED
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 116 filtered out; finished in 404.12s
+
+error: test failed, to rerun pass `-p slates-server --test fleet`
+== run 3 a_holder_that_lost_placed_content_is_repaired_by_the_healer exit 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 11.18s
+
