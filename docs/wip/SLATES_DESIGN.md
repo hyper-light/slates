@@ -2169,7 +2169,16 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
 > held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
-> so none serves a request after the acknowledgement.
+> so none serves a request after the acknowledgement. **2026-11-09:** on Linux the ended FUSE mount's own registry
+> attachment is revoked too (`fuse::fence_if_mounted`); before, it was not, and a revoked consumer's FUSE mount read on
+> (`docs/bugs/2026-11-09-a-revoked-consumers-linux-fuse-mount-went-on-serving.md`). The same day the fenced mount's
+> kernel cache was closed as well: a page the kernel holds is read with no request, so a descriptor opened before the
+> revocation read a page its readahead had fetched and the process never asked for. The fence now wakes the mount,
+> which tells its kernel to drop the root and every node it references (`FUSE_NOTIFY_INVAL_INODE` of all data, sliced
+> under the shard's budget, written on the notify thread) while it answers every request `ENOTCONN`, and ends only once
+> the last slice is written; the revocation is acknowledged after the mount has ended, bounded by the told wait (§4.6,
+> `told::TOLD_WAIT_NS`) and counted past it (`fuse.revoked_overdue`). The cost is one message per node the kernel
+> references, at most the volume's inode allowance.
 
 > **Amendment (2026-10-17): invalidations are delivered off the answering thread, not before each request.**
 > "Before each request" was not merely an ordering preference — it deadlocked the mount, and could not be kept.
