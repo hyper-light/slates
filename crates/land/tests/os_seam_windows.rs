@@ -120,11 +120,80 @@ fn a_directory_this_process_makes_is_a_target_it_owns() {
   assert!(opened.is_ok(), "{:?}", opened.err());
 }
 
-/// §4.15 step 4: a target another user owns is refused. Do: open the system's own directory, which `TrustedInstaller`
-/// owns on every Windows, as a target. Expect: `TargetNotOwned`, before anything could be written.
+/// Format: PowerShell's words for this process's token: its user's SID, then its default owner's (`TokenOwner`).
+const TOKEN_SIDS: &str =
+  "$i = [Security.Principal.WindowsIdentity]::GetCurrent(); $i.User.Value; $i.Owner.Value";
+
+/// Runs `script` in PowerShell, which inherits this process's token, and returns its output's lines.
+fn powershell(script: &str) -> Vec<String> {
+  let out = std::process::Command::new("powershell")
+    .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "powershell: {out:?}");
+  String::from_utf8_lossy(&out.stdout)
+    .lines()
+    .map(|line| line.trim().to_owned())
+    .filter(|line| !line.is_empty())
+    .collect()
+}
+
+/// This token's user SID and its default owner's SID.
+fn token_sids() -> (String, String) {
+  let lines = powershell(TOKEN_SIDS);
+  let [user, default_owner] = lines.as_slice() else {
+    panic!("a user and a default owner: {lines:?}")
+  };
+  (user.clone(), default_owner.clone())
+}
+
+/// The SID that owns `path`, as Windows reports it.
+fn owner_sid(path: &Path) -> String {
+  let script = format!(
+    "(Get-Acl -LiteralPath '{}').GetOwner([Security.Principal.SecurityIdentifier]).Value",
+    path.display()
+  );
+  powershell(&script).concat()
+}
+
+/// §4.15 step 4, the branch an elevated token takes: a target is the writer's when its owner is the token's default
+/// owner, the owner this process's own creations get, though that is not the token's user. Do: make a directory in this
+/// process, read the token's user and default owner and the directory's owner, and open the directory as a target.
+/// Expect: the directory bears the default owner and not the user, and opens. On a token whose default owner is its
+/// user (an unelevated one), the branch cannot be reached: skipped loudly. CI's runners and an elevated shell take it
+/// (`BUILTIN\Administrators`, measured 2026-11-06).
+#[test]
+fn a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users() {
+  let (user, default_owner) = token_sids();
+  if user == default_owner {
+    eprintln!(
+      "SKIP: this token's default owner is its user {user}, so no tree it makes bears another owner"
+    );
+    return;
+  }
+  let space = Workspace::new("default-owner");
+  let owner = owner_sid(&space.target());
+  assert_eq!(
+    owner, default_owner,
+    "made by this process, so its default owner's"
+  );
+  assert_ne!(owner, user, "the branch under test: not the user's");
+  let opened = OsLand::open_target(&space.target());
+  assert!(opened.is_ok(), "{:?}", opened.err());
+}
+
+/// §4.15 step 4: a target another SID owns is refused, whatever the token. Do: read the owner of the system's own
+/// directory, which `TrustedInstaller` owns on every Windows, check it is neither this token's user nor its default
+/// owner, and open it as a target. Expect: `TargetNotOwned`, before anything could be written.
 #[test]
 fn a_target_another_user_owns_is_refused() {
   let system = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+  let (user, default_owner) = token_sids();
+  let owner = owner_sid(&system);
+  assert!(
+    owner != user && owner != default_owner,
+    "the target's owner {owner} is another SID than the user {user} and the default owner {default_owner}"
+  );
   let opened = OsLand::open_target(&system);
   assert!(
     matches!(opened, Err(TargetRefusal::TargetNotOwned)),
