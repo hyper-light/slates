@@ -9079,6 +9079,7 @@ new process. In simulation the session ended one round trip after its first pack
     loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
     bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
     here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
+  - **The process test is parked `#[ignore]` (2026-11-09, the supervisor, landing it).** `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` passed 15 of 15 a side on three CI runners (diag-61), but on a Mac at load 46 to 48 it failed 2 of 3 runs, and at load 232 the stack gate's one. Each failure read 0 resets while b's first read reached the restarted a in 207 to 263 ms: b's forward found its session lent (`fleet.forward.session_out`) or the link already judged the old a dead, so no packet reached the new process on the old session and no reset was owed. The product behaved; the test does not hold its precondition. Owed (raft-chaos): assert b still holds its session to the old a when a restarts, retry within a bound when it does not, and count the runs in which the reset path ran, then un-ignore it.
 
 ### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
 
