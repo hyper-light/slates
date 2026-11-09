@@ -61,15 +61,37 @@ fn spec(n: usize) -> CreateSpec {
   }
 }
 
-/// Creates [`VOLUMES`] volumes; their ids.
+/// Creates `spec`'s volume and returns its id. A create the client's own reply deadline answers `Stalled` (a live
+/// daemon silent past the derived deadline, `Deadlines::derive`: the product's answer under heavy load, 1 s on this
+/// Mac) is counted in `stalled` and asked again under the same name: the retry makes the volume, or finds the first
+/// attempt's (`AlreadyExists` names it), so the test still knows every id exactly.
+fn create_counting(client: &mut Client, spec: &CreateSpec, stalled: &mut usize) -> VolumeId {
+  loop {
+    match client.create(spec) {
+      Ok(id) => return id,
+      Err(slates_client::ClientError::Stalled { .. }) => *stalled += 1,
+      Err(slates_client::ClientError::Refused(slates_client::Refusal::AlreadyExists {
+        existing,
+      }))
+        if *stalled > 0 =>
+      {
+        return existing;
+      }
+      Err(e) => panic!("{}: {e}", spec.name),
+    }
+  }
+}
+
+/// Creates [`VOLUMES`] volumes; their ids. Reports the creates answered `Stalled` and asked again.
 fn populate(client: &mut Client) -> BTreeSet<VolumeId> {
-  (0..VOLUMES)
-    .map(|n| {
-      client
-        .create(&spec(n))
-        .unwrap_or_else(|e| panic!("volume {n}: {e}"))
-    })
-    .collect()
+  let mut stalled = 0usize;
+  let made = (0..VOLUMES)
+    .map(|n| create_counting(client, &spec(n), &mut stalled))
+    .collect();
+  eprintln!(
+    "{VOLUMES} volumes made; {stalled} create(s) answered Stalled by the client's reply deadline and asked again"
+  );
+  made
 }
 
 /// Lists until the listing is exactly `survivors`, within [`ASYNC_WAIT`]: a destroy is answered before its teardown's
@@ -164,7 +186,7 @@ fn a_volume_that_lives_through_a_paged_walk_is_listed_exactly_once() {
         client.destroy(id).unwrap();
         destroyed.insert(id);
       }
-      client.create(&spec(VOLUMES + pages)).unwrap();
+      create_counting(&mut client, &spec(VOLUMES + pages), &mut 0);
     }
     let (ids, next) = page(&mut client, after);
     pages += 1;

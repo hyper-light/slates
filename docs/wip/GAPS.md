@@ -39,7 +39,11 @@
 > order, a reply chunk's worth, each shard sending at most a page. The client walks the pages, sync and as an async
 > chain. A new volume's name is bounded so its summary fits one page (4,012 bytes; `InvalidName` past it), and an unrecovered
 > volume's cause is cut to fit beside it; recorded, the cause is bounded (a base at `create`: 1,023 bytes on macOS, 3,812
-> on Linux and Windows; a reason at 256) so `status` names it whole. 3,000 volumes
+> on Linux and Windows; a reason at 256) so `status` names it whole. **Under load:** at load about 160 on this Mac (2026-11-09) creates
+> past about 2,300 volumes on two shards were answered `Stalled` by the client's own reply deadline (derived from the
+> liveness budget, 1 s here): a live daemon silent past it, the product's answer, not a test literal. `volume_list.rs`
+> counts each and asks again under the same name (`AlreadyExists` names a first attempt that landed); how long a create
+> takes past a few thousand volumes under that load is not yet measured. 3,000 volumes
 > list on two shards, and a walk under churn lists each survivor once
 > (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
 > - **`changed_since`, the same shape: fixed the same way (A-264, 2026-11-08, revised 2026-11-09).** Refused at 800
