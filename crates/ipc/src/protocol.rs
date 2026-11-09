@@ -291,7 +291,9 @@ pub enum RequestBody {
     /// The volume.
     volume: VolumeId,
   },
-  /// List the caller's volumes.
+  /// List the caller's volumes in one reply. Retired: a listing past a few hundred volumes outgrew the client's bulk
+  /// area, so the daemon refuses it `BadRequest` naming [`RequestBody::ListPage`], which pages the listing (§4.4).
+  /// Kept for its wire index (append-only evolution, D-15).
   List,
   /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
@@ -796,6 +798,31 @@ pub enum RequestBody {
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
   },
+  /// One page of the caller's volumes from `cursor` (§4.4 `list`): as many as one reply chunk holds, each shard's in id
+  /// order, the shards in turn; the reply names the cursor that continues it. A read; never recorded. Appended.
+  ListPage {
+    /// Where the page begins: [`ListCursor::FIRST`] for the first page, else the `next` of the page before.
+    cursor: ListCursor,
+  },
+}
+
+/// Where a paged listing of volumes continues (§4.4 `list`): a shard, by its position among the daemon's shards, and
+/// the last volume of it already listed. A volume created or destroyed between pages may be listed or not, as `readdir`
+/// across a change may; one that stands throughout is listed exactly once.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListCursor {
+  /// The shard's position among the daemon's shards.
+  pub shard: u32,
+  /// The last volume of that shard already listed; none before its first.
+  pub after: Option<VolumeId>,
+}
+
+impl ListCursor {
+  /// Format: the first page's cursor, the first shard from its first volume.
+  pub const FIRST: ListCursor = ListCursor {
+    shard: 0,
+    after: None,
+  };
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1455,6 +1482,7 @@ impl RequestBody {
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
       | RequestBody::List
+      | RequestBody::ListPage { .. }
       | RequestBody::DaemonStatus
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
@@ -3242,7 +3270,7 @@ pub enum ReplyBody {
     /// The report. Boxed: a cold, wide report that would otherwise size every reply's move.
     report: Box<StatusReport>,
   },
-  /// The listing.
+  /// The listing in one reply. Retired with [`RequestBody::List`]: no daemon answers it; kept for its wire index.
   Listed {
     /// The volumes.
     volumes: Vec<VolumeSummary>,
@@ -3520,6 +3548,13 @@ pub enum ReplyBody {
   LiveShippingSet {
     /// Whether it is live-shipped now.
     live_shipped: bool,
+  },
+  /// One page of a listing of volumes (`ListPage`, §4.4). Appended.
+  ListedPage {
+    /// The volumes on this page, in id order.
+    volumes: Vec<VolumeSummary>,
+    /// Where the listing continues; none after its last page.
+    next: Option<ListCursor>,
   },
 }
 

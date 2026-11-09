@@ -3651,7 +3651,6 @@ fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
-    scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
     recovered,

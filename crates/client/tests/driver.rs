@@ -12,7 +12,7 @@ use slates_anchor::AnchorSegment;
 use slates_client::driver::{Driver, Event, Ticket};
 use slates_client::{Client, ClientError, Deadlines};
 use slates_ipc::HeldRendezvous;
-use slates_ipc::protocol::ReplyBody;
+use slates_ipc::protocol::{ListCursor, ReplyBody};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
@@ -122,7 +122,7 @@ impl Ticker {
               ticket,
               reply.map(|body| {
                 assert!(
-                  matches!(body, Some(ReplyBody::Listed { .. })),
+                  matches!(body, Some(ReplyBody::ListedPage { .. })),
                   "a list answered {body:?}"
                 );
               }),
@@ -248,7 +248,10 @@ fn submit_lists(client: &mut Client, driver: &mut Driver, count: usize) -> (Vec<
   let mut admitted = Vec::new();
   let mut refused = 0;
   for _ in 0..count {
-    match driver.submit(client, Box::new(|client: &mut Client| client.list_begin())) {
+    match driver.submit(
+      client,
+      Box::new(|client: &mut Client| client.list_page_begin(ListCursor::FIRST)),
+    ) {
       Ok(ticket) => admitted.push(ticket),
       Err(ClientError::TooManyOutstanding { .. }) => refused += 1,
       Err(e) => panic!("{e}"),
@@ -389,7 +392,7 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   let cancelled = driver
     .submit(
       &mut client,
-      Box::new(|client: &mut Client| client.list_begin()),
+      Box::new(|client: &mut Client| client.list_page_begin(ListCursor::FIRST)),
     )
     .unwrap();
   driver.cancel(&mut client, cancelled);
@@ -448,7 +451,7 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
   let ticket = driver
     .submit(
       &mut client,
-      Box::new(|client: &mut Client| client.list_begin()),
+      Box::new(|client: &mut Client| client.list_page_begin(ListCursor::FIRST)),
     )
     .unwrap();
   let started = Instant::now();
@@ -475,7 +478,10 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
     "reported again before it was finished: {second:?}"
   );
   let reply = client.poll_reply_word(*word).unwrap();
-  assert!(matches!(reply, Some(ReplyBody::Listed { .. })), "{reply:?}");
+  assert!(
+    matches!(reply, Some(ReplyBody::ListedPage { .. })),
+    "{reply:?}"
+  );
   driver.finish(ticket);
   assert!(driver.is_idle());
   daemon.stop();

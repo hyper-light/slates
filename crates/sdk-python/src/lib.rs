@@ -44,7 +44,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use slates_client::driver::{Begin, Driver, Event, Ticket};
 use slates_client::{
-  Client as RustClient, ClientError, Connecting, CreateSpec, Deadlines, Filter, Landing,
+  Client as RustClient, ClientError, Connecting, CreateSpec, Deadlines, Filter, Landing, ListWalk,
   NamePolicy, Rebased, RequestId, SizeClass, SnapshotId, StatusReport, Submitted, VolumeId,
   VolumeSummary, WorkOp,
 };
@@ -614,7 +614,8 @@ enum Decode {
   Snapshotted,
   /// A status dict.
   Status,
-  /// A list of volume-entry dicts.
+  /// A page of a listing (`ListPage`, §4.4): settled by [`settle_listing_page`], which asks for the next page under
+  /// the same future until the last, then resolves to the list of volume-entry dicts.
   Listed,
   /// A resize's confirmation (resolves to `None`).
   Resized,
@@ -645,6 +646,8 @@ enum Decode {
 struct Pending {
   future: Py<PyAny>,
   decode: Decode,
+  /// A listing's walk so far, for a [`Decode::Listed`] call; none for every other.
+  listing: Option<ListWalk>,
 }
 
 /// An already-resolved awaitable for the async fast path: `await` returns the value without touching
@@ -882,20 +885,40 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Status)
   }
 
-  /// Lists the daemon's volumes as a list of dicts (§4.4) — the async form of `Client.list`.
+  /// Lists the daemon's volumes as a list of dicts sorted by name (§4.4) — the async form of `Client.list`: every
+  /// page of the listing (`ListPage`), each spun for as any verb's reply is; a page that does not land within its
+  /// spin leaves the call to the pump, which asks for the rest ([`settle_listing_page`]).
   fn list<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
-    let (ticket, fast) = slf.borrow_mut().begin_spin(
-      Box::new(move |c: &mut RustClient| c.list_begin()),
-      |c: &mut RustClient, request: RequestId, spin: u64| {
-        let fast = match c.list_spin(request, spin).map_err(refusal)? {
-          Some(volumes) => Some(summaries_to_py(py, volumes)?),
-          None => None,
-        };
-        Ok(fast)
-      },
-    )?;
-    finish(&slf, ticket, fast, Decode::Listed)
+    let mut walk = ListWalk::new();
+    loop {
+      let cursor = walk.cursor();
+      let mut landed = None;
+      let (ticket, _fast) = slf.borrow_mut().begin_spin(
+        Box::new(move |c: &mut RustClient| c.list_page_begin(cursor)),
+        |c: &mut RustClient, request: RequestId, spin: u64| {
+          Ok(
+            c.list_page_spin(request, spin)
+              .map_err(refusal)?
+              .map(|page| {
+                landed = Some(page);
+                py.None()
+              }),
+          )
+        },
+      )?;
+      let Some(page) = landed else {
+        let future = finish(&slf, ticket, None, Decode::Listed)?;
+        if let Some(entry) = slf.borrow_mut().pending.get_mut(&ticket) {
+          entry.listing = Some(walk);
+        }
+        return Ok(future);
+      };
+      if walk.take(page).map_err(refusal)?.is_none() {
+        let value = summaries_to_py(py, walk.finish())?;
+        return Ok(Bound::new(py, Ready { value: Some(value) })?.into_any());
+      }
+    }
   }
 
   /// Resizes the volume's quota (§4.4) — the async form of `Client.resize`; resolves to `None`.
@@ -1384,6 +1407,7 @@ fn finish<'py>(
       Pending {
         future: future.clone().unbind(),
         decode,
+        listing: None,
       },
     );
     if this.event_loop.is_none() {
@@ -1421,9 +1445,21 @@ impl CancelHook {
     let client = self.client.bind(py);
     {
       let mut this = client.borrow_mut();
-      if this.pending.remove(&self.ticket).is_some() {
+      // A listing asks for each next page under a new ticket and the same future (`settle_listing_page`), so a call
+      // no longer under the hook's ticket is found by its future.
+      let ticket = if this.pending.contains_key(&self.ticket) {
+        Some(self.ticket)
+      } else {
+        this
+          .pending
+          .iter()
+          .find(|(_, entry)| entry.future.bind(py).is(&future))
+          .map(|(ticket, _)| *ticket)
+      };
+      if let Some(ticket) = ticket {
+        this.pending.remove(&ticket);
         let this = &mut *this;
-        this.driver.cancel(&mut this.inner, self.ticket);
+        this.driver.cancel(&mut this.inner, ticket);
       }
     }
     // Never raises into the loop (a done callback's exception is only logged).
@@ -1601,6 +1637,9 @@ fn settle_one(slf: &Bound<'_, AsyncClient>, event: Event) -> PyResult<()> {
       let Some(decode) = slf.borrow().pending.get(&ticket).map(|entry| entry.decode) else {
         return Ok(());
       };
+      if matches!(decode, Decode::Listed) {
+        return settle_listing_page(slf, ticket, word);
+      }
       let decoded = {
         let mut this = slf.borrow_mut();
         decode_pending(py, &mut this.inner, word, decode)
@@ -1627,6 +1666,59 @@ fn settle_one(slf: &Bound<'_, AsyncClient>, event: Event) -> PyResult<()> {
   match outcome {
     Ok(value) => future.call_method1("set_result", (value,))?,
     Err(error) => future.call_method1("set_exception", (error.into_value(py),))?,
+  };
+  Ok(())
+}
+
+/// Settles a landed page of a listing (`ListPage`, §4.4) into its call: the page joins the walk; the last page resolves
+/// the call with every volume, sorted by name as `Client.list` sorts; any other asks for the next page under the same
+/// future, so the caller awaits one call for the whole listing. A page the walk refuses, or a next page the driver
+/// cannot take, fails the call typed.
+fn settle_listing_page(slf: &Bound<'_, AsyncClient>, ticket: Ticket, word: u64) -> PyResult<()> {
+  let py = slf.py();
+  let polled = slf.borrow_mut().inner.list_page_poll(word);
+  let page = match polled {
+    Ok(None) => return Ok(()),
+    Ok(Some(page)) => Ok(page),
+    Err(error) => Err(error),
+  };
+  let (future, outcome) = {
+    let mut this = slf.borrow_mut();
+    this.driver.finish(ticket);
+    let Some(mut entry) = this.pending.remove(&ticket) else {
+      return Ok(());
+    };
+    let mut walk = entry.listing.take().unwrap_or_default();
+    match page.and_then(|page| walk.take(page)) {
+      Ok(None) => (entry.future, Ok(walk.finish())),
+      Ok(Some(next)) => {
+        let this = &mut *this;
+        let submitted = this.driver.submit(
+          &mut this.inner,
+          Box::new(move |c: &mut RustClient| c.list_page_begin(next)),
+        );
+        match submitted.and_then(|next_ticket| {
+          this.inner.begin_ack_if_due()?;
+          Ok(next_ticket)
+        }) {
+          Ok(next_ticket) => {
+            entry.listing = Some(walk);
+            this.pending.insert(next_ticket, entry);
+            return Ok(());
+          }
+          Err(error) => (entry.future, Err(error)),
+        }
+      }
+      Err(error) => (entry.future, Err(error)),
+    }
+  };
+  let future = future.bind(py);
+  if future.call_method0("done")?.extract::<bool>()? {
+    return Ok(());
+  }
+  match outcome {
+    Ok(volumes) => future.call_method1("set_result", (summaries_to_py(py, volumes)?,))?,
+    Err(error) => future.call_method1("set_exception", (refusal(error).into_value(py),))?,
   };
   Ok(())
 }
@@ -1709,10 +1801,11 @@ fn decode_pending(
       Some(report) => Some(status_dict(py, report)?.into_any()),
       None => None,
     },
-    Decode::Listed => match inner.list_poll(word).map_err(refusal)? {
-      Some(volumes) => Some(summaries_to_py(py, volumes)?),
-      None => None,
-    },
+    Decode::Listed => {
+      return Err(PyRuntimeError::new_err(
+        "a listing page is settled by settle_listing_page, never decoded alone",
+      ));
+    }
     Decode::Resized => inner
       .resize_poll(word)
       .map_err(refusal)?

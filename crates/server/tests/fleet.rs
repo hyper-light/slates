@@ -2064,8 +2064,8 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
 /// Whether the daemon at `instance` lists `volume` among its own: a listing gathers its shards' catalogs only.
 fn lists_volume(instance: &str, volume: VolumeId) -> bool {
   matches!(
-    Client::connect(instance).call(&RequestBody::List),
-    ReplyBody::Listed { volumes } if volumes.iter().any(|summary| summary.id == volume)
+    Client::connect(instance).listed(),
+    Ok(volumes) if volumes.iter().any(|summary| summary.id == volume)
   )
 }
 
@@ -7567,6 +7567,34 @@ struct Client {
 }
 
 impl Client {
+  /// Every page of the caller's listing (`ListPage`, §4.4), walked from the first: the volumes, or the first reply that
+  /// was not a page, or a page whose next cursor does not advance (which would keep the walk asking forever).
+  fn listed(&mut self) -> Result<Vec<slates_ipc::protocol::VolumeSummary>, Box<ReplyBody>> {
+    let mut volumes = Vec::new();
+    let mut cursor = slates_ipc::protocol::ListCursor::FIRST;
+    loop {
+      match self.call(&RequestBody::ListPage { cursor }) {
+        ReplyBody::ListedPage {
+          volumes: page,
+          next,
+        } => {
+          volumes.extend(page);
+          match next {
+            None => return Ok(volumes),
+            Some(next) if (next.shard, next.after) > (cursor.shard, cursor.after) => cursor = next,
+            Some(next) => {
+              return Err(Box::new(ReplyBody::ListedPage {
+                volumes: Vec::new(),
+                next: Some(next),
+              }));
+            }
+          }
+        }
+        other => return Err(Box::new(other)),
+      }
+    }
+  }
+
   fn connect(instance: &str) -> Client {
     let started = Instant::now();
     loop {
@@ -10612,7 +10640,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     OTHER_PARTITION,
     usize::from(TWO_SHARDS),
   )));
-  let listed = client.call(&RequestBody::List);
+  let listed = client.listed();
   let status = client.call(&RequestBody::DaemonStatus);
   daemon_a.stop();
   daemon_b.stop();
@@ -10637,7 +10665,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     "the other owner shard refuses with the shortfall it measured from the fanned configuration: {on_other:?}"
   );
   assert!(
-    matches!(&listed, ReplyBody::Listed { volumes } if volumes.is_empty()),
+    matches!(&listed, Ok(volumes) if volumes.is_empty()),
     "reads continue, and the refused creates created nothing: {listed:?}"
   );
   let ReplyBody::DaemonStatus { report } = status else {

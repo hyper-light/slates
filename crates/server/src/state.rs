@@ -538,9 +538,6 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
-  /// Listings in flight: by request word, the client slot, the shards still to answer, and
-  /// the summaries so far (a scatter-gather over owners, §4.8 "Lookup").
-  pub scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::VolumeSummary>)>,
   /// `grants` reads in flight: the caller's grants live on the shards that presented their landings (a
   /// grant record is written where its landing was), so the read is a scatter-gather like a listing — by
   /// request word, the client slot, the shards still to answer, and the summaries so far.

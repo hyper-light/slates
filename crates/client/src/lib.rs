@@ -37,8 +37,8 @@ pub mod error;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
-  VhostUserDevice, defers_reply,
+  LAST_SEQUENCE, Landing, ListWalk, ListedPage, Rebased, SESSION_KEY_BYTES, Session, ShardsStream,
+  StreamEnd, Submitted, VhostUserDevice, defers_reply,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -54,12 +54,12 @@ pub use slates_ipc::protocol::{
   DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established,
   Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
   HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
-  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, NamePolicy,
-  OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency,
-  RetirementReport, Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal, SizeClass,
-  SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeSummary, WorkOp,
+  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, ListCursor,
+  NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount,
+  Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal,
+  SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport,
+  TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason,
+  VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

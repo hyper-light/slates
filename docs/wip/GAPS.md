@@ -14752,6 +14752,19 @@ first-beat kill itself stays with that open entry, and the Mac's runs add to it:
 killed (1 to 236), and in the bounded run none of the 236 printed its first configuration line, so they were killed
 before any shard started or recovered anything.
 
+### 2026-11-08: `volume list` was refused past a few hundred volumes — fixed (A-pending); five sibling replies owed
+
+`slates volume list` answered "reply too large for the bulk area" once a daemon held a few hundred volumes (liveness's
+restart harness): the gathered listing was one reply, and a reply is one 4,096-byte bulk chunk. A listing is now paged
+by the chunk (`ListPage`, A-pending), walked by the client, the CLI and both SDKs. Red then green through the CLI with 2,000
+volumes (`volume_list_answers_every_one_of_thousands_of_volumes`). Bug record
+`docs/bugs/2026-11-08-volume-list-was-refused-past-a-few-hundred-volumes.md`.
+
+**Open:** five other replies carry a whole list in one chunk and meet the same refusal at scale: `changed-since`
+(reproduced 2026-11-08: 400 changed files of about 40-byte paths, `changed-since GREEN 0` refused), `audit`, `grants`,
+`advance`'s invalidated paths and `submit`/`rebase`'s conflict windows. Each is owed a page by the chunk as `ReadDir` and
+`ListPage` have.
+
 ### 2026-11-07: the MCP edge test held a slow connection open past the edge's own deadline — fixed
 
 `the_mcp_surface_serves_the_tools` (`crates/mcp/tests/mcp.rs`) failed "the slow connection is still open, unanswered"

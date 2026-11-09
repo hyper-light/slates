@@ -17,7 +17,7 @@ use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_db::{DbError, Partition};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Established, FleetReport, FreshnessBasis,
-  GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt, ReadWritePolicy,
+  GroupReport, HealthSignal, Intent, ListCursor, NamePolicy, PlacedState, ReadAt, ReadWritePolicy,
   RecoveryCause, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
   SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
   decode_body, encode_body, unpack,
@@ -2163,8 +2163,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::Revoke { consumer, proof } = body {
     return revoke_on_channel(state, client.index(), request.request, consumer, proof);
   }
-  if let RequestBody::List = body {
-    return scatter_list(state, client.index(), request.request, principal);
+  if let RequestBody::ListPage { cursor } = body {
+    return list_page_on_channel(state, client.index(), request.request, principal, cursor);
   }
   if let RequestBody::Grants = body {
     return scatter_grants(state, client.index(), request.request, principal);
@@ -2900,53 +2900,6 @@ fn retry_forwards(state: &mut ShardState) -> bool {
   any
 }
 
-/// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
-/// merges when the last part arrives.
-fn scatter_list(
-  state: &mut ShardState,
-  client_index: u32,
-  request: u64,
-  principal: Principal,
-) -> Served {
-  let others: Vec<u16> = state
-    .shards
-    .iter()
-    .copied()
-    .filter(|s| *s != state.shard)
-    .collect();
-  let mine = match list(state, &principal) {
-    ReplyBody::Listed { volumes } => volumes,
-    other => return Served::Reply(other),
-  };
-  if others.is_empty() {
-    return Served::Reply(ReplyBody::Listed { volumes: mine });
-  }
-  state
-    .scatters
-    .insert(request, (client_index, others.len(), mine));
-  let origin = state.shard;
-  for shard in others {
-    let principal = principal.clone();
-    let task = SpawnRequest::new(
-      Box::pin(async move {
-        let part = match crate::state::with_state(|s| list(s, &principal)) {
-          Some(ReplyBody::Listed { volumes }) => volumes,
-          _ => Vec::new(),
-        };
-        crate::xshard::send_reply_home(origin, move || {
-          gather(request, part);
-        })
-        .await;
-      }),
-      None,
-    );
-    if let Some(reply) = send_part(state, shard, task, ScatterKind::List, request) {
-      return Served::Reply(reply);
-    }
-  }
-  Served::Forwarded
-}
-
 /// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
 /// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
 /// principal and the origin merges when the last part arrives.
@@ -3057,8 +3010,6 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
 /// Which scatter a part belongs to, so a part that cannot be sent is settled in its own table.
 #[derive(Clone, Copy)]
 enum ScatterKind {
-  /// `scatter_list`, its entry in [`ShardState::scatters`].
-  List,
   /// `scatter_grants`, in [`ShardState::grant_scatters`].
   Grants,
   /// `scatter_status`, in [`ShardState::status_scatters`].
@@ -3124,7 +3075,7 @@ fn send_part(
 }
 
 /// Settles a part that could not be sent to `shard`: an acknowledgement's release is counted ([`release_part_back`]);
-/// a listing's, grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
+/// a grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
 /// part, the entry goes and the scatter's answer is returned, `Overloaded` for the first refused shard, counted, with
 /// its client slot and whether it is paged.
 fn settle_refused(
@@ -3138,7 +3089,6 @@ fn settle_refused(
       release_part_back(state, request, &refused(Refusal::NotFound));
       return None;
     }
-    ScatterKind::List => (count_down(&mut state.scatters, request), false),
     ScatterKind::Grants => (count_down(&mut state.grant_scatters, request), false),
     ScatterKind::Status => (count_down(&mut state.status_scatters, request), true),
   };
@@ -3158,9 +3108,6 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
   match kind {
     ScatterKind::Acknowledge => {
       state.ack_scatters.remove(&request);
-    }
-    ScatterKind::List => {
-      state.scatters.remove(&request);
     }
     ScatterKind::Grants => {
       state.grant_scatters.remove(&request);
@@ -3761,29 +3708,6 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
   }
 }
 
-/// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: Vec<VolumeSummary>) {
-  let done = crate::state::with_state(|s| {
-    let entry = s.scatters.get_mut(&request)?;
-    entry.2.extend(part);
-    entry.1 = entry.1.saturating_sub(1);
-    if entry.1 == 0 {
-      let refused_for = s.scatter_refusals.remove(&request);
-      s.scatters
-        .remove(&request)
-        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
-    } else {
-      None
-    }
-  })
-  .flatten();
-  if let Some(((client_index, _, mut volumes), unsent)) = done {
-    volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    let reply = unsent.unwrap_or(ReplyBody::Listed { volumes });
-    crate::state::deliver(client_index, request, reply, false);
-  }
-}
-
 pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
   match r {
     Refusal::NotFound => "not_found",
@@ -4177,7 +4101,10 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
-    RequestBody::List => list(state, principal),
+    RequestBody::List => refused(Refusal::BadRequest {
+      reason: LIST_RETIRED.to_owned(),
+    }),
+    RequestBody::ListPage { cursor } => list_page_here(state, principal, cursor),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
@@ -9726,33 +9653,155 @@ fn restore_node(
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
-fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
-  let volumes = state
+/// Format: why the daemon refuses a whole-listing `List`: it pages the listing instead (§4.4).
+const LIST_RETIRED: &str = "List answered a whole listing in one reply, which outgrew the bulk area; ListPage pages it (§4.4)";
+
+/// `volume`'s summary as a listing shows it: its accounting from the live volume where this shard holds one, else the
+/// record's.
+fn summary_of(state: &ShardState, volume: &VolumeRecord) -> VolumeSummary {
+  let live = state
+    .by_id
+    .get(&volume.id)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+    .map(|served| served.volume.accounting());
+  VolumeSummary {
+    id: to_wire_volume(volume.id),
+    name: volume.name.clone(),
+    referenced_bytes: live.as_ref().map_or(volume.referenced_bytes, |accounting| {
+      accounting.referenced_bytes
+    }),
+    unique_bytes: live
+      .as_ref()
+      .map_or(volume.unique_bytes, |accounting| accounting.unique_bytes),
+    overlay: matches!(volume.base, BaseRecord::Path { .. }),
+    live_shipped: volume.policy.live_shipped,
+  }
+}
+
+/// The encoded bytes a page of volumes has room for: one bulk chunk, the most one reply carries
+/// (`crate::config::bulk_chunk_bytes`), less an empty page's framing, as a directory's page is sized
+/// (`crate::listing`).
+fn list_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::ListedPage {
+    volumes: Vec::new(),
+    next: Some(ListCursor {
+      shard: u32::MAX,
+      after: Some(VolumeId {
+        bytes: [u8::MAX; 16],
+      }),
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// `ListPage` on the shard its cursor names: the principal's readable volumes this shard owns after `cursor.after`, in
+/// id order, as many as one reply chunk holds (at least one, so a listing always progresses); the next cursor names
+/// the rest of this shard, else the next shard's first, else none.
+fn list_page_here(state: &mut ShardState, principal: &Principal, cursor: ListCursor) -> ReplyBody {
+  let mut readable: Vec<VolumeSummary> = state
     .db
     .partition()
     .volumes()
     .into_iter()
-    .filter(|v| rights_of(v, principal).read && v.state != VolumeState::Destroyed)
-    .map(|v| VolumeSummary {
-      id: to_wire_volume(v.id),
-      name: v.name.clone(),
-      referenced_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.referenced_bytes, |s| {
-          s.volume.accounting().referenced_bytes
-        }),
-      unique_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
-      overlay: matches!(v.base, BaseRecord::Path { .. }),
-      live_shipped: v.policy.live_shipped,
-    })
+    .filter(|volume| rights_of(volume, principal).read && volume.state != VolumeState::Destroyed)
+    .map(|volume| summary_of(state, volume))
+    .filter(|summary| cursor.after.is_none_or(|after| summary.id > after))
     .collect();
-  ReplyBody::Listed { volumes }
+  readable.sort_by_key(|summary| summary.id);
+  let room = list_page_room();
+  let mut used = 0usize;
+  let mut volumes = Vec::new();
+  let total = readable.len();
+  for summary in readable {
+    let mut encoded = Vec::new();
+    summary.encode(&mut encoded);
+    if !volumes.is_empty() && used.saturating_add(encoded.len()) > room {
+      break;
+    }
+    used = used.saturating_add(encoded.len());
+    volumes.push(summary);
+  }
+  let next_shard = cursor.shard.saturating_add(1);
+  let next = match volumes.last() {
+    Some(last) if volumes.len() < total => Some(ListCursor {
+      shard: cursor.shard,
+      after: Some(last.id),
+    }),
+    _ if usize::try_from(next_shard).is_ok_and(|position| position < state.shards.len()) => {
+      Some(ListCursor {
+        shard: next_shard,
+        after: None,
+      })
+    }
+    _ => None,
+  };
+  ReplyBody::ListedPage { volumes, next }
+}
+
+/// `ListPage` from a client's channel: served here when its cursor names this shard, else sent to the shard it names as
+/// a scatter's part is ([`send_part`]): a full control channel is waited on for room within [`PART_ROOM_BUDGET_NS`]
+/// and then answered the typed `Overloaded`, and a shard gone while its daemon stops leaves the page to the client's
+/// resend.
+fn list_page_on_channel(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+  cursor: ListCursor,
+) -> Served {
+  let Some(shard) = usize::try_from(cursor.shard)
+    .ok()
+    .and_then(|position| state.shards.get(position))
+    .copied()
+  else {
+    return Served::Reply(refused(Refusal::BadRequest {
+      reason: "a list cursor names no shard of this daemon".to_owned(),
+    }));
+  };
+  if shard == state.shard {
+    return Served::Reply(list_page_here(state, &principal, cursor));
+  }
+  let origin = state.shard;
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let page = crate::state::with_state(|s| list_page_here(s, &principal, cursor))
+        .unwrap_or_else(|| refused(Refusal::Overloaded { shard }));
+      crate::xshard::send_reply_home(origin, move || {
+        crate::state::deliver(client_index, request, page, false);
+      })
+      .await;
+    }),
+    None,
+  );
+  let unsent =
+    match slates_rt::registry::send_control_or_return(shard, Control::Spawn(Box::new(task))) {
+      Ok(()) => return Served::Forwarded,
+      Err(slates_rt::registry::RefusedControl {
+        error: slates_rt::RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => unsent,
+      Err(slates_rt::registry::RefusedControl {
+        error: slates_rt::RtError::ShardGone { .. },
+        ..
+      }) => {
+        state.count(SCATTER_SHARD_GONE, 1);
+        return Served::Forwarded;
+      }
+      Err(_) => return Served::Reply(part_unsent(state, shard)),
+    };
+  let waiting = slates_rt::futures::spawn(async move {
+    if !crate::xshard::given_room_within(shard, unsent, PART_ROOM_BUDGET_NS).await
+      && let Some(reply) = crate::state::with_state_counted(|s| part_unsent(s, shard))
+    {
+      crate::state::deliver(client_index, request, reply, false);
+    }
+  })
+  .and_then(slates_rt::futures::detach);
+  match waiting {
+    Ok(()) => Served::Forwarded,
+    Err(_) => Served::Reply(part_unsent(state, shard)),
+  }
 }
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32]) -> ReplyBody {

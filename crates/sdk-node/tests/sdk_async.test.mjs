@@ -54,7 +54,7 @@ test('the addon exposes the async low-level primitives', (t) => {
   const methods = Object.getOwnPropertyNames(slates.Client.prototype);
   const expected = [
     'beginSpinCreate', 'pollCreate', 'beginSpinSnapshot', 'pollSnapshot',
-    'beginSpinStatus', 'pollStatus', 'beginSpinList', 'pollList',
+    'beginSpinStatus', 'pollStatus', 'beginSpinListPage', 'pollListPage',
     'beginSpinResize', 'pollResize', 'beginSpinDestroy', 'pollDestroy',
     'beginSpinCreateGreen', 'pollCreateGreen', 'beginSpinCreateWork', 'pollCreateWork',
     'beginSpinEdit', 'pollEdit', 'beginSpinSubmit', 'pollSubmit',

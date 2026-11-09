@@ -10,8 +10,8 @@ use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Established,
   Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome,
-  LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights,
-  Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  LandingSummary, ListCursor, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody,
+  Rights, Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
 #[cfg(unix)]
@@ -798,10 +798,70 @@ fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
 }
 
 /// Extracts the volume list from its reply, or a typed mismatch.
-fn extract_listed(body: ReplyBody) -> Result<Vec<VolumeSummary>, ClientError> {
+fn extract_listed_page(body: ReplyBody) -> Result<ListedPage, ClientError> {
   match body {
-    ReplyBody::Listed { volumes } => Ok(volumes),
+    ReplyBody::ListedPage { volumes, next } => Ok(ListedPage { volumes, next }),
     _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+  }
+}
+
+/// One page of a listing of volumes (`ListPage`, §4.4): its volumes, and the cursor the listing continues from, none
+/// after the last page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedPage {
+  /// The volumes on the page.
+  pub volumes: Vec<VolumeSummary>,
+  /// Where the listing continues; none after its last page.
+  pub next: Option<ListCursor>,
+}
+
+/// A listing of volumes walked page by page (`ListPage`, §4.4): the volumes gathered so far and the cursor of the page
+/// asked for. The sync [`Client::list`] and the SDKs' async listings walk with it, so every one stops the same way.
+#[derive(Clone, Debug)]
+pub struct ListWalk {
+  gathered: Vec<VolumeSummary>,
+  asked: ListCursor,
+}
+
+impl Default for ListWalk {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl ListWalk {
+  /// A walk from the listing's first page.
+  pub fn new() -> ListWalk {
+    ListWalk {
+      gathered: Vec::new(),
+      asked: ListCursor::FIRST,
+    }
+  }
+
+  /// The cursor of the page to ask for next.
+  pub fn cursor(&self) -> ListCursor {
+    self.asked
+  }
+
+  /// Takes the page answered for [`Self::cursor`]: the cursor to ask next, or none when it was the last. A page whose
+  /// cursor is not past the one asked (a later shard, or a later volume of the same one) would keep the walk asking
+  /// forever, so it ends the walk as an unexpected reply.
+  pub fn take(&mut self, page: ListedPage) -> Result<Option<ListCursor>, ClientError> {
+    self.gathered.extend(page.volumes);
+    match page.next {
+      None => Ok(None),
+      Some(next) if (next.shard, next.after) > (self.asked.shard, self.asked.after) => {
+        self.asked = next;
+        Ok(Some(next))
+      }
+      Some(_) => Err(ClientError::UnexpectedReply { verb: "list" }),
+    }
+  }
+
+  /// Every volume gathered, sorted by name.
+  pub fn finish(mut self) -> Vec<VolumeSummary> {
+    self.gathered.sort_by(|a, b| a.name.cmp(&b.name));
+    self.gathered
   }
 }
 
@@ -2474,23 +2534,23 @@ impl Client {
     self.poll_as(word, extract_status)
   }
 
-  /// Begins a list, returning its request id.
-  pub fn list_begin(&mut self) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::List)
+  /// Begins one page of a listing from `cursor` ([`ListCursor::FIRST`] for the first), returning its request id.
+  pub fn list_page_begin(&mut self, cursor: ListCursor) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::ListPage { cursor })
   }
 
-  /// Takes a list reply within `spin_ns`.
-  pub fn list_spin(
+  /// Takes a listing page's reply within `spin_ns`.
+  pub fn list_page_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
-  ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_listed)
+  ) -> Result<Option<ListedPage>, ClientError> {
+    self.spin_as(id, spin_ns, extract_listed_page)
   }
 
-  /// Takes a list reply by id word once the completion fd signals.
-  pub fn list_poll(&mut self, word: u64) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.poll_as(word, extract_listed)
+  /// Takes a listing page's reply by id word once the completion fd signals.
+  pub fn list_page_poll(&mut self, word: u64) -> Result<Option<ListedPage>, ClientError> {
+    self.poll_as(word, extract_listed_page)
   }
 
   /// Begins a resize, returning its request id.
@@ -3899,11 +3959,16 @@ impl Client {
     }
   }
 
-  /// The caller's volumes.
+  /// The caller's volumes, sorted by name: every page of the listing (`ListPage`, §4.4), walked from the first. Each
+  /// page is one reply chunk, so a daemon of any number of volumes answers every page.
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, ClientError> {
-    match self.call(&RequestBody::List)? {
-      ReplyBody::Listed { volumes } => Ok(volumes),
-      _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+    let mut walk = ListWalk::new();
+    loop {
+      let cursor = walk.cursor();
+      let page = extract_listed_page(self.call(&RequestBody::ListPage { cursor })?)?;
+      if walk.take(page)?.is_none() {
+        return Ok(walk.finish());
+      }
     }
   }
 

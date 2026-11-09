@@ -1770,6 +1770,79 @@ fn json_list_has(instance: &str, id: &str) {
   );
 }
 
+/// Shape: how many volumes the listing-at-scale test creates: ten times the few hundred at which liveness's restart
+/// harness met `volume list` refused (2026-11-08), so the answer spans many reply chunks.
+const LISTED_AT_SCALE: usize = 2_000;
+/// Shape: CLI processes creating the listing test's volumes at once, so the setup takes seconds, not minutes.
+const CREATORS: usize = 8;
+
+/// §4.4 (`volume list`) with the bounded answers of §4.7: do create [`LISTED_AT_SCALE`] volumes through the CLI, then
+/// list them with `volume list` and with `volume list --json`; expect exit 0 and every volume created listed exactly
+/// once, by id and name. Before the listing was paged the daemon answered the whole listing as one reply, which
+/// outgrew the client's bulk area past a few hundred volumes and was refused "reply too large for the bulk area".
+#[test]
+fn volume_list_answers_every_one_of_thousands_of_volumes() {
+  let instance = format!("cli-list-scale-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let created: Vec<(String, String)> = std::thread::scope(|scope| {
+    let creators: Vec<_> = (0..CREATORS)
+      .map(|creator| {
+        let instance = instance.as_str();
+        scope.spawn(move || {
+          (creator..LISTED_AT_SCALE)
+            .step_by(CREATORS)
+            .map(|index| {
+              let name = format!("listed-{index:05}");
+              let (code, out, err) =
+                run(instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+              assert_eq!(code, 0, "create {name}: {err}");
+              (value_of(&out, "id"), name)
+            })
+            .collect::<Vec<_>>()
+        })
+      })
+      .collect();
+    creators
+      .into_iter()
+      .flat_map(|creator| creator.join().unwrap())
+      .collect()
+  });
+  assert_eq!(created.len(), LISTED_AT_SCALE);
+
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for (id, name) in &created {
+    let lines = out
+      .lines()
+      .filter(|line| line.starts_with(id.as_str()))
+      .count();
+    assert_eq!(lines, 1, "{id} ({name}) listed once by `volume list`");
+    assert!(
+      out
+        .lines()
+        .any(|line| line.starts_with(id.as_str()) && line.contains(name.as_str())),
+      "{id} listed with its name {name}"
+    );
+  }
+
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  let listed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+  let listed = listed.as_array().expect("a JSON array");
+  for (id, name) in &created {
+    let matching: Vec<_> = listed
+      .iter()
+      .filter(|volume| volume["id"] == id.as_str())
+      .collect();
+    assert_eq!(
+      matching.len(),
+      1,
+      "{id} listed once by `volume list --json`"
+    );
+    assert_eq!(matching[0]["name"], name.as_str(), "{id}'s name");
+  }
+}
+
 /// `status --json` (no volume): the daemon's status as one JSON object (the MCP `daemon_json` schema).
 fn json_daemon_status(instance: &str) {
   let (code, out, err) = run(instance, &["status", "--json"]);

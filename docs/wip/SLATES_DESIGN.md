@@ -19438,3 +19438,32 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-pending — A listing of volumes is paged by the reply chunk (accepted 2026-11-08, the supervisor's order; its number is the supervisor's to allocate)
+Applied in the same change to: §4.4 (`list`), `crates/ipc/src/protocol.rs` (`ListPage`, `ListedPage`, `ListCursor`;
+`List` and `Listed` retired), `crates/server/src/{verbs,state,daemon}.rs` (`list_page_here`, `list_page_on_channel`; the
+listing's scatter removed), `crates/client/src/{client,lib}.rs` (`ListWalk`, `ListedPage`, the page verbs),
+`crates/sdk-python/src/lib.rs` and `crates/sdk-node/{src/lib.rs,async.mjs}` (the async `list` walks the pages),
+`crates/cli/tests/cli.rs`, `crates/server/tests/{daemon,fleet,ack_release}.rs`, `crates/client/tests/{async_core,driver}.rs`,
+`crates/sdk-node/tests/sdk_async.test.mjs`, GAPS, `docs/bugs/2026-11-08-volume-list-was-refused-past-a-few-hundred-volumes.md`.
+- **Changes §4.4's `list`:** it answered every readable volume in one reply, gathered from every shard; past a few
+  hundred volumes that reply outgrew the client's bulk chunk and the daemon refused it ("reply too large for the bulk
+  area"). A listing is now pages: `ListPage { cursor }` answers the readable volumes of the shard the cursor names after
+  its last listed one, in id order, as many as one reply chunk holds and at least one, and the cursor that continues it:
+  the rest of that shard, else the next shard's first, else none. The page's room is derived as a directory page's is
+  (A-85): the bulk chunk less an empty page's framing.
+- **Across shards:** the shard serving the client answers a page of its own at once and sends any other as a
+  scatter's part is sent (A-216's sweep): a full control channel is waited on for room within half the liveness budget,
+  then the page is answered `Overloaded` naming the shard.
+- **Consistency:** a volume that stands throughout a listing is listed exactly once; one created or destroyed between
+  pages may be listed or not, as `readdir` across a change may.
+- **`List` and `Listed`:** kept for their wire indexes (D-15's append-only evolution) and never answered: the daemon
+  refuses `List` `BadRequest` naming `ListPage`. No second path answers a whole listing.
+- **Clients:** `Client::list` walks the pages (`ListWalk`, which ends the walk as an unexpected reply on a page whose
+  cursor does not advance) and sorts by name as the gathered listing did; the SDKs' async `list` walks them under one
+  awaitable, and a cancel ends it at whichever page is waiting.
+- **Proven:** `volume_list_answers_every_one_of_thousands_of_volumes` (2,000 volumes through the CLI, each listed once
+  by `volume list` and `volume list --json`; refused before), the SDKs' sync and async suites over a live daemon, and
+  `a_listing_whose_part_cannot_be_sent_is_refused_overloaded`.
+- **Not changed:** the other replies that carry a whole list (`changed-since`, `audit`, `grants`, `advance`'s
+  invalidated paths, `submit`'s and `rebase`'s conflicts) meet the same bound and are owed the same paging (GAPS).

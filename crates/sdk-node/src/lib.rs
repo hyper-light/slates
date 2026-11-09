@@ -43,8 +43,8 @@ use napi_derive::napi;
 use slates_client::driver::{Begin, Driver, Event};
 use slates_client::{
   Client as RustClient, ClientError, Connecting as RustConnecting, CreateSpec, Deadlines, Filter,
-  HostAnswer, Landing, LandingDegradation, NamePolicy, Rebased, RequestId, SizeClass, SnapshotId,
-  StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
+  HostAnswer, Landing, LandingDegradation, ListCursor, ListedPage, NamePolicy, Rebased, RequestId,
+  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -461,13 +461,59 @@ pub struct StatusBegin {
   pub fast: Option<VolumeStatus>,
 }
 
-/// A list begin-and-spin result (see [`CreateBegin`]).
+/// Where a paged listing of volumes continues (`ListPage`, §4.4): a shard by its position, and the last volume of it
+/// already listed, as hex. The async `list` passes back each page's `next` as it is.
 #[napi(object)]
-pub struct ListBegin {
+#[derive(Clone)]
+pub struct ListPageCursor {
+  /// The shard's position among the daemon's shards.
+  pub shard: u32,
+  /// The last volume of that shard already listed, as hex; absent before its first.
+  pub after: Option<String>,
+}
+
+/// One page of a listing of volumes.
+#[napi(object)]
+pub struct ListPage {
+  /// The volumes on the page.
+  pub volumes: Vec<VolumeEntry>,
+  /// Where the listing continues; absent after its last page.
+  pub next: Option<ListPageCursor>,
+}
+
+/// A listing page's begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct ListPageBegin {
   /// The request id word.
   pub word: String,
-  /// The volume entries, present when the reply came within the spin window.
-  pub fast: Option<Vec<VolumeEntry>>,
+  /// The page, present when the reply came within the spin window.
+  pub fast: Option<ListPage>,
+}
+
+/// A listing's cursor from its JavaScript form.
+fn list_cursor(cursor: Option<ListPageCursor>) -> Result<ListCursor> {
+  match cursor {
+    None => Ok(ListCursor::FIRST),
+    Some(cursor) => Ok(ListCursor {
+      shard: cursor.shard,
+      after: cursor.after.as_deref().map(parse_volume).transpose()?,
+    }),
+  }
+}
+
+/// A listing page in its JavaScript form.
+fn list_page(page: ListedPage) -> Result<ListPage> {
+  Ok(ListPage {
+    volumes: page
+      .volumes
+      .into_iter()
+      .map(volume_entry)
+      .collect::<Result<Vec<_>>>()?,
+    next: page.next.map(|next| ListPageCursor {
+      shard: next.shard,
+      after: next.after.as_ref().map(volume_hex),
+    }),
+  })
 }
 
 /// A unit verb's begin-and-spin result (resize/destroy): `fast` is `true` when the verb completed
@@ -984,40 +1030,33 @@ impl Client {
     )
   }
 
-  /// Begins a list and spins for its reply; the word and the entries if they landed in the spin.
+  /// Begins one page of a listing from `cursor` (absent for the first page, else the `next` of the page before) and
+  /// spins for its reply; the word and the page if it landed in the spin.
   #[napi]
-  pub fn begin_spin_list(&mut self) -> Result<ListBegin> {
+  pub fn begin_spin_list_page(&mut self, cursor: Option<ListPageCursor>) -> Result<ListPageBegin> {
+    let cursor = list_cursor(cursor)?;
     let (word, fast) = self.begin_spin(
-      Box::new(move |c: &mut RustClient| c.list_begin()),
+      Box::new(move |c: &mut RustClient| c.list_page_begin(cursor)),
       |c: &mut RustClient, id: RequestId, spin: u64| {
-        let fast = match c.list_spin(id, spin).map_err(refusal)? {
-          Some(volumes) => Some(
-            volumes
-              .into_iter()
-              .map(volume_entry)
-              .collect::<Result<Vec<_>>>()?,
-          ),
-          None => None,
-        };
-        Ok(fast)
+        c.list_page_spin(id, spin)
+          .map_err(refusal)?
+          .map(list_page)
+          .transpose()
       },
     )?;
-    Ok(ListBegin { word, fast })
+    Ok(ListPageBegin { word, fast })
   }
 
-  /// Takes a list reply by its word once the completion fd signals.
+  /// Takes a listing page's reply by its word once the completion fd signals.
   #[napi]
-  pub fn poll_list(&mut self, word: String) -> Result<Option<Vec<VolumeEntry>>> {
+  pub fn poll_list_page(&mut self, word: String) -> Result<Option<ListPage>> {
     let word = parse_word(&word)?;
-    match self.inner.list_poll(word).map_err(refusal)? {
-      Some(volumes) => Ok(Some(
-        volumes
-          .into_iter()
-          .map(volume_entry)
-          .collect::<Result<Vec<_>>>()?,
-      )),
-      None => Ok(None),
-    }
+    self
+      .inner
+      .list_page_poll(word)
+      .map_err(refusal)?
+      .map(list_page)
+      .transpose()
   }
 
   /// Begins a resize and spins for its reply; the word and `true` if it completed within the spin.

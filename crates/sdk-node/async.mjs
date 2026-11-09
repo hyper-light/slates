@@ -30,6 +30,17 @@ function defaultAddon() {
 // Nanoseconds in a millisecond, the unit setTimeout takes.
 const NS_PER_MS = 1e6;
 
+// Whether a listing asked from `asked` (null for the first page) was told a `next` past it: a later shard, or a later
+// volume of the same one. Volume ids are fixed-length hex, so their string order is their byte order.
+function listCursorAdvances(asked, next) {
+  const shard = asked == null ? 0 : asked.shard;
+  const after = asked == null ? null : asked.after ?? null;
+  if (next.shard !== shard) return next.shard > shard;
+  const nextAfter = next.after ?? null;
+  if (nextAfter == null) return false;
+  return after == null || nextAfter > after;
+}
+
 export class AsyncClient {
   constructor(inner) {
     this._c = inner;
@@ -75,8 +86,38 @@ export class AsyncClient {
     return this._call(() => this._c.beginSpinStatus(volume), (w) => this._c.pollStatus(w));
   }
 
+  // Every page of the listing (ListPage, §4.4), each one call, walked from the first: the volumes sorted by name, as
+  // the sync list returns them. The Promise returned is mapped to whichever page's call is waiting, so `cancel` ends
+  // the walk at that page. A page whose cursor is not past the one asked would keep the walk asking forever, so it
+  // rejects instead.
   list() {
-    return this._call(() => this._c.beginSpinList(), (w) => this._c.pollList(w));
+    const walk = { promise: null, ticket: null };
+    const follow = (call) => {
+      const ticket = this._tickets.get(call);
+      if (ticket == null) return;
+      walk.ticket = ticket;
+      if (walk.promise) this._tickets.set(walk.promise, ticket);
+    };
+    const pages = async () => {
+      const volumes = [];
+      let cursor = null;
+      for (;;) {
+        const asked = cursor;
+        const call = this._call(() => this._c.beginSpinListPage(asked), (w) => this._c.pollListPage(w));
+        follow(call);
+        const page = await call;
+        volumes.push(...page.volumes);
+        if (page.next == null) break;
+        if (!listCursorAdvances(asked, page.next)) {
+          throw new Error(`the daemon answered a listing page whose next cursor does not advance: ${JSON.stringify(page.next)}`);
+        }
+        cursor = page.next;
+      }
+      return volumes.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+    };
+    walk.promise = pages();
+    if (walk.ticket != null) this._tickets.set(walk.promise, walk.ticket);
+    return walk.promise;
   }
 
   // Resize and destroy return nothing: their poll yields `true` (done) rather than a value, which the

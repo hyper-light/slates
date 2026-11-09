@@ -46,6 +46,34 @@ struct Client {
 }
 
 impl Client {
+  /// Every page of the caller's listing (`ListPage`, §4.4), walked from the first: the volumes, or the first reply that
+  /// was not a page, or a page whose next cursor does not advance (which would keep the walk asking forever).
+  fn listed(&mut self) -> Result<Vec<slates_ipc::protocol::VolumeSummary>, Box<ReplyBody>> {
+    let mut volumes = Vec::new();
+    let mut cursor = slates_ipc::protocol::ListCursor::FIRST;
+    loop {
+      match self.call(&RequestBody::ListPage { cursor }) {
+        ReplyBody::ListedPage {
+          volumes: page,
+          next,
+        } => {
+          volumes.extend(page);
+          match next {
+            None => return Ok(volumes),
+            Some(next) if (next.shard, next.after) > (cursor.shard, cursor.after) => cursor = next,
+            Some(next) => {
+              return Err(Box::new(ReplyBody::ListedPage {
+                volumes: Vec::new(),
+                next: Some(next),
+              }));
+            }
+          }
+        }
+        other => return Err(Box::new(other)),
+      }
+    }
+  }
+
   fn connect(instance: &str) -> Client {
     let started = Instant::now();
     loop {
@@ -354,7 +382,7 @@ fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
       "create {sequence}: {reply:?}"
     );
   }
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let Ok(volumes) = client.listed() else {
     panic!("list the admitted volumes");
   };
   assert_eq!(volumes.len(), SDK_CREATE_COUNT);
@@ -433,10 +461,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
     "completion releases the capture"
   );
   let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
-  assert!(matches!(
-    first.call(&RequestBody::List),
-    ReplyBody::Listed { .. }
-  ));
+  assert!(first.listed().is_ok());
   assert_eq!(
     first.call_once(&cancelled),
     ReplyBody::Refused {
@@ -586,10 +611,7 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   );
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
-    assert!(matches!(
-      client.call(&RequestBody::List),
-      ReplyBody::Listed { .. }
-    ));
+    assert!(client.listed().is_ok());
   }
   drop(daemon);
 }
@@ -669,10 +691,7 @@ fn an_idle_daemon_parks_once_its_clients_windows_have_passed() {
   let (daemon, instance) = daemon("idle-spin");
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
-    assert!(matches!(
-      client.call(&RequestBody::List),
-      ReplyBody::Listed { .. }
-    ));
+    assert!(client.listed().is_ok());
   }
   // Derived: one liveness budget outlasts any idle window (the wake estimate × the idle ratio, milliseconds
   // at most), and a second one spans ten heartbeats and a reap sweep, each a timer that ends in an idle
@@ -771,7 +790,7 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
     "the failure count is the one the policy was stated under"
   );
   // Reads continue: the listing answers (empty — nothing was created), and the status counts the refusal.
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let Ok(volumes) = client.listed() else {
     strict.stop();
     panic!("a read is served while writes are refused");
   };
@@ -885,7 +904,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
 
 /// List shows both volumes; detach releases the lease.
 fn list_and_detach(client: &mut Client, id: slates_ipc::protocol::VolumeId, attachment: u64) {
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let Ok(volumes) = client.listed() else {
     panic!("list");
   };
   let mut names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -925,7 +944,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let Ok(volumes) = client.listed() else {
       panic!("list");
     };
     let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -970,7 +989,7 @@ fn rifl_scenario() {
     panic!("retry");
   };
   assert_eq!(again, volume);
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let Ok(volumes) = client.listed() else {
     panic!("list");
   };
   assert_eq!(volumes.len(), 1, "the retry did not execute again");
@@ -1620,7 +1639,7 @@ fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
   let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
     panic!("create the owner-only volume");
   };
-  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+  let Ok(volumes) = workload.listed() else {
     panic!("the consumer lists its accessible volumes");
   };
   let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
@@ -1799,10 +1818,10 @@ fn once_revoked_every_verb_refuses_before_any_effect(
     }
   ));
   assert!(matches!(
-    workload.call(&RequestBody::List),
-    ReplyBody::Refused {
+    workload.listed().map_err(|reply| *reply),
+    Err(ReplyBody::Refused {
       refusal: Refusal::ConsumerRevoked
-    }
+    })
   ));
 }
 
@@ -2149,7 +2168,7 @@ fn version_reservation_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let Ok(volumes) = client.listed() else {
       panic!("list");
     };
     if volumes.is_empty() {
@@ -2600,7 +2619,7 @@ fn snapshot_destroy_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let Ok(volumes) = client.listed() else {
       panic!("list");
     };
     if volumes.iter().all(|v| v.name != "clone") {
@@ -3572,7 +3591,7 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
 fn wait_for_volume_count(client: &mut Client, count: usize) {
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let Ok(volumes) = client.listed() else {
       panic!("list");
     };
     if volumes.len() == count {

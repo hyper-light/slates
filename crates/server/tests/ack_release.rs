@@ -509,17 +509,36 @@ fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Dura
   );
 }
 
-/// §4.14, A-216's sibling sweep. Do: on a two-shard daemon, hold the other shard and fill its control channel, then
-/// list the volumes. Expect: `Overloaded { shard }` naming the other shard, once its part has waited half the liveness
-/// budget for room and inside the hold. Before, the
-/// listing's part for that shard was settled through a nested state borrow that never ran, and the listing was never
-/// answered.
+/// §4.14, A-216's sibling sweep, §4.4 `ListPage`. Do: on a two-shard daemon, hold the other shard and fill its control
+/// channel, then ask for that shard's page of the listing. Expect: `Overloaded { shard }` naming the other shard, once
+/// the page has waited half the liveness budget for room and inside the hold. Before, the listing's part for that shard
+/// was settled through a nested state borrow that never ran, and the listing was never answered.
 #[test]
 fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
-  check_typed_refusal(
-    "list",
-    scattered_with_the_other_shard_full("list-full", &RequestBody::List),
-  );
+  check_typed_refusal("list", other_shards_page_with_it_full("list-full"));
+}
+
+/// [`scattered_with_the_other_shard_full`] for a listing: the page its cursor names on the shard the client is not served
+/// on.
+fn other_shards_page_with_it_full(name: &str) -> (usize, ReplyBody, Duration) {
+  let (daemon, instance) = daemon(name);
+  let mut client = Client::connect(&instance);
+  let other = 1 - serving(&daemon, client.client);
+  let cursor = slates_ipc::protocol::ListCursor {
+    shard: u32::try_from(other).unwrap(),
+    after: None,
+  };
+  let (holding, hold_on) = hold_until_answered(&daemon, other);
+  let flooded = daemon.flood_control_channel_of(other).unwrap();
+  let started = Instant::now();
+  let (_, reply) = client.call(&RequestBody::ListPage { cursor });
+  let took = started.elapsed();
+  hold_on.store(false, Ordering::Release);
+  holding.join().unwrap();
+  let shard = usize::from(daemon.shards()[other].0);
+  daemon.stop();
+  assert!(flooded > 0, "the other shard's control channel was filled");
+  (shard, reply, took)
 }
 
 /// §4.8 grants, A-216's sibling sweep. Do: as the listing test, but ask for the grants. Expect: `Overloaded { shard }`,
