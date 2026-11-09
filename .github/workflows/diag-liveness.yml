@@ -1,0 +1,88 @@
+name: diag-liveness-a223-window-arms
+
+# Diagnostics only, never on main (A-223, for the supervisor's window-rule decision): the branch at 843cc514 with a
+# fixed idle window from SLATES_DIAG_IDLE_WINDOW_NS. Arms: the branch's own rule (floor x 100, no override), 50, 100 and
+# 200 us. Two shards; quiet and two spinning shell loops per logical CPU; three rounds, the arms alternating. Results go
+# to diag-results/liveness-34-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WIN_SHA: 9a2446dcfadd6b361e805045c75af3da3f6c3c6a
+
+jobs:
+  arms:
+    name: A-223 window arms (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build
+        run: |
+          set +e +o pipefail
+          git worktree add ../src "$WIN_SHA" > /dev/null 2>&1
+          ( cd ../src && CARGO_TARGET_DIR=../target cargo build --release --locked -p slates-client --example provision_bench ) > ../build.log 2>&1 || { echo "== build failed" | tee -a ../results.txt; grep -E '^error' -A6 ../build.log | head -30 >> ../results.txt; exit 1; }
+          ( cd ../src && git log -1 --format='arms %h %s' | cut -c1-90 ) | tee -a ../results.txt
+      - name: The arms, quiet and loaded, three rounds, alternating
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          B="../target/release/examples/provision_bench$ext"
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          export PROVISION_BENCH_SHARDS=2
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              for arm in rule 50000 100000 200000; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round=$round arm=$arm at $(date -u +%H:%M:%S)" | tee -a $R
+                if [ $arm = rule ]; then unset SLATES_DIAG_IDLE_WINDOW_NS; else export SLATES_DIAG_IDLE_WINDOW_NS=$arm; fi
+                timeout 1500 "$B" > ../run.log 2>&1; status=$?
+                unset SLATES_DIAG_IDLE_WINDOW_NS
+                for p in $pids; do kill "$p" 2>/dev/null; done
+                wait 2>/dev/null
+                grep -E 'provisioning histogram|_cpu_|spinning_1 parks|parked_1 parks|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|panicked' ../run.log | cut -c1-600 | tee -a $R
+                echo "== exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-34-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-34 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
