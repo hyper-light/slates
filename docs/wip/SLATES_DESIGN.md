@@ -19500,7 +19500,7 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
 
-### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object (accepted 2026-11-08; step (a) built)
+### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object (accepted 2026-11-08; steps (a) and (b) built)
 
 A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
 every object of the retired host the holder did not list: listing nothing meant holding nothing. A holder whose page
@@ -19516,7 +19516,6 @@ The change, in four steps:
 - **(c), landed:** a copy a holder cannot promise is a typed refusal that keeps its answer incomplete
   (`HostPromise::unpromised`).
 - **(a), built:** the counting rule is a pure function, `slates_db::takeover::readiness`, under a `CountingRule`.
-  `takeover::ready_objects` calls it with today's rule (`CompleteAnswer`), so this step changes no behaviour.
   `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover:
   - one or two cohorts per object;
   - writes to one cohort (a later owner in the recovery chain) or to all of them (a joint write), each committed by
@@ -19532,12 +19531,23 @@ The change, in four steps:
   - only an object's first cohort judged;
   - the recovery quorum one short. The minimal history is
   `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`.
-- **(b), owed:** after a holder's pages are complete, the successor asks it by name for each learned object it did not
-  list. The holder answers from a direct `holder_records` look-up, with no routing filter: its highest record, or
-  "nothing held" for that object alone. The rule becomes `CountingRule::NamedAnswer`: a member promised an object when
-  it listed it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise
-  case (a survivor that never received an object) still completes: that survivor answers "nothing held" by name. The
-  wire change appends a question and an answer on the takeover stream, with hostile-input tests on both sides.
+- **(b), built:** after a holder's pages are complete, the successor asks it by name for each learned object it did not
+  list, among the objects whose recovery cohorts it is in. The holder answers from a direct `holder_records` look-up,
+  with no routing filter (`takeover::answer_by_name`): its highest record, promised as a page promises it, or "nothing
+  held" for that object alone. The rule is now `CountingRule::NamedAnswer`: a member promised an object when it listed
+  it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise case (a
+  survivor that never received an object) still completes: that survivor answers "nothing held" by name.
+  - **What stands in for routing.** A warm-restarted holder loses its routing and its `departed_owners`, so neither can
+    decide. A holder answers only when the committed configuration names the asker the object's successor and the
+    copy's acceptor serves an owner in the retired host's recovery chain, or the asker already. So a question never
+    installs the asker over a live owner's object. Anything else is refused, counted `fleet.takeover.named_refused`,
+    and stays unanswered.
+  - **The wire.** `HostPrepare::named` and `HostPromise::nothing` are lists appended to the existing messages, written
+    only when not empty, so a page request and its answer keep their bytes. Hostile-input tests cover both sides. A
+    holder from before A-251 refuses a question that names objects. A successor then waits on that holder's answer as
+    on a silent member, which the cohort's quorum tolerates up to `f`: liveness only, until it is upgraded.
+  - A by-name answer is bounded by a page's bytes, and a question by the ids that fit one page. What is left out is
+    asked again next period.
 - **(d), owed:** the process test.
 
 What (b) does not cover: an object that every holder of it leaves out of its pages, and the successor does not hold
@@ -19545,7 +19555,10 @@ itself, is never learned. The round can then confirm without it under either rul
 scope (some survivor lists every object a survivor holds), and GAPS records the case.
 
 Applied in the same change to:
-- `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, with unit tests.
+- `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, `promise_object`,
+  `answer_by_name`, with unit tests.
+- `crates/db/src/register.rs`: `HostPrepare::named`, `HostPromise::nothing`, `Acceptor::authority`.
 - `crates/db/tests/takeover_model.rs` (new).
-- `crates/server/src/takeover.rs`: `ready_objects`.
-- GAPS's A-251 entry.
+- `crates/server/src/takeover.rs`: `ready_objects`, `fold_answers`, `begin_round`, `serve_host_prepare`, and the module
+  doc's account of the empty promise.
+- Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.

@@ -1106,7 +1106,11 @@ impl Promise {
 /// configuration generation the round runs under, and the object after which this page starts (`None` for the
 /// first). One round per retired host replaces a round per object: a holder answers for all of that host's
 /// objects whose successor is the asker, and a holder that holds nothing answers too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A request may instead name objects (A-251 (b)): the successor asks a holder whose pages are complete about each
+/// object it learned that the holder did not list, and the holder answers each alone, from its own records, with no
+/// routing in the way. A request that names objects asks no page.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPrepare {
   /// The retired host whose objects are taken over.
   pub departed: HostId,
@@ -1118,6 +1122,9 @@ pub struct HostPrepare {
   pub generation: u64,
   /// The object after which this page starts, `None` for the first page.
   pub after: Option<ObjectId>,
+  /// The objects asked about by name, each answered alone; empty for a page request. Appended to the wire only when
+  /// not empty, so a page request's bytes are as before A-251.
+  pub named: Vec<ObjectId>,
 }
 
 /// Format: an absent optional field on the takeover wire.
@@ -1125,9 +1132,12 @@ const FIELD_ABSENT: u8 = 0;
 /// Format: a present optional field on the takeover wire; its value follows.
 const FIELD_PRESENT: u8 = 1;
 
-/// Format: the widest [`HostPrepare`]: departed, owner, epoch, generation (u64 LE each), then the page start's
-/// presence byte and object.
-const HOST_PREPARE_BYTES: usize = 4 * size_of::<u64>() + 1 + OBJECT_BYTES;
+/// Format: a page request's widest bytes ([`HostPrepare`]): departed, owner, epoch, generation (u64 LE each), then the
+/// page start's presence byte and object. A request naming objects appends their count (u32 LE) and the objects.
+pub const HOST_PREPARE_BYTES: usize = 4 * size_of::<u64>() + 1 + OBJECT_BYTES;
+
+/// Format: the bytes an appended list of objects takes before its objects: its count (u32 LE).
+pub const OBJECT_LIST_HEADER_BYTES: usize = size_of::<u32>();
 
 impl HostPrepare {
   /// The canonical bytes: departed, owner, epoch, generation (each u64 LE), then a presence byte and, when
@@ -1139,6 +1149,7 @@ impl HostPrepare {
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
     put_optional_object(&mut out, self.after);
+    put_object_list(&mut out, &self.named);
     out
   }
 
@@ -1151,6 +1162,7 @@ impl HostPrepare {
     let epoch = HostEpoch(reader.word()?);
     let generation = reader.word()?;
     let after = reader.optional_object()?;
+    let named = reader.object_list()?;
     reader.finish()?;
     Ok(HostPrepare {
       departed,
@@ -1158,6 +1170,7 @@ impl HostPrepare {
       epoch,
       generation,
       after,
+      named,
     })
   }
 }
@@ -1166,10 +1179,11 @@ impl HostPrepare {
 /// is the asker, each with the highest record it holds — its fence raised to the epoch and the asker's
 /// authority installed before this answer was formed — where the next page starts if the holder has more, and
 /// the highest fence it found above the epoch on an object it therefore could not promise, so the asker retries
-/// above it. A holder's **complete** answer (every page, until `next` is `None`) promises the asker every object
-/// of the retired host whose successor it is: those it lists, and — by listing nothing more — every one it holds
-/// nothing of. That empty promise binds as a listed one does: the retired host is no member, so no holder
-/// accepts its records, and the successor is the only member the configuration names for the object.
+/// above it. A page promises what it lists, and nothing of what it does not (A-251): a holder's routing decides what
+/// its pages list, and it can leave out a copy it holds. An object the holder did not list is promised only by name:
+/// the asker names it ([`HostPrepare::named`]) and the holder reports its record or, in `nothing`, that it holds none.
+/// That empty promise binds as a listed one does: the retired host is no member, so no holder accepts its records, and
+/// the successor is the only member the configuration names for the object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPromise {
   /// The answering holder.
@@ -1190,6 +1204,10 @@ pub struct HostPromise {
   /// a page is no answer for what it leaves out, so the asker does not count it as complete. Listing nothing means
   /// holding nothing only when this is zero.
   pub unpromised: u32,
+  /// Of the objects a request named (A-251 (b)), those this holder holds nothing of: its promise of each, alone. A
+  /// named object it holds is among `entries`; one it could not answer is in neither. Appended to the wire only when
+  /// not empty.
+  pub nothing: Vec<ObjectId>,
 }
 
 /// Format: the fixed width of one [`HostPromise`] entry before its value: the object (16 bytes), the record's
@@ -1244,6 +1262,7 @@ impl HostPromise {
       out.extend_from_slice(&value_len.to_le_bytes());
       out.extend_from_slice(&accepted.value);
     }
+    put_object_list(&mut out, &self.nothing);
     out
   }
 
@@ -1284,6 +1303,7 @@ impl HostPromise {
         },
       ));
     }
+    let nothing = reader.object_list()?;
     reader.finish()?;
     Ok(HostPromise {
       holder,
@@ -1294,6 +1314,7 @@ impl HostPromise {
       next,
       fenced,
       unpromised,
+      nothing,
     })
   }
 }
@@ -1306,6 +1327,22 @@ fn put_optional_object(out: &mut Vec<u8>, object: Option<ObjectId>) {
       out.push(FIELD_PRESENT);
       out.extend_from_slice(&object.0);
     }
+  }
+}
+
+/// Appends a list of objects when it is not empty: its count, then the objects. An empty list writes nothing, so a
+/// message without one keeps its earlier bytes.
+fn put_object_list(out: &mut Vec<u8>, objects: &[ObjectId]) {
+  if objects.is_empty() {
+    return;
+  }
+  out.extend_from_slice(
+    &u32::try_from(objects.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  for object in objects {
+    out.extend_from_slice(&object.0);
   }
 }
 
@@ -1378,6 +1415,23 @@ impl<'a> WireReader<'a> {
       FIELD_PRESENT => Ok(Some(self.object()?)),
       _ => Err(RegisterError::MalformedRecord),
     }
+  }
+
+  /// An appended list of objects ([`put_object_list`]): empty when no bytes are left; otherwise a count of at least one
+  /// that the bytes left can hold, then the objects. A count of zero is refused, so each list has one encoding.
+  fn object_list(&mut self) -> Result<Vec<ObjectId>, RegisterError> {
+    if self.rest.is_empty() {
+      return Ok(Vec::new());
+    }
+    let count = usize::try_from(self.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+    if count == 0 || count > self.remaining() / OBJECT_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let mut objects = Vec::with_capacity(count);
+    for _ in 0..count {
+      objects.push(self.object()?);
+    }
+    Ok(objects)
   }
 
   /// The bytes left to read.
@@ -1586,6 +1640,11 @@ impl Acceptor {
       return Err(RegisterError::ConflictingPosition);
     }
     Ok(())
+  }
+
+  /// The authority this acceptor serves now: the generation and the owner allowed to write.
+  pub fn authority(&self) -> Authority {
+    self.authority
   }
 
   /// Installs a new configuration authority — the holder applying the configuration update the regional
@@ -4473,6 +4532,7 @@ mod tests {
       next: Some(ObjectId::new(HostId(1), 8)),
       fenced: Some(HostEpoch(6)),
       unpromised: 3,
+      nothing: Vec::new(),
     }
   }
 
@@ -4486,12 +4546,13 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 9,
       after: Some(ObjectId::new(HostId(1), 3)),
+      named: Vec::new(),
     };
     let first_page = HostPrepare {
       after: None,
-      ..prepare
+      ..prepare.clone()
     };
-    for request in [prepare, first_page] {
+    for request in [prepare.clone(), first_page] {
       assert_eq!(HostPrepare::decode(&request.encode()), Ok(request));
     }
     let answer = sample_host_promise();
@@ -4506,11 +4567,11 @@ mod tests {
     assert!(answer.binds(&prepare));
     assert!(!answer.binds(&HostPrepare {
       epoch: HostEpoch(5),
-      ..prepare
+      ..prepare.clone()
     }));
     assert!(!answer.binds(&HostPrepare {
       departed: HostId(7),
-      ..prepare
+      ..prepare.clone()
     }));
     assert_eq!(
       answer.encode().len(),
@@ -4535,6 +4596,7 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 9,
       after: Some(ObjectId::new(HostId(1), 3)),
+      named: Vec::new(),
     }
     .encode();
     let answer = sample_host_promise().encode();
@@ -4572,6 +4634,92 @@ mod tests {
       HostPromise::decode(&lying),
       Err(RegisterError::MalformedRecord)
     );
+  }
+
+  /// A-251 (b): a by-name question and its answer round-trip with their appended lists, and a page request or answer
+  /// with none keeps exactly the bytes it had before A-251, so a holder or successor that predates it reads them as
+  /// before. Do: encode a request naming two objects and an answer holding one and naming one held nothing of; encode
+  /// both with empty lists and compare with the fields alone. Expect: equal round trips; the empty lists add no bytes.
+  #[test]
+  fn a_named_question_and_its_answer_round_trip_and_a_page_keeps_its_bytes() {
+    let named = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: None,
+      named: vec![ObjectId::new(HostId(1), 3), ObjectId::new(HostId(1), 8)],
+    };
+    assert_eq!(HostPrepare::decode(&named.encode()), Ok(named.clone()));
+    assert_eq!(
+      named.encode().len(),
+      4 * size_of::<u64>() + 1 + OBJECT_LIST_HEADER_BYTES + 2 * OBJECT_BYTES
+    );
+    let page = HostPrepare {
+      named: Vec::new(),
+      ..named
+    };
+    assert_eq!(
+      page.encode().len(),
+      4 * size_of::<u64>() + 1,
+      "a page request's bytes are unchanged"
+    );
+    let answer = HostPromise {
+      nothing: vec![ObjectId::new(HostId(1), 9)],
+      ..sample_host_promise()
+    };
+    assert_eq!(HostPromise::decode(&answer.encode()), Ok(answer.clone()));
+    assert_eq!(
+      answer.encode().len(),
+      sample_host_promise().encode().len() + OBJECT_LIST_HEADER_BYTES + OBJECT_BYTES,
+      "an answer without the list keeps its bytes"
+    );
+  }
+
+  /// Hostile input on A-251's appended lists: a list cut anywhere, a count of zero (which no encoder writes, so a list
+  /// has one encoding), a count beyond what its bytes hold, and a stray byte after it are typed refusals, on the
+  /// question and on the answer.
+  #[test]
+  fn a_hostile_named_list_is_refused() {
+    let question = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: None,
+      named: vec![ObjectId::new(HostId(1), 3), ObjectId::new(HostId(1), 8)],
+    }
+    .encode();
+    let answer = HostPromise {
+      nothing: vec![ObjectId::new(HostId(1), 9), ObjectId::new(HostId(1), 10)],
+      ..sample_host_promise()
+    }
+    .encode();
+    let question_list = 4 * size_of::<u64>() + 1;
+    let answer_list = sample_host_promise().encode().len();
+    for (bytes, list_at, decodes) in [
+      (
+        &question,
+        question_list,
+        (|b: &[u8]| HostPrepare::decode(b).is_ok()) as fn(&[u8]) -> bool,
+      ),
+      (&answer, answer_list, |b: &[u8]| {
+        HostPromise::decode(b).is_ok()
+      }),
+    ] {
+      for cut in list_at + 1..bytes.len() {
+        assert!(!decodes(&bytes[..cut]), "cut at {cut}");
+      }
+      let mut zero = bytes[..list_at].to_vec();
+      zero.extend_from_slice(&0u32.to_le_bytes());
+      assert!(!decodes(&zero), "a count of zero");
+      let mut lying = bytes.clone();
+      lying[list_at..list_at + OBJECT_LIST_HEADER_BYTES].copy_from_slice(&u32::MAX.to_le_bytes());
+      assert!(!decodes(&lying), "a count beyond the bytes");
+      let mut trailing = bytes.clone();
+      trailing.push(0);
+      assert!(!decodes(&trailing), "a stray byte after the list");
+    }
   }
 
   /// Banned item 8: retirements nobody confirms stay bounded by the members, the oldest dropped first, however

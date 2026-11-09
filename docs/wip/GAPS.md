@@ -5587,8 +5587,9 @@ be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostP
 `docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). **Step (a), built:** the counting rule is
 `slates_db::takeover::readiness`, and `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover with an omission
 nemesis. Over 2,000 histories today's rule lost 166 committed records with the nemesis on and none with it off; A-251's
-by-name rule lost none. Still owed: (b) the per-object question by name and the switch to `CountingRule::NamedAnswer`,
-then (d) the process test. **Not covered by (b):** an object that every holder of it leaves out of its pages, and the
+by-name rule lost none. **Step (b), built:** a successor asks by name for what a member's complete pages did not list,
+a holder answers from its own records with no routing filter, and the successor counts under
+`CountingRule::NamedAnswer`. Still owed: (d) the process test. **Not covered by (b):** an object that every holder of it leaves out of its pages, and the
 successor does not hold, is never learned, so a round can confirm without it under either rule (A-251).
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and

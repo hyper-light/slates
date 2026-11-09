@@ -6429,6 +6429,7 @@ mod tests {
         epoch: HostEpoch(2),
         generation,
         after: None,
+        named: Vec::new(),
       };
       let spoofed = crate::takeover::serve_host_prepare(state, local, departed, &prepare.encode());
       let promised =
@@ -6473,6 +6474,7 @@ mod tests {
         epoch: HostEpoch(2),
         generation: state.fleet.configuration().version,
         after: None,
+        named: Vec::new(),
       }
       .encode();
       let now = slates_machine::clock::monotonic_ns();
@@ -6542,6 +6544,150 @@ mod tests {
     assert_eq!(
       once_lapsed, 1,
       "once its answers can no longer feed the lease, its copy is learned"
+    );
+  }
+
+  /// A-251 (b), the holder's side, the warm-restart case (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`):
+  /// a holder that lost a copy's routing leaves it out of its complete page, and answers for it when asked by name. Do:
+  /// retire the owner of a record this node holds, forget the copy's routing and lineage, then answer the successor's
+  /// page and its question by name. Expect: the page lists nothing and is complete; the answer by name reports the
+  /// record; an object this node has no record of is answered as held nothing of.
+  #[test]
+  fn a_holder_answers_by_name_for_a_copy_its_page_leaves_out() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([29; 16]);
+    let (page, named, absent) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      state.departed_owners.remove(&object);
+      let regional = state.council.configuration().clone();
+      let absent = (0..=u8::MAX)
+        .map(|seed| ObjectId([seed; 16]))
+        .find(|other| *other != object && regional.successor(departed, *other) == Some(successor))
+        .unwrap();
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      let question = HostPrepare {
+        named: vec![object, absent],
+        ..prepare
+      };
+      let named = crate::takeover::serve_host_prepare(state, local, successor, &question.encode());
+      (page, named, absent)
+    });
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert!(
+      page.entries.is_empty() && page.next.is_none(),
+      "the page leaves the copy out, complete: {page:?}"
+    );
+    let named = HostPromise::decode(&named).expect("the question answers");
+    assert_eq!(
+      named
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the held copy is reported by name"
+    );
+    assert_eq!(
+      named.nothing,
+      vec![absent],
+      "and what it does not hold is said to be held nothing of"
+    );
+  }
+
+  /// A-251 (b), the successor's side: a complete page that did not list an object promises nothing of it. Do: at f = 1
+  /// with this node the successor of an object it holds and a third member its cohort's other survivor, fold the third
+  /// member's complete, empty page; then its answer by name. Expect: after the page the object is not ready and the next
+  /// round asks the third member about it by name; after the answer (holding nothing of it) the object is ready.
+  #[test]
+  fn a_complete_page_promises_nothing_of_an_object_it_did_not_list() {
+    use slates_db::register::{HostPromise, ObjectId};
+    let (ready_after_page, asked, ready_after_answer) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let (departed, object) = (0..=u8::MAX)
+        .find_map(|seed| {
+          let object = ObjectId([seed; 16]);
+          let departed = slates_db::HostId(local.0 ^ 1);
+          let third = slates_db::HostId(local.0 ^ 2);
+          let mut probe = slates_db::register::RegionalConfiguration::formed(
+            vec![local, departed, third],
+            slates_db::register::Quorum { f: 1 },
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          );
+          probe.take_over(departed, 3);
+          (probe.successor(departed, object) == Some(local)).then_some((departed, object))
+        })
+        .unwrap();
+      let third = slates_db::HostId(local.0 ^ 2);
+      let (retired, successor) = retire_the_owner_of_a_held_object(state, object);
+      assert_eq!((retired, successor), (departed, local));
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let requests = crate::takeover::begin_round(state, departed, local).unwrap();
+      let (_, page_request) = requests
+        .iter()
+        .find(|(host, _)| *host == third)
+        .unwrap()
+        .clone();
+      let answer = HostPromise {
+        holder: third,
+        departed,
+        epoch: page_request.epoch,
+        generation: page_request.generation,
+        entries: Vec::new(),
+        next: None,
+        fenced: None,
+        unpromised: 0,
+        nothing: Vec::new(),
+      };
+      crate::takeover::fold_answers(state, departed, vec![(third, answer.clone(), false)]);
+      let ready_after_page = crate::takeover::ready_objects(state, departed, local).len();
+      let requests = crate::takeover::begin_round(state, departed, local).unwrap();
+      let asked = requests
+        .iter()
+        .find(|(host, _)| *host == third)
+        .map(|(_, request)| request.named.clone())
+        .unwrap_or_default();
+      let named = HostPromise {
+        nothing: vec![object],
+        ..answer
+      };
+      crate::takeover::fold_answers(state, departed, vec![(third, named, true)]);
+      let ready_after_answer = crate::takeover::ready_objects(state, departed, local);
+      (ready_after_page, (asked, object), ready_after_answer)
+    });
+    assert_eq!(
+      ready_after_page, 0,
+      "a complete empty page promises nothing of the object"
+    );
+    assert_eq!(
+      asked.0,
+      vec![asked.1],
+      "the next round asks about it by name"
+    );
+    assert_eq!(
+      ready_after_answer
+        .iter()
+        .map(|(ready, _)| *ready)
+        .collect::<Vec<_>>(),
+      vec![asked.1],
+      "held nothing of, by name, is a promise"
     );
   }
 

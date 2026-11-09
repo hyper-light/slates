@@ -14,12 +14,14 @@
 //!   takeover asks every other member of its recovery neighbourhoods for the records it holds of that host's
 //!   objects whose successor is the asker, in pages of one fresh session's first credit ([`page_budget`]). A
 //!   holder raises its fence and installs the asker's authority on each object it lists before answering
-//!   ([`serve_host_prepare`]). A holder's complete answer promises every object of the host whose successor is
-//!   the asker — those it lists, and, by listing nothing more, those it holds nothing of: the retired host is
-//!   no member, so no holder accepts its records, and the successor is the only member the configuration names
-//!   for the object. That empty promise is what the per-object round could not give, and why a takeover
-//!   stalled for good when one survivor never received the object
-//!   (`docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).
+//!   ([`serve_host_prepare`]). Pages list what the holder's routing says falls to the asker, so a holder's silence
+//!   about an object says nothing (A-251): a holder that lost a copy's routing leaves it out of a complete page. So once
+//!   a member's pages are complete the successor asks it **by name** about each object it learned that the member did
+//!   not list, and the member answers each alone from its own records: its highest record, or that it holds nothing of
+//!   it ([`slates_db::takeover::answer_by_name`]). That named "nothing" is the empty promise a takeover needs when a
+//!   survivor never received the object
+//!   (`docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`): the retired host is no
+//!   member, so no holder accepts its records, and the successor is the only member the configuration names for it.
 //! - **Adoption.** An object is adopted once `f + 1` members of each of its recovery cohorts have promised, so
 //!   the adoption meets every record any of them committed; the newest reported record is re-committed under
 //!   the successor's own placement at the round's epoch, and the successor then serves it.
@@ -35,9 +37,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record};
 use slates_db::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage, ObjectId,
-  Placement, Prepare, Record, RegionalConfiguration, RegisterError, encode_refusal,
+  Placement, Record, RegionalConfiguration, RegisterError, encode_refusal,
 };
-use slates_db::takeover::{CountingRule, Heard, Readiness, readiness};
+use slates_db::takeover::{
+  CountingRule, Heard, Readiness, answer_by_name, promise_object, readiness,
+};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
@@ -134,6 +138,9 @@ pub struct HostTakeover {
   lost: BTreeSet<ObjectId>,
   /// The highest fence a holder reported above the epoch; the next round runs above it.
   fenced: Option<HostEpoch>,
+  /// Per learned object, the members that answered for it by name holding nothing of it (A-251 (b)): their promise of
+  /// that object alone. A member's complete pages promise nothing of an object they did not list.
+  named_nothing: BTreeMap<ObjectId, BTreeSet<HostId>>,
 }
 
 /// One asked member's progress through its answer: the object its next page starts after, and whether its
@@ -155,6 +162,7 @@ impl HostTakeover {
       adopted: BTreeSet::new(),
       lost: BTreeSet::new(),
       fenced: None,
+      named_nothing: BTreeMap::new(),
     }
   }
 
@@ -167,6 +175,7 @@ impl HostTakeover {
     self.learned.clear();
     self.lost.clear();
     self.fenced = None;
+    self.named_nothing.clear();
   }
 
   /// The objects learned and not yet adopted.
@@ -324,7 +333,11 @@ pub(crate) fn serve_host_prepare(
     *count = count.saturating_add(1);
     return Vec::new();
   }
-  let page = list_page(state, local, &prepare);
+  let page = if prepare.named.is_empty() {
+    list_page(state, local, &prepare)
+  } else {
+    answer_named(state, local, &prepare)
+  };
   // The promise stands behind the shard's publish (§4.8 persistence before reply): the page raised each listed
   // object's fence and installed the asker's authority, and a warm restart keeps this node's member id, so that
   // fence must hold after it. A refused publish promises nothing; the asker asks again.
@@ -334,6 +347,33 @@ pub(crate) fn serve_host_prepare(
     return Vec::new();
   }
   page.encode()
+}
+
+/// Counter: objects a holder refused to answer by name (A-251 (b)): the configuration names another successor, or the
+/// copy's acceptor serves an owner outside the retired host's recovery chain. Such an object stays unanswered.
+const TAKEOVER_NAMED_REFUSED: &str = "fleet.takeover.named_refused";
+
+/// Answers a by-name question from this holder's own records, with no routing in the way
+/// ([`slates_db::takeover::answer_by_name`]): its highest record of each named object, or that it holds nothing of it.
+fn answer_named(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> HostPromise {
+  let regional = state.council.configuration().clone();
+  let answer = answer_by_name(
+    local,
+    prepare,
+    &regional,
+    &mut state.holder_records,
+    page_budget(),
+  );
+  if answer.refused > 0 {
+    state.count(TAKEOVER_NAMED_REFUSED, u64::from(answer.refused));
+  }
+  if answer.promise.unpromised > 0 {
+    state.count(
+      TAKEOVER_PAGE_UNPROMISED,
+      u64::from(answer.promise.unpromised),
+    );
+  }
+  answer.promise
 }
 
 /// The status count of takeover promises not answered because the shard's publish carrying their raised fences was
@@ -393,6 +433,7 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
     next: None,
     fenced: None,
     unpromised: 0,
+    nothing: Vec::new(),
   };
   let mut used = slates_db::register::HOST_PROMISE_HEADER_BYTES;
   let mut last = prepare.after;
@@ -448,27 +489,6 @@ fn page_of(promise: &HostPromise) -> Page {
     after: promise.next,
     complete: promise.next.is_none() && promise.unpromised == 0,
   }
-}
-
-/// Promises `object` to the asker: installs the asker's authority under the round's generation and runs the
-/// prepare through the object's acceptor, raising its fence to the epoch. The highest record held, `None` when
-/// the acceptor holds nothing, or the refusal (a fence already above the epoch).
-fn promise_object(
-  acceptor: &mut Acceptor,
-  object: ObjectId,
-  prepare: &HostPrepare,
-) -> Result<Option<Accepted>, RegisterError> {
-  acceptor.install_authority(Authority {
-    generation: prepare.generation,
-    owner: prepare.owner,
-  })?;
-  let promise = acceptor.prepare(&Prepare {
-    owner: prepare.owner,
-    object,
-    epoch: prepare.epoch,
-    generation: prepare.generation,
-  })?;
-  Ok(promise.highest)
 }
 
 /// One period of this node's takeovers (§4.8), run by the record-plane coordinator: for every kept retirement
@@ -532,7 +552,8 @@ async fn drive_host_takeover(
 
 /// Readies this period's round of `departed`'s takeover: starts it (or starts it over, on a new configuration
 /// or above a fence a holder reported), promises this node's own copies of the objects that fall to it, and
-/// returns the page request for each member that has not answered in full. `None` while this node's placement
+/// returns each member's next question: its next page while its pages are incomplete, then the objects it has not
+/// answered for by name, if any. `None` while this node's placement
 /// is behind the council's (its round must run under the configuration the holders install).
 pub(crate) fn begin_round(
   state: &mut ShardState,
@@ -577,19 +598,64 @@ pub(crate) fn begin_round(
     .filter(|host| *host != local && regional.members.contains(host))
     .filter_map(|host| {
       let page = take.pages.get(&host).copied().unwrap_or_default();
-      (!page.complete).then_some((
+      let named = if page.complete {
+        unanswered_by_name(take, &regional, departed, host)
+      } else {
+        Vec::new()
+      };
+      (!page.complete || !named.is_empty()).then_some((
         host,
         HostPrepare {
           departed,
           owner: local,
           epoch,
           generation,
-          after: page.after,
+          after: if page.complete { None } else { page.after },
+          named,
         },
       ))
     })
     .collect();
   Some(requests)
+}
+
+/// Derived: the most objects one by-name question names: the ids that fit one page's bytes after a request's fields
+/// ([`page_budget`]), at least one. The answer is bounded by the holder as a page is; what it leaves out is asked
+/// again next period.
+fn named_per_question() -> usize {
+  page_budget()
+    .saturating_sub(slates_db::register::HOST_PREPARE_BYTES)
+    .saturating_sub(slates_db::register::OBJECT_LIST_HEADER_BYTES)
+    .checked_div(slates_db::register::OBJECT_BYTES)
+    .unwrap_or(0)
+    .max(1)
+}
+
+/// The learned objects `host`, whose pages are complete, has not answered for (A-251 (b)): those of whose recovery
+/// cohorts it is a member that it neither listed nor named as holding nothing, at most [`named_per_question`].
+fn unanswered_by_name(
+  take: &HostTakeover,
+  regional: &RegionalConfiguration,
+  departed: HostId,
+  host: HostId,
+) -> Vec<ObjectId> {
+  take
+    .learned
+    .iter()
+    .filter(|(object, reports)| {
+      !reports.contains_key(&host)
+        && !take
+          .named_nothing
+          .get(*object)
+          .is_some_and(|hosts| hosts.contains(&host))
+        && regional
+          .recovery_cohorts(departed, **object)
+          .iter()
+          .any(|cohort| cohort.contains(&host))
+    })
+    .map(|(object, _)| *object)
+    .take(named_per_question())
+    .collect()
 }
 
 /// The epoch a new round of `departed`'s takeover starts at: above every epoch this node's copies of the
@@ -647,6 +713,7 @@ fn promise_local_copies(
     epoch,
     generation,
     after: None,
+    named: Vec::new(),
   };
   let mut learned = Vec::new();
   let mut fenced = None;
@@ -716,11 +783,10 @@ async fn ask_pages(
     }
     if let Ok(promise) = HostPromise::decode(&reply.bytes)
       && promise.holder == host
-      && wanted
-        .get(&host)
-        .is_some_and(|prepare| promise.binds(prepare))
+      && let Some(prepare) = wanted.get(&host)
+      && promise.binds(prepare)
     {
-      answers.push((host, promise));
+      answers.push((host, promise, !prepare.named.is_empty()));
     } else {
       unbound = unbound.saturating_add(1);
     }
@@ -746,13 +812,18 @@ async fn ask_pages(
   Some(dispatch)
 }
 
-/// Folds members' page answers into `departed`'s round: each listed record learned under its holder, each
-/// page's start advanced (complete once a page names no next), and the highest fence above the epoch noted.
-fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, HostPromise)>) {
+/// Folds members' answers into `departed`'s round: each listed record learned under its holder, and the highest fence
+/// above the epoch noted. A page answer advances its member's page (complete once a page names no next); an answer by
+/// name (A-251 (b)) leaves the page as it was and records each object its member holds nothing of.
+pub(crate) fn fold_answers(
+  state: &mut ShardState,
+  departed: HostId,
+  answers: Vec<(HostId, HostPromise, bool)>,
+) {
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return;
   };
-  for (host, promise) in answers {
+  for (host, promise, by_name) in answers {
     if let Some(fence) = promise.fenced
       && fence >= take.epoch
     {
@@ -769,17 +840,26 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
           .insert(host, highest);
       }
     }
-    take.pages.insert(host, page);
+    if by_name {
+      for object in promise.nothing {
+        if take.learned.contains_key(&object) {
+          take.named_nothing.entry(object).or_default().insert(host);
+        }
+      }
+    } else {
+      take.pages.insert(host, page);
+    }
   }
 }
 
 /// The objects of `departed`'s takeover ready to adopt, each with the newest record reported for it: every
 /// one of its recovery cohorts has its recovery quorum of members that promised it — `cohort − f`, `f + 1` at
-/// the floor, at least one ([`slates_db::register::Quorum::recovery`]) — this node, a member whose answer is
-/// complete, or one that listed it. An object with a cohort left with fewer members than that quorum is lost,
+/// the floor, at least one ([`slates_db::register::Quorum::recovery`]) — this node, a member that listed it, or one
+/// that answered for it by name. An object with a cohort left with fewer members than that quorum is lost,
 /// counted and never adopted: more of that cohort failed than the region tolerates. The rule is
-/// [`slates_db::takeover::readiness`], under [`CountingRule::CompleteAnswer`] until A-251 (b) asks by name; the model in
-/// `crates/db/tests/takeover_model.rs` finds where that rule adopts an older record than a committed one.
+/// [`slates_db::takeover::readiness`] under [`CountingRule::NamedAnswer`] (A-251); the model in
+/// `crates/db/tests/takeover_model.rs` finds where counting a complete page instead adopts an older record than a
+/// committed one.
 pub(crate) fn ready_objects(
   state: &mut ShardState,
   departed: HostId,
@@ -799,12 +879,12 @@ pub(crate) fn ready_objects(
     .filter(|(_, page)| page.complete)
     .map(|(host, _)| *host)
     .collect();
-  let named_nothing = BTreeSet::new();
+  let none_named = BTreeSet::new();
   for (object, reports) in &take.learned {
     let heard = Heard {
       reports,
       complete: &complete,
-      named_nothing: &named_nothing,
+      named_nothing: take.named_nothing.get(object).unwrap_or(&none_named),
       local: local_promises.then_some(local),
     };
     let cohorts = regional.recovery_cohorts(departed, *object);
@@ -813,7 +893,7 @@ pub(crate) fn ready_objects(
       |host| regional.members.contains(&host),
       regional.quorum,
       &heard,
-      CountingRule::CompleteAnswer,
+      CountingRule::NamedAnswer,
     ) {
       Readiness::Ready => {
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
@@ -1104,6 +1184,7 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 5,
       after: None,
+      named: Vec::new(),
     };
     let refusal = promise_object(&mut acceptor, object, &prepare).unwrap_err();
     let mut promise = HostPromise {
@@ -1115,6 +1196,7 @@ mod tests {
       next: None,
       fenced: None,
       unpromised: 0,
+      nothing: Vec::new(),
     };
     let mut counters = BTreeMap::new();
     assert!(page_of(&promise).complete, "an empty answer is a full one");
@@ -1158,6 +1240,7 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 5,
       after: None,
+      named: Vec::new(),
     };
     let mut empty = Acceptor::new(RegisterHost(2), authority);
     assert_eq!(promise_object(&mut empty, object, &prepare), Ok(None));
