@@ -1015,6 +1015,19 @@ impl Shipper {
     })
   }
 
+  /// Folds a holder's answer as [`Shipper::on_reply`] does, for a caller that sends from [`Shipper::pending`] when it
+  /// sends: `Some(epoch)` when a later epoch has superseded this owner.
+  pub fn fold_reply(
+    &mut self,
+    holder: HostId,
+    reply: Result<Option<Head>, LiveError>,
+  ) -> Option<HostEpoch> {
+    match self.on_reply(holder, reply) {
+      Next::Fenced(current) => Some(current),
+      Next::Nothing | Next::Entries(_) | Next::Install => None,
+    }
+  }
+
   /// Folds a holder's answer (to an entry or an install) and says what to send it next. A head on this chain is an
   /// acknowledgement of every position up to it; a head off the chain or behind the retained tail draws an install; a
   /// fence above this epoch means the owner has been superseded.
