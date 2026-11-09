@@ -1,0 +1,79 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): the A/B for the catch-up fix: diag-70's holder stopped mid-install for 20 s
+# and resumed under the stream, heads every 100 ms after the resume, on main (A) and on the fix (B), x12 per leg.
+# Results to diag-results/live-durability-76-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: stays-stopped (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: main-a-x86, os: ubuntu-latest, ref: db8a1f35addd1d22940b71cfb1a421eb5cb26bdb }
+          - { leg: fix-a-x86, os: ubuntu-latest, ref: 9aaf563d2efa601b28ef2d03dbc4df51272d63ca }
+          - { leg: main-b-x86, os: ubuntu-latest, ref: db8a1f35addd1d22940b71cfb1a421eb5cb26bdb }
+          - { leg: fix-b-x86, os: ubuntu-latest, ref: 9aaf563d2efa601b28ef2d03dbc4df51272d63ca }
+          - { leg: main-arm, os: ubuntu-24.04-arm, ref: db8a1f35addd1d22940b71cfb1a421eb5cb26bdb }
+          - { leg: fix-arm, os: ubuntu-24.04-arm, ref: 9aaf563d2efa601b28ef2d03dbc4df51272d63ca }
+    runs-on: ${{ matrix.os }}
+    env:
+      SLATES_DIAG_INSTALL_FLOOR_MS: "30000"
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "leg ${{ matrix.leg }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          export SLATES_DIAG_STOP_DIR="$RUNNER_TEMP/stopdir"; mkdir -p "$SLATES_DIAG_STOP_DIR"
+          for run in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            rm -f "$SLATES_DIAG_STOP_DIR"/*
+            timeout 400 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact diag_a_holder_stopped_mid_install_stays_stopped > ../run.log 2>&1; status=$?
+            grep -E '^LD-TL|panicked' ../run.log | cut -c1-300 | sed "s/^/   r$run /" >> $R || true
+            echo "   r$run counts: installs $(grep -c '^LD-LANE install' ../run.log) taken $(grep -c '^LD-TAKE' ../run.log) images $(grep -c '^LD-IMAGE' ../run.log) why $(grep -c '^LD-WHY' ../run.log)" >> $R
+            echo "== run $run exit $status" >> $R
+            slow=$(grep -E '^LD-TL caught' ../run.log | grep -vE 'caught Some\(([0-9.]+(ms|µs)|[0-4]\.[0-9]+s)\)' | wc -l)
+            if [ $status -ne 0 ] || [ "$slow" -gt 0 ]; then
+              { grep -E '^LD-TL|^LD-TAKE|^LD-IMAGE|^---|fleet_session|fleet\.live\.|panicked' ../run.log | cut -c1-400 | head -2500; grep '^LD-S ' ../run.log | head -600; } > ../kept/stays-$run.log
+            fi
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-76-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-76 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
