@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "suite": "pjdfstest",
+  "transport": "native-linux-nfs4",
+  "host": {
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "Linux 7.0.0-1017-azure",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-09",
+  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount; binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "bound": "every test file at the pinned commit (238 files), 300s per file",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 238,
+      "cases": 8798,
+      "passed": 6972,
+      "failed": 1798,
+      "needs_root": 0,
+      "todo": 28,
+      "expected_failures": 1798,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-linux-nfs4.pjdfstest.txt",
+    "blake3": "a16a60bdfc73cbf32dc80d57722c88cb954f5bf69ea5c18e866a3e6144fbcfe0",
+    "entries": 1798
+  },
+  "duration_ms": 259560,
+  "notes": [
+    "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: FACCESSAT FCHMODAT FCHOWNAT FSTATAT LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT POSIX_FALLOCATE READLINKAT RENAMEAT SYMLINKAT UTIMENSAT SYS_SYSMACROS_H STRUCT_STAT_ST_ATIM STRUCT_STAT_ST_CTIM STRUCT_STAT_ST_MTIM)",
+    "1798 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "failures by shape (12 of 205 shapes; names folded to N, inode numbers to <inode>): 180 × lstat N/N inode, expected ENOENT, got <inode>; 150 × lchown N/N 65534 65534, expected 0, got ENOENT; 120 × mknod N/N b 0644 1 2, expected 0, got EPERM; 119 × mknod N/N c 0644 1 2, expected 0, got EPERM; 92 × unlink N/N, expected 0, got ENOENT; 80 × unlink N, expected 0, got ENOENT; 76 × -u 65534 -g 65534 rename N/N N/N, expected EACCES|EPERM, got ENOENT; 52 × test_check (a comparison of two values the script read; no message); 40 × -u 65534 -g 65534 rename N/N N/N, expected 0, got ENOENT; 40 × mknod N b 0644 1 2, expected 0, got EPERM; 38 × mknod N c 0644 1 2, expected 0, got EPERM; 36 × lstat N/N inode,uid,gid, expected ENOENT,65534,65534, got <inode>,65534,65534"
+  ]
+}
