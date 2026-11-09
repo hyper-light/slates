@@ -5849,6 +5849,148 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   );
 }
 
+/// Shape: the clients reading through the starved origin at once, each a full ring of reads a round: enough that most
+/// forwards wait for the lane's driver, as in clients' runs (2 batches begun against 20 to 25 given up). One serial
+/// reader was not: with b's control shard at nice 19 beside two spinners, main served every read (2026-11-09,
+/// adacachy2: 18 to 29 reads, the longest 2.3 s, none given up).
+const STARVED_ORIGIN_CLIENTS: usize = 32;
+/// Shape: the refusals the starved-origin test keeps to print.
+const STARVED_ORIGIN_SHOWN: usize = 8;
+
+/// What [`read_in_rounds`] saw.
+struct StarvedReads {
+  served: usize,
+  unanswered: usize,
+  rounds: u32,
+  longest: Duration,
+  /// The first [`STARVED_ORIGIN_SHOWN`] refusals, with when they came.
+  refused: Vec<(Duration, String)>,
+}
+
+/// Sends `slots` reads from each client a round and collects their replies within `reply_wait`, round after round for
+/// `watch`; a round with a reply missing past its wait ends the watch, since the late reply would sit in the ring.
+fn read_in_rounds(
+  clients: &mut [Client],
+  read: &RequestBody,
+  slots: usize,
+  reply_wait: Duration,
+  watch: Duration,
+) -> StarvedReads {
+  let mut seen = StarvedReads {
+    served: 0,
+    unanswered: 0,
+    rounds: 0,
+    longest: Duration::ZERO,
+    refused: Vec::new(),
+  };
+  let watching = Instant::now();
+  while watching.elapsed() < watch && seen.unanswered == 0 {
+    let round = Instant::now();
+    for client in clients.iter_mut() {
+      client.send_burst(read, slots);
+    }
+    for client in clients.iter_mut() {
+      let replies = client.collect_tagged(slots, reply_wait.saturating_sub(round.elapsed()));
+      seen.unanswered += slots - replies.len();
+      for (_, reply) in replies {
+        if matches!(reply, ReplyBody::Status { .. }) {
+          seen.served += 1;
+        } else if seen.refused.len() < STARVED_ORIGIN_SHOWN {
+          seen
+            .refused
+            .push((watching.elapsed(), format!("{reply:?}")));
+        }
+      }
+    }
+    seen.longest = seen.longest.max(round.elapsed());
+    seen.rounds += 1;
+  }
+  seen
+}
+
+/// A-232 (class C+D), from clients' false-death runs: an origin at nice 19 beside two spinners a CPU was refused its
+/// read after 10 to 12 s, with `fleet.forward.batch_given_up` 20 to 25 against 2 batches begun, while the owner was
+/// alive. A forward's stall budget ran on the wall clock of the origin's control shard, so time the shard spent off its
+/// CPU counted as the owner's silence. Do: three nodes; a volume on a, read through b; b's control shard starved as
+/// clients' origin was (nice 19 beside two spinners at nice 0 on its CPU, `common::starve::Depth::Nice`); reads through
+/// b by [`STARVED_ORIGIN_CLIENTS`] clients, a full ring each a round, for a failover SLO and a half. Expect: b gives up
+/// no forward batch to a, which answers throughout, and reads are served. How many is b's CPU's to say, not the lane's:
+/// at nice 19 beside two spinners b's control shard has about 0.7% of its CPU, and 1,024 reads in flight outran it with
+/// the fix as before it (4 to 11 served in 11 s, the rest unanswered, b's own refusal at its failover SLO included), so
+/// those are printed, not held to a bound. Before: b gave up 2 and 713 batches (adacachy2, 2026-11-09).
+#[test]
+fn a_starved_origin_keeps_its_forward_to_a_live_owner() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "starved-origin", &daemons);
+  let mut probe = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
+  let given_up = |daemon: &Daemon| {
+    summed_counters(daemon)
+      .get("fleet.forward.batch_given_up")
+      .copied()
+      .unwrap_or(0)
+  };
+  let given_up_before = given_up(&daemons[1]);
+  // Shape: a failover SLO and a half, so main's refusal (10 to 12 s in clients' runs) falls inside the watch.
+  let failover_slo_ns = daemons[1].config().failover_slo_ns;
+  let watch = Duration::from_nanos(failover_slo_ns.saturating_mul(3) / 2);
+  // Shape: each read's reply wait: the failover SLO, past which b refuses, and a liveness budget for the reply to reach
+  // the test, so what is measured is b's answer, not the client's own wall deadline (clients', A-232).
+  let reply_wait_ns = failover_slo_ns.saturating_add(LIVENESS_BUDGET_NS);
+  // Connected before the starving: a claim is answered on b's control shard, which then answers little.
+  let mut clients: Vec<Client> = (0..STARVED_ORIGIN_CLIENTS)
+    .map(|_| Client::connect(daemons[1].instance()))
+    .collect();
+  let starved = common::starve::starve_shard(
+    &daemons[1],
+    daemons[1].shards()[0],
+    common::starve::Depth::Nice,
+  );
+  let read = RequestBody::Status { volume };
+  let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
+  let reply_wait = Duration::from_nanos(reply_wait_ns);
+  let StarvedReads {
+    served,
+    unanswered,
+    rounds,
+    longest,
+    refused,
+  } = read_in_rounds(&mut clients, &read, slots, reply_wait, watch);
+  drop(clients);
+  let shown = starved.shown.clone();
+  starved.stop();
+  let given_up_during = given_up(&daemons[1]).saturating_sub(given_up_before);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "b's control shard starved ({shown}) for {watch:?}: {STARVED_ORIGIN_CLIENTS} clients, {rounds} rounds, the longest \
+     {longest:?}; {served} reads served, {unanswered} unanswered within {reply_wait:?}; refused (first \
+     {STARVED_ORIGIN_SHOWN}) {refused:?}; b gave up {given_up_during} forward batches"
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert!(served > 0, "a read through the starved b was served");
+  assert_eq!(
+    given_up_during, 0,
+    "b gave up {given_up_during} forward batches to a live a while its own shard was starved (refused {refused:?})"
+  );
+}
+
 /// §4.9, found by fixtures' 1,000-client replica-kill rung (2026-11-07): the client node's control shard refused 117
 /// spawns at admission, its task arena full, and 87 forwards handed to it never started, so their clients, which wait
 /// for a forwarded verb while the daemon lives, waited for good (`fleet.forward.client.to_control` 85,750 against

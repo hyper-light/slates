@@ -18,6 +18,8 @@ pub(crate) mod nfs;
 pub(crate) mod nfs4;
 pub(crate) mod target;
 // The vhost-user front end a VMM speaks, over `guest`'s driver (Linux, where vhost-user is built).
+// One shard's thread starved of its CPU while it stays runnable, beside spinners (A-228, A-232).
+pub(crate) mod starve;
 pub(crate) mod trace;
 #[cfg(target_os = "linux")]
 pub(crate) mod vhost_front_end;

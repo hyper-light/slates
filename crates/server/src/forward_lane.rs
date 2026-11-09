@@ -24,7 +24,9 @@
 //! (`fleet.forward.lane_full`), never queued. The session's own stream credit bounds the open exchanges, and a
 //! forward past it waits queued (`Backlogged`, refused typed by the endpoint) until a stream frees. Each forwarder
 //! bounds its own wait: the batch is given up once none of its forwards has made progress for its stall budget,
-//! where progress is a reply completed or bytes of one of its own replies read. Its open exchanges are abandoned on
+//! counted in its own shard's polls so a starved origin does not take its own lateness for the owner's silence, and
+//! bounded on the wall by the failover SLO ([`Quiet`]), where progress is a reply completed or bytes of one of its own
+//! replies read. Its open exchanges are abandoned on
 //! the next turn and its queued ones dropped. Until 2026-11-07 progress was any byte the session consumed while a
 //! forward was open: a session busy with other replies kept a forward its owner never answered alive for good (298 in
 //! fixtures' 1,000-client primary-kill rung, the owner unable to commit and the session full of `LeaseUnconfirmed`
@@ -132,6 +134,13 @@ struct Lane {
   driver: Option<Waker>,
   /// The waiting forwarders' wakers.
   waiters: BTreeMap<u64, Waker>,
+  /// The lane's poll clock ([`Quiet`]): the driver's turns, each credited its wall time up to the larger of a poll pace
+  /// and the CPU its shard ran meanwhile, nanoseconds.
+  polled_ns: u64,
+  /// When the clock was last credited (0: never).
+  polled_at: u64,
+  /// The shard's CPU time then (`None`: its clock could not be read).
+  cpu_at: Option<u64>,
 }
 
 /// Every peer's lane, in the control shard's state.
@@ -206,8 +215,12 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
 enum Look {
   /// Every ticket is done: the replies, in order.
   Done(Vec<Option<Vec<u8>>>),
-  /// Not all done; whether this forwarder should drive (nobody does), and its latest progress.
-  Waiting { drive: bool, progress_ns: u64 },
+  /// Not all done; whether this forwarder should drive (nobody does), its latest progress, and the lane's poll clock.
+  Waiting {
+    drive: bool,
+    progress_ns: u64,
+    polled_ns: u64,
+  },
 }
 
 /// Looks at `tickets`; when this forwarder should drive, marks the lane driven by it.
@@ -234,7 +247,11 @@ fn look(peer: HostId, tickets: &[u64]) -> Option<Look> {
     if drive {
       lane.driving = true;
     }
-    Some(Look::Waiting { drive, progress_ns })
+    Some(Look::Waiting {
+      drive,
+      progress_ns,
+      polled_ns: lane.polled_ns,
+    })
   })
   .flatten()
 }
@@ -304,12 +321,13 @@ pub(crate) async fn forward_batch(
     driving: false,
   };
   let began = futures::now_ns();
+  let mut quiet = Quiet::new(began, peer);
   let mut begun = false;
   let mut first_reply: Option<(u64, usize)> = None;
   let mut missed = false;
   loop {
     let look = look(peer, &held.tickets)?;
-    let (drive, progress_ns) = match look {
+    let (drive, progress_ns, polled_ns) = match look {
       Look::Done(replies) => {
         state::with_state(|s| s.count(BATCH_DONE, 1));
         let last_ns = futures::now_ns();
@@ -321,15 +339,19 @@ pub(crate) async fn forward_batch(
           streamed_ns: last_ns.saturating_sub(first_ns),
         });
       }
-      Look::Waiting { drive, progress_ns } => (drive, progress_ns),
+      Look::Waiting {
+        drive,
+        progress_ns,
+        polled_ns,
+      } => (drive, progress_ns, polled_ns),
     };
     held.driving = held.driving || drive;
-    let quiet_ns = futures::now_ns().saturating_sub(progress_ns.max(began));
-    if quiet_ns >= stall_ns {
+    quiet.progressed(progress_ns, polled_ns);
+    if quiet.spent(polled_ns, stall_ns) {
       // Nothing of this batch moved for its budget: what came back is kept, the rest is given up (`Held`'s drop).
       return given_up(peer, &held, begun);
     }
-    let left_ns = stall_ns.saturating_sub(quiet_ns);
+    let left_ns = quiet.left_ns(polled_ns, stall_ns);
     if held.driving {
       if let Some(ended) = drive_turn(
         peer,
@@ -341,14 +363,119 @@ pub(crate) async fn forward_batch(
       {
         return ended;
       }
+      credit_poll(peer);
     } else {
-      // Woken when one of this batch's replies is taken, or when the driver leaves; bounded by the budget left.
+      // Woken when one of this batch's replies is taken, or when the driver leaves; bounded by the budget left, on the
+      // wall, and looked at again then in the lane's polls.
       let _ = futures::within(left_ns, wait_woken(peer, forwarder)).await;
       begun = begun || any_begun(peer, &held.tickets);
       if first_reply.is_none() {
         first_reply = first_answered(peer, &held.tickets);
       }
     }
+  }
+}
+
+/// The poll pace: a driving turn lasts at most this long, and the lane's poll clock is credited at most this much a turn.
+const POLL_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+
+/// Credits `peer`'s lane poll clock after a driving turn: the wall time since the last credit, up to the larger of a
+/// poll pace and the CPU time this shard ran meanwhile ([`Quiet`]); the wall alone where the shard's clock cannot be
+/// read.
+fn credit_poll(peer: HostId) {
+  let now = futures::now_ns();
+  let cpu = shard_cpu_ns();
+  state::with_state(|s| {
+    if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
+      if lane.polled_at != 0 {
+        let waited = now.saturating_sub(lane.polled_at);
+        let ran = match (cpu, lane.cpu_at) {
+          (Some(cpu), Some(at)) => cpu.saturating_sub(at),
+          _ => waited,
+        };
+        lane.polled_ns = lane
+          .polled_ns
+          .saturating_add(waited.min(ran.max(POLL_PACE_NS)));
+      }
+      lane.polled_at = now;
+      lane.cpu_at = cpu;
+    }
+  });
+}
+
+/// The CPU time this shard's thread has run, nanoseconds (`slates_rt::registry::shard_cpu`): `None` off a shard or
+/// where the platform reads no thread clock.
+fn shard_cpu_ns() -> Option<u64> {
+  let shard = slates_rt::registry::current_shard()?;
+  let holder = slates_rt::registry::holder_of(shard)?;
+  slates_rt::registry::shard_cpu(holder).map(|reading| reading.spent_ns)
+}
+
+/// A forwarder's quiet: the time since its batch last progressed, counted in its lane's poll clock (A-232, class C+D),
+/// not the wall clock. The lane's driver turns at most a poll pace at a time, and each turn credits the clock its wall
+/// time up to the larger of a pace and the CPU its shard ran meanwhile; every forwarder on the lane reads that one clock,
+/// so waiters sleep until woken as before and no forwarder polls on its own. The three cases it tells apart:
+/// - An idle shard wakes on time and is credited about the wall, so a dead owner's batch is given up at its stall
+///   budget as before.
+/// - A busy shard wakes late but ran the whole time, and is credited the wall too. Polls alone credited it a pace a
+///   turn: with a deaf session under a 256-client burst the batches outlived their budget, piled up, and kept the
+///   control shard's beat 0.5 to 6.5 s late, and the first answer on the replacement came 22.4 s after the drop
+///   against 26 to 336 ms (this Mac, 2026-11-09).
+/// - A starved shard wakes late having run little, and is credited a pace a turn, so the time its own thread could not
+///   run is not taken for the owner's silence. Before (clients' false-death runs, an origin at nice 19 beside two
+///   spinners a CPU): batches to a live owner given up 20 to 25 times against 2 begun, the read refused after 10 to
+///   12 s.
+///
+/// The wall still bounds it: a batch quiet for a failover SLO (`DaemonConfig::failover_slo_ns`, the operator's bound on
+/// a failover) is given up however little its shard ran. The shard's CPU clock alone (`observe::ShardTime`) cannot
+/// judge this: an idle shard runs little too, and the forwarder runs on the shard it would judge, which then always
+/// reads as running.
+struct Quiet {
+  /// When the batch last progressed (its start at first), on the wall.
+  since_ns: u64,
+  /// The lane's poll clock then.
+  mark_ns: u64,
+  /// The wall bound on the quiet: the failover SLO, or the stall budget alone off a daemon.
+  cap_ns: Option<u64>,
+}
+
+impl Quiet {
+  fn new(began: u64, peer: HostId) -> Self {
+    let (cap_ns, mark_ns) = state::with_state(|s| {
+      let mark = s
+        .forward_lanes
+        .lanes
+        .get(&peer)
+        .map_or(0, |lane| lane.polled_ns);
+      (s.config.failover_slo_ns, mark)
+    })
+    .map_or((None, 0), |(cap, mark)| (Some(cap), mark));
+    Quiet {
+      since_ns: began,
+      mark_ns,
+      cap_ns,
+    }
+  }
+
+  /// The batch's latest progress, `progress_ns` on the wall (0 when none), with the lane's clock `polled_ns`: a later
+  /// one starts the quiet again.
+  fn progressed(&mut self, progress_ns: u64, polled_ns: u64) {
+    if progress_ns > self.since_ns {
+      self.since_ns = progress_ns;
+      self.mark_ns = polled_ns;
+    }
+  }
+
+  /// Whether the quiet has run `stall_ns` of the lane's polls, or the wall bound.
+  fn spent(&self, polled_ns: u64, stall_ns: u64) -> bool {
+    let wall_ns = futures::now_ns().saturating_sub(self.since_ns);
+    polled_ns.saturating_sub(self.mark_ns) >= stall_ns
+      || wall_ns >= self.cap_ns.unwrap_or(stall_ns).max(stall_ns)
+  }
+
+  /// The polls left of `stall_ns`: the next wait's bound, on the wall (a driving turn takes a pace of it at most).
+  fn left_ns(&self, polled_ns: u64, stall_ns: u64) -> u64 {
+    stall_ns.saturating_sub(polled_ns.saturating_sub(self.mark_ns))
   }
 }
 
@@ -360,7 +487,7 @@ async fn drive_turn(
   held: &Held,
   (begun, first_reply, missed): (&mut bool, &mut Option<(u64, usize)>, &mut bool),
 ) -> Option<Option<BatchReplies>> {
-  match turn(peer, left_ns).await {
+  match turn(peer, left_ns.min(POLL_PACE_NS)).await {
     Turn::Driven { any_reply } => {
       *begun = true;
       if any_reply && first_reply.is_none() {
@@ -372,10 +499,7 @@ async fn drive_turn(
     }
     Turn::SessionOut => {
       count_miss(peer, missed);
-      if futures::sleep(crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD)
-        .await
-        .is_err()
-      {
+      if futures::sleep(POLL_PACE_NS).await.is_err() {
         return Some(None);
       }
     }
