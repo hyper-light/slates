@@ -89,6 +89,10 @@ pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
 /// Format: `ReparsePoints` — bit 4: the file system serves reparse points, so WinFsp calls the reparse slots and
 /// follows a symbolic link it finds while opening a path (A-275; `fsctl.h` v2.1, `FSP_FSCTL_VOLUME_PARAMS_V0_FIELD_DEFN`).
 pub(crate) const VOLUME_FLAG_REPARSE_POINTS: u32 = 1 << 4;
+/// Format: `ReparsePointsAccessCheck` — bit 5: WinFsp's driver refuses a symbolic link's `FSCTL_SET_REPARSE_POINT` from
+/// a user-mode caller whose token lacks `SeCreateSymbolicLinkPrivilege` (`STATUS_PRIVILEGE_NOT_HELD`; `src/sys/fsctl.c`
+/// v2.1, 231-240), as NTFS does (A-275).
+pub(crate) const VOLUME_FLAG_REPARSE_POINTS_ACCESS_CHECK: u32 = 1 << 5;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back

@@ -628,3 +628,53 @@ proptest::proptest! {
     }
   }
 }
+
+/// Format: where a shard image's or a shard delta's version sits: after its four-byte magic.
+const VERSION_AT: usize = size_of::<u32>();
+
+/// `bytes` (an encoded shard image or delta) with its version replaced by `version`.
+fn with_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
+  bytes[VERSION_AT..VERSION_AT + size_of::<u16>()].copy_from_slice(&version.to_le_bytes());
+  bytes
+}
+
+/// A-275 (§4.8 "Recovery"). Do: give recovery a shard image written as the version before this build's, its bytes
+/// otherwise this build's own (A-275 changed what a symlink's Windows bits may hold, not their layout). Expect it
+/// refused, typed (`RecoveryIncomplete`, main's refusal of another version): an earlier reader of a 27 image would have
+/// dropped a directory link's bit without a word, and this one must not read a 26 image as its own either.
+#[test]
+fn an_image_of_the_version_before_this_builds_is_refused() {
+  let mut store = store();
+  let vol = seeded(&mut store);
+  let older = slates_vfs::recover::IMAGE_VERSION - 1;
+  let bytes = with_version(full(&vol, &store).to_content(), older);
+  assert_eq!(
+    ShardImage::from_content(&bytes),
+    Err(slates_vfs::error::VfsError::RecoveryIncomplete)
+  );
+  assert!(ShardImage::from_content(&full(&vol, &store).to_content()).is_ok());
+}
+
+/// A-275 (§4.8 "Recovery"). Do: commit a checkpoint, then append a CRC-valid delta frame written as the delta version
+/// before this build's, its bytes otherwise this build's own. Expect the recovery refused, typed (`RecoveryIncomplete`),
+/// not the delta replayed as this build's.
+#[test]
+fn a_delta_of_the_version_before_this_builds_is_refused() {
+  use slates_wire::Wire;
+  let mut store = store();
+  let mut vol = seeded(&mut store);
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let mut journal = Journal::default();
+  journal
+    .checkpoint(&mut checkpoints, &full(&vol, &store))
+    .unwrap();
+  vol.mark_published(&store);
+  create(&mut vol, &mut store, "after", b"after the checkpoint");
+  let older = slates_vfs::checkpoint_log::DELTA_VERSION - 1;
+  let body = with_version(delta_of(&mut vol, &store).to_bytes(), older);
+  journal.append_encoded(&mut log, &body).unwrap();
+  assert_eq!(
+    Journal::recover(&checkpoints, &log).map(|_| ()),
+    Err(slates_vfs::error::VfsError::RecoveryIncomplete)
+  );
+}

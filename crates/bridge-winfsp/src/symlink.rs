@@ -4,14 +4,22 @@
 //! string per link, the form every platform reads (`readlink`). This module is the map between them, host-buildable and
 //! tested on any host; the mount host (`crate::host`) answers WinFsp's reparse callbacks with it.
 //!
-//! **The stored form.** A relative link keeps its substitute with `/` for `\`, so Linux and macOS follow it too: a
-//! Windows `..\lib\x` is the volume's `../lib/x`, and a link Linux made to `../lib/x` reads on Windows as `..\lib\x`.
-//! A device-relative substitute (`\usr\bin`, relative to the drive's root) becomes `/usr/bin`, which is what a Linux
-//! link to `/usr/bin` reads as on Windows. An absolute link keeps the Win32 path its NT substitute names: `\??\C:\x`
-//! is kept as `C:\x`, and `\??\UNC\srv\share\x` as `\\srv\share\x`, so the stored target says which it was by its
-//! first characters (a drive letter and `:\`, or `\\`), and a relative target never starts so since its separators are
-//! `/`. An absolute substitute in any other NT form (`\??\Volume{…}\`, `\Device\…`) has no such Win32 path and is
+//! **The stored form (A-275's separator rule).** A relative link means the same object on every platform (R8): it is
+//! stored with `/` and presented to Windows with `\`, as Git for Windows writes a link (`mingw_create_symlink`) and reads
+//! one back (`normalize_ntpath`). A Windows `..\lib\x` is the volume's `../lib/x`, and a link Linux made to `../lib/x`
+//! reads on Windows as `..\lib\x`. A Windows link relative to the drive's root (`\x\y`, a device-relative substitute)
+//! names an object in the volume, so it is stored as the path to it from the link's own directory (`../../x/y` for a
+//! link at `\a\b\link`), which every platform resolves to the same object; Windows then reads it back in that form.
+//! Every other target is presented as given and resolves only where it means something. A POSIX-absolute target
+//! (`/usr/bin`, made on Linux or macOS) names a path outside the volume: Windows is shown it unchanged and absolute, and
+//! it resolves to nothing on the drive. A Windows-absolute link keeps the Win32 path its NT substitute names
+//! (`\??\C:\x` is kept as `C:\x`, `\??\UNC\srv\share\x` as `\\srv\share\x`), which Linux and macOS read unchanged and
+//! do not resolve. An absolute substitute in any other NT form (`\??\Volume{…}\`, `\Device\…`) has no Win32 path and is
 //! refused (`STATUS_IO_REPARSE_DATA_INVALID`).
+//!
+//! **The lossy case.** A POSIX name may hold `\`, which Windows takes for a separator. A Linux target `a\b` (one name)
+//! reads on Windows as two components, and one that starts with a drive letter and `:\` (`C:\x`) or with `\\` reads as
+//! a Windows-absolute path. Neither resolves to what Linux meant; Windows cannot name such a file in any case.
 //!
 //! **What is not kept.** The print name: it is derived from the substitute, as `CreateSymbolicLink` writes it (the
 //! same name for a relative link; the Win32 path for an absolute one, its UNC form with one leading `\` dropped, which
@@ -104,6 +112,9 @@ fn is_absolute(target: &str) -> bool {
 
 /// The substitute name, print name and flags Windows is shown for a stored target.
 fn names(target: &str) -> (String, String, u32) {
+  if target.starts_with('/') {
+    return (target.to_owned(), target.to_owned(), 0);
+  }
   if is_absolute(target) {
     match target.strip_prefix(UNC_PREFIX) {
       Some(rest) => (
@@ -184,10 +195,28 @@ fn name(data: &[u8], at: usize) -> Result<String, Refusal> {
   String::from_utf16(&units).map_err(|_| Refusal::Malformed)
 }
 
+/// A substitute relative to the drive's root (`\x\y`) as the path to the same object from the directory of the link at
+/// `link` (a WinFsp path, `\a\b\link`): one `..` for each of that directory's components, then the substitute's.
+fn from_link_directory(link: &str, rooted: &str) -> String {
+  let depth = link
+    .split('\\')
+    .filter(|part| !part.is_empty())
+    .count()
+    .saturating_sub(1);
+  let parts: Vec<&str> = std::iter::repeat_n("..", depth)
+    .chain(rooted.split('\\').filter(|part| !part.is_empty()))
+    .collect();
+  if parts.is_empty() {
+    ".".to_owned()
+  } else {
+    parts.join("/")
+  }
+}
+
 /// The target the volume keeps for a symbolic link reparse buffer Windows set (`FSCTL_SET_REPARSE_POINT`, as
-/// `CreateSymbolicLink` sends it). The print name is checked to lie within the buffer but not kept (the module's
-/// "What is not kept").
-pub fn target(data: &[u8]) -> Result<String, Refusal> {
+/// `CreateSymbolicLink` sends it) on the link at `link`, a WinFsp path. The print name is checked to lie within the
+/// buffer but not kept (the module's "What is not kept").
+pub fn target(data: &[u8], link: &str) -> Result<String, Refusal> {
   if tag(data) != Some(IO_REPARSE_TAG_SYMLINK) {
     return match tag(data) {
       Some(_) => Err(Refusal::Tag),
@@ -209,7 +238,10 @@ pub fn target(data: &[u8]) -> Result<String, Refusal> {
     return Err(Refusal::Malformed);
   }
   if flags & SYMLINK_FLAG_RELATIVE != 0 {
-    return Ok(substitute.replace('\\', "/"));
+    return Ok(match substitute.strip_prefix('\\') {
+      Some(rooted) => from_link_directory(link, rooted),
+      None => substitute.replace('\\', "/"),
+    });
   }
   let path = substitute.strip_prefix(NT_PREFIX).ok_or(Refusal::Foreign)?;
   let target = match path.strip_prefix(UNC_DEVICE) {
@@ -252,6 +284,11 @@ mod tests {
     b
   }
 
+  /// The target set on a link in the drive's root.
+  fn target_at(data: &[u8]) -> Result<String, Refusal> {
+    target(data, "\\link")
+  }
+
   /// The three fields winfstest's `t/reparse/02.t` reads back from a buffer: substitute, print and flags.
   fn read_back(data: &[u8]) -> (String, String, u32) {
     let flags = u32::from_le_bytes(data[16..20].try_into().unwrap());
@@ -261,7 +298,7 @@ mod tests {
   #[test]
   fn a_relative_link_is_kept_with_slashes_and_reads_back_as_windows_set_it() {
     let set = windows_buffer("dir\\name", "dir\\name", 1);
-    assert_eq!(target(&set), Ok("dir/name".to_owned()));
+    assert_eq!(target_at(&set), Ok("dir/name".to_owned()));
     let shown = reparse_data("dir/name").unwrap();
     assert_eq!(tag(&shown), Some(IO_REPARSE_TAG_SYMLINK));
     assert_eq!(
@@ -278,7 +315,7 @@ mod tests {
   fn an_absolute_drive_link_keeps_its_win32_path() {
     // t/reparse/02.t: SubstituteName == "\\??\\" + dstpath, PrintName == dstpath, Flags == 0.
     let set = windows_buffer("\\??\\X:\\work\\b", "X:\\work\\b", 0);
-    assert_eq!(target(&set), Ok("X:\\work\\b".to_owned()));
+    assert_eq!(target_at(&set), Ok("X:\\work\\b".to_owned()));
     let shown = reparse_data("X:\\work\\b").unwrap();
     assert_eq!(
       read_back(&shown),
@@ -290,7 +327,7 @@ mod tests {
   fn a_unc_link_keeps_its_unc_path_and_prints_as_windows_does() {
     // t/reparse/02.t: SubstituteName == "\\??\\UNC" + dstpath[1:], PrintName == dstpath[1:].
     let set = windows_buffer("\\??\\UNC\\srv\\share\\x", "\\srv\\share\\x", 0);
-    assert_eq!(target(&set), Ok("\\\\srv\\share\\x".to_owned()));
+    assert_eq!(target_at(&set), Ok("\\\\srv\\share\\x".to_owned()));
     let shown = reparse_data("\\\\srv\\share\\x").unwrap();
     assert_eq!(
       read_back(&shown),
@@ -302,21 +339,46 @@ mod tests {
     );
   }
 
+  /// A-275's separator rule. Do: read on Windows a relative link Linux made, and a POSIX-absolute one. Expect: the
+  /// relative one with `\` and the relative flag; the absolute one as given and absolute (flags 0), since it names a
+  /// path outside the volume.
   #[test]
-  fn a_link_made_on_linux_reads_on_windows_relative_to_the_drive() {
-    // `../lib` relative to the link's directory; `/usr/bin` relative to the drive's root (a device-relative name,
-    // which WinFsp's resolver splices in from the root).
+  fn a_link_made_on_linux_reads_on_windows_with_its_meaning() {
     assert_eq!(
-      read_back(&reparse_data("../lib").unwrap()),
-      ("..\\lib".into(), "..\\lib".into(), 1)
+      read_back(&reparse_data("../lib/x").unwrap()),
+      ("..\\lib\\x".into(), "..\\lib\\x".into(), 1)
     );
     assert_eq!(
       read_back(&reparse_data("/usr/bin").unwrap()),
-      ("\\usr\\bin".into(), "\\usr\\bin".into(), 1)
+      ("/usr/bin".into(), "/usr/bin".into(), 0)
+    );
+  }
+
+  /// A-275. Do: set links relative to the drive's root (`\x\y`) on links at the root, one and two directories down.
+  /// Expect: each stored as the path to `\x\y` from its own directory, so Linux and macOS reach the same object.
+  #[test]
+  fn a_link_relative_to_the_drives_root_is_kept_relative_to_its_directory() {
+    let rooted = windows_buffer("\\x\\y", "\\x\\y", 1);
+    assert_eq!(target(&rooted, "\\link"), Ok("x/y".to_owned()));
+    assert_eq!(target(&rooted, "\\a\\link"), Ok("../x/y".to_owned()));
+    assert_eq!(target(&rooted, "\\a\\b\\link"), Ok("../../x/y".to_owned()));
+    let root = windows_buffer("\\", "\\", 1);
+    assert_eq!(target(&root, "\\a\\link"), Ok("..".to_owned()));
+    assert_eq!(target(&root, "\\link"), Ok(".".to_owned()));
+  }
+
+  /// A-275's lossy case. Do: read on Windows a link Linux made to a name holding `\`. Expect: Windows takes the `\` for
+  /// a separator (two components), and a name that starts like a drive path reads as a Windows-absolute one.
+  #[test]
+  fn a_posix_name_holding_a_backslash_is_read_as_a_separator() {
+    assert_eq!(
+      read_back(&reparse_data("a\\b").unwrap()),
+      ("a\\b".into(), "a\\b".into(), 1)
     );
     assert_eq!(
-      target(&windows_buffer("\\usr\\bin", "\\usr\\bin", 1)),
-      Ok("/usr/bin".to_owned())
+      read_back(&reparse_data("C:\\x").unwrap()).2,
+      0,
+      "taken for a drive path"
     );
   }
 
@@ -329,7 +391,7 @@ mod tests {
       "\\??\\rel",
     ] {
       assert_eq!(
-        target(&windows_buffer(substitute, "p", 0)),
+        target_at(&windows_buffer(substitute, "p", 0)),
         Err(Refusal::Foreign),
         "{substitute}"
       );
@@ -341,38 +403,42 @@ mod tests {
   fn another_tag_is_answered_as_before_links_were_served() {
     let mut mount_point = windows_buffer("\\??\\C:\\x", "C:\\x", 0);
     mount_point[..4].copy_from_slice(&0xA000_0003u32.to_le_bytes());
-    assert_eq!(target(&mount_point), Err(Refusal::Tag));
+    assert_eq!(target_at(&mount_point), Err(Refusal::Tag));
     assert_eq!(Refusal::Tag.status(), Ntstatus(0xC000_0010));
   }
 
   #[test]
   fn a_malformed_buffer_is_refused_not_read_past() {
     let good = windows_buffer("a", "a", 1);
-    assert_eq!(target(&good[..3]), Err(Refusal::Malformed));
+    assert_eq!(target_at(&good[..3]), Err(Refusal::Malformed));
     assert_eq!(
-      target(&good[..good.len() - 1]),
+      target_at(&good[..good.len() - 1]),
       Err(Refusal::Malformed),
       "length disagrees"
     );
     let mut far = good.clone();
     far[8..10].copy_from_slice(&200u16.to_le_bytes());
     assert_eq!(
-      target(&far),
+      target_at(&far),
       Err(Refusal::Malformed),
       "a name past the buffer"
     );
     let mut odd = good.clone();
     odd[10..12].copy_from_slice(&1u16.to_le_bytes());
-    assert_eq!(target(&odd), Err(Refusal::Malformed), "half a UTF-16 unit");
     assert_eq!(
-      target(&windows_buffer("", "", 1)),
+      target_at(&odd),
+      Err(Refusal::Malformed),
+      "half a UTF-16 unit"
+    );
+    assert_eq!(
+      target_at(&windows_buffer("", "", 1)),
       Err(Refusal::Malformed),
       "no target"
     );
     let mut lone = windows_buffer("ab", "ab", 1);
     lone[20..22].copy_from_slice(&0xD800u16.to_le_bytes());
     assert_eq!(
-      target(&lone),
+      target_at(&lone),
       Err(Refusal::Malformed),
       "an unpaired surrogate"
     );

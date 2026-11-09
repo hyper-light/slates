@@ -3039,9 +3039,10 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> list with one of the stated differences (security descriptors, generic reparse data, named streams, a link's own data;
 > a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
-> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
+> 18 cases off, leaving 355; symbolic links in A-275, which lets 105 cases behind three script-level entries run, 78
+> passing and 30 listed case by case, leaving 382). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -14423,7 +14424,10 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
     (`ERROR_INVALID_FUNCTION`). **Amended by A-275 (2026-11-09):** a volume symlink is the Windows symbolic link, so
-    the reason stands for generic reparse data (REPARSE) and no longer for symbolic links.
+    the reason stands for generic reparse data (REPARSE) and no longer for symbolic links, with three differences a
+    POSIX link brings, each stated in A-275: a link holds no data stream of its own (SYMLINK-DATA); a link POSIX made is
+    a file link, whatever its target; and a link relative to the drive's root (`\x\y`) is kept relative to its own
+    directory, so moved, it reaches what that path names from its new directory, where NTFS keeps it naming `\x\y`.
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
 - **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
@@ -16203,62 +16207,108 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 
 ### A-275 — A volume symlink is a Windows symbolic link: the WinFsp drive serves reparse points (accepted 2026-11-09, the supervisor's pick)
 Applied in the same change to: A-209 (amended: REPARSE and SYMLINK), §4.5 (the inode's kept Windows bits), §4.6 (the
-Windows conformance status), GAPS, the winfstest list
-(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`), `crates/vfs`
-(`inode::WindowsAttributes::LINK_DIRECTORY`, `kept`, `from_image`), and `crates/bridge-winfsp` (`symlink.rs`; the
-reparse slots, `GetSecurityByName`'s walk and `file_info`'s tag in `host.rs`; the slots and exports in `ffi.rs`).
+Windows conformance status), §4.8 (image version 27, delta version 10), GAPS, `docs/wip/conformance.md`, the winfstest
+list (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 355 to 382 entries) and its record,
+`crates/vfs` (`inode::WindowsAttributes::LINK_DIRECTORY`, `kept`, `from_image`; `IMAGE_VERSION`, `DELTA_VERSION`),
+and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`'s walk and `file_info`'s tag in
+`host.rs`; the slots and exports in `ffi.rs`).
 - **What was missing.** The drive served no reparse point, so every `CreateSymbolicLinkW` answered
   `ERROR_INVALID_FUNCTION`, a link made on Linux showed on Windows as a reparse point Windows could not follow, and
-  winfstest's `t/reparse/02.t` and `03.t` stopped at their first case. git for Windows (`core.symlinks`) and npm make
-  links this way.
+  winfstest's `t/reparse/02.t`, `03.t` and `t/streams/04.t` stopped at their first link. Git for Windows
+  (`core.symlinks`) and npm make links this way.
 - **The rule.** A volume symlink is the Windows symbolic link; there is no second kind of link. The drive sets WinFsp's
-  `ReparsePoints` and leaves `ReparsePointsAccessCheck` off, as WinFsp's memfs does, so making a link needs no privilege
-  (R10). Windows follows a link through WinFsp's own resolver (`FspFileSystemResolveReparsePoints`, and
-  `FspFileSystemFindReparsePoint` when a path's walk fails), which asks the shard for each component's link without
+  `ReparsePoints` (bit 4 of `VolumeParams`, `fsctl.h` v2.1) and fills its four reparse slots. Windows follows a link
+  through WinFsp's own resolver (`FspFileSystemResolveReparsePoints`, and `FspFileSystemFindReparsePoint` when a path's
+  walk fails, as memfs's `GetSecurityByName` does), which asks the shard for each component's link by name without
   following it. `FSCTL_GET_REPARSE_POINT` is answered with an `IO_REPARSE_TAG_SYMLINK` buffer made from the volume's
   target. `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer, on the empty file or directory `CreateSymbolicLinkW`
   has just made, replaces it with a volume link at its name, keeping its attribute bits; `FSCTL_DELETE_REPARSE_POINT`
-  turns a link back into an empty file or directory.
-- **The stored form.** The volume keeps one target string per link, as every platform reads it.
-  - A relative link keeps its substitute name with `/` for `\`, so Linux and macOS follow it too. A device-relative one
-    (`\usr\bin`) is kept as `/usr/bin`, which is what a Linux link to `/usr/bin` shows on Windows.
-  - An absolute link keeps the Win32 path its `\??\` substitute names: `C:\x`, or `\\srv\share\x` for a UNC path.
-    A relative target never starts like that, since its separators are `/`, so the form says which kind it was.
-  - A directory link (`SYMBOLIC_LINK_FLAG_DIRECTORY`) keeps `FILE_ATTRIBUTE_DIRECTORY` in the inode's Windows bits,
-    kept on a symlink alone (`WindowsAttributes::LINK_DIRECTORY`). Windows reports it as `DIRECTORY | REPARSE_POINT`
-    (0x410) and removes it with `RemoveDirectory`; a file link reports `ARCHIVE | REPARSE_POINT` (0x420).
-- **Limits, each stated to Windows by its answer.**
-  - The print name is not kept. It is derived from the substitute as `CreateSymbolicLinkW` writes it, so a link set
-    with another print name reads back with the derived one.
-  - An absolute substitute with no Win32 path (`\??\Volume{…}\`, `\Device\…`) is refused
-    (`STATUS_IO_REPARSE_DATA_INVALID`).
-  - A file with bytes cannot become a link (`STATUS_DIRECTORY_NOT_EMPTY`): a POSIX link keeps no bytes, as an NTFS
-    directory with entries cannot become one.
-  - Every other reparse tag (junctions, app-specific tags) still answers `STATUS_INVALID_DEVICE_REQUEST`, as every
-    reparse request did before. Generic reparse data is a separate amendment, owed after named streams.
-  - The open that set the link keeps the object it opened, now unlinked, as a POSIX open of an unlinked file does.
-    WinFsp drops what Windows cached of the name after the set
-    (`FspFsvolFileSystemControlReparsePointComplete` invalidates the node's information), so the next open finds the
-    link.
+  turns a link back into an empty file or directory. Generic reparse data (every other tag) is its own change, owed
+  after named streams; it still answers `STATUS_INVALID_DEVICE_REQUEST`, as every reparse request did before.
+- **1. A link's type.** A Windows link is typed: a directory link carries `FILE_ATTRIBUTE_DIRECTORY` and is removed by
+  `RemoveDirectory`, a file link by `DeleteFile`. A volume symlink is untyped.
+  - A link Windows made keeps the type it was created with: the empty object `CreateSymbolicLinkW` made is a directory
+    for `SYMBOLIC_LINK_FLAG_DIRECTORY`, and the link that replaces it keeps `FILE_ATTRIBUTE_DIRECTORY` in A-262's
+    `Inode::windows`, whose kept set admits that bit for a symlink alone (`WindowsAttributes::LINK_DIRECTORY`). It
+    reports `DIRECTORY | REPARSE_POINT` (0x410), a file link `ARCHIVE | REPARSE_POINT` (0x420), as `t/reparse/03.t` and
+    `02.t` expect.
+  - A link POSIX made has no type and is presented as a file link, whatever its target is, and stays one when its target
+    changes type. This is how Samba presents a link opened as itself (`fdos_mode` reports `FILE_ATTRIBUTE_REPARSE_POINT`
+    for `S_IFLNK`, never `DIRECTORY`; samba master 9ae24f2f, `source3/smbd/dosmode.c` 729-746). WSL types a link by its
+    target only when it makes the NT link itself, and only for a target that exists (release notes, build 17046;
+    microsoft/WSL 2183822c, `test/windows/wsl/DrvFsTests.cpp` 160-191); Git for Windows makes a typeless link a file link
+    and recreates it as a directory link once its target exists as one (`compat/mingw.c`, `create_phantom_symlink`,
+    `process_phantom_symlink`), which on this drive sets the bit as any directory link does. The type decides only how
+    the link is removed and listed: WinFsp follows a file link into a directory, "contrary to NTFS" (its traverse check
+    in `src/dll/security.c`, and its resolver, which reads no link's type), so nothing a POSIX link names fails to
+    resolve on the drive. Deriving the type from the target at each lookup was rejected: it costs a resolution per link
+    in every listing, and Windows keeps a name's information until told (`FileInfoTimeout` infinite), so a target's
+    change of type would leave the link's reported type stale with no notification to correct it. Promoting a link the
+    drive finds pointing at a directory, as Git for Windows promotes its own, was rejected too: the drive would write the
+    volume on a lookup, which a read-only attachment refuses and which a publication would then carry; Git for Windows
+    promotes by recreating the link with `SYMBOLIC_LINK_FLAG_DIRECTORY`, which the drive keeps. When a target later
+    changes type, no link's type follows it: a POSIX link stays a file link, and a Windows link keeps the type it was made
+    with, as on NTFS.
+- **2. Separators (R8: one volume, one meaning).** A relative target is stored with `/` and presented to Windows with
+  `\`, as Git for Windows writes a link (`mingw_create_symlink`) and reads one (`normalize_ntpath`), and as WSL's DrvFs
+  does both ways (`drvfs.c` 3524-3570). A Windows link relative to the drive's root (`\x\y`) is stored as the path to the
+  same object from the link's own directory (`../../x/y` for a link at `\a\b\link`), which resolves to that object on
+  every platform; Windows reads it back in that form. This is a stated difference: POSIX has no form relative to a
+  volume's root, so a moved link of this form reaches what its path names from its new directory, where NTFS keeps it
+  naming `\x\y` (`a_link_relative_to_the_drives_root_follows_its_directory_when_moved`: moved one directory deeper, the
+  link reaches `\a\x\y`). `CreateSymbolicLinkW` never makes this form (it makes a rooted target absolute); only a
+  program that writes the reparse buffer itself does. Every other target is presented as given and resolves only where
+  it means something: a POSIX-absolute one (`/usr/bin`) is shown to Windows unchanged with flags 0 and resolves to
+  nothing on the drive; a Windows-absolute one keeps the Win32 path of its `\??\` substitute (`C:\x`, or `\\srv\share\x`
+  for `\??\UNC\srv\share\x`), which Linux and macOS read unchanged and do not resolve. Any other absolute NT form
+  (`\??\Volume{…}\`, `\Device\…`) has no Win32 path and is refused `STATUS_IO_REPARSE_DATA_INVALID`. The lossy case: a
+  POSIX name holding `\`, which Windows takes for a separator, so `a\b` reads on Windows as two components and `C:\x` as
+  a drive path; neither reaches what Linux meant, and Windows cannot name such a file in any case. Samba sends a
+  relative target's `/` unchanged (`read_symlink_reparse`, `source3/smbd/files.c` 859-922); slates converts, since its
+  drive is followed by WinFsp's resolver, which splits at `\` alone.
+- **3. Privilege: NTFS's rule.** Making a link asks for `SeCreateSymbolicLinkPrivilege`, unless Developer Mode's
+  unprivileged create applies (`CreateSymbolicLinkW` with `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Git for
+  Windows passes, `adjust_symlink_flags`; Microsoft Learn, CreateSymbolicLinkW). The user-mode drive never sees the
+  caller's token on an `FSCTL_SET_REPARSE_POINT`; WinFsp's driver does, and checks the privilege when the volume sets
+  `ReparsePointsAccessCheck` (`SeSinglePrivilegeCheck`, `src/sys/fsctl.c` 231-240, v2.1), refusing
+  `STATUS_PRIVILEGE_NOT_HELD` (`ERROR_PRIVILEGE_NOT_HELD`), NTFS's answer. The drive sets it (memfs, airfs and WinFsp's
+  FUSE layer leave it off, which would make the drive looser than NTFS). Measured on the runner
+  (`a_link_is_refused_to_a_caller_without_the_symlink_privilege`, `a_link_is_made_by_a_caller_holding_the_symlink_privilege`,
+  `a_link_is_made_without_the_privilege_under_developer_mode`): PENDING-PRIVILEGE. The daemon holds no privilege (R10).
+- **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
+  its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
+  relative link (prefixed with the volume's name) and an absolute one alike (`src/sys/create.c` 893-996, v2.1), so the
+  I/O manager reopens the new name under the caller's token and is never handed an `IO_REPARSE_TAG_SYMLINK` to evaluate.
+  The drive is a local disk file system (`FILE_DEVICE_DISK_FILE_SYSTEM` without `FILE_REMOTE_DEVICE`,
+  `src/sys/volume.c`). Measured on the runner: PENDING-EVALUATION.
+- **The stored form's cost, and the format bump.** The directory bit lives in the inode's existing `u16`: no inode,
+  wire, archive or layout change. But an earlier reader would drop the bit without a word and show a directory link as
+  a file link, so the image (version 27) and the delta (version 10) are bumped, and a reader of another version refuses
+  them typed rather than read them as its own (the version-refusal tests in `crates/vfs/tests/checkpoint_log.rs`). FUSE,
+  NFS and FSKit read and make links as before and never see the bit.
 - **Crash behaviour.** A set or delete is one shard request that removes the object and makes its replacement, then
-  publishes once (§4.8, D-18). No publication shows the name missing or holding both, so a crash leaves the old object
-  or the link, never neither. A link's target and its directory bit are made by two volume operations within that one
-  request, so they too are published together.
-- **What it costs other platforms.** Nothing on the wire or in the archive. The directory bit lives in the inode's
-  existing `u16` (no inode, image or delta layout change). An older image carries no directory bit on any link and reads
-  as before; an older binary reading a newer image drops the bit, and the link reads as a file link. FUSE, NFS and FSKit
-  read and make links as before; they never see the bit. A link made on Linux or macOS has no directory bit and is a
-  file link on Windows, which Windows still follows into a directory (WinFsp's resolver does not check a link's kind).
-  An absolute Windows target reads on Linux as a path such as `C:\x`, which does not resolve there.
-- **Proven** by `symbolic_links_made_through_the_drive_are_followed_and_read_back`
-  (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows runner: a relative file link, an absolute file link, a
-  relative directory link and a link made before its target, read through, read back and removed; red on main, every
-  `CreateSymbolicLinkW` answering `ERROR_INVALID_FUNCTION`), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
+  publishes once (§4.8, D-18): no publication shows the name missing or holding both, so a crash leaves the old object or
+  the link, never neither.
+- **Limits, each answered by its status.** The print name is derived, not kept. A file with bytes cannot become a link
+  (`STATUS_DIRECTORY_NOT_EMPTY`). A link holds no bytes of its own: a write or read through a handle opened on the link
+  itself is refused (`ERROR_INVALID_PARAMETER`; NTFS and memfs keep a data stream beside a reparse point;
+  `t/reparse/02.t` cases 15 and 16, listed SYMLINK-DATA). The open that set the link keeps the object it opened, now
+  unlinked, as a POSIX open of an unlinked file does; WinFsp drops what Windows cached of the name after the set
+  (`FspFsvolFileSystemControlReparsePointComplete` invalidates the node's information), so the next open finds the link.
+- **What winfstest says** (diagnostics run 42695804063, windows-latest, 733 cases): the links let 105 cases run that
+  never ran. With the 3 listed cases they unlocked (02.t:1, 03.t:1, streams/04.t:9), 78 pass and 30 are listed, none a
+  defect: 02.t 39 of 41 (15 and 16, SYMLINK-DATA), 03.t 26 of 26, streams/04.t 13 of its cases 9 to 49 (28 listed
+  STREAMS, each through a `name:stream` path). The list goes from 355 to 382, recorded from PENDING-RECORD.
+- **Proven** by `symbolic_links_made_through_the_drive_are_followed_and_read_back` and
+  the three privilege tests and `a_link_relative_to_the_drives_root_follows_its_directory_when_moved`
+  (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows
+  runner; the first red on main, `ERROR_INVALID_FUNCTION` at the first `CreateSymbolicLinkW`, and red with the four
+  reparse callbacks removed: PENDING-RED), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
   (`crates/bridge-core/tests/volume_bridge.rs`; on main the reply read 2 where 18 was set),
   `windows_attributes_survive_an_image_and_a_rebuild` (`crates/vfs/tests/recover.rs`; with the old image mask the
-  rebuilt volume read 2, not 18), the buffer's eight tests in `crates/bridge-winfsp/src/symlink.rs` (its layout built
-  field by field from MS-FSCC 2.1.2.4, hostile buffers refused), and winfstest's `t/reparse/02.t` and `03.t` run whole
-  against the shortened list.
+  rebuilt volume read 2, not 18), the version-refusal tests, the buffer's ten tests in `crates/bridge-winfsp/src/symlink.rs`
+  (its layout built field by field from MS-FSCC 2.1.2.4; hostile buffers refused; the separator rule and its lossy case),
+  and winfstest judged against the 382-entry list.
 
 ### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record

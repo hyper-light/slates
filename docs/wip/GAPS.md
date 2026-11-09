@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Windows symbolic links through the WinFsp drive: built (2026-11-09, §4.6; A-275).** Every `CreateSymbolicLinkW` on
+> the drive answered `ERROR_INVALID_FUNCTION`, so git and npm could make no link there and a link made on Linux showed
+> as a reparse point Windows could not follow. Now a volume symlink is the Windows symbolic link: WinFsp's resolver
+> follows it, a relative target is stored with `/` and shown with `\`, a directory link keeps its type in the inode's
+> Windows bits (image 27, delta 10, an older reader refusing them), and making one asks for
+> `SeCreateSymbolicLinkPrivilege` as NTFS does, unless Developer Mode's unprivileged create applies. winfstest's
+> `t/reparse/02.t`, `03.t` and `t/streams/04.t` run to their ends: 78 cases newly pass, and three script-level entries
+> become 30 case-level ones, each with its reason (355 to 382 entries; finer grain, no case that passed before fails).
+> Stated differences: a link holds no data stream; a link POSIX made is a file link; a link relative to the drive's root
+> is kept relative to its directory, so moved, it reaches another object where NTFS keeps it on `\x\y`. **Still owed:**
+> generic reparse data (39 entries), its own amendment after named streams.
+
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken

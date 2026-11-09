@@ -79,9 +79,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
 /// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
-/// Format: the image layout version, bumped with any change to the types below or to the held replicas'
-/// image they carry.
-const IMAGE_VERSION: u16 = 24;
+/// 25 is A-251's and 26 raft-7's (A-270), in landing order. 27 (A-275, 2026-11-09) a symlink's Windows bits may hold
+/// `FILE_ATTRIBUTE_DIRECTORY` (a Windows directory link): the bytes are laid out as 24's, but a reader of an earlier
+/// version would drop the bit without a word and show a directory link as a file link, so it refuses this version.
+/// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
+/// replicas' image they carry.
+pub const IMAGE_VERSION: u16 = 27;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

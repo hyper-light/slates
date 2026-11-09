@@ -1772,7 +1772,7 @@ extern "C" fn set_reparse_point(
 ) -> Ntstatus {
   // SAFETY: our file system, the open's name and the request's `size` bytes, owned by WinFsp for this call.
   let (handler, path, data) = unsafe { reparse_request(fs, file_name, buffer, size) };
-  match crate::symlink::target(&data) {
+  match crate::symlink::target(&data, &path) {
     Ok(target) => changed(handler.call(Op::MakeLink {
       object: context_key(context),
       path,
@@ -2396,9 +2396,10 @@ impl Mounted {
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
       // A volume symlink is a Windows symbolic link (A-275): WinFsp asks the reparse slots and follows each link it
-      // meets while opening a path. Access checks on links are left off (`ReparsePointsAccessCheck`), as WinFsp's own
-      // memfs leaves them, so no privilege is needed to make one (R10).
+      // meets while opening a path. Making one asks for `SeCreateSymbolicLinkPrivilege`, as NTFS does: WinFsp's driver
+      // checks the caller's token (`ReparsePointsAccessCheck`); the daemon itself holds no privilege (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
+      | ffi::VOLUME_FLAG_REPARSE_POINTS_ACCESS_CHECK
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed

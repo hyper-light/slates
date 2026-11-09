@@ -38,7 +38,13 @@
 > cases give the same verdicts on x86_64 and arm64: 254 pass, 374 fail, every failure on
 > `expected-failures/native-windows-winfsp.winfstest.txt` with one of A-209's five stated differences. Since
 > A-259 (2026-11-08) the drive keeps a creation time, so `t/base/06.t` case 5 passes and 373 are listed; since A-262 it
-> keeps the attribute bits too, so the 18 ATTRIBUTES cases pass and 355 are listed, with three stated differences left. The suite found
+> keeps the attribute bits too, so the 18 ATTRIBUTES cases pass and 355 are listed, with three stated differences left.
+> Since A-275 (2026-11-09) a volume symlink is a Windows symbolic link, and the list goes from 355 entries to 382. That is
+> finer grain, not a regression: `t/reparse/02.t`, `03.t` and `t/streams/04.t` had stopped at their first link, so their
+> remaining 105 cases failed unrun behind three script-level entries (02.t:1, 03.t:1, streams/04.t:9). Those cases now
+> run to the end of their 733: 78 newly pass, the three entries come off, and 30 case-level entries take their place,
+> each with its reason (02.t:15-16, a link's own data stream, SYMLINK-DATA; 28 of streams/04.t's, each through a
+> `name:stream` path, STREAMS). No case that passed before fails now; the record is re-recorded from the run. The suite found
 > four Win32 bugs, each fixed with a failing test first (`docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`).
 > fsx wedges over the drive (an open bug, listed as `fsx-seed-1-unfinished:10000` in
 > `expected-failures/native-windows-winfsp.fsx.txt`); every fsx run now has a 300 s bound and is judged against its
@@ -552,9 +558,11 @@ still be established separately.
   behaviour (environmental). Linux adapter records and its first root review are now tracked.
 - A daemon transport for the FUSE bridge, so the Linux cells can be RAN, not LIMITED.
 - A Windows workload roster over the drive (the mount step exists since A-209); an ETW tracer.
-- The Windows features the drive does not keep (A-209's stated differences: security descriptors, reparse points and
-  symbolic links, named streams), each a reason on winfstest's list; a feature built later strikes its cases from the
-  list, as the settable creation time did (A-259, `t/base/06.t` case 5) and the attribute bits did (A-262, 18 cases).
+- The Windows features the drive does not keep (A-209's stated differences: security descriptors, generic reparse data,
+  named streams, and the three a POSIX link brings to symbolic links, A-275), each a reason on winfstest's list; a
+  feature built later strikes its cases from the list, as the settable creation time did (A-259, `t/base/06.t` case 5),
+  the attribute bits did (A-262, 18 cases) and symbolic links did (A-275, three script-level entries become 30 case-level
+  ones and 78 cases newly pass).
 - A live virtio-fs guest and the OCI attachment form; then their cells.
 - Pressure and failure suites (Phase 9).
 - Sibling findings for their owners: the volume root directory lists as `root wheel` through the
