@@ -8769,7 +8769,8 @@ const ENOTCONN: i32 = 107;
 /// volume it could not rebuild (`verbs::reconcile_lost` runs only for a rebuilt one), so the mount went uncounted and its
 /// attachment's record stayed. Do: an overlay over a host directory, FUSE-mounted; remove the directory and kill the
 /// daemon with its mount kept; wait for the successor. Expect the volume refused `NotRecovered`, the mount still in the
-/// kernel's table (A-102), a `stat` through it answering `ENOTCONN`, and one dead mount counted. Linux only.
+/// kernel's table (A-102), a `stat` through it answering `ENOTCONN`, one dead mount counted, and the successor's recovery
+/// reconciling out the mount's attachment record (its log: `and 1 attachments`), as a rebuilt volume's. Linux only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_counted() {
@@ -8777,7 +8778,12 @@ fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_cou
     return;
   }
   let instance = format!("cli-unrecoveredmount-{}", std::process::id());
-  let anchor = start_anchor(&instance);
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], ONE_SHARD);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
   let scratch = ScratchDir {
     path: build_output_dir("slates-unrecoveredmount"),
   };
@@ -8802,6 +8808,7 @@ fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_cou
   };
   fuse_mount_and_check(&instance, &id, &mount.path);
   shell(&format!("rmdir {base}"));
+  while lines.try_recv().is_ok() {}
   restart_keeping_mounts(&instance);
   let (code, _, err) = run(&instance, &["status", &id]);
   assert_ne!(
@@ -8809,6 +8816,23 @@ fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_cou
     "recovery could not rebuild the volume whose base is gone"
   );
   assert!(err.contains("NotRecovered"), "{err}");
+  // The anchor's stderr is forwarded by a thread, so the successor's recovery line may land a moment after it serves.
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut recovered: Vec<String> = Vec::new();
+  while recovered.is_empty() && Instant::now() < deadline {
+    recovered.extend(
+      lines
+        .try_iter()
+        .filter(|line| line.contains("reconciled out")),
+    );
+    pause();
+  }
+  assert!(
+    recovered
+      .iter()
+      .any(|line| line.contains(" and 1 attachments")),
+    "the successor's recovery ended the dead mount's attachment record: {recovered:?}"
+  );
   assert!(
     is_mounted(&mount.path),
     "A-102: the dead mount is left in place"
