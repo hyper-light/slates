@@ -5807,7 +5807,11 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let rounds = burst.join().unwrap();
   let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
     .into_iter()
-    .filter(|(name, _)| name.contains("judged_dead") || name.contains("given_up"))
+    .filter(|(name, _)| {
+      name.contains("judged_dead")
+        || name.contains("given_up")
+        || name.contains("replaced_answered")
+    })
     .collect();
   drop(owner);
   for daemon in daemons {
