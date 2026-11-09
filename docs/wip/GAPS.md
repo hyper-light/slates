@@ -6,7 +6,13 @@
 > kernel 7.3 a process spawn while the page is dirty does that: 6 attempts of 6 with a spawn in the window. That
 > write-back is fresh and rightly applied, so the run tested nothing. The daemon now counts `fuse.writebacks_applied`.
 > The test reads it around each store and retries an attempt whose precondition did not hold, up to 6, then fails
-> naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
+> naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed.
+> In the whole suite every attempt still missed, since sibling tests' spawns write the page back; so the scenario now
+> runs in its own re-invoked process. Whole suite, adacachy2, load 23-34: with the scenario in the suite's process,
+> 20 of 27 attempts missed; in its own, 13 of 13 runs passed and 10 of 10 echoed attempts held at once. Open:
+> `unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point` failed its non-vacuity assertion once in 20
+> such runs, likely the same cause; `a_start_whose_shards_sum_past_a_window_comes_up` hung 65 minutes once in the suite
+> (it passes alone in 3 s). Record:
 > `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a

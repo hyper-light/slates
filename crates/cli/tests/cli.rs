@@ -8128,19 +8128,75 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
 /// after the other path's write: an applied write-back between them can only have come first, since after the write
 /// every byte of a page fetched before it is stale. An attempt whose precondition did not hold says so and starts
 /// again with a fresh fixture, up to [`DIRTY_PAGE_ATTEMPTS`]; it never passes or fails on the rule.
+///
+/// **In a process of its own.** Every attempt missed when the whole suite ran (B11's Linux gate, adacachy2, load 38-77):
+/// sibling tests spawn `slates` processes constantly, and each spawn in the window writes the page back. So the test
+/// re-invokes its own binary for this one test, as [`DIRTY_PAGE_ROLE`] says, and the scenario runs there with nothing
+/// else in the process; the parent requires the child's exit 0 and its tagged verdict ([`DIRTY_PAGE_TAG`]), and echoes
+/// the child's tagged lines (each missed attempt, then the verdict).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
+  if std::env::var_os(DIRTY_PAGE_ROLE).is_some() {
+    dirty_page_scenario();
+    return;
+  }
   if !live_mount_runs() {
     return;
   }
+  let child = Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      "a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path",
+      "--nocapture",
+      "--test-threads=1",
+    ])
+    .env(DIRTY_PAGE_ROLE, "child")
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&child.stdout);
+  let stderr = String::from_utf8_lossy(&child.stderr);
+  for line in stdout.lines().chain(stderr.lines()) {
+    if line.contains(DIRTY_PAGE_TAG) {
+      println!("{line}");
+    }
+  }
+  assert!(
+    child.status.success(),
+    "the scenario's own process failed ({}):\n{stdout}\n{stderr}",
+    child.status
+  );
+  assert!(
+    stdout
+      .lines()
+      .any(|line| line.contains(&format!("{DIRTY_PAGE_TAG}held"))),
+    "the scenario's own process tested the rule (its tagged verdict):\n{stdout}\n{stderr}"
+  );
+}
+
+/// Format: the environment variable that makes this test binary, re-invoked for the one dirty-page test, run its
+/// scenario ([`dirty_page_scenario`]) rather than re-invoke itself again.
+#[cfg(target_os = "linux")]
+const DIRTY_PAGE_ROLE: &str = "SLATES_CLI_TEST_DIRTY_PAGE_ROLE";
+/// Format: the tag before the child's verdict, looked for anywhere in a line: libtest prints `test <name> ... ` without
+/// ending the line, so the child's first line comes glued to it.
+#[cfg(target_os = "linux")]
+const DIRTY_PAGE_TAG: &str = "dirty-page-child: ";
+
+/// The dirty-page scenario, run in the test binary's own re-invoked process: attempts until one holds its precondition
+/// and passes the rule's assertions, or [`DIRTY_PAGE_ATTEMPTS`] have missed it.
+#[cfg(target_os = "linux")]
+fn dirty_page_scenario() {
   let mut missed = Vec::new();
   for attempt in 1..=DIRTY_PAGE_ATTEMPTS {
     match dirty_page_attempt(attempt) {
-      DirtyPageAttempt::Held => return,
+      DirtyPageAttempt::Held => {
+        println!("{DIRTY_PAGE_TAG}held at attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}");
+        return;
+      }
       DirtyPageAttempt::Missed(miss) => {
         eprintln!(
-          "attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}: precondition not held, retrying: {miss}"
+          "{DIRTY_PAGE_TAG}attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}: precondition not held, retrying: {miss}"
         );
         missed.push(miss);
       }
@@ -8154,7 +8210,8 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
 
 /// Derived: attempts at [`a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`]'s precondition.
 /// The run on main held it 10 of 10 at load 66-68 (adacachy2, 2026-11-09), a miss rate under 30% at 95% confidence (3
-/// / 10, the rule of three); at 30% six attempts all miss with 0.3^6 = 0.0007, under one in a thousand.
+/// / 10, the rule of three); at 30% six attempts all miss with 0.3^6 = 0.0007, under one in a thousand. Those runs had the
+/// process to themselves, one test thread, as the re-invoked child has.
 #[cfg(target_os = "linux")]
 const DIRTY_PAGE_ATTEMPTS: u32 = 6;
 

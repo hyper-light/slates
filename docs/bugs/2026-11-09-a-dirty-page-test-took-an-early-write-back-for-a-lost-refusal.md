@@ -39,3 +39,37 @@ traced in a gate. The test as on main passed 10 of 10 alone at load 66-68.
 - before, the test as on main: 10 of 10 passed; instrumented with spawns in the window: 10 of 10 failed as in B10;
 - after: 10 of 10 passed twice (load 66-68, then 77), no attempt missed;
 - red check (a spawn in the window): 6 of 6 attempts reported the precondition not held, then the precondition failure.
+
+## Second fix: the scenario runs in a process of its own (2026-11-09)
+
+**What the first fix left.** In the whole CLI suite (B11's Linux gate, adacachy2, load 38-77) every attempt missed
+and the test failed naming the precondition: sibling tests spawn `slates` processes all the time, and each spawn that
+lands between a store and the other path's write writes the page back. More attempts cannot fix that; the spawns
+are the process's, so the scenario needs a process without them.
+
+**The edit.** `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` re-invokes its own test binary
+for itself alone (`--exact`, one test thread) with `SLATES_CLI_TEST_DIRTY_PAGE_ROLE` set, the cross-process fixture
+pattern of `crates/anchor/tests/anchor.rs`. In that child the attempts run as before, each proving its precondition by
+`fuse.writebacks_applied`. Each line the parent reads carries the tag `dirty-page-child: `, looked for anywhere in a
+line, since libtest's `test <name> ... ` comes glued to the first. The parent requires the child's exit 0 and its
+`held` line, and echoes its tagged lines.
+
+**Runs (adacachy2, kernel 7.3.3-cachyos, `SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli`, the whole suite,
+own target dir):**
+- red check, the scenario back in the suite's process (the role variable set on the parent), 7 runs with
+  `--nocapture` at load 23-34: 20 of 27 attempts missed, each "the whole-file phase: 1 write-back(s) of the store's
+  page applied before the replacement", and the scenario held only at attempts 4, 4, 4, 4, 2, 4 and 5 (one more run
+  without `--nocapture`, at load 41, passed with its misses unrecorded);
+- after, the scenario in its child: 13 of 13 runs passed at load 28-34, and in the 10 that echo the child's lines
+  every run held at attempt 1, so 0 attempts of 10 missed.
+
+All these runs skipped `a_start_whose_shards_sum_past_a_window_comes_up`. In the first whole-suite run its anchor
+restarted the daemon (`--shards 308`) for 65 minutes without coming up, and another agent's run of the same binary
+on the same box hung in the same test. Alone, it passed in 3 s. It has no deadline of its own; reported, not fixed
+here.
+
+**A sibling with the same cause.** In one of the 20 whole-suite runs,
+`unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point` failed its non-vacuity assertion ("another
+path wrote into a page holding unsynced stores", `crates/cli/tests/cli.rs`): it runs in the suite's process, so a
+sibling's spawn can write its dirty pages back before the other path's write. Reported, not fixed here.
+
