@@ -4,3 +4,5 @@ server exit 0
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.93s
 test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.65s
+fleet exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 7.59s
