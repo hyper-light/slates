@@ -12,21 +12,29 @@ committed newer one. Step (c) closed the same hole for a copy the holder could n
 (`2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`).
 
 **Impact.** A takeover could lose a committed record (NoLoss). `crates/db/tests/takeover_model.rs` shows the rule doing so:
-over 2,000 generated histories, 166 committed records lost with holders leaving copies out of complete pages, none
+over 2,000 generated histories, 216 committed records lost with holders leaving copies out of complete pages, none
 without.
+
+**The same hole in the successor's own copy.** It learns its own copies through its routing (`promise_local_copies`), and
+counted its open lease gate as its promise. A successor whose routing lost its own newer copy could then adopt a member's
+older record: with the nemesis leaving out the successor's own copies too, that rule lost 86 committed records over the
+same histories. Found while designing step (d)'s process test.
 
 **Edits (A-251 (b)).**
 - `crates/db/src/takeover.rs`: `CountingRule::NamedAnswer`, and `answer_by_name`, the holder's answer from its own records.
 - `crates/db/src/register.rs`: `HostPrepare::named` and `HostPromise::nothing`, appended to the wire.
 - `crates/server/src/takeover.rs`: the successor asks each member whose pages are complete about what it did not list
   (`begin_round`, `unanswered_by_name`), folds the answers (`fold_answers`), and counts under the named rule
-  (`ready_objects`). A holder answers through `answer_named`.
+  (`ready_objects`). A holder answers through `answer_named`. The successor answers itself by name, from its own records,
+  while its lease gate is open (`answer_own_copies_by_name`); the named rule no longer counts its gate alone.
 
 **Tests.**
 - `a_complete_page_promises_nothing_of_an_object_it_did_not_list` (a real shard): after a complete, empty page the object
   is not ready and the next round asks about it by name; after the answer it is ready.
 - `a_holder_answers_by_name_for_a_copy_its_page_leaves_out` (a real shard, the copy's lineage forgotten): the page lists
   nothing and is complete; the answer by name reports the record.
+- `a_successor_whose_routing_lost_its_own_copy_still_adopts_it` (a real shard): the successor's own newer copy, its
+  lineage forgotten, is adopted over a member's older record. Red with the successor not answering itself.
 - `a_holder_answers_each_named_object_from_its_own_records` and `a_named_answer_keeps_to_its_budget_and_reports_a_higher_fence`
   in `crates/db/src/takeover.rs`.
 - `a_named_question_and_its_answer_round_trip_and_a_page_keeps_its_bytes` and `a_hostile_named_list_is_refused`.

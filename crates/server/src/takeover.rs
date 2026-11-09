@@ -867,6 +867,9 @@ pub(crate) fn ready_objects(
 ) -> Vec<(ObjectId, Accepted)> {
   let regional = state.council.configuration().clone();
   let local_promises = gate_open(state, departed);
+  if local_promises {
+    answer_own_copies_by_name(state, departed, local, &regional);
+  }
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -916,6 +919,61 @@ pub(crate) fn ready_objects(
     }
   }
   ready
+}
+
+/// The successor answers itself by name (A-251 (b)), as it asks any member: for each learned object it has neither
+/// reported nor named, a direct look-up of its own records ([`answer_by_name`]). Its own copies are learned through its
+/// routing (`promise_local_copies`), which can lose one as any holder's can, so its silence is no promise. Run only
+/// while its lease gate is open, as every promise of its own is.
+fn answer_own_copies_by_name(
+  state: &mut ShardState,
+  departed: HostId,
+  local: HostId,
+  regional: &RegionalConfiguration,
+) {
+  let Some(take) = state.host_takeovers.get(&departed) else {
+    return;
+  };
+  let named: Vec<ObjectId> = take
+    .learned
+    .iter()
+    .filter(|(object, reports)| {
+      !reports.contains_key(&local)
+        && !take
+          .named_nothing
+          .get(*object)
+          .is_some_and(|hosts| hosts.contains(&local))
+    })
+    .map(|(object, _)| *object)
+    .collect();
+  if named.is_empty() {
+    return;
+  }
+  let prepare = HostPrepare {
+    departed,
+    owner: local,
+    epoch: take.epoch,
+    generation: take.generation,
+    after: None,
+    named,
+  };
+  let answer = answer_by_name(
+    local,
+    &prepare,
+    regional,
+    &mut state.holder_records,
+    usize::MAX,
+  );
+  if answer.refused > 0 {
+    state.count(TAKEOVER_NAMED_REFUSED, u64::from(answer.refused));
+  }
+  if answer.promise.unpromised > 0 {
+    state.count(
+      TAKEOVER_PAGE_UNPROMISED,
+      u64::from(answer.promise.unpromised),
+    );
+  }
+  fold_answers(state, departed, vec![(local, answer.promise, true)]);
 }
 
 /// The newer of two reported records by phase one's order (sequence, then epoch), with tied sealed heads merged: two

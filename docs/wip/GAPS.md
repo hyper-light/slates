@@ -5661,7 +5661,7 @@ complete answer as a promise for every object not listed, so an omitted copy rea
 be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostPromise::unpromised`, record
 `docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`). **Step (a), built:** the counting rule is
 `slates_db::takeover::readiness`, and `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover with an omission
-nemesis. Over 2,000 histories today's rule lost 166 committed records with the nemesis on and none with it off; A-251's
+nemesis. Over 2,000 histories today's rule lost 216 committed records with the nemesis on and none with it off; A-251's
 by-name rule lost none. **Step (b), built:** a successor asks by name for what a member's complete pages did not list,
 a holder answers from its own records with no routing filter, and the successor counts under
 `CountingRule::NamedAnswer`. Still owed: (d) the process test. **Not covered by (b):** an object that every holder of it leaves out of its pages, and the

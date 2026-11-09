@@ -6370,6 +6370,15 @@ mod tests {
     state: &mut crate::state::ShardState,
     object: slates_db::register::ObjectId,
   ) -> (slates_db::HostId, slates_db::HostId) {
+    retire_the_owner_of_a_held_record(state, object, 0)
+  }
+
+  /// [`retire_the_owner_of_a_held_object`], the held record at ledger position `sequence`.
+  fn retire_the_owner_of_a_held_record(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+  ) -> (slates_db::HostId, slates_db::HostId) {
     use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
     use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
     let local = state.fleet.host();
@@ -6397,7 +6406,7 @@ mod tests {
       .accept(&Record {
         owner: departed,
         object,
-        sequence: 0,
+        sequence,
         epoch: FIRST_EPOCH,
         generation,
         value: b"head".to_vec(),
@@ -6604,6 +6613,73 @@ mod tests {
       named.nothing,
       vec![absent],
       "and what it does not hold is said to be held nothing of"
+    );
+  }
+
+  /// A-251 (b), the successor's own copy: its routing can lose a copy it holds as any holder's can, so it answers
+  /// itself by name rather than counting its open gate. Do: at f = 1, this node the successor of an object it holds at
+  /// position 1; forget the copy's lineage here, so its own learning misses it; fold the third member's page listing an
+  /// older record (position 0). Expect: the object is adopted with this node's newer record, which it reported by name.
+  #[test]
+  fn a_successor_whose_routing_lost_its_own_copy_still_adopts_it() {
+    use slates_db::register::{Accepted, HostEpoch, HostPromise, ObjectId};
+    let ready = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let (departed, object) = (0..=u8::MAX)
+        .find_map(|seed| {
+          let object = ObjectId([seed; 16]);
+          let departed = slates_db::HostId(local.0 ^ 1);
+          let third = slates_db::HostId(local.0 ^ 2);
+          let mut probe = slates_db::register::RegionalConfiguration::formed(
+            vec![local, departed, third],
+            slates_db::register::Quorum { f: 1 },
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          );
+          probe.take_over(departed, 3);
+          (probe.successor(departed, object) == Some(local)).then_some((departed, object))
+        })
+        .unwrap();
+      let third = slates_db::HostId(local.0 ^ 2);
+      let (retired, successor) = retire_the_owner_of_a_held_record(state, object, 1);
+      assert_eq!((retired, successor), (departed, local));
+      state.departed_owners.remove(&object);
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let requests = crate::takeover::begin_round(state, departed, local).unwrap();
+      let (_, page_request) = requests
+        .iter()
+        .find(|(host, _)| *host == third)
+        .unwrap()
+        .clone();
+      let older = HostPromise {
+        holder: third,
+        departed,
+        epoch: page_request.epoch,
+        generation: page_request.generation,
+        entries: vec![(
+          object,
+          Accepted {
+            sequence: 0,
+            epoch: HostEpoch(1),
+            value: b"older".to_vec(),
+          },
+        )],
+        next: None,
+        fenced: None,
+        unpromised: 0,
+        nothing: Vec::new(),
+      };
+      crate::takeover::fold_answers(state, departed, vec![(third, older, false)]);
+      crate::takeover::ready_objects(state, departed, local)
+    });
+    assert_eq!(ready.len(), 1, "{ready:?}");
+    assert_eq!(
+      ready[0].1.sequence, 1,
+      "this node's newer copy, not the third member's older one: {ready:?}"
     );
   }
 

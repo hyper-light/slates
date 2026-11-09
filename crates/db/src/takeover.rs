@@ -42,7 +42,9 @@ pub struct Heard<'a> {
   /// The members that answered for the object by name, holding nothing of it.
   pub named_nothing: &'a BTreeSet<HostId>,
   /// The successor itself when it may promise its own copies (its lease gate open, §4.8 "Leases and reads"); `None`
-  /// while it may not, when its own answer counts for nothing.
+  /// while it may not. Counted as a promise of its own only under [`CountingRule::CompleteAnswer`]: under
+  /// [`CountingRule::NamedAnswer`] the successor promises as any member does, by its report or its named "nothing",
+  /// which it gives itself only while its gate is open.
   pub local: Option<HostId>,
 }
 
@@ -68,11 +70,13 @@ pub enum Readiness {
 impl Heard<'_> {
   /// Whether `host` has promised the object under `rule`.
   fn promised(&self, host: HostId, rule: CountingRule) -> bool {
-    if self.local == Some(host) || self.reports.contains_key(&host) {
+    if self.reports.contains_key(&host) {
       return true;
     }
     match rule {
-      CountingRule::CompleteAnswer => self.complete.contains(&host),
+      CountingRule::CompleteAnswer => self.local == Some(host) || self.complete.contains(&host),
+      // The successor too: its own copies are learned through its routing, which can lose one as any holder's can, so
+      // its silence is no promise; it answers itself by name (`named_nothing`) as it asks any member.
       CountingRule::NamedAnswer => self.named_nothing.contains(&host),
     }
   }
@@ -537,8 +541,11 @@ mod tests {
     assert!(answer.promise.entries.is_empty() && answer.promise.nothing.is_empty());
   }
 
-  /// The successor's own promise counts only while its lease gate is open. Do: a cohort of the retired host, the
-  /// successor and one other that listed the object. Expect: ready with the successor's promise, waiting without it.
+  /// The successor's own promise: under today's rule its open gate alone counts; under A-251's it counts only by its own
+  /// report or its named "nothing", since its routing can lose a copy it holds. Do: a cohort of the retired host, the
+  /// successor and one other that listed the object; the successor's gate open, then shut; then the successor named.
+  /// Expect: today's rule ready with the gate open and waiting with it shut; A-251's waiting until the successor names
+  /// the object, then ready.
   #[test]
   fn the_successors_own_promise_counts_only_with_its_gate_open() {
     let (departed, local, a) = (HostId(9), HostId(1), HostId(2));
@@ -563,7 +570,7 @@ mod tests {
         is_member,
         quorum,
         &open,
-        CountingRule::NamedAnswer
+        CountingRule::CompleteAnswer
       ),
       Readiness::Ready
     );
@@ -573,9 +580,35 @@ mod tests {
         is_member,
         quorum,
         &shut,
-        CountingRule::NamedAnswer
+        CountingRule::CompleteAnswer
       ),
       Readiness::Waiting
+    );
+    assert_eq!(
+      readiness(
+        &cohorts,
+        is_member,
+        quorum,
+        &open,
+        CountingRule::NamedAnswer
+      ),
+      Readiness::Waiting,
+      "an open gate is no answer under A-251's rule"
+    );
+    let named = BTreeSet::from([local]);
+    let answered = Heard {
+      named_nothing: &named,
+      ..open
+    };
+    assert_eq!(
+      readiness(
+        &cohorts,
+        is_member,
+        quorum,
+        &answered,
+        CountingRule::NamedAnswer
+      ),
+      Readiness::Ready
     );
   }
 }

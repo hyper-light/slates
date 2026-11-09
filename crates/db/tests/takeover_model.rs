@@ -11,14 +11,15 @@
 //! each object the rule calls ready, with the newest record reported; an adoption is final.
 //!
 //! The nemesis leaves an object out of some holders' pages, as `takeover::list_page`'s routing filter did for a holder
-//! whose routing disagreed with the successor's, while the page still ends complete. It is held to A-251 (b)'s scope:
-//! every object a survivor holds is listed by at least one survivor, or learned by the successor itself. An object
-//! every holder leaves out is never learned, under either rule. That case is outside this model and is recorded in GAPS.
+//! whose routing disagreed with the successor's, while the page still ends complete. It leaves copies out of the
+//! successor's own learning too (`promise_local_copies` goes through its routing). It is held to A-251 (b)'s scope:
+//! every object a survivor holds is listed by at least one survivor, the successor among them. An object every holder
+//! leaves out is never learned, under either rule. That case is outside this model and is recorded in GAPS.
 //!
 //! The oracle is the design's NoLoss: an adopted record is at least as new as every committed record of its object.
 //! Under A-251's rule the successor also asks, by name, each survivor whose pages are complete for every object it
-//! learned and that survivor did not list. A survivor answers with its record, or that it holds nothing. Every object
-//! with a committed record must then end adopted.
+//! learned and that survivor did not list, and answers itself the same way while its gate is open. A survivor answers
+//! with its record, or that it holds nothing. Every object with a committed record must then end adopted.
 //!
 //! - `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`: the minimal history, red on today's rule.
 //! - `the_named_rule_holds_no_loss_on_every_history` (proptest): A-251's rule never loses a committed record and
@@ -189,20 +190,15 @@ fn history(seed: u64, omit: bool) -> History {
   let mut omitted: BTreeMap<HostId, BTreeSet<ObjectId>> = BTreeMap::new();
   if omit {
     for (object, state) in &objects {
-      let holders: Vec<HostId> = state
-        .held
-        .keys()
-        .copied()
-        .filter(|host| *host != SUCCESSOR)
-        .collect();
+      // The successor's own routing can lose a copy as any holder's can, so its own learning is left out too.
+      let holders: Vec<HostId> = state.held.keys().copied().collect();
       let mut left_out: Vec<HostId> = holders
         .iter()
         .copied()
         .filter(|_| draw.chance(1, 2))
         .collect();
-      // A-251 (b)'s scope: some survivor lists each object a survivor holds, unless the successor learns it itself.
-      let learned_locally = gate_open && state.held.contains_key(&SUCCESSOR);
-      if !learned_locally && !holders.is_empty() && left_out.len() == holders.len() {
+      // A-251 (b)'s scope: some survivor, the successor among them, lists each object a survivor holds.
+      if !holders.is_empty() && left_out.len() == holders.len() {
         left_out.pop();
       }
       for host in left_out {
@@ -260,6 +256,9 @@ fn run(history: &History, rule: CountingRule) -> Round {
       continue;
     };
     answer(history, &mut round, host, rule);
+    if gate_open {
+      answer_self(history, &mut round, rule);
+    }
     settle(history, &mut round, rule, gate_open);
   }
   // The lease gate opens once the retired owner's lease has lapsed, as it does in time; then every survivor answers in
@@ -271,16 +270,60 @@ fn run(history: &History, rule: CountingRule) -> Round {
   let rounds = asked.len() * (history.objects.len() + 2) * 2;
   for host in asked.iter().copied().cycle().take(rounds) {
     answer(history, &mut round, host, rule);
+    answer_self(history, &mut round, rule);
     settle(history, &mut round, rule, gate_open);
   }
   round
 }
 
-/// The successor learns its own copies once it may promise them.
+/// Under A-251's rule the successor answers itself by name, as it answers any member's question: for each learned
+/// object it did not learn from its own copies (its routing may have lost one), a direct look-up of what it holds.
+fn answer_self(history: &History, round: &mut Round, rule: CountingRule) {
+  if rule != CountingRule::NamedAnswer {
+    return;
+  }
+  let learned: Vec<ObjectId> = round.reports.keys().copied().collect();
+  for object in learned {
+    if round.adopted.contains_key(&object)
+      || round.reports[&object].contains_key(&SUCCESSOR)
+      || round
+        .named_nothing
+        .get(&object)
+        .is_some_and(|hosts| hosts.contains(&SUCCESSOR))
+    {
+      continue;
+    }
+    match history.objects[&object].held.get(&SUCCESSOR) {
+      Some(own) => {
+        round
+          .reports
+          .entry(object)
+          .or_default()
+          .insert(SUCCESSOR, own.clone());
+        round
+          .named_reports
+          .entry(object)
+          .or_default()
+          .insert(SUCCESSOR);
+      }
+      None => {
+        round
+          .named_nothing
+          .entry(object)
+          .or_default()
+          .insert(SUCCESSOR);
+      }
+    }
+  }
+}
+
+/// The successor learns its own copies once it may promise them, those its routing still has.
 fn open_gate(history: &History, round: &mut Round) {
+  let omitted = history.omitted.get(&SUCCESSOR);
   for (object, state) in &history.objects {
     if let Some(own) = state.held.get(&SUCCESSOR)
       && !round.adopted.contains_key(object)
+      && omitted.is_none_or(|left_out| !left_out.contains(object))
     {
       round
         .reports

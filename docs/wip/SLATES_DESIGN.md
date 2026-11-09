@@ -19596,12 +19596,12 @@ The change, in four steps:
   - one or two cohorts per object;
   - writes to one cohort (a later owner in the recovery chain) or to all of them (a joint write), each committed by
     `Quorum::committed_within` in every cohort it targets;
-  - the successor's own copies behind its lease gate;
+  - the successor's own copies behind its lease gate, learned through its routing as any holder's are;
   - pages answered in a generated order;
   - a nemesis that leaves objects out of holders' pages while the pages still end complete.
 
   Its oracle is NoLoss: an adopted record is at least as new as every committed one. Over 2,000 generated histories,
-  today's rule lost 0 records with the nemesis off and 166 with it on. A-251's rule (below) lost none, and 280 of its
+  today's rule lost 0 records with the nemesis off and 216 with it on. A-251's rule (below) lost none, and 400 of its
   adoptions came only from a holder's answer by name. Each of three mutants of the rule turns the model red:
   - the named rule also counting a complete page;
   - only an object's first cohort judged;
@@ -19613,6 +19613,11 @@ The change, in four steps:
   held" for that object alone. The rule is now `CountingRule::NamedAnswer`: a member promised an object when it listed
   it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise case (a
   survivor that never received an object) still completes: that survivor answers "nothing held" by name.
+  - **The successor answers itself by name too.** It learns its own copies through its routing (`promise_local_copies`),
+    which can lose one as any holder's can. So under the named rule its open lease gate is no promise on its own: while
+    the gate is open, it answers itself by name for each learned object it has not reported, from its own records
+    (`takeover::answer_own_copies_by_name`, at the start of `ready_objects`). With the nemesis also leaving out the
+    successor's own copies, a successor that counted its gate instead lost 86 committed records over the 2,000 histories.
   - **What stands in for routing.** A warm-restarted holder loses its routing and its `departed_owners`, so neither can
     decide. A holder answers only when the committed configuration names the asker the object's successor and the
     copy's acceptor serves an owner in the retired host's recovery chain, or the asker already. So a question never
