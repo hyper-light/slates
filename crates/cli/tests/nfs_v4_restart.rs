@@ -186,6 +186,7 @@ fn held_file_survives_restart(client: &mut slates_client::Client, root: &Path) {
   held.write_all(b"before;").unwrap();
   held.sync_all().unwrap();
   flock(&held, FlockOperation::NonBlockingLockExclusive).expect("the lock is granted");
+  let unlinked = open_and_unlink(root);
 
   let previous = client.daemon_status().unwrap().pid;
   let killed = Command::new("kill")
@@ -231,4 +232,59 @@ fn held_file_survives_restart(client: &mut slates_client::Client, root: &Path) {
   flock(&other, FlockOperation::Unlock).unwrap();
   drop((held, other));
   std::fs::remove_file(&path).unwrap();
+  unlinked_file_kept(root, unlinked);
+}
+
+/// The bytes the file unlinked while open holds across the restart.
+const UNLINKED_BYTES: &[u8] = b"unlinked while open, before the restart;";
+
+/// Opens a new file, writes [`UNLINKED_BYTES`] to it and unlinks it while the descriptor stays open (A-260): its
+/// client sends the REMOVE, since the server's OPEN promised to keep the file (`OPEN4_RESULT_PRESERVE_UNLINKED`).
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn open_and_unlink(root: &Path) -> std::fs::File {
+  let path = root.join("unlinked");
+  let mut file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create_new(true)
+    .open(&path)
+    .unwrap();
+  file.write_all(UNLINKED_BYTES).unwrap();
+  file.sync_all().unwrap();
+  std::fs::remove_file(&path).unwrap();
+  file
+}
+
+/// A-260 across the restart: the file unlinked while open still reads its bytes through its descriptor at a link
+/// count of zero (the successor took its open's hold again from the journal before reclaiming unheld files), and no
+/// silly rename's `.nfs*` name is in the directory, then or after the close.
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn unlinked_file_kept(root: &Path, mut file: std::fs::File) {
+  use std::os::unix::fs::MetadataExt;
+  let silly = |root: &Path| -> Vec<String> {
+    std::fs::read_dir(root)
+      .unwrap()
+      .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+      .filter(|name| name.starts_with(".nfs"))
+      .collect()
+  };
+  assert_eq!(
+    file.metadata().unwrap().nlink(),
+    0,
+    "the file unlinked before the restart reports a link count of zero"
+  );
+  file.seek(SeekFrom::Start(0)).unwrap();
+  let mut contents = Vec::new();
+  file.read_to_end(&mut contents).unwrap();
+  assert_eq!(
+    contents, UNLINKED_BYTES,
+    "the file unlinked before the restart reads its bytes after it"
+  );
+  assert_eq!(
+    silly(root),
+    Vec::<String>::new(),
+    "no silly rename while open"
+  );
+  drop(file);
+  assert_eq!(silly(root), Vec::<String>::new(), "none after the close");
 }

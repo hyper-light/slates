@@ -5,6 +5,8 @@
 # with the same reason: the A-26 device refusals and their cascades
 # (docs/bugs/2026-09-20-pjdfstest-device-fixture-cascades.md), and unlink/14.t:4, reworded for v4.
 # The NFSv3 list's tests/utimensat/09.t:5 (NFS-TIME) passes over v4 and is absent here.
+# tests/unlink/14.t:4 (NFS-OPEN) passes since A-260 (2026-11-08): an open holds its file and OPEN answers
+# OPEN4_RESULT_PRESERVE_UNLINKED, so the client no longer silly-renames the unlinked open file.
 # One case per line; no file wildcard. Unlisted failures, listed passes and absent
 # listed cases fail the gate. This list can only shrink after this review.
 # Device names are never substituted, and the upstream suite is never patched in CI.
@@ -1797,7 +1799,6 @@ tests/unlink/11.t:177  A-26 refuses char creation; this iteration checks that de
 tests/unlink/11.t:178  A-26 refuses char creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).
 tests/unlink/11.t:179  A-26 refuses char creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).
 tests/unlink/11.t:180  A-26 refuses char creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).
-tests/unlink/14.t:4  The Linux NFSv4 client silly-renames an open unlinked file, as over NFSv3, while this server does not set OPEN4_RESULT_PRESERVE_UNLINKED; the temporary name keeps nlink=1 until close (NFS-OPEN).
 tests/utimensat/00.t:17  A-26 refuses block creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).
 tests/utimensat/00.t:18  A-26 refuses block creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).
 tests/utimensat/00.t:19  A-26 refuses block creation; this iteration checks that device or metadata/namespace effects requiring its existence (DEVICE-FIXTURE).

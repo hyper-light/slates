@@ -8626,6 +8626,81 @@ in order, up to the last whole record's size, and appended them as the credit fr
 
 Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
 
+### The council's voter change after a candidate's node is replaced (§4.8; 2026-11-09, diag-live-durability-71)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, main 80be552a. **Flow:**
+a three-node anchored fleet; one candidate's node is killed and a fresh one started in its place (a new member id),
+quiet or under the write stream. Every node's status is polled every 10 ms for `fleet_council_joint` and the voter
+ids. Joint closed means every node reports no joint configuration, with the new id seated and the old one gone. 8
+runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the kill.
+
+| arch, load | answered → joint entered | joint open (entered → closed everywhere) | kill → closed |
+|---|---|---|---|
+| x86, quiet | median 1.90 s, max 2.61 s | median 0.21 s, max 0.35 s | median 2.16 s, max 2.88 s |
+| x86, loaded | median 1.93 s, max 2.87 s | median 0.15 s, max 0.33 s | median 2.17 s, max 3.32 s |
+| arm, quiet | median 1.91 s, max 2.30 s | median 0.21 s, max 0.22 s | median 2.15 s, max 2.56 s |
+| arm, loaded | median 2.00 s, max 4.02 s | median 0.22 s, max 1.18 s | median 2.23 s, max 5.26 s |
+
+**Reading.** The joint follows the replacement's catch-up on the council log, about 0.2 s. The ~1.9 s before it opens
+is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
+dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
+that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
+for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+it in 6 of 6 x86 runs.
+
+### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
+
+**The change.** A lane's install exchange ends only on its reply or its deadline, and the deadline has no ceiling (up to
+77 s and 614 s measured, diag-live-durability-56). The watch ended it early once the owner kept no direct contact with
+the holder (`keeps_direct_contact_with`) and the session had acknowledged nothing for a silence. That silence was first
+a fixed liveness budget (1 s, `agents/live-durability-watch-2`), then the session's own persistent-congestion duration:
+three probe timeouts, each at least the initial 666 ms (`agents/live-durability-watch-3`). On the simulated fabric the
+fixed second cut a live holder whose acknowledgements a queue held back 1.1 to 2.0 s apart; the duration never did.
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, the watch switched on or off
+in one binary.
+
+**diag-live-durability-65: a holder restarted mid-install** (watch-2's rule, 12 restarts and 10 rolling partitions a
+leg, at the budgets the code computes and at a 30 s floor on installs of 64 KiB or more):
+
+| leg | restarts over 1 s | catch-up median | worst | partitions passed | cuts |
+|---|---|---|---|---|---|
+| real, off, x86 | 1 of 12 | 31 ms | 3.87 s | 10 of 10 | 0 |
+| real, on, x86 | 0 of 12 | 24 ms | 0.05 s | 10 of 10 | 0 |
+| real, off, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| real, on, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| floor, off, x86 | 4 of 12 | 894 ms | 7.01 s | 10 of 10 | 0 |
+| floor, on, x86 | 2 of 12 | 25 ms | 32.42 s | 10 of 10 | 1 |
+| floor, off, arm | 7 of 12 | 2,038 ms | 13.05 s | 10 of 10 | 0 |
+| floor, on, arm | 1 of 12 | 21 ms | 29.14 s | 10 of 10 | 0 |
+
+The watch's case does not occur in this flow: the restarted holder's successor answers under its id 3 to 27 ms after
+the kill, so the owner never loses contact, and no kept restart log shows a cut. diag-67 and -68 meant to stop a holder
+for good but armed the stop for any daemon, and the other candidate stopped itself: none of 96 runs reached the case.
+
+**diag-live-durability-70: a holder stopped on its install for 20 s, then resumed** (watch-3's rule, 30 s floor, the
+stop armed for the target alone, 12 runs a leg, 48 of 48 passed, every one stopped on its install). Catch-up is from the
+resume until the holder is within 50 entries of the owner's head; none = not within 50 s:
+
+| leg | the stopped holder's exchange | catch-up, each run (s) | median | not caught |
+|---|---|---|---|---|
+| off, x86 | held 20.1 s, then answered (the stale install) | 2.05 3.88 2.67 none 2.35 2.22 1.31 none 2.01 none none 2.06 | 2.14 s | 4 of 12 |
+| on, x86 | cut, median 2.12 s (12 of 12) | 1.88 2.04 2.86 none 27.73 11.06 none 1.86 2.16 none none 2.22 | 2.19 s | 4 of 12 |
+| off, arm | held 20.1 s, then answered | 3.68 none 6.40 1.84 33.83 6.20 3.32 6.40 4.09 2.01 1.29 2.35 | 3.68 s | 1 of 12 |
+| on, arm | cut, median 3.48 s (12 of 12) | 1.66 1.80 2.35 3.44 1.61 3.72 1.35 3.95 3.03 1.72 1.68 1.87 | 1.84 s | 0 of 12 |
+
+Mann–Whitney, off slower than on: x86 U = 68.5 of 144, z = −0.21, p ≈ 0.84 (even; 4 of 12 over 4 s or not caught
+off, 6 on); arm U = 111.5 of 144, z = 2.28, p ≈ 0.023 (6 of 12 off, 0 on), the two sets overlapping (on's worst
+3.95 s against off's median 3.68 s).
+
+**Reading.** The watch does what its rule says: the stopped holder's exchange was cut every time, a little past 2 s on
+x86 and later on arm, where the session's probe timeout is larger. On x86 catch-up after the resume is even, with the
+watch's tail worse (27.7 s against 3.88 s worst). On arm it is likely faster with the watch, but no mechanism is known:
+the freed lane leads to a holder that is stopped anyway, and answering the stale install on resume caught up in most
+runs as fast as a fresh image. **Held, not landed:** the decision waits on why arm's runs without the watch stall after
+the resume (GAPS). If it is the stale install answered late, the watch earns its place on arm; if it is the slow
+catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
+are that slow catch-up.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -12192,3 +12267,47 @@ end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
   submits alone. Since 2026-11-09 (after them) the harness files an operation under its outcome, as it files an attempt,
   so `operation SubmitAccepted` and `operation SubmitConflict` compare with their `latency` rows; the comparison owed
   above uses them.
+
+## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
+
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+
+**Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
+
+**Command.** `cargo build --release --locked -p slates-client --example provision_bench`, run with no arguments and with `PROVISION_BENCH_SHARDS=2`. Diagnostics runs [diag-liveness-31](https://github.com/hyper-light/slates/actions/runs/42648540654) (windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-latest) and diag-liveness-32 (windows-11-arm), results pushed to `diag-results/liveness-31-<os>` and `liveness-32-windows-11-arm`. Main is 80be552a with this bench applied (2e435448). The A-223 arm is A-223 merged onto 80be552a (d0106bec). Each runner has 4 CPUs (macos-latest 3). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU. Three rounds per cell, the arms alternating. A paced cell has 9 runs (3 rounds of 3), a rest cell 3, a p99 cell 9 (3 rounds of the bench's 3 runs). Ranges are the lowest to the highest run.
+
+**Main, two shards, one client paced at 1 ms:**
+
+| runner | at rest, quiet | paced, quiet | paced, loaded | single-client p99, quiet |
+|---|---|---|---|---|
+| Windows x86_64 (windows-latest) | 0–5 | 34–71 | 742–754 | 40.3 µs–80.1 µs |
+| Windows arm64 (windows-11-arm) | 5–15 | 31–104 | 100–269 | 30.1 µs–70.0 µs |
+| Linux x86_64 (ubuntu-latest) | 1–3 | 1464–2024 | 936–1102 | 17.4 µs–22.4 µs |
+| Linux arm64 (ubuntu-24.04-arm) | 1–2 | 1773–2022 | 859–1111 | 22.3 µs–24.4 µs |
+| macOS arm64 (macos-latest) | 1 | 132–466 | 77–480 | 242.4 µs–1.1 ms |
+
+**Main at each runner's derived shard count:**
+
+| runner | shards | at rest, quiet | paced, quiet | paced, loaded |
+|---|---|---|---|---|
+| Windows x86_64 | 1 | 0–15 | 12–39 | 11–30 |
+| Windows arm64 | 3 | 0–5 | 88–176 | 104–1342 |
+| Linux x86_64 | 1 | 0–1 | 609–692 | 622–863 |
+| Linux arm64 | 3 | 1–2 | 1709–2545 | 1148–1420 |
+| macOS arm64 | 2 | 1 | 180–394 | 127–288 |
+
+**A-223 beside it, two shards:** the paced cost, quiet then loaded, main → A-223.
+
+| runner | paced, quiet | paced, loaded |
+|---|---|---|
+| Windows x86_64 | 34–71 → 191–493 | 742–754 → 756–778 |
+| Windows arm64 | 31–104 → 230–404 | 100–269 → 728–745 |
+| Linux x86_64 | 1464–2024 → 1466–2026 | 936–1102 → 971–1031 |
+| Linux arm64 | 1773–2022 → 1727–2022 | 859–1111 → 848–1206 |
+| macOS arm64 | 132–466 → 117–356 | 77–480 → 118–194 |
+
+**What it means.**
+- **Linux pays on main, and A-223 does not change it.** At two shards a 1 ms-paced client costs Linux x86_64 1,464 to 2,024 thousandths of a core and Linux arm64 1,773 to 2,022, against 0 to 3 at rest. The boot probe's wake was 5.9 to 7.3 µs, so the boot window (0.59 to 0.73 ms) is shorter than the pause. In the paced form, though, the owner shard (shard 1) parked 0 times per 1,000 creates in every round on both runners. Its live estimate had risen to 34 to 70 µs, making its window 3.4 to 7.0 ms. The other shard parked 0 to 819 times per 1,000 (`provision.parked_1 parks per 1000 creates`). The estimate feeding on its own spinning is the window rule's item (i).
+- **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
+- **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
+- **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.

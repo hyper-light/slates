@@ -476,6 +476,18 @@ impl ChangeSignal {
     self.fd.as_raw_fd()
   }
 
+  /// Signals this signal itself, from its owner's thread: the owner's loop wakes as it does for a change (a revoked
+  /// mount, woken to drop its kernel's cache, AUD-29-84). A counter already at its ceiling is already signalled.
+  pub fn signal(&self) -> Result<(), ChannelError> {
+    match rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {
+      Ok(_) | Err(rustix::io::Errno::AGAIN) => Ok(()),
+      Err(e) => Err(ChannelError::Device {
+        call: "notify",
+        code: Some(e.raw_os_error()),
+      }),
+    }
+  }
+
   /// Takes the pending signals (the counter, in one read); a counter already at zero is nothing. An owner awaiting
   /// [`Self::raw_signal`] itself drains once it is readable, or the descriptor stays readable and the wait spins.
   pub fn drain(&self) {
@@ -670,6 +682,14 @@ pub struct ServeState {
   /// The bytes of the shard's metadata ledger admitted for this mount's byte states ([`make_room`]). Returned to the
   /// ledger by the mount's owner when the mount ends ([`ServeState::states_charged`]).
   states_charged: u64,
+  /// Where the round that drops a revoked mount's kernel cache stands ([`revoked_turn`]); `None` while the mount's
+  /// attachment admits its requests.
+  dropping: Option<Dropping>,
+  /// Inode invalidations sent by revoked mounts' rounds since this was last read: the non-vacuity count of AUD-29-84's
+  /// cache drop. Read and cleared by the owner that reports it.
+  revoked_invalidated: u64,
+  /// Requests refused while a revoked mount's round ran, since this was last read. Read and cleared by the owner.
+  revoked_refused: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -714,6 +734,9 @@ impl ServeState {
       holds: KernelHolds::default(),
       journal_overruns: 0,
       states_charged: 0,
+      dropping: None,
+      revoked_invalidated: 0,
+      revoked_refused: 0,
     }
   }
 
@@ -751,6 +774,21 @@ impl ServeState {
   /// ([`dispatch_request`]).
   pub fn take_writebacks_unknown(&mut self) -> u64 {
     std::mem::take(&mut self.writebacks_unknown)
+  }
+
+  /// Whether this mount's attachment was found revoked and its kernel's cache is being dropped before it ends
+  /// ([`revoked_turn`]): its owner serves it without the volume's lease, since it answers nothing from the volume.
+  pub fn dropping(&self) -> bool {
+    self.dropping.is_some()
+  }
+
+  /// What revoked mounts' rounds did since this was last asked, and zero afterwards, as `(inodes invalidated, requests
+  /// refused)` ([`revoked_turn`]; AUD-29-84).
+  pub fn take_revoked_counts(&mut self) -> (u64, u64) {
+    (
+      std::mem::take(&mut self.revoked_invalidated),
+      std::mem::take(&mut self.revoked_refused),
+    )
   }
 
   /// The rounds that found this mount behind the journal's retention since this was last asked, and zero afterwards:
@@ -917,9 +955,9 @@ pub enum Step {
 /// whole service, so a barrier over the volume (§4.6 "Writeback and snapshot barrier") sees exactly
 /// the requests the seam may still be applying — one at a time here — and a loop that dies
 /// mid-request leaves that request counted, which a barrier reports as incomplete until the owner's
-/// failed-consumer cleanup. A revoked or epoch-fenced attachment ends the mount rather than serving
-/// under stale authority (§4.8; per-request revalidation). A device error other than a disconnect is
-/// returned to the caller.
+/// failed-consumer cleanup. A revoked or epoch-fenced attachment serves nothing under stale authority
+/// (§4.8; per-request revalidation): its kernel's cache is dropped while every request is refused, then the
+/// mount ends ([`revoked_turn`]; AUD-29-84). A device error other than a disconnect is returned to the caller.
 pub fn serve_step(
   channel: &mut FuseChannel,
   bridge: &mut dyn Bridge,
@@ -930,7 +968,10 @@ pub fn serve_step(
 ) -> Result<Step, ChannelError> {
   if wake == Wake::Change {
     let Ok(cx) = attachments.begin(attachment) else {
-      return Ok(Step::Ended);
+      return match revoked_turn(channel, state)? {
+        Revoked::Ended => Ok(Step::Ended),
+        Revoked::Dropping => Ok(Step::Change(Delivered::default())),
+      };
     };
     let delivered = deliver_owed(channel, bridge, &cx, state);
     attachments.end(attachment);
@@ -947,7 +988,18 @@ pub fn serve_step(
     return Ok(Step::Dropped);
   }
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Step::Ended);
+    let request = channel.take_request();
+    let opcode = Request::parse(&request)
+      .ok()
+      .and_then(|parsed| parsed.opcode);
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Step::Ended),
+      Revoked::Dropping => Ok(Step::Request {
+        opcode,
+        delivered: Delivered::default(),
+        error: REVOKED_ERRNO,
+      }),
+    };
   };
   // `dispatch` needs a mutable reply buffer separate from the request buffer the channel owns,
   // so the request is copied out (one memcpy of a small message; the io_uring path avoids it
@@ -1060,18 +1112,7 @@ fn deliver_owed(
   }
   refused_writebacks_told(state, &mut messages);
   if !messages.is_empty() {
-    let notifier = match state.notifier.take() {
-      Some(notifier) => notifier,
-      None => {
-        let wake = match state.notify_wake.as_ref() {
-          Some(notifier) => Some(notifier.try_clone()?),
-          None => None,
-        };
-        Notifier::start(channel.device_clone()?, wake)?
-      }
-    };
-    let notifier = state.notifier.insert(notifier);
-    notifier.send(messages, before)?;
+    notifier_of(channel, state)?.send(messages, before)?;
     state.takeover_out = takeover.is_some();
   }
   if let Some(slice) = takeover {
@@ -1209,6 +1250,161 @@ fn takeover_told(
     invalidated,
     next,
   }
+}
+
+/// Format: the errno a revoked mount answers each request while its kernel's cache is dropped ([`revoked_turn`]): the
+/// kernel's own answer once the mount has ended (A-102), so a process sees one answer through the whole revocation.
+pub const REVOKED_ERRNO: i32 = rustix::io::Errno::NOTCONN.raw_os_error();
+
+/// Where a revoked mount's round stands ([`revoked_turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dropping {
+  /// Slices remain: the next takes the nodes above `after` (`None`: the first, which carries the root).
+  Owed {
+    /// The last node a slice took.
+    after: Option<u64>,
+  },
+  /// The last slice is sent: the mount ends once no round is out.
+  Sent,
+}
+
+/// What a revoked mount's turn decided ([`revoked_turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Revoked {
+  /// The kernel's cache is still being dropped: the mount serves on, refusing every request.
+  Dropping,
+  /// Dropped, or the device refused a round: the mount ends.
+  Ended,
+}
+
+/// A turn of a mount whose attachment admits no more requests: a consumer's revocation, an expiry, a detach, a fenced
+/// epoch (§4.8, §4.13; AUD-29-84). Before the mount ends, its kernel drops the pages, attributes and listings of the
+/// root and of every node it references ([`KernelHolds`]), each by a `FUSE_NOTIFY_INVAL_INODE` of all its data.
+///
+/// **Why.** Ending the mount makes the kernel answer every request `ENOTCONN`, but a page already in its cache is read
+/// without a request. A descriptor opened before the revocation read the page after the one it had read, which the
+/// kernel's readahead had fetched and the process never asked for: 3 of 3 on adacachy2 (Linux 7.3, 2026-11-09;
+/// `a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read` in `crates/server/tests/fuse_mount.rs`).
+///
+/// **How.** The nodes are walked in order, a slice a round, each slice at most the owner's budget
+/// ([`ServeState::slices_within`]) and at least one node, as a takeover round is ([`takeover_told`]). Every round goes
+/// through the notify thread ([`Notifier`]): dropping a page waits for a `READ` that holds it, which this thread
+/// answers (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). So the mount keeps reading requests
+/// meanwhile and answers each [`REVOKED_ERRNO`] without reaching the volume ([`refuse_revoked`]). It ends only once no
+/// round is out, so dropping it never joins a notify thread still waiting in the kernel. A round the device refuses ends
+/// it at once: the kernel then holds the connection no longer, or refuses notifications for good.
+///
+/// **Bound.** One message a node the kernel references, which is at most the volume's inode allowance.
+fn revoked_turn(channel: &FuseChannel, state: &mut ServeState) -> Result<Revoked, ChannelError> {
+  let dropping = *state.dropping.get_or_insert(Dropping::Owed { after: None });
+  if let Some(notifier) = state.notifier.as_mut()
+    && notifier.busy()
+  {
+    let Some((outcome, _before)) = notifier.returned() else {
+      return Ok(Revoked::Dropping);
+    };
+    state.takeover_out = false;
+    match outcome {
+      Ok(refused) => {
+        state.entry_invalidations_refused = state
+          .entry_invalidations_refused
+          .saturating_add(u64::from(refused));
+      }
+      Err(_) => return Ok(Revoked::Ended),
+    }
+  }
+  let Dropping::Owed { after } = dropping else {
+    return Ok(Revoked::Ended);
+  };
+  let began = std::time::Instant::now();
+  let budget = std::time::Duration::from_nanos(state.slice_ns);
+  let expire_only = state.expire_only;
+  let mut messages: Round = Vec::new();
+  let invalidate = |ino: u64, messages: &mut Round| {
+    let invalidation = Invalidation::Inode {
+      ino,
+      data: CachedBytes::ALL,
+    };
+    encode_invalidation(&invalidation, expire_only).map(|message| messages.push(message))
+  };
+  // The kernel names the root node 1 whatever the volume's root inode is ([`addressed_to_the_kernel`]).
+  if after.is_none() {
+    let _ = invalidate(crate::bridge::FUSE_ROOT_ID, &mut messages);
+  }
+  let mut last = after;
+  let mut cut = false;
+  for ino in state.holds.nodes_after(after) {
+    last = Some(ino);
+    if ino != crate::bridge::FUSE_ROOT_ID {
+      let _ = invalidate(ino, &mut messages);
+    }
+    if began.elapsed() >= budget {
+      cut = true;
+      break;
+    }
+  }
+  let more = cut && state.holds.nodes_after(last).next().is_some();
+  state.dropping = Some(if more {
+    Dropping::Owed { after: last }
+  } else {
+    Dropping::Sent
+  });
+  if messages.is_empty() {
+    return Ok(if more {
+      Revoked::Dropping
+    } else {
+      Revoked::Ended
+    });
+  }
+  let sent = u64::try_from(messages.len()).unwrap_or(u64::MAX);
+  let before = state.coherence.cursor();
+  notifier_of(channel, state)?.send(messages, before)?;
+  state.revoked_invalidated = state.revoked_invalidated.saturating_add(sent);
+  Ok(Revoked::Dropping)
+}
+
+/// Answers `request`, read from a mount whose attachment admits no more requests, [`REVOKED_ERRNO`] without reaching
+/// the volume, then turns the mount's revoked round ([`revoked_turn`]). A request that takes no reply (a `FORGET`) is
+/// answered by nothing, and the lookups it gives back are taken off what the kernel holds, so the round skips them.
+fn refuse_revoked(
+  channel: &FuseChannel,
+  state: &mut ServeState,
+  request: &[u8],
+) -> Result<Revoked, ChannelError> {
+  let parsed = Request::parse(request).ok();
+  let opcode = parsed.as_ref().and_then(|parsed| parsed.opcode);
+  if crate::bridge::takes_reply(opcode) {
+    let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+    let n = ReplyHeader::write_error(unique, REVOKED_ERRNO, &mut state.reply)
+      .map_err(ChannelError::from)?;
+    match channel.write_reply(state.reply.get(..n).unwrap_or(&[])) {
+      Ok(_) => {}
+      Err(ChannelError::Disconnected) => return Ok(Revoked::Ended),
+      Err(e) => return Err(e),
+    }
+  } else {
+    note_delivered(request, 0, state);
+  }
+  state.revoked_refused = state.revoked_refused.saturating_add(1);
+  revoked_turn(channel, state)
+}
+
+/// The mount's notify thread, started with its first round ([`Notifier`]).
+fn notifier_of<'a>(
+  channel: &FuseChannel,
+  state: &'a mut ServeState,
+) -> Result<&'a mut Notifier, ChannelError> {
+  let notifier = match state.notifier.take() {
+    Some(notifier) => notifier,
+    None => {
+      let wake = match state.notify_wake.as_ref() {
+        Some(notifier) => Some(notifier.try_clone()?),
+        None => None,
+      };
+      Notifier::start(channel.device_clone()?, wake)?
+    }
+  };
+  Ok(state.notifier.insert(notifier))
 }
 
 /// The messages an `Everything` becomes (A-141): an attribute-and-data invalidation of every node the kernel references
@@ -1898,6 +2094,10 @@ pub enum Turn {
   Replayed,
   /// A slice of a running allocation landed and more remains (A-108): the owner yields, then turns again.
   Continued,
+  /// The attachment admits no more requests and its kernel's cache is being dropped before the mount ends
+  /// ([`revoked_turn`]; AUD-29-84): the request read, if any, was answered [`REVOKED_ERRNO`] without reaching the
+  /// volume. The owner turns again when a request or the round's end wakes it.
+  Refused,
 }
 
 /// One non-blocking turn for an owner that makes a request's effect durable before answering (the daemon,
@@ -1933,7 +2133,11 @@ pub fn dispatch_ready(
     return Ok(Turn::Dropped);
   }
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Turn::Ended);
+    let request = channel.take_request();
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
   };
   let request = channel.take_request();
   let parsed = Request::parse(&request).ok();
@@ -2017,7 +2221,11 @@ fn continue_allocation(
   slice_bytes: u64,
 ) -> Result<Turn, ChannelError> {
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Turn::Ended);
+    // The allocation's request is answered refused, as any other a revoked mount holds.
+    return match refuse_revoked(channel, state, allocation.request())? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
   };
   let delivered = match deliver_owed(channel, bridge, &cx, state) {
     Ok(delivered) => delivered,
