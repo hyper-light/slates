@@ -43,7 +43,9 @@ never in its slot. Its peer was gone without a word, and no holder of it judged 
 
 Every borrower's hold is bounded by a derived budget (25 borrow sites: `broadcast`/`CommitBudget`, `request_within`,
 `commit_record`, `within`, the location round's budget, `record_exchange_budget_ns`). So a borrowed session reaches
-`return_sessions`, and is judged there, within its window plus one bounded hold. A session that sits unborrowed in its slot
+`return_sessions`, and is judged there, within its window plus one bounded hold. Because the judgement runs only when a
+borrower returns, how late past its window a silent session is dropped is the lane's return cadence: 0 to 209 ms past
+the 1,998 ms window in the runs above. A session that sits unborrowed in its slot
 is the link's discovery refresh's to catch: a page on a dead session fails, and the link drops it. A first trace that
 seemed to show a judgment missed was the discovery refresh rescuing at 0 ms, before any return could see the silence.
 

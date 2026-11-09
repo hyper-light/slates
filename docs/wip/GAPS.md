@@ -560,7 +560,8 @@
 >   of its slot, so the link never replaced it: requests through the client node waited 25 to 135 s. Now
 >   `fleet::return_sessions` drops a session returned silent past the transport's one rule (`peer_silent_past`), and the
 >   link redials. Deaf-session test with discovery held: red 5 of 5, green 5 of 5, dropped 0 to 209 ms past its 1,998 ms
->   window, answered on the replacement 26 to 336 ms later. **The division, so no timer is added "just in case":**
+>   window (that lateness is the lane's return cadence, since the judgement runs only when a borrower returns),
+>   answered on the replacement 26 to 336 ms later. **The division, so no timer is added "just in case":**
 >   `return_sessions` judges every borrowed session (every borrower's hold is bounded by a derived budget), the link's
 >   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
 >   sooner where it is heard
