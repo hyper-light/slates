@@ -8968,6 +8968,33 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   its copy, the home region is lost, and the promoted mirror serves the content. Owner: live-fixes, after the home
   healer fix and its siblings.
 
+### 2026-11-09: a heal left the head naming a holder that had left the fleet (fixed)
+
+- **Found** fixing the healer (live-fixes). On a five-node `f = 1` fleet, after a holder the head named was stopped and
+  retired, both survivors that held the head still named it 300 periods later, and nothing was republished: 453 s for a
+  plain volume, 456 s for a live one, on a Mac at load 30 to 72.
+- **Cause:** a head is never rewritten at its sequence, so the heal's re-recorded placement never reached it. Two more
+  faults surfaced in the fix's own measured runs:
+  - A replacement put at the head's own sequence is refused by a cohort member that holds that head and is not named
+    in it (`content_retention::admits`).
+  - A heal had no bound, so a single refused replace stayed open, and the healer skipped the volume for good.
+- **Fixed:**
+  - A heal that finds a named holder gone puts its content on the current cohort at the next sequence. That put is
+    ahead of every holder's records, so the door admits it.
+  - Once recorded, the head is republished at exactly that sequence.
+  - Every heal ends at the membership horizon, counted `fleet.heal.unfinished`, and is taken up again on a later step.
+  - Tests, each red on the old code: `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+    `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left`, and
+    `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`. The last is also red with only the
+    bound removed (`fleet.heal.unfinished` 0).
+  - Bug doc: `docs/bugs/2026-11-09-a-heal-left-the-head-naming-a-holder-that-had-left.md`.
+- **Reopened:** the cause of `a_holder_that_lost_placed_content_is_repaired_by_the_healer`'s failure under the suite's
+  load. The account given on 2026-11-08 (a heal offering the first-ranked candidate first) was never measured and is
+  wrong: on three nodes the door refuses that candidate's put, and its test passed 3 of 3 on the old code
+  (diag-live-fixes-66).
+- **Open siblings, reported, not changed:** a takeover's re-commit and a neighbourhood change re-place content under a
+  new holder set, and are owed a test of the same shape. The mirror's own healer is the entry above.
+
 ### 2026-11-08: a learner lost the only voters it knew and stopped learning configurations (fixed)
 
 - **Found** by raft-chaos's five-node flow (diag-raft-chaos-mesh-52, runs 2 and 7 of 8): after the bootstrap voter was

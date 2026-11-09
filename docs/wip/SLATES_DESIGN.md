@@ -5948,7 +5948,14 @@ a reader's fetch stages the same way, one chunk per exchange, and resumes from w
 each holder's offer and transfer progress independently, with no wait on the slowest offer;
 anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
-repeatedly late candidate on probation for the group to replace. Cold sealed content (a
+repeatedly late candidate on probation for the group to replace. A head is never rewritten at its
+sequence, so when a holder the head names has left the fleet the healer places the content on the
+current cohort at the **next** sequence and, once that placement is recorded, republishes the same
+head snapshot at exactly that sequence naming the new holders (A-276). The next sequence is what
+lets the put through: a holder whose newest head at a sequence does not name it refuses a put there,
+and admits one ahead of every record it holds (`content_retention::admits`). Every heal is bounded by
+the membership horizon from its first round; one that has not placed by then ends, counted, and the
+volume is healed again on a later step. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
@@ -19505,3 +19512,43 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-276 — A heal that replaces a departed holder puts at the next sequence and republishes the head there; every heal ends at the membership horizon (accepted 2026-11-09, the supervisor's ruling; amends §4.10's healer)
+
+Applied in the same change to:
+- §4.10: the "Content replication" paragraph's healer sentences.
+- GAPS and `docs/bugs/2026-11-09-a-heal-left-the-head-naming-a-holder-that-had-left.md`.
+- `crates/server/src/fleet.rs` (`heal_one_placed_snapshot`, `Heal`, `start_seal`, `content_work`,
+  `record_placed_seals`, `republish_head`) and `crates/server/src/head.rs` (`SealJob::put_sequence`,
+  `SealJob::republish`).
+- The tests in `crates/server/tests/fleet.rs`: `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+  `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left` and
+  `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`.
+
+- **The rule amended.** §4.10 said the healer replays puts that never reached f+1. It said nothing of a holder the head
+  names that has left the fleet. A head is never rewritten at its sequence, so the heal's re-recorded placement never
+  reached it.
+- **The rule now.**
+  - When a holder the placement names is no longer a member, or none named is remote, the heal places the content on
+    the current cohort at the head's sequence plus one.
+  - Once that placement is recorded, the same head snapshot is republished at exactly that sequence
+    (`Op::VolumeHeadAdvanced`), naming the new holders.
+  - Otherwise the heal re-offers at the head's own sequence, as before.
+  - Every heal is bounded by the membership horizon (`lease::horizon_ns`) from its first round. One that has not placed
+    by then ends, counted `fleet.heal.unfinished`, and a later step takes the volume up again.
+- **Why the next sequence.** A holder's door (`content_retention::admits`) admits a put only when its newest record at
+  that sequence names it, or when the put is ahead of every record it holds. A cohort member that holds the head and
+  is not named in it therefore refuses a put at the head's sequence. Measured: the first cut put there, the owner
+  counted `fleet.heal.named_gone` 1 and `fleet.heal.republished` 0, and the heads still named the departed holder 300
+  periods later. At the next sequence the put is ahead everywhere, retention keeps it as the newest placement ahead,
+  and the republished head at that sequence then names its holders.
+- **Why the bound.** With no bound, a heal that could not place stayed open, and the healer skips a volume with a seal
+  in progress, so one refusal left the volume unhealed for good. Measured with every put refused: without the bound,
+  `fleet.heal.unfinished` stayed 0 (36 s); with it, the heal ended counted, and once the refusal lifted the head was
+  republished.
+- **Evidence.** On the old code both republish tests fail, on a five-node `f = 1` fleet on a Mac at load 30 to 72: the
+  heads still name the departed holder and nothing is republished (453 s and 456 s). With the change all three tests
+  pass (14 s to 62 s, load 34 to 73).
+- **What it does not change.** The head's value, the snapshot, its manifest and what a client sees: the status's head,
+  snapshot and attachment counts, bytes and lease epoch, and the file's bytes are checked equal across a republish. The
+  mirror's own healer stays open (GAPS, AC-8.15).
