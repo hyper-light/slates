@@ -282,7 +282,7 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     unique: 5,
     reply: b"reply".to_vec(),
   }];
-  // Held pieces put and removed (A-251), each given out of key order, so the streamed encoder's sort is compared.
+  // Held pieces put and removed (A-260), each given out of key order, so the streamed encoder's sort is compared.
   let held_put = vec![
     slates_vfs::recover::HeldPiece {
       key: [6; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
@@ -499,12 +499,12 @@ enum JournalStep {
   GiveBack { quarters: usize },
   /// The journal dropped and recovered from its memories, as a restarted daemon's is.
   Restart,
-  /// One held piece (A-251) put (`bytes` of the step) or removed, its delta appended (a checkpoint instead when the log
+  /// One held piece (A-260) put (`bytes` of the step) or removed, its delta appended (a checkpoint instead when the log
   /// is full): the piece's key is `[key; HELD_PIECE_KEY_BYTES]`, from a few, so puts overwrite and removals find one.
   Held { key: u8, remove: bool },
 }
 
-/// The shard's full image with `held`, the model's held pieces (A-251), carried.
+/// The shard's full image with `held`, the model's held pieces (A-260), carried.
 fn full_with(
   vol: &Volume,
   store: &Store,
@@ -582,7 +582,7 @@ proptest::proptest! {
     ..proptest::prelude::ProptestConfig::default()
   }))]
 
-  /// A-117, A-226 and A-251, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put and
+  /// A-117, A-226 and A-260, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put and
   /// removed, give-backs and restarts over memories that record each byte written; expect after every step that the
   /// dead ranges name every written byte no restart reads, lie inside what no restart reads and end at the last such
   /// write, and that a restart recovers the volume's full image and the model's held pieces whatever was given back.
@@ -704,7 +704,7 @@ fn with_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
   bytes
 }
 
-/// A-251 (§4.8 "Recovery"): do give recovery a shard image written in the version before this build's. Expect it
+/// A-260 (§4.8 "Recovery"): do give recovery a shard image written in the version before this build's. Expect it
 /// refused `RecoveryVersion`, naming both versions, before any field is decoded: a layout this build does not know is
 /// never read as its own.
 #[test]
@@ -722,7 +722,7 @@ fn an_image_of_another_version_is_refused_by_its_version() {
   );
 }
 
-/// A-251 (§4.8 "Recovery"): do commit a checkpoint, then append a CRC-valid delta frame written in the delta version
+/// A-260 (§4.8 "Recovery"): do commit a checkpoint, then append a CRC-valid delta frame written in the delta version
 /// before this build's. Expect the recovery refused `RecoveryVersion`. Read as a torn frame instead, the replay would end
 /// there and recover the checkpoint without the acknowledged deltas after it.
 #[test]
@@ -732,7 +732,9 @@ fn a_delta_of_another_version_is_refused_not_read_as_torn() {
   let mut vol = seeded(&mut store);
   let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
   let mut journal = Journal::default();
-  journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+  journal
+    .checkpoint(&mut checkpoints, &full(&vol, &store))
+    .unwrap();
   vol.mark_published(&store);
   create(&mut vol, &mut store, "after", b"after the checkpoint");
   let older = slates_vfs::checkpoint_log::DELTA_VERSION - 1;
@@ -747,7 +749,7 @@ fn a_delta_of_another_version_is_refused_not_read_as_torn() {
   );
 }
 
-/// A log memory that records every write in order (A-251's crash test), so a crash can be put after any byte of any of
+/// A log memory that records every write in order (A-260's crash test), so a crash can be put after any byte of any of
 /// them, in the order the journal made them.
 struct WriteRecorder {
   memory: Vec<u8>,
@@ -772,7 +774,7 @@ impl ImageWrite for WriteRecorder {
   }
 }
 
-/// A-251, a crash at every step of a held write (`crates/land/tests/oracle.rs`'s pattern): do commit a checkpoint
+/// A-260, a crash at every step of a held write (`crates/land/tests/oracle.rs`'s pattern): do commit a checkpoint
 /// holding piece A, append the delta that puts B and removes A into a log that records its writes, and for every write
 /// the journal made and every byte of it, rebuild the log as a crash just after that byte leaves it, and recover.
 /// Expect each recovery to hold A alone (the frame not committed) or B alone (it committed), never both, neither or
@@ -790,20 +792,31 @@ fn a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new() {
   let mut checkpoints = vec![0u8; MEMORY];
   let mut journal = Journal::default();
   journal
-    .checkpoint(&mut checkpoints, &full(&vol, &store).with_held(before.clone()))
+    .checkpoint(
+      &mut checkpoints,
+      &full(&vol, &store).with_held(before.clone()),
+    )
     .unwrap();
   let delta = ShardDelta::new(
     Vec::new(),
     Vec::new(),
-    (after.clone(), vec![[1; slates_vfs::recover::HELD_PIECE_KEY_BYTES]]),
+    (
+      after.clone(),
+      vec![[1; slates_vfs::recover::HELD_PIECE_KEY_BYTES]],
+    ),
     None,
   );
   let mut recorder = WriteRecorder {
     memory: vec![0u8; MEMORY],
     writes: Vec::new(),
   };
-  journal.append(&mut recorder, &delta, &mut Vec::new()).unwrap();
-  assert!(recorder.writes.len() > 1, "the append is several writes, so a crash can fall between them");
+  journal
+    .append(&mut recorder, &delta, &mut Vec::new())
+    .unwrap();
+  assert!(
+    recorder.writes.len() > 1,
+    "the append is several writes, so a crash can fall between them"
+  );
   let last = recorder.writes.len() - 1;
   for (index, (offset, bytes)) in recorder.writes.iter().enumerate() {
     for kept in 0..=bytes.len() {

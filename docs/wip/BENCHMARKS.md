@@ -11996,3 +11996,32 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
+
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-260; 2026-11-08)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
+(other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the
+contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary> measure_what_live_shipping
+--nocapture`, the binary built with `cargo test --release -p slates-cli --test live_fleet --no-run` at each arm's commit.
+Arms interleaved round by round (`ab3.sh`, `ab3b.sh` in the agent's scratch):
+
+- **main** at 92dcd16c: a candidate's live copies are not in its recovery image, so its acknowledgement publishes nothing.
+- **whole** at c07d1de6 (raft-5): every acknowledgement publishes the whole held image.
+- **pieces** at eeb4a6ee (agents/raft-7): every acknowledgement publishes the held pieces it changed.
+
+Microseconds, what live shipping adds to a stable 4 KiB write at the median (live p50 less plain p50), and the live p99:
+
+| arm | runs | added at the median | live p99 |
+|---|---|---|---|
+| main | 4 | 65.3, 75.5, 71.4, 73.0 | 146.5, 197.2, 162.4, 636.3 |
+| whole | 3 | 206.7 (alone, load 86), 224.8, 220.2 | 670.4, 824.8, 776.5 |
+| pieces | 6 | 76.0, 72.7, 79.1, 71.2, 69.2, 65.3 | 275.7, 247.5, 208.5, 233.3, 199.0, 151.4 |
+
+Seven arm runs printed no figures (each of the three in the second A/B's first round at load 98–145, and main in its
+second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
+each), so the test reports failure after printing; the figures stand.
+
+**Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
+65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
+pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
+answers.

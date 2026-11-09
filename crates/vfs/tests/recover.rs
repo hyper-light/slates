@@ -2244,7 +2244,7 @@ fn streamed_shard(store: &mut Store) -> StreamedShard {
       reply: b"r4".to_vec(),
     },
   ];
-  // Two held pieces (A-251), out of key order, so the streamed encoder's sort is compared too.
+  // Two held pieces (A-260), out of key order, so the streamed encoder's sort is compared too.
   let held = vec![
     slates_vfs::recover::HeldPiece {
       key: [7; slates_vfs::recover::HELD_PIECE_KEY_BYTES],

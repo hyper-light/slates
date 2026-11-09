@@ -105,7 +105,8 @@
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
 > - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image is changing, and two format changes at once would collide. Owed when that lands:
+>   format raft-5's incremental held image was changing (it is built: A-260, image version 23, delta version 6), and two
+>   format changes at once would collide. Owed when that lands:
 >   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
 
@@ -14718,6 +14719,30 @@ because sixteen daemons share the test process, and was the second partition.
 - **What a fix has to decide.** A shard blocked in the kernel (state `D`) or runnable but starved (state `R`) is still
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
+
+### 2026-11-08: a holder's acknowledgement published everything it held — fixed (A-260)
+
+raft-4's c6e178aa made a candidate publish before it acknowledges a live entry, so its copies survive its own warm
+restart. But each publication carried the shard's whole held image (the content hold, every register, every live copy
+with all its entries), rebuilt and compared byte for byte, so an acknowledgement cost what the holder held.
+- Across 64 held records a delta's held bytes grew from 2,224 to 55,216
+  (`a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds`, red first).
+- A live write cost 207–225 µs at the median, against main's 65–76 µs.
+
+Now the held image is keyed pieces, and a delta carries only those put and removed: the same test holds the late median
+to one record's, and a live write costs 65–79 µs (BENCHMARKS, interleaved at load 42–113).
+- Held registers and live copies are tracked maps, so no change goes unmarked.
+- The format versions moved (image 23, delta 6), and another build's journal is refused `RecoveryVersion`, never
+  misread.
+
+Open:
+- The content hold and the mirror records are still compared whole at each publication.
+- `a_candidates_restored_copy_serves_its_owners_takeover` is ignored for main's per-host principals: a survivor refuses
+  the taken-over volume's reads `NotShared`, with or without this change. Reported to the supervisor.
+- `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` sometimes answers the fsync made with every
+  candidate running `EIO` (the "healthy" one). On main at 92dcd16c: once in 6 runs that reached it, at load 96. On
+  agents/raft-7: 2 in 9, once in the full suite at load over 100 and once alone at load 36 (adacachy, 2026-11-08).
+  Not this change's, so open: the counters of a failing run are kept in the agent's scratch (`fsync2-main-2.log`).
 
 ### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-250)
 

@@ -1351,7 +1351,10 @@ fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_ho
   };
   let early = median(&per_hold[1..=HELD_WINDOW]);
   let late = median(&per_hold[per_hold.len() - HELD_WINDOW..]);
-  assert!(early > 0, "a delta carries the record it holds: {per_hold:?}");
+  assert!(
+    early > 0,
+    "a delta carries the record it holds: {per_hold:?}"
+  );
   assert!(
     late <= 2 * early,
     "a delta's held bytes do not grow with what is held: early median {early}, late {late}: {per_hold:?}"

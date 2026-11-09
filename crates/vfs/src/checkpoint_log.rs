@@ -31,12 +31,12 @@ use crate::recover::{
 
 /// Format: a delta's magic, checked before anything else on decode.
 const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
-/// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
-/// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
-/// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
-/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed; 5 (A-231, 2026-11-05) the
-/// held connections' byte states; 6 (A-251, 2026-11-07) what the shard holds for other owners as the pieces put and the
-/// keys removed since the last publication, never the whole held image.
+/// The delta format's history: 1 (A-68, 2026-10-04); 2 (A-126, 2026-10-09) a file changed only by writes to its chunked
+/// body is carried as its written windows (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call
+/// records changed and purged since the last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they
+/// changed; 5 (A-231, 2026-11-05) the held connections' byte states; 6 (A-260, 2026-11-08) what the shard holds for other
+/// owners as the pieces put and the keys removed since the last publication, never the whole held image.
+/// Format: the delta format's version, bumped with any change to the delta's types.
 pub const DELTA_VERSION: u16 = 6;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
@@ -64,7 +64,7 @@ pub struct ShardDelta {
   pub volumes: Vec<KeyedRecord>,
   /// The volumes no longer held, in key order.
   pub removed: Vec<[u8; 16]>,
-  /// The held pieces put since the last publication (A-251), in key order, each whole.
+  /// The held pieces put since the last publication (A-260), in key order, each whole.
   pub held_put: Vec<HeldPiece>,
   /// The held pieces removed since the last publication, in key order.
   pub held_removed: Vec<[u8; HELD_PIECE_KEY_BYTES]>,
@@ -115,16 +115,7 @@ impl ShardDelta {
     for key in removed.iter() {
       key.encode(out);
     }
-    held_put.sort_unstable_by_key(|piece| piece.key);
-    slates_wire::codec::encode_len(held_put.len(), out);
-    for piece in held_put.iter() {
-      piece.encode(out);
-    }
-    held_removed.sort_unstable();
-    slates_wire::codec::encode_len(held_removed.len(), out);
-    for key in held_removed.iter() {
-      key.encode(out);
-    }
+    encode_held(out, held_put, held_removed);
     match replies {
       None => out.push(slates_wire::codec::OPTION_NONE),
       Some(replies) => {
@@ -233,7 +224,44 @@ impl ShardDelta {
   }
 }
 
+/// Writes a delta's held pieces put and keys removed (A-260's format), each sorted by key, as `ShardDelta`'s `encode`
+/// writes its `held_put` and `held_removed`.
+fn encode_held(
+  out: &mut Vec<u8>,
+  held_put: &mut [HeldPiece],
+  held_removed: &mut [[u8; HELD_PIECE_KEY_BYTES]],
+) {
+  held_put.sort_unstable_by_key(|piece| piece.key);
+  slates_wire::codec::encode_len(held_put.len(), out);
+  for piece in held_put.iter() {
+    piece.encode(out);
+  }
+  held_removed.sort_unstable();
+  slates_wire::codec::encode_len(held_removed.len(), out);
+  for key in held_removed.iter() {
+    key.encode(out);
+  }
+}
+
 impl ShardImage {
+  /// Folds a delta's held pieces into this image (A-260): each piece put replaces or joins the one under its key, then
+  /// each key removed drops its piece. A delta never puts and removes one key.
+  fn fold_held(&mut self, delta: &ShardDelta) {
+    for piece in &delta.held_put {
+      match self.held.binary_search_by_key(&piece.key, |held| held.key) {
+        Ok(at) => {
+          if let Some(held) = self.held.get_mut(at) {
+            held.bytes.clone_from(&piece.bytes);
+          }
+        }
+        Err(at) => self.held.insert(at, piece.clone()),
+      }
+    }
+    self
+      .held
+      .retain(|held| delta.held_removed.binary_search(&held.key).is_err());
+  }
+
   /// Applies a delta (the module doc): afterwards this image is the shard's image at the delta's publication. A
   /// volume delta over a volume this image does not hold is refused [`VfsError::RecoveryIncomplete`].
   pub fn apply(&mut self, delta: &ShardDelta) -> Result<(), VfsError> {
@@ -277,19 +305,7 @@ impl ShardImage {
     self
       .volumes
       .retain(|volume| delta.removed.binary_search(&volume.key).is_err());
-    for piece in &delta.held_put {
-      match self.held.binary_search_by_key(&piece.key, |held| held.key) {
-        Ok(at) => {
-          if let Some(held) = self.held.get_mut(at) {
-            held.bytes.clone_from(&piece.bytes);
-          }
-        }
-        Err(at) => self.held.insert(at, piece.clone()),
-      }
-    }
-    self
-      .held
-      .retain(|held| delta.held_removed.binary_search(&held.key).is_err());
+    self.fold_held(delta);
     if let Some(replies) = &delta.replies {
       self.replies.clone_from(replies);
     }

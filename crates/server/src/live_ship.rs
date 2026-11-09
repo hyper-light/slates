@@ -229,7 +229,7 @@ pub(crate) struct HeldLive {
   owner: u64,
   fence: u64,
   head: Option<HeldHead>,
-  /// The slot of the first entry (A-251).
+  /// The slot of the first entry (A-260).
   first: u64,
   /// The entries, from `first`, in slot order. A head piece carries none; recovery joins them from their own pieces.
   entries: Vec<Vec<u8>>,
@@ -314,7 +314,7 @@ pub(crate) struct Held {
   entries: VecDeque<Vec<u8>>,
   /// Their bytes.
   bytes: usize,
-  /// The slot of the first entry (A-251): entry `i` is slot `first + i`, its held piece's position. Entries are only
+  /// The slot of the first entry (A-260): entry `i` is slot `first + i`, its held piece's position. Entries are only
   /// pushed after the last or all cleared ([`Held::clear_entries`], which moves it past them), so a slot never names
   /// two entries, and a delta carries a copy's new slots and the ones it dropped.
   first: u64,
@@ -341,7 +341,7 @@ impl Held {
     self.entries.get(index).map(Vec::as_slice)
   }
 
-  /// This copy's head piece's fields (A-251): its owner, fence, head and first slot, with no entries.
+  /// This copy's head piece's fields (A-260): its owner, fence, head and first slot, with no entries.
   pub(crate) fn head_of(&self, object: ObjectId) -> HeldLive {
     HeldLive {
       object: object.0,
@@ -360,7 +360,7 @@ impl Held {
 
 #[cfg(test)]
 impl Held {
-  /// Test support (A-251's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
+  /// Test support (A-260's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
   pub(crate) fn for_test(owner: HostId, object: ObjectId, first: u64) -> Held {
     Held {
       replica: Replica::new(owner, object),
@@ -389,9 +389,9 @@ pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
   /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
-  /// copies reached since the last (A-251).
+  /// copies reached since the last (A-260).
   pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
-  /// The first slot a copy made now takes (A-251): at or above every slot a committed publication carried for any copy,
+  /// The first slot a copy made now takes (A-260): at or above every slot a committed publication carried for any copy,
   /// so a copy dropped and made again never reuses a published entry's key.
   pub(crate) slot_floor: u64,
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a

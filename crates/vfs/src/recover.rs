@@ -77,7 +77,7 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
-/// 22 (A-231, 2026-11-05) the held connections' byte states. 23 (A-251, 2026-11-07) what the shard holds for other
+/// 22 (A-231, 2026-11-05) the held connections' byte states. 23 (A-260, 2026-11-07) what the shard holds for other
 /// owners is keyed pieces ([`HeldPiece`]) instead of one opaque image, so a delta carries only the pieces that changed.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
@@ -512,7 +512,7 @@ pub struct ShardImage {
   pub version: u16,
   /// The volumes, in key order.
   pub volumes: Vec<KeyedImage>,
-  /// What this shard holds for other owners as their candidate holder (AUD-29-59, A-251): keyed pieces in key order,
+  /// What this shard holds for other owners as their candidate holder (AUD-29-59, A-260): keyed pieces in key order,
   /// opaque here (the server cuts and joins them), none when nothing is held. A holder acknowledges what it holds only
   /// once an image or a delta carrying it is committed.
   pub held: Vec<HeldPiece>,
@@ -606,11 +606,11 @@ pub struct HeldReply {
   pub reply: Vec<u8>,
 }
 
-/// Format: the bytes of a held piece's key (A-251): the server's kind byte, an object id (16 bytes), and a position (a
+/// Format: the bytes of a held piece's key (A-260): the server's kind byte, an object id (16 bytes), and a position (a
 /// big-endian word, so key order within an object is position order). Opaque here beyond its width.
 pub const HELD_PIECE_KEY_BYTES: usize = 1 + 16 + size_of::<u64>();
 
-/// One piece of what a shard holds for other owners (A-251): a key and its bytes, both opaque here. An image carries
+/// One piece of what a shard holds for other owners (A-260): a key and its bytes, both opaque here. An image carries
 /// every piece; a delta carries the pieces put and the keys removed since the last publication, so what a holder's
 /// acknowledgement costs its publication is the piece it changed, not everything it holds.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -694,7 +694,7 @@ impl ShardImage {
     }
   }
 
-  /// This image carrying `held`, the pieces of what the shard holds for other owners (AUD-29-59, A-251), in key order.
+  /// This image carrying `held`, the pieces of what the shard holds for other owners (AUD-29-59, A-260), in key order.
   pub fn with_held(self, mut held: Vec<HeldPiece>) -> ShardImage {
     held.sort_by_key(|piece| piece.key);
     ShardImage { held, ..self }

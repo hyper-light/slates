@@ -11130,7 +11130,8 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
 /// object or a slice in it.
 fn read_journal(
   state: &ShardState,
-) -> Option<Result<(Option<ShardImage>, slates_vfs::checkpoint_log::Journal), slates_vfs::VfsError>> {
+) -> Option<Result<(Option<ShardImage>, slates_vfs::checkpoint_log::Journal), slates_vfs::VfsError>>
+{
   let (start, end) = state.content_range;
   let (delta_start, delta_end) = state.delta_range;
   let object = state.content.as_ref()?;
@@ -11152,10 +11153,13 @@ fn read_journal(
       0
     },
   };
-  Some(slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log))
+  Some(slates_vfs::checkpoint_log::Journal::recover(
+    &checkpoints,
+    &log,
+  ))
 }
 
-/// Test support (A-251's oracle): whether the held pieces a restart would read from this shard's committed journal are
+/// Test support (A-260's oracle): whether the held pieces a restart would read from this shard's committed journal are
 /// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
 /// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
 pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
@@ -11762,10 +11766,7 @@ fn publish_delta_into(
     .map(|piece| piece.bytes.len())
     .fold(0usize, usize::saturating_add);
   if carried > 0 {
-    state.count(
-      DELTA_HELD_BYTES,
-      u64::try_from(carried).unwrap_or(u64::MAX),
-    );
+    state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
   call_records_published(state);
