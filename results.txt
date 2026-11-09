@@ -1,0 +1,46 @@
+24869c87 on ubuntu-latest, 4 CPUs, Mon Nov  9 21:01:24 UTC 2026, head 7fd964f16831a810f4a1d296ae2b29025b87c6d7
+== run 1 a_heal_republishes_the_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 13.03s
+
+== run 1 a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.92s
+
+== run 1 a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later exit 0 11 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 10.81s
+
+== run 2 a_heal_republishes_the_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.21s
+
+== run 2 a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left exit 0 12 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.54s
+
+== run 2 a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later exit 0 11 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 10.83s
+
+== run 3 a_heal_republishes_the_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.89s
+
+== run 3 a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.46s
+
+== run 3 a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later exit 0 11 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 10.87s
+
+== run 4 a_heal_republishes_the_head_once_a_named_holder_has_left exit 0 12 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.27s
+
+== run 4 a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.40s
+
+== run 4 a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later exit 0 11 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 10.84s
+
+== run 5 a_heal_republishes_the_head_once_a_named_holder_has_left exit 0 12 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.38s
+
+== run 5 a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left exit 0 13 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 12.66s
+
+== run 5 a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later exit 0 11 s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 10.83s
+
