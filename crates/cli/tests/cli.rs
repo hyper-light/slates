@@ -3725,6 +3725,9 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.discovery.pages",
     "fleet.learner.fetches",
     "fleet.learner.fetch_paced",
+    // A learner's fetch period that found no session to any member of its region yet, skipped and asked again the next
+    // period, as `fetch_paced` is (310d7010 added it; B10's Linux gate found each forming node counting it once).
+    "fleet.learner.no_session",
     "fleet.plane.announce_lends",
     "fleet.plane.announcements_sent",
     // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
