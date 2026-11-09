@@ -10576,11 +10576,16 @@ pub(crate) async fn rebuild_recovered(
 
 /// The held replicas' content and registers from the image (AUD-29-59; §4.8 persistence before reply), what
 /// [`rebuild_recovered`] takes back before the volumes.
-fn restore_held_image(state: &mut ShardState, held: &[u8], rebuilt: &mut Rebuilt) {
+fn restore_held_image(
+  state: &mut ShardState,
+  held: &[slates_vfs::recover::HeldPiece],
+  rebuilt: &mut Rebuilt,
+) {
   // The held replicas' blocks too (A-64), then every claim is committed: the recovered image names them all, so none
   // is reused before this daemon's first publication commits.
-  // The held image carries the content hold and the held registers (§4.8 persistence before reply): split, the
-  // content claimed and rebuilt below, the registers rebuilt with their fences once the hold is.
+  // The held image's pieces carry the content hold, the held registers and the live copies (§4.8 persistence before
+  // reply; A-270): split, the content claimed and rebuilt below, the registers rebuilt with their fences once the hold
+  // is.
   let held = match crate::content_holder::split_held(held) {
     Ok(held) => Some(held),
     Err(e) => {
