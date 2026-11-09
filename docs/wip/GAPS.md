@@ -14564,8 +14564,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     EACCES]` (diag-slabs-42, run 42517407649); with the fix, v4 `EROFS` for each and v3 `EACCES` for each open
     (diag-slabs-43, run 42517769901, with workspace clippy, the NFS bridge and the server's kernel NFS suites green). v3's
     `EACCES` at open is its limit, not a miss (A-258). The bridge's read-only export test is red with the ACCESS mask
-    taken out (granted 29 for 1). Conformance's probe counts the v3 opens as that limit (its 0fad3bb2), and its run on
-    this fix (diag-conformance-32) is owed.
+    taken out (granted 29 for 1). Conformance's probe counts the v3 opens as that limit (its 0fad3bb2). Its run on this
+    fix (diag-conformance-32, run 42523564648): v3 10 of 14 `EROFS` and the three opens at the limit, v4 13 of 14; the
+    other in each, `truncate/10.t`'s path truncate, answers `EACCES`, which is the protocol's limit on v3 and v4 alike,
+    not a slates defect: the client asks ACCESS for a regular file's write without an open, and Linux's own server
+    leaves the bit out for a read-only export (`fs/nfsd/vfs.c` `nfsd_permission`, `nfsd_access`), so knfsd gives the same
+    `EACCES` (A-258; the supervisor's decision (a): the write bits stay withheld over v4, since granting them makes
+    `access(W_OK)` call a read-only file writable).
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
