@@ -1,0 +1,12 @@
+runner x86_64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit dace24e1f
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 1 exit 0 took 110s load 10.62
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 2 exit 0 took 115s load 12.37
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 3 exit 0 took 116s load 12.30
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 4 exit 0 took 114s load 12.74
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 5 exit 0 took 127s load 12.88
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 6 exit 0 took 146s load 12.12
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 7 exit 0 took 113s load 12.05
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 8 exit 0 took 114s load 12.41
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 9 exit 0 took 121s load 12.50
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 10 exit 0 took 130s load 12.94
+== a_share_of_a_green_made_after_its_last_version_survives_a_takeover passed 10 failed 0
