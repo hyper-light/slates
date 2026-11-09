@@ -1,0 +1,52 @@
+name: DIAG live-fixes the learner tests on one CPU with two spinners on it, red arm (not for main)
+
+on:
+  push:
+    branches: [diag-live-fixes-68]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  arm:
+    name: Learner red on one CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The tests on CPU 0
+        shell: bash
+        run: |
+          R=../results.txt
+          echo "red on ubuntu-latest, $(nproc) CPUs, pinned to CPU 0 with 2 spinners, $(date -u), head $(git rev-parse HEAD)" > $R
+          for s in 1 2; do taskset -c 0 sh -c 'while :; do :; done' & done
+          for run in 1 2 3; do
+            for t in a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone a_learner_fetches_the_councils_committed_configuration_over_the_transport; do
+              status=0
+              perl -e 'alarm shift; exec @ARGV' 1500 taskset -c 0 cargo test --locked -p slates-server --test fleet -- --nocapture --exact $t > ../run.log 2>&1 || status=$?
+              echo "== run $run $t exit $status" | tee -a $R
+              grep -E -A3 'panicked|^test result|fleet wait gave up' ../run.log | cut -c1-3000 >> $R || true
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-68 results"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-live-fixes-68"
