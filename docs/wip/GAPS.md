@@ -158,6 +158,17 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
+> `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
+> field (`dropped_unconfirmed`); an old entry is refused only because it runs out of bytes there (`Truncated`), and a
+> new one at an old build because bytes are left over (`LengthMismatch`). Every caller refuses rather than defaults:
+> - a retained council's base and view at restart (`retention::restore`);
+> - snapshots (`fold::for_saved`, `fold::install`);
+> - a learner's fetch and a join (`consensus`).
+> So a mixed fleet stops typed, but by accident of length: a later change that keeps the length, or appends a field
+> whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
+> mismatch.
+
 > **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
 > A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
 > what it had learned, and confirmed its share. The retirement was then pruned, `RegionalConfiguration::lineage` read

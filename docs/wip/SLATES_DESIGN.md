@@ -19837,3 +19837,14 @@ Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
 flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
 §4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
 here; a lineage model is owed with (ii).
+
+**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
+the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
+old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
+- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
+- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
+- an installed snapshot (`fold::install` declines it);
+- a learner's fetch and a join (`consensus`).
+A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
+But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
+none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
