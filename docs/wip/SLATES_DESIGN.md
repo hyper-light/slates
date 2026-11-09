@@ -2042,11 +2042,11 @@ permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that moun
 macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Over NFS an ACCESS reply grants no
 write bit to such an attachment, and an NFSv4 OPEN for writing answers `NFS4ERR_ROFS`. NFSv3 has no OPEN: the client
 decides an open from ACCESS, and Linux reports an ungranted bit as `EACCES`, so over v3 an open for writing answers
-`EACCES` and every change that reaches the server `EROFS` (A-258, v3's limit). A path `truncate(2)` and `access(2)`
+`EACCES` and every change that reaches the server `EROFS` (A-260, v3's limit). A path `truncate(2)` and `access(2)`
 for writing answer `EACCES` over v3 and v4 alike: the client asks ACCESS for a regular file's write without an open
 (`nfs_permission`), and no NFS server can make ACCESS say `EROFS`. Linux's own server answers a read-only export the
 same way (`fs/nfsd/vfs.c`, `nfsd_permission` refuses `nfserr_rofs`, and `nfsd_access` leaves the bit out rather than
-fail the call), so this is the protocol's limit, not a slates defect (A-258). Until 2026-11-08 the bridge granted
+fail the call), so this is the protocol's limit, not a slates defect (A-260). Until 2026-11-08 the bridge granted
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
@@ -18845,7 +18845,7 @@ Applied in the same change to:
   successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
-### A-258 — Over NFSv3 a read-only attachment's open for writing answers `EACCES`, v3's limit (accepted 2026-11-08, the supervisor's decision)
+### A-260 — Through a read-only NFS attachment, what ACCESS decides answers `EACCES`: v3's open for writing, and a path truncate and `access(W_OK)` over v3 and v4 (accepted 2026-11-08, the supervisor's decisions)
 Applied in the same change to:
 - §4.6 ("A read-only attachment is a read-only file system");
 - `crates/bridge-nfs/src/procedures.rs` (`access_result`, `change_refusal`, `extension::CHANGE_ALLOWED`, `state_io`),
