@@ -336,7 +336,12 @@ NFS bridge (FUSE on Linux); `slates unmount PATH` removes it. On Linux the FUSE 
 FUSE mounts and unmounts only under your home directory, `/mnt`, `/media`, `/tmp` and `/run/user/UID`, for every caller
 and inside containers too; a `PATH` anywhere else is refused `Permission denied` ("the mount helper returned no device
 descriptor … fusermount3: mount failed"). Mount under one of those directories, or have an administrator allow the
-path in `/etc/apparmor.d/local/fusermount3` and reload the profile (`apparmor_parser -r /etc/apparmor.d/fusermount3`). `--subtree DIR` presents only that
+path in `/etc/apparmor.d/local/fusermount3` and reload the profile (`apparmor_parser -r /etc/apparmor.d/fusermount3`).
+(Measured 2026-11-09 on GitHub's ubuntu-26.04 runner image 20261101.186.1, fusermount3 3.18.2; the profile's own file is
+the authority, so read it on your host.) slates does not predict the profile: it attempts the mount, and when the
+kernel refuses it and the kernel labels the helper with an AppArmor profile, `slates mount` is refused
+`MountRefusedByHelperPolicy`, naming the helper, the profile and its mode, and the host's profile and local-override
+files. `--subtree DIR` presents only that
 directory of the volume: it is the mount's root, and nothing outside it can be reached through the mount,
 not even by a handle made by hand. A subtree that is a file or does not exist is refused, and nothing is mounted. `slates advance ATTACHMENT
 [SNAPSHOT]` moves a snapshot's mount to another snapshot of the volume (the newest when none is given) and prints

@@ -3076,6 +3076,22 @@ pub enum Refusal {
     /// The requester, by its host's certificate anchor and its account.
     principal: Principal,
   },
+  /// The host refused the mount at the requested point through its mount helper's own policy: the kernel refused the
+  /// helper's mount, and the kernel labels the helper with an AppArmor profile (Ubuntu 26.04 confines `fusermount3` to
+  /// a few directories, `docs/cli.md`). Read from the exited helper's label after the kernel refused, never predicted
+  /// (GAPS, decided 2026-11-09). The two files are where to look on the host, named by convention. Appended.
+  MountRefusedByHelperPolicy {
+    /// The helper.
+    helper: String,
+    /// The AppArmor profile confining it, as the kernel labels it.
+    profile: String,
+    /// The profile's mode, as the kernel labels it (`enforce`).
+    mode: String,
+    /// Where the profile's file is kept on the host, by convention.
+    policy_file: String,
+    /// Where an operator's local rules for it are kept on the host, by convention.
+    local_override: String,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.

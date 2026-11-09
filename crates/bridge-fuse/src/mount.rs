@@ -140,6 +140,10 @@ pub enum MountError {
   /// The helper refused `allow_other`: the host's `/etc/fuse.conf` does not grant `user_allow_other`, an
   /// operator's setting (§4.6). Read from the helper's own refusal, never from the file (R1).
   AllowOtherNotGranted,
+  /// The kernel refused the helper's mount (`Permission denied`) and the kernel labels the helper with an AppArmor
+  /// profile (GAPS, decided 2026-11-09): the profile's policy refused this mount point. Read from the exited helper's
+  /// own label, never predicted ([`crate::helper_policy`]).
+  RefusedByHelperPolicy(crate::helper_policy::HelperPolicy),
 }
 
 impl std::fmt::Display for MountError {
@@ -148,6 +152,11 @@ impl std::fmt::Display for MountError {
       Self::Socketpair { code } => write!(f, "socketpair refused (code {code:?})"),
       Self::AllowOtherNotGranted => f.write_str(
         "the mount helper refused allow_other: the host does not grant user_allow_other in /etc/fuse.conf",
+      ),
+      Self::RefusedByHelperPolicy(policy) => write!(
+        f,
+        "the AppArmor profile {} ({}) confining {} refused this mount point (see {} and {})",
+        policy.profile, policy.mode, policy.helper, policy.policy_file, policy.local_override
       ),
       Self::Spawn { code } => write!(
         f,
@@ -175,6 +184,28 @@ impl std::fmt::Display for MountError {
 }
 
 impl std::error::Error for MountError {}
+
+/// The AppArmor profile that refused the helper's mount: the helper said the kernel refused it
+/// ([`crate::helper_policy::PERMISSION_DENIED`]) and its exited label names a profile and mode; `None` otherwise.
+#[cfg(target_os = "linux")]
+fn refusing_policy(
+  message: &str,
+  label: Option<&str>,
+) -> Option<crate::helper_policy::HelperPolicy> {
+  if !message.contains(crate::helper_policy::PERMISSION_DENIED) {
+    return None;
+  }
+  crate::helper_policy::policy_of(FUSERMOUNT, label?)
+}
+
+/// No other platform mounts through `fusermount3`, so no helper policy is diagnosed there.
+#[cfg(not(target_os = "linux"))]
+fn refusing_policy(
+  _message: &str,
+  _label: Option<&str>,
+) -> Option<crate::helper_policy::HelperPolicy> {
+  None
+}
 
 /// A mount: the channel over the mounted connection and the mount point, so `unmount` can tear
 /// it down with the same helper.
@@ -513,6 +544,13 @@ impl PendingHandshake {
         }
       }
     }
+    // A helper that handed back no device is a refusal: its label is read while it is held unreaped, before
+    // `try_finish` reaps it, so the label is the exited helper's own (GAPS, 2026-11-09).
+    let label = if self.device.is_none() {
+      self.guard.exited_label()
+    } else {
+      None
+    };
     match self.guard.try_finish() {
       Ok(None) => Progress::Waiting(Awaiting::Exit),
       Ok(Some(status)) => Progress::Done(match self.device.take() {
@@ -521,6 +559,8 @@ impl PendingHandshake {
           let message = self.helper_message();
           if message.contains(ALLOW_OTHER_REFUSAL) {
             Err(MountError::AllowOtherNotGranted)
+          } else if let Some(policy) = refusing_policy(&message, label.as_deref()) {
+            Err(MountError::RefusedByHelperPolicy(policy))
           } else if device.is_some() {
             Err(MountError::Helper {
               exit: HelperExit::of(status),
@@ -610,6 +650,17 @@ impl HelperGuard {
       // caller error, reported rather than panicked (the no-panic law).
       None => Err(MountError::Spawn { code: None }),
     }
+  }
+
+  /// The helper's AppArmor label once it has exited, read while it is held unreaped (`waitid` with `WNOWAIT`), so the
+  /// `/proc` entry is still the helper's; `None` while it runs, or when the label cannot be read.
+  fn exited_label(&self) -> Option<String> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let child = self.0.as_ref()?;
+    let pid = Pid::from_raw(i32::try_from(child.id()).ok()?)?;
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    waitid(WaitId::Pid(pid), options).ok()??;
+    crate::helper_policy::label_of(child.id())
   }
 
   /// Reaps the helper if it has exited, taking the child; `None` while it still runs.

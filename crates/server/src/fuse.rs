@@ -394,6 +394,17 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
             reason: slates_ipc::protocol::UnsupportedReason::AllowOtherNotGranted,
           })
         }
+        Err(MountError::RefusedByHelperPolicy(policy)) => {
+          s.count(MOUNT_REFUSED, 1);
+          release_unmounted_lease(s, &pending.record);
+          crate::verbs::refused(Refusal::MountRefusedByHelperPolicy {
+            helper: policy.helper,
+            profile: policy.profile,
+            mode: policy.mode,
+            policy_file: policy.policy_file,
+            local_override: policy.local_override,
+          })
+        }
         Err(error) => {
           s.count(MOUNT_REFUSED, 1);
           release_unmounted_lease(s, &pending.record);

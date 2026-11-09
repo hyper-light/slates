@@ -516,6 +516,20 @@
 > those directories unless an administrator extends `/etc/apparmor.d/local/fusermount3`. Owed: the lane's run at
 > this change (no CI run of it yet).
 
+> **A FUSE mount the host's helper policy refuses is diagnosed from the helper's own AppArmor label, never predicted
+> (decided 2026-11-09, the supervisor's; slabs).** On a host whose `fusermount3` is confined (Ubuntu 26.04, the entry
+> above), a `slates mount` outside the profile's directories answered only the helper's "Permission denied". The
+> decision: the mount is attempted as before and the kernel decides; when the helper hands back no device and says
+> "Permission denied", its AppArmor label, read from `/proc/<pid>/attr` while the exited helper is held unreaped, names
+> the profile and mode, and the daemon answers `MountRefusedByHelperPolicy { helper, profile, mode, policy_file,
+> local_override }`; otherwise the refusal it answered before. No directory list in code: re-implementing the
+> profile's globs would be a second authority, drift from local rules, other distributions and the next profile, and
+> refuse mounts the kernel allows; `docs/cli.md` holds the measured list. No file fallback: the label read held in
+> every leg measured (diag-slabs-57: the host's runner user, the host's root, the container's root), so a fallback would
+> run nowhere (§2 item 7). The first build read the profile's file instead and could not fire in a container, where
+> the host's file is absent (diag-slabs-55/56 skipped). Test: `a_mount_the_helpers_apparmor_profile_refuses_names_the_profile`.
+> Record: `docs/bugs/2026-11-09-a-mount-fusermount3s-apparmor-profile-refused-said-only-permission-denied.md`.
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
