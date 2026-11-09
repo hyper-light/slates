@@ -1,6 +1,6 @@
-//! Measurement (not a gate): what `changed_since` costs on a large green with a long history when it reports every
-//! dimension (`Green::changed_between(v, head)`) against the content index alone (`Green::changed_since`, before
-//! 2026-11-08), §4.16. Skips loudly without the tree; run in release:
+//! Measurement (not a gate): what `changed_since` costs on a large green with a long history, read from the change
+//! index (`Green::changes_after`), against `Green::changed_between(v, head)`, the per-path histories' walk of every path,
+//! at a dense span and at sparse ones, on a tree and on several copies of it (`SLATES_TREE_COPIES`), §4.16. Skips loudly without the tree; run in release:
 //! `SLATES_KERNEL_TREE=<linux-v7.4-rc1> cargo test --release -p slates-merge --test changed_since_cost -- --ignored --nocapture`.
 // Test harness code: an unwrap here is a failed run.
 #![allow(
@@ -31,6 +31,9 @@ const OTHER_DIMENSIONS_EVERY: u64 = 10;
 const PAGE_PATHS: usize = 150;
 /// Shape: the best of this many reads is reported.
 const ROUNDS: usize = 5;
+/// Shape: how many copies of the tree the green holds (`SLATES_TREE_COPIES`, default one): each under a prefix of its
+/// own, so a span's changes stay the same while the tree grows.
+const DEFAULT_COPIES: usize = 1;
 
 /// Every file under `root`, as paths relative to it.
 fn files_under(root: &std::path::Path) -> Vec<String> {
@@ -77,7 +80,14 @@ fn changed_since_over_every_dimension_against_the_content_index() {
     eprintln!("skipped: set SLATES_KERNEL_TREE to a kernel tree");
     return;
   };
-  let paths = files_under(std::path::Path::new(&root));
+  let copies = std::env::var("SLATES_TREE_COPIES")
+    .ok()
+    .and_then(|copies| copies.parse().ok())
+    .unwrap_or(DEFAULT_COPIES);
+  let tree = files_under(std::path::Path::new(&root));
+  let paths: Vec<String> = (0..copies)
+    .flat_map(|copy| tree.iter().map(move |path| format!("copy-{copy}/{path}")))
+    .collect();
   let origin = Origin {
     files: paths
       .iter()
@@ -113,34 +123,33 @@ fn changed_since_over_every_dimension_against_the_content_index() {
   }
   eprintln!("history of {SUBMITS} submits in {:?}", built.elapsed());
   let head = green.head();
-  for version in [0, head / 2, head.saturating_sub(10)] {
+  for version in [0, head / 2, head.saturating_sub(10), head.saturating_sub(1)] {
     let expected = green.changed_between(version, head);
-    let walked: Vec<String> = green.changed_since_after(version, None).cloned().collect();
     assert_eq!(
-      walked, expected,
-      "the merged walk is changed_between(v, head) exactly"
+      green.changed_since(version),
+      expected,
+      "the change index answers changed_between(v, head) exactly"
     );
     let (whole_ns, whole_len) = best(|| green.changed_between(version, head).len());
-    let (merged_ns, merged_len) = best(|| green.changed_since_after(version, None).count());
+    let (merged_ns, merged_len) = best(|| green.changed_since(version).len());
     let (paged_ns, pages) = best(|| {
-      let mut after: Option<String> = None;
+      let mut cursor = None;
       let mut pages = 0usize;
       loop {
-        let page: Vec<String> = green
-          .changed_since_after(version, after.as_deref())
+        let page: Vec<_> = green
+          .changes_after(version, cursor)
           .take(PAGE_PATHS)
-          .cloned()
           .collect();
         pages += 1;
         match page.last() {
-          Some(last) if page.len() == PAGE_PATHS => after = Some(last.clone()),
+          Some(last) if page.len() == PAGE_PATHS => cursor = Some((last.version, last.index + 1)),
           _ => break,
         }
       }
       pages
     });
     eprintln!(
-      "since version {version} of {head}: changed_between {whole_ns} ns ({whole_len} paths) | merged walk {merged_ns} \
+      "since version {version} of {head}: changed_between {whole_ns} ns ({whole_len} paths) | change index {merged_ns} \
        ns ({merged_len}) | paged walk {paged_ns} ns ({pages} pages of {PAGE_PATHS}, {} ns a page)",
       paged_ns / pages.max(1) as u128
     );

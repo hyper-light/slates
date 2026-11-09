@@ -63,6 +63,8 @@ fn fingerprint(st: &Stat) -> Fingerprint {
     uid: st.st_uid,
     gid: st.st_gid,
     birth_ns: stamp_ns(widen(st.st_birthtime), widen(st.st_birthtime_nsec)),
+    // A Unix file system holds no Windows attribute bits (A-262).
+    windows: 0,
   }
 }
 
@@ -86,6 +88,9 @@ fn fingerprint(st: &Statx) -> Fingerprint {
     } else {
       0
     },
+
+    // A Unix file system holds no Windows attribute bits (A-262).
+    windows: 0,
   }
 }
 

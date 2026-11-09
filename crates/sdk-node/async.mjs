@@ -291,6 +291,9 @@ export class AsyncClient {
         this._pending.delete(event.ticket);
         this._c.finish(event.ticket);
         entry.resolve(value);
+      } else {
+        // A chained call took a step (a listing's next page, a large edit's next put): its next reply is reported.
+        this._c.continued(event.ticket);
       }
     }
     if (this._pending.size === 0) {

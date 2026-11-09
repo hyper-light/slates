@@ -75,6 +75,8 @@ impl Mock {
       atime: 0,
       mtime: self.mtime,
       ctime: self.ctime,
+      btime: self.ctime,
+      windows: 0,
       change: 0,
     }
   }
@@ -118,6 +120,8 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        btime: 0,
+        windows: 0,
         change: 0,
       }),
       2 => Ok(self.file_attr()),
@@ -299,6 +303,8 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        btime: 0,
+        windows: 0,
         change: 0,
       },
       8,

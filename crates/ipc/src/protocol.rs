@@ -198,17 +198,19 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
-  /// One page of the files a green changed strictly after `version` (§4.16): what a lagging work reconciles. In path
-  /// order past `after`: `None` begins, and each page that says `more` is continued after its last path. A page holds
-  /// what one reply chunk holds (§4.3), so the client walks an answer of any length; a path changed after `version`
-  /// when the walk began is answered exactly once.
+  /// One page of the paths a green changed strictly after `version` (§4.16, A-264): what a lagging work reconciles.
+  /// Read from the green's change index in version order from `from` (`None` begins), each page ending where one reply
+  /// chunk is full (§4.3) or where the shard's slice of its turn is spent, whichever comes first, so a page costs what
+  /// it passes and never the green's tree. A page may hold no path and still carry a cursor; the client walks to the
+  /// end. A path changed after `version` when the walk began is answered once, and once more if it changes again
+  /// during the walk. A version past the head is refused `UnknownBase`.
   ChangedSince {
     /// The green.
     green: VolumeId,
     /// The base version to compare against.
     version: u64,
-    /// The last path of the previous page, or `None` for the first page.
-    after: Option<String>,
+    /// Where the previous page stopped, or `None` for the first page.
+    from: Option<ChangedCursor>,
   },
   /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
   CreateWork {
@@ -1865,6 +1867,9 @@ pub struct VolumeSummary {
   pub overlay: bool,
   /// Whether it is live-shipped (A-200). Appended.
   pub live_shipped: bool,
+  /// Why recovery could not rebuild it after the daemon's restart, when it could not (§4.8): every verb on it but its
+  /// destroy answers [`Refusal::NotRecovered`] with this cause. Appended.
+  pub not_recovered: Option<RecoveryCause>,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
@@ -2038,6 +2043,10 @@ pub struct StatusReport {
   pub mounts_elided: u32,
   /// The volume's journal: its budget, and what its consuming rounds found waiting (§4.5). Appended.
   pub journal: JournalReport,
+  /// Unlinked files kept for a mount that survived a daemon's takeover (U10): its kernel may hold a handle the dead
+  /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
+  /// quota, until that mount ends. Zero outside a takeover. Appended.
+  pub takeover_kept: u32,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -2721,6 +2730,16 @@ pub struct GrantSummary {
   pub state: String,
 }
 
+/// Where a `changed_since` walk stands (§4.16, A-264): the green version it is in and how many of that version's
+/// changed paths it has passed. A committed version's paths never change, so the cursor stays valid as the green moves.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangedCursor {
+  /// The version.
+  pub version: u64,
+  /// The entries of `version` passed.
+  pub passed: u32,
+}
+
 /// An audit record on the wire (§4.15).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry {
@@ -3187,13 +3206,13 @@ pub enum ReplyBody {
     /// The head version.
     head: u64,
   },
-  /// One page of the files changed since a version (`ChangedSince`), in path order.
+  /// One page of the paths changed since a version (`ChangedSince`).
   ChangedSince {
-    /// The changed file paths of this page.
+    /// The changed paths this page answers.
     paths: Vec<String>,
-    /// Whether more follow: the next page is asked after this page's last path. A flag, not the path again, so a page
+    /// Where the next page continues, or `None` when the walk is done. A version and a count, never a path, so a page
     /// holding one long path need not hold it twice.
-    more: bool,
+    next: Option<ChangedCursor>,
   },
   /// A work volume was created over a green.
   WorkCreated {

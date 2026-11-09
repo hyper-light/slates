@@ -118,7 +118,7 @@ fn taken_over(store: &Store, image: &VolumeImage, host: &mut SimHost) -> (Store,
   )
   .unwrap();
   recovered
-    .settle_recovered_references(&mut after, |id| id == KERNEL)
+    .settle_recovered_references(&mut after, |id| id == KERNEL, &[KERNEL])
     .unwrap();
   (after, recovered)
 }

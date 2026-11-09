@@ -265,8 +265,12 @@ impl VolumeBridge<'_> {
       .is_none_or(|mode| mode & PERMISSION_BITS == current.mode);
     let same_owner = changes.uid.is_none_or(|uid| uid == current.uid)
       && changes.gid.is_none_or(|gid| gid == current.gid);
-    let times = changes.atime.is_some() || changes.mtime.is_some() || changes.ctime.is_some();
-    if !same_mode || !same_owner || times {
+    let times = changes.atime.is_some()
+      || changes.mtime.is_some()
+      || changes.ctime.is_some()
+      || changes.btime.is_some();
+    // An AppleDouble view keeps no Windows attribute bits of its own (A-262): a view no Windows host lists.
+    if !same_mode || !same_owner || times || changes.windows.is_some() {
       return Err(VfsError::NotPermitted);
     }
     if let Some(size) = changes.size {
@@ -335,6 +339,8 @@ impl VolumeBridge<'_> {
       atime: mtime,
       mtime,
       ctime,
+      btime: owner_attrs.btime,
+      windows: 0,
       change: self.volume.view_change(self.store, owner)?,
     })
   }

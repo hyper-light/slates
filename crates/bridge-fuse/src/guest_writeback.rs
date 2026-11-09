@@ -10,8 +10,8 @@
 //! write: 4,095 of a page's 4,095 other-path bytes in `a_guests_stale_cache_write_back_never_reverts_another_paths_write`
 //! (`crates/bridge-virtiofs/tests/device.rs`).
 //!
-//! **The rule** (A-192's, for NFS; the host FUSE mount masks instead, A-139/140): a write-back holding stale bytes that
-//! differ from the file's bytes now is refused `EIO` whole, and the other path's change survives. Nothing is inferred
+//! **The rule** (every transport's since A-248: [`crate::coherence::judge_writeback`]): a write-back holding stale bytes
+//! that differ from the file's bytes now is refused `EIO` whole, and the other path's change survives. Nothing is inferred
 //! (CLAUDE.md, banned item 11): the write-back is applied whole or refused whole. Where the states cannot tell (a journal
 //! that no longer reaches back, a file lost for room), it is refused too. The guest learns of a refusal at its next
 //! `fsync` or `msync` of the file.
@@ -31,10 +31,12 @@
 
 use crate::abi::Opcode;
 use crate::coherence::{
-  MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritableOpens,
+  MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritableOpens, WritebackVerdict,
+  judge_writeback,
 };
 use crate::request::{ReadIn, Request, WriteIn};
-use slates_bridge_core::{Bridge, OpContext};
+use slates_bridge_core::dax_backing::read_whole;
+use slates_bridge_core::{Bridge, ObjectId, OpContext};
 
 /// The dirty-page write-back rule for one guest (see the module doc).
 #[derive(Default)]
@@ -46,7 +48,8 @@ pub struct GuestWriteback {
   fed_through: Option<u64>,
   /// The bytes of metadata the states were charged ([`Bridge::admit_states`]), the guest's until its device ends.
   charged: u64,
-  /// Write-backs refused because they held stale bytes another path had changed: the rule's non-vacuity count.
+  /// Write-backs refused because they held stale bytes another path had changed that differ from the file's: the rule's
+  /// non-vacuity count.
   refused_stale: u64,
   /// Write-backs refused because the states could not tell. Zero is the healthy reading.
   refused_unknown: u64,
@@ -120,8 +123,9 @@ impl GuestWriteback {
     self.fed_through = Some(head);
   }
 
-  /// Judges a cache write-back of `nodeid` against the states fed through the head: applied when none of its bytes is
-  /// stale, refused `EIO` when any is or when it cannot be told.
+  /// Judges a cache write-back of `nodeid` against the states fed through the head by the shared rule
+  /// ([`judge_writeback`]): applied whole when none of its stale bytes differs from the file's, refused `EIO` whole when
+  /// one does or when it cannot be told.
   fn judge(
     &mut self,
     request: &[u8],
@@ -131,24 +135,36 @@ impl GuestWriteback {
     cx: &OpContext,
     reply: &mut [u8],
   ) -> usize {
-    let stale = Request::parse(request)
+    let write = Request::parse(request)
       .ok()
-      .and_then(|parsed| WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok())
-      .and_then(|write| {
-        let end = write
-          .offset
-          .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
-        self
-          .states
-          .stale_after(nodeid, write.offset..end, head, &[])
-      });
-    match stale {
-      Some(stale) if stale.is_empty() => crate::bridge::dispatch(request, bridge, cx, reply),
-      Some(_) => {
+      .and_then(|parsed| WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok());
+    let verdict = write.map_or(WritebackVerdict::Unknown, |write| {
+      let end = write
+        .offset
+        .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
+      let stale = self
+        .states
+        .stale_after(nodeid, write.offset..end, head, &[]);
+      let object = ObjectId {
+        inode: nodeid,
+        generation: 0,
+      };
+      judge_writeback(
+        stale.as_deref(),
+        write.offset,
+        write.data,
+        |at, len, out| read_whole(bridge, cx, object, (at, len), out).is_ok(),
+      )
+    });
+    match verdict {
+      WritebackVerdict::Apply | WritebackVerdict::Identical => {
+        crate::bridge::dispatch(request, bridge, cx, reply)
+      }
+      WritebackVerdict::Conflict => {
         self.refused_stale = self.refused_stale.saturating_add(1);
         crate::bridge::refuse_with_eio(request, reply)
       }
-      None => {
+      WritebackVerdict::Unknown => {
         self.refused_unknown = self.refused_unknown.saturating_add(1);
         crate::bridge::refuse_with_eio(request, reply)
       }

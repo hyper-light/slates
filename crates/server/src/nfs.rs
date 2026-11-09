@@ -1213,7 +1213,7 @@ fn stale_write_back(
     crate::nfs_writeback::note_connection(s, connection, held, inherited);
     crate::nfs_writeback::judge(s, connection, (handle.volume, handle.inode), at, data)
   })?;
-  if verdict == crate::nfs_writeback::Verdict::Apply {
+  if verdict.applies() {
     return None;
   }
   Some((AcceptStatus::Success, io_failure_reply(NFSPROC3_WRITE)?))
@@ -2239,6 +2239,12 @@ impl compound::Backend for RoutedBackend {
 
   fn now_ns(&self) -> u64 {
     futures::now_ns()
+  }
+
+  /// Every open and delegation the daemon records holds its file in the volume (A-260, `crate::nfs_state::hold`),
+  /// whichever shard owns the file, and the hold is taken again from the partition's records after a restart.
+  fn preserves_unlinked(&self) -> bool {
+    true
   }
 
   fn owns_file(&self, fh: &Nfsfh3) -> bool {

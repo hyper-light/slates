@@ -1287,8 +1287,10 @@ fn a_process_outside_the_anchor_cannot_take_either_holders_mount_handles() {
   );
 }
 
-/// A-198, Step 9.4. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
-/// the CLI's typed failure exit, the original daemon still serving, and the original drive still returning its file.
+/// A-198, Step 9.4; A-254. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
+/// the CLI's typed failure exit, refused at the instance's rendezvous before it creates anything (A-254: the owner is
+/// decided first), the original daemon still serving, and the original drive still returning its file. Before A-254
+/// the second daemon got as far as its segment and was refused there (`CreateFileMappingW`, the name a live section).
 #[test]
 fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
   if !live_mount_runs() {
@@ -1321,8 +1323,12 @@ fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
     "the foreign daemon must return the CLI's startup failure exit"
   );
   assert!(
-    error.contains("the name is already a live section") && error.contains("Some(183)"),
-    "the second daemon must reach and fail the existing-instance ownership check: {error}"
+    error.contains("a live process already holds instance") && error.contains("rendezvous"),
+    "the second daemon must be refused at the rendezvous, before it creates anything (A-254): {error}"
+  );
+  assert!(
+    !error.contains("CreateFileMappingW"),
+    "and never reach the segment, whose name the live daemon holds: {error}"
   );
   assert_eq!(daemon_pid(&fixture.instance), Some(owner));
   assert_eq!(
@@ -2057,4 +2063,111 @@ fn unmount_naming_the_unasked(instance: &str, drive: &str, kind: &str) {
     "the unmount of {drive} names the volume it could not ask, by its refusal ({kind}): {err}"
   );
   assert!(drive_goes(drive), "the drive {drive} goes");
+}
+
+/// Makes `base` on the runner's disk with an ordinary file, a read-only one and a hidden one, each through the Windows
+/// shell (`echo`, then `attrib`), so the test writes no file of its own.
+fn make_attribute_base(base: &str) {
+  cmd(&["mkdir", base]);
+  for name in ["plain.txt", "locked.txt", "hidden.txt"] {
+    cmd(&["echo", "from the disk", ">", &format!("{base}\\{name}")]);
+  }
+  cmd(&["attrib", "+R", &format!("{base}\\locked.txt")]);
+  cmd(&["attrib", "+H", &format!("{base}\\hidden.txt")]);
+}
+
+/// Through the drive at `drive`, over [`make_attribute_base`]'s files: each one's attributes, the ordinary file's append
+/// and delete, and the read-only file's refusals of both.
+#[allow(clippy::disallowed_methods)] // file calls through the drive under test
+fn assert_attributes_through(drive: &str) {
+  use std::io::Write;
+  use std::os::windows::fs::MetadataExt;
+  /// Format: `FILE_ATTRIBUTE_READONLY` and `FILE_ATTRIBUTE_HIDDEN`.
+  const READONLY: u32 = 0x1;
+  const HIDDEN: u32 = 0x2;
+  let path = |name: &str| format!("{drive}\\{name}");
+  let attributes = |name: &str| std::fs::metadata(path(name)).unwrap().file_attributes();
+  assert_eq!(
+    attributes("plain.txt") & (READONLY | HIDDEN),
+    0,
+    "an ordinary file is neither read-only nor hidden"
+  );
+  assert_eq!(
+    attributes("locked.txt") & READONLY,
+    READONLY,
+    "the read-only file reads read-only"
+  );
+  assert_eq!(
+    attributes("hidden.txt") & HIDDEN,
+    HIDDEN,
+    "the hidden file reads hidden"
+  );
+  std::fs::OpenOptions::new()
+    .append(true)
+    .open(path("plain.txt"))
+    .unwrap()
+    .write_all(b"appended through the drive\n")
+    .unwrap();
+  std::fs::remove_file(path("plain.txt")).unwrap();
+  let denied = Some(i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED).unwrap());
+  let opened = std::fs::OpenOptions::new()
+    .append(true)
+    .open(path("locked.txt"));
+  assert_eq!(
+    opened.unwrap_err().raw_os_error(),
+    denied,
+    "the read-only file refuses a write"
+  );
+  assert_eq!(
+    std::fs::remove_file(path("locked.txt"))
+      .unwrap_err()
+      .raw_os_error(),
+    denied,
+    "the read-only file refuses its delete"
+  );
+}
+
+/// A-262, the Windows base plane. Do: in a real directory on the runner's disk make an ordinary file, a read-only one
+/// (`attrib +R`) and a hidden one (`attrib +H`); create an overlay volume over the directory and mount it at a drive;
+/// through the drive read each file's attributes, append to the ordinary file and delete it, then try to append to and
+/// delete the read-only one. Expect: the ordinary file reports neither `READONLY` nor `HIDDEN`, takes the append and
+/// deletes; the read-only one reports `READONLY` and refuses both (`ERROR_ACCESS_DENIED`); the hidden one reports
+/// `HIDDEN`. Before, the Windows base reported each file's attribute word as its mode (`ARCHIVE`, `0x20`, as `0o040`),
+/// so the drive took an ordinary file for one its owner may not write.
+#[test]
+fn an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("attrbase");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let base = format!(
+    "{}\\attrbase-{}",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  make_attribute_base(&base);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "over",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "volume create --base: {err}");
+  let id = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  assert_attributes_through(&drive);
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+  cmd(&["attrib", "-R", &format!("{base}\\locked.txt")]);
+  cmd(&["rmdir", "/S", "/Q", &base]);
 }

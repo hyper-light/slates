@@ -1378,7 +1378,9 @@ fn resolve_refusal(error: &dns::DnsError) -> &'static str {
 /// `client` is driven one `establish` step **on its same socket** (kept for a retry on failure, so the
 /// peer's pinned `accept` completes rather than a fresh-port re-dial being ignored — the establishment
 /// fragility that flaked both the probe mesh's formation and the record plane's takeover under load), and a
-/// client that was consumed but whose session was then lost is rebuilt. Returns the updated `(client, session)`.
+/// client that was consumed but whose session was then lost is rebuilt, its handshake run in the same call. Built in
+/// one call and driven in the next, every redial waited a whole link period first: a median of 101 ms over 487 redials
+/// (diag-live-durability-50), on the way of every resumed peer's catch-up. Returns the updated `(client, session)`.
 async fn establish_session(
   client: Option<Endpoint>,
   session: Option<Endpoint>,
@@ -1392,6 +1394,10 @@ async fn establish_session(
   if session.is_some() {
     return (client, session);
   }
+  let client = match client {
+    Some(endpoint) => Some(endpoint),
+    None => client_for(identity, name, (address, plane), certificate, resolver).await,
+  };
   match client {
     Some(mut endpoint) => match endpoint.establish().await {
       Ok(()) => (None, Some(endpoint)),
@@ -1404,7 +1410,10 @@ async fn establish_session(
       // budget ran out was kept forever and, its flight being a local of that first call, never sent
       // another byte (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
       Err(EndpointError::NotReady)
-        if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
+        if keeps_its_socket(
+          endpoint.handshake_budgets_spent(),
+          endpoint.handshake_stall(),
+        ) =>
       {
         count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         (Some(endpoint), None)
@@ -1429,11 +1438,23 @@ async fn establish_session(
         (None, None)
       }
     },
-    None => (
-      client_for(identity, name, (address, plane), certificate, resolver).await,
-      None,
-    ),
+    None => (None, None),
   }
+}
+
+/// Whether a dialer whose `establish` ended `NotReady` retries on the same socket rather than dialing afresh. A peer
+/// that has not answered may still be booting or starved, so it gets [`ESTABLISH_BUDGETS_BEFORE_REDIAL`] budgets. A
+/// dialer past its confirmation has heard from its peer and is waiting on an end that gave up: another budget on this
+/// socket is another 22 s waiting on state that is gone, which is 44 s of a 41.9 s formation at load 170 (2026-11-08).
+fn keeps_its_socket(budgets_spent: u32, stall: Option<HandshakeStall>) -> bool {
+  !matches!(
+    stall,
+    Some(
+      HandshakeStall::ConfirmDeadline
+        | HandshakeStall::ConfirmSilence
+        | HandshakeStall::ConfirmGarbage
+    )
+  ) && budgets_spent < ESTABLISH_BUDGETS_BEFORE_REDIAL
 }
 
 /// Shape: the handshake budgets a dialer spends on one socket before it dials afresh from a new port. The
@@ -1522,6 +1543,10 @@ async fn serve_peer_records(
     let next =
       match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
         Ok(next) => next,
+        Err(EndpointError::PeerReset) => {
+          count_refusal(SERVE_PEER_RESET);
+          return;
+        }
         Err(_) => return,
       };
     let (stream_id, stream, request) = match next {
@@ -4267,6 +4292,16 @@ const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
+
+/// Counter: a borrowed record session returned reset by its peer (A-261, `EndpointError::PeerReset`: the peer restarted
+/// under the same identity and no longer holds it), its link dropped so the link task dials the new process.
+/// Format: a counter name in the daemon's status report.
+const LINK_PEER_RESET: &str = "fleet.link.peer_reset";
+
+/// Counter: a served record session its dialer reset (A-261: a process restarted onto the dialer's port, under its
+/// identity), its serve loop ended.
+/// Format: a counter name in the daemon's status report.
+const SERVE_PEER_RESET: &str = "fleet.serve.peer_reset";
 /// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
 /// record link to it (never established, or removed at its retirement), its session lent to a coordinator
 /// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a
@@ -4348,6 +4383,7 @@ fn dial_fault_counter(error: &EndpointError) -> &'static str {
     EndpointError::Closed => "fleet.dial.fault.closed",
     EndpointError::Admission(_) => "fleet.dial.fault.admission",
     EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    EndpointError::PeerClosed => "fleet.dial.fault.peer_closed",
     _ => "fleet.dial.fault.other",
   }
 }
@@ -4845,6 +4881,7 @@ async fn enroll_record_session(
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
     });
+    crate::live_ship::holder_reached(peer_host);
   }
 }
 
@@ -7073,6 +7110,11 @@ async fn run_record_plane(local: HostId) {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
     slates_rt::registry::with_current(|ctx| ctx.beat_progress());
+    // The merge record plane stamps each version with the period it first works it in, and judges its placement by
+    // it (`merge_service::PLACED_WITHIN_PERIOD`).
+    let _ = state::with_state(|s| {
+      s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+    });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
     // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers
@@ -7795,12 +7837,20 @@ pub(crate) fn take_sessions(
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
 /// removed by its link task), a slot the link task re-established since (holding a newer session, or
 /// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
-/// never installed over a newer session.
+/// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
+/// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
+/// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
+        Some(link)
+          if link.endpoint.is_none() && link.borrowed == returned && endpoint.peer_reset() =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_PEER_RESET, 1);
+        }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
@@ -7857,6 +7907,37 @@ pub(crate) async fn forward_batch_over_leader_session(
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+}
+
+#[cfg(test)]
+mod dial_tests {
+  use super::{ESTABLISH_BUDGETS_BEFORE_REDIAL, HandshakeStall, keeps_its_socket};
+
+  /// §4.8 formation: a dialer past its confirmation redials at once; one whose peer has not answered keeps its socket
+  /// for the budgets a booting or starved peer may need. Do: ask for every stall at no budgets spent and at the limit.
+  /// Expect: a confirmation stall never keeps the socket; every other stall keeps it until the budgets are spent.
+  #[test]
+  fn a_dialer_past_its_confirmation_redials_at_once() {
+    for stall in [
+      HandshakeStall::ConfirmDeadline,
+      HandshakeStall::ConfirmSilence,
+      HandshakeStall::ConfirmGarbage,
+    ] {
+      assert!(!keeps_its_socket(1, Some(stall)), "{stall:?}");
+    }
+    for stall in [
+      HandshakeStall::Silence,
+      HandshakeStall::Repeats,
+      HandshakeStall::Fragments,
+      HandshakeStall::TurnCeiling,
+    ] {
+      assert!(keeps_its_socket(1, Some(stall)), "{stall:?}");
+      assert!(
+        !keeps_its_socket(ESTABLISH_BUDGETS_BEFORE_REDIAL, Some(stall)),
+        "{stall:?}"
+      );
+    }
+  }
 }
 
 #[cfg(test)]
@@ -8072,6 +8153,70 @@ mod tests {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
     Endpoint::client(socket, peer, &identity, &der, "fleet", fleet_shape()).unwrap()
+  }
+
+  /// A record link's redial (A-200's rolling partition flow): do call [`establish_session`] once with no client, to a
+  /// port nothing is bound to. Expect the call that builds the endpoint to run its first handshake too, a budget spent
+  /// before it returns. Before, the build and the handshake were separate calls a link period apart: 100.3 ms at the
+  /// tenth percentile and 100.9 to 101.9 ms at the median over 487 redials (diag-live-durability-50), on the path of every
+  /// resumed peer's catch-up.
+  #[test]
+  fn a_redial_starts_its_handshake_in_the_call_that_builds_it() {
+    let config = slates_rt::runtime::RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 64,
+      timers_per_shard: 64,
+      ring_entries: 64,
+      step_budget_ns: 1_000_000_000,
+      timer_tick_ns: 100_000,
+      batch: 64,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    };
+    let mut sim = slates_rt::sim::SimRuntime::new(&config, 1).unwrap();
+    let shard = sim.shard_ids()[0];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    sim
+      .spawn_on(shard, async move {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["fleet".to_owned()])
+          .unwrap()
+          .self_signed(&key)
+          .unwrap();
+        let der = certificate.der().clone();
+        let identity = Identity::from_der(
+          der.clone(),
+          rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        );
+        let kept = slates_rt::registry::with_current(|context| context.keep(identity))
+          .unwrap()
+          .unwrap();
+        let address = NodeAddress::Ip(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
+        let (client, session) = establish_session(
+          None,
+          None,
+          kept,
+          "fleet",
+          (&address, crate::deploy::Plane::Record),
+          &der,
+          None,
+        )
+        .await;
+        let _ = result_tx.send((
+          client.map(|dial| dial.handshake_budgets_spent()),
+          session.is_some(),
+        ));
+      })
+      .unwrap();
+    sim.run_until_idle();
+    assert_eq!(
+      result_rx.try_recv().unwrap(),
+      (Some(1), false),
+      "the dial is kept with its first handshake budget spent (the peer is silent), no session"
+    );
   }
 
   /// AC-8.1 (§4.8 "Deployment", task #22; docs/bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md):

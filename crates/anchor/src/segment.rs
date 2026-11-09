@@ -12,8 +12,8 @@ use crate::layout::{
   PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
   RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SESSION_SECRET_BYTES,
   SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_PID,
-  SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SESSION_PRESENT, SUP_SESSION_SECRET,
-  SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT,
+  SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -77,6 +77,7 @@ fn segment_words(geometry: &Geometry) -> Words {
           at.saturating_add(SUP_LOG_REFUSALS),
           Width::U64,
         ))
+        .with(WordRun::one(at.saturating_add(SUP_SERVING), Width::U64))
         .with(WordRun::one(
           at.saturating_add(SUP_SESSION_PRESENT),
           Width::U64,
@@ -149,6 +150,7 @@ pub struct Supervision<'a> {
   stop_by: &'a AtomicU64,
   hold_refusals: &'a AtomicU64,
   log_refusals: &'a AtomicU64,
+  serving: &'a AtomicU64,
 }
 
 impl Supervision<'_> {
@@ -187,6 +189,17 @@ impl Supervision<'_> {
     self.started.load(Ordering::Acquire)
   }
 
+  /// The daemon marks that its start, recovery included, is done and it serves (`layout::SUP_SERVING`): `now_ns` in the
+  /// heartbeat's host domain, never zero.
+  pub fn mark_serving(&self, now_ns: u64) {
+    self.serving.store(now_ns.max(1), Ordering::Release);
+  }
+
+  /// When the current daemon began serving, if it has since its start.
+  pub fn serving_since(&self) -> Option<u64> {
+    Some(self.serving.load(Ordering::Acquire)).filter(|at| *at != 0)
+  }
+
   /// The anchor asks the daemon to stop gracefully (`layout::SUP_STOP`): `now_ns` in the heartbeat's host
   /// domain, never zero (a zero reading is taken as one nanosecond), so the request always reads as made.
   pub fn request_stop(&self, now_ns: u64) {
@@ -211,6 +224,7 @@ impl Supervision<'_> {
 
   /// The anchor records a start. A new daemon starts with no stop requested or declared.
   pub fn record_start(&self, pid: u64, now_ns: u64, restart: bool) {
+    self.serving.store(0, Ordering::Release);
     self.stop.store(0, Ordering::Release);
     self.stop_by.store(0, Ordering::Release);
     self.pid.store(pid, Ordering::Release);
@@ -565,6 +579,7 @@ impl AnchorSegment {
       stop_by: self.word_at(spec, SUP_STOP_BY)?,
       hold_refusals: self.word_at(spec, SUP_HOLD_REFUSALS)?,
       log_refusals: self.word_at(spec, SUP_LOG_REFUSALS)?,
+      serving: self.word_at(spec, SUP_SERVING)?,
     })
   }
 

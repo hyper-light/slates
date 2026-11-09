@@ -123,13 +123,20 @@ pub const SUP_HOLD_REFUSALS: usize = 192;
 /// reports as `anchor_log_lines_refused` in `slates status`. Zero in a block an older anchor wrote.
 /// Format: the byte offset inside the supervision block, the word after the hold refusals.
 pub const SUP_LOG_REFUSALS: usize = 200;
+/// The current daemon's **serving** word: when, in the heartbeat's host domain, it finished its start (recovery
+/// included) and began serving; zero until then, and zeroed at every start. An exit after it is a daemon that
+/// recovered, which the restart bound does not count (`supervise.rs`). Zero in a block an older daemon wrote, so every
+/// exit under it counts, as before.
+/// Format: the byte offset inside the supervision block, the word after the refused log lines.
+pub const SUP_SERVING: usize = 208;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon
 /// hold, still opens its session after a daemon restart: a client resuming under its id proves the key before its
 /// seat or its completion records are served, so a stranger that names a dead client's id gets neither. Unlike the
 /// issuer secret it is not minted at every start, since resumption crosses starts.
-/// Format: the byte offset inside the supervision block, the first cache line past the refusal words (208, so 256).
+/// Format: the byte offset inside the supervision block, the first cache line past the refusal and serving words (216,
+/// so 256).
 pub const SUP_SESSION_PRESENT: usize = 256;
 /// Format: the client session secret's offset, the word after its published word.
 pub const SUP_SESSION_SECRET: usize = 264;

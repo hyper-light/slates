@@ -201,6 +201,18 @@ impl Driver {
     }
   }
 
+  /// Keeps a call whose reply the binding took by its verb's poll and that is not over: a chained call (a listing's
+  /// page, a large edit's step, a `changed_since` page) answered `None` while the client sent its next request under
+  /// the same word. Its next reply is reported again, and its deadline counts from now: each step has the reply
+  /// deadline a call has. Before 2026-11-09 a call was reported once until it was finished, so a chain's second reply
+  /// was never reported and the call failed `Stalled` at the deadline.
+  pub fn continued(&mut self, ticket: Ticket) {
+    if let Some(call) = self.calls.get_mut(&ticket) {
+      call.reported = false;
+      call.sent = Instant::now();
+    }
+  }
+
   /// Releases a call the caller no longer awaits (a cancelled future): queued, it is never sent; in flight,
   /// its reply is dropped when it comes.
   pub fn cancel(&mut self, client: &mut Client, ticket: Ticket) {

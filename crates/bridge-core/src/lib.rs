@@ -69,6 +69,13 @@ pub struct NodeAttr {
   pub mtime: i64,
   /// The change time.
   pub ctime: i64,
+  /// The birth time: when the object was made, unless a host whose API sets a creation time set another (WinFsp's
+  /// `SetFileTime`, A-259).
+  pub btime: i64,
+  /// The Windows attribute bits kept beside the mode, at Windows' values (A-262): `HIDDEN`, `SYSTEM`, `ARCHIVE`,
+  /// `OFFLINE`, `NOT_CONTENT_INDEXED`, and a directory's `READONLY` (a file's is its mode). Only the WinFsp drive
+  /// reports them.
+  pub windows: u16,
   /// The change counter: it moves on every change to the object and never repeats, whatever the
   /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
   pub change: u64,
@@ -133,6 +140,12 @@ pub struct SetAttr {
   /// and FSKit carry no such field and leave it `None`, and the change time then advances to the
   /// volume's clock as for any attribute change.
   pub ctime: Option<i64>,
+  /// A new birth time (nanoseconds since the Unix epoch), if set: only a host whose API sets a creation time asks for
+  /// it (WinFsp's `SetFileTime`, A-259); POSIX has no call that sets one, so FUSE, NFS and FSKit leave it `None`.
+  pub btime: Option<i64>,
+  /// New Windows attribute bits, if set (A-262): only a host whose API sets them asks (WinFsp's `SetBasicInfo` and
+  /// create); the volume keeps those [`slates_vfs::inode::WindowsAttributes::kept`] allows for the object's kind.
+  pub windows: Option<u32>,
 }
 
 /// The `renameat2` flags a rename carries. The operation layer preserves them and an

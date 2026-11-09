@@ -1088,7 +1088,8 @@ fn small_edits_to_a_large_file_are_charged_as_retained_history_and_fold_below_th
 /// Folding is floor-bounded: with a live reader at version 3 and no budget at all, the fold stops at 3, balanced, and
 /// versions at or above 3 still reconstruct while the head is untouched.
 fn assert_fold_bounded_by_the_reachable_floor(green: &mut Green, head: u64) {
-  let before = green.retained_bytes().history;
+  let folded = |green: &Green| green.retained_bytes().history + green.changes_bytes();
+  let before = folded(green);
   let released = green.fold_history_to_budget(3, 0);
   assert_eq!(
     green.folded_below(),
@@ -1096,9 +1097,9 @@ fn assert_fold_bounded_by_the_reachable_floor(green: &mut Green, head: u64) {
     "the reader's version bounds the fold"
   );
   assert_eq!(
-    green.retained_bytes().history,
+    folded(green),
     before - released,
-    "what the fold released left the running total"
+    "what the fold released (the histories' and the change index's) left the running totals"
   );
   assert_eq!(
     green.retained_bytes().history,
@@ -1183,11 +1184,36 @@ fn assert_fold_to_head(green: &mut Green, head: u64) {
   assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }
 
+/// What changed since `version`, walked through the change index `per_page` entries at a time from the cursor each
+/// page leaves (the last entry it passed), as a server pages it: the paths answered, sorted, and how many each was.
+fn walked(green: &Green, version: u64, per_page: usize) -> Vec<String> {
+  let mut answered = Vec::new();
+  let mut cursor = None;
+  loop {
+    let page: Vec<_> = green
+      .changes_after(version, cursor)
+      .take(per_page)
+      .collect();
+    answered.extend(
+      page
+        .iter()
+        .filter(|change| change.last)
+        .map(|change| change.path.to_owned()),
+    );
+    match page.last() {
+      Some(last) if page.len() == per_page => cursor = Some((last.version, last.index + 1)),
+      _ => break,
+    }
+  }
+  answered.sort();
+  answered
+}
+
 /// §4.16 `changed_since` (A-264). Do: on a green, submit increments that change content, a symlink, a mode, an xattr,
-/// a hard link and a directory, at different versions; then ask what changed since each version, whole and in pages
-/// of two. Expect: exactly `changed_between(v, head)` each time, every dimension's path included, and the pages the
-/// same paths in the same order. Before 2026-11-08 `changed_since` read the content index alone and answered only the
-/// files whose content changed.
+/// a hard link and a directory, at different versions, and change one file again; then ask what changed since each
+/// version, whole and walked in pages of two entries. Expect: exactly `changed_between(v, head)` each time, every
+/// dimension's path included and the file changed twice answered once. Before 2026-11-08 `changed_since` read the
+/// content index alone and answered only the files whose content changed.
 #[test]
 fn changed_since_reports_every_dimension_as_changed_between_does() {
   let mut green = Green::new();
@@ -1202,6 +1228,7 @@ fn changed_since_reports_every_dimension_as_changed_between_does() {
   green.submit(&Build::new().setxattr("a", "user.k", b"v").at(4, 3));
   green.submit(&Build::new().link("l", "b").at(5, 4));
   green.submit(&Build::new().mkdir("d").at(6, 5));
+  green.submit(&Build::new().overwrite("a", 0, b"A").at(7, 6));
   let head = green.head();
   for version in 0..=head {
     let expected = green.changed_between(version, head);
@@ -1210,20 +1237,13 @@ fn changed_since_reports_every_dimension_as_changed_between_does() {
       expected,
       "since {version}, whole"
     );
-    let mut paged: Vec<String> = Vec::new();
-    loop {
-      let page: Vec<String> = green
-        .changed_since_after(version, paged.last().map(String::as_str))
-        .take(2)
-        .cloned()
-        .collect();
-      let full = page.len() == 2;
-      paged.extend(page);
-      if !full {
-        break;
-      }
+    for per_page in [1, 2] {
+      assert_eq!(
+        walked(&green, version, per_page),
+        expected,
+        "since {version}, in pages of {per_page}"
+      );
     }
-    assert_eq!(paged, expected, "since {version}, in pages of two");
   }
   let since_content = green.changed_since(1);
   for path in ["s", "b", "a", "l", "d"] {
@@ -1232,4 +1252,52 @@ fn changed_since_reports_every_dimension_as_changed_between_does() {
       "{path} changed after version 1: {since_content:?}"
     );
   }
+}
+
+/// §4.16 `changed_since` (A-264). Do: on a green, submit eight versions, each after the first changing a file of its own
+/// and one shared file; read what changed since each version, then fold the history below version 5 and read again from 5 on. Expect:
+/// a read costs the entries of the span alone (since version 7, two entries, however many versions came before), and
+/// after the fold every read answers as `changed_between` does, below the floor too, the superseded entries below it
+/// gone, and the index's running total equals its recount before and after.
+#[test]
+fn changed_since_reads_the_span_alone_and_folds_with_the_histories() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("shared", b"0").at(1, 0));
+  for n in 2..=8u8 {
+    green.submit(
+      &Build::new()
+        .overwrite("shared", 0, &[n])
+        .create(&format!("own-{n}"), b"x")
+        .at(n, u64::from(n - 1)),
+    );
+  }
+  let head = green.head();
+  assert_eq!(head, 8, "every submit accepted");
+  assert_eq!(
+    green.changes_after(head - 1, None).count(),
+    2,
+    "one version's entries"
+  );
+  assert_walks_match_from(&green);
+  assert_eq!(green.changes_bytes(), green.retained_bytes().changes);
+  let before = green.changes_after(0, None).count();
+  green.fold_history_before(5);
+  assert_eq!(
+    green.changes_after(0, None).count(),
+    before - 4,
+    "the fold dropped the shared file's four superseded entries below version 5, and kept every last change"
+  );
+  assert_walks_match_from(&green);
+}
+
+/// Every walk to the head answers as `changed_between` does, and the index's running total is its recount.
+fn assert_walks_match_from(green: &Green) {
+  let head = green.head();
+  for version in 0..=head {
+    assert_eq!(
+      walked(green, version, 3),
+      green.changed_between(version, head)
+    );
+  }
+  assert_eq!(green.changes_recounted(), green.changes_bytes());
 }
