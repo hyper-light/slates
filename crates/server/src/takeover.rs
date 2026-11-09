@@ -1041,7 +1041,9 @@ fn record_adoption(
   {
     // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
     // and held inputs on the shard its id routes to (AUD-14).
-    state.pending_green_materializations.insert(object, merge);
+    state
+      .pending_green_materializations
+      .insert(object, crate::state::PendingGreen { merge, attempts: 0 });
   }
   let count = state.refusals.entry(TAKEOVER_ADOPTED).or_insert(0);
   *count = count.saturating_add(1);

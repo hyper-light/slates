@@ -11362,7 +11362,7 @@ fn chain_phase(
 }
 
 /// A volume id's bytes in hexadecimal, as the CLI prints a volume id.
-fn hex_of(bytes: &[u8]) -> String {
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

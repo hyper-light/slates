@@ -15105,6 +15105,20 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   product non-convergence if that is not the cause.
 - **Instrumented:** on failure the test now prints each survivor's `merge.takeover*` and `fleet.takeover*` counters and
   its holder state of the green, which name the branch the next failure is stuck in.
+- **Bounded (2026-11-09, the supervisor's order), cause still open.** Every branch of `materialize_pending_greens`
+  retried each period with nothing that could clear it: `waits_catalog`, `incomplete`, a refused materialization, and a
+  missing placement or partition shard, which was not even counted. Each pending green now counts its attempts, one a
+  period, and past the failover SLO's worth (`failover_slo_ns / HEARTBEAT_NS`, 100 at the default 10 s; counted in
+  attempts so a loaded node's late periods take none of them) it is given up on: its owner shard records it unrecovered,
+  every verb on it answers `NotRecovered { cause: TakeoverIncomplete { waited_on } }` naming the branch (`catalog`,
+  `chain`, `placement`, `refused`), the node claims it to lookups, and `merge.takeover_given_up` counts it with a log
+  line. A green whose partition has no shard here is dropped at the bound, counted and logged. Red first
+  (`a_taken_over_green_whose_catalog_never_comes_is_refused_by_name`, `a_taken_over_green_whose_chain_is_short_is_refused_by_name`,
+  a one-node fleet at a 1 s SLO): without the bound each planted green retried 99 times in 100 periods and its status
+  answered `NotFound` throughout; with it, `NotRecovered` naming its branch after 10 attempts. The next stuck run of the
+  green-share test therefore fails with the branch named, not by its 4,000-period wait.
+- **Sibling, open:** a taken-over **volume**'s materialization (`fleet::materialize`, the `fleet.materialize.waits.*`
+  counters: content, placement, catalog, catalog placement, shard) waits each period the same way, with no bound.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

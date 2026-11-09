@@ -1504,6 +1504,7 @@ pub fn recovery_cause_kind(cause: &RecoveryCause) -> &'static str {
     RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
     RecoveryCause::ImageRefused { .. } => "ImageRefused",
     RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+    RecoveryCause::TakeoverIncomplete { .. } => "TakeoverIncomplete",
   }
 }
 

@@ -958,8 +958,9 @@ pub struct ShardState {
   /// Taken-over **greens** whose newest merge record this node adopted, awaiting materialization into
   /// an owned green on the shard the id routes to (§4.16 owner-loss recovery; AUD-14): the catalog
   /// record, the origin, the chain and the engine rebuilt from this node's own accepted records and
-  /// held inputs. Bounded by the objects this node owns; empty on a laptop.
-  pub pending_green_materializations: BTreeMap<ObjectId, crate::merge_service::MergeRecordValue>,
+  /// held inputs. Each carries the attempts made, which `fleet::materialize_pending_greens` bounds. Bounded by the
+  /// objects this node owns; empty on a laptop.
+  pub pending_green_materializations: BTreeMap<ObjectId, PendingGreen>,
   /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), with the tombstone's
   /// sequence: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where the record plane
   /// ships the tombstone's remaining stages. Never materialized. Bounded by the objects this node owns.
@@ -1246,4 +1247,14 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
   if let Some(task) = server {
     slates_rt::registry::wake(task.0);
   }
+}
+
+/// A taken-over green awaiting materialization (§4.16 owner-loss recovery; `ShardState::pending_green_materializations`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingGreen {
+  /// Its newest merge record, as adopted.
+  pub merge: crate::merge_service::MergeRecordValue,
+  /// The materializations attempted so far, one a fleet period: past the failover SLO's worth the green is given up
+  /// on, every verb on it answering `Refusal::NotRecovered` (`fleet::materialize_pending_greens`).
+  pub attempts: u32,
 }
