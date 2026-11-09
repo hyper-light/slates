@@ -45,6 +45,8 @@ use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
 
 use crate::state;
 
+/// Format: nanoseconds per millisecond, for the lane's log lines.
+const NS_PER_MS: u64 = 1_000_000;
 /// The status count of a forward refused because its lane held [`lane_bound`] forwards already.
 const LANE_FULL: &str = "fleet.forward.lane_full";
 /// The status count of a forward answered unanswered because its session was replaced while it was open.
@@ -556,7 +558,7 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
       s.dead_session_recovered_ns = Some(recovered);
       slates_machine::log_line!(
         "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped",
-        recovered / 1_000_000
+        recovered / NS_PER_MS
       );
     }
     Some((answered.any_reply, replaced, begun, woken))
