@@ -1,0 +1,143 @@
+# Diagnostics for the conformance agent: never on main. Triggered only by pushes to diag-conformance-* branches.
+# conformance-19 (A-94, the guest virtio-fs mount nosuid,nodev), rerun: the workspace bound at /mnt/src, since Ubuntu 26.04 enforces
+# /etc/apparmor.d/fusermount3 (FUSE mounts only under home, /mnt, /media, /tmp, /run/user; slabs, diag-slabs-51). Red on the
+# test-only commit, green on the fix; results to diag-results/conformance-<run>-<job>, read with git fetch.
+name: diag-conformance
+
+on:
+  push:
+    branches: ['diag-conformance-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  red:
+    name: "A-94 guest test on the test-only commit (expected red)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: diag-results/conformance-${{ github.run_id }}-red
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: 0717586a525f24d73763d005c1409ba83c10e3ae
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUB'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUB
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; nproc; uname -a; echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; cat /etc/os-release | head -3; } > results/00-image.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The planted-setuid guest test in QEMU
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set +e
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1 --exact a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest' > results/10-setuid.log 2>&1
+          echo "exit $?" >> results/10-setuid.log
+          grep -E "^test |test result|panicked|left|right|SKIP|euid|exit |Permission denied|fusermount" results/10-setuid.log > results/11-setuid-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+
+  green:
+    name: "A-94 guest test with nosuid,nodev"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: diag-results/conformance-${{ github.run_id }}-green
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUB'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUB
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; nproc; uname -a; echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; cat /etc/os-release | head -3; } > results/00-image.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The planted-setuid guest test in QEMU
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set +e
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1 --exact a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest' > results/10-setuid.log 2>&1
+          echo "exit $?" >> results/10-setuid.log
+          grep -E "^test |test result|panicked|left|right|SKIP|euid|exit |Permission denied|fusermount" results/10-setuid.log > results/11-setuid-summary.txt
+          "$RUNNER_TEMP/publish.sh"
