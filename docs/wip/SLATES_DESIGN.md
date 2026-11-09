@@ -5722,8 +5722,8 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > owner shard spent about 1,800 of 2,241 samples doing it. A partition now snapshots once the log since its last
 > snapshot has taken the recovery budget's worth of replay work and is at least that snapshot's size
 > (`replay::snapshot_due`). The work is timed on each commit's append and apply, the work a replay repeats per record,
-> and never extrapolated from one stretch of log to the next, whose records may differ in size. Since 2026-11-09 it is
-> timed in the committing thread's own CPU time, not on the wall (A-243's amendment below). So snapshot work stays
+> and never extrapolated from one stretch of log to the next, whose records may differ in size. It is timed on the
+> wall: the committing thread's CPU time was measured and rejected on 2026-11-09 (A-243's amendment below). So snapshot work stays
 > within about twice the log it absorbs, whatever the partition's size, and `slates status` shows each shard's
 > snapshots, their bytes and longest duration, the log appended, the tail's bytes and measured work, the budget and
 > the floor.
@@ -15471,28 +15471,31 @@ Applied in the same change to:
 - **Owed.**
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
-- **Amended 2026-11-09 (the supervisor's question to raft, from loadtest-scale's cadence work): the work is the
-  committing thread's CPU time, never the wall.**
-  - *Why.* The rule charges a commit what a replay repeats of it: its append's encode, checksum and copy, and its
-    apply. A replay repeats that CPU work, not the time the committing thread spent waiting for a core. Charged on the
-    wall, a commit preempted under load was charged its wait too, so the trigger came early exactly when the machine
-    was busiest, adding snapshot work to that load. Recovery under contention takes longer in wall time whatever the
-    trigger charged at commit, since the wait at commit time says nothing about the wait at recovery. The bound above
-    (decode(P) + max(budget, the replay of P bytes)) is a bound on work, now measured as work.
-  - *Measured.* `snapshot_cadence.rs` failed on a Mac under 36 spinners, 3 of 6 at load 69–112. At load 135 and above,
-    its approach stopped after one record, because a record's wall time reached 5 ms. B10's Mac gate failed it again
-    at load 62–78. On adacachy (Linux, 24 busy loops in one capped unit, load 54–72) main passed every round, so the
-    failure did not reproduce there.
-  - *The rule.* `slates_rt::calling_thread_cpu_ns`: on Linux and macOS, `CLOCK_THREAD_CPUTIME_ID` through rustix;
-    on Windows, `GetThreadTimes` on the current-thread pseudo-handle. Windows charges a thread's time a scheduler tick
-    (15.6 ms by default) at a time, so one commit reads zero or a tick, and the trigger's sum over about a budget of
-    work is unbiased. Where no thread clock is read (Miri), nothing is charged, and the ring and the byte floor still
-    force snapshots. The recovery's own work, which the tail starts from after a boot, is the recovering thread's CPU
-    time too. `Recovered::replay_ns` stays the recovery's wall time, which is what it reports.
-  - *Red first.* `time_off_the_cpu_inside_timed_work_is_not_charged` (`crates/db/src/replay.rs`): a thread asleep 50 ms
-    inside timed work was charged 1,256,121,510 ns on the wall clock (at load 93), and under half the sleep now.
-  - *Applied to:* `crates/rt/src/thread_clock.rs` (`calling_thread_cpu_ns`, one unsafe site for Windows, so
-    unsafe-budget.toml's slates-rt goes from 101 to 102) and `crates/db/src/replay.rs` (`WorkClock`).
+- **Measured and rejected 2026-11-09: the work charged in the committing thread's CPU time (the supervisor's question to
+  raft, from loadtest-scale's cadence work). The trigger stays on the wall; closed with no change.**
+  - *The argument for it.* The rule charges a commit what a replay repeats of it, its append's encode, checksum and
+    copy and its apply, "never on a wait". Preemption is a wait inside those spans that a replay never repeats, so
+    CPU time looked the faithful measure: the wall charged a preempted commit its wait, and so would bring the trigger
+    early exactly when the machine was busiest.
+  - *Measured* (adacachy, 2026-11-09, release builds, the two triggers interleaved; command:
+    `cargo test --release -p slates-db --test snapshot_cadence measure_snapshots_per_thousand_records -- --ignored
+    --exact --nocapture` on each arm). Snapshots per 200,000 small records with a 10 ms budget:
+
+    | phase (load) | wall (main) | thread CPU time |
+    |---|---|---|
+    | quiet (123–125) | 4, 4, 5 | 5, 5, 5 |
+    | 24 busy loops in the unit (125–143) | 7, 6, 7 | 10, 8, 10 |
+
+    The CPU-time trigger snapshots more often than the wall, and more so under load, the opposite of the argument. Two
+    causes. A thread CPU clock read is a system call on Linux where the wall's is a vDSO read, and part of each read
+    lands inside the span it times, so a record of about a microsecond is charged its own clock reads, more under load.
+    And a contended record burns more CPU (shared cores, cache pressure, lower clocks), which a quiet replay would not
+    repeat either. The reads also add two system calls to every commit. A calibrated subtraction of the read's cost
+    would be a second correction on a measure already worse, so it was not tried.
+  - *What failed instead.* `snapshot_cadence.rs`'s longest-tail test failed on a Mac (3 of 6 at load 69–112, and in
+    B10's Mac gate at load 62–78) because its approach predicted the next record from the last, which a preempted
+    record inflated. loadtest-scale's fix (predicting from the largest record seen) addressed it. On adacachy both
+    triggers passed that test 6 of 6 under 24 busy loops at load 32–72.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 

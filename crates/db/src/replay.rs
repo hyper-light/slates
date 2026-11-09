@@ -198,35 +198,6 @@ fn newest_snapshot(
   Ok(None)
 }
 
-/// The clock a partition's replay work is charged by (A-243): the committing thread's CPU time
-/// ([`slates_rt::calling_thread_cpu_ns`]), what a replay repeats of a commit (its append's encode, checksum and copy, and
-/// its apply), never the time the thread waited for a core. Charged on the wall, a commit preempted under load was
-/// charged its wait too, so the trigger came early exactly when the machine was busiest, adding snapshot work to the
-/// load (`time_off_the_cpu_inside_timed_work_is_not_charged`; `snapshot_cadence.rs` failed 3 of 6 on a Mac at load
-/// 69–112). Where no thread clock is read (Miri), nothing is charged, and the ring and the byte floor still force
-/// snapshots.
-#[derive(Clone, Copy, Debug)]
-struct WorkClock {
-  started: Option<u64>,
-}
-
-impl WorkClock {
-  /// Starts the clock now.
-  fn start() -> WorkClock {
-    WorkClock {
-      started: slates_rt::calling_thread_cpu_ns(),
-    }
-  }
-
-  /// The work since the start, nanoseconds: the thread's CPU time since, zero where either read failed.
-  fn elapsed_ns(self) -> u64 {
-    match (self.started, slates_rt::calling_thread_cpu_ns()) {
-      (Some(started), Some(now)) => now.saturating_sub(started),
-      _ => 0,
-    }
-  }
-}
-
 /// Recovers partition `index` from the segment: the newest valid snapshot, then the records
 /// after it; the torn tail is cut; the replay is timed.
 pub fn recover(
@@ -236,7 +207,6 @@ pub fn recover(
   now_ns: u64,
 ) -> Result<(Db, Recovered), DbError> {
   let started = Instant::now();
-  let work = WorkClock::start();
   let log = LogRing::new(RegionKind::Log(index));
   let DerivedPartition {
     partition,
@@ -268,7 +238,7 @@ pub fn recover(
     next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
     stats: DbStats::default(),
-    replay_work_ns_since_snapshot: work.elapsed_ns(),
+    replay_work_ns_since_snapshot: replay_ns,
     recovery_budget_ns: RECOVERY_BUDGET_NS,
     snapshot_floor_bytes: snapshot_bytes,
     pending: None,
@@ -387,18 +357,17 @@ impl Db {
     }
   }
 
-  /// Adds the work since `started` to the tail's replay work (A-243). The work decides nothing inside an apply; the
+  /// Adds the time since `started` to the tail's replay work (A-243). The time decides nothing inside an apply; the
   /// commit consults it after the append ([`maintain`](Self::maintain)).
-  fn charge_replay_work(&mut self, started: WorkClock) {
-    self.replay_work_ns_since_snapshot = self
-      .replay_work_ns_since_snapshot
-      .saturating_add(started.elapsed_ns());
+  fn charge_replay_work(&mut self, started: Instant) {
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(elapsed);
   }
 
   /// Applies `op` inside a transaction, timing it as replay work: its record is appended at the commit, so the apply
   /// and the append are timed apart.
   fn apply_timed(&mut self, op: &Op) -> Result<(), DbError> {
-    let started = WorkClock::start();
+    let started = Instant::now();
     let applied = self.partition.apply(op);
     self.charge_replay_work(started);
     applied
@@ -412,7 +381,7 @@ impl Db {
     seq: u64,
     entry: &LogEntry,
   ) -> Result<u64, DbError> {
-    let started = WorkClock::start();
+    let started = Instant::now();
     let appended = self.log.append(segment, seq, entry);
     self.charge_replay_work(started);
     appended
@@ -441,14 +410,14 @@ impl Db {
       ops: vec![op.clone()],
     };
     // One clock pair over the append and the apply, adjacent here: the work a replay repeats for this record (A-243).
-    let mut started = WorkClock::start();
+    let mut started = Instant::now();
     let bytes = match self.log.append(segment, seq, &entry) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
         // A full ring: the snapshot releases everything before it, then the append retries; the snapshot's own time is
         // not replay work.
         self.snapshot(segment)?;
-        started = WorkClock::start();
+        started = Instant::now();
         self.log.append(segment, seq, &entry)?
       }
       Err(e) => return Err(e),
@@ -645,33 +614,5 @@ impl Db {
   /// The log's bytes used, free and capacity.
   pub fn log_usage(&self, segment: &AnchorSegment) -> Result<(u64, u64, u64), DbError> {
     self.log.usage(segment)
-  }
-}
-
-#[cfg(test)]
-mod work_clock_tests {
-  use super::WorkClock;
-
-  /// Shape: how long the test keeps its thread off the CPU inside timed work.
-  const OFF_CPU: std::time::Duration = std::time::Duration::from_millis(50);
-
-  /// A-243, the trigger's measure: do start the clock a commit's replay work is charged by, keep the thread off the CPU
-  /// for 50 ms (asleep), then read the work. Expect under half of it: a replay repeats a commit's work, not the time its
-  /// thread waited, so time off the CPU must not be charged (Windows charges a thread's time a scheduler tick at a time,
-  /// 15.6 ms by default, so a sleeping thread shows at most one). The wall clock charged the whole sleep, and under
-  /// load, where a committing thread waits for a core, the trigger came early (`snapshot_cadence.rs`, 3 of 6 at load
-  /// 69–112 on a Mac).
-  #[test]
-  fn time_off_the_cpu_inside_timed_work_is_not_charged() {
-    let clock = WorkClock::start();
-    #[allow(clippy::disallowed_methods)]
-    // a test keeping its own thread off the CPU, which is what it measures
-    std::thread::sleep(OFF_CPU);
-    let charged = clock.elapsed_ns();
-    let slept = u64::try_from(OFF_CPU.as_nanos()).unwrap();
-    assert!(
-      charged < slept / 2,
-      "time off the CPU was charged as replay work: {charged} ns of a {slept} ns sleep"
-    );
   }
 }

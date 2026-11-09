@@ -648,14 +648,13 @@
 >   (main failed 3 of 6 at load 69 to 112 under two spinners a CPU). It now predicts from the largest record it has seen,
 >   an early snapshot's lower bound included: 6 of 6 at load 116 to 143, though at 135 and above the approach stopped
 >   after one record (`docs/bugs/2026-11-09-the-cadence-tests-approach-predicted-the-next-record-from-the-last.md`).
->   The trigger timed replay work on the wall, so preemption counted as work: answered by A-243's amendment below.
->   **Amended 2026-11-09 (A-243's amendment):** the work is charged in the committing thread's CPU time, not on the
->   wall. Charged on the wall, a commit preempted under load was charged its wait, so the trigger came early when the
->   machine was busiest. `snapshot_cadence.rs` failed on a Mac 3 of 6 at load 69–112 and in B10's Mac gate at load
->   62–78 (`snapshot_cadence.rs:272`, "a snapshot came before the approach stopped 3 times"). Red first:
->   `time_off_the_cpu_inside_timed_work_is_not_charged`, where a 50 ms sleep was charged 1.26 s on the wall. **Open
->   until the Mac gate judges it:** on adacachy, main passed every round under 24 busy loops, so the failure is
->   reproduced only on the Mac.
+>   Whether the trigger should charge the thread's CPU time instead of the wall was then measured and rejected (below).
+>   **The trigger in CPU time, measured and rejected (2026-11-09, A-243's amendment; closed, no change).** Charging a
+>   commit's replay work in the committing thread's CPU time snapshotted more often than the wall, per 200,000 records
+>   with a 10 ms budget: quiet 5, 5, 5 against 4, 4, 5, and under 24 busy loops 10, 8, 10 against 7, 6, 7 (adacachy,
+>   load 123–143). The CPU clock's reads are system calls that land inside the spans they time, and a contended record
+>   burns more CPU that a quiet replay would not repeat. The trigger stays on the wall;
+>   `measure_snapshots_per_thousand_records` (ignored) is the recorded command.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards

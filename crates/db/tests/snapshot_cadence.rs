@@ -491,3 +491,40 @@ fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
     "the small records' tail was timed at least once before the next snapshot"
   );
 }
+
+/// Shape: the records the cadence measurement appends after its settling snapshots.
+const MEASURED_RECORDS: u64 = 200_000;
+/// Format: the records a reported rate is per.
+const PER_RECORDS: u64 = 1_000;
+
+/// A-243's amendment, the recorded command of a measurement run by hand (`--ignored --nocapture`). Do: on a fresh segment
+/// with a 10 ms recovery budget, settle past a few snapshots, then append `MEASURED_RECORDS` small records. Prints the
+/// snapshots taken per 1,000 records, the trigger's cadence. Run on the wall trigger and on one charging the committing
+/// thread's CPU time, quiet and under 24 busy loops, it showed the CPU-time trigger snapshotting more often (10, 8, 10
+/// against 7, 6, 7 loaded), so that change was rejected.
+#[test]
+#[ignore = "a measurement, run by hand on each arm, quiet and loaded"]
+fn measure_snapshots_per_thousand_records() {
+  let mut seg = segment(BUDGET_LOG_BYTES);
+  let mut db = recover(&mut seg, 0, caps(), 0).unwrap().0;
+  db.set_recovery_budget(SMALL_BUDGET_NS);
+  let record = green();
+  let id = record.id;
+  db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+    .unwrap();
+  let mut n = 0u64;
+  while db.stats().snapshots < SETTLING_SNAPSHOTS {
+    n += 1;
+    account(&mut db, &mut seg, id, n);
+  }
+  let before = db.stats().snapshots;
+  for _ in 0..MEASURED_RECORDS {
+    n += 1;
+    account(&mut db, &mut seg, id, n);
+  }
+  let taken = db.stats().snapshots - before;
+  println!(
+    "cadence: {taken} snapshots over {MEASURED_RECORDS} records, {:.2} per {PER_RECORDS}",
+    taken as f64 * PER_RECORDS as f64 / MEASURED_RECORDS as f64
+  );
+}
