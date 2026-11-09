@@ -20077,7 +20077,10 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
 - **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
   refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
   with room for a recovery cause's fixed part), so every volume a client can create is one it can list. An unrecovered
-  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it.
+  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
+  record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
+  room (1,023 bytes on macOS, 3,812 on Linux and Windows; `BaseUnavailable` with `ENAMETOOLONG` past it) and a reason,
+  the daemon's own text, at 256.
 - **Proven:** red first on main (3,000 volumes, refused); a walk under churn lists each of 2,991 survivors once in 37
   pages; the longest admitted name lists; 2,000 volumes list through the CLI, plain and JSON.
 - **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a

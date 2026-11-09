@@ -33,7 +33,8 @@
 > list what a server holds. `List { after }` is now answered a page at a time, `Listed { volumes, next }`: volumes in id
 > order, a reply chunk's worth, each shard sending at most a page. The client walks the pages, sync and as an async
 > chain. A new volume's name is bounded so its summary fits one page (4,012 bytes; `InvalidName` past it), and an unrecovered
-> volume's cause is cut to fit beside it. 3,000 volumes
+> volume's cause is cut to fit beside it; recorded, the cause is bounded (a base at `create`: 1,023 bytes on macOS, 3,812
+> on Linux and Windows; a reason at 256) so `status` names it whole. 3,000 volumes
 > list on two shards, and a walk under churn lists each survivor once
 > (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
 > - **Still open, the same one-reply shape:** `changed_since` (reproduced: refused at 800 changed files), and, by their
