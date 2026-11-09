@@ -8735,6 +8735,96 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   drop(anchor);
 }
 
+/// Format: the variable a lane sets to an existing directory the test's user owns that fusermount3's AppArmor profile
+/// does not allow a FUSE mount at (`.github/workflows`: the 26.04 container's build output, or a host directory made
+/// with sudo outside the profile).
+#[cfg(target_os = "linux")]
+const ENV_POLICY_REFUSED: &str = "SLATES_TEST_HELPER_POLICY_REFUSED";
+/// Format: the variable a lane sets to an existing directory the test's user owns that the profile allows.
+#[cfg(target_os = "linux")]
+const ENV_POLICY_ALLOWED: &str = "SLATES_TEST_HELPER_POLICY_ALLOWED";
+
+/// The AppArmor label the kernel gives `fusermount3` (`fusermount3 (enforce)` on Ubuntu 26.04), read as the product
+/// reads it: the helper exec'd, held unreaped after it exits (`waitid` with `WNOWAIT`), its `/proc` label read, then
+/// reaped (diag-slabs-57: readable as root, in a container and as an unprivileged user). `None` when it is unconfined
+/// or the label cannot be read.
+#[cfg(target_os = "linux")]
+fn fusermount3_label() -> Option<String> {
+  use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+  let mut child = Command::new("fusermount3")
+    .arg("-V")
+    .stdout(std::process::Stdio::null())
+    .spawn()
+    .ok()?;
+  let pid = Pid::from_raw(i32::try_from(child.id()).ok()?)?;
+  let held = waitid(
+    WaitId::Pid(pid),
+    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+  );
+  let label = held.ok().and_then(|_| {
+    ["attr/apparmor/current", "attr/current"]
+      .iter()
+      .find_map(|attr| std::fs::read_to_string(format!("/proc/{}/{attr}", child.id())).ok())
+  });
+  let _ = child.wait();
+  label
+    .map(|label| label.trim().to_owned())
+    .filter(|label| !label.is_empty() && label != "unconfined")
+}
+
+/// Decided 2026-11-09 (GAPS, the supervisor's): a FUSE mount the host's mount helper policy refuses is diagnosed after
+/// the kernel refuses it, from the helper's own AppArmor label, never predicted. Ubuntu 26.04 confines `fusermount3` to
+/// a few directories, and a `slates mount` elsewhere answered only the helper's "Permission denied". Do: where
+/// `fusermount3` is confined (its label, read as the product reads it), mount a volume at a directory the profile
+/// refuses ([`ENV_POLICY_REFUSED`]), then at one it allows ([`ENV_POLICY_ALLOWED`]). Expect the first refused
+/// `MountRefusedByHelperPolicy` naming the profile and its mode as the kernel reports them, and the second mounted.
+/// Linux only; the lanes run it in the 26.04 container as root and on the 26.04 host as the runner's user.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mount_the_helpers_apparmor_profile_refuses_names_the_profile() {
+  let (Some(refused), Some(allowed)) = (
+    std::env::var(ENV_POLICY_REFUSED).ok(),
+    std::env::var(ENV_POLICY_ALLOWED).ok(),
+  ) else {
+    eprintln!(
+      "SKIP: set {ENV_POLICY_REFUSED} and {ENV_POLICY_ALLOWED} to run the helper-policy test"
+    );
+    return;
+  };
+  if !live_mount_runs() {
+    return;
+  }
+  let Some(label) = fusermount3_label() else {
+    eprintln!("SKIP: fusermount3 is not confined here (no AppArmor label)");
+    return;
+  };
+  let (profile, mode) = label
+    .rsplit_once(" (")
+    .map(|(profile, mode)| (profile.to_owned(), mode.trim_end_matches(')').to_owned()))
+    .expect("an AppArmor label names its profile and mode");
+  let instance = format!("cli-helperpolicy-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "policy", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["mount", &id, &refused]);
+  assert_ne!(
+    code, 0,
+    "the helper's profile ({label}) refuses a mount at {refused}"
+  );
+  assert!(
+    err.contains("MountRefusedByHelperPolicy") && err.contains(&profile) && err.contains(&mode),
+    "the refusal names the helper's AppArmor profile {profile} and its mode {mode}: {err}"
+  );
+  let allowed = MountPoint { path: allowed };
+  fuse_mount_and_check(&instance, &id, &allowed.path);
+  drop(allowed);
+  drop(anchor);
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
