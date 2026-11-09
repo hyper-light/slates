@@ -15492,7 +15492,12 @@ Applied in the same change to:
     answered.
 - **Checked.** The crash oracle, at every store and torn inside each, twice over. Put in by hand, each of these is
   caught: no check before the save, recovery that ignores a settled response, and `begin` clearing the saved response.
-- **Measured.** Owed to its A/B against a do-nothing arm.
+- **Measured.** `diag-winfsp-overlap-51` (run 42675148419), main against a control (main built again) against the cut,
+  ten runs on each Windows runner, quiet and loaded (BENCHMARKS, "Cut (c)"). arm64 loaded is faster within every run on
+  stat, write, rename and unlink: p50 −6.3, −23.8, −12.8 and −16.0 µs (10 of 10 each), p99 −1,750, −1,522, −1,395 and
+  −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
+  moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
+  about what the round did when the shard is idle.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 

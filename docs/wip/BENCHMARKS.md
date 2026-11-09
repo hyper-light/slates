@@ -11912,6 +11912,146 @@ it is **rejected**, and A-198 stays as written. The ledger's own writes, the oth
 against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
 2.3 against 3.2 and 2.0 against 2.8).
 
+### Cut (c): an open's confirmation off the receive worker's path (A-274; audit step 7; 2026-11-09)
+
+**The change.** After sending a successful Create's response the receive worker had waited for the shard to confirm the
+open: a round on every open, 9.9 µs at the mean on arm64 quiet and 139.6 µs loaded (`diag-winfsp-overlap-50`, run
+42506936806). Now it posts the confirmation, wakes the mount's task and goes on; the journal keeps the open's response,
+settled, until the confirmation is applied (A-274, `agents/winfsp-overlap-24`).
+
+**The A/B.** Diag `diag-winfsp-overlap-51` (run 42675148419): main `9ba16222`, a control (the same commit built again, the
+bench's own floor) and the cut (`b9e300cd`), interleaved on one VM of each runner, quiet and loaded (two spinners a
+logical CPU), ten runs a lane, 0 failed, the list rotating each run (windows-ab.sh), with the stall detector (no stall).
+windows-11-arm: win11-vs2026-arm64 20261101.203.1, 4 CPUs. windows-latest: win25-vs2026 20261103.298.1, 4 CPUs. Each cell
+is the arm minus main within each run, every run shown, sorted; the cut is called against the control's spread.
+
+**Verdict: it lands.** A one-path change is judged on loaded tails first.
+- arm64 loaded is faster within every run on stat, write, rename and unlink:
+  - p50: −6.3, −23.8, −12.8 and −16.0 µs (10 of 10 runs each); write and unlink beyond the control's spread;
+  - p99: −1,750, −1,522, −1,395 and −2,375 µs (8, 9, 9 and 8 of 10); write beyond the control's spread, the rest
+    inside its very wide spread.
+- No x86_64 loaded p99 moves beyond the control's spread.
+- **The cost: a quiet stat.** p50 +8.1 µs on arm64 (3 of 10 runs faster; beyond the control's −3.8 to +2.9) and +4.0 µs
+  on x86_64 (0 of 10 faster; the control's −5.8 to +16.4). Under no load the shard has time to spare, and the wake the
+  post makes costs about what the round it replaces did. The variant that posts without the wake is measured next, as
+  its own A/B against this one, with "a Create then a security query" a named op.
+
+#### arm64 (windows-11-arm): 10 runs
+
+arm64 (windows-11-arm), loaded, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1231.8 | -863.4 -686.0 -114.1 +64.0 +118.0 +317.5 +461.9 +588.1 +627.3 +796.9 | +317.5 (3/10 faster) | -513.1 -506.2 -440.1 -159.9 +63.7 +94.3 +331.6 +678.0 +722.9 +1105.2 | +94.3 (4/10 faster) | within the control |
+| stat | 4040.4 | -9402.2 -7296.6 -3977.3 -3423.7 -2850.0 -1749.8 -1162.8 -899.9 +2612.8 +6183.1 | -1749.8 (8/10 faster) | -6781.1 -3311.3 -2125.9 -1847.2 -959.7 -656.4 -182.1 +324.1 +1320.4 +1585.5 | -656.4 (7/10 faster) | within the control |
+| read | 92.8 | -3.0 -1.4 -0.2 +0.4 +0.7 +2.6 +3.2 +4.1 +4.4 +6.0 | +2.6 (3/10 faster) | -3.1 -2.7 -1.6 -1.4 -0.9 -0.8 +0.7 +1.3 +1.3 +6.3 | -0.8 (6/10 faster) | within the control |
+| write | 2761.0 | -2755.0 -2635.2 -2557.1 -2118.6 -1906.9 -1522.4 -1301.6 -1273.0 -55.4 +323.3 | -1522.4 (9/10 faster) | -959.4 -914.1 +172.3 +297.6 +398.4 +483.0 +933.5 +1050.3 +1194.3 +7459.0 | +483.0 (2/10 faster) | **faster** beyond the control |
+| rename | 36452.2 | -2687.0 -2423.7 -1872.5 -1851.0 -1410.7 -1394.5 -1349.0 -1137.6 -300.8 +235.0 | -1394.5 (9/10 faster) | -1782.2 -1284.8 -629.2 -205.2 +238.9 +341.4 +468.7 +874.1 +1612.9 +3360.7 | +341.4 (4/10 faster) | within the control |
+| unlink | 27342.3 | -5623.1 -5382.4 -4402.1 -3925.8 -2782.2 -2375.0 -876.8 -204.3 +453.0 +1940.4 | -2375.0 (8/10 faster) | -6144.8 -3447.3 -2869.9 -1776.1 +771.6 +1466.4 +2048.0 +2093.5 +3483.9 +6100.7 | +1466.4 (4/10 faster) | within the control |
+| fsync | 378.5 | -261.8 -192.5 -130.0 -36.1 -30.5 -5.9 +0.3 +7.0 +22.3 +55.6 | -5.9 (6/10 faster) | -262.4 -131.4 -90.1 -42.1 -27.4 -23.1 -0.5 +17.9 +18.0 +19.2 | -23.1 (7/10 faster) | within the control |
+| open | 42098.2 | -3411.0 -2092.8 -204.9 +570.0 +2123.8 +3448.0 +3631.3 +4602.9 +4720.6 +5712.2 | +3448.0 (3/10 faster) | -2824.0 -2724.6 -11.6 +331.8 +2738.3 +2754.4 +2923.2 +4098.6 +4946.9 +5601.7 | +2754.4 (3/10 faster) | within the control |
+| close | 41643.0 | -3062.9 -1921.0 -1891.7 -1306.0 -602.7 +1316.0 +1891.2 +2466.0 +2504.1 +2601.3 | +1316.0 (5/10 faster) | -4538.2 -2128.7 -1042.2 +510.3 +643.1 +1742.8 +1788.2 +1870.0 +2720.7 +5440.6 | +1742.8 (3/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 214.5 | -7.3 -4.6 -2.5 -2.4 -0.7 +0.2 +1.4 +2.1 +5.3 +8.8 | +0.2 (5/10 faster) | -7.6 -5.6 -3.5 -3.5 -2.7 -1.8 -1.7 -1.1 +2.6 +10.6 | -1.8 (8/10 faster) | within the control |
+| stat | 160.8 | -8.8 -8.6 -8.2 -7.7 -6.5 -6.3 -6.2 -5.3 -5.0 -3.2 | -6.3 (10/10 faster) | -8.5 -6.0 -4.1 -4.1 -1.6 -1.6 -1.5 -0.9 +0.3 +1.4 | -1.6 (8/10 faster) | within the control |
+| read | 50.3 | -2.5 -1.2 -1.1 -0.4 -0.4 -0.1 +0.3 +1.0 +1.5 +2.4 | -0.1 (6/10 faster) | -1.7 -0.9 -0.8 -0.6 -0.3 -0.1 +0.2 +0.4 +1.5 +1.8 | -0.1 (6/10 faster) | within the control |
+| write | 200.8 | -34.5 -33.5 -30.1 -28.9 -27.9 -23.8 -21.7 -17.3 -17.1 -15.7 | -23.8 (10/10 faster) | -7.1 -2.6 -2.3 -2.2 -2.0 -0.2 +0.7 +3.6 +3.8 +4.1 | -0.2 (6/10 faster) | **faster** beyond the control |
+| rename | 535.2 | -54.6 -44.5 -30.0 -27.9 -22.9 -12.8 -8.1 -7.5 -5.8 -2.1 | -12.8 (10/10 faster) | -51.0 -13.1 -8.9 -7.3 -2.0 +3.7 +9.1 +16.2 +21.9 +34.9 | +3.7 (5/10 faster) | within the control |
+| unlink | 351.1 | -24.3 -21.8 -20.9 -20.2 -17.7 -16.0 -15.1 -13.4 -8.5 -7.6 | -16.0 (10/10 faster) | -13.1 -9.8 -8.5 -6.4 -5.0 -3.7 -1.3 +1.5 +4.7 +11.9 | -3.7 (7/10 faster) | **faster** beyond the control |
+| fsync | 115.7 | -6.5 -3.9 -1.7 -1.4 +2.2 +2.8 +4.4 +6.8 +9.6 +11.1 | +2.8 (4/10 faster) | -12.6 -10.9 -8.9 -7.2 -4.4 -2.6 -1.0 -0.7 +4.0 +13.2 | -2.6 (8/10 faster) | within the control |
+| open | 4040.9 | -159.6 -152.8 -147.9 -80.1 -44.4 +11.4 +166.8 +198.0 +243.9 +387.3 | +11.4 (5/10 faster) | -365.5 -306.1 -258.4 -166.5 +110.3 +122.3 +164.4 +177.1 +224.3 +241.1 | +122.3 (4/10 faster) | within the control |
+| close | 4683.7 | -340.5 -314.2 -165.3 -147.0 -71.0 -43.3 +143.7 +248.2 +268.9 +372.7 | -43.3 (6/10 faster) | -285.0 -223.0 -222.2 -175.4 +48.6 +56.9 +103.7 +153.2 +202.0 +249.5 | +56.9 (4/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 453.0 | -50.7 -46.7 -20.6 -8.7 +7.5 +15.1 +20.7 +26.7 +29.5 +59.3 | +15.1 (4/10 faster) | -115.3 -72.9 -27.0 -26.6 -0.3 +18.2 +21.5 +36.2 +43.8 +114.1 | +18.2 (5/10 faster) | within the control |
+| stat | 284.2 | -187.2 -161.8 -109.0 -76.8 -42.7 -12.4 -9.0 +33.3 +50.3 +123.5 | -12.4 (7/10 faster) | -199.6 -93.0 -79.0 -12.1 +17.9 +41.4 +62.3 +76.6 +193.5 +221.6 | +41.4 (4/10 faster) | within the control |
+| read | 77.9 | -6.9 -6.4 -4.6 -4.3 -3.5 -3.5 +2.7 +4.1 +6.7 +12.1 | -3.5 (6/10 faster) | -4.8 -2.1 -1.9 -1.9 -1.8 -0.5 +1.6 +3.3 +3.8 +7.6 | -0.5 (6/10 faster) | within the control |
+| write | 266.8 | -37.2 -15.2 -13.4 -5.1 +1.5 +1.5 +5.8 +7.8 +13.5 +18.8 | +1.5 (4/10 faster) | -33.4 -32.8 -18.1 -15.8 -5.7 +10.2 +10.7 +12.1 +29.7 +38.6 | +10.2 (5/10 faster) | within the control |
+| rename | 1265.5 | -437.5 -364.5 -168.8 -132.0 -6.5 +101.8 +278.1 +327.3 +385.2 +918.1 | +101.8 (5/10 faster) | -715.7 -58.6 -16.5 +84.8 +150.6 +201.5 +382.7 +649.4 +669.4 +809.2 | +201.5 (3/10 faster) | within the control |
+| unlink | 564.7 | -141.1 -77.3 -65.6 -31.3 -28.4 +5.4 +5.6 +17.0 +89.5 +150.6 | +5.4 (5/10 faster) | -102.9 -25.7 -0.4 +31.2 +39.0 +67.2 +81.6 +101.6 +185.9 +234.5 | +67.2 (3/10 faster) | within the control |
+| fsync | 204.7 | -31.5 -20.2 -12.5 -10.3 -9.0 +2.6 +2.8 +5.6 +7.8 +12.1 | +2.6 (5/10 faster) | -25.6 -19.4 -11.2 -5.0 -4.7 -0.7 +2.3 +2.9 +3.7 +11.7 | -0.7 (6/10 faster) | within the control |
+| open | 5731.1 | -256.7 -248.7 -229.7 -178.6 -103.3 -100.0 -17.5 +155.8 +389.7 +391.5 | -100.0 (7/10 faster) | -392.5 -383.9 -234.1 -95.5 -18.0 -4.4 +10.3 +70.6 +178.0 +700.9 | -4.4 (6/10 faster) | within the control |
+| close | 6876.5 | -1182.5 -596.2 -393.6 -322.8 -295.5 -175.2 -95.4 +310.6 +981.6 +1221.5 | -175.2 (7/10 faster) | -1866.0 -1128.3 -112.4 -96.9 -70.5 +55.9 +132.8 +509.9 +4072.7 +6155.7 | +55.9 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 200.2 | -11.1 -3.5 -1.3 -0.9 +0.4 +0.4 +2.0 +7.2 +9.9 +10.8 | +0.4 (4/10 faster) | -5.4 -1.6 +0.0 +0.2 +0.6 +3.6 +4.1 +5.5 +6.0 +7.8 | +3.6 (2/10 faster) | within the control |
+| stat | 150.1 | -3.0 -0.8 -0.7 +0.4 +6.9 +8.1 +8.8 +15.4 +15.6 +20.8 | +8.1 (3/10 faster) | -3.8 -3.7 -1.5 -0.8 +0.3 +0.7 +1.1 +1.4 +1.9 +2.9 | +0.7 (4/10 faster) | **slower** beyond the control |
+| read | 41.9 | -10.3 -3.7 -1.3 -1.1 -0.7 -0.4 +3.7 +4.5 +6.6 +11.6 | -0.4 (6/10 faster) | -3.7 -1.4 -0.1 +0.4 +1.4 +3.4 +4.6 +4.9 +6.5 +9.7 | +3.4 (3/10 faster) | within the control |
+| write | 97.9 | -4.9 -3.3 -2.5 -1.6 -1.1 -0.6 +0.0 +0.1 +3.8 +6.1 | -0.6 (6/10 faster) | -4.4 -4.0 -2.1 -1.7 -1.2 -1.1 -0.9 -0.1 +1.2 +3.4 | -1.1 (8/10 faster) | within the control |
+| rename | 464.4 | -15.2 -14.3 -6.0 -1.9 -0.6 +0.3 +6.4 +8.0 +8.3 +9.0 | +0.3 (5/10 faster) | -16.5 -9.5 -6.5 -5.2 +0.6 +3.6 +3.7 +4.5 +6.0 +9.3 | +3.6 (4/10 faster) | within the control |
+| unlink | 288.1 | -8.8 -7.3 -5.4 -4.6 -2.3 -2.1 +0.9 +1.4 +3.2 +4.0 | -2.1 (6/10 faster) | -9.2 -5.3 -3.4 +1.0 +2.2 +3.9 +4.3 +6.7 +7.4 +9.0 | +3.9 (3/10 faster) | within the control |
+| fsync | 112.5 | -6.0 -5.3 -4.3 -1.7 -1.1 -0.7 +1.6 +2.1 +2.3 +11.3 | -0.7 (6/10 faster) | -7.8 -6.7 -6.0 -2.8 -1.7 -1.4 -1.3 -0.9 -0.1 +7.4 | -1.4 (9/10 faster) | within the control |
+| open | 1156.8 | -705.1 -202.4 -135.2 -93.4 -19.2 +178.1 +330.3 +856.4 +2450.4 +2656.1 | +178.1 (5/10 faster) | -176.3 -105.4 +109.4 +132.4 +153.7 +221.0 +262.8 +341.1 +751.8 +2338.5 | +221.0 (2/10 faster) | within the control |
+| close | 3826.4 | -115.8 -72.2 -15.5 -10.3 -3.5 +1.1 +11.8 +26.3 +89.7 +147.3 | +1.1 (5/10 faster) | -102.8 -55.6 -50.4 -21.1 +7.5 +9.0 +13.0 +28.9 +30.3 +52.9 | +9.0 (4/10 faster) | within the control |
+
+#### x86_64 (windows-latest): 10 runs
+
+x86_64 (windows-latest), loaded, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 102497.6 | -31758.8 -2422.8 -2050.7 -1672.5 -1317.9 -1314.0 +722.9 +1214.3 +4083.9 +7175.7 | -1314.0 (6/10 faster) | -30827.6 -3854.9 -3376.3 -3300.6 -2394.8 -2281.3 -1824.3 -956.9 +1966.3 +2243.4 | -2281.3 (8/10 faster) | within the control |
+| stat | 3857.9 | -15959.9 -5365.2 -1247.3 +110.0 +412.7 +1989.6 +3724.1 +5488.1 +12598.8 +19597.3 | +1989.6 (3/10 faster) | -15916.3 -2745.8 -2140.8 -207.0 -52.6 +279.6 +1854.8 +2569.1 +5079.0 +5874.3 | +279.6 (5/10 faster) | within the control |
+| read | 291.2 | -15.5 -15.3 -6.7 -6.1 -0.4 +2.4 +3.4 +4.9 +5.6 +24.4 | +2.4 (5/10 faster) | -23.0 -18.0 -6.5 -4.6 -2.4 -1.1 +9.2 +11.9 +12.6 +13.7 | -1.1 (6/10 faster) | within the control |
+| write | 509.3 | -551.0 -77.1 -40.1 -37.2 -30.6 -8.0 -5.6 +47.6 +59.5 +60.1 | -8.0 (7/10 faster) | -481.8 -61.0 -52.6 -44.2 -43.4 -37.1 -33.2 -25.2 -2.3 +16.5 | -37.1 (9/10 faster) | within the control |
+| rename | 61975.5 | -5393.6 -4808.5 -3465.8 +1023.7 +1984.8 +3250.0 +4114.7 +6679.4 +6715.0 +10289.9 | +3250.0 (3/10 faster) | -8243.9 -2166.0 -1084.6 -718.8 -370.3 +2885.1 +5930.6 +6851.1 +7230.7 +7781.7 | +2885.1 (5/10 faster) | within the control |
+| unlink | 33442.3 | -771.3 +10.0 +50.2 +97.5 +161.7 +466.5 +805.2 +844.8 +977.0 +1234.3 | +466.5 (1/10 faster) | -1253.2 -1035.2 -989.4 -881.7 -835.0 -429.7 -225.0 +370.6 +1052.9 +1167.6 | -429.7 (7/10 faster) | within the control |
+| fsync | 564.5 | -318.3 -247.6 -128.9 -36.5 -0.1 +10.7 +116.0 +123.8 +329.4 +331.1 | +10.7 (5/10 faster) | -294.1 -251.6 -166.6 -64.9 -53.1 -38.5 +37.3 +39.0 +74.7 +132.4 | -38.5 (6/10 faster) | within the control |
+| open | 1916.6 | -4580.1 -1214.4 -922.0 -23.5 +137.2 +275.2 +368.7 +1856.8 +3463.5 +3954.6 | +275.2 (4/10 faster) | -3620.6 -868.4 -737.7 -426.7 -79.1 -27.1 +136.5 +957.1 +2367.1 +8864.1 | -27.1 (6/10 faster) | within the control |
+| close | 236.9 | -15.5 -3.5 -2.2 +1.6 +2.7 +4.1 +6.2 +11.2 +12.7 +13.4 | +4.1 (3/10 faster) | -34.0 -14.0 -12.1 -11.8 -5.4 -5.0 -4.7 -3.2 +20.3 +32.4 | -5.0 (8/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1811.8 | -179.4 -92.6 -41.4 -12.2 +5.7 +6.0 +16.0 +18.5 +21.9 +28.2 | +6.0 (4/10 faster) | -164.5 -93.0 -92.4 -47.6 -47.0 +4.1 +8.1 +11.2 +19.3 +53.3 | +4.1 (5/10 faster) | within the control |
+| stat | 282.0 | -77.0 -24.4 -15.7 -15.3 -11.5 -9.7 +1.7 +3.8 +31.8 +68.5 | -9.7 (6/10 faster) | -73.8 -26.2 -7.8 -5.4 -4.7 +6.6 +10.5 +14.7 +26.1 +57.3 | +6.6 (5/10 faster) | within the control |
+| read | 101.5 | -29.2 -0.5 +0.6 +1.0 +1.6 +1.9 +2.4 +2.5 +4.8 +32.3 | +1.9 (2/10 faster) | -30.0 -1.9 -0.8 -0.7 -0.7 -0.4 -0.1 +0.6 +0.7 +31.1 | -0.4 (7/10 faster) | within the control |
+| write | 108.1 | -28.6 -27.2 -0.6 +1.1 +1.3 +1.6 +1.6 +3.3 +5.2 +29.4 | +1.6 (3/10 faster) | -29.0 -28.6 -4.5 -1.9 -1.7 +0.4 +0.5 +0.6 +22.9 +29.5 | +0.4 (5/10 faster) | within the control |
+| rename | 706.5 | -170.9 +3.0 +3.3 +12.1 +17.3 +17.4 +21.1 +26.7 +100.4 +189.7 | +17.4 (1/10 faster) | -178.0 -45.3 -3.6 -3.2 -2.7 +1.7 +11.8 +18.9 +97.9 +183.4 | +1.7 (5/10 faster) | within the control |
+| unlink | 435.1 | -47.5 -3.8 +1.2 +6.2 +10.0 +10.6 +22.6 +37.2 +38.9 +55.9 | +10.6 (2/10 faster) | -38.4 -33.7 -18.7 -7.5 -4.3 +0.5 +5.1 +13.6 +24.8 +34.8 | +0.5 (5/10 faster) | within the control |
+| fsync | 150.6 | -60.3 -27.9 -3.5 +1.3 +1.9 +3.2 +4.5 +6.0 +27.4 +63.5 | +3.2 (3/10 faster) | -55.7 -32.4 -8.2 -3.5 +1.0 +1.1 +2.5 +4.3 +41.7 +61.4 | +1.1 (4/10 faster) | within the control |
+| open | 249.7 | -46.6 -3.1 -1.7 +5.3 +6.3 +7.1 +7.9 +18.3 +33.5 +58.1 | +7.1 (3/10 faster) | -32.1 -23.8 -19.6 -10.7 -3.7 -1.3 +0.3 +24.0 +26.4 +29.1 | -1.3 (6/10 faster) | within the control |
+| close | 74.4 | -4.3 -1.8 -0.4 -0.2 +0.3 +0.4 +0.5 +0.6 +2.6 +28.9 | +0.4 (4/10 faster) | -4.2 -1.7 -1.6 -1.2 -0.5 -0.4 -0.1 +0.1 +3.0 +29.5 | -0.4 (7/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1463.4 | -83.0 -70.3 -66.5 -48.5 -15.7 -13.3 +26.4 +32.4 +70.3 +198.9 | -13.3 (6/10 faster) | -130.4 -85.2 -54.6 -48.3 -47.1 -17.1 +2.3 +3.0 +79.8 +169.4 | -17.1 (6/10 faster) | within the control |
+| stat | 329.7 | -5.5 -1.4 +4.9 +7.7 +18.2 +20.9 +20.9 +36.1 +41.7 +61.1 | +20.9 (2/10 faster) | -29.4 -20.2 -9.1 -0.4 +14.6 +21.3 +31.7 +35.7 +44.7 +68.2 | +21.3 (4/10 faster) | within the control |
+| read | 21.2 | -1.3 -0.9 -0.8 -0.3 -0.3 -0.2 +0.1 +0.3 +0.7 +0.9 | -0.2 (6/10 faster) | -1.2 -1.0 -0.7 -0.5 -0.4 -0.3 -0.2 +0.1 +0.1 +0.7 | -0.3 (7/10 faster) | within the control |
+| write | 187.0 | -16.6 -14.3 -4.8 -1.7 +0.6 +0.8 +1.3 +5.4 +10.4 +15.1 | +0.8 (4/10 faster) | -43.0 -24.3 -15.9 -10.5 -1.9 -0.4 +4.5 +7.7 +14.8 +15.1 | -0.4 (6/10 faster) | within the control |
+| rename | 814.4 | -160.2 -91.2 -18.0 -15.6 -3.7 -1.4 +38.4 +65.0 +73.3 +105.5 | -1.4 (6/10 faster) | -250.2 -155.6 -139.3 -138.0 -94.3 -71.5 -24.4 -16.7 +26.4 +53.2 | -71.5 (8/10 faster) | within the control |
+| unlink | 713.5 | -40.3 -37.8 -27.1 -11.9 -11.0 -10.7 +6.9 +14.6 +33.1 +92.0 | -10.7 (6/10 faster) | -72.3 -61.6 -58.5 -36.9 -13.3 -5.5 -1.3 +10.4 +61.6 +90.1 | -5.5 (7/10 faster) | within the control |
+| fsync | 180.2 | -16.2 -11.3 -4.9 -4.4 +1.5 +2.7 +2.7 +9.7 +10.1 +17.7 | +2.7 (4/10 faster) | -40.6 -13.6 -10.8 -3.3 -0.4 +0.6 +3.4 +4.8 +6.0 +9.9 | +0.6 (5/10 faster) | within the control |
+| open | 217.5 | -49.6 -29.7 -17.2 -14.3 -8.4 +1.2 +6.6 +14.3 +15.1 +54.9 | +1.2 (5/10 faster) | -40.0 -33.9 -26.7 -22.8 -7.6 +4.4 +24.1 +25.5 +27.2 +27.3 | +4.4 (5/10 faster) | within the control |
+| close | 109.3 | -7.9 -5.4 -4.9 -3.2 -1.1 -0.2 -0.1 +3.1 +7.5 +8.2 | -0.2 (7/10 faster) | -20.1 -7.2 -3.2 -3.0 +1.0 +1.9 +2.6 +4.6 +7.5 +7.5 | +1.9 (4/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 711.2 | -15.4 -7.6 +1.2 +7.1 +9.7 +14.9 +15.9 +24.0 +25.3 +46.7 | +14.9 (2/10 faster) | -24.5 -18.6 -11.7 -3.0 -1.5 +4.1 +8.5 +16.1 +34.5 +50.1 | +4.1 (5/10 faster) | within the control |
+| stat | 172.7 | +0.0 +1.6 +2.6 +3.1 +3.2 +4.0 +5.3 +6.6 +8.3 +9.4 | +4.0 (0/10 faster) | -5.8 -3.6 -1.3 -0.4 +0.9 +1.2 +1.4 +4.4 +7.6 +16.4 | +1.2 (4/10 faster) | within the control |
+| read | 6.5 | -0.2 -0.1 -0.1 -0.1 +0.0 +0.0 +0.1 +0.1 +0.1 +0.1 | +0.0 (4/10 faster) | -0.1 -0.1 -0.1 +0.0 +0.0 +0.0 +0.0 +0.0 +0.1 +0.1 | +0.0 (3/10 faster) | within the control |
+| write | 56.0 | -1.5 -0.8 -0.6 +0.1 +0.4 +0.6 +1.2 +2.1 +2.4 +2.6 | +0.6 (3/10 faster) | -2.1 -1.6 -1.3 -1.2 -0.5 -0.3 +0.0 +1.0 +2.1 +3.9 | -0.3 (6/10 faster) | within the control |
+| rename | 349.4 | -11.1 -1.1 -0.9 +1.4 +2.3 +3.1 +3.6 +4.0 +6.1 +11.4 | +3.1 (3/10 faster) | -14.5 -8.5 -4.8 -3.5 -1.5 -1.5 -1.4 -0.3 +3.2 +12.6 | -1.5 (8/10 faster) | within the control |
+| unlink | 214.0 | -28.7 -2.2 +0.5 +1.0 +1.4 +2.7 +3.7 +5.3 +6.7 +39.7 | +2.7 (2/10 faster) | -27.4 -14.0 -2.8 -2.2 +0.2 +0.5 +2.1 +3.6 +10.5 +27.7 | +0.5 (4/10 faster) | within the control |
+| fsync | 84.9 | -2.0 -1.0 -0.6 +0.0 +0.2 +0.6 +0.8 +2.2 +3.2 +3.7 | +0.6 (3/10 faster) | -2.5 -1.7 -1.2 -0.7 -0.1 +0.0 +0.2 +2.3 +3.3 +4.6 | +0.0 (5/10 faster) | within the control |
+| open | 91.8 | -9.1 -1.8 -1.2 +0.0 +0.1 +0.2 +0.3 +0.4 +0.4 +0.8 | +0.2 (3/10 faster) | -9.6 -2.4 -1.5 -0.6 -0.5 -0.5 -0.3 -0.1 +0.7 +1.2 | -0.5 (8/10 faster) | within the control |
+| close | 43.8 | -0.7 -0.4 -0.4 -0.2 -0.1 +0.3 +0.5 +1.1 +1.4 +1.7 | +0.3 (5/10 faster) | -1.4 -0.8 -0.6 -0.6 -0.3 -0.1 +0.0 +0.9 +1.2 +1.9 | -0.1 (6/10 faster) | within the control |
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
@@ -11928,6 +12068,8 @@ against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64
 - **What is left that crash safety does not need:** the open's confirmation round on the worker's path, 3.6 µs an open
   on arm64 and 3.0 on x86_64. The separate send is A-215's, rejected. A reply channel per shard call and a path's
   String the DLL arm pays too.
+- **Cut (c), that round off the worker's path (A-274, 2026-11-09):** landed on arm64's loaded tails (write p99 −1,522
+  µs, 9 of 10 runs, beyond the control); a quiet stat costs +8.1 µs on arm64 and +4.0 on x86_64 (above).
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
 
