@@ -7837,6 +7837,8 @@ pub(crate) fn take_sessions(
   .unwrap_or_default()
 }
 
+/// Format: nanoseconds per millisecond, for the link's log lines.
+const NS_PER_MS: u64 = 1_000_000;
 /// The status count of a record session dropped on its return because its peer was silent past the rule
 /// ([`return_sessions`]), for the link to dial again.
 const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
@@ -7878,6 +7880,15 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_SESSION_JUDGED_DEAD, 1);
+          // How far past the window the judgment came, so the margin over the duration is on record, not just a count.
+          slates_machine::log_line!(
+            "slates-server: record session to {host:?} dropped silent after {} ms, its window {} ms",
+            endpoint.peer_silence_ns().unwrap_or(0) / NS_PER_MS,
+            endpoint
+              .persistent_congestion_duration()
+              .max(crate::daemon::LIVENESS_BUDGET_NS)
+              / NS_PER_MS
+          );
           s.dead_session_dropped_at.insert(host, futures::now_ns());
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
