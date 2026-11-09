@@ -1,0 +1,93 @@
+runner ubuntu-latest, 4 CPUs, Mon Nov  9 18:09:43 UTC 2026, after 7561b338, before 93aa5dd7, sample 1
+before ../t-before/debug/deps/fleet-10359b5eeeb6ade0
+after ../t-after/debug/deps/fleet-10359b5eeeb6ade0
+== pair 1 arm before at 18:09:43, load 3.34 1.80 0.75
+held positions (successor, (b, c)) before the death: [(HostId(10297292766385083197), (Some(2), Some(1))), (HostId(17320762699593317345), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [42, 37, 254, 101, 134, 103, 191, 208, 0, 0, 0, 0, 0, 0, 0, 6] }: [], VolumeId { bytes: [42, 37, 254, 101, 134, 103, 191, 208, 0, 0, 0, 0, 0, 0, 12, 149] }: []}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 2)]), Ok([("fleet.takeover.adopt_unplaced", 3993), ("fleet.takeover.adopt_unplaced.no_holders", 6), ("fleet.takeover.adopt_unplaced.unacked", 3987), ("fleet.takeover.adopted", 1), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 12)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9080) panicked at crates/server/tests/fleet.rs:9382:3:
+every volume served within 60s: {VolumeId { bytes: [42, 37, 254, 101, 134, 103, 191, 208, 0, 0, 0, 0, 0, 0, 0, 6] }: "[]", VolumeId { bytes: [42, 37, 254, 101, 134, 103, 191, 208, 0, 0, 0, 0, 0, 0, 12, 149] }: "[]"}
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 414.27s
+
+== pair 1 arm before exit 101, load 0.30 0.62 0.55
+== pair 1 arm after at 18:16:37, load 0.30 0.62 0.55
+held positions (successor, (b, c)) before the death: [(HostId(5367025768941932372), (Some(2), Some(1))), (HostId(17033410995892314304), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [147, 6, 248, 51, 42, 189, 187, 30, 0, 0, 0, 0, 0, 0, 0, 6] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }], VolumeId { bytes: [147, 6, 248, 51, 42, 189, 187, 30, 0, 0, 0, 0, 0, 0, 10, 89] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_authority", 2), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 7)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9187) panicked at crates/server/tests/fleet.rs:9398:5:
+volume VolumeId { bytes: [147, 6, 248, 51, 42, 189, 187, 30, 0, 0, 0, 0, 0, 0, 0, 6] } is served at its second snapshot SnapshotId { value: 4294967296 }, not an older one: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 7.72s
+
+== pair 1 arm after exit 101, load 0.33 0.61 0.55
+== pair 2 arm before at 18:16:45, load 0.33 0.61 0.55
+held positions (successor, (b, c)) before the death: [(HostId(6763744133035755043), (Some(2), Some(1))), (HostId(8391136734855944176), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [243, 133, 57, 207, 60, 241, 225, 66, 0, 0, 0, 0, 0, 0, 0, 6] }: [], VolumeId { bytes: [243, 133, 57, 207, 60, 241, 225, 66, 0, 0, 0, 0, 0, 0, 20, 104] }: []}; counters [Ok([("fleet.takeover.adopted", 4), ("fleet.takeover.page_unbound", 4), ("fleet.takeover.page_unmatched", 3), ("fleet.takeover.pages_unsent", 2), ("fleet.takeover.unpromised", 18)]), Ok([("fleet.takeover.adopt_unplaced", 4044), ("fleet.takeover.adopt_unplaced.no_holders", 8), ("fleet.takeover.adopt_unplaced.unacked", 4036), ("fleet.takeover.adopted", 1), ("fleet.takeover.page_unbound", 3), ("fleet.takeover.page_unmatched", 4), ("fleet.takeover.stale_configuration", 4), ("fleet.takeover.unpromised", 6)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9212) panicked at crates/server/tests/fleet.rs:9382:3:
+every volume served within 60s: {VolumeId { bytes: [243, 133, 57, 207, 60, 241, 225, 66, 0, 0, 0, 0, 0, 0, 0, 6] }: "[]", VolumeId { bytes: [243, 133, 57, 207, 60, 241, 225, 66, 0, 0, 0, 0, 0, 0, 20, 104] }: "[]"}
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 416.33s
+
+== pair 2 arm before exit 101, load 0.28 0.35 0.44
+== pair 2 arm after at 18:23:42, load 0.28 0.35 0.44
+held positions (successor, (b, c)) before the death: [(HostId(2646995057562036543), (Some(2), Some(1))), (HostId(13536383606904400351), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [18, 235, 84, 194, 70, 167, 195, 18, 0, 0, 0, 0, 0, 0, 0, 6] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }], VolumeId { bytes: [18, 235, 84, 194, 70, 167, 195, 18, 0, 0, 0, 0, 0, 0, 36, 43] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]}; counters [Ok([("fleet.takeover.adopted", 6), ("fleet.takeover.listed_by_authority", 2), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 31)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9318) panicked at crates/server/tests/fleet.rs:9398:5:
+volume VolumeId { bytes: [18, 235, 84, 194, 70, 167, 195, 18, 0, 0, 0, 0, 0, 0, 0, 6] } is served at its second snapshot SnapshotId { value: 4294967296 }, not an older one: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 5.32s
+
+== pair 2 arm after exit 101, load 0.25 0.34 0.44
+== pair 3 arm before at 18:23:47, load 0.25 0.34 0.44
+held positions (successor, (b, c)) before the death: [(HostId(2194790015918194310), (Some(2), Some(1))), (HostId(4217994343900685957), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [95, 215, 131, 178, 109, 225, 150, 201, 0, 0, 0, 0, 0, 0, 0, 6] }: [], VolumeId { bytes: [95, 215, 131, 178, 109, 225, 150, 201, 0, 0, 0, 0, 0, 0, 48, 169] }: []}; counters [Ok([("fleet.takeover.adopted", 6), ("fleet.takeover.page_unbound", 4), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 20)]), Ok([("fleet.takeover.adopt_unplaced", 4069), ("fleet.takeover.adopt_unplaced.no_holders", 6), ("fleet.takeover.adopt_unplaced.unacked", 4063), ("fleet.takeover.adopted", 1), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 4), ("fleet.takeover.stale_configuration", 3), ("fleet.takeover.unpromised", 4)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9342) panicked at crates/server/tests/fleet.rs:9382:3:
+every volume served within 60s: {VolumeId { bytes: [95, 215, 131, 178, 109, 225, 150, 201, 0, 0, 0, 0, 0, 0, 0, 6] }: "[]", VolumeId { bytes: [95, 215, 131, 178, 109, 225, 150, 201, 0, 0, 0, 0, 0, 0, 48, 169] }: "[]"}
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 418.60s
+
+== pair 3 arm before exit 101, load 0.28 0.31 0.38
+== pair 3 arm after at 18:30:45, load 0.28 0.31 0.38
+held positions (successor, (b, c)) before the death: [(HostId(4134092077868269076), (Some(2), Some(1))), (HostId(18302817837511258993), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [111, 197, 143, 108, 225, 22, 70, 153, 0, 0, 0, 0, 0, 0, 0, 6] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }], VolumeId { bytes: [111, 197, 143, 108, 225, 22, 70, 153, 0, 0, 0, 0, 0, 0, 12, 62] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_authority", 2), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 7)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9429) panicked at crates/server/tests/fleet.rs:9398:5:
+volume VolumeId { bytes: [111, 197, 143, 108, 225, 22, 70, 153, 0, 0, 0, 0, 0, 0, 0, 6] } is served at its second snapshot SnapshotId { value: 4294967296 }, not an older one: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 4.79s
+
+== pair 3 arm after exit 101, load 0.26 0.30 0.38
+== pair 4 arm before at 18:30:50, load 0.26 0.30 0.38
+held positions (successor, (b, c)) before the death: [(HostId(3706797989890996796), (Some(2), Some(1))), (HostId(6751808166240932948), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [97, 18, 156, 114, 67, 56, 26, 16, 0, 0, 0, 0, 0, 0, 0, 6] }: [], VolumeId { bytes: [97, 18, 156, 114, 67, 56, 26, 16, 0, 0, 0, 0, 0, 0, 50, 221] }: []}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 2)]), Ok([("fleet.takeover.adopt_unplaced", 4010), ("fleet.takeover.adopt_unplaced.no_holders", 4), ("fleet.takeover.adopt_unplaced.unacked", 4006), ("fleet.takeover.adopted", 7), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 48)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9453) panicked at crates/server/tests/fleet.rs:9382:3:
+every volume served within 60s: {VolumeId { bytes: [97, 18, 156, 114, 67, 56, 26, 16, 0, 0, 0, 0, 0, 0, 0, 6] }: "[]", VolumeId { bytes: [97, 18, 156, 114, 67, 56, 26, 16, 0, 0, 0, 0, 0, 0, 50, 221] }: "[]"}
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 424.84s
+
+== pair 4 arm before exit 101, load 0.31 0.26 0.33
+== pair 4 arm after at 18:37:55, load 0.31 0.26 0.33
+held positions (successor, (b, c)) before the death: [(HostId(951525166834641745), (Some(2), Some(1))), (HostId(11458121148200278633), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [230, 237, 137, 101, 104, 13, 50, 160, 0, 0, 0, 0, 0, 0, 0, 6] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }], VolumeId { bytes: [230, 237, 137, 101, 104, 13, 50, 160, 0, 0, 0, 0, 0, 0, 9, 219] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_authority", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.round_behind", 1), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 3)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 8)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9530) panicked at crates/server/tests/fleet.rs:9398:5:
+volume VolumeId { bytes: [230, 237, 137, 101, 104, 13, 50, 160, 0, 0, 0, 0, 0, 0, 0, 6] } is served at its second snapshot SnapshotId { value: 4294967296 }, not an older one: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 4.76s
+
+== pair 4 arm after exit 101, load 0.29 0.26 0.33
+== pair 5 arm before at 18:38:00, load 0.29 0.26 0.33
+held positions (successor, (b, c)) before the death: [(HostId(10515570089112524684), (Some(2), Some(1))), (HostId(16146595633511135788), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [82, 168, 213, 29, 47, 209, 40, 137, 0, 0, 0, 0, 0, 0, 0, 6] }: [], VolumeId { bytes: [82, 168, 213, 29, 47, 209, 40, 137, 0, 0, 0, 0, 0, 0, 14, 235] }: []}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.round_behind", 1), ("fleet.takeover.stale_configuration", 1), ("fleet.takeover.unpromised", 2)]), Ok([("fleet.takeover.adopt_unplaced", 4016), ("fleet.takeover.adopt_unplaced.no_holders", 5), ("fleet.takeover.adopt_unplaced.unacked", 4011), ("fleet.takeover.adopted", 1), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 10)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9553) panicked at crates/server/tests/fleet.rs:9382:3:
+every volume served within 60s: {VolumeId { bytes: [82, 168, 213, 29, 47, 209, 40, 137, 0, 0, 0, 0, 0, 0, 0, 6] }: "[]", VolumeId { bytes: [82, 168, 213, 29, 47, 209, 40, 137, 0, 0, 0, 0, 0, 0, 14, 235] }: "[]"}
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 416.12s
+
+== pair 5 arm before exit 101, load 0.17 0.19 0.26
+== pair 5 arm after at 18:44:56, load 0.17 0.19 0.26
+held positions (successor, (b, c)) before the death: [(HostId(4775208635104644697), (Some(2), Some(1))), (HostId(9055688097051005298), (Some(2), Some(1)))]; served heads {VolumeId { bytes: [50, 60, 23, 53, 43, 157, 128, 208, 0, 0, 0, 0, 0, 0, 0, 6] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }], VolumeId { bytes: [50, 60, 23, 53, 43, 157, 128, 208, 0, 0, 0, 0, 0, 0, 14, 243] }: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]}; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_authority", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 3)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 12)])]
+
+thread 'a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages' (9712) panicked at crates/server/tests/fleet.rs:9398:5:
+volume VolumeId { bytes: [50, 60, 23, 53, 43, 157, 128, 208, 0, 0, 0, 0, 0, 0, 0, 6] } is served at its second snapshot SnapshotId { value: 4294967296 }, not an older one: [SnapshotId { value: 0 }, SnapshotId { value: 0 }]
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 115 filtered out; finished in 6.83s
+
+== pair 5 arm after exit 101, load 0.15 0.19 0.26
