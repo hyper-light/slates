@@ -20,7 +20,13 @@ holds the mount's connection, so every publication carried: the lane failed.
   the anchor holds): fetch a page, then write it back twenty times, each with one more byte stored. Before: rounds 1 to
   19 refused `NFS3ERR_IO` (status 5), every write-back after the first. After: all applied, the file the last page.
 - The only change between the two runs is `carry` no longer consuming the live states: the cause is A-231's carry.
-- CI: `diag-bug-sweep-15` runs fsx seed 1 over native-macos-nfs at 7ce90ebb, e86fb417 and the fix, interleaved.
+- CI, the A/B: `diag-bug-sweep-17` (run 42425914509, macos-latest, macOS 26.7.2) built e86fb417 and the fix each into
+  its own target dir and ran `cargo xtask conformance all` four times, interleaved. e86fb417 failed fsx seed 1 over
+  native-macos-nfs in both rounds (23:39 and 23:48 UTC, load 6.6 and 1.5); the fix passed both (23:44 and 23:53, load
+  1.4 and 1.9). pjdfstest was the same in all four: 6,781 passed, 1,905 expected failures, 0 unexpected. Main's next
+  macOS conformance, on 4811191a with the fix, passed (run 42434181746).
+- `diag-bug-sweep-15` and `-16` passed every tree and do not count: the trees shared one `CARGO_TARGET_DIR`, and the
+  conformance harness runs the binary in it, so each may have run the last one built.
 
 ## Root cause
 

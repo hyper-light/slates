@@ -54,6 +54,7 @@ pub mod params;
 pub mod pmtud;
 pub mod receive;
 pub mod reorder;
+pub mod reset;
 pub mod rtt;
 pub mod session;
 pub mod stream;

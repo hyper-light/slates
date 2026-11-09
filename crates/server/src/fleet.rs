@@ -1543,6 +1543,10 @@ async fn serve_peer_records(
     let next =
       match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
         Ok(next) => next,
+        Err(EndpointError::PeerReset) => {
+          count_refusal(SERVE_PEER_RESET);
+          return;
+        }
         Err(_) => return,
       };
     let (stream_id, stream, request) = match next {
@@ -4332,6 +4336,16 @@ const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
+
+/// Counter: a borrowed record session returned reset by its peer (A-261, `EndpointError::PeerReset`: the peer restarted
+/// under the same identity and no longer holds it), its link dropped so the link task dials the new process.
+/// Format: a counter name in the daemon's status report.
+const LINK_PEER_RESET: &str = "fleet.link.peer_reset";
+
+/// Counter: a served record session its dialer reset (A-261: a process restarted onto the dialer's port, under its
+/// identity), its serve loop ended.
+/// Format: a counter name in the daemon's status report.
+const SERVE_PEER_RESET: &str = "fleet.serve.peer_reset";
 /// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
 /// record link to it (never established, or removed at its retirement), its session lent to a coordinator
 /// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a
@@ -7140,6 +7154,11 @@ async fn run_record_plane(local: HostId) {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
     slates_rt::registry::with_current(|ctx| ctx.beat_progress());
+    // The merge record plane stamps each version with the period it first works it in, and judges its placement by
+    // it (`merge_service::PLACED_WITHIN_PERIOD`).
+    let _ = state::with_state(|s| {
+      s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+    });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
     // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers
@@ -7862,12 +7881,20 @@ pub(crate) fn take_sessions(
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
 /// removed by its link task), a slot the link task re-established since (holding a newer session, or
 /// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
-/// never installed over a newer session.
+/// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
+/// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
+/// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
+        Some(link)
+          if link.endpoint.is_none() && link.borrowed == returned && endpoint.peer_reset() =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_PEER_RESET, 1);
+        }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);

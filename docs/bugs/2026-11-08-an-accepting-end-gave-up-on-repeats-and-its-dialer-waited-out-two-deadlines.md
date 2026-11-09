@@ -50,3 +50,24 @@ at most one probe timeout is a time bound. It remains a shape constant, sized to
 **Then also fixed (A-258).** The accepting end gave up silently, so a dialer waited out one 22 s deadline for an end that had
 gone. It now sends a close sealed under the Handshake keys (RFC 9000 §10.2.3), and the dialer ends `PeerClosed` within a
 round trip; a close that does not open under those keys is ignored.
+
+**Measured on CI afterwards (interleaved A/B, the five-node fresh-member flow).**
+- **The runs.** Before is 1d1bac87 plus the diagnostic harness (counters, no fix); after is 4c73c048 plus the same
+  harness. The arms alternate run by run.
+- **diag-59** (2 CPUs, load 1.5–15, 36 runs a side): no handshake stall counter in either arm.
+- **diag-60** (the test and its five daemons on one CPU, with 4 busy loops, 6 one-byte `dd` copies, 2 direct-I/O
+  writers and a `dsync` writer on it; load 15–23; 36 runs a side): the first half of the stall reproduced, the 40 s
+  formations did not.
+  - Before:
+    - `fleet.accept.stall.repeats` in 3 runs, each with `fleet.accept.stall.silence` and, in 2 of them,
+      `fleet.dial.stall.confirm_silence` (one `fleet.dial.redial`);
+    - those runs' second formations took 4.7, 5.8 and 6.0 s;
+    - formations over all runs: 1.8 / 4.0 / 16.9 s (min / median / max), one over 10 s, the 16.9 s run carrying no
+      stall counter.
+  - After: no stall counter in any run; formations 2.1 / 4.0 / 8.9 s, none over 10 s.
+  - Not reproduced here: the dialer waiting out its 22 s confirmation deadline. Its peer's silence ended the wait
+    first (`confirm_silence`), so the formations of 40–72 s seen on the shared Mac at load 127–244 did not appear on
+    CI's runner.
+- **Unrelated failures.** 6 runs before and 7 after failed one wait, `wait_neighbourhood_settled`. One or two nodes
+  stayed at an older configuration version (8 against 11–14) for a whole fleet wait. Neither arm changes that path.
+  It is passed on as its own finding.

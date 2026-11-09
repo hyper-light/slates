@@ -12782,9 +12782,14 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
 /// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
 /// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
 /// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
-/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
-/// every submit accepted, each as the next version, and the median answered within one coordinator period
-/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another. Expect every submit
+/// accepted, each as the next version, and, judged in the daemon's own terms rather than by a wall bound, most versions
+/// placed at the quorum in the same coordinator period they were enqueued in
+/// (`merge.placed_within_period` against `merge.placed_after_periods`, the coordinator's own period count): an
+/// accepted version wakes the record plane, which ships it between periods, so its answer does not wait for one. Before
+/// A-235 every version was placed only after a period began (its inputs put at one, its record at the next). A busy
+/// machine stretches every period and every exchange alike, so the judgement holds under load, where a fixed 100 ms
+/// bound did not (a median of 909 ms under 36 spinners, 2026-11-07).
 #[test]
 fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
   /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
@@ -12845,10 +12850,26 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
     unheld, 0,
     "no holder refused a record for want of inputs it was counted holding: {counters:?}"
   );
+  let owner_count = |name: &str| {
+    counters
+      .first()
+      .into_iter()
+      .flatten()
+      .filter(|(counter, _)| counter == name)
+      .map(|(_, count)| *count)
+      .sum::<u64>()
+  };
+  let within = owner_count("merge.placed_within_period");
+  let after = owner_count("merge.placed_after_periods");
   assert!(
-    median < Duration::from_nanos(HEARTBEAT_NS),
-    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
-    HEARTBEAT_NS / 1_000_000
+    within + after >= SUBMITS,
+    "every version's placement was judged ({within} within its period, {after} after periods, of {SUBMITS} submits): \
+     {counters:?}"
+  );
+  assert!(
+    within > after,
+    "most versions placed without waiting for the coordinator's period: {within} within the period they were enqueued \
+     in, {after} only after a period began; answers {waits:?}"
   );
 }
 
@@ -16946,6 +16967,161 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
   );
 }
 
+/// Shape: how long after its owner's restart a read through b may take to reach the new process once b's session to
+/// the old one is reset (A-261): the reset itself is a round trip, then one heartbeat for b's link task to come round
+/// to the dropped link, a dial and a discovery page, all well inside one liveness budget. loadtest-scale's lane-side
+/// bound for the same case, with no reset, is two budgets (its `DEAD_SESSION_BOUND`).
+const RESET_LANE_BOUND: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+
+/// A-261 (RFC 9000 §10.3), loadtest-scale's primary-kill case (2026-11-08): a primary restarted under the same member id
+/// left the client node's record session to it in place, lent and dead, for 25 to 135 s. With stateless reset the
+/// restarted process answers the first packet on that session with a reset ending in the token its identity issued
+/// for it, and b drops the link and dials the new process. Do: three nodes; a volume owned by a, read through b; restart
+/// a with its identity on its ports; read through b until a answers. Expect: b counted the reset
+/// (`fleet.link.peer_reset`), and the first read to reach the restarted a came within [`RESET_LANE_BOUND`].
+#[test]
+#[ignore = "A-261: parked until it holds its own precondition (b still holding its session to the old a at the restart); on a Mac at load 46-48 it failed 2 of 3 with 0 resets while b reached the restarted a in 207-263 ms, its session lent or replaced first; GAPS A-261"]
+#[allow(clippy::cognitive_complexity)]
+fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["reset-lane-a", "reset-lane-b", "reset-lane-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("reset-lane-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(&format!("reset-lane-{node}-{pid}"), profile, &configs[node])
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "reset-lane", &daemons);
+  let mut probe = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let resets_before = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap();
+  drop(owner);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let restarted = Instant::now();
+  let mut answers = Vec::new();
+  let mut reset_seen = None;
+  let reached = loop {
+    let reply = probe.call(&read);
+    if reset_seen.is_none()
+      && refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() > resets_before
+    {
+      reset_seen = Some(restarted.elapsed());
+    }
+    let from_b = matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::OwnerUnreachable { .. } | Refusal::HomedElsewhere { .. }
+      }
+    );
+    answers.push((restarted.elapsed(), reply));
+    if !from_b {
+      break Some(restarted.elapsed());
+    }
+    if restarted.elapsed() > 10 * RESET_LANE_BOUND {
+      break None;
+    }
+  };
+  let resets = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() - resets_before;
+  let counters: Vec<(&str, u64)> = daemons[1]
+    .fleet_refusals()
+    .unwrap()
+    .into_iter()
+    .filter(|(name, _)| name.starts_with("fleet.forward") || name.starts_with("fleet.link"))
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "the first read through b to reach the restarted a came {reached:?} after its restart, b's reset seen by {reset_seen:?} \
+     ({resets} resets; {} answers before, the last {:?}); b's forward and link counters {counters:?}",
+    answers.len().saturating_sub(1),
+    answers.last()
+  );
+  assert!(
+    routed,
+    "b routed the volume to a before the restart: {last:?}"
+  );
+  assert!(
+    resets >= 1,
+    "b's session to the old a was reset: {counters:?}"
+  );
+  let reached = reached.unwrap_or_else(|| {
+    panic!(
+      "no read through b reached the restarted a within {:?}: {answers:?}",
+      10 * RESET_LANE_BOUND
+    )
+  });
+  assert!(
+    reached <= RESET_LANE_BOUND,
+    "a read through b reached the restarted a {reached:?} after its restart, past {RESET_LANE_BOUND:?}"
+  );
+}
+
 /// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past
 /// a wall window.
 const STARVED_OWNER: Duration = Duration::from_millis(1_500);
@@ -17160,4 +17336,183 @@ fn a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share
     served_after_share,
     "node b's read was served once the named share was made (last: {after_share:?})"
   );
+}
+
+/// §4.8 Lookup after a green's takeover (A-127). Do: on a settled three-node fleet at `f = 1`, make a green with a work
+/// and an edit on its owner, submit the work there (version 1, committed at the quorum), and stop the owner; then from
+/// a client on the survivor that does not take the green over, ask the green's versions until the placement deadline.
+/// Expect the read forwarded to the successor and answered `Versions { head: 1 }`: a location round finds the node that
+/// adopted the green.
+#[test]
+fn a_greens_successor_is_found_by_a_survivor_after_its_owner_died() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "located-green", &daemons);
+  let edited = owner_client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submitted = owner_client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  drop(owner_client);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Survivors' indices once the owner is removed: 0 is hosts[1], 1 is hosts[2].
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  let placed_before = daemons[0].merge_record_placed(green, 1);
+  daemons.remove(0).stop();
+  let mut reader = Client::connect(daemons[other_index].instance());
+  let began = Instant::now();
+  let read = loop {
+    let reply = reader.call(&RequestBody::Versions { green });
+    if matches!(reply, ReplyBody::Versions { .. }) || began.elapsed() >= PLACEMENT_DEADLINE {
+      break reply;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+  };
+  let took = began.elapsed();
+  let counters = |daemon: &Daemon| -> Vec<(String, u64)> {
+    daemon
+      .fleet_refusals()
+      .map(|counters| {
+        counters
+          .into_iter()
+          .filter(|(name, _)| {
+            ["fleet.owner_location.", "fleet.takeover.", "fleet.materialize", "fleet.forward."]
+              .iter()
+              .any(|prefix| name.starts_with(prefix))
+          })
+          .map(|(name, count)| (name.to_owned(), count))
+          .collect()
+      })
+      .unwrap_or_default()
+  };
+  let successor_counters = counters(&daemons[successor_index]);
+  let other_counters = counters(&daemons[other_index]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(matches!(edited, ReplyBody::Edited), "the edit was declared: {edited:?}");
+  assert!(
+    matches!(submitted, ReplyBody::Submitted { version: Some(1), .. }),
+    "the submit was accepted as version 1: {submitted:?}"
+  );
+  assert_eq!(placed_before, Ok(true), "version 1 committed at the quorum");
+  assert_eq!(
+    read,
+    ReplyBody::Versions { head: 1 },
+    "the survivor's read reached the green's successor after {took:?}; the successor's counters {successor_counters:?}; \
+     the reader's node's {other_counters:?}"
+  );
+}
+
+/// §4.16 "Commit", A-255 (A-252's takeover half): a completion record moves with its object, and for a merge the object
+/// is the green (RIFL §3: "If the object migrates, then the completion record must move with it"). Do: three nodes at
+/// `f = 1`; on a, a green and a work shared with the fleet; through b, one edit, then the submit begun from a library
+/// client whose answer is never read; once both holders hold version 1 (committed at the quorum), a dies, and the
+/// survivor rendezvous ranks first takes the green over; b's client sends the submit again under the same id. Expect
+/// it answered `Submitted { version: Some(1) }` (T-8.11, §4.16's failure matrix: "Masked after takeover on a candidate
+/// that holds the ledger"), and the green holding the one version.
+#[test]
+fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_greens_successor() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "answer-lost-green", &daemons);
+  drop(owner_client);
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let edited = routed.then(|| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    })
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut resender = common::client::connect(daemons[1].instance());
+  // The answer is never read: it is lost with the owner.
+  let word = resender.begin(&submit).map(|id| id.word());
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  let again = word.as_ref().ok().and_then(|word| {
+    let began = Instant::now();
+    loop {
+      match resent_answer(&mut resender, *word, &submit) {
+        Some(Ok(ReplyBody::Refused {
+          refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. },
+        }))
+        | Some(Err(_))
+        | None
+          if began.elapsed() < RESEND_RETRY_FOR =>
+        {
+          std::thread::sleep(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
+        }
+        other => break other,
+      }
+    }
+  });
+  let mut reader = Client::connect(daemons[successor_index].instance());
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert!(matches!(edited, Some(ReplyBody::Edited)), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(caught_up, "both holders held version 1 before the owner died");
+  assert!(materialized, "the successor took the green over at version 1");
+  assert_eq!(
+    again,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit resent after its owner died is answered its version by the green's successor"
+  );
+  assert_eq!(head, ReplyBody::Versions { head: 1 }, "the green holds the one version");
 }
