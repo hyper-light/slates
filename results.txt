@@ -1,0 +1,46 @@
+runner aarch64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit 049c21ff
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 1 exit 0 load 14.77
+hedge: measured before the hold Ok((1, Some(678025071))) (readings, p95 ns); hedged true; second seal placed after 4.937154081s, held Ok(5278339754) ns (placed while held: true); readings after Ok((3, Some(874787926)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 178.99s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 2 exit 0 load 14.42
+hedge: measured before the hold Ok((2, Some(1071732480))) (readings, p95 ns); hedged true; second seal placed after 4.710052188s, held Ok(4896796108) ns (placed while held: true); readings after Ok((3, Some(1071732480)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 134.10s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 3 exit 0 load 15.23
+hedge: measured before the hold Ok((1, Some(20271067))) (readings, p95 ns); hedged true; second seal placed after 51.976334797s, held Ok(20078350107) ns (placed while held: false); readings after Ok((3, Some(1279713614)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 190.32s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 4 exit 0 load 14.77
+hedge: measured before the hold Ok((2, Some(591638154))) (readings, p95 ns); hedged true; second seal placed after 3.491048147s, held Ok(3763283901) ns (placed while held: true); readings after Ok((4, Some(591638154)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 165.04s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 5 exit 0 load 14.70
+hedge: measured before the hold Ok((1, Some(50788383))) (readings, p95 ns); hedged true; second seal placed after 36.332034101s, held Ok(20105401852) ns (placed while held: false); readings after Ok((2, Some(50788383)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 211.40s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 6 exit 0 load 14.73
+hedge: measured before the hold Ok((1, Some(651050097))) (readings, p95 ns); hedged true; second seal placed after 3.799028223s, held Ok(4078450683) ns (placed while held: true); readings after Ok((3, Some(634587875)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 147.21s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 7 exit 0 load 15.01
+hedge: measured before the hold Ok((1, Some(671758450))) (readings, p95 ns); hedged true; second seal placed after 4.554027555s, held Ok(4662101337) ns (placed while held: true); readings after Ok((2, Some(442306836)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 148.49s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 8 exit 0 load 15.21
+hedge: measured before the hold Ok((1, Some(1604080520))) (readings, p95 ns); hedged true; second seal placed after 6.364044156s, held Ok(6613206246) ns (placed while held: true); readings after Ok((2, Some(411918471)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 196.82s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 9 exit 0 load 15.19
+hedge: measured before the hold Ok((1, Some(18006639))) (readings, p95 ns); hedged true; second seal placed after 90.270039531s, held Ok(20189519305) ns (placed while held: false); readings after Ok((3, Some(707611011)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 201.99s
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 10 exit 0 load 15.01
+hedge: measured before the hold Ok((1, Some(17756113))) (readings, p95 ns); hedged true; second seal placed after 60.18403911s, held Ok(20083266541) ns (placed while held: false); readings after Ok((2, Some(17756113)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 207.24s
+== a_slow_first_round_candidate_is_hedged_after_the_measured_p95 passed 10 failed 0
+== hedge mutant exit 0
+hedge: measured before the hold Ok((1, Some(3497765))) (readings, p95 ns); hedged true; second seal placed after 300.447423863s, held Ok(20000000308) ns (placed while held: false); readings after Ok((2, Some(2510516)))
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 301.98s
