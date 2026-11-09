@@ -45,6 +45,12 @@ use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
 
 use crate::state;
 
+/// The status count of a failed or silent session dropped (a peer's reset, the transport's silence rule, a discovery page
+/// that failed) whose replacement the lane had a reply on within a liveness budget of the drop: the property the
+/// forward path owes after any such drop, whoever dropped it.
+const REPLACED_ANSWERED_IN_BUDGET: &str = "fleet.forward.replaced_answered_in_budget";
+/// Of the same drops, those whose replacement's first reply came later than a liveness budget after the drop.
+const REPLACED_ANSWERED_PAST_BUDGET: &str = "fleet.forward.replaced_answered_past_budget";
 /// Format: nanoseconds per millisecond, for the lane's log lines.
 const NS_PER_MS: u64 = 1_000_000;
 /// The status count of a forward refused because its lane held [`lane_bound`] forwards already.
@@ -556,6 +562,14 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
     {
       let recovered = futures::now_ns().saturating_sub(dropped);
       s.dead_session_recovered_ns = Some(recovered);
+      s.count(
+        if recovered <= crate::daemon::LIVENESS_BUDGET_NS {
+          REPLACED_ANSWERED_IN_BUDGET
+        } else {
+          REPLACED_ANSWERED_PAST_BUDGET
+        },
+        1,
+      );
       slates_machine::log_line!(
         "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped",
         recovered / NS_PER_MS

@@ -4912,6 +4912,9 @@ async fn refresh_discovery(
         }
       } else {
         state.record_sessions.remove(&peer_host);
+        state
+          .dead_session_dropped_at
+          .insert(peer_host, futures::now_ns());
       }
     });
   }
@@ -7866,6 +7869,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
         }
         Some(link)
           if link.endpoint.is_none()

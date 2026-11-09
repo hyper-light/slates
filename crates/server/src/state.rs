@@ -816,8 +816,9 @@ pub struct ShardState {
   /// Test support (never reachable from the wire): a peer whose record link pages no discovery while set, so a test can
   /// hold the one rescue that does not depend on a borrower (`Daemon::inject_discovery_hold`). `None` in production.
   pub injected_discovery_hold: Option<slates_db::HostId>,
-  /// When each peer's record session was last dropped as silent (`fleet::return_sessions`), until the forward lane's
-  /// first reply on its replacement logs the gap. One entry a peer, so bounded by the roster.
+  /// When each peer's record session was last dropped as failed or silent (a peer's reset, the transport's silence rule,
+  /// a discovery page that failed), until the forward lane's first reply on its replacement logs and counts the gap. One
+  /// entry a peer, so bounded by the roster.
   pub dead_session_dropped_at: BTreeMap<slates_db::HostId, u64>,
   /// How long after the last silent session's drop the forward lane's first reply on its replacement came (logged too):
   /// what a test or an operator reads to see the lane back on a live session. `None` until it has happened.
