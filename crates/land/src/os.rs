@@ -141,7 +141,6 @@ fn target_component_refusal(
 fn check_crossing(dir: BorrowedFd<'_>, name: &str) -> Result<(), TargetRefusal> {
   slates_base::own_mounts::check_child(dir, std::ffi::OsStr::new(name)).map_err(|error| match error
   {
-    HostError::OwnMount(_) => TargetRefusal::OwnMount,
     other => TargetRefusal::Unavailable(other),
   })
 }
