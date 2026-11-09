@@ -421,9 +421,11 @@
 >   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
 >   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
 >   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
-> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
->   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
->   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
+> - **Found here, fixed 2026-11-09:** a kept FUSE mount of such a volume was left answering `ENOTCONN`, as A-102 makes
+>   every dead mount, but recovery skipped the rest of A-102 for it: uncounted, its record kept. (This line first read
+>   it as a mount that should be unmounted; A-102 forbids that.) See A-154's section, "a FUSE mount the predecessor
+>   kept, of a volume its successor could not rebuild". **Open:** the Python and Node SDKs' listings carry neither
+>   `live_shipped` nor `not_recovered` (clients').
 
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed

@@ -42,8 +42,8 @@ records until someone edited the catalog by hand. A share of one was recorded an
     already (`find`); the test now holds it.
 
 **Siblings found, not fixed here.**
-- On Linux, a FUSE mount the predecessor kept of a volume recovery could not rebuild is never adopted, so its device is
-  let go and the kernel's mount stays, answering `ENOTCONN`; recovery's stale-mount unmount (`reconcile_lost`) is skipped
-  for such a volume. The destroy now removes the mount's record but does not unmount it. From reading
-  `crates/server/src/fuse.rs` and `verbs::rebuild_recovered`; not yet run.
+- On Linux, a FUSE mount the predecessor kept of a volume recovery could not rebuild is left answering `ENOTCONN`, as
+  A-102 makes every dead mount, but recovery skipped the rest of A-102 for it (`reconcile_lost` runs only for a rebuilt
+  volume). This note first said the mount should be unmounted, which A-102 forbids. Fixed 2026-11-09:
+  `2026-11-09-a-dead-mount-of-an-unrecovered-volume-went-uncounted.md`.
 - The Python and Node SDKs' listings carry neither `live_shipped` (A-200) nor `not_recovered`.
