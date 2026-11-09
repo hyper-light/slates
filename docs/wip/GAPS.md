@@ -15283,3 +15283,10 @@ runs on the box at load average 74 to 93, and never alone.
   4,194,304 for 0. The server's end of a mount now sweeps its attachment's references (§4.6, "A FUSE mount's end gives
   back its lookups"). Test: `the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end`
   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-09-an-unmounted-fuse-mounts-lookups-stayed-counted.md`.
+- **A sibling, fixed 2026-11-09 (slabs; found reading the unrecovered destroy):** a FUSE mount the predecessor kept, of
+  a volume its successor could not rebuild, was left in place answering `ENOTCONN`, as A-102 makes every dead mount, but
+  recovery skipped the rest of A-102 for it (`reconcile_lost` runs only for a rebuilt volume): it was not counted
+  `fuse.dead_mount_left` and its attachment's record stayed until a destroy. (The first reading, 2026-11-08, said the
+  mount should be unmounted; A-102 forbids that.) Recovery now ends such a mount as a rebuilt volume's
+  (`leave_dead_mounts`). Test: `a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_counted`
+  (`crates/cli/tests/cli.rs`, Linux). Record: `docs/bugs/2026-11-09-a-dead-mount-of-an-unrecovered-volume-went-uncounted.md`.

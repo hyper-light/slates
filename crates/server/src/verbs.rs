@@ -10712,11 +10712,46 @@ async fn rebuild_record(
           record.name
         );
         state.unrecovered.insert(record.id, cause);
+        rebuilt.attachments_dropped = rebuilt
+          .attachments_dropped
+          .saturating_add(leave_dead_mounts(state, record));
         return false;
       }
     },
   }
   true
+}
+
+/// Ends the FUSE mounts the predecessor kept of a volume recovery could not rebuild (§4.8; A-102), as
+/// [`reconcile_lost`] ends a rebuilt volume's dead mounts: nothing can serve them, so each is left in place for its user
+/// to unmount, answering `ENOTCONN`, and counted (`fuse::leave_stale`), and its attachment's record ends. Before
+/// 2026-11-09 recovery skipped this for such a volume: the mount went uncounted and its record stayed until a destroy.
+/// Returns how many records ended.
+fn leave_dead_mounts(state: &mut ShardState, record: &VolumeRecord) -> usize {
+  let now = state.clock.monotonic_ns();
+  let mounts: Vec<(u64, String)> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .iter()
+    .filter_map(|a| {
+      a.form
+        .fuse_mount_point()
+        .map(|point| (a.id, point.to_owned()))
+    })
+    .collect();
+  let mut ended: usize = 0;
+  for (id, point) in mounts {
+    state.stale_fuse_mounts.push((id, point));
+    if state
+      .db
+      .mutate(&mut state.segment, &Op::AttachmentRemoved { id }, now)
+      .is_ok()
+    {
+      ended = ended.saturating_add(1);
+    }
+  }
+  ended
 }
 
 /// How many clone edges lead from `volume` back to a volume that is no clone (A-64: the order recovery rebuilds in).

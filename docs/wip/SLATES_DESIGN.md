@@ -2219,7 +2219,10 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > anchor's copy released, a fenced shard writing no record), and the mount answers `ENOTCONN` until its user
 > unmounts it, so no write by path reaches the disk beneath. The restart after a crash likewise ends a dead mount's
 > record and leaves the mount for its user (`leave_stale`, counted `fuse.dead_mount_left`); that path runs only on
-> kernels before Linux 6.9, since later ones keep the mount through the anchor's held device (A-61).
+> kernels before Linux 6.9, since later ones keep the mount through the anchor's held device (A-61). A kept mount of a
+> volume recovery could not rebuild is dead on every kernel, since nothing can serve it, and is ended the same way
+> (`verbs::leave_dead_mounts`, 2026-11-09; before, recovery skipped it, so it went uncounted and its record stayed;
+> `docs/bugs/2026-11-09-a-dead-mount-of-an-unrecovered-volume-went-uncounted.md`).
 
 > **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
 > buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,
