@@ -1,0 +1,127 @@
+leg a-arm, 4 CPUs, Mon Nov  9 20:11:26 UTC 2026, tree 02dca707691896fe88ad1b74690fa7779c91b481
+== release build exit 0
+   r1 LD-LANE install wall_ns 1794255340476083036 holder 14355122578966349333 bytes 108688 budget_ns 30000000000 took_ns 2595852 answered true cut false
+   r1 LD-TL stopped_on_install Some(6471) after 116.895525ms
+   r1 LD-TL resume wall_ns 1794255362960028773
+   r1 LD-LANE install wall_ns 1794255362974020859 holder 281773894769869881 bytes 7966142 budget_ns 30000000000 took_ns 20079283002 answered true cut false
+   r1 LD-LANE install wall_ns 1794255364820740450 holder 281773894769869881 bytes 75070978 budget_ns 30000000000 took_ns 969706774 answered true cut false
+   r1 LD-TL caught Some(2.651614083s)
+   r1 LD-TL durable Some(17521) then Some(17525) after 14.661822ms
+   r1 LD-TL writes 17503
+   r1 batches 4 samples 15
+   r1 counts: installs 3 taken 3 images 5 why 2
+== run 1 exit 0
+   r2 LD-TL stopped_on_install Some(8976) after 170.347802ms
+   r2 LD-TL resume wall_ns 1794255389462942366
+   r2 LD-LANE install wall_ns 1794255389481875019 holder 4484129536157537623 bytes 17298152 budget_ns 30000000000 took_ns 20081513123 answered true cut false
+   r2 LD-LANE install wall_ns 1794255391235153628 holder 4484129536157537623 bytes 150631634 budget_ns 30000000000 took_ns 986532221 answered true cut false
+   r2 LD-TL caught Some(4.004160552s)
+   r2 LD-TL durable Some(35692) then Some(35696) after 8.840125ms
+   r2 LD-TL writes 35674
+   r2 batches 15 samples 26
+   r2 counts: installs 2 taken 2 images 3 why 1
+== run 2 exit 0
+   r3 LD-LANE install wall_ns 1794255395922537605 holder 351174578077633326 bytes 91424 budget_ns 30000000000 took_ns 5214575 answered true cut false
+   r3 LD-TL stopped_on_install Some(11671) after 158.492044ms
+   r3 LD-TL resume wall_ns 1794255418269799028
+   r3 LD-LANE install wall_ns 1794255418289061848 holder 7248655531288750459 bytes 17210508 budget_ns 30000000000 took_ns 20085211934 answered true cut false
+   r3 LD-LANE install wall_ns 1794255420757490735 holder 7248655531288750459 bytes 183358517 budget_ns 30000000000 took_ns 1420787448 answered true cut false
+   r3 LD-TL caught Some(12.863838255s)
+   r3 LD-TL durable Some(46020) then Some(46023) after 17.502934ms
+   r3 LD-TL writes 45993
+   r3 batches 14 samples 99
+   r3 counts: installs 3 taken 3 images 4 why 2
+== run 3 exit 0
+   r4 LD-LANE install wall_ns 1794255432904108781 holder 6081041220959089212 bytes 108688 budget_ns 30000000000 took_ns 2145047 answered true cut false
+   r4 LD-TL stopped_on_install Some(15812) after 213.482555ms
+   r4 LD-TL resume wall_ns 1794255455360830558
+   r4 LD-LANE install wall_ns 1794255455369709897 holder 11468400639633083535 bytes 10670516 budget_ns 30000000000 took_ns 20079794793 answered true cut false
+   r4 LD-LANE install wall_ns 1794255456703042286 holder 11468400639633083535 bytes 90369346 budget_ns 55279981104 took_ns 773747791 answered true cut false
+   r4 LD-TL caught Some(1.659742265s)
+   r4 LD-TL durable Some(20795) then Some(20805) after 71.746419ms
+   r4 LD-TL writes 20786
+   r4 batches 6 samples 9
+   r4 counts: installs 3 taken 3 images 4 why 2
+== run 4 exit 0
+   r5 LD-TL stopped_on_install Some(18128) after 142.183013ms
+   r5 LD-TL resume wall_ns 1794255480997348872
+   r5 LD-LANE install wall_ns 1794255481009762024 holder 11967085375596871329 bytes 13515526 budget_ns 30000000000 took_ns 20068394933 answered true cut false
+   r5 LD-LANE install wall_ns 1794255482348985840 holder 11967085375596871329 bytes 107372408 budget_ns 30000000000 took_ns 731477105 answered true cut false
+   r5 LD-TL caught Some(1.616190874s)
+   r5 LD-TL durable Some(24709) then Some(24712) after 19.350256ms
+   r5 LD-TL writes 24691
+   r5 batches 1 samples 9
+   r5 counts: installs 2 taken 2 images 3 why 1
+== run 5 exit 0
+   r6 LD-TL stopped_on_install Some(20426) after 178.572952ms
+   r6 LD-TL resume wall_ns 1794255506480310636
+   r6 LD-LANE install wall_ns 1794255506500420351 holder 14100569481686413688 bytes 15312480 budget_ns 30000000000 took_ns 20078992891 answered true cut false
+   r6 LD-LANE install wall_ns 1794255508556392187 holder 14100569481686413688 bytes 113972222 budget_ns 30000000000 took_ns 1390624616 answered true cut false
+   r6 LD-TL caught Some(2.494189586s)
+   r6 LD-TL durable Some(26191) then Some(26204) after 67.291205ms
+   r6 LD-TL writes 26184
+   r6 batches 9 samples 15
+   r6 counts: installs 2 taken 2 images 3 why 2
+== run 6 exit 0
+   r7 LD-TL stopped_on_install Some(22821) after 201.532768ms
+   r7 LD-TL resume wall_ns 1794255533016600965
+   r7 LD-LANE install wall_ns 1794255533035407814 holder 2921675641297282289 bytes 18639986 budget_ns 30000000000 took_ns 20096467510 answered true cut false
+   r7 LD-LANE install wall_ns 1794255535255952224 holder 2921675641297282289 bytes 192002324 budget_ns 30000000000 took_ns 1115930306 answered true cut false
+   r7 LD-TL caught Some(4.03368309s)
+   r7 LD-TL durable Some(44752) then Some(44760) after 80.492783ms
+   r7 LD-TL writes 44740
+   r7 batches 5 samples 24
+   r7 counts: installs 2 taken 2 images 3 why 1
+== run 7 exit 0
+   r8 LD-LANE install wall_ns 1794255538556379179 holder 98640288833079630 bytes 259780 budget_ns 30000000000 took_ns 1970882 answered true cut false
+   r8 LD-TL stopped_on_install Some(25578) after 268.081686ms
+   r8 LD-TL resume wall_ns 1794255560831888060
+   r8 LD-LANE install wall_ns 1794255560845592089 holder 6686666315486338410 bytes 13923896 budget_ns 30000000000 took_ns 20125596643 answered true cut false
+   r8 LD-LANE install wall_ns 1794255562143234872 holder 6686666315486338410 bytes 111925410 budget_ns 30000000000 took_ns 667298624 answered true cut false
+   r8 LD-TL caught Some(1.654095012s)
+   r8 LD-TL durable Some(25845) then Some(25848) after 10.268458ms
+   r8 LD-TL writes 25828
+   r8 batches 3 samples 7
+   r8 counts: installs 3 taken 3 images 3 why 2
+== run 8 exit 0
+   r9 LD-TL stopped_on_install Some(27849) after 181.650034ms
+   r9 LD-TL resume wall_ns 1794255586610065956
+   r9 LD-LANE install wall_ns 1794255586621012452 holder 4637681520216119009 bytes 8681522 budget_ns 30000000000 took_ns 20072323465 answered true cut false
+   r9 LD-LANE install wall_ns 1794255587910652947 holder 4637681520216119009 bytes 80287099 budget_ns 30000000000 took_ns 798271550 answered true cut false
+   r9 LD-TL caught Some(1.697479729s)
+   r9 LD-TL durable Some(18526) then Some(18530) after 16.448262ms
+   r9 LD-TL writes 18510
+   r9 batches 8 samples 10
+   r9 counts: installs 2 taken 2 images 3 why 1
+== run 9 exit 0
+   r10 LD-TL stopped_on_install Some(30171) after 236.264737ms
+   r10 LD-TL resume wall_ns 1794255612164495049
+   r10 LD-LANE install wall_ns 1794255612180265276 holder 1827517248100706912 bytes 20559234 budget_ns 30000000000 took_ns 20086530481 answered true cut false
+   r10 LD-LANE install wall_ns 1794255615101307879 holder 1827517248100706912 bytes 197466098 budget_ns 30000000000 took_ns 993551252 answered true cut false
+   r10 LD-TL caught Some(6.223473904s)
+   r10 LD-TL durable Some(47984) then Some(47989) after 8.969966ms
+   r10 LD-TL writes 47966
+   r10 batches 11 samples 35
+   r10 counts: installs 2 taken 2 images 4 why 1
+== run 10 exit 0
+   r11 LD-TL stopped_on_install Some(33277) after 229.09117ms
+   r11 LD-TL resume wall_ns 1794255642513103888
+   r11 LD-LANE install wall_ns 1794255642528272278 holder 1399740481735812557 bytes 15739056 budget_ns 30000000000 took_ns 20097745312 answered true cut false
+   r11 LD-LANE install wall_ns 1794255644529571601 holder 1399740481735812557 bytes 157949009 budget_ns 30000000000 took_ns 1076943629 answered true cut false
+   r11 LD-TL caught Some(6.216451244s)
+   r11 LD-TL durable Some(37609) then Some(37617) after 74.303816ms
+   r11 LD-TL writes 37594
+   r11 batches 7 samples 44
+   r11 counts: installs 2 taken 2 images 3 why 1
+== run 11 exit 0
+   r12 LD-LANE install wall_ns 1794255651428553199 holder 49128128184381497 bytes 268412 budget_ns 30000000000 took_ns 3949276 answered true cut false
+   r12 LD-TL stopped_on_install Some(36360) after 178.363733ms
+   r12 LD-TL resume wall_ns 1794255673663794015
+   r12 LD-LANE install wall_ns 1794255673685133664 holder 14671182699953151361 bytes 16350022 budget_ns 30000000000 took_ns 20090514126 answered true cut false
+   r12 LD-LANE install wall_ns 1794255675253970994 holder 14671182699953151361 bytes 135016669 budget_ns 30000000000 took_ns 783399721 answered true cut false
+   r12 LD-TL caught Some(2.150432191s)
+   r12 LD-TL durable Some(31288) then Some(31324) after 66.159526ms
+   r12 LD-TL writes 31305
+   r12 batches 5 samples 10
+   r12 counts: installs 3 taken 3 images 3 why 2
+== run 12 exit 0
