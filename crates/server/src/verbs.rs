@@ -3709,6 +3709,10 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     peers_unmeshed: shards
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
+    diag_contacts: shards
+      .iter()
+      .flat_map(|shard| shard.diag_contacts.clone())
+      .collect(),
     learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
   }
 }

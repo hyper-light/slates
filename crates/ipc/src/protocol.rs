@@ -1268,6 +1268,8 @@ pub struct ShardReport {
   /// Of `peers_in_contact`, those with no formed probe session yet: zero once this node's mesh is up
   /// (`Daemon::fleet_meshed`). Appended.
   pub peers_unmeshed: u32,
+  /// DIAG (never for main): each other member's direct-contact reason and this node's belief about it (control shard).
+  pub diag_contacts: Vec<String>,
   /// This node's council configuration fetches as a learner (control shard only; empty elsewhere). Appended.
   pub learner: LearnerReport,
 }
