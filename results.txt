@@ -1,0 +1,413 @@
+runner ubuntu-latest, 4 CPUs, Mon Nov  9 05:21:29 UTC 2026, after 6903909a, before a915f305, sample 6
+before ../t-before/release/deps/live_chaos-12e0e667394c1712
+after ../t-after/release/deps/live_chaos-12e0e667394c1712
+== pair 1 arm after at 05:21:31, load 2.51 2.75 1.75
+DIAG formation took 2.76546791s
+DIAG settlement took 3.445234412s
+DIAG formation took 5.455040895s
+DIAG settlement took 3.539977795s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.844062575s
+  the stale holder stayed stopped 1.844062575s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 86.50s
+DIAG dials formation t=0.0s chaos-fresh-member-a-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 4; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-a-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-b-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-c-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-d-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-e-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-10264: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-10264: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-10264: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 1 arm after exit 0, load 15.85 7.19 3.42
+== pair 1 arm before at 05:23:00, load 15.85 7.19 3.42
+DIAG formation took 3.167335022s
+DIAG settlement took 4.046073433s
+DIAG formation took 16.888398102s
+DIAG settlement took 4.038445981s
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (11767) panicked at crates/cli/tests/live_chaos.rs:454:7:
+every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet wait (settled, neighbourhood, configuration version): [(Some(9), Some(9), Some(11)), (Some(4), Some(4), Some(11)), (Some(4), Some(4), Some(7)), (Some(8), Some(8), Some(11)), (Some(3), Some(3), Some(7))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 103.10s
+DIAG dials formation t=0.0s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-c-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-11766: members 3; fleet_peers_probed: 1; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 3
+DIAG dials formation t=0.0s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=5.6s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 0; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=5.6s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.6s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=5.6s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=11.2s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=11.2s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=11.2s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-b-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-11766: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 1 arm before exit 101, load 22.58 11.97 5.53
+== pair 2 arm after at 05:24:45, load 21.81 11.99 5.57
+DIAG formation took 2.854286575s
+DIAG settlement took 1.618582468s
+DIAG formation took 5.510273417s
+DIAG settlement took 7.637963928s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 2.031114579s
+  the stale holder stayed stopped 2.031114579s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 91.19s
+DIAG dials formation t=0.0s chaos-fresh-member-a-13922: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-13922: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-13922: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2; fleet.accept.replaced: 4
+DIAG dials settlement t=0.0s chaos-fresh-member-a-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 4; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials formation t=0.0s chaos-fresh-member-a-13922: members 4; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-13922: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials settlement t=0.0s chaos-fresh-member-a-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials settlement t=3.8s chaos-fresh-member-a-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.8s chaos-fresh-member-b-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.8s chaos-fresh-member-c-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.8s chaos-fresh-member-d-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.8s chaos-fresh-member-e-13922: members 5; fleet_peers_probed: 4; fleet_configuration_version: 16; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+== pair 2 arm after exit 0, load 20.29 14.26 6.99
+== pair 2 arm before at 05:26:18, load 20.29 14.26 6.99
+DIAG formation took 2.766666312s
+DIAG settlement took 3.548157251s
+DIAG formation took 6.453340463s
+DIAG settlement took 3.829059611s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.939151485s
+  the stale holder stayed stopped 1.939151485s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 102.40s
+DIAG dials formation t=0.0s chaos-fresh-member-a-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 3
+DIAG dials settlement t=0.0s chaos-fresh-member-a-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 3
+DIAG dials settlement t=1.8s chaos-fresh-member-a-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-b-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-c-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-d-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.8s chaos-fresh-member-e-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 3
+DIAG dials formation t=0.0s chaos-fresh-member-a-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-15443: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-15443: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+== pair 2 arm before exit 0, load 19.01 15.85 8.36
+== pair 3 arm after at 05:28:03, load 19.01 15.85 8.36
+DIAG formation took 2.715719671s
+DIAG settlement took 3.3389611s
+DIAG formation took 5.32139818s
+DIAG settlement took 7.018818141s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.92923952s
+  the stale holder stayed stopped 1.92923952s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 79.57s
+DIAG dials formation t=0.0s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 0; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 4
+DIAG dials formation t=0.0s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.dial.stale_dropped: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.dial.stale_dropped: 1
+DIAG dials settlement t=3.4s chaos-fresh-member-a-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=3.4s chaos-fresh-member-b-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.4s chaos-fresh-member-c-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.4s chaos-fresh-member-d-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 16; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.4s chaos-fresh-member-e-16955: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.dial.stale_dropped: 1
+== pair 3 arm after exit 0, load 19.86 16.97 9.38
+== pair 3 arm before at 05:29:24, load 19.86 16.97 9.38
+DIAG formation took 3.093697363s
+DIAG settlement took 2.095617588s
+DIAG formation took 5.373767229s
+DIAG settlement took 3.876147421s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.893274159s
+  the stale holder stayed stopped 1.893274159s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 98.66s
+DIAG dials formation t=0.0s chaos-fresh-member-a-18474: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-a-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-18474: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-18474: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 3 arm before exit 0, load 18.83 17.68 10.43
+== pair 4 arm after at 05:31:05, load 18.37 17.61 10.44
+DIAG formation took 2.944295732s
+DIAG settlement took 3.865409828s
+DIAG formation took 5.41823113s
+DIAG settlement took 3.631912529s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.741333681s
+  the stale holder stayed stopped 1.741333681s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 138.06s
+DIAG dials formation t=0.0s chaos-fresh-member-a-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-b-20028: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-20028: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-a-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-b-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-c-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-d-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=2.0s chaos-fresh-member-e-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-20028: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-20028: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-20028: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 10; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 14; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-20028: members 5; fleet_peers_probed: 4; fleet_configuration_version: 12; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+== pair 4 arm after exit 0, load 16.38 17.47 11.40
+== pair 4 arm before at 05:33:25, load 16.11 17.40 11.40
+DIAG formation took 2.661165045s
+DIAG settlement took 3.317149003s
+DIAG formation took 5.29133696s
+DIAG settlement took 3.500036549s
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (22017) panicked at crates/cli/tests/live_chaos.rs:454:7:
+every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet wait (settled, neighbourhood, configuration version): [(Some(9), Some(9), Some(13)), (Some(9), Some(9), Some(13)), (Some(4), Some(4), Some(7)), (Some(8), Some(8), Some(13)), (Some(9), Some(9), Some(13))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 93.22s
+DIAG dials formation t=0.0s chaos-fresh-member-a-22016: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-22016: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials settlement t=0.0s chaos-fresh-member-a-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials settlement t=1.7s chaos-fresh-member-a-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-b-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-c-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-d-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.7s chaos-fresh-member-e-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4
+DIAG dials formation t=0.0s chaos-fresh-member-a-22016: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-22016: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-c-22016: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-22016: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4; fleet.dial.stale_dropped: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-22016: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 4; fleet.dial.stale_dropped: 1
+== pair 4 arm before exit 101, load 21.92 18.96 12.51
+== pair 5 arm after at 05:35:00, load 21.20 18.86 12.52
+DIAG formation took 2.98816944s
+DIAG settlement took 2.114804852s
+DIAG formation took 5.878199661s
+DIAG settlement took 7.298568606s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.745248933s
+  the stale holder stayed stopped 1.745248933s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 145.20s
+DIAG dials formation t=0.0s chaos-fresh-member-a-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-e-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-a-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-b-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-24029: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-24029: members 5; fleet_peers_probed: 3; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-e-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=3.6s chaos-fresh-member-a-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.6s chaos-fresh-member-b-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=3.6s chaos-fresh-member-c-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=3.6s chaos-fresh-member-d-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=3.6s chaos-fresh-member-e-24029: members 5; fleet_peers_probed: 4; fleet_configuration_version: 15; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+== pair 5 arm after exit 0, load 17.08 18.59 13.38
+== pair 5 arm before at 05:37:28, load 17.08 18.59 13.38
+DIAG formation took 2.956069671s
+DIAG settlement took 1.948288491s
+DIAG formation took 5.142292263s
+DIAG settlement took 3.599006884s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 1.628953788s
+  the stale holder stayed stopped 1.628953788s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 122.25s
+DIAG dials formation t=0.0s chaos-fresh-member-a-26024: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-e-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-26024: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-26024: members 5; fleet_peers_probed: 3; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.dial.stale_dropped: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-a-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 11; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.dial.stale_dropped: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-c-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 13; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-e-26024: members 5; fleet_peers_probed: 4; fleet_configuration_version: 14; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+== pair 5 arm before exit 0, load 17.64 18.65 14.06
+== pair 6 arm after at 05:39:32, load 17.35 18.58 14.06
+DIAG formation took 2.669144011s
+DIAG settlement took 3.586031236s
+DIAG formation took 5.39928632s
+DIAG settlement took 3.46095376s
+thread 'a_member_that_never_held_the_log_never_stands_in_for_its_holder' (28127) panicked at crates/cli/tests/live_chaos.rs:454:7:
+every node held the newest configuration and its neighbourhood settled, or kept changing, within each fleet wait (settled, neighbourhood, configuration version): [(Some(4), Some(4), Some(10)), (Some(4), Some(4), Some(6)), (Some(8), Some(8), Some(10)), (Some(7), Some(7), Some(10)), (Some(8), Some(8), Some(10))]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 88.55s
+DIAG dials formation t=0.0s chaos-fresh-member-a-28125: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 2
+DIAG dials formation t=0.0s chaos-fresh-member-b-28125: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 2
+DIAG dials settlement t=1.9s chaos-fresh-member-a-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.9s chaos-fresh-member-b-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.9s chaos-fresh-member-c-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-28125: members 5; fleet_peers_probed: 3; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-28125: members 5; fleet_peers_probed: 3; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-28125: members 5; fleet_peers_probed: 2; fleet_configuration_version: 0; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-e-28125: members 5; fleet_peers_probed: 3; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.accept.replaced: 2
+DIAG dials settlement t=0.0s chaos-fresh-member-a-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-28125: members 5; fleet_peers_probed: 4; fleet_configuration_version: 8; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.replaced: 2
+== pair 6 arm after exit 101, load 22.18 19.79 14.90
+== pair 6 arm before at 05:41:03, load 22.18 19.79 14.90
+DIAG formation took 2.862393992s
+DIAG settlement took 3.739731744s
+DIAG formation took 5.950410509s
+DIAG settlement took 4.008005444s
+chaos a member that never held the log at a takeover: the stale holder stayed stopped 2.188691457s
+  the stale holder stayed stopped 2.188691457s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 89.24s
+DIAG dials formation t=0.0s chaos-fresh-member-a-30053: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-c-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-d-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.handshake: 1; fleet.accept.replaced: 1; fleet.accept.stall.repeats: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 0; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-c-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-d-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 5; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.handshake: 1; fleet.accept.replaced: 1; fleet.accept.stall.repeats: 1
+DIAG dials settlement t=1.9s chaos-fresh-member-a-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.9s chaos-fresh-member-b-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.9s chaos-fresh-member-c-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 2; fleet_peers_unmeshed: 0
+DIAG dials settlement t=1.9s chaos-fresh-member-d-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-a-30053: members 5; fleet_peers_probed: 3; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1
+DIAG dials formation t=0.0s chaos-fresh-member-b-30053: members 5; fleet_peers_probed: 3; fleet_configuration_version: 6; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.dial.stall.confirm_silence: 1
+DIAG dials formation t=0.0s chaos-fresh-member-c-30053: members 5; fleet_peers_probed: 3; fleet_configuration_version: 0; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 1; fleet.accept.replaced: 1
+DIAG dials formation t=0.0s chaos-fresh-member-d-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials formation t=0.0s chaos-fresh-member-e-30053: members 5; fleet_peers_probed: 3; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 1; fleet.accept.handshake: 1; fleet.accept.replaced: 1; fleet.accept.stall.repeats: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-a-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-b-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.dial.stall.confirm_silence: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-c-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 3; fleet_peers_unmeshed: 0; fleet.accept.replaced: 1
+DIAG dials settlement t=0.0s chaos-fresh-member-d-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 7; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0
+DIAG dials settlement t=0.0s chaos-fresh-member-e-30053: members 5; fleet_peers_probed: 4; fleet_configuration_version: 9; fleet_peers_in_contact: 4; fleet_peers_unmeshed: 0; fleet.accept.handshake: 3; fleet.accept.replaced: 1; fleet.accept.stall.repeats: 1; fleet.accept.stall.silence: 2
+      4 fleet.accept.stall.repeats: 1
+      2 fleet.dial.stall.confirm_silence: 1
+      1 fleet.accept.stall.silence: 2
+== pair 6 arm before exit 0, load 20.67 20.10 15.48
