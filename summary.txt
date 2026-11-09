@@ -1,0 +1,355 @@
+image: ubuntu26 20261101.186.1; kernel 7.0.0-1019-azure; all=failure
+$ sh -c grep -n -E "peers_probed|configuration_version|ConsensusRecoveryUnavailable|error|Error|failed" "$RUNNER_TEMP/kind-all.log" | head -40
+177:#11 0.951   Downloaded thiserror-impl v2.0.21
+185:#11 0.962   Downloaded thiserror v2.0.21
+260:#11 12.32    Compiling thiserror v2.0.21
+261:#11 12.49    Compiling thiserror-impl v2.0.21
+436:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+448:slates-0: host=6943466742849572260 f=1 members=[1842316702224201956, 2888847717586071709, 6943466742849572260] peers_probed=0 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=50 version=3 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+449:slates-1: host=2888847717586071709 f=1 members=[2888847717586071709, 3206855398801348487, 6943466742849572260] peers_probed=0 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=54 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+450:slates-2: host=1842316702224201956 f=1 members=[1842316702224201956, 3302179842379991946, 6943466742849572260] peers_probed=0 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=54 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+456:--- slates-0 status: fleet={"configuration_version":3,"council":{"base_periods":10,"elections":1,"joint":false,"leader_lease":false,"leads":true,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":1,"voters":1},"detector":[{"condemnation_allowance_milli":7000,"condemnations":0,"configured":false,"expected_ns":513038,"judged_by":"provisional","margin_ns":59999486962,"mistake_milli":1000,"peer":1842316702224201956,"samples":0,"suspicion_allowance_milli":8000,"suspicions":1}],"detector_granularity_ns":617914,"f":1,"held_records":0,"host":6943466742849572260,"host_epoch":1,"inbox_full":0,"members":[1842316702224201956,2888847717586071709,6943466742849572260],"peers_probed":0,"replaced":0,"root":{"base_periods":10,"elections":1,"joint":false,"leader_lease":false,"leads":true,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":1,"voters":1},"served_sessions":[],"sessions":[{"bytes_consumed":4746,"congestion_window":2986,"lent":false,"path_mtu":1466,"peer":1842316702224201956,"persistent_collapses":0,"pto_ns":1176148,"smoothed_rtt_ns":176148,"spurious_losses":0},{"bytes_consumed":4767,"congestion_window":7161,"lent":false,"path_mtu":1466,"peer":2888847717586071709,"persistent_collapses":0,"pto_ns":1184821,"smoothed_rtt_ns":184821,"spurious_losses":0}],"sessions_refused":0,"takeover":{"members":3,"neighbourhood_generation":2,"retirements":[],"settled_generation":2},"takeovers_pending":0,"unknown_id":0} refusals={"content.purged_bytes": 89448448, "content.ticks.idle": 194, "fleet.discovery.pages": 418, "fleet.learner.fetch_paced": 134, "fleet.learner.fetches": 24, "fleet.plane.address_unresolved": 24, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.report.sent": 1, "fleet.resolve.refused": 50}
+514:--- slates-1 status: fleet={"configuration_version":0,"council":{"base_periods":10,"elections":0,"joint":false,"leader_lease":false,"leads":false,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":0,"voters":0},"detector":[],"detector_granularity_ns":0,"f":1,"held_records":0,"host":2888847717586071709,"host_epoch":1,"inbox_full":0,"members":[2888847717586071709,3206855398801348487,6943466742849572260],"peers_probed":0,"replaced":1,"root":{"base_periods":10,"elections":0,"joint":false,"leader_lease":false,"leads":false,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":0,"voters":0},"served_sessions":[{"bytes_consumed":218592,"congestion_window":10440,"path_mtu":1466,"peer":16049843796353648581,"persistent_collapses":0,"pto_ns":1103333,"smoothed_rtt_ns":103333,"spurious_losses":0}],"sessions":[],"sessions_refused":0,"takeover":{"members":0,"neighbourhood_generation":0,"retirements":[],"settled_generation":0},"takeovers_pending":0,"unknown_id":0} refusals={"content.purged_bytes": 89444352, "content.ticks.idle": 193, "fleet.learner.fetch_paced": 3302, "fleet.plane.address_unresolved": 18, "fleet.resolve.timeout": 54, "fleet.seal.pair_served": 1}
+515:--- slates-1 council: (exit 1: {"error":{"kind":"refused","message":"ConsensusRecoveryUnavailable"}}
+572:--- slates-2 status: fleet={"configuration_version":0,"council":{"base_periods":10,"elections":0,"joint":false,"leader_lease":false,"leads":false,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":0,"voters":0},"detector":[{"condemnation_allowance_milli":5000,"condemnations":0,"configured":false,"expected_ns":0,"judged_by":"provisional","margin_ns":60000000000,"mistake_milli":1000,"peer":6943466742849572260,"samples":0,"suspicion_allowance_milli":6000,"suspicions":1}],"detector_granularity_ns":12837079484,"f":1,"held_records":0,"host":1842316702224201956,"host_epoch":1,"inbox_full":0,"members":[1842316702224201956,3302179842379991946,6943466742849572260],"peers_probed":0,"replaced":1,"root":{"base_periods":10,"elections":0,"joint":false,"leader_lease":false,"leads":false,"pre_elections":0,"pre_votes_granted":0,"pre_votes_refused":0,"priority_ns":0,"priority_spread_ns":0,"rank":0,"refused_leased":0,"refused_log":0,"refused_role":0,"refused_term":0,"rtt_spread_ns":0,"rtt_tail_ns":0,"samples":0,"span_periods":10,"term":0,"voters":0},"served_sessions":[{"bytes_consumed":434042,"congestion_window":10146,"path_mtu":1466,"peer":16049843796353648581,"persistent_collapses":0,"pto_ns":1066062,"smoothed_rtt_ns":66062,"spurious_losses":0}],"sessions":[],"sessions_refused":0,"takeover":{"members":0,"neighbourhood_generation":0,"retirements":[],"settled_generation":0},"takeovers_pending":0,"unknown_id":0} refusals={"content.purged_bytes": 89448448, "content.ticks.idle": 193, "fleet.learner.fetch_paced": 3302, "fleet.plane.address_unresolved": 33, "fleet.resolve.timeout": 54, "fleet.seal.pair_served": 1}
+$ kubectl --context kind-slates-lane get pods -A -o wide
+NAMESPACE            NAME                                                READY   STATUS    RESTARTS       AGE     IP           NODE                        NOMINATED NODE   READINESS GATES
+kube-system          coredns-559f6c778d-ftg9k                            1/1     Running   0              3m32s   10.244.0.2   slates-lane-control-plane   <none>           <none>
+kube-system          coredns-559f6c778d-wtfcn                            1/1     Running   0              3m32s   10.244.0.3   slates-lane-control-plane   <none>           <none>
+kube-system          etcd-slates-lane-control-plane                      1/1     Running   0              3m41s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+kube-system          kindnet-6pzs6                                       1/1     Running   0              3m27s   172.18.0.7   slates-lane-worker4         <none>           <none>
+kube-system          kindnet-7dsrd                                       1/1     Running   0              3m27s   172.18.0.4   slates-lane-worker5         <none>           <none>
+kube-system          kindnet-bcvr6                                       1/1     Running   0              3m27s   172.18.0.3   slates-lane-worker3         <none>           <none>
+kube-system          kindnet-cfjnz                                       1/1     Running   0              3m32s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+kube-system          kindnet-lqtz7                                       1/1     Running   0              3m27s   172.18.0.6   slates-lane-worker2         <none>           <none>
+kube-system          kindnet-x4s7z                                       1/1     Running   0              3m27s   172.18.0.2   slates-lane-worker          <none>           <none>
+kube-system          kube-apiserver-slates-lane-control-plane            1/1     Running   0              3m41s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+kube-system          kube-controller-manager-slates-lane-control-plane   1/1     Running   0              3m41s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+kube-system          kube-proxy-47vgj                                    0/1     Error     5 (111s ago)   3m27s   172.18.0.7   slates-lane-worker4         <none>           <none>
+kube-system          kube-proxy-8mj62                                    1/1     Running   0              3m32s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+kube-system          kube-proxy-jdrz9                                    0/1     Error     5 (105s ago)   3m27s   172.18.0.6   slates-lane-worker2         <none>           <none>
+kube-system          kube-proxy-mqjcb                                    0/1     Error     5 (106s ago)   3m27s   172.18.0.3   slates-lane-worker3         <none>           <none>
+kube-system          kube-proxy-nz6sg                                    0/1     Error     5 (113s ago)   3m27s   172.18.0.4   slates-lane-worker5         <none>           <none>
+kube-system          kube-proxy-t9pv6                                    1/1     Running   0              3m27s   172.18.0.2   slates-lane-worker          <none>           <none>
+kube-system          kube-scheduler-slates-lane-control-plane            1/1     Running   0              3m41s   172.18.0.5   slates-lane-control-plane   <none>           <none>
+local-path-storage   local-path-provisioner-75f7fc7dc5-q67z6             1/1     Running   0              3m32s   10.244.0.4   slates-lane-control-plane   <none>           <none>
+slates               slates-0                                            1/1     Running   0              3m11s   10.244.3.2   slates-lane-worker          <none>           <none>
+slates               slates-1                                            1/1     Running   0              3m11s   10.244.1.2   slates-lane-worker4         <none>           <none>
+slates               slates-2                                            1/1     Running   0              3m11s   10.244.2.2   slates-lane-worker2         <none>           <none>
+$ sh -c kubectl --context kind-slates-lane -n slates describe pod slates-0 | sed -n '/Containers:/,$p' | grep -E 'State|Reason|Exit Code|Restart Count|Last State|Started|Finished|Warning|Normal|Killing|BackOff|OOM|Signal' 
+    State:          Running
+      Started:      Mon, 09 Nov 2026 22:44:39 +0000
+    Restart Count:  0
+  Type    Reason     Age    From               Message
+  Normal  Scheduled  3m11s  default-scheduler  Successfully assigned slates/slates-0 to slates-lane-worker
+  Normal  Pulled     3m10s  kubelet            spec.containers{slates}: Container image "slates:lane" already present on machine and can be accessed by the pod
+  Normal  Created    3m10s  kubelet            spec.containers{slates}: Container created
+  Normal  Started    3m10s  kubelet            spec.containers{slates}: Container started
+$ kubectl --context kind-slates-lane -n slates logs slates-0 --previous --tail=25
+Error from server (BadRequest): previous terminated container "slates" in pod "slates-0" not found
+$ kubectl --context kind-slates-lane -n slates logs slates-0 --tail=25
+slates daemon: landings_awaiting_per_shard = 330: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 665: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 972200: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 15: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 329: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 44739242: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 249: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 119783: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 9941989: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 669: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 11894, timers: 11894 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance default serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 615 µs, 601 µs of its CPU, in 4 slices of 7 units; the longest slice 419 µs, the most CPU in one 426 µs, ending at unit 2 (a slice's floor 4 µs, 20 µs yielding)
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-server: fleet: resolving `slates-2.slates.slates.svc.cluster.local`: the nameserver answered rcode 3
+slates-cluster: fleet: HostId(6943466742849572260) holds HostId(1842316702224201956) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-cluster: fleet: HostId(6943466742849572260) holds HostId(2888847717586071709) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+$ kubectl --context kind-slates-lane -n slates exec slates-0 -- /slates status
+pid: 25
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 82796033
+clients_reaped: 180
+clients_refused: 0
+shards: 1
+fleet_host: 6943466742849572260
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1842316702224201956 2888847717586071709 6943466742849572260
+fleet_peers_probed: 0
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 3
+anchor: 16049843796353648581
+seal: minted
+seal_root: a8c13b192ba4a3bb88e81d7522325fa7
+seal_recipient: 7ebbed3b9a2c0f5fa3f0ff9f2c06e08d
+seal_key_slots: 128
+seal_keys_held: 2
+fleet_configuration_members: 3
+fleet_settled_generation: 2
+fleet_neighbourhood_generation: 2
+fleet_council_leads: true
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 0
+fleet_council_rtt_spread_ns: 0
+fleet_council_samples: 0
+fleet_council_term: 1
+fleet_council_priority_ns: 0
+$ sh -c kubectl --context kind-slates-lane -n slates describe pod slates-1 | sed -n '/Containers:/,$p' | grep -E 'State|Reason|Exit Code|Restart Count|Last State|Started|Finished|Warning|Normal|Killing|BackOff|OOM|Signal' 
+    State:          Running
+      Started:      Mon, 09 Nov 2026 22:44:41 +0000
+    Restart Count:  0
+  Type     Reason            Age    From               Message
+  Warning  FailedScheduling  3m11s  default-scheduler  0/6 nodes are available: 1 Insufficient cpu, 5 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 1 No preemption victims found for incoming pod, 5 Preemption is not helpful for scheduling.
+  Normal   Scheduled         3m9s   default-scheduler  Successfully assigned slates/slates-1 to slates-lane-worker4
+  Normal   Pulled            3m9s   kubelet            spec.containers{slates}: Container image "slates:lane" already present on machine and can be accessed by the pod
+  Normal   Created           3m9s   kubelet            spec.containers{slates}: Container created
+  Normal   Started           3m8s   kubelet            spec.containers{slates}: Container started
+$ kubectl --context kind-slates-lane -n slates logs slates-1 --previous --tail=25
+Error from server (BadRequest): previous terminated container "slates" in pod "slates-1" not found
+$ kubectl --context kind-slates-lane -n slates logs slates-1 --tail=25
+slates daemon: direct_maps_per_shard = 87381: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 330: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 665: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 761600: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 10: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 329: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 44739242: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 249: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 119783: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 9941989: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 669: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 11894, timers: 11894 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance default serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 919 µs, 842 µs of its CPU, in 5 slices of 7 units; the longest slice 600 µs, the most CPU in one 579 µs, ending at unit 2 (a slice's floor 3 µs, 24 µs yielding)
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-cluster: fleet: HostId(2888847717586071709) holds HostId(6943466742849572260) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-server: fleet: resolving `slates-0.slates.slates.svc.cluster.local`: no answer within the timeout after 2 attempt(s); last asked 10.96.0.10:53
+$ kubectl --context kind-slates-lane -n slates exec slates-1 -- /slates status
+pid: 25
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 53357940
+clients_reaped: 178
+clients_refused: 0
+shards: 1
+fleet_host: 2888847717586071709
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 2888847717586071709 3206855398801348487 6943466742849572260
+fleet_peers_probed: 0
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 1
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 0
+anchor: 14624967605486229604
+seal: minted
+seal_root: 26b6aaa9b52525e629f533e81e677af3
+seal_recipient: 34f6c703a2353dc1092696ae76002476
+seal_key_slots: 128
+seal_keys_held: 2
+fleet_configuration_members: 0
+fleet_settled_generation: 0
+fleet_neighbourhood_generation: 0
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 0
+fleet_council_rtt_spread_ns: 0
+fleet_council_samples: 0
+fleet_council_term: 0
+fleet_council_priority_ns: 0
+$ sh -c kubectl --context kind-slates-lane -n slates describe pod slates-2 | sed -n '/Containers:/,$p' | grep -E 'State|Reason|Exit Code|Restart Count|Last State|Started|Finished|Warning|Normal|Killing|BackOff|OOM|Signal' 
+    State:          Running
+      Started:      Mon, 09 Nov 2026 22:44:41 +0000
+    Restart Count:  0
+  Type     Reason            Age    From               Message
+  Warning  FailedScheduling  3m11s  default-scheduler  0/6 nodes are available: 1 Insufficient cpu, 5 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 1 No preemption victims found for incoming pod, 5 Preemption is not helpful for scheduling.
+  Warning  FailedScheduling  3m9s   default-scheduler  0/6 nodes are available: 2 Insufficient cpu, 4 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 2 No preemption victims found for incoming pod, 4 Preemption is not helpful for scheduling.
+  Normal   Scheduled         3m9s   default-scheduler  Successfully assigned slates/slates-2 to slates-lane-worker2
+  Normal   Pulled            3m8s   kubelet            spec.containers{slates}: Container image "slates:lane" already present on machine and can be accessed by the pod
+  Normal   Created           3m8s   kubelet            spec.containers{slates}: Container created
+  Normal   Started           3m8s   kubelet            spec.containers{slates}: Container started
+$ kubectl --context kind-slates-lane -n slates logs slates-2 --previous --tail=25
+Error from server (BadRequest): previous terminated container "slates" in pod "slates-2" not found
+$ kubectl --context kind-slates-lane -n slates logs slates-2 --tail=25
+slates daemon: direct_maps_per_shard = 87381: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 330: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 665: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 914100: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_bandwidth_bytes_per_ns = 15: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 4456544: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 131072: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 262144: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 329: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 44739242: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 155344: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: fleet_sessions_per_plane = 249: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 119783: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 9941989: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 669: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 11894, timers: 11894 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance default serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 699 µs, 672 µs of its CPU, in 4 slices of 7 units; the longest slice 512 µs, the most CPU in one 505 µs, ending at unit 2 (a slice's floor 4 µs, 17 µs yielding)
+slates-server: fleet timing: election timeout = 10 × max(broadcast RTT tail over the voters, heartbeat 100000000 ns) = 10 periods at the floor (span the same over the tail's spread: 10 periods); round budget base = max(heartbeat, tail) = 100000000 ns, stall = max(2 periods, tail) = 200000000 ns, extensions 10 × 100000000 ns; no path measured yet
+slates-cluster: fleet: HostId(1842316702224201956) holds HostId(6943466742849572260) alive: None -> MemberState { liveness: Alive, incarnation: 0 }, folded at crates/server/src/fleet.rs:587:7
+slates-server: fleet: resolving `slates-1.slates.slates.svc.cluster.local`: no answer within the timeout after 2 attempt(s); last asked 10.96.0.10:53
+$ kubectl --context kind-slates-lane -n slates exec slates-2 -- /slates status
+pid: 25
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 61056198
+clients_reaped: 179
+clients_refused: 0
+shards: 1
+fleet_host: 1842316702224201956
+fleet_f: 1
+fleet_host_epoch: 1
+fleet_members: 1842316702224201956 3302179842379991946 6943466742849572260
+fleet_peers_probed: 0
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 1
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 0
+anchor: 17400949303446440787
+seal: minted
+seal_root: a5428fd8a1c0b75567b9808e339b2c51
+seal_recipient: e1a4d50348c89a2ba775bc240e905f95
+seal_key_slots: 128
+seal_keys_held: 2
+fleet_configuration_members: 0
+fleet_settled_generation: 0
+fleet_neighbourhood_generation: 0
+fleet_council_leads: false
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 0
+fleet_council_rtt_spread_ns: 0
+fleet_council_samples: 0
+fleet_council_term: 0
+fleet_council_priority_ns: 0
+$ sh -c sudo dmesg -T | grep -i -E "apparmor|denied|audit" | tail -40
+[Mon Nov  9 22:37:26 2026] AppArmor: AppArmor initialized
+[Mon Nov  9 22:37:26 2026] AppArmor: AppArmor secmark mediation reserved: ready to be enabled
+[Mon Nov  9 22:37:26 2026] audit: initializing netlink subsys (disabled)
+[Mon Nov  9 22:37:26 2026] audit: type=2000 audit(1794263845.215:1): state=initialized audit_enabled=0 res=1
+[Mon Nov  9 22:37:26 2026] AppArmor: AppArmor Filesystem Enabled
+[Mon Nov  9 22:37:26 2026] AppArmor: AppArmor sha256 policy hashing enabled
+[Mon Nov  9 22:37:26 2026] evm: security.apparmor
+[Mon Nov  9 22:37:27 2026] systemd[1]: systemd 259.9-0ubuntu0.1 running in system mode (+PAM +AUDIT +SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK +BTF -XKBCOMMON -UTMP +SYSVINIT +LIBARCHIVE)
+[Mon Nov  9 22:37:28 2026] systemd-journald[167]: Collecting audit messages is disabled.
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.299:2): apparmor="STATUS" operation="profile_load" profile="unconfined" name="Discord" pid=379 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.300:3): apparmor="STATUS" operation="profile_load" profile="unconfined" name="QtWebEngineProcess" pid=381 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.300:4): apparmor="STATUS" operation="profile_load" profile="unconfined" name="1password" pid=378 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.300:5): apparmor="STATUS" operation="profile_load" profile="unconfined" name=4D6F6E676F444220436F6D70617373 pid=380 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.306:6): apparmor="STATUS" operation="profile_load" profile="unconfined" name="balena-etcher" pid=392 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.307:7): apparmor="STATUS" operation="profile_load" profile="unconfined" name="babeld" pid=391 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.308:8): apparmor="STATUS" operation="profile_load" profile="unconfined" name="alsamixer" pid=390 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.309:9): apparmor="STATUS" operation="profile_load" profile="unconfined" name="bfdd" pid=396 comm="apparmor_parser"
+[Mon Nov  9 22:37:29 2026] audit: type=1400 audit(1794263849.311:10): apparmor="STATUS" operation="profile_load" profile="unconfined" name="brave" pid=398 comm="apparmor_parser"
+[Mon Nov  9 22:37:34 2026] kauditd_printk_skb: 175 callbacks suppressed
+[Mon Nov  9 22:37:34 2026] audit: type=1400 audit(1794263854.548:186): apparmor="DENIED" operation="sendmsg" class="file" profile="systemd-detect-virt" name="/att/systemd-detect-virt/run/systemd/journal/socket" pid=1098 comm="systemd-detect-" requested_mask="w" denied_mask="w" fsuid=0 ouid=0
+[Mon Nov  9 22:37:34 2026] audit: type=1400 audit(1794263854.548:187): apparmor="DENIED" operation="capable" class="cap" profile="systemd-detect-virt" pid=1098 comm="systemd-detect-" capability=38  capname="perfmon"
+[Mon Nov  9 22:37:34 2026] audit: type=1400 audit(1794263854.548:188): apparmor="DENIED" operation="sendmsg" class="file" profile="systemd-detect-virt" name="/att/systemd-detect-virt/run/systemd/notify" pid=1098 comm="systemd-detect-" requested_mask="w" denied_mask="w" fsuid=0 ouid=0
+[Mon Nov  9 22:37:34 2026] audit: type=1400 audit(1794263854.613:189): apparmor="STATUS" operation="profile_replace" info="same as current profile, skipping" profile="unconfined" name="rsyslogd" pid=1020 comm="apparmor_parser"
+[Mon Nov  9 22:37:35 2026] audit: type=1400 audit(1794263854.987:190): apparmor="STATUS" operation="profile_replace" info="same as current profile, skipping" profile="unconfined" name="/usr/lib/snapd/snap-confine" pid=1269 comm="apparmor_parser"
+[Mon Nov  9 22:37:35 2026] audit: type=1400 audit(1794263855.264:191): apparmor="STATUS" operation="profile_load" profile="unconfined" name="docker-default" pid=1426 comm="apparmor_parser"
+[Mon Nov  9 22:44:02 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 22:44:02 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 22:44:02 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 22:44:02 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 22:44:02 2026] systemd-journald[95]: Collecting audit messages is disabled.
+[Mon Nov  9 22:44:02 2026] systemd-journald[94]: Collecting audit messages is disabled.
+$ sh -c sudo journalctl -k --no-pager | grep -i -E "apparmor=\"DENIED\"" | tail -30
+Nov 09 22:37:34 runnervmwuk1x kernel: audit: type=1400 audit(1794263854.548:186): apparmor="DENIED" operation="sendmsg" class="file" profile="systemd-detect-virt" name="/att/systemd-detect-virt/run/systemd/journal/socket" pid=1098 comm="systemd-detect-" requested_mask="w" denied_mask="w" fsuid=0 ouid=0
+Nov 09 22:37:34 runnervmwuk1x kernel: audit: type=1400 audit(1794263854.548:187): apparmor="DENIED" operation="capable" class="cap" profile="systemd-detect-virt" pid=1098 comm="systemd-detect-" capability=38  capname="perfmon"
+Nov 09 22:37:34 runnervmwuk1x kernel: audit: type=1400 audit(1794263854.548:188): apparmor="DENIED" operation="sendmsg" class="file" profile="systemd-detect-virt" name="/att/systemd-detect-virt/run/systemd/notify" pid=1098 comm="systemd-detect-" requested_mask="w" denied_mask="w" fsuid=0 ouid=0
+$ docker inspect slates-lane-worker3 --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-worker3 privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ docker inspect slates-lane-worker5 --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-worker5 privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ docker inspect slates-lane-worker4 --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-worker4 privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ docker inspect slates-lane-control-plane --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-control-plane privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ docker inspect slates-lane-worker2 --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-worker2 privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ docker inspect slates-lane-worker --format {{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}
+/slates-lane-worker privileged=true apparmor=unconfined security=[seccomp=unconfined apparmor=unconfined label=disable]
+$ sh -c sudo aa-status | grep -i -E "profiles|docker|runc|containerd|crun|unprivileged|kind" 
+185 profiles are loaded.
+108 profiles are in enforce mode.
+   docker-default
+   unprivileged_userns
+2 profiles are in complain mode.
+0 profiles are in prompt mode.
+0 profiles are in kill mode.
+75 profiles are in unconfined mode.
+   crun
+   runc
+3 processes have profiles defined.
+$ kubectl --context kind-slates-lane -n slates get events --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON             OBJECT               MESSAGE
+3m12s       Normal    Scheduled          pod/slates-0         Successfully assigned slates/slates-0 to slates-lane-worker
+3m12s       Normal    SuccessfulCreate   statefulset/slates   Create Pod slates-1 in StatefulSet slates successful
+3m12s       Normal    SuccessfulCreate   statefulset/slates   Create Pod slates-2 in StatefulSet slates successful
+3m12s       Normal    SuccessfulCreate   statefulset/slates   Create Pod slates-0 in StatefulSet slates successful
+3m12s       Warning   FailedScheduling   pod/slates-1         0/6 nodes are available: 1 Insufficient cpu, 5 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 1 No preemption victims found for incoming pod, 5 Preemption is not helpful for scheduling.
+3m12s       Warning   FailedScheduling   pod/slates-2         0/6 nodes are available: 1 Insufficient cpu, 5 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 1 No preemption victims found for incoming pod, 5 Preemption is not helpful for scheduling.
+3m11s       Normal    Started            pod/slates-0         Container started
+3m11s       Normal    Created            pod/slates-0         Container created
+3m11s       Normal    Pulled             pod/slates-0         Container image "slates:lane" already present on machine and can be accessed by the pod
+3m10s       Normal    Created            pod/slates-1         Container created
+3m10s       Normal    Pulled             pod/slates-1         Container image "slates:lane" already present on machine and can be accessed by the pod
+3m10s       Normal    Scheduled          pod/slates-1         Successfully assigned slates/slates-1 to slates-lane-worker4
+3m10s       Warning   FailedScheduling   pod/slates-2         0/6 nodes are available: 2 Insufficient cpu, 4 node(s) had untolerated taint(s). preemption: 0/6 nodes are available: 2 No preemption victims found for incoming pod, 4 Preemption is not helpful for scheduling.
+3m10s       Normal    Scheduled          pod/slates-2         Successfully assigned slates/slates-2 to slates-lane-worker2
+3m9s        Normal    Started            pod/slates-1         Container started
+3m9s        Normal    Started            pod/slates-2         Container started
+3m9s        Normal    Created            pod/slates-2         Container created
+3m9s        Normal    Pulled             pod/slates-2         Container image "slates:lane" already present on machine and can be accessed by the pod
