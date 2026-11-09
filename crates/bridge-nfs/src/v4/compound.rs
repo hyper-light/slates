@@ -2441,6 +2441,15 @@ async fn check_open_access<B: Backend>(
     needed |= access3::READ;
   }
   if access & share::WRITE != 0 {
+    // A read-only attachment refuses an open for writing as a read-only file system does (§4.6), before the ACCESS
+    // check below would answer `NFS4ERR_ACCESS` for the write bit it no longer grants (GAPS, 2026-11-08).
+    let result = backend
+      .call_v3(extension::CHANGE_ALLOWED, v3call::handle_only(fh))
+      .await;
+    let status = v3call::status_only(&result).map_err(|_| Nfsstat4::Serverfault)?;
+    if status != Nfsstat3::Ok {
+      return Err(Nfsstat4::of_v3(status));
+    }
     needed |= access3::MODIFY;
   }
   let result = backend

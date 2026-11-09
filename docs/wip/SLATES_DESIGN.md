@@ -2049,7 +2049,14 @@ an open for writing (a write access mode or `O_TRUNC`) and at every mutating ver
 before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
 delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
 permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
-macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Over NFS an ACCESS reply grants no
+write bit to such an attachment, and an NFSv4 OPEN for writing answers `NFS4ERR_ROFS`. NFSv3 has no OPEN: the client
+decides an open from ACCESS, and Linux reports an ungranted bit as `EACCES`, so over v3 an open for writing answers
+`EACCES` and every change that reaches the server `EROFS` (A-269, v3's limit). A path `truncate(2)` and `access(2)`
+for writing answer `EACCES` over v3 and v4 alike: the client asks ACCESS for a regular file's write without an open
+(`nfs_permission`), and no NFS server can make ACCESS say `EROFS`. Linux's own server answers a read-only export the
+same way (`fs/nfsd/vfs.c`, `nfsd_permission` refuses `nfserr_rofs`, and `nfsd_access` leaves the bit out rather than
+fail the call), so this is the protocol's limit, not a slates defect (A-269). Until 2026-11-08 the bridge granted
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
@@ -18935,6 +18942,45 @@ Applied in the same change to:
   a bounded leak (GAPS). **Closed 2026-11-08 by a1b44bb1:** each `FORGET` is logged beside the writes (A-63), and a
   successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
+
+### A-269 — Through a read-only NFS attachment, what ACCESS decides answers `EACCES`: v3's open for writing, and a path truncate and `access(W_OK)` over v3 and v4 (accepted 2026-11-08, the supervisor's decisions)
+Applied in the same change to:
+- §4.6 ("A read-only attachment is a read-only file system");
+- `crates/bridge-nfs/src/procedures.rs` (`access_result`, `change_refusal`, `extension::CHANGE_ALLOWED`, `state_io`),
+  `crates/bridge-nfs/src/v4/compound.rs` (`check_open_access`), `crates/bridge-nfs/src/v4/v3call.rs` (`status_only`);
+- the tests: `crates/server/tests/nfs_read_only_kernel.rs`, and `a_write_through_a_read_only_export_is_refused`
+  (`crates/bridge-nfs/tests/procedures.rs`);
+- GAPS; `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+
+- **What §4.6 said.** A read-only attachment refuses every change as POSIX's read-only file system does: `EROFS`, at the
+  open for an open for writing and at every mutating verb.
+- **What it says now.** It still does, over every transport, with the exceptions ACCESS decides. Over NFSv3 an open for
+  writing answers `EACCES`, and every change that reaches the server answers `EROFS`. Over NFSv3 and NFSv4 a path
+  `truncate(2)` and `access(2)` for writing answer `EACCES`. Every other refusal over NFSv4, the open's included, is
+  `EROFS`.
+- **Why.** NFSv3 has no OPEN: a client decides `open(2)` from the ACCESS reply. Linux asks every ACCESS bit in one call
+  and caches the answer (`fs/nfs/dir.c` at v6.8, `nfs_do_access`, lines 3201–3207), and reports a bit the server did
+  not grant as `-EACCES` (lines 3219–3221). The only other answer a server has is an error on the ACCESS call itself,
+  which that one call carries for every bit, so it would refuse reads and lookups too. Over NFSv4 a regular file's open
+  skips ACCESS (`nfs_permission`, lines 3286–3288) and the server's OPEN decides, so `NFS4ERR_ROFS` reaches the
+  application as `EROFS`. Measured through the kernel's own clients on CI: v3 `EACCES` for `O_WRONLY`, `O_RDWR` and
+  `O_RDONLY|O_TRUNC`, v4 `EROFS` for each (diag-slabs-43, run 42517769901); every other change `EROFS` over both
+  (conformance's read-only run, 42498995934; the kernel test's create probe re-runs it). EROFS at a v3 open
+  would need a kernel mount made read-only (`-o ro`), which a read attachment under a writable mount is not.
+- **The truncate, and why the write bit stays withheld over v4 too (the supervisor's decision (a), 2026-11-08).** A path
+  `truncate(2)` checks write permission before any SETATTR, and Linux's `nfs_permission` sends a regular file's write
+  without an open through ACCESS on v4 as on v3, so it answers `EACCES` over both (conformance's run on this fix,
+  diag-conformance-32, run 42523564648: v3 10 of 14 `EROFS` with the three opens at the limit, v4 13 of 14; the other in
+  each is `truncate/10.t`). Granting the write bits in v4's ACCESS would turn the truncate into `EROFS` but make
+  `access(W_OK)` report a read-only file writable to every caller that checks first (`test -w`, editors, git): a wrong
+  answer, where `EACCES` is a refusal. Linux's own server gives a Linux client exactly these answers for a read-only
+  export: `fs/nfsd/vfs.c` (Linux v7.4-rc1) `nfsd_permission` (about line 2871) answers `nfserr_rofs` to any write,
+  attribute or truncate access on a read-only export or mount, and `nfsd_access` (about line 855) treats `nfserr_rofs`,
+  `nfserr_acces` and `nfserr_perm` alike: "simply don't 'or' in the access bit". So `access(W_OK)` and the truncate are
+  `EACCES`, and every WRITE and SETATTR is `EROFS`, from the incumbent too. (The knfsd lines are the supervisor's
+  reading of loadtest-scale's dataset tree; `fs/nfs/dir.c` at v6.8 is read here.) A local read-only file system answers
+  `access(W_OK)` `EROFS` from the mount's own flag, which no NFS server can reach through ACCESS.
+- **Evidence.** GAPS, the read-only attachment's entry; the bug record's "Found by conformance".
 
 ### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
 Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
