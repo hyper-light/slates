@@ -1,0 +1,47 @@
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794205664817726919 head 57 bytes 251047
+LD-LANE install wall_ns 1794205694818372463 holder 9402812383862435509 bytes 251132 budget_ns 30000000000 took_ns 30000485170 answered false cut false
+thread 'diag_a_holder_stopped_mid_install_stays_stopped' (26024) panicked at crates/cli/tests/live_chaos.rs:1371:7:
+--- chaos-staysstopped-a-26023 (status exit 3; live None):
+--- chaos-staysstopped-b-26023 (status exit 0; live Some([LiveState { holding: false, head: Some(58), durable: Some(56), owed: false, epoch: Some(1), identity: Some("2242538db68db936167e36b95bf81462b1063d6fc5a2d183c41ab31c57de4166"), fence: 1, holders: ["8038795335237256072", "9402812383862435509"], moving_to: [], recorded: ["8038795335237256072", "9402812383862435509"] }])):
+  shard 0 refused fleet.live.appended: 59
+  shard 0 refused fleet.live.awaited: 58
+  shard 0 refused fleet.live.durable: 57
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_built: 186
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.link_lost: 2
+  shard 0 refused fleet.live.no_session: 612
+  shard 0 refused fleet.live.resolved: 57
+  shard 0 refused fleet.live.unanswered: 613
+  shard 0 refused fleet.live.whole: 1
+--- chaos-staysstopped-c-26023 (status exit 3; live None):
+--- chaos-staysstopped-a-26023 (status exit 3; live None):
+--- chaos-staysstopped-b-26023 (status exit 0; live Some([LiveState { holding: false, head: Some(58), durable: Some(56), owed: false, epoch: Some(1), identity: Some("2242538db68db936167e36b95bf81462b1063d6fc5a2d183c41ab31c57de4166"), fence: 1, holders: ["8038795335237256072", "9402812383862435509"], moving_to: [], recorded: ["8038795335237256072", "9402812383862435509"] }])):
+  shard 0 refused fleet.live.appended: 59
+  shard 0 refused fleet.live.awaited: 58
+  shard 0 refused fleet.live.durable: 57
+  shard 0 refused fleet.live.held_back.placement: 1
+  shard 0 refused fleet.live.holders_recorded: 1
+  shard 0 refused fleet.live.install_built: 659
+  shard 0 refused fleet.live.install_image: 1
+  shard 0 refused fleet.live.link_lost: 2
+  shard 0 refused fleet.live.no_session: 1558
+  shard 0 refused fleet.live.resolved: 57
+  shard 0 refused fleet.live.unanswered: 1559
+  shard 0 refused fleet.live.whole: 1
+--- chaos-staysstopped-c-26023 (status exit 3; live None):
+LD-TAKE wall_ns 1794205807718675344 from 16988472567008750815 reply Ok(Some(57))
+LD-WHY wall_ns 1794205664716215943 behind_tail holder 9402812383862435509 reported Some(0) head Some(57) checkpoint Some(0) oldest Some(54) retained 4 bytes 19064 retain_bytes 5012
