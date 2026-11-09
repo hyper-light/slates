@@ -335,8 +335,12 @@
 >   cause (`not_recovered=<kind>`; JSON `"not_recovered"`), and `share`, which read only the catalog and went through,
 >   is refused `NotRecovered` with every catalog-only lookup (`find_record`). Proven on macOS: the destroy test red
 >   before (`refused: NotRecovered`) and green after, the volume still gone after a second restart; the sweep test red
->   at the list line before and at the share with `find_record`'s check taken out. Record:
->   `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
+>   at the list line before and at the share with `find_record`'s check taken out. On Linux at b7dc93c9 (merged with
+>   main 92dcd16c; diag-slabs-40, run 42506866309): workspace clippy, the whole server suite and both tests green, the
+>   CLI flow 94 of 95, its one failure the fleet formation test (`three_daemon_processes_deploy_a_fleet_…`, untouched
+>   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
+>   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
+>   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
 > - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
 >   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
 >   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
