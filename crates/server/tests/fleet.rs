@@ -12782,9 +12782,14 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
 /// 2026-11-06: at 1,000 clients against three servers at `f = 1` every accepted submit was answered `Overloaded`, its
 /// version committed, and one submit at a time took 159 to 670 ms on an idle fleet). A version's inputs were put at one
 /// coordinator period and its record shipped at the next, so every answer waited out at least one period. Do: on a
-/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another, timing each submit. Expect
-/// every submit accepted, each as the next version, and the median answered within one coordinator period
-/// ([`HEARTBEAT_NS`]): an accepted version wakes the record plane, which ships it as soon as its inputs place.
+/// settled three-node fleet at `f = 1`, submit twenty works over one green one after another. Expect every submit
+/// accepted, each as the next version, and, judged in the daemon's own terms rather than by a wall bound, most versions
+/// placed at the quorum in the same coordinator period they were enqueued in
+/// (`merge.placed_within_period` against `merge.placed_after_periods`, the coordinator's own period count): an
+/// accepted version wakes the record plane, which ships it between periods, so its answer does not wait for one. Before
+/// A-235 every version was placed only after a period began (its inputs put at one, its record at the next). A busy
+/// machine stretches every period and every exchange alike, so the judgement holds under load, where a fixed 100 ms
+/// bound did not (a median of 909 ms under 36 spinners, 2026-11-07).
 #[test]
 fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
   /// Shape: submits timed, one after another; enough for the median to be one submit's answer, not a lucky one.
@@ -12845,10 +12850,26 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
     unheld, 0,
     "no holder refused a record for want of inputs it was counted holding: {counters:?}"
   );
+  let owner_count = |name: &str| {
+    counters
+      .first()
+      .into_iter()
+      .flatten()
+      .filter(|(counter, _)| counter == name)
+      .map(|(_, count)| *count)
+      .sum::<u64>()
+  };
+  let within = owner_count("merge.placed_within_period");
+  let after = owner_count("merge.placed_after_periods");
   assert!(
-    median < Duration::from_nanos(HEARTBEAT_NS),
-    "the median submit is answered within one coordinator period ({} ms): median {median:?}, every answer {waits:?}",
-    HEARTBEAT_NS / 1_000_000
+    within + after >= SUBMITS,
+    "every version's placement was judged ({within} within its period, {after} after periods, of {SUBMITS} submits): \
+     {counters:?}"
+  );
+  assert!(
+    within > after,
+    "most versions placed without waiting for the coordinator's period: {within} within the period they were enqueued \
+     in, {after} only after a period began; answers {waits:?}"
   );
 }
 
