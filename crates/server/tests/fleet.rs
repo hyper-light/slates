@@ -6802,6 +6802,95 @@ fn a_learner_learns_configurations_that_leave_the_membership_alone() {
   );
 }
 
+/// §4.8, D-14, learners: a learner keeps learning configurations after the voters it joined from are gone. Do form five
+/// members at `f = 1`, find a learner whose own Raft view names no voter but the bootstrapper (it joined while the
+/// council was the bootstrapper alone), stop the bootstrapper, and let the council retire it and commit what follows.
+/// Expect every survivor's council configuration to reach the newest any survivor holds, past the version at the stop,
+/// within the fleet's progress budget. Found by raft-chaos's fresh-member flow (CI diag-raft-chaos-mesh-52, runs 2 and
+/// 7): replacing the bootstrap voter left both non-voters at version 8 against 11 and 12 for a whole fleet wait. A
+/// learner asked only the voters of its join state, which a fetched configuration does not update, and with no session
+/// to any of them it asked no one and counted nothing.
+#[test]
+fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let bootstrapper = hosts[0];
+  let mut voters: Vec<HostId> = Vec::new();
+  assert!(
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || daemons[0]
+      .council_voters()
+      .map(|committed| {
+        voters = committed.unwrap_or_default();
+        voters.contains(&bootstrapper)
+      })),
+    "the council committed a voter set with the bootstrapper in its seat: {voters:?}"
+  );
+  // Each learner's own Raft view of the voters. One that names only the bootstrapper is the case this test is for, and
+  // one that joined later names more; the outcome below must hold either way, so the run says which it was.
+  let known: Vec<(HostId, Vec<HostId>)> = daemons
+    .iter()
+    .zip(&hosts)
+    .filter(|(_, host)| !voters.contains(host))
+    .map(|(daemon, host)| {
+      (
+        *host,
+        daemon.council_voters().ok().flatten().unwrap_or_default(),
+      )
+    })
+    .collect();
+  let stranded = known
+    .iter()
+    .filter(|(_, view)| !view.is_empty() && view.iter().all(|voter| *voter == bootstrapper))
+    .count();
+  eprintln!(
+    "{stranded} of {} learners knew only the bootstrapper at the stop: {known:?}",
+    known.len()
+  );
+  let before = daemons
+    .iter()
+    .filter_map(|daemon| daemon.configuration_versions().ok())
+    .map(|(_, council)| council)
+    .max()
+    .unwrap_or(0);
+  daemons.remove(0).stop();
+
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut versions: Vec<Result<(u64, u64), ObserveError>> = Vec::new();
+  let caught_up = poll_until(&observed, formation_deadline(), || {
+    versions = daemons.iter().map(Daemon::configuration_versions).collect();
+    let councils: Vec<u64> = versions
+      .iter()
+      .filter_map(|version| version.as_ref().ok().map(|(_, council)| *council))
+      .collect();
+    let newest = councils.iter().copied().max().unwrap_or(0);
+    Ok(
+      councils.len() == daemons.len()
+        && newest > before
+        && councils.iter().all(|council| *council == newest),
+    )
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    caught_up,
+    "every survivor's council passed version {before} and reached the newest (installed, council) per survivor: \
+     {versions:?}; the learners' views at the stop {known:?}"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
