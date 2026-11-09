@@ -5914,6 +5914,13 @@ failure.
 > client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
 > named, short of the failure matrix's Masked: owed as A-255 (GAPS).
 
+> **Status (2026-11-09, A-255: a submit's completion moves with its green).** After a takeover a resend under its own id
+> is answered the version it was accepted as, the failure matrix's Masked. Its completion key rides the version's chain
+> entry and merge record, and the green's successor records it. The resend reaches the successor through the work's
+> catalog record, which names the green: held, or learned from a location round. A version's record ships only once
+> that catalog is committed, and the record plane ships the catalog at the work's creation. A merge record carries
+> format version 1; another version is refused typed.
+
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
 > the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
@@ -16179,6 +16186,48 @@ Applied in the same change to: §4.16 (Commit status); §4.10 content retention 
 tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
 `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
 shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
+
+### A-255 — A submit's completion moves with its green, and a resend reaches the green's successor through its work's catalog (accepted and built 2026-11-09; loadtest-scale's route, fixtures' gate, the supervisor's three constraints)
+
+Applied in the same change to:
+- `crates/merge`: `chain_entry` version 2 carries `Completion { origin, client, sequence }`.
+- `crates/anchor`: `LAYOUT_VERSION` 7.
+- `crates/server`:
+  - `MergeRecordValue::completion` and its format version (`RECORD_MAGIC`, `RECORD_VERSION` 1, `RecordRefused`);
+  - `record_taken_over_completions`;
+  - `CatalogValue::work_of`, `fleet::owed_merge_catalogs` and `owed_adopted_work_catalogs`;
+  - `verbs::locate_work_green`;
+  - `owner_location::locate_work_of` and `Reply::work_of`;
+  - the record plane's gate (`PendingMergeRecord::work`, `fleet::catalog_committed`, `MergeWork::ShipWorkCatalog`,
+    `works_owing_catalog`).
+- The tests named in the bug record, GAPS, and §4.16's status.
+
+- **What was there.** A-252 made a waiting submit a durable state of the owner's partition. After a takeover the
+  resend was refused `OwnerUnreachable` without end. The completion window died with the owner, and the resend routes
+  by its work's id, which no survivor owns: a work's head is never placed.
+- **The rule.**
+  - RIFL §3: "If the object migrates, then the completion record must move with it." For a merge the object is the
+    green. The submit's completion key rides its version's chain entry and merge record, which holders replicate.
+    The successor's adopted chain answers a resend under that key with its version at once. The key lives as long as
+    the record, under W2's retention, and has no separate table.
+  - The route is the work's own replicated catalog register, which names its green. It needs no global catalog (D-14),
+    no client wire change and no id format change. A request for a work no member owns goes unchanged to the green's
+    owner. An origin holding no copy of the catalog learns the green from a location round of the catalog's holders.
+  - The green's owner answers only the completion under the request's own key and refuses anything else `NotFound`. A
+    key copied into another session is refused at its origin's door (A-SEAT).
+  - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
+    without its route. The record plane ships that catalog at the work's creation, and on demand.
+  - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
+    so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
+    (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
+    (`a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_greens_successor`).
+  - A merge record carries its own format version. Another is refused typed, never decoded by a second path (§2.7).
+- **Measured.** A submit made right after its work's creation: median 1.59–1.64 ms against 1.25–1.29 ms without the
+  work's catalog, on an idle Mac Studio, 2026-11-09. While the catalog waited for the coordinator's period it was
+  109 ms. The bug record has the arms.
+- **Open.**
+  - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
+  - The cross-region case is owed a test.
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
