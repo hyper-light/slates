@@ -7516,16 +7516,24 @@ async fn peer_recipient(
   Some(public)
 }
 
-/// The recipient key kept for the node at `anchor`, for delivering to it as `member`.
+/// The recipient key kept for the node at `anchor`, when it was learned from `member`: a node back at its anchor with
+/// fresh RAM (the same certificate, so the same anchor) has a new member id and a recipient of its own, so a key learned
+/// from its predecessor is not its key. Kept by anchor alone, the predecessor's key was used for the replacement for
+/// good: every pair wrapped to it was refused (1,583 of 1,583, diag-live-durability-72), so the replacement could open
+/// no key it was sent (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
 fn kept_recipient(
   kept: &std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
   anchor: u64,
-  _member: HostId,
+  member: HostId,
 ) -> Option<hyper_seal::recipient::RecipientPublic> {
-  kept.get(&anchor).map(|(_, public)| public.clone())
+  kept
+    .get(&anchor)
+    .filter(|(learned_from, _)| *learned_from == member)
+    .map(|(_, public)| public.clone())
 }
 
-/// Keeps `public`, learned from `member` at `anchor`, while fewer than `capacity` anchors are kept.
+/// Keeps `public`, learned from `member` at `anchor`: replacing what the anchor's earlier member gave, or a new anchor
+/// while fewer than `capacity` are kept (the bound `pairs_delivered` keeps too).
 fn keep_recipient(
   kept: &mut std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
   capacity: usize,
@@ -7533,7 +7541,7 @@ fn keep_recipient(
   member: HostId,
   public: hyper_seal::recipient::RecipientPublic,
 ) {
-  if kept.len() < capacity {
+  if kept.len() < capacity || kept.contains_key(&anchor) {
     kept.insert(anchor, (member, public));
   }
 }
