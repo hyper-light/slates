@@ -2444,3 +2444,5 @@ slates-server: shard 0 initialized in 3263 µs, 0 µs of its CPU, in 6 slices of
 slates anchor: a starting daemon is killed once it makes no CPU progress for the 1000 ms liveness window, or one of its threads runs that much CPU without its first beat, in its own CPU time (read from the OS, each thread's)
 slates-winfsp: reply spin window = 8900 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 10 of 10 done, 2026-11-09T21:00:49Z
+To https://github.com/hyper-light/slates
+   ab339d8..25cd107  25cd107e9347fabe9cc68c4ee1951a726f4d2c77 -> diag-results/winfsp-overlap-42675148419-cutc-arm
