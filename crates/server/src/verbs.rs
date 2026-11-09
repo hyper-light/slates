@@ -3501,6 +3501,23 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       0
     },
+    learner: if is_control_shard(state) {
+      learner_report(state)
+    } else {
+      slates_ipc::protocol::LearnerReport::default()
+    },
+  }
+}
+
+/// This node's council configuration fetches as a learner, for status ([`slates_ipc::protocol::LearnerReport`]).
+pub(crate) fn learner_report(state: &ShardState) -> slates_ipc::protocol::LearnerReport {
+  let now = slates_rt::futures::now_ns();
+  let log = state.learner_fetch;
+  slates_ipc::protocol::LearnerReport {
+    council_version: state.council.configuration().version,
+    fetched_version: log.fetched_version,
+    asked: log.asked,
+    last_asked_ago_ns: log.asked_at_ns.map(|at| now.saturating_sub(at)),
   }
 }
 
@@ -3687,6 +3704,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     peers_unmeshed: shards
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
+    learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
   }
 }
 
@@ -4404,6 +4422,7 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     Some(Err(refusal)) => return refused(refusal),
     Some(Ok(())) => {}
   }
+  let mut fenced = Vec::new();
   for shard in shards.iter().copied() {
     let marked = crate::xshard::call_in_shard_time(
       origin,
@@ -4415,15 +4434,44 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     match marked {
       None => return refused(Refusal::NotFound),
       Some(Err(refusal)) => return refused(refusal),
-      Some(Ok(())) => {}
+      Some(Ok(mounts)) if mounts.is_empty() => {}
+      Some(Ok(mounts)) => fenced.push((shard, mounts)),
     }
   }
+  revoked_mounts_ended(origin, fenced).await;
   ReplyBody::Revoked
 }
 
+/// Waits until every FUSE mount the revocation fenced (each shard's, by attachment and volume) has had its kernel drop
+/// what it cached and ended (AUD-29-84; `crate::fuse::fence_if_mounted`), so no process reads, after the revocation is
+/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most [`crate::told::TOLD_WAIT_NS`],
+/// the bound a writer waits for the same kernels to be told of a change; one past it is counted and the revocation
+/// acknowledged anyway, since every request of the mount is already refused.
+#[cfg(target_os = "linux")]
+async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
+  for (shard, mounts) in fenced {
+    let ended = crate::xshard::task_within(
+      origin,
+      shard,
+      move || crate::fuse::revoked_mounts_ended(mounts),
+      crate::told::TOLD_WAIT_NS,
+    )
+    .await;
+    if ended.is_none() {
+      let _ = crate::state::with_state_counted(|s| s.count(REVOKED_MOUNTS_OVERDUE, 1));
+    }
+  }
+}
+
+/// Elsewhere no mount is fenced this way: nothing to wait for.
+#[cfg(not(target_os = "linux"))]
+async fn revoked_mounts_ended(_origin: u16, _fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {}
+
 /// Marks every slot on this shard bound to `consumer` revoked, so its next verb's gate — one local read
 /// in `serve` — refuses before any effect (banned item 10: no cross-shard call on a write path).
-fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
+/// Returns the FUSE mounts the ending fenced, each by attachment and volume: they end once their kernels have dropped
+/// what they cached, which the revocation awaits (`revoked_mounts_ended`).
+fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<Vec<(u64, DbVolumeId)>, Refusal> {
   let bound: Vec<Handle<ClientSlot>> = s
     .clients
     .iter()
@@ -4450,10 +4498,27 @@ fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
     .into_iter()
     .cloned()
     .collect();
-  for record in held {
-    end_attachment(s, &record, Ending::Otherwise).map_err(|e| refusal_of_db(&e))?;
+  for record in &held {
+    end_attachment(s, record, Ending::Otherwise).map_err(|e| refusal_of_db(&e))?;
   }
-  Ok(())
+  Ok(fenced_mounts(s, &held))
+}
+
+/// The FUSE mounts of `ended` attachments still served on this shard: fenced, and ending once their kernels have dropped
+/// what they cached (`crate::fuse::fence_if_mounted`).
+#[cfg(target_os = "linux")]
+fn fenced_mounts(s: &ShardState, ended: &[AttachmentRecord]) -> Vec<(u64, DbVolumeId)> {
+  ended
+    .iter()
+    .filter(|record| s.fuse_mounts.contains_key(&record.id))
+    .map(|record| (record.id, record.volume))
+    .collect()
+}
+
+/// Elsewhere there is no FUSE mount.
+#[cfg(not(target_os = "linux"))]
+fn fenced_mounts(_s: &ShardState, _ended: &[AttachmentRecord]) -> Vec<(u64, DbVolumeId)> {
+  Vec::new()
 }
 
 /// Sets `subject`'s rights on `volume` (§4.13 "Access lists": `admin` covers changing the list; the owner
@@ -8481,6 +8546,10 @@ pub(crate) fn end_attachment(
     #[cfg(target_os = "linux")]
     crate::fuse::unmount_if_mounted(state, record.id);
   }
+  // However it ends, a FUSE mount of the attachment serves nothing more: its registry attachment is revoked, as a host
+  // mount's is below, so a revoked consumer's mount reaches nothing (AUD-29-84).
+  #[cfg(target_os = "linux")]
+  crate::fuse::fence_if_mounted(state, record.id);
   // A WinFsp mount ends with its attachment, however it ends: a drive letter has no directory beneath it for a later
   // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
   #[cfg(windows)]
@@ -12562,6 +12631,11 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
 /// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
 /// its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
+/// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
+/// `told::TOLD_WAIT_NS` (AUD-29-84): its requests were refused, but a page its kernel held may have been read meanwhile.
+/// Zero is the healthy reading.
+#[cfg(target_os = "linux")]
+const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 #[cfg(target_os = "linux")]

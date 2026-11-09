@@ -316,6 +316,17 @@ impl Attachments {
     Ok(Barrier { volume, closed })
   }
 
+  /// The owner `id`'s references are held under, live or revoked, until it is drained; `None` for an unknown
+  /// attachment. Not an admission: a teardown sweeps an ending attachment's own references under it, after a revocation
+  /// has stopped its requests (the server's FUSE mount end).
+  pub fn owner(&self, id: AttachmentId) -> Option<RefOwner> {
+    self.registry.get(id.0).ok().map(|attachment| {
+      attachment
+        .durable
+        .map_or(RefOwner::Process(id.key()), RefOwner::Attachment)
+    })
+  }
+
   /// Marks an attachment revoked: it admits no new effect (a later [`Attachments::context`] on it
   /// refuses), while its record survives for an in-flight drain. `drain` frees the slot once the
   /// last in-flight request has released it.
