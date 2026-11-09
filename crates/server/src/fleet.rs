@@ -7793,10 +7793,17 @@ fn record_acks_in(
   entry.placement.candidates = placement.candidates.clone();
   entry.placement.joint = placement.joint.clone();
   entry.epoch = entry.epoch.max(epoch);
+  let mut moved = false;
   for host in placement.acked {
     if !entry.placement.acked.contains(&host) {
       entry.placement.acked.push(host);
+      moved = true;
     }
+  }
+  // A placement that gained an acknowledgement moved a live volume's durability forward: its held replies wait on
+  // (`live_ship::DurableBound`).
+  if moved {
+    crate::live_ship::heard(state, object);
   }
   // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
   // the last thing they waited for.

@@ -14948,6 +14948,35 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed; two siblings open
+
+`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
+running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
+adacachy2 by pinning the test and 32 spinners to four CPUs with the test's daemons reniced to 15: the healthy `fsync`
+failed in every run that reached it (3 of 10; the rest failed earlier in the fleet's start). The give-up's record
+(`fuse::settle_held`, `live_ship::durability_report`) showed what it lacked: the candidate held the bytes (`durable 1`,
+its target), and the volume's head was not yet placed when the wall clock reached the liveness budget.
+
+Fixed (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`): a held reply gives up only
+after a whole window of the liveness budget in which nothing moved its volume's durability forward
+(`live_ship::DurableBound`), for the FUSE `fsync` and for `live_ship::wait_durable` (an NFS stable write or `COMMIT`, a
+Shards `FSYNC`). Red 3 of 3 and green 6 of 6 in `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`;
+the stopped-candidates flow still refuses after one window (1.0004–1.0017 s, 3 of 3).
+
+Open:
+- **Two siblings judge the same wait by one deadline still:** the virtio-fs device's held `FSYNC`
+  (`slates_bridge_virtiofs`, its `durable_bound_ns` from `virtiofs.rs`) and WinFsp's held flush (`winfsp.rs`, its
+  `deadline_ns` from `live_ship::durable_wait_ns`). Each answers `EIO` (`STATUS_UNEXPECTED_IO_ERROR`) at one liveness
+  budget from its hold, however its candidates are answering. Not changed with this fix: each is its own crate's or
+  platform's wait, and neither is run by a lane that loads it.
+- **An owner starved past a window's end** judges that end when it next runs, possibly before it has folded the
+  acknowledgements waiting on its sockets, so a window it could not observe may read as silent. raft's failing run shows
+  the owner itself late (the stopped-candidates `fsync` gave up after 1.60 s against a 1.00 s bound). Not reproduced
+  apart from the candidates' slowness.
+- The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
+  period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
+  silence.
+
 ### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
 
 `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,

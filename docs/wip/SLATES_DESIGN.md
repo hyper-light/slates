@@ -6161,6 +6161,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
 >
+> **The wait is judged by what it hears, not by the clock (2026-11-09).** A held `fsync` gave up at one wall-clock
+> deadline of the liveness budget from its hold, so load that slowed the candidates or the owner spent it: a healthy
+> `fsync` answered `EIO` 1 in 6 runs on main and 2 in 9 on raft-7 at load 36–145. Under load on adacachy2 its bytes
+> were already held by a candidate while the volume's head placement, shipped on the membership loop, was still in
+> flight. Now each live volume counts the acknowledgements that moved its durability forward (a holder's position, its
+> head's or catalog's placement), and a held reply gives up only after a whole window of the liveness budget in which
+> that count did not move (`live_ship::DurableBound`). Stopped candidates acknowledge nothing and are still given up
+> after one window; candidates that answer slowly keep it waiting. The FUSE `fsync` and the shared wait of an NFS stable
+> write and a Shards `FSYNC` (`live_ship::wait_durable`) judge by it; a refusal logs what durability still lacked
+> (`live_ship::durability_report`). Red first: with both candidates cycling stopped 700 ms and running 100 ms,
+> `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly` refused the first `fsync` `EIO` after
+> 1.0013–1.0037 s, 3 of 3; after, 6 of 6 succeeded in 1.50–1.59 s
+> (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`).
+>
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
 > it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
