@@ -408,3 +408,106 @@ fn a_poll_the_host_kept_off_its_cpu_is_not_its_tasks() {
     "{counters:?}"
   );
 }
+
+/// Shape: how long the work between two polls holds the thread in the timing tests below, twenty quanta: a poll
+/// timed from before it reads past the quantum by any clock, and a scheduler's preemption of a trivial poll is far
+/// shorter.
+const BETWEEN_POLLS: Duration = Duration::from_millis(20);
+
+/// Holds the thread for [`BETWEEN_POLLS`] of wall time.
+fn hold_between_polls() {
+  let began = Instant::now();
+  while began.elapsed() < BETWEEN_POLLS {
+    std::hint::spin_loop();
+  }
+}
+
+/// A task that is ready at its first poll and whose destructor holds the thread: the runtime drops it after the poll,
+/// outside any poll.
+struct SlowToDrop;
+
+impl Future for SlowToDrop {
+  type Output = ();
+  fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+    Poll::Ready(())
+  }
+}
+
+impl Drop for SlowToDrop {
+  fn drop(&mut self) {
+    hold_between_polls();
+  }
+}
+
+/// A task that is pending once and ready at its next poll, waking itself: two trivial polls.
+struct PendingOnceThenReady(bool);
+
+impl Future for PendingOnceThenReady {
+  type Output = ();
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    if self.0 {
+      return Poll::Ready(());
+    }
+    self.0 = true;
+    cx.waker().wake_by_ref();
+    Poll::Pending
+  }
+}
+
+/// Every poll past the quantum by the wall clock, however attributed.
+fn polls_past_the_quantum(counters: &slates_rt::shard::Counters) -> u64 {
+  counters.long_steps + counters.preempted_steps + counters.unattributed_steps
+}
+
+/// §4.3, A-31: a poll is timed from its own start. A finished task's destructor runs after its poll and before the next
+/// poll of the batch, and is neither poll's: a trivial poll after it is not past the quantum. (The shard reuses a poll's
+/// end reading as the next poll's start only when nothing but the queue's bookkeeping runs between them.)
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_poll_is_not_timed_through_the_destructor_of_the_task_before_it() {
+  let rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+  rt.spawn(SlowToDrop).unwrap();
+  rt.spawn(PendingOnceThenReady(false)).unwrap();
+  let ctx = rt.context();
+  step_until_idle(ctx);
+  let counters = ctx.counters();
+  assert_eq!(
+    counters.polls, 3,
+    "one batch polled both tasks, then the second again: {counters:?}"
+  );
+  assert_eq!(polls_past_the_quantum(&counters), 0, "{counters:?}");
+  assert!(
+    counters.longest_step_ns < u64::try_from(BETWEEN_POLLS.as_nanos()).unwrap(),
+    "no poll was timed through the destructor: {counters:?}"
+  );
+}
+
+/// §4.3, A-31: a batch's first poll is timed from its own start, not from the step's timer check: the pollers' checks
+/// run between the two (the daemon's walks every client ring on the shard) and are no task's poll.
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_poll_is_not_timed_through_the_poller_checks_before_it() {
+  let rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+  let task = rt.spawn(PendingOnceThenReady(false)).unwrap();
+  let ctx = rt.context();
+  let checked = std::cell::Cell::new(false);
+  ctx
+    .register_poller(
+      task,
+      Box::new(move || {
+        if !checked.replace(true) {
+          hold_between_polls();
+        }
+        false
+      }),
+    )
+    .unwrap();
+  step_until_idle(ctx);
+  let counters = ctx.counters();
+  assert_eq!(counters.polls, 2, "{counters:?}");
+  assert_eq!(polls_past_the_quantum(&counters), 0, "{counters:?}");
+  assert!(
+    counters.longest_step_ns < u64::try_from(BETWEEN_POLLS.as_nanos()).unwrap(),
+    "no poll was timed through the pollers' checks: {counters:?}"
+  );
+}

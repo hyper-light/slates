@@ -12115,3 +12115,63 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## A shard's clock reads under 3,000 clients (§4.3, A-31; 2026-11-09)
+
+A 2 s profile of W1's owner shard had put 124 of its 1,105 samples in `mach_absolute_time` and 30 in
+`__thread_selfusage`, about 14%. The question was what each poll's readings cost and whether the judgments need them
+per poll. Four cuts, none changing what a poll is charged:
+- a poll's end reading is the next poll's start, but only when the poll stayed pending within the quantum, so nothing ran
+  between them but the queue's bookkeeping;
+- an armed step's window reading is its timer reading too;
+- a wait's end reads no thread account, since the step after every wait reads one before any poll could use it;
+- a room wait (`xshard::given_room_within`) reads the clock only after a refusal.
+
+Two tests hold the first cut's limit, and each was red-checked against the naive form:
+- `a_poll_is_not_timed_through_the_destructor_of_the_task_before_it`;
+- `a_poll_is_not_timed_through_the_poller_checks_before_it`.
+
+A first build that reused every poll's end, and started a batch at the timer reading, failed each test.
+
+**Command.** `run.sh <tag> <rounds>` with `B=<arm>` (kept with this record's session, `pollclock-ship`). Each run is
+`load_bench --tree linux-v7.4-rc1/kernel --clients 3000 --hot-files 2400 --per-connection 32 --rounds 3 --reply-patience 60`,
+in process, with `sample <pid> 2` taken a second after the level connects. A run counts, on each shard thread, the
+inclusive samples of `mach_absolute_time` and `__thread_selfusage` (`count.sh`, which gives 124 and 30 on the earlier
+profile). The busiest shard is the one with the fewest `kevent` samples, shard 19 in every run. Arms alternate order
+each round. Release, no LTO.
+
+**Hardware and load.** adas-mac-studio.local-2, Apple silicon, 32 CPUs, macOS 26.4.1, 2026-11-09; one-minute load 3 to 29
+as the rounds ran.
+
+| Owner shard (of ~1,100 samples) | main 84d1f59a | this change |
+|---|---|---|
+| `mach_absolute_time`, by round | 102, 92, 81, 73, 90, 100, 118, 108 (mean 95.5) | 85, 67, 79, 78, 72, 93, 101, 90 (mean 83.1) |
+| `__thread_selfusage`, by round | 29, 43, 36, 27, 31, 40, 15, 28 (mean 31.1) | 32, 22, 29, 33, 34, 24, 44, 35 (mean 31.6) |
+| clock share of busy samples | 12.4, 13.3, 11.0, 10.4, 11.5, 13.4, 12.3, 13.0% | 11.1, 9.0, 10.2, 10.7, 10.1, 11.3, 14.0, 11.7% |
+
+Over all 23 shards, `mach_absolute_time` fell from 18 to 22% of busy samples (mean 20%) to 18.0 to 18.9% (mean
+18.5%). Wall time was level: 8.2 to 9.1 s on both arms, and one main run of 17.6 s. Oracle failures were 0 on every run.
+
+**What the samples name.** The owner's reads, each charged to its nearest slates caller (`callers.sh`), mean of the
+eight runs:
+
+| Reader | main | this change |
+|---|---|---|
+| the step's own reads (the polls, the timers) | 34.6 | 35.4 |
+| the thread account at an armed step's start | 31.1 | 31.6 |
+| the server's and database's stamps for a verb | 46.9 | 45.5 |
+| a room wait's deadline, and the rest | 14.0 | 2.3 |
+
+The owner's saving is the room wait's read alone, about 12 samples of 1,100.
+
+- **The step's reads.** The owner's polls mostly finish a request, so a dropped future follows the poll and the next poll
+  reads its own start. The pending serve polls of the other shards are where the reuse saves.
+- **The poll's end.** Of main's two reads a poll, the one after the poll drew 38 to 50 samples a run and the one before
+  2 to 10, at the same count. Alone on the quiet Studio, a read costs 18 to 20 ns and adds 0 to 25 ns after 4 to 16 cache
+  misses or 16 to 64 scattered stores (`clockbench`). So the samples at the read after a poll are most likely the
+  poll's own tail (an inference from these two measurements, not a measurement of it), and they overstate the read.
+- **The thread account.** Under this load every shard stays armed, because each busy period runs a poll past a quantum
+  of a few microseconds. So every step reads it: 31 owner samples, and 700 to 860 over the 23 shards. Cutting it changes
+  which polls get a window, so it is a decision, not a cut.
+- **The server's stamps.** `run_recorded`, `record_completion` and the database's `mutate` and `commit` each read the
+  clock for one verb.

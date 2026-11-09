@@ -17,8 +17,11 @@
 //! four CPUs, 2026-09-25, best of five rounds of 200,000 calls): the CPU clock 155–161 ns and `getrusage`
 //! 130–134 ns; on Apple silicon the CPU clock 107–129 ns (2026-09-22). That is too dear for every poll,
 //! so the shard reads only at the end of a poll that already ran long, and — while a long poll went
-//! unattributed for want of a window — at each step's start and each wait's end ([`Tracker`]); a busy
-//! period that runs no long poll stops the readings. macOS counts no per-thread voluntary switches, so a
+//! unattributed for want of a window — at each step's start ([`Tracker`]); a busy period that runs no long poll
+//! stops the readings. Until 2026-11-09 an armed shard read at each wait's end too, and the step that follows every
+//! wait read again before any poll could use the first: the wait's reading never judged a poll. Under 3,000 clients
+//! (W1, adas-mac-studio.local-2) the shards stay armed, and the step-start reading was 779 samples of `thread_selfusage`
+//! in a 2 s profile of 23 shards. macOS counts no per-thread voluntary switches, so a
 //! poll off the CPU there is unattributed unless the runtime itself yielded in it. A virtual machine's
 //! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
 //! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
@@ -173,7 +176,8 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
 }
 
 /// The shard's windows and when it reads. A window opens at the end reading of every long poll, and —
-/// while armed — at each step's start and each wait's end. A wait closes the window, so a park's own
+/// while armed — at each step's start (a wait's end opens none: a step follows every wait, and only a step polls). A
+/// wait closes the window, so a park's own
 /// block is never charged to a poll. The shard arms when a long poll found no window, or one that did not
 /// decide it; a busy period (from one wait to the next, having done work) that runs no long poll disarms,
 /// so a healthy shard reads nothing.
@@ -183,7 +187,7 @@ pub(crate) struct Tracker {
   window_start: Option<(ThreadAccount, u64)>,
   /// Whether the runtime yielded the thread inside a poll since the window opened.
   yielded: bool,
-  /// Whether step starts and wait ends open windows.
+  /// Whether step starts open windows.
   armed: bool,
   /// Whether the busy period since the last wait did work.
   period_worked: bool,
@@ -192,7 +196,7 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
-  /// Whether the shard is reading at step starts and wait ends.
+  /// Whether the shard is reading at step starts.
   #[cfg(test)]
   fn armed(&self) -> bool {
     self.armed
@@ -222,14 +226,6 @@ impl Tracker {
       }
       self.period_worked = false;
       self.period_long = false;
-    }
-  }
-
-  /// A wait ended: while armed, a window opens at what `read` returns (called only then).
-  pub(crate) fn wait_ended(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
-    if self.armed {
-      self.window_start = read();
-      self.yielded = false;
     }
   }
 
@@ -367,7 +363,6 @@ mod tests {
     tracker.step_ended(true);
     // A busy period that ran a long poll keeps the arming across its wait.
     tracker.wait_began();
-    tracker.wait_ended(|| at(QUANTUM_NS * 6, account(300, Some(1))));
     assert!(tracker.armed());
     tracker.step_began(|| at(QUANTUM_NS * 6, account(300, Some(1))));
     tracker.step_ended(true);
@@ -375,7 +370,6 @@ mod tests {
     tracker.wait_began();
     tracker.wait_began();
     assert!(!tracker.armed());
-    tracker.wait_ended(|| panic!("a disarmed shard reads nothing"));
     tracker.step_began(|| panic!("a disarmed shard reads nothing"));
   }
 
@@ -391,8 +385,8 @@ mod tests {
     );
     tracker.step_ended(true);
     tracker.wait_began();
-    // The park blocked (a voluntary switch) — then the next busy period opens a fresh window after it.
-    tracker.wait_ended(|| at(QUANTUM_NS * 100, account(10, Some(5))));
+    // The park blocked (a voluntary switch) — then the next busy period's first step opens a fresh window after it.
+    tracker.step_began(|| at(QUANTUM_NS * 100, account(10, Some(5))));
     assert_eq!(
       tracker.long_poll(
         QUANTUM_NS * 100,

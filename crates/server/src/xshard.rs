@@ -248,9 +248,11 @@ pub fn run_on_waiting(
 /// shard's clock, not a count of tries: until 2026-11-06 it was `budget / pace + 1` tries of one pause each, and on a
 /// starved shard every pause ran late, so the wait stretched with the starvation (51 tries took 1.54 s against a
 /// 500 ms budget with the shard kept off its CPU 20 ms at a time; `a_status_on_a_starved_shard_is_refused_overloaded_on_time`
-/// in `crates/server/tests/ack_release.rs`).
+/// in `crates/server/tests/ack_release.rs`). The clock is read only once a channel has refused: every reply and every
+/// part goes through here, and a send that finds room needs no deadline (15 of the owner shard's 1,105 samples were this
+/// read under W1's 3,000 clients, adas-mac-studio.local-2, 2026-11-09).
 pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
-  let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
+  let mut deadline = None;
   loop {
     match registry::send_control_or_return(target, message) {
       Ok(()) => return true,
@@ -260,7 +262,10 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
       }) => message = unsent,
       Err(_) => return false,
     }
-    let left = deadline.saturating_sub(slates_rt::futures::now_ns());
+    let now = slates_rt::futures::now_ns();
+    let left = deadline
+      .get_or_insert(now.saturating_add(budget_ns))
+      .saturating_sub(now);
     if left == 0 {
       return false;
     }

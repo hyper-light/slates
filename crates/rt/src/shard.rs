@@ -65,6 +65,19 @@ pub struct StepOutcome {
   pub next_deadline_ns: Option<u64>,
   /// Whether the shard finished its shutdown and left the loop.
   pub exit: bool,
+  /// The shard clock's last reading in the step, when it read one (it ran a timer check or a poll): the loop's next
+  /// question of the clock asks it, not the clock again.
+  pub clock_ns: Option<u64>,
+}
+
+/// A poll's clock: its end, and the start the next poll in the batch may take without reading the clock again.
+#[derive(Clone, Copy, Debug)]
+struct PollClock {
+  /// The shard clock at the poll's end.
+  ended_ns: u64,
+  /// `ended_ns` when nothing but the queue's bookkeeping runs before the next poll; `None` when a destructor or a
+  /// thread-account read does, so the next poll reads its own start.
+  next_start_ns: Option<u64>,
 }
 
 /// The shard's counters (the tripwires of GAPS §7 read them).
@@ -1148,7 +1161,7 @@ impl ShardContext {
         break;
       }
       if outcome.did_work {
-        let now = self.now_ns();
+        let now = outcome.clock_ns.unwrap_or_else(|| self.now_ns());
         if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
           let _ = self.harvest_io();
           last_wait_ns = now;
@@ -1211,11 +1224,7 @@ impl ShardContext {
       return false;
     }
     self.update_attribution(Tracker::wait_began);
-    let found = self.spin_for_work(window_end, deadline_ns);
-    if found {
-      self.wait_ended();
-    }
-    found
+    self.spin_for_work(window_end, deadline_ns)
   }
 
   /// The spin itself: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn
@@ -1298,16 +1307,25 @@ impl ShardContext {
         did_work: false,
         next_deadline_ns: None,
         exit: true,
+        clock_ns: None,
       };
     }
     let _entered = registry::enter(self);
     // While a long poll has gone unattributed, each step opens a window at its start, so the next long
-    // poll is judged by the step's own CPU alone; an unarmed shard reads neither clock.
+    // poll is judged by the step's own CPU alone; an unarmed shard reads neither clock. The window's shard clock is
+    // the step's timer clock too, so an armed step reads it once.
+    let mut window_ns = None;
     if self.real_time {
-      self.update_attribution(|tracker| tracker.step_began(|| self.account_now()));
+      self.update_attribution(|tracker| {
+        tracker.step_began(|| {
+          let opened = self.account_now();
+          window_ns = opened.map(|(_, clock_ns)| clock_ns);
+          opened
+        })
+      });
     }
     let mut did_work = false;
-    let (drained, batch, alone) = self
+    let (drained, batch, alone, timers_read_ns) = self
       .with_inner(|inner| {
         inner.counters.steps = inner.counters.steps.saturating_add(1);
         // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
@@ -1329,11 +1347,17 @@ impl ShardContext {
         }
         let mut work = self.drain_control(inner);
         work |= self.drain_inbound(inner);
-        work |= self.expire_timers(inner);
+        let (fired, timers_read_ns) = self.expire_timers(inner, window_ns);
+        work |= fired;
         work |= self.wake_ready_pollers(inner);
-        (work, inner.config.batch, live_alone(inner))
+        (
+          work,
+          inner.config.batch,
+          live_alone(inner),
+          Some(timers_read_ns),
+        )
       })
-      .unwrap_or((false, 1, None));
+      .unwrap_or((false, 1, None, None));
     did_work |= drained;
     // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`). A shard a task holds
     // alone polls that task only, when it is ready ([`Self::spawn_alone`]).
@@ -1341,9 +1365,18 @@ impl ShardContext {
       Some(holder) => self.local.take_slot(holder.index()),
       None => self.local.take_ready(batch.max(1)),
     };
+    // A poll's end is the next poll's start when nothing but the queue's bookkeeping ran between them: the poll
+    // returned pending, so no destructor ran, and it was within the quantum, so no thread account was read. A batch's
+    // first poll reads its own start, after the pollers' checks (a walk of the shard's client rings). Before 2026-11-09
+    // every poll read the clock at its start and its end.
+    let mut clock_ns = timers_read_ns;
+    let mut next_start_ns = None;
     for (polled, slot) in ready.iter().enumerate() {
       did_work = true;
-      self.poll_slot(*slot);
+      let start = next_start_ns.unwrap_or_else(|| self.now_ns());
+      let polled_clock = self.poll_slot(*slot, start);
+      clock_ns = Some(polled_clock.ended_ns);
+      next_start_ns = polled_clock.next_start_ns;
       // A task this poll ran began to hold the shard alone: the rest of the batch waits for it, in its order.
       if alone.is_none() && self.held_alone() {
         self
@@ -1369,6 +1402,7 @@ impl ShardContext {
       did_work,
       next_deadline_ns,
       exit,
+      clock_ns,
     }
   }
 
@@ -1404,7 +1438,6 @@ impl ShardContext {
       }
       None => lost = self.wait_in_driver(deadline_ns),
     }
-    self.wait_ended();
     if lost {
       self.fail_all();
     }
@@ -1499,13 +1532,6 @@ impl ShardContext {
     let attributed = tracker.long_poll(poll_started_ns, ended_ns, end, quantum);
     self.attribution.set(tracker);
     Some(attributed)
-  }
-
-  /// A wait ended: while a long poll has gone unattributed, a window opens now.
-  fn wait_ended(&self) {
-    if self.real_time {
-      self.update_attribution(|tracker| tracker.wait_ended(|| self.account_now()));
-    }
   }
 
   /// The thread's account and the shard clock now: an attribution window's start.
@@ -1784,8 +1810,10 @@ impl ShardContext {
     }
   }
 
-  fn expire_timers(&self, inner: &mut ShardInner) -> bool {
-    let now = inner.driver.now_ns();
+  /// Fires the timers due by the clock now, `read_ns` when the step has read it already; returns whether any fired,
+  /// and the clock it went by.
+  fn expire_timers(&self, inner: &mut ShardInner, read_ns: Option<u64>) -> (bool, u64) {
+    let now = read_ns.unwrap_or_else(|| inner.driver.now_ns());
     let mut fired = std::mem::take(&mut inner.fired);
     inner.timers.advance(now, &mut fired);
     let any = !fired.is_empty();
@@ -1796,26 +1824,33 @@ impl ShardContext {
     }
     inner.fired = fired;
     self.wake_timer_waiters(inner, freed);
-    any
+    (any, now)
   }
 
-  fn poll_slot(&self, slot: u32) {
+  /// Polls the task in `slot`, its poll begun at `start` on the shard clock: the clock at the poll's end, and whether
+  /// the next poll may start at it ([`PollClock`]).
+  fn poll_slot(&self, slot: u32, start: u64) -> PollClock {
     self.local.clear_pending(slot);
     let taken = self.with_inner(|inner| take_future(inner, slot)).flatten();
     let Some((mut future, generation, cancelled)) = taken else {
-      return;
+      return PollClock {
+        ended_ns: start,
+        next_start_ns: Some(start),
+      };
     };
     if cancelled {
       // The future is dropped outside any borrow: destructors may wake other tasks.
       drop(future);
       self.with_inner(|inner| finish(inner, &self.local, slot, Outcome::Cancelled));
-      return;
+      return PollClock {
+        ended_ns: start,
+        next_start_ns: None,
+      };
     }
     let word = Encoded::pack(self.id, slot, generation).unwrap_or(Encoded::from_word(0));
     let waker = waker_for(word);
     let mut cx = Context::from_waker(&waker);
     self.current_task.set(Some(slot));
-    let start = self.now_ns();
     let poll = future.as_mut().poll(&mut cx);
     let ended = self.now_ns();
     self.current_task.set(None);
@@ -1834,7 +1869,14 @@ impl ShardContext {
         },
       )
     });
+    // Only a pending poll within the quantum leaves nothing between its end and the next poll's start but the queue's
+    // bookkeeping: a finished future's destructor, or a long poll's thread account, runs after `ended`.
+    let next_start_ns = (dropped.is_none() && attributed.is_none()).then_some(ended);
     drop(dropped);
+    PollClock {
+      ended_ns: ended,
+      next_start_ns,
+    }
   }
 }
 
