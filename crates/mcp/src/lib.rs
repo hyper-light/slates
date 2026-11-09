@@ -32,8 +32,8 @@ use slates_client::{
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
   GreenBase, GroupReport, HostAnswer, Intent, KernelCache, Landing, LandingDegradation,
   LandingOutcome, LandingSummary, NamePolicy, OciBinding, ReadAt, ReadWritePolicy, Rebased,
-  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  RecoveryCause, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
+  Submitted, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,
 };
 
@@ -1488,7 +1488,23 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
     "referenced_bytes": v.referenced_bytes,
     "unique_bytes": v.unique_bytes,
     "overlay": v.overlay,
+    "not_recovered": v.not_recovered.as_ref().map(recovery_cause_kind),
   })
+}
+
+/// The kind of why recovery could not rebuild a volume (§4.8), as `volume list` and its JSON name it: the
+/// [`RecoveryCause`] variant's name. The whole cause, with its path or reason, is in the volume's `status` refusal.
+pub fn recovery_cause_kind(cause: &RecoveryCause) -> &'static str {
+  match cause {
+    RecoveryCause::NoImage => "NoImage",
+    RecoveryCause::BlocksUnclaimed => "BlocksUnclaimed",
+    RecoveryCause::BaseMissing { .. } => "BaseMissing",
+    RecoveryCause::BaseOnOwnMount { .. } => "BaseOnOwnMount",
+    RecoveryCause::BaseUnavailable { .. } => "BaseUnavailable",
+    RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
+    RecoveryCause::ImageRefused { .. } => "ImageRefused",
+    RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+  }
 }
 
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
@@ -1507,6 +1523,7 @@ pub fn status_json(r: &StatusReport) -> Value {
       .map(|mount| serde_json::json!({ "attachment": mount.attachment, "path": mount.path }))
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
+    "takeover_kept": r.takeover_kept,
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,

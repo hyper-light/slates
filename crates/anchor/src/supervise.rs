@@ -5,6 +5,8 @@
 //! The restart bound is derived, not a retry count: a daemon that has failed more times inside
 //! the recovery budget than that budget holds daemon starts is not recovering, and restarting
 //! it again is a busy loop; supervision then records `CrashLoop` in the segment and refuses.
+//! A failure is an exit before the daemon's start was done (`layout::SUP_SERVING`, which the
+//! daemon marks once it serves): an exit after it is a daemon that recovered, restarted at once.
 //! The supervisor is driven by its owner (the `slates anchor` command loop): `step` polls the
 //! child once and never blocks, so the owner interleaves it with heartbeat observation and its
 //! control channel.
@@ -690,6 +692,20 @@ impl Supervisor {
     };
     self.child = None;
     let exit_code = status.code();
+    // Only a daemon that exited before its start was done counts toward the bound: one that served had recovered, so
+    // restarting it is not a busy loop (the module's rule). Its own mark says so (`layout::SUP_SERVING`), not its first
+    // beat, since a recovering daemon beats (its recovery runs in slices). Until 2026-11-09 every exit counted, and a
+    // daemon killed while serving more often than the window holds starts was backed off as a crash loop (the WinFsp
+    // drive test, backed off 16 s at its twentieth kill on both Windows runners).
+    if self.segment.supervision()?.serving_since().is_some() {
+      self.backoff_ns = self.policy.window_ns;
+      self.segment.supervision()?.record_exit(false);
+      self.start(now_ns)?;
+      return Ok(Step::Restarted {
+        exit_code,
+        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+      });
+    }
     self.restarts_at_ns.push_back(now_ns);
     while self
       .restarts_at_ns

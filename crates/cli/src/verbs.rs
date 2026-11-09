@@ -2304,9 +2304,10 @@ fn option_text<T: std::fmt::Display>(value: Option<T>) -> String {
   value.map_or_else(|| "none".to_owned(), |v| v.to_string())
 }
 
-/// One volume per line: id, name, referenced bytes, unique bytes, overlay, live shipping (A-200).
+/// One volume per line: id, name, referenced bytes, unique bytes, overlay, live shipping (A-200), and, for a volume
+/// recovery could not rebuild, `not_recovered=` and its cause's kind (`slates status ID` gives the whole cause).
 fn summary_line(volume: &VolumeSummary) -> String {
-  format!(
+  let line = format!(
     "{} {} referenced={} unique={} overlay={} live_shipped={}",
     volume_id_text(volume.id),
     volume.name,
@@ -2314,7 +2315,14 @@ fn summary_line(volume: &VolumeSummary) -> String {
     volume.unique_bytes,
     volume.overlay,
     volume.live_shipped
-  )
+  );
+  match &volume.not_recovered {
+    Some(cause) => format!(
+      "{line} not_recovered={}",
+      slates_mcp::recovery_cause_kind(cause)
+    ),
+    None => line,
+  }
 }
 
 /// The status, one `key: value` per line.
@@ -2381,6 +2389,9 @@ fn mounts_text(report: &StatusReport) -> String {
   }
   if report.mounts_elided > 0 {
     out.push_str(&format!("mounts_elided: {}\n", report.mounts_elided));
+  }
+  if report.takeover_kept > 0 {
+    out.push_str(&format!("takeover_kept: {}\n", report.takeover_kept));
   }
   out
 }

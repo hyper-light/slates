@@ -9,7 +9,8 @@
 //!   (`t/base/03.t` case 3); the drive answered success.
 //! - An open with `TRUNCATE_EXISTING` must leave the file empty (`t/base/05.t` case 12); the drive kept its bytes.
 //! - `SetFileTime`'s access and write times must be kept (`t/base/06.t` case 6); the drive answered success and kept
-//!   neither. A creation time is not kept: the volume records no settable birth time (A-209's stated difference).
+//!   neither. Its creation time must be kept too (`t/base/06.t` case 5, A-259): the volume keeps a birth time, but the
+//!   drive reported the change time as the creation time and dropped the one set.
 //! - A file shrunk and then extended must reach its new size: the WinFsp fsx port wedges at an extension that follows
 //!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
 //!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
@@ -59,6 +60,9 @@ const FILE_BYTES: usize = 42;
 const SET_MODIFIED_SECONDS: u64 = 4_102_444_800;
 /// Format: the access time the times test sets: an hour after [`SET_MODIFIED_SECONDS`], so the two cannot be confused.
 const SET_ACCESSED_SECONDS: u64 = SET_MODIFIED_SECONDS + 3_600;
+/// Format: the creation time the creation-time test sets: a day before [`SET_MODIFIED_SECONDS`], and earlier than any
+/// time the drive could stamp on a new file, so a kept creation time cannot be mistaken for one the drive made.
+const SET_CREATED_SECONDS: u64 = SET_MODIFIED_SECONDS - 86_400;
 /// Format: the file sizes and the write of fsx's operations 157 to 164 at seed 1, which wedged the drive at 164: the
 /// size before (157), the shrink (161), the write past the end that leaves a hole (162: 28,320 bytes at 205,924), the
 /// second shrink (163) and the extension (164).
@@ -450,6 +454,38 @@ fn a_files_write_and_access_times_set_through_the_drive_are_kept() {
   );
 }
 
+/// A-259, `t/base/06.t` case 5. Do: make a file on the drive, set its creation time through its handle
+/// (`SetFileTime`, `FileTimesExt::set_created`), close it, and read its times back through a fresh look. Expect: the
+/// creation time set, to the second, and the write time left as it was. Before, the drive reported each object's change
+/// time as its creation time, and `SetBasicInfo` dropped the creation time it was given, so the read back was the
+/// moment of the set.
+#[test]
+fn a_files_creation_time_set_through_the_drive_is_kept() {
+  use std::os::windows::fs::FileTimesExt;
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("created");
+  let created = std::time::UNIX_EPOCH + Duration::from_secs(SET_CREATED_SECONDS);
+  let file = std::fs::File::create(drive.path("born.txt")).unwrap();
+  let written = file.metadata().unwrap().modified().unwrap();
+  file
+    .set_times(std::fs::FileTimes::new().set_created(created))
+    .unwrap();
+  drop(file);
+  let seen = std::fs::metadata(drive.path("born.txt")).unwrap();
+  assert_eq!(
+    seen.created().unwrap(),
+    created,
+    "the creation time set is kept"
+  );
+  assert_eq!(
+    seen.modified().unwrap(),
+    written,
+    "setting the creation time left the write time as it was"
+  );
+}
+
 /// Runs `steps` on a thread and waits [`WAIT_FOR`] for its answer: a call that wedges the drive fails the test with
 /// `what` instead of holding it forever. A wedged thread is left behind holding its handle; the test has failed.
 fn within_wait<T: Send + 'static>(what: &str, steps: impl FnOnce() -> T + Send + 'static) -> T {
@@ -539,4 +575,56 @@ fn a_file_shrunk_then_extended_by_zero_writes_reaches_the_size() {
     extended.iter().all(|byte| *byte == 0),
     "the extension reads as zeros"
   );
+}
+
+/// A-262, `t/base/01.t` and `07.t`. Do: create a file on the drive with `FILE_ATTRIBUTE_HIDDEN`, read its attributes,
+/// mark it read-only (`SetFileAttributes` through `set_permissions`), try to delete it, clear its read-only state and
+/// delete it. Expect: the file reports `HIDDEN | ARCHIVE` (kept, and archived as NTFS marks a new file), then
+/// `READONLY` beside them; its delete is refused `ERROR_ACCESS_DENIED` while read-only; once cleared it deletes. Before,
+/// every file reported `NORMAL` and a read-only file deleted.
+#[test]
+fn a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete() {
+  use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+  /// Format: `FILE_ATTRIBUTE_READONLY`, `HIDDEN`, `ARCHIVE` and `NORMAL`.
+  const READONLY: u32 = 0x1;
+  const HIDDEN: u32 = 0x2;
+  const ARCHIVE: u32 = 0x20;
+  const NORMAL: u32 = 0x80;
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("attributes");
+  let path = drive.path("kept.txt");
+  drop(
+    std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .attributes(HIDDEN)
+      .open(&path)
+      .unwrap(),
+  );
+  let attributes = || std::fs::metadata(&path).unwrap().file_attributes();
+  assert_eq!(
+    attributes() & (READONLY | HIDDEN | ARCHIVE | NORMAL),
+    HIDDEN | ARCHIVE,
+    "a file created hidden is kept hidden, and archived"
+  );
+  let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+  permissions.set_readonly(true);
+  std::fs::set_permissions(&path, permissions.clone()).unwrap();
+  assert_eq!(
+    attributes() & (READONLY | HIDDEN | ARCHIVE),
+    READONLY | HIDDEN | ARCHIVE,
+    "read-only beside the kept bits"
+  );
+  assert_eq!(
+    std::fs::remove_file(&path).unwrap_err().raw_os_error(),
+    Some(ERROR_ACCESS_DENIED),
+    "a read-only file refuses its delete"
+  );
+  // On Windows this clears `FILE_ATTRIBUTE_READONLY` alone; the lint's world-writable mode is Unix's.
+  #[allow(clippy::permissions_set_readonly_false)]
+  permissions.set_readonly(false);
+  std::fs::set_permissions(&path, permissions).unwrap();
+  std::fs::remove_file(&path).unwrap();
 }

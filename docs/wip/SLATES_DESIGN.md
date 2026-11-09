@@ -619,6 +619,16 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > Records: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`,
 > `docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`.
 
+> **Step 2's recovery runs in slices (2026-11-07).** A shard's start, its recovery included, was one poll, so a
+> recovery past a liveness window of CPU stopped the A-228 watchdog's beat until it ended, and an anchor would kill every
+> successor in turn. Now each shard's start runs alone on its shard (`slates_rt::futures::spawn_alone`: nothing else
+> the shard is sent runs before it ends, as behind one long poll), and its recovery yields between units, each slice at
+> least half the live step quantum, its yields held to 5% of its time, and at most a heartbeat period: each record in the order recovery always took them, a green's held origin a directory's listing or
+> a file's read a unit, its chain an entry a unit, each logged write. Measured: 16 greens over a held 78-file tree
+> recovered in 2.82 s of CPU in 959 slices with the beat never older than 496 ms, where the unsliced daemon went 2.20 s
+> without a beat. The catalog's replay and a green's engine built over its origin are each one unit still. Record:
+> `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -1805,7 +1815,10 @@ enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-
 struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
-               body: Body, identity: Option<Blake3>, born: Epoch, flags }
+               body: Body, identity: Option<Blake3>, born: Epoch, flags,
+               windows: WindowsAttributes /* A-262: HIDDEN, SYSTEM, ARCHIVE, OFFLINE, NOT_CONTENT_INDEXED, and a
+                                             directory's READONLY (a file's is its mode), at Windows' values, in the
+                                             two bytes of tail padding, so no inode grows */ }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
             Base { witness: Option<Handle<Witness>>, pinned: ExtentList, fd: Option<BaseFd>, lost: bool } }
 struct Extent { off: u64, len: u64, src: ExtentSrc } enum ExtentSrc { Chunk{chunk: ChunkHandle, off: u32}, Zero, Base{fd: BaseFd} }
@@ -2039,7 +2052,14 @@ an open for writing (a write access mode or `O_TRUNC`) and at every mutating ver
 before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
 delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
 permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
-macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Over NFS an ACCESS reply grants no
+write bit to such an attachment, and an NFSv4 OPEN for writing answers `NFS4ERR_ROFS`. NFSv3 has no OPEN: the client
+decides an open from ACCESS, and Linux reports an ungranted bit as `EACCES`, so over v3 an open for writing answers
+`EACCES` and every change that reaches the server `EROFS` (A-269, v3's limit). A path `truncate(2)` and `access(2)`
+for writing answer `EACCES` over v3 and v4 alike: the client asks ACCESS for a regular file's write without an open
+(`nfs_permission`), and no NFS server can make ACCESS say `EROFS`. Linux's own server answers a read-only export the
+same way (`fs/nfsd/vfs.c`, `nfsd_permission` refuses `nfserr_rofs`, and `nfsd_access` leaves the bit out rather than
+fail the call), so this is the protocol's limit, not a slates defect (A-269). Until 2026-11-08 the bridge granted
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
@@ -2459,8 +2479,8 @@ guest's later requests meanwhile, completing the held reply out of order, which 
 Shards stream, whose VMM sends one request at a time, holds its reply frame. **A guest's own stale page** is judged
 too (2026-11-06): its device delivers no invalidation, so a page the guest dirtied and launders at a revalidation can
 carry bytes another path changed since. The device keeps per-guest byte states, fed by the guest's reads, its own
-writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back holding a stale byte `EIO` whole:
-A-192's rule, not the host mount's mask (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
+writes and the journal's other changes, and refuses a `FUSE_WRITE_CACHE` write-back whose stale bytes differ from the
+file's `EIO` whole: the rule every transport shares since A-248 (`slates_bridge_fuse::guest_writeback`). Each mount's told point is its coherence
 cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
 without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
@@ -2474,9 +2494,18 @@ A directory's listing, an outsider's change beneath a base, and a mount fallen b
 having no byte range. A guest's DAX map of a file shared through a mount lives in that cache. Under a whole-file drop
 for every change, each one-byte change elsewhere to a 128 MiB file made the guest's next scan of its map take 356–382
 ms, against 0.2–0.3 ms warm (Linux 7.2.9, crosvm, 2026-10-22). **A page the kernel writes back from its cache is applied
-only where it is not stale** (A-139, A-140). A `WRITE` carrying `FUSE_WRITE_CACHE` is
-applied except over the bytes another path changed after the kernel's copy of them was fetched, the mount's own writes
-since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
+whole or refused whole** (A-248, Ada's decision of 2026-11-07: "Refuse, like NFS"). A `WRITE` carrying
+`FUSE_WRITE_CACHE` whose bytes include any another path changed after the kernel's copy of them was fetched (the
+mount's own writes since excepted), and that differ from the file's bytes now, is refused `EIO` whole: the other path's
+change survives, and the program learns at its `msync` or `fsync` that its store did not land. Whole means the whole
+`WRITE`: Linux gathers contiguous dirty pages into one, so a page no other path touched can go with it. The kernel marks
+every page of a refused write-back clean, so the mount drops them all from its cache at the next round, after the reply,
+and the next read fetches what the volume holds. Stale bytes equal to the file's change nothing, so such a write-back is
+applied whole. It is one rule for every transport that writes back a
+client's cache, the host mount, a virtio-fs guest and an NFS v3 connection (`slates_bridge_fuse::coherence::judge_writeback`),
+and the write log records a refused write-back nowhere. Until A-248 the mount applied the write-back outside its stale
+bytes (A-139, A-140), which chose bytes between the store and the other path's change: an inferred merge, banned item
+11. For each byte of a file open for writing, the mount keeps
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
 records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
 mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A mount taken over by a
@@ -2484,7 +2513,7 @@ restarted daemon** (A-61) never saw the opens its kernel made before. At its fir
 publication counted open for it, fresh as of its start, and its rounds feed them from there (A-156). A request naming a
 handle opened after that publication adopts its file (A-147): fresh as of the mount's start, with the journal's changes
 to it since then applied, and judged from there like any other. Untracked, such a file was judged against every change
-since the mount's start. A store made after a re-fetch of bytes another path had changed was then kept back, and
+since the mount's start. A store made after a re-fetch of bytes another path had changed was then judged stale, and
 lost. **A READ through a handle
 opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
 that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
@@ -2748,6 +2777,23 @@ therefore one implementation shared by both versions.
     client, session and state id therefore names an instance no earlier life used.
   - Kept records come back even if a smaller bound was derived since; only new state is refused until
     the tables are back under their bounds.
+- **An open holds its file (A-260, built 2026-11-08).** Every open and every delegation holds one reference on its
+  file in the volume, owned by `RefOwner::NfsState` of the attachment whose handle made it. It is taken when the
+  record of the open or grant commits and given back when the record of its end does: a CLOSE, FREE_STATEID,
+  DELEGRETURN, a revocation, or a client's purge (its lease lapsed, it rebooted, it was destroyed). A file removed while
+  one is held keeps serving by its handle at a link count of zero, and its space comes back at the last end (POSIX's
+  unlink-while-open). The server promises this with `OPEN4_RESULT_PRESERVE_UNLINKED` (RFC 8881 §18.16.4), and the
+  Linux client then sends the REMOVE instead of renaming the file aside to `.nfs*` (kernel commit 43245eca, 2022), a
+  name a landing would carry. The standalone server's opens hold nothing, so it makes no such promise.
+  - The partition's journal is these holds' only record. The recovery image carries none; a recovery takes them again
+    from the journaled opens and delegations before it settles references and reclaims the files no one holds
+    (`nfs_state::hold_recovered`). So a removed open file is served across a restart, and one whose last open ended
+    before the restart is reclaimed by it.
+  - An attachment's end gives back every hold made through it (`nfs_state::release_attachment`): no request is served
+    under it again. Its opens stay in the file state until their client closes them or is purged, and those
+    give-backs find nothing left to give.
+  - A hold is bounded by the state's own bounds (the opens and the delegations it may record). A removed file's space
+    is charged at the REMOVE, as for any reference (§4.2), and freed at the reclaim.
 - **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file, **acting uid**),
   upgraded and advanced by a reopen;
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
@@ -2992,8 +3038,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
-> points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
+> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
+> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -4980,7 +5027,12 @@ needs a listing the recovered plane has not read yet reads it then rather than t
 base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
 listing still renumbers their untouched entries (A-151; 2026-11-08,
 `docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
-return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success. A volume whose record survives but which recovery
+cannot rebuild at all is listed with its cause (`VolumeSummary::not_recovered`), and every verb on it answers
+`NotRecovered { cause }` but its destroy. The destroy removes the record, which has no live slot, in one step, as a merge
+volume's does: its attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its
+snapshots' records, lineage and keys and leaves its tombstone, with nothing materialized (2026-11-08,
+`docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`).
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -7119,6 +7171,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
+> **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
+> shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
+> gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
+> **2026-11-08, the transitive wait:** a shard blocked joining another thread of the process (the FUSE notify thread,
+> the landing barrier thread, the WinFsp mount thread; `slates_rt::registry::spawn_waited`) is read as that thread while
+> it is runnable, so a shard waiting on a starved thread is starved, not stuck; one waiting on a blocked thread is still
+> a deadlock. Before, a shard parked on a starved thread withheld the beat at 30 of 40 looks (3 of 3 on adacachy2).
 
 > **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
 > daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;
@@ -7129,6 +7188,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
 > (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
 > were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> **2026-11-08:** the start judgment also asks the OS whether any of the start's threads is runnable
+> (`slates_rt::process_runnable`), as the watchdog asks of a shard: a start whose CPU stands still a window while one of its
+> threads waits for a CPU is starved and waited for. Before, a start held off its CPUs was killed ("made no progress for
+> 1014 ms" on CI's Windows runner; red 2 of 2 on adacachy2 by `a_start_held_off_its_cpus_is_starved_not_stuck`).
+> Since 2026-11-08 the spinning half is judged on the start's busiest thread, as the rule is a thread's: the process's
+> summed CPU, held to one window, killed every start of 23 shards on a 32-CPU Studio and of 48 on an 18-CPU Mac
+> (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 
@@ -10805,6 +10871,8 @@ vfs, cluster and server crates.
   NFS (red with the attribute restore disabled, green with it).
 - What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
   the merge engine's metadata dimension, R1–R10.
+- **Amended by A-259 (2026-11-08):** the bridges' attributes carry the birth time now, and WinFsp reports it as the
+  creation time and sets it through `SetFileTime`.
 
 ### A-54 — Content transfers resume from verified chunks, and holders progress independently (2026-10-01)
 Applied in the same change to: §4.10 "Content replication", GAPS (AUD-29-55–58), the shard image version (9),
@@ -12038,7 +12106,7 @@ Status: built 2026-10-05 (condition 4).
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
   writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE).
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268).
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -13006,7 +13074,10 @@ Applied in the same change to:
 - the benches' global `sync` replaced by `sync -f PATH` (`mixed/copy_tree.sh`, `mem/per_file.sh`, `mem/per_entry.sh`,
   `nfs/large_io.sh`).
 
-Status: built 2026-10-08.
+Status: built 2026-10-08. Since 2026-11-09 only an exit before the daemon served counts toward the bound (the
+supervision block's serving word, which the daemon marks once its start, recovery included, is done): a daemon killed
+while serving had recovered, and counting it backed off a test that killed a serving daemon twenty times
+(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`).
 - What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
   over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
   160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
@@ -13844,6 +13915,57 @@ Applied in the same change to:
   87 suspicions and no black hole on this rule (-51), every suspicion by probe timeout. No session of those runs lost
   its size. The stall rate is unchanged within what 60 runs can show (0 stalls against 1, at about 1 in 100).
 
+### A-248 — A FUSE cache write-back is refused whole when a stale byte differs from the file's, as NFS's is: one rule for every transport (accepted 2026-11-07, Ada's decision: "Refuse, like NFS")
+Applied in the same change to: §4.6 ("Cache posture": the write-back paragraph, the guest's sentence), A-139 and A-140
+(superseded), GAPS (the 2026-10-21 dirty-page entry), `crates/bridge-fuse` (`coherence.rs`: `WritebackVerdict`,
+`judge_writeback`, new; `channel.rs`: `serve_writeback` judges by it and `Dispatched` keeps no kept-back ranges;
+`bridge.rs`: `unmasked_segments` and `serve_cache_write` removed; `guest_writeback.rs`: the same rule;
+`tests/writeback.rs`, `tests/coherence_mount.rs`), `crates/bridge-core` (`dax_backing::read_whole`, now public: the
+rule's reader), `crates/server` (`fuse.rs`: `fuse.writeback_conflicts` and `fuse.writeback_identical` replace
+`fuse.writeback_bytes_kept_back`, and the write log takes the whole write; `nfs_writeback.rs` and `nfs.rs`: the same
+rule), `crates/cli` (`tests/cli.rs`: the dirty-page, truncation and unsynced-history tests, and A-152's release test for
+U10's rule; `tests/guest_dax.rs`: the oracle), the bug record
+`docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+- **The decision.** Ada, 2026-11-07, asked whether the host FUSE mount should go on applying a stale write-back outside
+  its stale bytes (A-139, A-140) or refuse it as NFS does (A-192): "Refuse, like NFS."
+- **Changes §4.6.** A `FUSE_WRITE_CACHE` write-back is applied whole or refused whole. One whose stale bytes (another
+  path changed them after the kernel's copy was fetched) all equal the file's bytes now is applied, since it changes
+  nothing there; one with a stale byte that differs is refused `EIO`, a conflict; one whose stale bytes cannot be told is
+  refused, unknown, as before. The other path's change survives, and the program learns at its `msync` or `fsync`. A
+  refused write-back changes nothing, and the write log records nothing of it.
+- **Whole is the whole `WRITE`, and what it carried is dropped.** A neighbouring page in the same `WRITE` loses its
+  unsynced stores, and the program is told at its sync. Linux gathers contiguous dirty pages into one `WRITE`, so a page
+  no other path touched can share a stale page's refusal. A per-page split would be a partial apply again; Ada's rule is
+  "A stale write-back fails with an I/O error at msync or fsync … and nothing is silently mixed". The kernel marks every
+  page of a refused `WRITE` clean whatever the answer.
+  No change names an untouched page, so it would go on serving a store the volume refused. Every byte a refused write-back
+  carried is therefore owed an inode invalidation (`ServeState::refused_writebacks`, one covering range a file), sent
+  through the notify thread by the next round after the reply. Found by reading while rewriting the three-writer
+  history's oracle for this change. Every refusal, conflict or unknown, is covered.
+- **Why.** The mask chose bytes between the program's store and the other path's change, which is an inferred merge
+  (banned item 11), and it hid its losses: a store over stale bytes was dropped while the `msync` answered 0 (GAPS,
+  A-147's entry). Refusal is what NFS already did since A-192, and what the guest device did since 2026-11-06.
+- **One rule.** `judge_writeback` takes a write-back's stale ranges, its bytes and a reader of the file's bytes now; the
+  host mount and the guest device read through their bridge (`read_whole`, past the bridge's read cap), NFS through the
+  volume. Before, the guest device refused any stale byte, equal or not, against its own module doc; it now applies an
+  identical one, as NFS did.
+- **Proven.** `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` (`crates/cli/tests/cli.rs`,
+  Linux) was rewritten first: a stale whole page refused with the replacement whole and the sync failing; a write-back
+  after a refetch applied whole; a stale page over a second mount's bytes 100–200 refused, the second mount's bytes kept
+  and the sync failing. `a_refused_write_back_drops_every_page_it_carried_from_the_kernels_cache`
+  (`crates/bridge-fuse/tests/coherence_mount.rs`) holds the batch: three contiguous pages, the last stale, one refused
+  `WRITE`, and every page coming to read what the volume holds. The dirty-page test was red before the change, 3 of 3 on each Linux arch (`diag-bug-sweep-18`, run 42438497719, Linux
+  7.0.0-1017-azure), each at the stale page's sync, which the masked apply answered `Ok`. By use over a real volume
+  bridge, `a_write_back_is_judged_whole_against_the_files_bytes_now` (`crates/bridge-fuse/tests/writeback.rs`) holds the
+  rule's four verdicts, an identical range twice the bridge's read cap, and a range past the file's end.
+- **What it does not change.** How staleness is judged (A-140's byte states, A-144's ambiguous reads, A-147's adopted
+  handles), the first writable open's cache drop, invalidation delivery, and `write(2)` through a mount, which is
+  write-through and never judged. AC-3.3's residual is still a race between two writers on one page, but its loser is
+  now told: a store concurrent with another path's call to the same page is refused with its page, not kept back.
+- **Residual, stated.** A transport that cannot invalidate cannot drop a refused batch's pages: a virtio-fs guest's
+  device delivers no invalidation, and an NFS client is told only the refusal. Pages that shared the refused `WRITE`
+  there stay cached, holding the stores, until the client next revalidates them. Found by reading, not measured.
+
 ### A-231 — A held NFS connection's byte states cross a takeover, and what the successor cannot know is judged stale (accepted 2026-11-07, the supervisor's decision)
 Applied in the same change to: §4.6 "NFS v3" (its status), A-192 (its restart line), GAPS, `crates/vfs`
 (`recover.rs`: `HeldNfsStates`, `CarriedFile`, `CarriedRange`, `CarriedByte`, `ShardImage::nfs_states`, image version
@@ -13883,7 +14005,13 @@ last), `crates/cli/tests/nfs_held.rs` (the history test).
 - **2026-11-07, a regression fixed** (`docs/bugs/2026-11-07-a-held-connections-own-write-back-was-refused-as-stale.md`):
   the carry consumed the live trackers inside a call, before the call's own records were noted, so a held connection's
   own write went stale and its next write-back was refused (main CI 42395077767, fsx over the macOS mount). The carry
-  now reads a copy and leaves the live states alone.
+  now reads a copy and leaves the live states alone. The A/B that decides it is `diag-bug-sweep-17` (run 42425914509;
+  one macos-latest runner, macOS 26.7.2; each tree built into its own target dir; `cargo xtask conformance all`
+  interleaved): e86fb417 failed fsx seed 1 over native-macos-nfs in both of its rounds, the fix passed both, and
+  pjdfstest was identical in all four (6,781 passed, 1,905 expected failures, 0 unexpected). Main's first green macOS
+  conformance after the fix landed agrees (4811191a, run 42434181746). Two runs a side is a small sample, but nothing
+  else differed. `diag-bug-sweep-15` and `-16` do not count: their trees shared one target dir, so each harness may
+  have run the last binary built.
 ### A-239 — On Windows the daemon reports an administrator's full crash dumps; it registers no region exclusion (accepted 2026-11-07, the supervisor's decision: option b)
 Applied in the same change to: §1's RAM-only guarantee 2, GAPS (`8a-win-dumps`), `crates/server` (`local_dumps.rs`,
 new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_exclusion.rs`, new), `crates/ipc`
@@ -13912,6 +14040,7 @@ new; the daemon's start reads it; `verbs.rs`: the status field; `tests/dump_excl
   second also asserts the daemon's detection reads it), each holding the residual as measured.
 
 ### A-241 — A client proves its id with a session key, and a request names its own client (accepted 2026-11-07, the supervisor's order)
+Numbered 2026-11-07 by the supervisor; the commit that made it, 28885a6d, names it "A-SEAT, number pending".
 Applied in the same change to: §4.9 (its status), GAPS (GAP-A9-9's entry), the bug record of 2026-11-07,
 `crates/anchor` (`layout::SUP_SESSION_PRESENT`, `SUP_SESSION_SECRET`, `SESSION_SECRET_BYTES`, appended;
 `AnchorSegment::publish_session_secret`, `session_secret`), `crates/ipc` (`region.rs`: the session key at header byte
@@ -14296,11 +14425,14 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   slates does not claim, five Windows features, each a reason on the reviewed list:
   - **ATTRIBUTES**: no Windows attribute bits. Every file reports `FILE_ATTRIBUTE_NORMAL` and every directory
     `FILE_ATTRIBUTE_DIRECTORY`; READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced (the volume's
-    permission is POSIX's mode).
+    permission is POSIX's mode). **Amended by A-262 (2026-11-08):** the volume keeps HIDDEN, SYSTEM, ARCHIVE, OFFLINE,
+    NOT_CONTENT_INDEXED and a directory's READONLY beside the mode, and a file's READONLY is its mode's write bits, so
+    the reason stands for READONLY and no longer for the rest; the 18 cases are off the list.
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
     volume's own rule; a DACL set or asked for at create is not kept.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
-    time), and POSIX has no setter.
+    time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
+    birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
     (`ERROR_INVALID_FUNCTION`).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
@@ -14557,8 +14689,10 @@ Status: built 2026-11-06.
   is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
   ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
   (`JournalStep::GiveBack { quarters }`). The test of the shard held is
-  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
-  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+  `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step`: each step's CPU on the shard thread's own clock, which load
+  does not inflate. Until 2026-11-08 it also held a probe's longest wait against a quiet floor, which on a loaded host
+  measured the host (10.4 ms against 2.2 ms at load 65), and waited for the bytes given back to stand still, where it
+  now waits on the journal having nothing left to give back.
 - The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
   area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
   records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
@@ -16077,6 +16211,161 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
+`docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
+(`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
+- **What was wrong.** A MKNOD of a block or character device, and NFSv4's CREATE of one, answered `NFS3ERR_BADTYPE`
+  (`NFS4ERR_BADTYPE` over v4), the status RFC 1813 §3.3.11 names for a type the server does not make. The Linux client
+  maps both to its internal `EBADTYPE`, errno 527, which reached every program as "Unknown error 527": 331 cases of a
+  full pjdfstest run over NFSv4, and the same over NFSv3 (CI run 42498995934 and a CachyOS run, 2026-11-08). It was
+  also answered before the name was looked at.
+- **Why EPERM.** On a local Linux file system a device node needs privilege (`CAP_MKNOD`, checked in `vfs_mknod`), and
+  slates never holds privilege (R10), so `EPERM` is what a local file system gives this same caller. RFC 1813's
+  `BADTYPE` describes a server that lacks the type, which is not slates' reason, and Linux turns it into a
+  kernel-internal errno that leaks to programs.
+- **The rule.** Slates makes no device nodes (A-26), so it answers as a local file system that cannot hold one, in the
+  order Linux's `vfs_mknod` checks: a taken name is `EXIST` (an exclusive create over NFS skips the client's own lookup,
+  so only the server can say so), a directory the caller may not write is `ACCES`, then `PERM`, which a client reports
+  as `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
+  requested".
+- **What it does not change.** A-26's boundary (no device node is made, on any path), FIFOs and sockets, and every
+  reviewed list: no pjdfstest case expects `EPERM` from a device `mknod` (each failing one expects success, or `EEXIST`
+  on a name the case before failed to make), so every listed case still fails, now reading `EPERM`.
+- **Proven** by `a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it` and
+  `a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first` (`crates/bridge-nfs/tests/procedures.rs`),
+  `a_device_create_is_refused_eperm_and_a_taken_name_eexist_first` (`crates/bridge-nfs/tests/v4.rs`), each red on the old
+  MKNOD with 10007, and through the Linux kernel's NFSv4 client by `a_device_node_is_refused_eperm`
+  (`crates/server/tests/nfs_v4_kernel.rs`, as root on CI).
+
+### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive, the volume and the Windows base plane built; a Windows landing and the merge owed)
+Applied in the same change to: §4.5 (the inode), §4.6 (the Windows conformance status), A-209 (amended: ATTRIBUTES),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 373 to 355 entries), `crates/vfs`
+(`inode::WindowsAttributes`, `Volume::set_windows_attributes` and the overlay's, the image v23 and delta v6 layouts),
+`crates/bridge-core` (`NodeAttr::windows`, `SetAttr::windows`, the owner rule, the AppleDouble view's refusal), the
+FUSE, NFS and FSKit bridges (each sets none), and `crates/bridge-winfsp` (the attribute decisions in `lib.rs`; create,
+overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
+- **Why A-209's reason no longer covers them.** A-209 left the bits out because "the volume's permission is POSIX's
+  mode": one permission model. That holds for `READONLY` alone. `HIDDEN`, `SYSTEM`, `ARCHIVE`, `OFFLINE` and
+  `NOT_CONTENT_INDEXED` are metadata, not permissions, and Windows tools rely on them: Git for Windows hides `.git`
+  (`core.hideDotFiles`), Explorer hides by them, and backups and `robocopy /A` read `ARCHIVE`. The drive answered
+  their `SetFileAttributes` success and kept nothing.
+- **The rule.**
+  - A file's `READONLY` is its mode's write bits, the one model. Setting it clears every class's write bit; clearing it
+    gives the owner's back. The drive reports `READONLY` for a file its owner may not write. This is WSL DrvFs's mapping,
+    and Samba's `map readonly`, so a POSIX tool sees what Windows set and the reverse.
+  - The other bits, and a directory's `READONLY` (Windows gives it no permission: Explorer reads it as a display
+    hint, and the mode keeps its POSIX meaning), are kept as metadata in `Inode::windows`, a `u16` at Windows' values.
+  - A file the volume makes is `ARCHIVE`, as NTFS and WinFsp's memfs mark every file they make. A create applies the
+    caller's word with `ARCHIVE`; an overwrite's supersede takes the caller's word and a plain overwrite adds it to the
+    file's, each with `ARCHIVE`; `SetBasicInfo` replaces the word, `INVALID_FILE_ATTRIBUTES` leaving it as it is.
+  - The Win32 rules on top: a read-only file refuses its delete (`STATUS_CANNOT_DELETE`, `ERROR_ACCESS_DENIED`) and a
+    rename replacing it (`ERROR_ACCESS_DENIED`). Setting the bits asks for the owner or root, as a mode change does.
+- **What it costs.** No inode grows: the `u16` sits in the two bytes of tail padding (measured with `offset_of!`;
+  `Inode` stays 168 bytes, `cargo run -p slates-vfs --example tree_heap` reads 260, 275 and 293 heap bytes per entry for
+  npm, pip and cargo trees, before and after). The image's inode gains two bytes (layout version 23, the delta's 6), with
+  a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
+- **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
+  them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
+  file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode. Since stage 3's base half
+  an overlay of a Windows directory reads them from its disk; an overlay of a Linux or macOS directory has none to read.
+- **Each stage's state.**
+  - **Stage 1, built 2026-11-08:** the volume, the image (layout 23), the drive, the list (373 to 355).
+  - **Stage 3's base half, built 2026-11-08:** the Windows base plane reads them. A fingerprint carries the disk's bits
+    apart from its mode (`Fingerprint::windows`, image layout 24, delta 7, `a_witness_encoding_is_its_golden_vector`), and
+    the Windows base reports a POSIX mode by DrvFs's mapping (`windows_mode_and_bits` in `crates/base/src/lib.rs`: a
+    directory `S_IFDIR | 0o755`, a file `S_IFREG | 0o644`, `0o444` when `READONLY`, a reparse point `S_IFLNK | 0o777`).
+    An untouched base entry reports the disk's bits, and takes an outsider's change to them at its directory's relist,
+    as it takes an outsider's `chmod`
+    (`an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_their_change`, `crates/vfs/tests/base.rs`),
+    and on CI's Windows runner through an overlay of a real directory mounted as a drive
+    (`an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes`, `crates/cli/tests/winfsp.rs`:
+    an ordinary file is writable and deletable, an `attrib +R` one refuses both, an `attrib +H` one reads hidden).
+    It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
+    an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
+    delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
+  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). It waits on a Windows
+    landing writer, which does not exist yet (`crates/land`'s writer is `cfg(unix)`). Linux and macOS landings carry
+    the bits in the volume and apply none.
+  - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
+    identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
+- **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
+  operations declared through the SDK (`WorkState::journal`: edits and declarations, `WorkOp`), and no `WorkOp` carries
+  the bits, so no work can set them and two increments can never differ in them alone; a mounted work would be derived
+  from its volume's journal, and the volume's ops document carries none of them
+  (`windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them`, `crates/vfs/tests/derive.rs`:
+  a bits-only work derives the unchanged document byte for byte, and a rewrite derives the same with or without them).
+  A landing ignores them without error (`a_landing_ignores_windows_attribute_bits_without_error`,
+  `crates/land/tests/oracle.rs`: §4.15's worked example with the bits on an edited, a created and an untouched base file
+  lands `Done` and leaves the same disk, writing as many entries as without).
+- **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
+  `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
+  bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
+  drive's decisions unit-tested in `crates/bridge-winfsp/src/lib.rs`, and on CI's Windows runner by
+  `a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete` (`crates/cli/tests/winfsp_semantics.rs`) and
+  winfstest against the shortened list.
+
+### A-260 — An NFSv4 open or delegation holds its file, so a file removed while open is preserved (accepted 2026-11-08)
+Applied in the same change to: §4.6 (NFSv4 state, "An open holds its file"), GAPS, `docs/wip/conformance.md`, the
+NFSv4 pjdfstest list (`docs/wip/conformance/expected-failures/native-linux-nfs4.pjdfstest.txt`, `tests/unlink/14.t:4`
+struck), `crates/vfs` (`RefOwner::NfsState` and its settle), `crates/bridge-nfs` (`files::Holding`, `FileState`'s and
+`Delegations`' queues, `Backend::preserves_unlinked`, OPEN's result flags), and `crates/server` (`nfs_state::hold`,
+`hold_recovered`, `release_attachment`; the recovery and `end_attachment` call them).
+- **What was wrong.** An NFSv4 open lived only in the owner's file state and held nothing in the volume, so a REMOVE
+  reclaimed an open file at once and its handle answered `NFS4ERR_STALE`. The Linux client keeps POSIX's
+  unlink-while-open by renaming such a file aside (`.nfs<fileid><counter>`) unless the server answers its OPEN with
+  `OPEN4_RESULT_PRESERVE_UNLINKED`, which this server never did: every tool that removes a file it holds open (git,
+  editors, sqlite) left a `.nfs*` name in the volume until the close, a name a landing would carry. pjdfstest listed it
+  as `unlink/14.t:4` (NFS-OPEN).
+- **The rule.** Every open and delegation holds one volume reference on its file from the commit of its record to the
+  commit of its end's, owned by `RefOwner::NfsState(attachment)`. The journal is the holds' only record, and a
+  recovery takes them again from it before reclaiming unheld files. An attachment's end gives its holds back. The OPEN
+  reply carries `OPEN4_RESULT_PRESERVE_UNLINKED` from a server whose backend holds (the daemon's), and not from the
+  standalone server's.
+- **Why a third owner kind.** A kernel's references (a FUSE mount's, owned by its attachment) are carried in the
+  recovery image and settled by their attachment's survival; NFSv4 state is journaled and must be counted from its
+  journal. One count for both would let a recovery double a hold, or reclaim a file a FUSE kernel still holds.
+- **What it does not change.** The wire of the state extension procedures and of the journaled records, the recovery
+  image, NFSv3 (stateless: its client's silly rename stays, NFS-OPEN on the NFSv3 lists), and how a client's state ends.
+- **Proven** by `a_file_removed_while_open_over_nfsv4_serves_until_its_last_close`,
+  `..._serves_across_a_daemon_restart` and `..._is_freed_when_its_clients_lease_lapses`
+  (`crates/server/tests/recovery.rs`, each red on the old server: `NFS4ERR_STALE` at the first GETATTR by handle; the
+  restart one red again with the recovery's re-take removed, and the lease one with a purge's give-backs removed, its
+  file's 65,536 bytes kept), `every_open_and_delegation_takes_one_hold_and_gives_it_back_at_its_end`
+  (`crates/bridge-nfs/tests/v4_delegation.rs`), and through the Linux kernel's v4.1 and v4.2 clients by
+  `an_unlinked_open_file_keeps_serving_with_no_silly_rename` (`crates/server/tests/nfs_v4_kernel.rs`; with the
+  daemon's promise turned off, the kernel's client renamed the unlinked open file to `.nfs000100000000000b00000009`,
+  2026-11-08, Linux 7.2), the unlinked-open leg of `nfsv4_opens_and_locks_survive_a_daemon_restart`
+  (`crates/cli/tests/nfs_v4_restart.rs`, across a `SIGKILL`), and pjdfstest's `unlink/14.t:4` over the NFSv4 transport
+  (6,972 passed and 1,798 failed against the struck list, every failure listed). Record:
+  `docs/bugs/2026-11-08-an-nfsv4-file-removed-while-open-was-reclaimed-at-once.md`.
+
+### A-259 — The WinFsp drive reports and keeps the creation time a caller sets (accepted 2026-11-08)
+Applied in the same change to: §4.6 (the Windows conformance status and its stated differences), A-53 (amended),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 374 to 373 entries),
+`crates/bridge-core` (`NodeAttr::btime`, `SetAttr::btime`, the access rule, the volume bridge and its read-only view),
+`crates/bridge-winfsp/src/host.rs` (`SetBasicInfo`, `file_info`), the FUSE, NFS and FSKit bridges (each sets none), and
+the record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`.
+- **What was missing.** The volume keeps a birth time per object (A-53, `Volume::set_times` takes one), but the bridges'
+  attributes carried none. WinFsp reported the change time as every object's creation time and dropped the creation
+  time `SetFileTime` set, so winfstest's `t/base/06.t` case 5 was listed as CREATION-TIME, one of A-209's five stated
+  differences.
+- **The rule.** A bridge's attributes report the volume's birth time, and a `setattr` may set it. Only a host whose API
+  sets a creation time asks for one (WinFsp's `SetBasicInfo`, from `SetFileTime` and `SetFileInformationByHandle`);
+  POSIX has no call that sets a birth time, so the FUSE, NFS and FSKit bridges never set it. Setting it is an explicit
+  time, so it asks for the owner or root, as an explicit access or modification time does (`setattr_denial`); a read-only
+  view refuses it, as it refuses every time.
+- **What it does not change.** The wire and the archive (the birth time was already in both, A-53), FUSE, NFS and FSKit's
+  answers, and the other stated differences (ATTRIBUTES, SECURITY, REPARSE and SYMLINK, STREAMS).
+- **Proven** by `setattr_sets_and_reports_a_birth_time` (`crates/bridge-core/tests/volume_bridge.rs`; with the volume
+  bridge passing no birth time, as before, the reply read back 1794155205189903000 instead of the 333 set),
+  `a_creation_time_asks_for_the_owner` (`crates/bridge-core/src/access.rs`; with the birth time out of the owner check,
+  a writer who is not the owner was allowed), and on CI's Windows runner by
+  `a_files_creation_time_set_through_the_drive_is_kept` (`crates/cli/tests/winfsp_semantics.rs`) and winfstest judged
+  against the shortened list.
 
 ### A-235 — The merge record plane runs when there is merge work, and a version's inputs go only to holders whose next record it is (accepted 2026-11-06)
 
@@ -18819,6 +19108,45 @@ Applied in the same change to:
   successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
+### A-269 — Through a read-only NFS attachment, what ACCESS decides answers `EACCES`: v3's open for writing, and a path truncate and `access(W_OK)` over v3 and v4 (accepted 2026-11-08, the supervisor's decisions)
+Applied in the same change to:
+- §4.6 ("A read-only attachment is a read-only file system");
+- `crates/bridge-nfs/src/procedures.rs` (`access_result`, `change_refusal`, `extension::CHANGE_ALLOWED`, `state_io`),
+  `crates/bridge-nfs/src/v4/compound.rs` (`check_open_access`), `crates/bridge-nfs/src/v4/v3call.rs` (`status_only`);
+- the tests: `crates/server/tests/nfs_read_only_kernel.rs`, and `a_write_through_a_read_only_export_is_refused`
+  (`crates/bridge-nfs/tests/procedures.rs`);
+- GAPS; `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+
+- **What §4.6 said.** A read-only attachment refuses every change as POSIX's read-only file system does: `EROFS`, at the
+  open for an open for writing and at every mutating verb.
+- **What it says now.** It still does, over every transport, with the exceptions ACCESS decides. Over NFSv3 an open for
+  writing answers `EACCES`, and every change that reaches the server answers `EROFS`. Over NFSv3 and NFSv4 a path
+  `truncate(2)` and `access(2)` for writing answer `EACCES`. Every other refusal over NFSv4, the open's included, is
+  `EROFS`.
+- **Why.** NFSv3 has no OPEN: a client decides `open(2)` from the ACCESS reply. Linux asks every ACCESS bit in one call
+  and caches the answer (`fs/nfs/dir.c` at v6.8, `nfs_do_access`, lines 3201–3207), and reports a bit the server did
+  not grant as `-EACCES` (lines 3219–3221). The only other answer a server has is an error on the ACCESS call itself,
+  which that one call carries for every bit, so it would refuse reads and lookups too. Over NFSv4 a regular file's open
+  skips ACCESS (`nfs_permission`, lines 3286–3288) and the server's OPEN decides, so `NFS4ERR_ROFS` reaches the
+  application as `EROFS`. Measured through the kernel's own clients on CI: v3 `EACCES` for `O_WRONLY`, `O_RDWR` and
+  `O_RDONLY|O_TRUNC`, v4 `EROFS` for each (diag-slabs-43, run 42517769901); every other change `EROFS` over both
+  (conformance's read-only run, 42498995934; the kernel test's create probe re-runs it). EROFS at a v3 open
+  would need a kernel mount made read-only (`-o ro`), which a read attachment under a writable mount is not.
+- **The truncate, and why the write bit stays withheld over v4 too (the supervisor's decision (a), 2026-11-08).** A path
+  `truncate(2)` checks write permission before any SETATTR, and Linux's `nfs_permission` sends a regular file's write
+  without an open through ACCESS on v4 as on v3, so it answers `EACCES` over both (conformance's run on this fix,
+  diag-conformance-32, run 42523564648: v3 10 of 14 `EROFS` with the three opens at the limit, v4 13 of 14; the other in
+  each is `truncate/10.t`). Granting the write bits in v4's ACCESS would turn the truncate into `EROFS` but make
+  `access(W_OK)` report a read-only file writable to every caller that checks first (`test -w`, editors, git): a wrong
+  answer, where `EACCES` is a refusal. Linux's own server gives a Linux client exactly these answers for a read-only
+  export: `fs/nfsd/vfs.c` (Linux v7.4-rc1) `nfsd_permission` (about line 2871) answers `nfserr_rofs` to any write,
+  attribute or truncate access on a read-only export or mount, and `nfsd_access` (about line 855) treats `nfserr_rofs`,
+  `nfserr_acces` and `nfserr_perm` alike: "simply don't 'or' in the access bit". So `access(W_OK)` and the truncate are
+  `EACCES`, and every WRITE and SETATTR is `EROFS`, from the incumbent too. (The knfsd lines are the supervisor's
+  reading of loadtest-scale's dataset tree; `fs/nfs/dir.c` at v6.8 is read here.) A local read-only file system answers
+  `access(W_OK)` `EROFS` from the mount's own flag, which no NFS server can reach through ACCESS.
+- **Evidence.** GAPS, the read-only attachment's entry; the bug record's "Found by conformance".
+
 ### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
 Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
 - §4.8 ("Required persistence and protocol invariants");
@@ -18942,6 +19270,40 @@ Applied in the same change to:
   - tagging each daemon's handle values with an incarnation, so a successor never reissues one: it tells a reissued
     value apart, but the counts already balance without it.
 - **Evidence.** See the bug record's verification.
+
+- **2026-11-07, U10 (the supervisor's option 2): what a successor cannot count is kept until the mount ends.** A handle
+  the dead daemon issued after its last publication is in no image, so its successor reclaimed the file when it left the
+  namespace, and the handle's next read was refused. Now a volume names the FUSE mounts that survived the takeover at
+  recovery (`Volume::settle_recovered_references`'s `held_mounts`, from the server's surviving mount records), and while
+  any of them lives, a file made before the takeover (an inode below the volume's counter then, A-150) that leaves the
+  namespace with no reference the successor knows is kept as an orphan (`takeover_kept`): charged to the volume's quota,
+  so a write past it is refused `NoSpace`, counted in `slates status` (`takeover_kept`), and reclaimed when the last such
+  mount ends (`Volume::end_takeover_holder`, from the attachment's end: Linux sends `FUSE_DESTROY` only to fuseblk and
+  virtio-fs mounts, so the sweep alone never ran for an ordinary one). A file made after the takeover, and every file outside a takeover, is reclaimed at its
+  last close as before. This replaces A-152's "reclaimed at the kernel's forget" for pre-takeover files on a surviving
+  mount: the successor cannot know a handle no publication counted is not still open.
+  - **2026-11-09, never kept for a mount that forgot it.** A `FORGET` comes only once the kernel holds nothing of the
+    inode, no handle included (a handle holds a lookup), so a file whose last reference went back with a mount's
+    `FORGET`, live or replayed from the write log, is reclaimed at once unless another mount that survived the takeover
+    may still hold it (`Volume::forget_for`, `keeps_for_takeover_besides`). Found by
+    `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back` (a1b44bb1's replayed
+    `FORGET`): with the first U10 rule it failed on both Linux arches (diag-bug-sweep-27, run 42515180074), the file kept
+    until the mount ended; after, 3 of 3 on adacachy2. A-152's five takeover tests, which end with the kernel's `FORGET`,
+    expect the reclaim at the forget again, as they did before U10, and the real-mount release test the bytes back once
+    both descriptors close. A file is kept only while the successor cannot know: unlinked while a handle no image
+    counted may be open.
+  - `a_file_a_handle_no_publication_counted_may_hold_is_kept_until_its_mount_ends` (`crates/bridge-core/tests/
+    takeover_release.rs`): the file unlinked after the takeover still read through the uncounted handle, counted kept,
+    and reclaimed when the mount ends; a file made after the takeover reclaimed at once.
+  - `a_restart_loop_cannot_grow_the_kept_files_past_the_quota`: each takeover keeps one more file, the loop is refused
+    `NoSpace` with the volume's bytes never past its quota, and the mount's end frees them all.
+  - A-152's five takeover tests now hold the file to the mount's end, each asserting every reference given back first,
+    as does the real-mount release test (`the_handles_a_dead_daemon_issued_give_back_their_references_at_release`,
+    `crates/cli/tests/cli.rs`, Linux), which U10's first commit left expecting the bytes at the last close. Updated to
+    the rule, it found that the first commit never freed a kept file at a real unmount: red on both Linux arches
+    (`diag-bug-sweep-21`, run 42463819520, 1,048,576 bytes still referenced), where the in-process tests had called the
+    sweep directly.
+  - Red-checked: with no held mount named, the uncounted handle's file is reclaimed and the loop never meets the quota.
 
 ### A-151 — An untouched base file is bound to the disk file it was made from (accepted 2026-10-22)
 Applied in the same change to:
@@ -19392,6 +19754,9 @@ tests in `bridge-core/tests/invalidation.rs`, `bridge-fuse/tests/kernel_changes.
   their write-backs `EIO`), and the journal's budget, which stays as the ledger records it.
 
 ### A-140 — A cache write-back is judged by byte states the mount keeps as it consumes the journal (accepted 2026-10-22)
+> Its masked apply superseded 2026-11-07 by A-248 (Ada's decision, "Refuse, like NFS"): a stale write-back whose stale
+> bytes differ from the file's is now refused whole, `EIO`. The byte states below, and how they are fed, stand.
+
 Applied in the same change to: §4.6 (cache posture); A-139 (its basis superseded); `crates/bridge-core`
 (`changed.rs` `DataChange`/`data_change`; `Bridge::data_changes` replaces `Bridge::changed_since`; `volume_bridge.rs`,
 `scoped.rs`; `tests/data_changes.rs` replaces `tests/changed_since.rs`); `crates/bridge-fuse` (`coherence.rs`
@@ -19435,7 +19800,9 @@ mount's own requests and at reads, and judged at write-back); `crates/server/src
 
 ### A-139 — A cache write-back is applied only where it is not stale, judged by its page's fetch (accepted 2026-10-21)
 > Basis superseded 2026-10-22 by A-140: the walk back from each page's fetch point below needed records the journal no
-> longer held for a long-lived map (2 runs of 3 refused `EIO`, measured). The rule itself and its evidence stand.
+> longer held for a long-lived map (2 runs of 3 refused `EIO`, measured). The rule itself superseded 2026-11-07 by A-248
+> (Ada's decision, "Refuse, like NFS"): a write-back is no longer applied outside its stale bytes but refused whole. The
+> evidence of the bug stands.
 
 Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`changed.rs`, `Bridge::changed_since`,
 `Bridge::journal_capacity`); `crates/vfs/src/journal.rs` (`OpLog::oldest_seq`, `OpLog::capacity`); `crates/bridge-fuse`
@@ -19512,6 +19879,196 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-258 — A handshake gives up on time, not on a peer's resends; a dialer past its confirmation redials at once; an accepting end that abandons says so, sealed (accepted 2026-11-08)
+
+The fleet formed in 40 to 72 s instead of about a second on a loaded machine (load 127–244). Per-reason counters caught
+one of those formations (41.9 s, load about 170): an accepting end gave up its half of a handshake on the dialer's
+resends (`fleet.accept.stall.repeats`), and the dialer, already past its own side of TLS, waited out its confirmation
+deadline twice before it dialed afresh (`fleet.dial.stall.confirm_deadline`, then `fleet.dial.redial`).
+
+- **Repeats are bounded by time.** A resend of a flight this end has already answered is load's to spend: a dialer
+  slow to read the reply keeps resending, and each fragment of a resent flight counted as a repeat. So the accepting end
+  gave up on a live dialer within a second or two. A turn now gives up on repeats only at its derived deadline (33 × the
+  initial probe timeout, about 22 s). It answers them at its own backoff, and counts a resent flight once however many
+  fragments it spans (`Reassembly::RepeatRest`). `MAX_HANDSHAKE_RETRANSMITS` now bounds only waits paced by this end's
+  own timer.
+- **A dialer past its confirmation redials at once.** The second handshake budget on a socket
+  (`ESTABLISH_BUDGETS_BEFORE_REDIAL`, 2026-09-14) is for a peer that has not answered: one booting, or starved. A dialer
+  waiting on its confirmation has heard from its peer, and its peer's half is what is gone, so a second budget there
+  was 22 s more waiting on nothing (`fleet::keeps_its_socket`).
+- **An accepting end that abandons tells its dialer** (RFC 9000 §10.2.3, a SHOULD), in a close sealed under the
+  Handshake keys (`flight::SEALED_CLOSE_TAG`). The dialer then ends `PeerClosed` and redials within a round trip
+  instead of waiting out its deadline. It is sent only once the accepting end holds those keys; before that it has
+  answered nothing, and the dialer is still in its first budget, where waiting is right.
+  - **Why not the unprotected Initial-level close.** The RFC has a server also send its close in an Initial packet,
+    for a client that may not have the Handshake keys yet. In this dialect anyone who can send to a dialer's port could
+    forge one and cost the dialer its socket and a fresh dial. A dialer past the point where a close helps it holds the
+    Handshake keys already, since it has read the accepting end's sealed flight. So the close is sealed, and a dialer
+    ignores any close that does not open under those keys.
+  - Within the anti-amplification limit (RFC 9000 §8.1, which has no exemption for a close): the close is 22 bytes,
+    against an allowance of three times a received client flight of at least 1,200 bytes.
+  - A dialer sends no close: it may still retry on its socket.
+
+Applied in the same change to:
+- `crates/transport/src/endpoint.rs`: `HandshakeStall`, `handshake_stall`, `handshake_deadline`, the repeat handling
+  in `receive_flight`, `close_abandoned_handshake`, `is_peer_close`, `closes_sent`, and `EndpointError::PeerClosed`.
+- `crates/transport/src/flight.rs`: `Reassembly::RepeatRest`, `SEALED_CLOSE_TAG`, `seal_close`, `open_close`.
+- `crates/server/src/fleet.rs`: `keeps_its_socket`, and the `fleet.dial.stall.<reason>`, `fleet.accept.stall.<reason>`
+  and `fleet.dial.fault.<kind>` counters, `peer_closed` among them.
+- Bug record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`;
+  GAPS's formation entry.
+- Tests, each red-checked: `an_accepted_handshake_is_not_given_up_for_a_dialers_repeats`,
+  `a_dialer_that_only_repeats_is_given_up_at_the_handshakes_deadline`, `a_dialer_past_its_confirmation_redials_at_once`,
+  `a_dialer_hears_its_peer_abandon_the_handshake_within_a_round_trip` (red with no close sent),
+  `a_dialer_ignores_a_close_no_one_sealed` (red with a dialer that believed any close-shaped datagram), and the sealed
+  close's hostile-input tests in `flight.rs`.
+
+
+### A-261 — Stateless reset: a node restarted under its identity ends its peers' old sessions within a round trip (accepted 2026-11-08)
+
+On loadtest-scale's f = 1 primary-kill rung (2026-11-08), a primary restarted under the same member id. The client
+node's record session to it stayed in its slot, lent and dead, for 25 to 135 s: nothing told the client node that the
+process at the other end no longer held the session. The transport had no stateless reset (RFC 9000 §10.3). A
+restarted node's demultiplexer dropped every packet naming a session it did not hold, counted (`unknown_id`) and
+otherwise silent.
+
+- **The key** is HKDF-SHA256 over the node's identity's private key, salted and labelled for this use alone
+  (`reset::ResetKey`, `Identity::reset_key`). It is secret because only the node holds that key. It is never derived
+  from the certificate: every peer sees the certificate, so a key derived from it would let any peer forge a reset and
+  end any session.
+  - **The same identity must make the same tokens.** A restarted process holds no state for its old sessions. To end
+    them it has to recompute their tokens from what survives the restart, which is the identity and not the boot
+    (§10.3.2: "an endpoint that loses state can use the same method to generate a valid stateless reset token").
+  - **A new identity must not.** It is another node, and a node that could end another node's sessions could end
+    anyone's.
+- **The token** is HMAC-SHA256 of the session's connection id under that key, truncated to 16 bytes (§10.3.2). Each
+  session has one id, which both ends derive from the TLS exporter and which never changes. So each session has one
+  token, and connection ids (NEW_CONNECTION_ID, §19.15) are not needed first.
+- **Each end issues a token, and only inside the encrypted session.**
+  - It sends a `ResetToken` frame (kind 12) once the session's id is bound. The frame is ack-eliciting and retransmitted
+    until acknowledged.
+  - A token is unforgeable only because it never travels outside the encrypted session. So an end takes its peer's
+    token only from that frame. A second token unlike the first is a protocol violation: it is counted, and the first
+    token is kept.
+  - It is not a transport parameter, as §18.2's server token is: the id comes from the exporter, which exists only once
+    the handshake is done.
+  - The accepting end's token is the one that matters: its address outlives its restart. A restarted dialer comes back
+    on another ephemeral port, so its peer's packets for the old session usually reach a port that nothing holds. The
+    dialer's token covers the rare restart that rebinds the old port (below).
+- **Compatibility.** The frame goes only to a peer that states transport parameter 3 (`ID_READS_RESET_TOKENS`). An
+  older peer skips that parameter (§7.4.2) and is never sent a frame kind it would refuse. Dialect 2 is unchanged, so
+  mixed builds still talk during a rolling upgrade.
+- **The reset is sent by the demultiplexer.** It answers a 1-RTT packet that names no session, from a source with no
+  session there, with a datagram shaped as a short header. The datagram is unpredictable except for its last 16 bytes,
+  the token (§10.3), and its length obeys three bounds:
+  - it is shorter than its trigger (§10.3.3), so two endpoints cannot loop resets;
+  - it is at least 21 bytes, so a trigger of 21 bytes or fewer draws none;
+  - it is at most 43 bytes, at least the 41 below which a reset might be told from a short packet.
+
+  Three limits govern when it is sent:
+  - **No reset to a source that has a session there.** A dialer's first 1-RTT packet can outrun the binding of its new
+    id, and a reset then would end a session about to exist.
+  - **At most one reset per source per initial probe timeout (666 ms).** The interval is the transport's initial PTO:
+    RFC 9002 §6.2.2's `kInitialRtt` of 333 ms, doubled as the PTO before any RTT sample is
+    (`rtt::INITIAL_PTO_NS`). It is the same constant the handshake's own pacing uses, not a separate tuning. A peer
+    whose session is gone sends its next packet within its own probe timeout, so the first packet draws a reset at
+    once. The interval bounds only a lost reset's repeat and a flood: a flood from one source costs the path at most
+    one reset, smaller than its trigger, per 666 ms.
+  - **The table of sources answered is no larger than the session pool.**
+- **An endpoint on its own socket answers too** (§10.3: any endpoint may answer a packet it cannot associate). A
+  dialer's endpoint answers a short-header packet that names another session with a reset under the dialer's identity.
+  It sends at most one per initial probe timeout, each shorter than its trigger. So a process restarted onto the port
+  its old session's dialer held ends that session at the accepting end within a round trip. Otherwise the accepting
+  end would retransmit into it until its own timers gave up. On a shared socket the demultiplexer decides alone.
+  - **A session in its handshake is handed no stray.** It has no token to compare one with until its id is bound, and
+    a stray there could only be garbage in its reassembly. `a_stray_to_a_session_in_its_handshake_leaves_it_unaffected`
+    holds this: strays shaped as resets, from the dialer's address before the handshake completes, reach neither the
+    session nor a reset.
+- **The receiving end detects it.** When a datagram cannot be opened as the session's packet, its tail is compared with
+  the held token in constant time (§10.3.1). A match ends the session `EndpointError::PeerReset`, and every later use
+  refuses the same. A tail that matches nothing is discarded like any other stray.
+  - Detection sits in the endpoint, not the demultiplexer, because a reset of an accepting end's session arrives at the
+    dialer's own socket.
+  - The demultiplexer needs no table of tokens. A 1-RTT packet naming no session, from an established session's dialer,
+    goes to that session's inbox: the session compares it with the token its dialer issued (§10.3.1, the tokens for
+    that remote address). A session still in its handshake is never handed one.
+  - This departs from the design as first read (detection in the demultiplexer against a per-source table), as
+    confirmed 2026-11-08.
+- **The fleet** never puts a reset session back in its slot (`fleet::return_sessions`). It drops the link instead,
+  counted as `fleet.link.peer_reset`, and the link task dials the new process at its next pace (one heartbeat). Every
+  borrower returns through that one place: the forward lane, live shipping and the coordinator's dispatches.
+  loadtest-scale's borrower check stays as the backstop for a lost reset, a silent peer, a peer restarted under
+  another identity, and an older build. It is transport-only: at each turn, a session that failed, or one with bytes
+  in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal for
+  this case: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
+- **What it does not cover.** An accepting end whose dialer restarted onto another port holds a session no reset can
+  end, since nothing answers at the old port. That session ends on its own timers or the link's discovery deadline, as
+  before. An accepting end's serve loop counts a reset it does hear (`fleet.serve.peer_reset`).
+- **If the transport moves to `quinn-proto`** (`docs/wip/transport-quic.md`), its stateless reset replaces the frame,
+  the demultiplexer's sending and the endpoint's detection. The key's derivation and the fleet's handling stay.
+
+Applied in the same change to:
+- `crates/transport/src/reset.rs` (new): the key, the token, the datagram and its detection.
+- `crates/transport/src/session.rs`: `Frame::ResetToken`.
+- `crates/transport/src/params.rs`: `ID_READS_RESET_TOKENS`.
+- `crates/transport/src/connection.rs`: `issue_reset_token`, `peer_reset_token`, and the frame's receipt and resend.
+- `crates/transport/src/endpoint.rs`: `EndpointError::PeerReset`, the issuing, the detection, `answer_stray`,
+  `resets_sent`, `peer_reset` and `holds_reset_token`.
+- `crates/transport/src/demux.rs`: `reset_unknown`, the stray handed to an established session, `resets_sent` and
+  `resets_withheld`.
+- `crates/transport/src/handshake.rs`: `Identity::reset_key`.
+- `crates/server/src/fleet.rs`: `return_sessions`, `fleet.link.peer_reset` and `fleet.serve.peer_reset`.
+- Bug record `docs/bugs/2026-11-08-a-restarted-node-left-its-peers-sessions-to-it-in-place.md`; GAPS.
+- Tests, each red-checked:
+  - `crates/transport/tests/stateless_reset.rs`: `a_session_with_a_restarted_node_ends_within_a_round_trip` (10.0 ms
+    against a 10 ms round trip through the relay), `a_reset_from_another_identity_is_ignored`,
+    `a_node_resets_only_a_stranger_at_most_once_per_interval_and_shorter_than_it_sent`, and
+    `the_reset_key_is_the_private_keys_not_the_certificates`,
+    `a_dialer_restarted_onto_its_port_resets_the_accepting_ends_session` and
+    `a_reset_from_another_process_on_the_dialers_port_is_ignored`.
+  - The reset, frame, parameter and connection unit tests.
+  - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
+    (`crates/server/tests/fleet.rs`).
+
+### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
+
+A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
+line read as settled makes every holder reclaim its copy as stale (`takeover::resolve_held_objects`). The line was read
+as settled from absence: a retirement no longer kept, or a ranked successor neither a member nor a kept retirement. A
+retirement was pruned on its survivors' confirmations, and a survivor confirmed its share even when its round had
+declared an object lost (its settled cohort left with fewer members than its recovery quorum). So a takeover that
+adopted nothing could have every holder delete the copies the current members still held. The store-destroyed takeover
+lost its volume this way: its settled cohort was [owner, A, old B], and the replacement holding the live log was not
+in it.
+
+- **A share confirms only when every object its round learned was adopted** (`takeover::share_done`). A round with a
+  lost object leaves its retirement kept. A pruned retirement therefore means its objects were adopted.
+- **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
+  is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+  retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
+  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
+- **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
+- **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
+  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
+
+Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
+`a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
+`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
+flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
+§4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
+here; a lineage model is owed with (ii).
+
+**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
+the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
+old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
+- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
+- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
+- an installed snapshot (`fold::install` declines it);
+- a learner's fetch and a join (`consensus`).
+A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
+But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
+none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
 
 ### A-276 — A heal that replaces a departed holder puts at the next sequence and republishes the head there; every heal ends at the membership horizon (accepted 2026-11-09, the supervisor's ruling; amends §4.10's healer)
 

@@ -388,7 +388,8 @@ fn fingerprint_of_handle(
       info.ftLastWriteTime.dwLowDateTime,
     ),
     ctime_ns: change_time,
-    mode: info.dwFileAttributes,
+    // NTFS keeps no POSIX mode: DrvFs's mapping, with the attribute bits apart (A-262).
+    mode: crate::windows_mode_and_bits(info.dwFileAttributes).0,
     // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
     uid: 0,
     gid: 0,
@@ -398,6 +399,7 @@ fn fingerprint_of_handle(
       info.ftCreationTime.dwHighDateTime,
       info.ftCreationTime.dwLowDateTime,
     ),
+    windows: crate::windows_mode_and_bits(info.dwFileAttributes).1,
   })
 }
 

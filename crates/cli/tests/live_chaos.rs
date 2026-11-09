@@ -422,6 +422,48 @@ impl FrozenWindow {
 
 /// Waits until the fleet is whole on every node: all `members` members voting, all in the committed configuration, and
 /// a record session to each peer (`live_fleet.rs`'s `wait_settled`, which says why).
+/// Waits until every node's council has committed its last voter change (no joint configuration in flight) and all
+/// hold the same voters, within the fleet wait. A flow that has already spent its one failure (a candidate killed,
+/// replaced or restarted) must wait for this before it kills another node. At `f = 1` a second failure while the voter
+/// change is open cannot be survived under any membership scheme: joint consensus needs a majority of both sets, and
+/// single-server steps leave either {A, owner} needing both or four voters needing three. The flows' own waits
+/// (`wait_rejoined`, `judge_healed`) look at membership and the log, not the council. diag-live-durability-66 killed
+/// the owner with the change open in 6 of 6 x86 runs, and no survivor could elect a leader to take it over.
+fn wait_council_seated(instances: &[String]) {
+  let mut window = FrozenWindow::new();
+  loop {
+    let views: Vec<(String, String)> = instances
+      .iter()
+      .map(|instance| {
+        let (_, out, _) = run(instance, &["status"]);
+        let field = |key: &str| {
+          out
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or("?")
+            .trim()
+            .to_owned()
+        };
+        (
+          field("fleet_council_joint: "),
+          field("fleet_council_voter_ids: "),
+        )
+      })
+      .collect();
+    let seated = views
+      .iter()
+      .all(|(joint, voters)| joint == "false" && *voters == views[0].1 && voters != "?");
+    if seated {
+      return;
+    }
+    assert!(
+      window.moving(&format!("{views:?}")),
+      "every council committed its voter change, or kept changing, within each fleet wait (joint, voter ids): {views:?}"
+    );
+    pause();
+  }
+}
+
 fn wait_settled(instances: &[String], members: usize) {
   let mut window = FrozenWindow::new();
   loop {
@@ -1548,7 +1590,9 @@ fn a_candidate_killed_mid_stream_catches_up_and_its_copy_serves_a_takeover() {
   verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
   verdict.check("Agreement", disagreements);
   verdict.check("NoLoss (owner)", no_loss(&owner, &volume, &outcomes));
-  // The owner's whole node lost: the survivors, one of them the succeeded candidate, take the volume over.
+  // The owner's whole node lost: the survivors, one of them the succeeded candidate, take the volume over. Only once the
+  // council has seated the succeeded candidate: a second failure inside the voter change is past `f`.
+  wait_council_seated(&fleet.instances);
   fleet.kill_node(owner_index);
   let survivors: Vec<&str> = candidates.clone();
   let served = wait_serving(&survivors, &volume, &outcomes);
@@ -2575,6 +2619,8 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
     &outcomes,
     &samples,
   );
+  // The replacement seated before the owner dies: a second failure inside the voter change is past `f`.
+  wait_council_seated(&fleet.instances);
   fleet.kill_node(owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   match wait_serving(&survivors, &volume, &outcomes) {
@@ -2587,10 +2633,22 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         fenced_at_or_above(&survivors, &volume, epoch),
       );
     }
-    None => verdict.check(
-      "NoLoss (successor)",
-      vec!["no survivor served the volume within the fleet wait".to_owned()],
-    ),
+    None => {
+      verdict.check(
+        "NoLoss (successor)",
+        vec!["no survivor served the volume within the fleet wait".to_owned()],
+      );
+      // A-272: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave every
+      // copy where it is (`fleet.takeover.lost` counted, `reclaimed` none), for the round that can still recover it.
+      verdict.check(
+        "NoLoss (copies kept while unserved)",
+        survivors
+          .iter()
+          .filter(|survivor| counter(survivor, "fleet.takeover.reclaimed") > 0)
+          .map(|survivor| format!("{survivor} reclaimed its copy of a volume nobody serves"))
+          .collect(),
+      );
+    }
   }
   drop(fleet);
   verdict.judge();

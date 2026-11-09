@@ -570,6 +570,9 @@ impl ShimRequest {
           mtime: *mtime,
           // The shim wire carries no change time; it advances to the volume's clock.
           ctime: None,
+          btime: None,
+          // No Windows attribute bits either: only the WinFsp drive sets them (A-262).
+          windows: None,
         },
       ),
       ShimRequest::Root => out.push(OP_ROOT),
@@ -860,6 +863,9 @@ fn serve_rest(request: ShimRequest, bridge: &mut dyn Bridge, cx: &OpContext) -> 
         mtime,
         // The shim wire carries no change time; it advances to the volume's clock.
         ctime: None,
+        btime: None,
+        // No Windows attribute bits either: only the WinFsp drive sets them (A-262).
+        windows: None,
       };
       reply(bridge.setattr(object, cx, changes), |a| ok_attr(&a))
     }

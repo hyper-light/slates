@@ -1251,6 +1251,129 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
   assert!(shipper.append(vec![3]).is_ok());
 }
 
+/// A-200: a holder repeating the head it last acknowledged is on the chain, though the tail has since passed it. Do have
+/// both holders acknowledge position 1, which trims the entries through it, then have one report that head again (as a
+/// holder does refusing an entry it is not ready for). Expect the entries after it, not an install. A head at that position
+/// with another identity is a fork and still draws an install. Before, the owner knew only its head, its checkpoint and the
+/// retained entries, so it answered with an install: a restarted holder's catch-up took 42.8 s, every kept decision
+/// reporting the position one below the retained tail (`live_chaos`, diag-live-durability-62).
+#[test]
+fn a_holder_repeating_a_head_the_tail_has_passed_is_sent_the_entries_after_it() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    (8, 8),
+  );
+  let entries: Vec<_> = (0..4).map(|at| shipper.append(vec![at]).unwrap()).collect();
+  let mut replica = Replica::new(hosts[0], OBJECT);
+  replica.accept(&entries[0]).unwrap();
+  let held = replica.accept(&entries[1]).unwrap().unwrap();
+  shipper.on_reply(hosts[1], Ok(Some(held)));
+  shipper.on_reply(hosts[2], Ok(Some(held)));
+  assert_eq!(
+    shipper.on_reply(hosts[1], Err(LiveError::Behind { head: Some(held) })),
+    Next::Entries(entries[2..].to_vec()),
+    "the head it last acknowledged is on the chain"
+  );
+  let fork = Head {
+    identity: [9; 32],
+    ..held
+  };
+  assert_eq!(
+    shipper.on_reply(hosts[1], Err(LiveError::Behind { head: Some(fork) })),
+    Next::Install,
+    "another identity at that position is off the chain"
+  );
+}
+
+/// A shipper at `f = 1` from host 1 to holders 2, 3 and 4, retaining `retain` entries.
+fn shipper_to_three_holders(retain: usize) -> Shipper {
+  let hosts = [HostId(1), HostId(2), HostId(3), HostId(4)];
+  Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    (16, retain),
+  )
+}
+
+/// The heads a replica reaches accepting `entries` in order.
+fn heads_of(entries: &[Entry]) -> Vec<Head> {
+  let mut replica = Replica::new(HostId(1), OBJECT);
+  entries
+    .iter()
+    .map(|entry| replica.accept(entry).unwrap().unwrap())
+    .collect()
+}
+
+/// A head last acknowledged by a holder is on the chain, but the entries after it may not be retained. Do have holder 4
+/// acknowledge position 1, then append until the tail (two entries) has passed position 2, and have it report that head
+/// again. Expect an install, never entries with a gap: being on the chain only gets the reply as far as asking what is
+/// retained after it.
+#[test]
+fn a_head_last_acknowledged_with_the_tail_past_it_draws_an_install() {
+  let mut shipper = shipper_to_three_holders(2);
+  let mut entries: Vec<_> = (0..2).map(|at| shipper.append(vec![at]).unwrap()).collect();
+  let head = heads_of(&entries)[1];
+  shipper.on_reply(HostId(4), Ok(Some(head)));
+  entries.extend((2..8).map(|at| shipper.append(vec![at]).unwrap()));
+  assert_eq!(
+    shipper.on_reply(HostId(4), Err(LiveError::Behind { head: Some(head) })),
+    Next::Install,
+    "the entries after it are gone, so no entries can follow"
+  );
+}
+
+/// The acknowledgement that counts is the holder's own. Do have holder 4 acknowledge position 1 and holders 2 and 3
+/// position 3, which trims through position 1 and leaves the entries after it retained, then have holder 2 report position 1:
+/// a holder restarted with older state, reporting a head it no longer last acknowledged. Expect an install, though entries
+/// from there are retained and another holder last acknowledged that very head.
+#[test]
+fn a_head_another_holder_last_acknowledged_does_not_count() {
+  let mut shipper = shipper_to_three_holders(16);
+  let entries: Vec<_> = (0..6).map(|at| shipper.append(vec![at]).unwrap()).collect();
+  let heads = heads_of(&entries);
+  shipper.on_reply(HostId(4), Ok(Some(heads[1])));
+  shipper.on_reply(HostId(2), Ok(Some(heads[3])));
+  shipper.on_reply(HostId(3), Ok(Some(heads[3])));
+  assert_eq!(
+    shipper.on_reply(
+      HostId(2),
+      Err(LiveError::Behind {
+        head: Some(heads[1])
+      })
+    ),
+    Next::Install,
+    "a lower head than this holder's own is not what it last acknowledged"
+  );
+}
+
+/// The acknowledgement ends with the holder's membership. Do have every holder acknowledge position 1 (trimming it),
+/// move the holders to 2 and 3 alone, then add holder 4 back and have it report that head. Expect an install, though the
+/// entries after it are retained: it left the holder set, so its acknowledgement is forgotten.
+#[test]
+fn a_head_last_acknowledged_is_forgotten_when_the_holder_leaves() {
+  let mut shipper = shipper_to_three_holders(16);
+  let entries: Vec<_> = (0..6).map(|at| shipper.append(vec![at]).unwrap()).collect();
+  let head = heads_of(&entries)[1];
+  for holder in [HostId(2), HostId(3), HostId(4)] {
+    shipper.on_reply(holder, Ok(Some(head)));
+  }
+  let settled = [HostId(2), HostId(3)];
+  assert!(shipper.begin_transition(&settled));
+  assert!(shipper.activate(&settled));
+  assert!(shipper.begin_transition(&[HostId(2), HostId(3), HostId(4)]));
+  assert_eq!(
+    shipper.on_reply(HostId(4), Err(LiveError::Behind { head: Some(head) })),
+    Next::Install,
+    "a holder that left and came back has no acknowledgement to match"
+  );
+}
+
 /// A-200, AC-8.3: a holder's refusal is never counted as holding. Do append two entries, then answer the owner with
 /// each refusal a holder that will not keep them gives (a sender it does not take for the owner, no catalog yet, a
 /// fence, a stranger's object, malformed bytes). Expect the durable position unchanged after every one, and the owner
