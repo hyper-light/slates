@@ -7852,15 +7852,15 @@ const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 /// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
 /// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
 ///
-/// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one rule
-/// (`Endpoint::peer_silent_past`, shared with the install watch), an ack-eliciting packet unanswered for a liveness
-/// budget or the session's persistent-congestion duration, whichever is longer. It covers a reset lost and a peer that is
-/// silent. Judged at the one place every borrower hands the session back, and every borrower's hold is bounded by a
-/// derived budget, so a silent session is judged within its window plus one hold: with a deaf session under a
-/// 256-client burst the council's replication held it 120 times in 10 s while the forward lane's own check never got a
-/// turn (2026-11-09). A starved node can judge a live peer dead: that costs a session replaced, and the forwards on it are
-/// answered unanswered and sent again under their own ids, never run twice. A reset is checked first, so it is counted
-/// as one.
+/// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one
+/// judgement of a dead session (`Endpoint::peer_silent_past`, fleet-transport.md §5), an ack-eliciting packet
+/// unanswered for a liveness budget or the session's persistent-congestion duration, whichever is longer. It covers a
+/// reset lost and a peer that is silent. Judged at the one place every borrower hands the session back, and every
+/// borrower's hold is bounded by a derived budget, so a silent session is judged within its window plus one hold: with
+/// a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward lane's
+/// own check never got a turn (2026-11-09). A starved node can judge a live peer dead: that costs a session replaced,
+/// and the forwards on it are answered unanswered and sent again under their own ids, never run twice. A reset is
+/// checked first, so it is counted as one.
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {

@@ -36,7 +36,8 @@
 //! returns, so how late past its window a silent session is dropped is the lane's return cadence: 0 to 209 ms past a
 //! 1,998 ms window under a 256-client burst, in the record's runs. One sitting unborrowed in its slot is the link's
 //! discovery refresh's to catch, and a peer's stateless reset ends one sooner where it is heard. That division is why
-//! no timer judges it (the bug record of 2026-11-09, a dead record session was lent on). The lane's forwards on a dropped session are answered unanswered by its next settle.
+//! no timer judges it (the bug record of 2026-11-09, a dead record session was lent on). The lane's forwards on a
+//! dropped session are answered as unanswered by its next settle.
 //!
 //! **What a session change does.** An exchange is tied to the session it was begun on (its connection id). If the
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
