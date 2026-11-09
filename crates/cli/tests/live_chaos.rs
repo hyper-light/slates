@@ -1666,6 +1666,89 @@ fn judge_healed(
   }
 }
 
+/// Diag only (live-durability-71, never on main): one node's council view: (joint, voter ids, its own host id).
+fn diag_council(instance: &str) -> Option<(bool, Vec<String>, String)> {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return None;
+  }
+  let field = |key: &str| out.lines().find_map(|line| line.strip_prefix(key)).map(|value| value.trim().to_owned());
+  Some((
+    field("fleet_council_joint: ")? == "true",
+    field("fleet_council_voter_ids: ")?.split_whitespace().map(str::to_owned).collect(),
+    field("fleet_host: ")?,
+  ))
+}
+
+/// Diag only (live-durability-71): replaces one candidate's node and times the council's voter change: from the
+/// replacement answering, to any node reporting the joint configuration, to every live node reporting it closed with the
+/// replacement seated and the old id gone. `loaded` keeps the write stream running throughout.
+fn diag_joint_window(loaded: bool) {
+  let mut fleet = Fleet::start(if loaded { "jointload" } else { "jointquiet" }, Supervision::Anchored);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let replaced_index = fleet.others(owner_index)[0];
+  let volume = fleet.create_volume(&owner, "joint-window", true);
+  let instances = fleet.instances.clone();
+  let old_id = diag_council(&instances[replaced_index]).map(|view| view.2).unwrap_or_default();
+  let measure = |fleet: &mut Fleet| {
+    fleet.kill_node(replaced_index);
+    let killed = Instant::now();
+    fleet.replace_node(replaced_index);
+    let answered = killed.elapsed();
+    let new_id = diag_council(&instances[replaced_index]).map(|view| view.2).unwrap_or_default();
+    let (mut entered, mut closed) = (None, None);
+    let mut polls = 0u64;
+    while killed.elapsed() < Duration::from_secs(90) {
+      let views: Vec<Option<(bool, Vec<String>, String)>> = instances.iter().map(|instance| diag_council(instance)).collect();
+      polls += 1;
+      if entered.is_none() && views.iter().flatten().any(|view| view.0) {
+        entered = Some(killed.elapsed());
+      }
+      let seated = views.iter().all(|view| view.as_ref().is_some_and(|view| {
+        !view.0 && view.1.contains(&new_id) && !view.1.contains(&old_id)
+      }));
+      if seated {
+        closed = Some(killed.elapsed());
+        break;
+      }
+      sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+      "LD-JW loaded {loaded} killed->answered {answered:?} joint_entered {entered:?} joint_closed {closed:?} polls {polls} old {old_id} new {new_id}"
+    );
+    if closed.is_none() {
+      for instance in &instances {
+        eprintln!("LD-JW view {instance} {:?}", diag_council(instance));
+      }
+    }
+  };
+  if loaded {
+    let fleet_cell = std::cell::RefCell::new(&mut fleet);
+    let _ = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |_began| {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      measure(&mut fleet_cell.borrow_mut());
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    });
+  } else {
+    measure(&mut fleet);
+  }
+}
+
+#[test]
+fn diag_joint_window_quiet() {
+  if gated("joint-window-quiet") {
+    diag_joint_window(false);
+  }
+}
+
+#[test]
+fn diag_joint_window_loaded() {
+  if gated("joint-window-loaded") {
+    diag_joint_window(true);
+  }
+}
+
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
 /// process (SIGSTOP) for [`PARTITION`] in turn, the stream running throughout, then resume it. Expect every write
 /// acknowledged (durable through whichever candidate answers), none lost, both candidates caught up once healed, and one
