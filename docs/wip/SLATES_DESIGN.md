@@ -19871,17 +19871,28 @@ included, is never learned, so the round confirms without it and NoLoss breaks s
 any holder leave out any object. Over 1,000 histories (2,950 objects), the named rule with today's routing-selected
 pages left 620 committed objects unlearned. Two shapes were run against that nemesis, neither a global catalog
 (D-14 forbids one for lookups, not a host's own recovery directory):
-- **(i), chosen: a holder lists a copy by the authority it was written under.** A page lists, and a successor learns of
-  its own, every copy whose acceptor's authority puts the object in this round with the asker its successor, by the
-  configuration's lineage (`slates_db::takeover::falls_to`, `RegionalConfiguration::lineage`). This is in addition to
-  what routing gives it. The authority is kept with the copy, so a warm restart keeps it. Following the lineage rather
-  than the recovery chain means a chained successor's own objects are never listed in its predecessor's round, so no
-  object is adopted in two rounds. An omission can then come only from a holder that does not answer, which the quorum
-  rule already covers.
-  - Measured: 0 records lost over the same histories.
-  - Cost: no write at all; it reads what each copy keeps.
-  - `initial_epoch` takes the same copies into account, so a routing-lost copy does not fence the round higher.
-  - Counted `fleet.takeover.listed_by_authority` when routing alone would have missed a copy.
+- **(i), chosen, as one rule with no routing in it: a holder lists a copy by its authority's line, or by the line
+  of the owner an install moved that authority from.**
+  - **The rule.** A page lists, and a successor learns of its own, every copy whose acceptor's authority, or the owner an
+    install last moved that authority from (`Acceptor::moved_from`), has a line in the configuration
+    (`RegionalConfiguration::lineage`) that ends in this round with the asker as its successor
+    (`slates_db::takeover::copy_falls_to`). Today's routing filter is gone (CLAUDE.md §2.7: one rule, not a rule and a
+    second path).
+  - **Why the moved-from owner.** The install's authority reconcile moves a retired owner's copies to its successor.
+    After a warm restart, such a copy routes to the successor as a live owner, so neither routing nor the authority
+    alone names the retired host.
+  - **Why not the asker's authority alone.** The asker's own live objects never fall here. Listing one would raise its
+    fence to the round's epoch and could refuse the asker's own writes.
+  - **Measured over 1,000 histories (2,950 objects).** The model gives copies an authority an install may move, and
+    holds the asker's own objects:
+    - routing plus a chain path (the first shape (i) built) lost 204 records;
+    - the literal "chain or the asker" lost none, but learned the asker's own objects in every history;
+    - this rule lost none and learned none.
+    The first two are rejected.
+  - **Cost.** No write: the authority and its last move are kept with the copy.
+  - **Owed.** The held image does not yet persist `moved_from`. It waits on raft-7's new image format (raft, the
+    supervisor), and until then a warm restart forgets an earlier move.
+  - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.
   - Measured: 0 records lost over the same histories.

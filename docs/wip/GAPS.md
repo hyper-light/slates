@@ -5733,10 +5733,12 @@ nemesis. Over 2,000 histories today's rule lost 216 committed records with the n
 by-name rule lost none. **Step (b), built:** a successor asks by name for what a member's complete pages did not list,
 a holder answers from its own records with no routing filter, and the successor counts under
 `CountingRule::NamedAnswer`. **The names, folded into (b):** an object that every holder leaves out was never learned
-(620 committed objects unlearned over 1,000 histories). A holder now lists a copy by the authority it was written under,
-through the configuration's lineage, as well as by routing (shape (i): 0 lost, no extra write). The object directory kept
-by the cohort (shape (ii): 0 lost, one more committed record per create) is measured and rejected (A-251). Still owed:
-(d) the process test.
+(664 committed objects unlearned over 1,000 histories). A holder now lists a copy by one rule with no routing in it: the
+line of its authority, or of the owner an install moved that authority from (shape (i): 0 lost, none of the asker's own
+objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
+"the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
+**Owed:** the held image persisting `Acceptor::moved_from`, after raft-7's image format; until then a warm restart forgets
+an earlier move. (d), the process test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

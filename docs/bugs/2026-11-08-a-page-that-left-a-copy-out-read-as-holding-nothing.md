@@ -41,18 +41,23 @@ same histories. Found while designing step (d)'s process test.
 - The model, `crates/db/tests/takeover_model.rs`.
 
 **The names (folded in at the supervisor's direction).** An object every holder leaves out was never learned, so nothing
-asked about it by name: with the nemesis widened so any holder may omit any object, the named rule over today's pages
-left 620 committed objects unlearned over 1,000 histories. A holder now also lists, and a successor learns of its own,
-every copy whose acceptor's authority puts it in this round with the asker its successor, by the configuration's lineage
-(`slates_db::takeover::falls_to`; shape (i), 0 lost). The cohort-kept directory, shape (ii), lost nothing either but costs a
-commit per create, and is recorded in A-251 as measured and rejected.
-- `a_holder_lists_a_copy_whose_lineage_it_lost_and_answers_by_name` (a real shard): red with pages listing by routing alone.
-- `a_copy_falls_to_one_round_by_its_authority_alone`: red with the round unchecked. Its first cut missed that: a chained
-  successor's own round named the next successor too, until the case was added.
-- `a_successor_holding_nothing_of_an_object_promises_so_by_name` (a real shard): red with no self-answer.
-- Surviving, as expected: the successor learning its own copies by routing alone, since its self-answer still reaches the copy.
+asked about it by name. With the nemesis widened so any holder may omit any object, the named rule over today's pages left
+664 committed objects unlearned over 1,000 histories. A holder now lists, and a successor learns of its own, every copy
+whose authority's line, or the line of the owner an install moved that authority from, ends in this round with the asker as
+successor (`slates_db::takeover::copy_falls_to`). Routing plays no part.
+- **Measured and rejected:**
+  - routing plus a chain path (204 lost);
+  - "the chain or the asker", which learns the asker's own objects and would raise their fences;
+  - the cohort-kept directory (one more commit per create).
+- **Tests:**
+  - `a_copy_moved_to_the_successor_is_listed_by_the_owner_it_moved_from` (a real shard): red without the moved-from half,
+    and red with installs recording none.
+  - `the_askers_own_object_is_never_listed_in_another_hosts_round` (a real shard): red with the literal rule.
+  - `a_copy_falls_to_one_round_by_its_authority_alone`: red with the round unchecked; its first cut missed that.
+  - `a_successor_holding_nothing_of_an_object_promises_so_by_name` (a real shard): red with no self-answer.
+- **Owed:** the held image persisting the moved-from owner, after raft-7.
 
-The process test is step (d).
+The process test is step (d): `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`.
 
 **R3.** A question names the ids that fit one page after the request's fields (`named_per_question`, from `page_budget`). An
 answer is bounded by `page_budget`.
