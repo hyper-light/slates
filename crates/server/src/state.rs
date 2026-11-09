@@ -533,9 +533,9 @@ pub struct ShardState {
   /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
   /// bounded by the neighbourhood.
   pub member_anchors: std::collections::BTreeMap<slates_db::HostId, u64>,
-  /// The recipient public keys of peers by stable anchor, asked over their authenticated sessions and kept (A-92 piece
-  /// 4b), bounded by the fleet's peer capacity.
-  pub peer_recipients: BTreeMap<u64, hyper_seal::recipient::RecipientPublic>,
+  /// The recipient public keys of peers by stable anchor, each with the member it was learned from, asked over their
+  /// authenticated sessions and kept (A-92 piece 4b), bounded by the fleet's peer capacity (`fleet::kept_recipient`).
+  pub peer_recipients: BTreeMap<u64, (slates_db::HostId, hyper_seal::recipient::RecipientPublic)>,
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.
@@ -756,6 +756,9 @@ pub struct ShardState {
   pub config_refresh_wanted: bool,
   /// When an uninitialized council learner fetches next, and the wait after it (`fleet::next_learner_wait`).
   pub(crate) council_learner_pace: crate::fleet::LearnerPace,
+  /// This node's last council configuration fetch as a learner: when it asked, how many, and the version it held after
+  /// (`fleet::drive_learner_fetch`), for status.
+  pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
