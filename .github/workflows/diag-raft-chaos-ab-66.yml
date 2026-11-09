@@ -1,0 +1,77 @@
+name: DIAG raft-chaos diag-60's one-CPU load on live-fixes' learner-3 (not for main)
+
+# Diagnostics branch of the raft-chaos agent; never merged. One arm: agents/live-fixes-learner-3 (00a2589f) with diag-60's
+# harness, its dial series also keeping each node's fleet_learner, fleet_configuration_version, fleet_council_voter_ids
+# and no_session counters. The load is diag-60's: the test and its five daemons on CPU 0 with 4 busy loops, 6 one-byte dd
+# copies, 2 direct-I/O writers and 1 dsync writer there, each in its own process group, stopped by that group after the
+# run. diag-60 failed this test on 1d1bac87 and 4c73c048 with nodes stuck on their join-time configuration.
+
+on:
+  push:
+    branches: [diag-raft-chaos-ab-66]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  ab:
+    name: A/B ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build
+        run: CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-after cargo test --release --locked -p slates-cli --test live_chaos --no-run
+      - name: Interleaved runs
+        run: |
+          R=../results.txt
+          echo "runner ubuntu-latest, $(nproc) CPUs, $(date -u), tip $(git rev-parse --short=8 HEAD), sample ${{ matrix.sample }}" > $R
+          bin_of() { ls -t ../t-$1/release/deps/live_chaos-* | grep -v '\.d$' | head -1; }
+          echo "after $(bin_of after)" >> $R
+          for pair in 1 2 3 4 5 6 7 8; do
+            for arm in after; do
+              BIN=$(bin_of $arm)
+              # The load, each generator its own process group on CPUs 0-1.
+              LOADPG=""
+              for i in 1 2 3 4; do setsid taskset -c 0 bash -c 'while :; do :; done' & LOADPG="$LOADPG $!"; done
+              for i in 1 2 3 4 5 6; do setsid taskset -c 0 bash -c 'while :; do dd if=/dev/zero of=/dev/null bs=1 count=2000000 status=none; done' & LOADPG="$LOADPG $!"; done
+              for i in 1 2; do setsid taskset -c 0 bash -c "while :; do dd if=/dev/zero of=$RUNNER_TEMP/load-$i.bin bs=1M count=128 oflag=direct status=none; done" & LOADPG="$LOADPG $!"; done
+              setsid taskset -c 0 bash -c "while :; do dd if=/dev/zero of=$RUNNER_TEMP/sync.bin bs=4k count=256 oflag=dsync status=none; done" & LOADPG="$LOADPG $!"
+              sleep 2
+              echo "== pair $pair arm $arm at $(date -u +%H:%M:%S), load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+              status=0
+              timeout 900 taskset -c 0 "$BIN" --nocapture --test-threads=1 --exact a_member_that_never_held_the_log_never_stands_in_for_its_holder > ../run.log 2>&1 || status=$?
+              for g in $LOADPG; do kill -KILL -- -$g 2>/dev/null; done
+              wait 2>/dev/null
+              grep -E '^DIAG (formation|settlement) took|^DIAG slow formation|test result|panicked|no survivor adopted the registers; the|every node held the newest|stayed stopped|the fleet formed, or kept changing' ../run.log | cut -c1-900 >> $R
+              grep -E '^DIAG dials (formation|settlement)' ../run.log | tail -80 | cut -c1-1200 >> $R
+              if [ $status -ne 0 ]; then grep -E 'fleet_learner|fleet_council_voter_ids|fleet_configuration_version|no_session' ../run.log | tail -60 | cut -c1-1200 >> $R; fi
+              grep -oE '(fleet\.(dial|accept)\.(stall\.[a-z_]+|redial|fault[a-z_.]*)): [0-9]+' ../run.log | sort | uniq -c | sort -rn | head -12 >> $R
+              echo "== pair $pair arm $arm exit $status, load $(cut -d' ' -f1-3 /proc/loadavg)" >> $R
+            done
+          done
+          rm -f $RUNNER_TEMP/load-*.bin $RUNNER_TEMP/sync.bin
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-raft-chaos"
+          git config user.email "diag-raft-chaos@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-raft-chaos-ab-66 results ${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-66-${{ matrix.sample }}"
