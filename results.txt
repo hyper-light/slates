@@ -7,3 +7,6 @@ The extension loads and exposes the Client class, the SlatesError exception, and
 slates.SlatesError: Stalled { after_ns: 10000000000 }
 Ran 6 tests in 50.920s
 FAILED (errors=1)
+addon exit 0
+node exit 1
+DONE
