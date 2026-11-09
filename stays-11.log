@@ -1,0 +1,33 @@
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794240479376062527 head 86 bytes 376243
+LD-TAKE wall_ns 1794240479378776441 from 8003254994092090296 reply Ok(Some(86))
+LD-LANE install wall_ns 1794240479378944734 holder 3897726553464770171 bytes 376328 budget_ns 30000000000 took_ns 2609073 answered true cut false
+LD-IMAGE wall_ns 1794240481515406280 head 6342 bytes 27584653
+LD-TL stopped_on_install Some(50302) after 277.543566ms
+LD-TL resume wall_ns 1794240501641263732
+LD-TAKE wall_ns 1794240501675446345 from 8003254994092090296 reply Ok(Some(6342))
+LD-LANE install wall_ns 1794240501678067340 holder 11179101025956322192 bytes 27584738 budget_ns 30000000000 took_ns 20145425146 answered true cut false
+LD-IMAGE wall_ns 1794240502676835817 head 64351 bytes 282413412
+LD-TAKE wall_ns 1794240503068988684 from 8003254994092090296 reply Ok(Some(6342))
+LD-LANE install wall_ns 1794240503070650403 holder 11179101025956322192 bytes 27584738 budget_ns 30000000000 took_ns 1389450967 answered true cut false
+LD-TAKE wall_ns 1794240504736872254 from 8003254994092090296 reply Ok(Some(64351))
+LD-LANE install wall_ns 1794240504779983336 holder 11179101025956322192 bytes 282413497 budget_ns 30000000000 took_ns 1387556155 answered true cut false
+LD-TAKE wall_ns 1794240506185039014 from 8003254994092090296 reply Ok(Some(64351))
+LD-LANE install wall_ns 1794240506235994021 holder 11179101025956322192 bytes 282413497 budget_ns 30000000000 took_ns 1424830487 answered true cut false
+LD-TL caught None
+LD-TL durable Some(78849) then Some(78859) after 11.222883ms
+LD-TL writes 78793
+LD-WHY wall_ns 1794240479273595647 off_chain holder 3897726553464770171 reported Some(1) head Some(86) checkpoint Some(0) oldest Some(83) retained 4 bytes 19064 retain_bytes 5012
+LD-WHY wall_ns 1794240501678085657 behind_tail holder 11179101025956322192 reported Some(6342) head Some(64350) checkpoint Some(6342) oldest Some(61460) retained 2891 bytes 27581371 retain_bytes 27584653
+LD-WHY wall_ns 1794240503070667218 behind_tail holder 11179101025956322192 reported Some(6342) head Some(64376) checkpoint Some(64351) oldest Some(61461) retained 2916 bytes 40616071 retain_bytes 282413412

@@ -1,0 +1,29 @@
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794240149052332786 head 58 bytes 255379
+LD-TL stopped_on_install Some(13599) after 35.552353ms
+LD-TL resume wall_ns 1794240171186418410
+LD-TAKE wall_ns 1794240171186929099 from 7357321421921830262 reply Ok(Some(58))
+LD-LANE install wall_ns 1794240171187061981 holder 6676620972935135398 bytes 255464 budget_ns 30000000000 took_ns 22134490792 answered true cut false
+LD-IMAGE wall_ns 1794240172404555103 head 67504 bytes 296144774
+LD-IMAGE wall_ns 1794240196791738646 head 71824 bytes 315475175
+LD-TAKE wall_ns 1794240199473959850 from 7357321421921830262 reply Ok(Some(71824))
+LD-LANE install wall_ns 1794240199586430766 holder 6676620972935135398 bytes 315475260 budget_ns 59452786659 took_ns 2376096348 answered true cut false
+LD-TAKE wall_ns 1794240201681057275 from 7357321421921830262 reply Ok(Some(71824))
+LD-LANE install wall_ns 1794240201731164072 holder 6676620972935135398 bytes 315475260 budget_ns 30000000000 took_ns 2116440360 answered true cut false
+LD-TL caught None
+LD-TL durable Some(77382) then Some(77393) after 47.023229ms
+LD-TL writes 77333
+LD-WHY wall_ns 1794240149050270939 off_chain holder 6676620972935135398 reported Some(51) head Some(57) checkpoint Some(0) oldest Some(54) retained 4 bytes 19064 retain_bytes 5012
+LD-WHY wall_ns 1794240149050557623 off_chain holder 6676620972935135398 reported Some(52) head Some(57) checkpoint Some(0) oldest Some(54) retained 4 bytes 19064 retain_bytes 5012
+LD-WHY wall_ns 1794240171187098925 behind_tail holder 6676620972935135398 reported Some(58) head Some(67503) checkpoint Some(58) oldest Some(67451) retained 53 bytes 252916 retain_bytes 255379
