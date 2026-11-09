@@ -180,6 +180,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   }
   let daemon = Daemon::start_with_fleet(&profile, config, source, transport)
     .map_err(|e| failed("start", e))?;
+  // The start, recovery included, is done: an exit from here on is a daemon that recovered, which the anchor's restart
+  // bound does not count (`slates_anchor::layout::SUP_SERVING`).
+  if let Ok(supervision) = daemon.segment().supervision() {
+    supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
+      &mut slates_vfs::clock::HostClock::new(),
+    ));
+  }
   slates_machine::log_line!(
     "slates daemon: instance {} serving on {} shards{}",
     options.instance,
