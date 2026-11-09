@@ -15,8 +15,14 @@
 > node). What it owes: a rule for the work's node (the creating client's, with its name reachable from any node), the
 > owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
 
-> **Open (perf, 2026-11-08): measurement of A-247 step one.** The owner's cost per verdict, loadtest-scale's one-node
-> 1k/3k/10k rungs and fixtures' interleaved A/B are owed; the amendment's *Measured* list names them.
+> **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
+> main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
+> 42–62 (BENCHMARKS). The owner is the bottleneck, and rebases cost it more than verdicts (`map_rebase` 333 samples
+> against `judge_submission` 226 of 1,121). Owed: the owner's cost per verdict and per rebase.
+>
+> **Open (perf, 2026-11-09): main drops replies at 3,000 clients.** `xshard.reply_dropped` counts 4,074 to 4,439 a run on
+> main 80be552a (a forwarded verb's result carried home past a full channel for one coordinator period); each client
+> waits out its reply deadline and its resend is answered from its record.
 
 > **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
 > shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps

@@ -12048,3 +12048,34 @@ with verdicts), and the verdicts lose the batching. Rejected.
 owner, 1,121 samples): 799 (71%) in the batches of asks. Of those, `map_rebase` 333, `judge_submission` 226, and
 `build_increment` 241 inside those two. Rebases, 60,000 a run against 34,000 submits, cost the owner more than the
 verdicts do.
+
+**The same A/B by the anchor recipe, with lost replies counted (2026-11-08/09).** Main 80be552a (whose start judgment
+lets `slates anchor --quick` come up on this machine) against agents/perf-w1 492ad3c3 (W1 merged onto it), loadtest-scale's
+`rung.sh` (a single-node anchored daemon, the release harness against it), the same harness flags, interleaved and
+reversed on alternate rounds: 4 rounds at 1,000 clients, 10 at 3,000. adas-mac-studio.local-2, one-minute load 3.3 to
+21.0. Every run finished, oracle 0. `lost` is the sum of the harness's `lost` rows (the daemon's counters of a reply or
+an ask lost for want of room: `xshard.reply_dropped`, `lease.wait.undelivered`, `merge.acceptance_undelivered`,
+`merge.work.ask_unanswered`, `park_full`, `pending_stuck`, `floor_not_sent`). Milliseconds, the range over the runs:
+
+| Clients | | main | W1 |
+|---|---|---|---|
+| 1,000 | wall (s) | 1.28–1.33 | 0.78–0.82 |
+| 1,000 | lost | 0 | 0 |
+| 1,000 | CreateWork p50 / p99 | 7.3–8.7 / 21.8–22.3 | 3.2–4.4 / 6.9–9.5 |
+| 1,000 | Edit p50 / p99 | 10.0–10.1 / 21.7–22.3 | 3.0–3.3 / 17.7–23.1 |
+| 1,000 | SubmitAccepted p50 / p99 | 9.6–9.9 / 27.0–31.4 | 9.1–9.8 / 25.1–40.6 |
+| 1,000 | ReadHead p50 / p99 | 10.4–10.5 / 26.7–30.6 | 4.9–5.4 / 12.6–16.6 |
+| 3,000 | wall (s) | 7.96–8.07 | 4.31–4.62 |
+| 3,000 | lost | 4,074–4,439 (all `xshard.reply_dropped`) | 0 in 10 of 10 |
+| 3,000 | CreateWork p50 / p99 | 89.3–96.8 / 102.7–119.6 | 11.2–16.5 / 20.9–26.5 |
+| 3,000 | Edit p50 / p99 | 31.2–32.0 / 55.6–64.8 | 0.5 / 50.1–60.8 |
+| 3,000 | SubmitAccepted p50 / p99 | 28.6–29.3 / 42.4–62.4 | 23.3–24.5 / 56.4–72.3 |
+| 3,000 | SubmitConflict p50 / p99 | 31.9–33.1 / 43.3–63.4 | 33.4–35.5 / 73.8–79.5 |
+| 3,000 | ReadHead p50 / p99 | 32.2–33.3 / 42.4–64.4 | 10.5–11.3 / 22.3–23.5 |
+| 3,000 | Rebase p50 / p99 | 32.1–33.1 / 42.3–64.1 | 32.7–35.1 / 61.5–70.6 |
+
+- Main drops about 4,300 replies a 3,000-client run (`xshard.reply_dropped`, a forwarded verb's result carried home
+  past a full channel); the harness's resend under the same id answers each from its record after the reply deadline,
+  so the oracle stays 0. W1 drops none.
+- W1's verdict tail is still worse than main's: SubmitAccepted p99 56–72 ms against 42–62, SubmitConflict 74–80
+  against 43–63, Rebase 62–71 against 42–64.
