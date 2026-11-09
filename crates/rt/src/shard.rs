@@ -28,6 +28,8 @@ use slates_mem::{Encoded, Handle, Slab, ring};
 
 use slates_machine::wake::WakeEstimate;
 
+use crate::futures::DiagRule;
+
 use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
@@ -326,6 +328,8 @@ pub struct ShardContext {
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
   fixed_spin_ns: u64,
+  /// Diagnostics only (A-223 window arms): the boot probe's floor wake the shard was seeded with.
+  boot_floor_ns: u64,
   /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
   /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
   /// deterministic).
@@ -506,6 +510,9 @@ impl ShardContext {
         .map_or(1, |tracking| tracking.idle_ratio),
       fixed_quantum_ns: config.step_budget_ns,
       fixed_spin_ns: config.spin_ns,
+      boot_floor_ns: config
+        .wake_tracking
+        .map_or(0, |tracking| tracking.prior_floor_ns),
       real_time: driver.kind() != DriverKind::Simulation,
       attribution: Cell::new(Tracker::default()),
       entry: registry::entry(seed.id),
@@ -1430,9 +1437,23 @@ impl ShardContext {
   /// the shard tracks one (the 2-competitive spin, §4.3), else the configured spin. The floor, not the mean:
   /// the mean counts the wait a woken shard spends runnable for a CPU, which costs no CPU and which a
   /// spinning shard lengthens itself, so a window on the mean fed on its own spinning (A-223).
-  fn spin_window_ns(&self) -> u64 {
+  pub fn spin_window_ns(&self) -> u64 {
+    /// Diagnostics only: R9's floor, F.
+    const F_NS: u64 = 50_000;
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
-      estimate.floor_ns().max(1).saturating_mul(self.idle_ratio)
+      match crate::futures::diag_window_rule() {
+        // The x100 baseline: A-223 alone, the window on the live mean.
+        DiagRule::Mean => estimate.mean_ns().saturating_mul(self.idle_ratio),
+        // Option 2: max(F, the boot probe's smallest confirmed wake); no live estimate prices it.
+        DiagRule::Boot => F_NS.max(self.boot_floor_ns),
+        // Option 3: the live floor times the ratio, capped at four times F.
+        DiagRule::Capped => estimate
+          .floor_ns()
+          .max(1)
+          .saturating_mul(self.idle_ratio)
+          .min(F_NS.saturating_mul(4)),
+        DiagRule::Floor => estimate.floor_ns().max(1).saturating_mul(self.idle_ratio),
+      }
     })
   }
 

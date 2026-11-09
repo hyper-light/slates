@@ -4870,14 +4870,9 @@ async fn serve_loop() {
     state::with_state(|s| s.server_task = Some(task));
   }
   loop {
-    let idle_window_ns = derived!(
-      futures::wake_floor_ns()
-        .unwrap_or(0)
-        .saturating_mul(crate::config::IDLE_WINDOW_RATIO),
-      "the floor of the shard's wake estimate × IDLE_WINDOW_RATIO",
-      ["rt.wake_floor_ns", "IDLE_WINDOW_RATIO"]
-    )
-    .get();
+    // Diagnostics only: the shard's own window, priced by the chosen rule (the same quantity: idle_ratio is
+    // IDLE_WINDOW_RATIO on a daemon shard).
+    let idle_window_ns = futures::idle_window_ns().unwrap_or(0);
     let (did, within_window) = state::with_state(|s| {
       let did = verbs::serve_round(s);
       let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);

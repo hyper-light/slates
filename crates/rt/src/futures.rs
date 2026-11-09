@@ -45,6 +45,39 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// Diagnostics only (A-223 window arms): which rule prices the idle window, from `SLATES_DIAG_WINDOW_RULE`
+/// (mean, boot, capped; anything else the branch's floor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagRule {
+  /// The window on the live mean, x100 (A-223 alone).
+  Mean,
+  /// Option 2: max(F, the boot probe's floor).
+  Boot,
+  /// Option 3: the live floor x100, capped at 4F.
+  Capped,
+  /// The branch's floor x100.
+  Floor,
+}
+
+/// Diagnostics only: the rule chosen for this process, read once.
+#[allow(clippy::disallowed_methods)]
+pub fn diag_window_rule() -> DiagRule {
+  static RULE: std::sync::OnceLock<DiagRule> = std::sync::OnceLock::new();
+  *RULE.get_or_init(
+    || match std::env::var("SLATES_DIAG_WINDOW_RULE").as_deref() {
+      Ok("mean") => DiagRule::Mean,
+      Ok("boot") => DiagRule::Boot,
+      Ok("capped") => DiagRule::Capped,
+      _ => DiagRule::Floor,
+    },
+  )
+}
+
+/// Diagnostics only: the current shard's idle window as its rule prices it. `None` off a shard thread.
+pub fn idle_window_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.spin_window_ns())
+}
+
 /// The current shard's online wake estimate in nanoseconds (the configured step budget when it tracks
 /// none). `None` off a shard thread.
 pub fn wake_cost_ns() -> Option<u64> {
