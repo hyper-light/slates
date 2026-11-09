@@ -15417,7 +15417,7 @@ Applied in the same change to:
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
 
-### A-262 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
+### A-274 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
 
 Applied in the same change to:
 - §4.6 (Windows): this entry is its record.
@@ -15441,6 +15441,11 @@ Applied in the same change to:
   - A pending open always has its successful response in the journal, published or settled.
   - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
     confirmation ahead of the worker's next request.
+  - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
+    it, and a request answered without the shard (a security query, from the one fixed descriptor) can come right after a
+    Create. Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
+    replaces.
   - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
     posted confirmation's answer, waiting only if the shard has not yet applied it (a request answered without the shard,
     such as a security query, can come next).
