@@ -3677,3 +3677,9 @@ phases	cb_can_delete	between	11001	200	400	600	158
 phases	cb_rename	interface	11000	31000	37000	56000	48017
 phases	cb_rename	between	11000	400	500	800	303
 ## run 5 of 5 done, 2026-11-09T02:18:28Z
+To https://github.com/hyper-light/slates
+   13d0491..6fe14a8  6fe14a82a5bb2758f5afa74b6a042e2339b97c59 -> diag-results/winfsp-overlap-42506936806-arm-loaded
+# teardown: fsb-347-5-dll's drive '' was gone before its unmount
+# teardown: fsb-347-5-main's drive '' was gone before its unmount
+## crash events listed
+# Application Error, Windows Error Reporting and .NET runtime records naming slates since 2026-11-08T15:18:30.8055996-08:00: 0
