@@ -317,6 +317,31 @@ enum Op<T> {
   Release {
     object: T,
   },
+  /// The link at `path`, read without following it (A-TBD): WinFsp's `GetReparsePointByName`, which its resolver asks
+  /// of each component while it follows a path's links.
+  LinkByName {
+    path: String,
+  },
+  /// The link an open names (`FSCTL_GET_REPARSE_POINT`, A-TBD).
+  LinkOf {
+    object: T,
+  },
+  /// `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer (A-TBD): the empty file or directory an open names at
+  /// `path`, which `CreateSymbolicLink` has just made, becomes a volume link to `target`, keeping its attribute bits and,
+  /// for a directory, the directory bit that makes it a Windows directory link. A link it names is given the new target.
+  MakeLink {
+    object: T,
+    path: String,
+    target: String,
+  },
+  /// `FSCTL_DELETE_REPARSE_POINT` (A-TBD): the link an open names at `path` becomes an empty file, or an empty directory
+  /// for a directory link, as NTFS leaves the object when its reparse point is removed. `symlink_tag` is whether the
+  /// caller named a symbolic link's tag.
+  UnmakeLink {
+    object: T,
+    path: String,
+    symlink_tag: bool,
+  },
 }
 
 impl<T> Op<T> {
@@ -339,6 +364,8 @@ impl<T> Op<T> {
         | Op::Flush { .. }
         | Op::FlushVolume
         | Op::Cleanup { .. }
+        | Op::MakeLink { .. }
+        | Op::UnmakeLink { .. }
     )
   }
 }
@@ -376,6 +403,10 @@ enum Reply {
     info: FileInfo,
   },
   Ok,
+  /// A link's target, or `None` when the object is no link (A-TBD).
+  Link {
+    target: Option<String>,
+  },
   /// A typed refusal, already mapped to its `NTSTATUS`.
   Err(Ntstatus),
 }
@@ -686,6 +717,28 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Release { object } => Op::Release {
       object: ledger.get(object)?,
     },
+    Op::LinkByName { path } => Op::LinkByName { path },
+    Op::LinkOf { object } => Op::LinkOf {
+      object: ledger.get(object)?,
+    },
+    Op::MakeLink {
+      object,
+      path,
+      target,
+    } => Op::MakeLink {
+      object: ledger.get(object)?,
+      path,
+      target,
+    },
+    Op::UnmakeLink {
+      object,
+      path,
+      symlink_tag,
+    } => Op::UnmakeLink {
+      object: ledger.get(object)?,
+      path,
+      symlink_tag,
+    },
   })
 }
 
@@ -742,7 +795,13 @@ impl Served {
 fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
   Ok(FileInfo {
     file_attributes: crate::node_attributes(attr)?,
-    reparse_tag: 0,
+    // A link's tag (A-TBD): Windows reads it beside `FILE_ATTRIBUTE_REPARSE_POINT` in a listing and an open's
+    // information, and a program tells a symbolic link from another reparse point by it.
+    reparse_tag: if attr.kind == Kind::Symlink {
+      crate::symlink::IO_REPARSE_TAG_SYMLINK
+    } else {
+      0
+    },
     allocation_size: attr.size,
     file_size: attr.size,
     creation_time: filetime_from_unix_ns(attr.btime),
@@ -949,7 +1008,140 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       bridge.release(object.object, cx, object.fh)?;
       Reply::Ok
     }
+    Op::LinkByName { path } => match resolve(bridge, cx, &path) {
+      Ok(attr) => link_reply(bridge, cx, &attr)?,
+      Err(e) => Reply::Err(ntstatus(&e).as_i32()),
+    },
+    Op::LinkOf { object } => {
+      let attr = bridge.getattr(object.object, cx)?;
+      link_reply(bridge, cx, &attr)?
+    }
+    Op::MakeLink {
+      object,
+      path,
+      target,
+    } => op_make_link(bridge, cx, &path, object.object, &target)?,
+    Op::UnmakeLink {
+      object,
+      path,
+      symlink_tag,
+    } => op_unmake_link(bridge, cx, &path, object.object, symlink_tag)?,
   })
+}
+
+/// A link's target, or `None` for any other object (A-TBD).
+fn link_reply(bridge: &mut dyn Bridge, cx: &OpContext, attr: &NodeAttr) -> Result<Reply, VfsError> {
+  let target = match attr.kind {
+    Kind::Symlink => Some(bridge.readlink(ObjectId::new(attr.ino, attr.generation), cx)?),
+    _ => None,
+  };
+  Ok(Reply::Link { target })
+}
+
+/// The name `path` resolves to in its parent, checked to be the object an open names: a reparse request acts on the
+/// open's object, and a name another object has taken since is refused as a stale handle.
+fn opened_at<'p>(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &'p str,
+  opened: ObjectId,
+) -> Result<Result<(&'p str, ObjectId, NodeAttr), Ntstatus>, VfsError> {
+  let (name, parent) = match split_parent(bridge, cx, path)? {
+    Ok(pair) => pair,
+    Err(status) => return Ok(Err(status)),
+  };
+  let current = bridge.lookup(parent, cx, name)?;
+  if ObjectId::new(current.ino, current.generation) != opened {
+    return Err(VfsError::StaleHandle);
+  }
+  Ok(Ok((name, parent, current)))
+}
+
+/// `FSCTL_SET_REPARSE_POINT` with a symbolic link (A-TBD; [`Op::MakeLink`]). The volume cannot turn a file into a
+/// link in place, so the empty object is removed and a link made at its name, within this one request: the shard
+/// serves it whole and publishes after it, so no publication, and no crash, can show the name missing. The open
+/// keeps the removed object, as a POSIX open of an unlinked file does; Windows drops what it cached of the name
+/// (WinFsp's `FspFsvolFileSystemControlReparsePointComplete` invalidates the node's information), so its next open
+/// finds the link. A file with bytes refuses (`STATUS_DIRECTORY_NOT_EMPTY`), since a POSIX link keeps none, as a
+/// directory with entries does on NTFS.
+fn op_make_link(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &str,
+  opened: ObjectId,
+  target: &str,
+) -> Result<Reply, VfsError> {
+  let (name, parent, current) = match opened_at(bridge, cx, path, opened)? {
+    Ok(found) => found,
+    Err(status) => return Ok(Reply::Err(status)),
+  };
+  let directory = match current.kind {
+    Kind::Dir => {
+      bridge.rmdir(parent, cx, name)?;
+      u32::from(slates_vfs::inode::WindowsAttributes::LINK_DIRECTORY)
+    }
+    Kind::File if current.size != 0 => return Err(VfsError::NotEmpty),
+    Kind::File | Kind::Symlink => {
+      bridge.unlink(parent, cx, name)?;
+      0
+    }
+    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+  };
+  let link = bridge.symlink(parent, cx, name, target)?;
+  let link = bridge.setattr(
+    ObjectId::new(link.ino, link.generation),
+    cx,
+    SetAttr {
+      windows: Some(u32::from(current.windows) | directory),
+      ..SetAttr::default()
+    },
+  )?;
+  object_reply(&link, 0)
+}
+
+/// `FSCTL_DELETE_REPARSE_POINT` (A-TBD; [`Op::UnmakeLink`]): the link becomes an empty file, or an empty directory for
+/// a directory link, with the link's other attribute bits, made at its name within this one request as
+/// [`op_make_link`] makes a link. An object that is no link refuses `STATUS_NOT_A_REPARSE_POINT`, and a delete naming
+/// another tag `STATUS_IO_REPARSE_TAG_MISMATCH`, as WinFsp's `FspFileSystemCanReplaceReparsePoint` answers.
+fn op_unmake_link(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &str,
+  opened: ObjectId,
+  symlink_tag: bool,
+) -> Result<Reply, VfsError> {
+  let (name, parent, current) = match opened_at(bridge, cx, path, opened)? {
+    Ok(found) => found,
+    Err(status) => return Ok(Reply::Err(status)),
+  };
+  if current.kind != Kind::Symlink {
+    return Ok(Reply::Err(
+      crate::symlink::STATUS_NOT_A_REPARSE_POINT.as_i32(),
+    ));
+  }
+  if !symlink_tag {
+    return Ok(Reply::Err(
+      crate::symlink::STATUS_IO_REPARSE_TAG_MISMATCH.as_i32(),
+    ));
+  }
+  let link_directory = slates_vfs::inode::WindowsAttributes::LINK_DIRECTORY;
+  bridge.unlink(parent, cx, name)?;
+  let made = if current.windows & link_directory != 0 {
+    bridge.mkdir(parent, cx, name, DEFAULT_DIR_MODE)?
+  } else {
+    let (made, fh) = bridge.create(parent, cx, name, DEFAULT_FILE_MODE, 0)?;
+    bridge.release(ObjectId::new(made.ino, made.generation), cx, fh)?;
+    made
+  };
+  let made = bridge.setattr(
+    ObjectId::new(made.ino, made.generation),
+    cx,
+    SetAttr {
+      windows: Some(u32::from(current.windows & !link_directory)),
+      ..SetAttr::default()
+    },
+  )?;
+  object_reply(&made, 0)
 }
 
 /// Splits a WinFsp path into its final component and the resolved parent object (the directory the new
@@ -1367,7 +1559,9 @@ extern "C" fn get_security_by_name(
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
-  let op = match crate::dispatcher::private_path(&path) {
+  let private = crate::dispatcher::private_path(&path);
+  let plain = matches!(private, Ok(None));
+  let op = match private {
     Ok(None) => Op::Resolve { path },
     Ok(Some(crate::purge::PrivatePath::File(object))) => Op::PurgeResolve {
       object,
@@ -1388,9 +1582,222 @@ extern "C" fn get_security_by_name(
       // SAFETY: `p_sd_size`/`security_descriptor` follow WinFsp's in/out size protocol.
       unsafe { copy_security_descriptor(handler, security_descriptor, p_sd_size) }
     }
+    // A path through a link (A-TBD): the walk found no object, but a component before the last may be a link, which
+    // WinFsp follows when told where it is (memfs's `GetSecurityByName` does the same).
+    Reply::Err(status) if plain && !p_file_attributes.is_null() => match ffi::api() {
+      Ok(api) => {
+        let mut index = 0u32;
+        // SAFETY: the export takes our file system, our by-name callback, an unused context and this call's own name,
+        // into which it writes a terminator between components and puts each back; `p_file_attributes` is non-null
+        // and carries the link's index with `STATUS_REPARSE` (WinFsp's contract).
+        unsafe {
+          if (api.find_reparse_point)(
+            fs,
+            link_by_name,
+            std::ptr::null_mut(),
+            file_name,
+            &mut index,
+          ) == 0
+          {
+            return status;
+          }
+          *p_file_attributes = index;
+        }
+        crate::symlink::STATUS_REPARSE.as_i32()
+      }
+      Err(_) => status,
+    },
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
+}
+
+/// WinFsp's in/out reparse buffer: the bytes it offers and the length to report back; `None` when it asks only
+/// whether the object is a link (a null buffer).
+///
+/// # Safety
+/// `buffer` is null or holds `*size` writable bytes, and `size` is null or a writable `SIZE_T`, for the call.
+unsafe fn reparse_out<'call>(
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Option<(&'call mut [u8], &'call mut usize)> {
+  if buffer.is_null() || size.is_null() {
+    return None;
+  }
+  // SAFETY: both non-null and writable per the contract; the slice is the `*size` bytes WinFsp offers.
+  unsafe {
+    let capacity = *size;
+    Some((
+      std::slice::from_raw_parts_mut(buffer.cast::<u8>(), capacity),
+      &mut *size,
+    ))
+  }
+}
+
+/// Answers a link-or-not reply into WinFsp's reparse buffer (A-TBD): a link's reparse buffer and its length, success
+/// alone when WinFsp asked only whether it is one, and `STATUS_NOT_A_REPARSE_POINT` for another object.
+fn put_link(reply: Reply, out: Option<(&mut [u8], &mut usize)>) -> Ntstatus {
+  let target = match reply {
+    Reply::Link {
+      target: Some(target),
+    } => target,
+    Reply::Link { target: None } => return crate::symlink::STATUS_NOT_A_REPARSE_POINT.as_i32(),
+    Reply::Err(status) => return status,
+    _ => return crate::status_unsuccessful(),
+  };
+  let Some((buffer, size)) = out else {
+    return STATUS_SUCCESS.as_i32();
+  };
+  let data = match crate::symlink::reparse_data(&target) {
+    Ok(data) => data,
+    Err(refusal) => return refusal.status().as_i32(),
+  };
+  let Some(room) = buffer.get_mut(..data.len()) else {
+    return crate::symlink::STATUS_BUFFER_TOO_SMALL.as_i32();
+  };
+  room.copy_from_slice(&data);
+  *size = data.len();
+  STATUS_SUCCESS.as_i32()
+}
+
+/// WinFsp's `GetReparsePointByName` (A-TBD): the link at `file_name`, read on the shard without following it.
+extern "C" fn link_by_name(
+  fs: *mut FileSystem,
+  _context: Pvoid,
+  file_name: Pwstr,
+  _is_directory: Boolean,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus {
+  // SAFETY: our file system; `file_name` a NUL-terminated path, and `buffer`/`size` WinFsp's in/out buffer, all owned
+  // by WinFsp for this call.
+  let (handler, path, out) = unsafe {
+    (
+      handler(fs),
+      wide_to_string(file_name),
+      reparse_out(buffer, size),
+    )
+  };
+  put_link(handler.call(Op::LinkByName { path }), out)
+}
+
+/// `ResolveReparsePoints` (A-TBD): WinFsp's own resolver follows the path's links from `index`, asking
+/// [`link_by_name`] of each component, and leaves the path Windows opens instead in `buffer`.
+extern "C" fn resolve_reparse_points(
+  fs: *mut FileSystem,
+  file_name: Pwstr,
+  index: u32,
+  resolve_last: Boolean,
+  io_status: Pvoid,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus {
+  let Ok(api) = ffi::api() else {
+    return crate::status_unsuccessful();
+  };
+  // SAFETY: WinFsp passes its own name, status block, buffer and size through for the resolver's call, which takes
+  // our file system and our by-name callback.
+  unsafe {
+    (api.resolve_reparse_points)(
+      fs,
+      link_by_name,
+      std::ptr::null_mut(),
+      file_name,
+      index,
+      resolve_last,
+      io_status,
+      buffer,
+      size,
+    )
+  }
+}
+
+/// `GetReparsePoint` (`FSCTL_GET_REPARSE_POINT`, A-TBD): the link an open names.
+extern "C" fn get_reparse_point(
+  fs: *mut FileSystem,
+  context: Pvoid,
+  _file_name: Pwstr,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus {
+  // SAFETY: our file system and a live open-file context; `buffer`/`size` WinFsp's response buffer for this call.
+  let (handler, out) = unsafe { (handler(fs), reparse_out(buffer, size)) };
+  put_link(
+    handler.call(Op::LinkOf {
+      object: context_key(context),
+    }),
+    out,
+  )
+}
+
+/// The open's name and the reparse buffer a set or a delete hands over, copied out (A-TBD).
+///
+/// # Safety
+/// `fs` is our live file system, `file_name` the open's NUL-terminated name and `buffer` null or `size` readable
+/// bytes, all owned by WinFsp for the call.
+unsafe fn reparse_request<'fs>(
+  fs: *mut FileSystem,
+  file_name: Pwstr,
+  buffer: Pvoid,
+  size: usize,
+) -> (&'fs Handler, String, Vec<u8>) {
+  // SAFETY: the contract above.
+  unsafe {
+    let data = if buffer.is_null() {
+      Vec::new()
+    } else {
+      std::slice::from_raw_parts(buffer.cast::<u8>(), size).to_vec()
+    };
+    (handler(fs), wide_to_string(file_name), data)
+  }
+}
+
+/// A set's or a delete's answer: success once the shard made the change.
+fn changed(reply: Reply) -> Ntstatus {
+  match reply {
+    Reply::Object { .. } => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
+}
+
+/// `SetReparsePoint` (`FSCTL_SET_REPARSE_POINT`, A-TBD): a symbolic link's buffer makes the open's object a link
+/// ([`Op::MakeLink`]); any other tag is answered as before links were served (`crate::symlink::Refusal::Tag`).
+extern "C" fn set_reparse_point(
+  fs: *mut FileSystem,
+  context: Pvoid,
+  file_name: Pwstr,
+  buffer: Pvoid,
+  size: usize,
+) -> Ntstatus {
+  // SAFETY: our file system, the open's name and the request's `size` bytes, owned by WinFsp for this call.
+  let (handler, path, data) = unsafe { reparse_request(fs, file_name, buffer, size) };
+  match crate::symlink::target(&data) {
+    Ok(target) => changed(handler.call(Op::MakeLink {
+      object: context_key(context),
+      path,
+      target,
+    })),
+    Err(refusal) => refusal.status().as_i32(),
+  }
+}
+
+/// `DeleteReparsePoint` (`FSCTL_DELETE_REPARSE_POINT`, A-TBD): the open's link becomes an empty object
+/// ([`Op::UnmakeLink`]).
+extern "C" fn delete_reparse_point(
+  fs: *mut FileSystem,
+  context: Pvoid,
+  file_name: Pwstr,
+  buffer: Pvoid,
+  size: usize,
+) -> Ntstatus {
+  // SAFETY: our file system, the open's name and the request's `size` bytes, owned by WinFsp for this call.
+  let (handler, path, data) = unsafe { reparse_request(fs, file_name, buffer, size) };
+  changed(handler.call(Op::UnmakeLink {
+    object: context_key(context),
+    path,
+    symlink_tag: crate::symlink::tag(&data) == Some(crate::symlink::IO_REPARSE_TAG_SYMLINK),
+  }))
 }
 
 /// Copies the handler's reference security descriptor into WinFsp's buffer following the in/out size
@@ -1895,6 +2302,10 @@ static INTERFACE: Interface = Interface {
   can_delete: Some(can_delete),
   rename: Some(rename),
   read_directory: Some(read_directory),
+  resolve_reparse_points: Some(resolve_reparse_points),
+  get_reparse_point: Some(get_reparse_point),
+  set_reparse_point: Some(set_reparse_point),
+  delete_reparse_point: Some(delete_reparse_point),
   ..Interface::EMPTY
 };
 
@@ -1984,6 +2395,10 @@ impl Mounted {
       | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
+      // A volume symlink is a Windows symbolic link (A-TBD): WinFsp asks the reparse slots and follows each link it
+      // meets while opening a path. Access checks on links are left off (`ReparsePointsAccessCheck`), as WinFsp's own
+      // memfs leaves them, so no privilege is needed to make one (R10).
+      | ffi::VOLUME_FLAG_REPARSE_POINTS
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed

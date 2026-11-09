@@ -457,6 +457,15 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 130 -> 146 on 2026-11-09 (A-TBD, Windows symbolic links), each new site measured by `cargo
+# xtask unsafe`: in `ffi.rs` the four reparse slots' callback signatures and the three new export types
+# (`GetReparsePointByName`'s callback, `FspFileSystemResolveReparsePoints`, `FspFileSystemFindReparsePoint`), 7; in
+# `host.rs` the call of `FspFileSystemFindReparsePoint` with its index write in `get_security_by_name`, the call of
+# `FspFileSystemResolveReparsePoints`, `reparse_out` (an unsafe fn and its block: WinFsp's in/out reparse buffer as a
+# slice), `reparse_request` (an unsafe fn and its block: the set's or delete's name and bytes), and one block in each
+# of `link_by_name`, `get_reparse_point`, `set_reparse_point` and `delete_reparse_point` taking the handler and
+# buffers, 9. Every other step of the reparse work (the buffer's encoding and decoding, `crate::symlink`; the shard's
+# link operations) is safe Rust.
 # slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
 # version check, replacing the read of the reserved field that check once looked at, so a net one more).
 # slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
@@ -509,7 +518,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 130
+slates-bridge-winfsp = 146
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

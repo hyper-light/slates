@@ -3336,7 +3336,7 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
     .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
-  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows);
+  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows, inode.kind);
 }
 
 fn child_for(

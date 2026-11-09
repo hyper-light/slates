@@ -69,6 +69,9 @@ mod reply;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
+// Windows symbolic links: the map between the volume's link target and the reparse buffer Windows reads and sets
+// (A-TBD). Pure, so it is tested on every host.
+pub mod symlink;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API

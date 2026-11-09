@@ -338,7 +338,11 @@ impl XattrTable {
 /// display hint), so it is kept as metadata and leaves the mode alone. The bits keep Windows' own values, so a
 /// WinFsp reply and a Windows landing use them as they are; they fit in the two bytes alignment leaves at the end of
 /// an [`Inode`], so no inode grows (AC-1.5; 168 bytes, `cargo run -p slates-vfs --example tree_heap`). Linux and
-/// macOS carry them in the volume and apply none.
+/// macOS carry them in the volume and apply none. A symlink also keeps `FILE_ATTRIBUTE_DIRECTORY` (A-TBD): Windows links
+/// come in two kinds, a file link and a directory link (`SYMBOLIC_LINK_FLAG_DIRECTORY`), told apart by that bit alone
+/// and removed by `DeleteFile` and `RemoveDirectory` respectively; a POSIX link has no kind, so the bit is what a
+/// Windows directory link leaves in the volume. A link made on Linux or macOS has none and is a file link on Windows,
+/// which Windows follows into a directory all the same (WinFsp's resolver does not check a link's kind).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowsAttributes(u16);
 
@@ -355,7 +359,10 @@ impl WindowsAttributes {
   pub const OFFLINE: u16 = 0x1000;
   /// Format: `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`.
   pub const NOT_CONTENT_INDEXED: u16 = 0x2000;
-  /// Format: every bit kept, a directory's `READONLY` among them.
+  /// Format: `FILE_ATTRIBUTE_DIRECTORY`, kept for a symlink alone: a Windows directory link (A-TBD). A directory's is
+  /// its kind, never a bit.
+  pub const LINK_DIRECTORY: u16 = 0x0010;
+  /// Format: every bit kept on any kind, a directory's `READONLY` among them.
   pub const KEPT: u16 = Self::READONLY
     | Self::HIDDEN
     | Self::SYSTEM
@@ -363,22 +370,27 @@ impl WindowsAttributes {
     | Self::OFFLINE
     | Self::NOT_CONTENT_INDEXED;
 
-  /// The bits of `bits` (a Win32 attribute word) this volume keeps for an object of `kind`: a file's `READONLY` is its
-  /// mode, never a bit, and every bit outside [`WindowsAttributes::KEPT`] (the directory bit, a reparse point's, the
-  /// ones the drive derives) is dropped.
-  pub fn kept(bits: u32, kind: Kind) -> WindowsAttributes {
-    let kept = u32::from(Self::KEPT)
-      & if kind == Kind::Dir {
-        u32::MAX
-      } else {
-        !u32::from(Self::READONLY)
-      };
-    WindowsAttributes(u16::try_from(bits & kept).unwrap_or(0))
+  /// The bits of [`WindowsAttributes::KEPT`] and [`WindowsAttributes::LINK_DIRECTORY`] an object of `kind` keeps: a
+  /// file's or a link's `READONLY` is no bit (a file's is its mode), and the directory bit is a link's alone.
+  fn kept_for(kind: Kind) -> u16 {
+    match kind {
+      Kind::Dir => Self::KEPT,
+      Kind::Symlink => (Self::KEPT & !Self::READONLY) | Self::LINK_DIRECTORY,
+      Kind::File | Kind::Fifo | Kind::Socket => Self::KEPT & !Self::READONLY,
+    }
   }
 
-  /// The bits as an image carries them.
-  pub fn from_image(bits: u16) -> WindowsAttributes {
-    WindowsAttributes(bits & Self::KEPT)
+  /// The bits of `bits` (a Win32 attribute word) this volume keeps for an object of `kind`: a file's `READONLY` is its
+  /// mode, never a bit, a link keeps whether it is a directory link, and every other bit (a directory's own, a reparse
+  /// point's, the ones the drive derives) is dropped.
+  pub fn kept(bits: u32, kind: Kind) -> WindowsAttributes {
+    WindowsAttributes(u16::try_from(bits & u32::from(Self::kept_for(kind))).unwrap_or(0))
+  }
+
+  /// The bits as an image or the disk carries them for an object of `kind`. Before A-TBD every kind was masked with
+  /// [`WindowsAttributes::KEPT`] alone, so an older image carries no link's directory bit and reads as it did.
+  pub fn from_image(bits: u16, kind: Kind) -> WindowsAttributes {
+    WindowsAttributes(bits & (Self::KEPT | (Self::kept_for(kind) & Self::LINK_DIRECTORY)))
   }
 
   /// The bits, at Windows' own values.
@@ -525,13 +537,17 @@ impl Inode {
   ) -> bool {
     let changed = self.attrs.size != size
       || metadata.is_some_and(|(mode, uid, gid, windows)| {
-        (mode, uid, gid, WindowsAttributes::from_image(windows))
-          != (
-            self.attrs.mode,
-            self.attrs.uid,
-            self.attrs.gid,
-            self.windows,
-          )
+        (
+          mode,
+          uid,
+          gid,
+          WindowsAttributes::from_image(windows, self.kind),
+        ) != (
+          self.attrs.mode,
+          self.attrs.uid,
+          self.attrs.gid,
+          self.windows,
+        )
       })
       || self.attrs.mtime != mtime
       || self.attrs.ctime != ctime;
@@ -543,7 +559,7 @@ impl Inode {
       self.attrs.mode = mode;
       self.attrs.uid = uid;
       self.attrs.gid = gid;
-      self.windows = WindowsAttributes::from_image(windows);
+      self.windows = WindowsAttributes::from_image(windows, self.kind);
     }
     self.attrs.mtime = mtime;
     self.stamp_change(ctime);

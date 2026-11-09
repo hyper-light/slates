@@ -86,6 +86,9 @@ pub(crate) const VOLUME_FLAG_CASE_PRESERVED_NAMES: u32 = 1 << 1;
 pub(crate) const VOLUME_FLAG_UNICODE_ON_DISK: u32 = 1 << 2;
 /// Format: `PersistentAcls` — bit 3 (the file system enforces access-control lists).
 pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
+/// Format: `ReparsePoints` — bit 4: the file system serves reparse points, so WinFsp calls the reparse slots and
+/// follows a symbolic link it finds while opening a path (A-TBD; `fsctl.h` v2.1, `FSP_FSCTL_VOLUME_PARAMS_V0_FIELD_DEFN`).
+pub(crate) const VOLUME_FLAG_REPARSE_POINTS: u32 = 1 << 4;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
@@ -216,10 +219,28 @@ pub(crate) struct Interface {
   pub(crate) read_directory: Option<
     unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pwstr, Pvoid, u32, *mut u32) -> Ntstatus,
   >,
-  pub(crate) resolve_reparse_points: OpaqueCallback,
-  pub(crate) get_reparse_point: OpaqueCallback,
-  pub(crate) set_reparse_point: OpaqueCallback,
-  pub(crate) delete_reparse_point: OpaqueCallback,
+  /// `ResolveReparsePoints(FileSystem, FileName, ReparsePointIndex, ResolveLastPathComponent, PIoStatus, Buffer,
+  /// PSize)`; the status block is passed through to [`ResolveReparsePointsFn`] unread.
+  pub(crate) resolve_reparse_points: Option<
+    unsafe extern "C" fn(
+      *mut FileSystem,
+      Pwstr,
+      u32,
+      Boolean,
+      Pvoid,
+      Pvoid,
+      *mut usize,
+    ) -> Ntstatus,
+  >,
+  /// `GetReparsePoint(FileSystem, FileContext, FileName, Buffer, PSize)`.
+  pub(crate) get_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, *mut usize) -> Ntstatus>,
+  /// `SetReparsePoint(FileSystem, FileContext, FileName, Buffer, Size)`.
+  pub(crate) set_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, usize) -> Ntstatus>,
+  /// `DeleteReparsePoint(FileSystem, FileContext, FileName, Buffer, Size)`.
+  pub(crate) delete_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, usize) -> Ntstatus>,
   pub(crate) get_stream_info: OpaqueCallback,
   pub(crate) get_dir_info_by_name: OpaqueCallback,
   pub(crate) control: OpaqueCallback,
@@ -315,6 +336,40 @@ pub(crate) type NotifyFn = unsafe extern "system" fn(
   size: usize,
 ) -> Ntstatus;
 
+/// The `GetReparsePointByName` callback WinFsp's reparse helpers take (`winfsp.h` v2.1): the reparse buffer of the
+/// object at `FileName` (`IsDirectory` when more of the path follows), `STATUS_NOT_A_REPARSE_POINT` for another object,
+/// `STATUS_OBJECT_NAME_NOT_FOUND` for none; a null `Buffer` asks only whether it is one.
+pub(crate) type ReparsePointByNameFn = unsafe extern "C" fn(
+  file_system: *mut FileSystem,
+  context: Pvoid,
+  file_name: Pwstr,
+  is_directory: Boolean,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus;
+/// `FspFileSystemResolveReparsePoints` (`winfsp.h` v2.1; `src/dll/fsop.c`): follows the links in `FileName` from the
+/// component at `ReparsePointIndex`, asking each by name, and leaves the path Windows opens instead in `Buffer`.
+pub(crate) type ResolveReparsePointsFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  by_name: ReparsePointByNameFn,
+  context: Pvoid,
+  file_name: Pwstr,
+  reparse_point_index: u32,
+  resolve_last_path_component: Boolean,
+  io_status: Pvoid,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus;
+/// `FspFileSystemFindReparsePoint` (`winfsp.h` v2.1): whether a component of `FileName` before its last is a reparse
+/// point, and the index of the first.
+pub(crate) type FindReparsePointFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  by_name: ReparsePointByNameFn,
+  context: Pvoid,
+  file_name: Pwstr,
+  reparse_point_index: *mut u32,
+) -> Boolean;
+
 /// `FspVersion` (`winfsp.h`): the DLL's file version, major in the high 16 bits and minor in the low.
 pub(crate) type VersionFn = unsafe extern "system" fn(version: *mut u32) -> Ntstatus;
 
@@ -332,6 +387,8 @@ pub(crate) struct Api {
   pub(crate) notify_end: NotifyEndFn,
   pub(crate) notify: NotifyFn,
   pub(crate) version: VersionFn,
+  pub(crate) resolve_reparse_points: ResolveReparsePointsFn,
+  pub(crate) find_reparse_point: FindReparsePointFn,
 }
 
 /// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
@@ -370,6 +427,8 @@ fn load() -> Result<Api, Ntstatus> {
     notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
     notify: symbol(module, c"FspFileSystemNotify")?,
     version: symbol(module, c"FspVersion")?,
+    resolve_reparse_points: symbol(module, c"FspFileSystemResolveReparsePoints")?,
+    find_reparse_point: symbol(module, c"FspFileSystemFindReparsePoint")?,
   })
 }
 
@@ -445,6 +504,8 @@ impl Export for NotifyBeginFn {}
 impl Export for NotifyEndFn {}
 impl Export for NotifyFn {}
 impl Export for VersionFn {}
+impl Export for ResolveReparsePointsFn {}
+impl Export for FindReparsePointFn {}
 
 /// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
 /// export it.
