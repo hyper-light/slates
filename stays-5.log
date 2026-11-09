@@ -1,0 +1,30 @@
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1932: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120168: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77388192: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5157: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794240247322491795 head 1279 bytes 5528851
+LD-IMAGE wall_ns 1794240248894362314 head 3557 bytes 15481925
+LD-TL stopped_on_install Some(24987) after 243.05611ms
+LD-TL resume wall_ns 1794240268985566552
+LD-TAKE wall_ns 1794240268996297425 from 16934047481587924995 reply Ok(Some(3557))
+LD-LANE install wall_ns 1794240268998560347 holder 12558599076479233551 bytes 15482010 budget_ns 30000000000 took_ns 20100705730 answered true cut false
+LD-IMAGE wall_ns 1794240269689596320 head 35153 bytes 154210900
+LD-TAKE wall_ns 1794240269894564327 from 16934047481587924995 reply Ok(Some(3557))
+LD-LANE install wall_ns 1794240269897175026 holder 12558599076479233551 bytes 15482010 budget_ns 30000000000 took_ns 898509950 answered true cut false
+LD-TAKE wall_ns 1794240271089516987 from 16934047481587924995 reply Ok(Some(35153))
+LD-LANE install wall_ns 1794240271108036034 holder 12558599076479233551 bytes 154210985 budget_ns 30000000000 took_ns 1100673542 answered true cut false
+LD-TAKE wall_ns 1794240272343629405 from 16934047481587924995 reply Ok(Some(35153))
+LD-LANE install wall_ns 1794240272365464842 holder 12558599076479233551 bytes 154210985 budget_ns 30000000000 took_ns 1243521031 answered true cut false
+LD-TL caught Some(33.833757208s)
+LD-TL durable Some(42680) then Some(42686) after 11.987096ms
+LD-TL writes 42636
+LD-WHY wall_ns 1794240268998590681 behind_tail holder 12558599076479233551 reported Some(3557) head Some(35152) checkpoint Some(3557) oldest Some(33370) retained 1783 bytes 15479972 retain_bytes 15481925
+LD-WHY wall_ns 1794240269897200040 behind_tail holder 12558599076479233551 reported Some(3557) head Some(35172) checkpoint Some(35153) oldest Some(33371) retained 1802 bytes 22612056 retain_bytes 154210900
