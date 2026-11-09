@@ -13928,6 +13928,12 @@ rule's reader), `crates/server` (`fuse.rs`: `fuse.writeback_conflicts` and `fuse
 rule), `crates/cli` (`tests/cli.rs`: the dirty-page, truncation and unsynced-history tests, and A-152's release test for
 U10's rule; `tests/guest_dax.rs`: the oracle), the bug record
 `docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+- **A third count (2026-11-09).** `fuse.writebacks_applied` counts write-backs applied with no stale byte at all. The
+  dirty-page test reads it to prove its precondition, that the store's page was still dirty when the other path wrote.
+  On kernel 7.3 a process spawn while a shared-map page is dirty writes it back at once, and that write-back is fresh,
+  so it is applied and the rule is never exercised. Applied in the same change to: GAPS, `crates/bridge-fuse`
+  (`channel.rs`), `crates/server` (`fuse.rs`), `crates/cli` (`tests/cli.rs`), the bug record
+  `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 - **The decision.** Ada, 2026-11-07, asked whether the host FUSE mount should go on applying a stale write-back outside
   its stale bytes (A-139, A-140) or refuse it as NFS does (A-192): "Refuse, like NFS."
 - **Changes §4.6.** A `FUSE_WRITE_CACHE` write-back is applied whole or refused whole. One whose stale bytes (another

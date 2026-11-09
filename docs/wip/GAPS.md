@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
+> `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
+> Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
+> kernel 7.3 a process spawn while the page is dirty does that: 6 attempts of 6 with a spawn in the window. That
+> write-back is fresh and rightly applied, so the run tested nothing. The daemon now counts `fuse.writebacks_applied`.
+> The test reads it around each store and retries an attempt whose precondition did not hold, up to 6, then fails
+> naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
+> `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
+
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
