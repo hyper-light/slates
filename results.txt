@@ -1,0 +1,13 @@
+e99829c cli tests: the Unix own-mount landing test asserts the typed refusal, not the word -- a TargetUnavaila on ubuntu-latest
+steps: build success, test success
+test a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open ... slates anchor: instance cli-ownland-5542 up; daemon pid 5551; 1 shards
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 0.62s
+--- the log's last lines
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 10337, timers: 10337 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fl
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: instance cli-ownland-5542 serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 2497 µs, 2480 µs of its CPU, in 3 slices of 7 units; the longest slice 1773 µs, the most CPU in one 1838 µs, ending at unit 2 (a slice's floor 4 µs, 119 µs yielding)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 0.62s
+
