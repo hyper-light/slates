@@ -1,0 +1,2 @@
+tested 8548d54c04ed317ce62e752223a20a864c1fe57d on ubuntu-latest
+build exit 0
