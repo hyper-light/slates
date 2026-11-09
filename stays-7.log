@@ -1,0 +1,26 @@
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120114: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77593644: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794239446848571190 head 8 bytes 39532
+LD-TAKE wall_ns 1794239446848882582 from 9368445594161413316 reply Ok(Some(8))
+LD-LANE install wall_ns 1794239446848966286 holder 4718032268241453962 bytes 39617 budget_ns 1000149244 took_ns 370089 answered true cut false
+LD-IMAGE wall_ns 1794239446855329135 head 33 bytes 147447
+LD-TAKE wall_ns 1794239446861401783 from 9368445594161413316 reply Ok(Some(33))
+LD-LANE install wall_ns 1794239446861547970 holder 13706390799151169165 bytes 147532 budget_ns 30000000000 took_ns 6114440 answered true cut false
+LD-IMAGE wall_ns 1794239447974112669 head 2047 bytes 8846403
+thread 'diag_a_holder_stopped_mid_install_stays_stopped' (9919) panicked at crates/cli/tests/live_chaos.rs:1773:42:
+LD-WHY wall_ns 1794239446848169424 off_chain holder 4718032268241453962 reported Some(3) head Some(7) checkpoint Some(0) oldest Some(4) retained 4 bytes 19056 retain_bytes 5012
+LD-WHY wall_ns 1794239446852937948 off_chain holder 13706390799151169165 reported Some(16) head Some(24) checkpoint Some(8) oldest Some(17) retained 8 bytes 38128 retain_bytes 39532
+LD-WHY wall_ns 1794239446853370319 off_chain holder 13706390799151169165 reported Some(17) head Some(26) checkpoint Some(8) oldest Some(19) retained 8 bytes 38128 retain_bytes 39532
+LD-WHY wall_ns 1794239446853806115 off_chain holder 13706390799151169165 reported Some(18) head Some(28) checkpoint Some(8) oldest Some(21) retained 8 bytes 38128 retain_bytes 39532
+LD-WHY wall_ns 1794239446854224326 off_chain holder 13706390799151169165 reported Some(19) head Some(30) checkpoint Some(8) oldest Some(23) retained 8 bytes 38128 retain_bytes 39532
+LD-WHY wall_ns 1794239446854654744 off_chain holder 13706390799151169165 reported Some(20) head Some(32) checkpoint Some(8) oldest Some(25) retained 8 bytes 38128 retain_bytes 39532
