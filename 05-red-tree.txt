@@ -1,0 +1,17 @@
+ crates/bridge-winfsp/src/host.rs | 4 ----
+ 1 file changed, 4 deletions(-)
+diff --git a/crates/bridge-winfsp/src/host.rs b/crates/bridge-winfsp/src/host.rs
+index 374fcf800..2def94928 100644
+--- a/crates/bridge-winfsp/src/host.rs
++++ b/crates/bridge-winfsp/src/host.rs
+@@ -2302,10 +2302,6 @@ static INTERFACE: Interface = Interface {
+   can_delete: Some(can_delete),
+   rename: Some(rename),
+   read_directory: Some(read_directory),
+-  resolve_reparse_points: Some(resolve_reparse_points),
+-  get_reparse_point: Some(get_reparse_point),
+-  set_reparse_point: Some(set_reparse_point),
+-  delete_reparse_point: Some(delete_reparse_point),
+   ..Interface::EMPTY
+ };
+ 
