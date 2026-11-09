@@ -5737,8 +5737,8 @@ a holder answers from its own records with no routing filter, and the successor 
 line of its authority, or of the owner an install moved that authority from (shape (i): 0 lost, none of the asker's own
 objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
 "the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
-The held image persists `Acceptor::moved_from` (image version 23; raft-7 takes the next number if it lands second). (d),
-the process test, is built.
+**Owed, after raft-7 (A-270) lands:** the held image carrying `Acceptor::moved_from`, with the next image version and an
+old image refused typed; until then a warm restart forgets an earlier move. (d), the process test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

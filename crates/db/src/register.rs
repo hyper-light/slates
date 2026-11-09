@@ -1469,6 +1469,42 @@ pub struct Acceptor {
 /// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
 pub type AcceptedPositions = Vec<(ObjectId, u64, HostEpoch, Vec<u8>)>;
 
+/// One acceptor's durable state as a recovery image keeps it (§4.8 "persistence before reply"; A-251): the owner and
+/// configuration generation it serves under, the epoch its fence has seen, every position it accepted, and the retired
+/// owner an install last moved its authority from. [`Acceptor::to_persisted`] makes it and [`Acceptor::from_persisted`]
+/// rebuilds the same acceptor from it, so a restarted holder lists, refuses and accepts as it did before.
+///
+/// Format: the `Wire` encoding of its fields in this order. The moved-from owner is last, so the layout without it (the
+/// held image's register before A-251) is refused as truncated, never read as "moved from none" (CLAUDE.md §2.7); the
+/// image's version is what refuses an older image whole.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PersistedAcceptor {
+  /// The owner it serves under ([`Authority::owner`]).
+  pub owner: HostId,
+  /// The configuration generation it serves under ([`Authority::generation`]).
+  pub generation: u64,
+  /// The highest epoch its fence has seen.
+  pub promised: u64,
+  /// Every position it accepted, in key order.
+  pub accepted: Vec<PersistedPosition>,
+  /// The retired owner an install last moved its authority from ([`Acceptor::moved_from`]).
+  pub moved_from: Option<HostId>,
+}
+
+/// One accepted position of a [`PersistedAcceptor`]: the object, its ledger position, the epoch it was accepted at and
+/// the record's bytes.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PersistedPosition {
+  /// The object the record belongs to.
+  pub object: [u8; 16],
+  /// Its ledger position.
+  pub sequence: u64,
+  /// The epoch it was accepted at.
+  pub epoch: u64,
+  /// The record's bytes.
+  pub value: Vec<u8>,
+}
+
 impl Acceptor {
   /// A fresh acceptor for holder `id` serving under `authority`, having accepted nothing.
   pub fn new(id: HostId, authority: Authority) -> Acceptor {
@@ -1523,15 +1559,56 @@ impl Acceptor {
   }
 
   /// The retired owner an install last moved this acceptor's authority from ([`Acceptor::move_authority`]), `None` when
-  /// none has (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::with_moved_from`]).
+  /// none has (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::to_persisted`]).
   pub fn moved_from(&self) -> Option<HostId> {
     self.moved_from
   }
 
-  /// This acceptor with `moved_from` restored from its persisted state.
-  pub fn with_moved_from(mut self, moved_from: Option<HostId>) -> Acceptor {
-    self.moved_from = moved_from;
-    self
+  /// This acceptor's whole durable state, its moved-from owner too, as a recovery image keeps it (A-251).
+  pub fn to_persisted(&self) -> PersistedAcceptor {
+    let (promised, accepted) = self.persisted();
+    PersistedAcceptor {
+      owner: self.authority.owner,
+      generation: self.authority.generation,
+      promised: promised.0,
+      accepted: accepted
+        .into_iter()
+        .map(|(object, sequence, epoch, value)| PersistedPosition {
+          object: object.0,
+          sequence,
+          epoch: epoch.0,
+          value,
+        })
+        .collect(),
+      moved_from: self.moved_from,
+    }
+  }
+
+  /// The acceptor holder `id` kept as `persisted` ([`Acceptor::to_persisted`]), rebuilt after a restart.
+  pub fn from_persisted(id: HostId, persisted: PersistedAcceptor) -> Acceptor {
+    let accepted = persisted
+      .accepted
+      .into_iter()
+      .map(|position| {
+        (
+          ObjectId(position.object),
+          position.sequence,
+          HostEpoch(position.epoch),
+          position.value,
+        )
+      })
+      .collect();
+    let mut acceptor = Acceptor::recovered(
+      id,
+      Authority {
+        generation: persisted.generation,
+        owner: persisted.owner,
+      },
+      HostEpoch(persisted.promised),
+      accepted,
+    );
+    acceptor.moved_from = persisted.moved_from;
+    acceptor
   }
 
   /// The configuration generation this acceptor serves under: what a recovery image keeps with its records, so a
@@ -4753,6 +4830,134 @@ mod tests {
       let mut trailing = bytes.clone();
       trailing.push(0);
       assert!(!decodes(&trailing), "a stray byte after the list");
+    }
+  }
+
+  /// An acceptor with two accepted records, moved from a retired owner, for the persisted-state tests (A-251).
+  fn moved_acceptor() -> Acceptor {
+    let generation = 9;
+    let mut acceptor = Acceptor::new(
+      HostId(5),
+      Authority {
+        generation,
+        owner: HostId(1),
+      },
+    );
+    let object = ObjectId::new(HostId(1), 3);
+    for (sequence, value) in [(1, b"first".to_vec()), (2, b"second".to_vec())] {
+      acceptor
+        .accept(&Record {
+          object,
+          sequence,
+          epoch: FIRST_EPOCH,
+          generation,
+          owner: HostId(1),
+          value,
+        })
+        .unwrap();
+    }
+    acceptor
+      .move_authority(
+        Authority {
+          generation,
+          owner: HostId(2),
+        },
+        true,
+      )
+      .unwrap();
+    acceptor
+  }
+
+  /// A-251: an acceptor's persisted state round-trips through its encoding whole, its moved-from owner too, and the
+  /// encoding is canonical. Do: encode a moved acceptor's state, decode it, rebuild, and encode again. Expect: the same
+  /// authority, moved-from owner, fence and positions, and the same bytes.
+  #[test]
+  fn an_acceptors_persisted_state_round_trips_through_its_encoding() {
+    use slates_wire::Wire;
+    let acceptor = moved_acceptor();
+    let bytes = acceptor.to_persisted().to_bytes();
+    let rebuilt =
+      Acceptor::from_persisted(HostId(5), PersistedAcceptor::from_bytes(&bytes).unwrap());
+    assert_eq!(rebuilt.authority(), acceptor.authority());
+    assert_eq!(rebuilt.moved_from(), Some(HostId(1)));
+    assert_eq!(rebuilt.persisted(), acceptor.persisted());
+    assert_eq!(rebuilt.to_persisted().to_bytes(), bytes);
+  }
+
+  /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its bounds: a body cut at every byte and a
+  /// stray byte after it are each a typed refusal, with and without a moved-from owner. The layout before A-251 (no
+  /// moved-from owner) is refused as truncated, never read as "moved from none" (§2.7).
+  #[test]
+  fn a_cut_or_overlong_persisted_acceptor_is_refused() {
+    use slates_wire::{Wire, WireError};
+    let mut acceptor = moved_acceptor();
+    let moved = acceptor.to_persisted().to_bytes();
+    acceptor.moved_from = None;
+    let unmoved = acceptor.to_persisted().to_bytes();
+    for bytes in [&moved, &unmoved] {
+      for cut in 0..bytes.len() {
+        assert!(
+          matches!(
+            PersistedAcceptor::from_bytes(&bytes[..cut]),
+            Err(WireError::Truncated { .. })
+          ),
+          "cut at {cut}"
+        );
+      }
+      let mut trailing = bytes.clone();
+      trailing.push(0);
+      assert!(matches!(
+        PersistedAcceptor::from_bytes(&trailing),
+        Err(WireError::TrailingBytes { count: 1 })
+      ));
+    }
+    // The layout before A-251: the same fields without the moved-from owner's option.
+    let host_bytes = HostId(0).to_bytes().len();
+    let before = &moved[..moved.len() - 1 - host_bytes];
+    assert!(matches!(
+      PersistedAcceptor::from_bytes(before),
+      Err(WireError::Truncated { .. })
+    ));
+  }
+
+  /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its contents: an accepted count and a
+  /// record length of `u32::MAX` and a foreign tag where the moved-from owner's option is are each a typed refusal, and
+  /// no single flipped bit panics: it is refused or decodes to a state that rebuilds and encodes back to the flipped
+  /// bytes.
+  #[test]
+  fn a_hostile_persisted_acceptor_is_refused() {
+    use slates_wire::{Wire, WireError};
+    let moved = moved_acceptor().to_persisted().to_bytes();
+    let host_bytes = HostId(0).to_bytes().len();
+    // Lengths past what arrived: the accepted count, then the first record's value length.
+    let count_at = host_bytes + 2 * size_of::<u64>();
+    let value_length_at = count_at + size_of::<u32>() + OBJECT_BYTES + 2 * size_of::<u64>();
+    for at in [count_at, value_length_at] {
+      let mut lying = moved.clone();
+      lying[at..at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+      assert!(
+        matches!(
+          PersistedAcceptor::from_bytes(&lying),
+          Err(WireError::Truncated { .. })
+        ),
+        "a length of u32::MAX at {at}"
+      );
+    }
+    let mut foreign = moved.clone();
+    let tag_at = moved.len() - 1 - host_bytes;
+    foreign[tag_at] = slates_wire::codec::OPTION_SOME + 1;
+    assert!(matches!(
+      PersistedAcceptor::from_bytes(&foreign),
+      Err(WireError::BadTag { .. })
+    ));
+    for bit in 0..moved.len() * 8 {
+      let mut flipped = moved.clone();
+      flipped[bit / 8] ^= 1 << (bit % 8);
+      if let Ok(decoded) = PersistedAcceptor::from_bytes(&flipped) {
+        let rebuilt = Acceptor::from_persisted(HostId(5), decoded.clone());
+        assert_eq!(decoded.to_bytes(), flipped, "bit {bit} decodes canonically");
+        assert_eq!(rebuilt.moved_from(), decoded.moved_from, "bit {bit}");
+      }
     }
   }
 

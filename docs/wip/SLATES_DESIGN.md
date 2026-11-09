@@ -19894,9 +19894,14 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
   - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
     retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
     holds one owner, overwritten by the next such move, never a list.
-  - **The image.** The held image carries the field (`HeldRegister::moved_from`), so a warm restart keeps it, and the
-    image layout is version 23. Agreed with raft's raft-7 (A-270, image 23, delta 6): whichever of the two lands second
-    takes the next number. An image of another version is refused typed, as every version change before it was.
+  - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
+    owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
+    test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
+    byte. The layout without the field is refused as truncated, never read as "moved from none".
+  - **The image (owed, after raft-7).** raft-7 (A-270, image 23, delta 6) lands first. Then the held image's register
+    piece is this encoding, with the next image version, and an image of another version is refused typed
+    (`VfsError::RecoveryVersion`). A missing field is never read as none: that would be the compatibility shim §2.7
+    forbids. Until then a warm restart forgets an earlier move, as main does today.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.

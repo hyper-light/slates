@@ -553,6 +553,41 @@ mod tests {
     );
   }
 
+  /// The acceptor's persisted state round-trips with the field (A-251): what a restart rebuilds from its encoded image
+  /// (`PersistedAcceptor`) is the acceptor it was, so the one listing rule reads the same copy the same way after it. Do:
+  /// move a copy holding a record from a retired owner to its successor; encode its persisted state, decode it and
+  /// rebuild. Expect: the same authority, moved-from owner, fence and positions, and the copy still falls to the round.
+  #[test]
+  fn an_acceptors_persisted_state_round_trips_with_its_moved_from_owner() {
+    let (regional, asker, theirs, _) = retired_region();
+    let departed = HostId(1);
+    let generation = regional.version;
+    let mut copy = acceptor(HostId(5), departed, generation, Some((theirs[0], 2)));
+    copy
+      .move_authority(
+        Authority {
+          generation,
+          owner: asker,
+        },
+        true,
+      )
+      .unwrap();
+    let bytes = slates_wire::Wire::to_bytes(&copy.to_persisted());
+    let decoded: crate::register::PersistedAcceptor =
+      slates_wire::Wire::from_bytes(&bytes).unwrap();
+    let rebuilt = Acceptor::from_persisted(HostId(5), decoded);
+    assert_eq!(rebuilt.authority(), copy.authority());
+    assert_eq!(rebuilt.moved_from(), Some(departed));
+    assert_eq!(rebuilt.persisted(), copy.persisted());
+    assert_eq!(
+      copy_falls_to(&regional, &rebuilt, theirs[0], departed, asker),
+      copy_falls_to(&regional, &copy, theirs[0], departed, asker)
+    );
+    assert!(copy_falls_to(
+      &regional, &rebuilt, theirs[0], departed, asker
+    ));
+  }
+
   /// Shape (i) as one rule: a copy an install moved from the retired host to its successor still falls to that successor
   /// in the retired host's round, by the owner it moved from; the successor's own object, which no install moved from
   /// the round's line, never does, though the configuration may name it successor of that object too. Do: in a retired
