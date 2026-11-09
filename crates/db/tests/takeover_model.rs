@@ -17,11 +17,15 @@
 //! (`takeover::list_page` and `promise_local_copies` select by routing, and a warm restart loses routing), while the
 //! page still ends complete. Any holder may leave out any object, every holder of it included.
 //!
-//! **How a successor learns the objects** ([`Listing`]), the supervisor's two shapes for A-251:
-//! - [`Listing::Routing`], today's: a holder lists what its routing gives it. An object every holder leaves out is
+//! **How a successor learns the objects** ([`Listing`]), the supervisor's two shapes for A-251 and the forms of (i):
+//! - [`Listing::Routing`], before A-251: a holder lists what its routing gives it. An object every holder leaves out is
 //!   never learned.
-//! - [`Listing::Authority`], shape (i): a holder also lists every copy it holds under an authority in the retired host's
-//!   recovery chain, routing or not. Its cost per write is nothing: the authority is already kept with the copy.
+//! - [`Listing::RoutingOrChain`], shape (i) as first built: routing, plus every copy whose authority's line ends in the
+//!   round. It misses a copy whose authority an install had moved to the asker before its routing was lost.
+//! - [`Listing::ChainOrAsker`], shape (i) as one rule, literally: authority in the chain, or the asker. It learns the
+//!   asker's own live objects in another host's round.
+//! - [`Listing::MovedFrom`], shape (i) as one rule, chosen: the line of the copy's authority, or of the owner an install
+//!   moved it from. Its cost per write is nothing: the authority and its last move are kept with the copy.
 //! - [`Listing::Directory`], shape (ii): the retired host's recovery cohort keeps its object directory at `f + 1`, and
 //!   the successor reads every name from it. Its cost is one more committed record per object created.
 //!
@@ -32,7 +36,7 @@
 //! record, or that it holds nothing.
 //!
 //! - `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`: the minimal history, red on today's rule.
-//! - `the_named_rule_with_authority_listing_holds_no_loss_on_every_history` (proptest): the chosen shape.
+//! - `the_named_rule_with_moved_from_listing_holds_no_loss_on_every_history` (proptest): the chosen rule.
 //! - `the_nemesis_breaks_today_s_rule_and_each_shape_is_measured`: over generated histories, what each rule and shape
 //!   loses with the nemesis off and on, and each shape's cost per write.
 
@@ -68,10 +72,16 @@ const SEARCH_HISTORIES: u64 = 1_000;
 /// How a successor learns the retired host's objects (see the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Listing {
-  /// A holder lists what its routing gives it (today's).
+  /// A holder lists what its routing gives it (before A-251).
   Routing,
-  /// Shape (i): a holder also lists every copy it holds under an authority in the retired host's recovery chain.
-  Authority,
+  /// A holder lists what its routing gives it, and every copy whose authority's line ends in this round: routing plus a
+  /// second path, as A-251 (b) first built shape (i).
+  RoutingOrChain,
+  /// Shape (i) as one rule, literally: every copy whose authority is in the retired host's chain, or is the asker.
+  ChainOrAsker,
+  /// Shape (i) as one rule with the authority's history: every copy whose authority's line, or the line of the owner an
+  /// install moved it from, ends in this round.
+  MovedFrom,
   /// Shape (ii): the successor reads every name from the retired host's directory, kept by its cohort at `f + 1`.
   Directory,
 }
@@ -109,9 +119,11 @@ struct Copy {
   in_chain: bool,
 }
 
-/// One object of the retired host's.
+/// One object: the retired host's, or (`foreign`) one of the asker's own live objects some survivors also hold.
 #[derive(Clone, Debug)]
 struct Object {
+  /// The asker's own live object, under the asker's authority on every holder: never the round's to learn.
+  foreign: bool,
   cohorts: Vec<Vec<HostId>>,
   /// The copy each host holds.
   held: BTreeMap<HostId, Copy>,
@@ -127,6 +139,10 @@ struct History {
   objects: BTreeMap<ObjectId, Object>,
   /// The objects each holder's routing leaves out.
   omitted: BTreeMap<HostId, BTreeSet<ObjectId>>,
+  /// Of those, the copies whose authority an install had already moved to the asker before routing lost them (a
+  /// holder restored warm routes such a copy to the asker as a live owner): their authority alone no longer names the
+  /// retired host.
+  moved: BTreeSet<(HostId, ObjectId)>,
   page_entries: usize,
   /// Whether the successor may promise its own copies from the start; otherwise its gate opens after the schedule.
   gate_open: bool,
@@ -242,6 +258,7 @@ fn object(draw: &mut Draw, quorum: Quorum, survivors: &[HostId]) -> Object {
   }
   held.remove(&DEPARTED);
   Object {
+    foreign: false,
     cohorts,
     held,
     committed,
@@ -264,13 +281,25 @@ fn history(seed: u64, omit: bool) -> History {
       object(&mut draw, quorum, &survivors),
     );
   }
+  // The asker's own live objects, which some survivors hold under the asker's authority.
+  let first_foreign = u64::try_from(objects.len()).unwrap();
+  for index in 0..draw.within(0, 2) {
+    let mut foreign = object(&mut draw, quorum, &survivors);
+    foreign.foreign = true;
+    foreign.committed = None;
+    objects.insert(object_id(first_foreign + index), foreign);
+  }
   let gate_open = draw.chance(3, 4);
   let mut omitted: BTreeMap<HostId, BTreeSet<ObjectId>> = BTreeMap::new();
+  let mut moved = BTreeSet::new();
   if omit {
-    for (object, state) in &objects {
+    for (object, state) in objects.iter().filter(|(_, state)| !state.foreign) {
       for host in state.held.keys() {
         if draw.chance(1, 2) {
           omitted.entry(*host).or_default().insert(*object);
+          if draw.chance(1, 2) {
+            moved.insert((*host, *object));
+          }
         }
       }
     }
@@ -284,6 +313,7 @@ fn history(seed: u64, omit: bool) -> History {
     survivors,
     objects,
     omitted,
+    moved,
     page_entries: usize::try_from(draw.within(1, MAX_PAGE_ENTRIES)).unwrap(),
     gate_open,
     schedule,
@@ -317,18 +347,30 @@ impl Round {
   }
 }
 
-/// Whether `host` lists `object` in its pages (or, the successor, learns it from itself) under `listing`.
+/// Whether `host` lists `object` in its pages (or, the successor, learns it from itself) under `listing`. A routed copy's
+/// authority was moved to the asker by the install (`reconcile_held_authority`); a copy whose routing was lost before the
+/// install keeps the retired host's chain authority; one whose routing was lost after it (`moved`) keeps the asker's.
 fn lists(history: &History, listing: Listing, host: HostId, object: ObjectId) -> bool {
-  let Some(copy) = history.objects[&object].held.get(&host) else {
+  let state = &history.objects[&object];
+  let Some(copy) = state.held.get(&host) else {
     return false;
   };
+  if state.foreign {
+    // The asker's own object: under the asker's authority, routed to the asker as a live owner.
+    return listing == Listing::ChainOrAsker;
+  }
   let routed = history
     .omitted
     .get(&host)
     .is_none_or(|left_out| !left_out.contains(&object));
+  // An earlier owner's copy outside the chain stays under that owner; a chain copy is moved to the asker by a routed
+  // install, or was moved before its routing was lost.
+  let moved = copy.in_chain && (routed || history.moved.contains(&(host, object)));
+  let in_chain_now = copy.in_chain && !moved;
   match listing {
     Listing::Routing | Listing::Directory => routed,
-    Listing::Authority => routed || copy.in_chain,
+    Listing::RoutingOrChain => routed || in_chain_now,
+    Listing::ChainOrAsker | Listing::MovedFrom => in_chain_now || moved,
   }
 }
 
@@ -340,7 +382,7 @@ fn run(history: &History, rule: CountingRule, listing: Listing) -> Round {
     round.names = history
       .objects
       .iter()
-      .filter(|(_, state)| state.committed.is_some())
+      .filter(|(_, state)| !state.foreign && state.committed.is_some())
       .map(|(object, _)| *object)
       .collect();
   }
@@ -535,6 +577,16 @@ fn losses(history: &History, round: &Round) -> Vec<(ObjectId, Option<u64>, u64)>
     .collect()
 }
 
+/// The asker's own objects the round learned: a page or answer of the retired host's round that reached one raised its
+/// fence to the round's epoch, which can refuse the asker's own writes, and adopting it re-commits it at that epoch.
+fn foreign_learned(history: &History, round: &Round) -> usize {
+  round
+    .reports
+    .keys()
+    .filter(|object| history.objects[*object].foreign)
+    .count()
+}
+
 /// The minimal history the nemesis finds, by hand: f = 1, one object on the cohort {retired, a, b}; record 1 on a,
 /// record 2 committed on the retired host and b; b's page leaves the object out and ends complete. Do: a answers, then
 /// b. Expect: today's rule adopts record 1 over the committed record 2; A-251's rule waits for b's answer by name and
@@ -553,12 +605,14 @@ fn today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out() {
     objects: BTreeMap::from([(
       object,
       Object {
+        foreign: false,
         cohorts: vec![vec![DEPARTED, a, b]],
         held: BTreeMap::from([(a, copy(1)), (b, copy(2))]),
         committed: Some(2),
       },
     )]),
     omitted: BTreeMap::from([(b, BTreeSet::from([object]))]),
+    moved: BTreeSet::new(),
     page_entries: 1,
     gate_open: true,
     schedule: vec![0, 1],
@@ -580,13 +634,15 @@ proptest! {
     ..ProptestConfig::default()
   }))]
 
-  /// A-251's rule with shape (i), on every generated history with the widened nemesis on: no adopted record is older
-  /// than a committed one, and every object with a committed record ends adopted.
+  /// A-251's rule with shape (i) as one rule (a copy's authority's line, or its moved-from owner's), on every generated
+  /// history with the widened nemesis on: no adopted record is older than a committed one, every object with a committed
+  /// record ends adopted, and none of the asker's own objects is learned in the round.
   #[test]
-  fn the_named_rule_with_authority_listing_holds_no_loss_on_every_history(seed in any::<u64>()) {
+  fn the_named_rule_with_moved_from_listing_holds_no_loss_on_every_history(seed in any::<u64>()) {
     let history = history(seed, true);
-    let round = run(&history, CountingRule::NamedAnswer, Listing::Authority);
+    let round = run(&history, CountingRule::NamedAnswer, Listing::MovedFrom);
     prop_assert!(losses(&history, &round).is_empty(), "{:?}", losses(&history, &round));
+    prop_assert_eq!(foreign_learned(&history, &round), 0);
   }
 }
 
@@ -597,8 +653,13 @@ struct Tally {
   today_with: usize,
   named_routing_older: usize,
   named_routing_unlearned: usize,
-  authority: usize,
-  directory: usize,
+  routing_or_chain: usize,
+  chain_or_asker_lost: usize,
+  chain_or_asker_foreign: usize,
+  moved_from_lost: usize,
+  moved_from_foreign: usize,
+  directory_lost: usize,
+  directory_foreign: usize,
   named_mattered: usize,
   named_nothing: usize,
   creates: usize,
@@ -611,8 +672,13 @@ impl Tally {
       today_with: self.today_with + other.today_with,
       named_routing_older: self.named_routing_older + other.named_routing_older,
       named_routing_unlearned: self.named_routing_unlearned + other.named_routing_unlearned,
-      authority: self.authority + other.authority,
-      directory: self.directory + other.directory,
+      routing_or_chain: self.routing_or_chain + other.routing_or_chain,
+      chain_or_asker_lost: self.chain_or_asker_lost + other.chain_or_asker_lost,
+      chain_or_asker_foreign: self.chain_or_asker_foreign + other.chain_or_asker_foreign,
+      moved_from_lost: self.moved_from_lost + other.moved_from_lost,
+      moved_from_foreign: self.moved_from_foreign + other.moved_from_foreign,
+      directory_lost: self.directory_lost + other.directory_lost,
+      directory_foreign: self.directory_foreign + other.directory_foreign,
       named_mattered: self.named_mattered + other.named_mattered,
       named_nothing: self.named_nothing + other.named_nothing,
       creates: self.creates + other.creates,
@@ -638,7 +704,12 @@ fn measure(seed: u64) -> Tally {
         .all(|(host, _)| by_name.is_some_and(|hosts| hosts.contains(host)))
     })
     .count();
-  let chosen = run(&hostile, CountingRule::NamedAnswer, Listing::Authority);
+  let named = |listing| run(&hostile, CountingRule::NamedAnswer, listing);
+  let (chain_or_asker, moved_from, directory) = (
+    named(Listing::ChainOrAsker),
+    named(Listing::MovedFrom),
+    named(Listing::Directory),
+  );
   Tally {
     today_without: losses(
       &quiet,
@@ -658,16 +729,21 @@ fn measure(seed: u64) -> Tally {
       .iter()
       .filter(|(_, adopted, _)| adopted.is_none())
       .count(),
-    authority: losses(&hostile, &chosen).len(),
-    directory: losses(
-      &hostile,
-      &run(&hostile, CountingRule::NamedAnswer, Listing::Directory),
-    )
-    .len(),
+    routing_or_chain: losses(&hostile, &named(Listing::RoutingOrChain)).len(),
+    chain_or_asker_lost: losses(&hostile, &chain_or_asker).len(),
+    chain_or_asker_foreign: foreign_learned(&hostile, &chain_or_asker),
+    moved_from_lost: losses(&hostile, &moved_from).len(),
+    moved_from_foreign: foreign_learned(&hostile, &moved_from),
+    directory_lost: losses(&hostile, &directory).len(),
+    directory_foreign: foreign_learned(&hostile, &directory),
     named_mattered,
-    // Under shape (i) the by-name question still carries the promises of holders that list nothing of an object.
-    named_nothing: chosen.named_nothing.values().map(BTreeSet::len).sum(),
-    creates: hostile.objects.len(),
+    // The by-name question still carries the promises of holders that list nothing of an object.
+    named_nothing: moved_from.named_nothing.values().map(BTreeSet::len).sum(),
+    creates: hostile
+      .objects
+      .values()
+      .filter(|state| !state.foreign)
+      .count(),
   }
 }
 
@@ -676,62 +752,78 @@ fn measure(seed: u64) -> Tally {
 /// listing. Expect:
 /// - today's rule loses nothing without omissions and loses records with them;
 /// - A-251's rule with today's listing adopts nothing older, but leaves objects every holder left out unlearned;
-/// - with shape (i) or shape (ii) it loses nothing;
-/// - shape (i) adds no write per object created, and shape (ii) adds one directory record for each;
-/// - and the by-name question did work: under today's listing some adoptions came only from a named answer, and under
-///   shape (i) holders answered by name for objects they hold nothing of (shape (i) lists every in-chain copy, so a
-///   named record there is only an earlier owner's older copy).
+/// - routing plus the chain path (A-251 (b)'s first shape (i)) still loses objects whose authority an install had moved
+///   to the asker before their routing was lost;
+/// - "the chain or the asker" as one rule loses nothing but learns the asker's own objects in the round;
+/// - "the line of the authority or of the owner it moved from" (shape (i) as one rule) loses nothing and learns none;
+/// - shape (ii) loses nothing and learns none, at one more committed record per object created;
+/// - and the by-name question did work: under today's listing some adoptions came only from a named answer, and under the
+///   chosen rule holders answered by name for objects they hold nothing of.
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn the_nemesis_breaks_today_s_rule_and_each_shape_is_measured() {
   let tally = (0..SEARCH_HISTORIES)
     .map(measure)
     .fold(Tally::default(), Tally::add);
-  let Tally {
-    today_without,
-    today_with,
-    named_routing_older,
-    named_routing_unlearned,
-    authority,
-    directory,
-    named_mattered,
-    named_nothing,
-    creates,
-  } = tally;
-  // Per object created: shape (i) writes nothing more (the authority is kept with each copy already); shape (ii) commits
-  // one directory record at f + 1 of the retired host's cohort.
-  let (authority_writes, directory_writes) = (0usize, creates);
   eprintln!(
-    "{SEARCH_HISTORIES} histories, {creates} objects: today's rule lost {today_without} without omissions and \
-     {today_with} with them; A-251's rule with today's listing adopted {named_routing_older} older records and left \
-     {named_routing_unlearned} committed objects unlearned; with shape (i) it lost {authority}, with shape (ii) \
-     {directory}; extra records written per object created: shape (i) {authority_writes}, shape (ii) \
-     {directory_writes} over {creates}; {named_mattered} adoptions under today's listing came only from a named answer; \
-     under shape (i), {named_nothing} named answers of holding nothing"
+    "{SEARCH_HISTORIES} histories, {} objects: today's rule lost {} without omissions and {} with them; A-251's rule \
+     with today's listing adopted {} older records and left {} committed objects unlearned; routing plus the chain \
+     path lost {}; chain-or-asker lost {} and learned {} of the asker's own objects; moved-from lost {} and learned {}; \
+     the directory lost {} and learned {}, at {} extra committed records (moved-from: 0); {} adoptions under today's \
+     listing came only from a named answer; under moved-from, {} named answers of holding nothing",
+    tally.creates,
+    tally.today_without,
+    tally.today_with,
+    tally.named_routing_older,
+    tally.named_routing_unlearned,
+    tally.routing_or_chain,
+    tally.chain_or_asker_lost,
+    tally.chain_or_asker_foreign,
+    tally.moved_from_lost,
+    tally.moved_from_foreign,
+    tally.directory_lost,
+    tally.directory_foreign,
+    tally.creates,
+    tally.named_mattered,
+    tally.named_nothing,
   );
   assert_eq!(
-    today_without, 0,
+    tally.today_without, 0,
     "today's rule is safe when no page leaves a copy out"
   );
-  assert!(today_with > 0, "the nemesis found today's rule's loss");
+  assert!(
+    tally.today_with > 0,
+    "the nemesis found today's rule's loss"
+  );
   assert_eq!(
-    named_routing_older, 0,
+    tally.named_routing_older, 0,
     "the named rule adopts nothing older"
   );
   assert!(
-    named_routing_unlearned > 0,
+    tally.named_routing_unlearned > 0,
     "the widened nemesis leaves objects nobody listed"
   );
-  assert_eq!(authority, 0, "shape (i) loses nothing");
-  assert_eq!(directory, 0, "shape (ii) loses nothing");
-  assert_eq!(authority_writes, 0);
-  assert_eq!(directory_writes, creates);
   assert!(
-    named_mattered > 0,
+    tally.routing_or_chain > 0,
+    "routing plus the chain path misses copies moved before routing was lost"
+  );
+  assert_eq!(tally.chain_or_asker_lost, 0);
+  assert!(
+    tally.chain_or_asker_foreign > 0,
+    "chain-or-asker learns the asker's own objects"
+  );
+  assert_eq!(
+    (tally.moved_from_lost, tally.moved_from_foreign),
+    (0, 0),
+    "the chosen rule"
+  );
+  assert_eq!((tally.directory_lost, tally.directory_foreign), (0, 0));
+  assert!(
+    tally.named_mattered > 0,
     "the by-name question carried the newest record"
   );
   assert!(
-    named_nothing > 0,
-    "under shape (i) holders answer by name for what they do not hold"
+    tally.named_nothing > 0,
+    "holders answer by name for what they do not hold"
   );
 }

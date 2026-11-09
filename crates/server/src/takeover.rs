@@ -40,8 +40,8 @@ use slates_db::register::{
   Placement, Record, RegionalConfiguration, RegisterError, encode_refusal,
 };
 use slates_db::takeover::{
-  CountingRule, Heard, Readiness, answer_by_name, falls_to as falls_by_authority, promise_object,
-  readiness,
+  CountingRule, Heard, Readiness, answer_by_name, copy_falls_to, falls_to as falls_by_authority,
+  promise_object, readiness,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
@@ -350,10 +350,39 @@ pub(crate) fn serve_host_prepare(
   page.encode()
 }
 
-/// Counter: copies a page listed, or a successor learned of its own, by the copy's authority alone (A-251 (b), shape
-/// (i)): its routing did not give it. The non-vacuity count of the routing-free path. Format: a counter name in the
-/// daemon's status report.
-const TAKEOVER_LISTED_BY_AUTHORITY: &str = "fleet.takeover.listed_by_authority";
+/// Counter: copies a page listed, or a successor learned of its own, by the owner an install moved their authority from
+/// (A-251 (b), shape (i)): the authority alone named the successor, and only the moved-from owner placed the copy in this
+/// round. The non-vacuity count of that half of the rule. Format: a counter name in the daemon's status report.
+const TAKEOVER_LISTED_BY_MOVED_FROM: &str = "fleet.takeover.listed_by_moved_from";
+
+/// Takes the copies of `departed`'s objects this holder holds that fall to `asker` in its round (A-251 (b), shape (i),
+/// one rule with no routing in it: [`copy_falls_to`]), counting those only the moved-from owner placed there
+/// ([`TAKEOVER_LISTED_BY_MOVED_FROM`]).
+fn copies_falling_to(
+  state: &mut ShardState,
+  departed: HostId,
+  asker: HostId,
+  after: Option<ObjectId>,
+) -> Vec<ObjectId> {
+  let regional = state.council.configuration().clone();
+  let mut by_moved_from: u64 = 0;
+  let objects: Vec<ObjectId> = state
+    .holder_records
+    .iter()
+    .filter(|(object, _)| after.is_none_or(|after| **object > after))
+    .filter(|(object, acceptor)| {
+      let falls = copy_falls_to(&regional, acceptor, **object, departed, asker);
+      let by_authority = falls_by_authority(&regional, acceptor.owner(), **object, departed, asker);
+      by_moved_from = by_moved_from.saturating_add(u64::from(falls && !by_authority));
+      falls
+    })
+    .map(|(object, _)| *object)
+    .collect();
+  if by_moved_from > 0 {
+    state.count(TAKEOVER_LISTED_BY_MOVED_FROM, by_moved_from);
+  }
+  objects
+}
 
 /// Counter: objects a holder refused to answer by name (A-251 (b)): the configuration names another successor, or the
 /// copy's acceptor serves an owner outside the retired host's recovery chain. Such an object stays unanswered.
@@ -416,35 +445,7 @@ fn refuse(state: &mut ShardState) -> Vec<u8> {
 
 /// The page of `prepare`'s answer this holder gives: see [`serve_host_prepare`].
 fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> HostPromise {
-  let regional = state.council.configuration().clone();
-  let mut by_authority_only: u64 = 0;
-  let objects: Vec<ObjectId> = state
-    .holder_records
-    .iter()
-    .filter(|(object, _)| prepare.after.is_none_or(|after| **object > after))
-    .filter(|(object, acceptor)| {
-      let routed = state
-        .departed_owners
-        .get(*object)
-        .is_some_and(|departed| departed.owner == prepare.departed)
-        && state.fleet.object_owner(**object) == Some(prepare.owner);
-      // A-251 (b), shape (i): the copy's own authority, kept with it through a warm restart, decides too, so a
-      // copy whose routing was lost is still listed in the one round its line names.
-      let by_authority = falls_by_authority(
-        &regional,
-        acceptor.authority().owner,
-        **object,
-        prepare.departed,
-        prepare.owner,
-      );
-      by_authority_only = by_authority_only.saturating_add(u64::from(by_authority && !routed));
-      routed || by_authority
-    })
-    .map(|(object, _)| *object)
-    .collect();
-  if by_authority_only > 0 {
-    state.count(TAKEOVER_LISTED_BY_AUTHORITY, by_authority_only);
-  }
+  let objects = copies_falling_to(state, prepare.departed, prepare.owner, prepare.after);
   let budget = page_budget();
   let mut promise = HostPromise {
     holder: local,
@@ -698,29 +699,11 @@ fn initial_epoch(
   state
     .holder_records
     .iter()
-    .filter(|(object, acceptor)| {
-      falls_to(state, **object, departed, local)
-        || falls_by_authority(
-          regional,
-          acceptor.authority().owner,
-          **object,
-          departed,
-          local,
-        )
-    })
+    .filter(|(object, acceptor)| copy_falls_to(regional, acceptor, **object, departed, local))
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
     .try_fold(bumped, |highest, (_, _, epoch, _)| {
       Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
     })
-}
-
-/// Whether `object`, held here, is one of `departed`'s objects that falls to `local` in its takeover.
-fn falls_to(state: &ShardState, object: ObjectId, departed: HostId, local: HostId) -> bool {
-  state
-    .departed_owners
-    .get(&object)
-    .is_some_and(|record| record.owner == departed)
-    && state.fleet.object_owner(object) == Some(local)
 }
 
 /// Promises this node's own copies of `departed`'s objects that fall to it, as a holder answers a page: the
@@ -732,28 +715,7 @@ fn promise_local_copies(
   epoch: HostEpoch,
   generation: u64,
 ) {
-  let regional = state.council.configuration().clone();
-  let mut by_authority_only: u64 = 0;
-  let objects: Vec<ObjectId> = state
-    .holder_records
-    .iter()
-    .filter(|(object, acceptor)| {
-      let routed = falls_to(state, **object, departed, local);
-      let by_authority = falls_by_authority(
-        &regional,
-        acceptor.authority().owner,
-        **object,
-        departed,
-        local,
-      );
-      by_authority_only = by_authority_only.saturating_add(u64::from(by_authority && !routed));
-      routed || by_authority
-    })
-    .map(|(object, _)| *object)
-    .collect();
-  if by_authority_only > 0 {
-    state.count(TAKEOVER_LISTED_BY_AUTHORITY, by_authority_only);
-  }
+  let objects = copies_falling_to(state, departed, local, None);
   let prepare = HostPrepare {
     departed,
     owner: local,

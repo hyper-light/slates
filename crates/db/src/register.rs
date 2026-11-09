@@ -1459,6 +1459,9 @@ impl<'a> WireReader<'a> {
 pub struct Acceptor {
   id: HostId,
   authority: Authority,
+  /// The owner an install last moved this acceptor's authority from (A-251): a takeover moves a retired owner's copies
+  /// to its successor, and only this keeps whose object the copy was once the authority names the successor.
+  moved_from: Option<HostId>,
   fence: Fence,
   accepted: std::collections::BTreeMap<(ObjectId, u64), (HostEpoch, Vec<u8>)>,
 }
@@ -1472,6 +1475,7 @@ impl Acceptor {
     Acceptor {
       id,
       authority,
+      moved_from: None,
       fence: Fence::new(),
       accepted: std::collections::BTreeMap::new(),
     }
@@ -1495,6 +1499,7 @@ impl Acceptor {
     Acceptor {
       id,
       authority,
+      moved_from: None,
       fence,
       accepted,
     }
@@ -1515,6 +1520,18 @@ impl Acceptor {
   /// [`raise_fence`](Acceptor::raise_fence)).
   pub fn owner(&self) -> HostId {
     self.authority.owner
+  }
+
+  /// The owner an install last moved this acceptor's authority from, `None` when no install has changed its owner
+  /// (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::with_moved_from`]).
+  pub fn moved_from(&self) -> Option<HostId> {
+    self.moved_from
+  }
+
+  /// This acceptor with `moved_from` restored from its persisted state.
+  pub fn with_moved_from(mut self, moved_from: Option<HostId>) -> Acceptor {
+    self.moved_from = moved_from;
+    self
   }
 
   /// The configuration generation this acceptor serves under: what a recovery image keeps with its records, so a
@@ -1660,6 +1677,9 @@ impl Acceptor {
       return Err(RegisterError::ForeignGeneration {
         current: self.authority.generation,
       });
+    }
+    if authority.owner != self.authority.owner {
+      self.moved_from = Some(self.authority.owner);
     }
     self.authority = authority;
     Ok(())

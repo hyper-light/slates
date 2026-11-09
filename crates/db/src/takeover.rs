@@ -174,14 +174,33 @@ pub fn falls_to(
   )
 }
 
+/// Whether a holder's copy of `object`, kept by `acceptor`, falls to `asker` in `departed`'s takeover (A-251 (b), shape
+/// (i) as one rule): the line of its authority's owner ends there ([`falls_to`]), or the line of the owner an install
+/// moved that authority from does ([`Acceptor::moved_from`]). The second case is the common one: an install moves a
+/// retired owner's copies to its successor (`reconcile_held_authority`), and a holder restored warm then routes the copy
+/// to the successor as a live owner, so neither routing nor the authority alone names the retired host. Routing plays no
+/// part. The asker's own objects never fall here: no install moved them from the round's line.
+pub fn copy_falls_to(
+  regional: &RegionalConfiguration,
+  acceptor: &Acceptor,
+  object: ObjectId,
+  departed: HostId,
+  asker: HostId,
+) -> bool {
+  falls_to(regional, acceptor.owner(), object, departed, asker)
+    || acceptor
+      .moved_from()
+      .is_some_and(|from| falls_to(regional, from, object, departed, asker))
+}
+
 /// A holder's answer to a by-name question, and what it could not answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedAnswer {
   /// The answer: each named object it holds among `entries`, each it holds nothing of in `nothing`, a fence above the
   /// epoch in `fenced`, and the copies it could not promise for any other reason in `unpromised`.
   pub promise: HostPromise,
-  /// Named objects it refused to answer for this asker: the configuration names another successor, or the copy's
-  /// line ([`falls_to`]) puts it in another round or with a live owner. Such an object stays unanswered.
+  /// Named objects it refused to answer for this asker: the configuration names another successor, or the copy's line
+  /// ([`copy_falls_to`]) puts it in another round or with a live owner. Such an object stays unanswered.
   pub refused: u32,
 }
 
@@ -190,9 +209,9 @@ pub struct NamedAnswer {
 /// (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`), so routing cannot be what decides.
 /// Two checks stand in its place, both from what the holder has itself:
 /// - `regional`, the committed configuration, names the asker the object's successor;
-/// - the object's acceptor, when there is one, serves an owner whose line puts the object in this round with the asker
-///   as successor ([`falls_to`]), or the asker already (a page or an earlier answer installed it). A question never
-///   installs the asker over a live owner's object, nor over another round's.
+/// - the object's acceptor, when there is one, is in this round by its authority's line or the line of the owner an
+///   install moved it from ([`copy_falls_to`]). A question never installs the asker over a live owner's object, its own
+///   included, nor over another round's.
 ///
 /// A held copy is promised as a page promises it ([`promise_object`]) and reported; no acceptor means the holder holds
 /// nothing of the object, which it says for that object alone. The answer stops before `budget` bytes, at least one
@@ -233,10 +252,7 @@ pub fn answer_by_name(
       answer.promise.nothing.push(*object);
       continue;
     };
-    let serving = acceptor.authority().owner;
-    if serving != prepare.owner
-      && !falls_to(regional, serving, *object, prepare.departed, prepare.owner)
-    {
+    if !copy_falls_to(regional, acceptor, *object, prepare.departed, prepare.owner) {
       answer.refused = answer.refused.saturating_add(1);
       continue;
     }
@@ -474,11 +490,52 @@ mod tests {
     );
   }
 
+  /// Shape (i) as one rule: a copy an install moved from the retired host to its successor still falls to that successor
+  /// in the retired host's round, by the owner it moved from; the successor's own object, which no install moved from
+  /// the round's line, never does, though the configuration may name it successor of that object too. Do: in a retired
+  /// region, move a retired host's copy to its successor; and hold one of the successor's own objects whose successor in
+  /// the round is the successor by hash. Expect: the moved copy falls to the successor there; the successor's own does
+  /// not.
+  #[test]
+  fn a_moved_copy_falls_by_its_moved_from_owner_and_the_askers_own_never_does() {
+    let (regional, asker, theirs, _) = retired_region();
+    let departed = HostId(1);
+    let holder = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != asker)
+      .unwrap();
+    let generation = regional.version;
+    let mut moved = acceptor(holder, departed, generation, Some((theirs[0], 1)));
+    moved
+      .install_authority(Authority {
+        generation,
+        owner: asker,
+      })
+      .unwrap();
+    assert_eq!(moved.moved_from(), Some(departed));
+    assert!(
+      !falls_to(&regional, moved.owner(), theirs[0], departed, asker),
+      "its authority alone no longer says"
+    );
+    assert!(copy_falls_to(&regional, &moved, theirs[0], departed, asker));
+    // One of the asker's own objects whose successor in the retired host's round is the asker, by hash alone.
+    let own = theirs[1];
+    let askers = acceptor(holder, asker, generation, Some((own, 1)));
+    assert_eq!(askers.moved_from(), None);
+    assert!(
+      !copy_falls_to(&regional, &askers, own, departed, asker),
+      "the asker's own object"
+    );
+  }
+
   /// A-251 (b), the holder's side, with no routing at all (the warm-restarted holder's case): asked by name, a holder
   /// reports a copy it holds, says it holds nothing of one it has no acceptor for, and refuses an object the
-  /// configuration gives another successor and one whose acceptor serves a live owner outside the retired host's
-  /// chain. Do: four named objects (held; not held; another live owner's; one whose successor is not the asker).
-  /// Expect: one entry, one nothing, two refused, and the held copy fenced to the asker's epoch under its authority.
+  /// configuration gives another successor, one whose acceptor serves a live owner outside the retired host's chain, and
+  /// one of the asker's own. Do: five named objects (held; not held; another live owner's; the asker's own; one whose
+  /// successor is not the asker). Expect: one entry, one nothing, three refused, and the held copy fenced to the
+  /// asker's epoch under its authority.
   #[test]
   fn a_holder_answers_each_named_object_from_its_own_records() {
     let (regional, asker, theirs, other) = retired_region();
@@ -505,6 +562,11 @@ mod tests {
         theirs[2],
         acceptor(holder, live_owner, generation, Some((theirs[2], 5))),
       ),
+      // One of the asker's own objects, which no install moved from the round's line.
+      (
+        theirs[3],
+        acceptor(holder, asker, generation, Some((theirs[3], 2))),
+      ),
     ]);
     let prepare = HostPrepare {
       departed,
@@ -512,7 +574,7 @@ mod tests {
       epoch: HostEpoch(7),
       generation,
       after: None,
-      named: vec![theirs[0], theirs[1], theirs[2], other],
+      named: vec![theirs[0], theirs[1], theirs[2], theirs[3], other],
     };
     let answer = answer_by_name(holder, &prepare, &regional, &mut acceptors, usize::MAX);
     assert_eq!(
@@ -526,8 +588,8 @@ mod tests {
     );
     assert_eq!(answer.promise.nothing, vec![theirs[1]]);
     assert_eq!(
-      answer.refused, 2,
-      "another successor's object, and a live owner's"
+      answer.refused, 3,
+      "another successor's object, a live owner's, and the asker's own"
     );
     assert_eq!(
       acceptors[&theirs[0]].authority().owner,

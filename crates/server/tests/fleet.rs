@@ -9243,13 +9243,15 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
 /// `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md` (A-250 restores routing on a warm restart, so
 /// the loss is injected). Do: three nodes at f = 1; on a, volumes until one's successor is c and one's is b, each first
 /// head placed on all three; then c refuses a's records, and each volume's second head commits on a and b alone; a stops,
-/// and b forgets both volumes' routing and lineage. Expect: each volume is served at its second snapshot, not its first,
-/// and b listed both copies by their authority alone (`fleet.takeover.listed_by_authority`, shape (i)):
-/// - the volume whose successor is c: c holds only the first head, and b's routing no longer lists the second;
-/// - the volume whose successor is b: b's own learning by routing misses its copy.
+/// and b forgets both volumes' routing and lineage. Expect: each volume is served, and its takeover adopted the second
+/// head, which c, holding only the first before, then holds (the successor re-commits the adopted record through its
+/// placement):
+/// - the volume whose successor is c: b, its routing gone, lists its copy by the authority it was written under
+///   (A-251 (b), shape (i));
+/// - the volume whose successor is b: b learns its own copy the same way, not through routing.
 ///
-/// Under the rule before A-251 (b) both were adopted at their first head: c on b's complete page, silent about the copy,
-/// and b on its own open lease gate.
+/// On the rule before A-251 (b) (diag-62, 15 of 15 runs) neither volume was served within the deadline: b's forgotten
+/// routing left its acceptors unreconciled, and the successor's adoption through b went unplaced every period.
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
@@ -9294,7 +9296,6 @@ fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
   assert_eq!(volumes.len(), 2, "a volume for each successor: {volumes:?}");
   // The second heads reach a and b only.
   daemons[2].inject_record_refusal(&[hosts[0]]).unwrap();
-  let mut seconds = std::collections::BTreeMap::new();
   let mut positions = Vec::new();
   for (successor, (id, _)) in &volumes {
     let ReplyBody::Snapshotted { id: second, .. } =
@@ -9312,7 +9313,6 @@ fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
       daemons[2].held_position(object).unwrap(),
     );
     positions.push((*successor, held));
-    seconds.insert(*id, second);
   }
   drop(client);
   // The owner dies, and b's routing loses both copies.
@@ -9352,21 +9352,17 @@ fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
     }
     Ok(all)
   });
-  let served_heads: std::collections::BTreeMap<VolumeId, Vec<SnapshotId>> = volumes
-    .values()
-    .map(|(id, _)| {
-      let heads = clients
-        .iter_mut()
-        .filter_map(
-          |client| match client.call(&RequestBody::Status { volume: *id }) {
-            ReplyBody::Status { report } => Some(report.head),
-            _ => None,
-          },
-        )
-        .collect();
-      (*id, heads)
-    })
-    .collect();
+  // The adopted head, as c holds it: c held only the first head, so it holds the second only if the successor adopted
+  // the second and re-committed it through c, whichever survivor is the successor. Polled, since a re-commit can land
+  // after the volume is first served.
+  let mut adopted = std::collections::BTreeMap::new();
+  let _ = poll_until(&survivors_observed, PLACEMENT_DEADLINE, || {
+    adopted.clear();
+    for (id, _) in volumes.values() {
+      adopted.insert(*id, daemons[1].held_position(ObjectId(id.bytes))?);
+    }
+    Ok(adopted.values().all(|position| *position >= Some(2)))
+  });
   drop(clients);
   let counters: Vec<_> = daemons
     .iter()
@@ -9383,39 +9379,26 @@ fn a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages() {
     daemon.stop();
   }
   eprintln!(
-    "held positions (successor, (b, c)) before the death: {positions:?}; served heads {served_heads:?}; counters {counters:?}"
+    "held positions (successor, (b, c)) before the death: {positions:?}; c's after the takeover {adopted:?}; served \
+     {served}; counters {counters:?}"
   );
   assert!(
-    positions.iter().all(|(_, (b, c))| b > c),
-    "b holds a newer head than c of each volume: {positions:?}"
+    positions
+      .iter()
+      .all(|(_, (b, c))| *b == Some(2) && *c == Some(1)),
+    "b holds each volume's second head and c only its first: {positions:?}"
   );
   assert!(
     served,
     "every volume served within {SERVE_DEADLINE:?}: {heads:?}"
   );
-  for (id, second) in &seconds {
-    let heads = &served_heads[id];
-    assert!(
-      !heads.is_empty() && heads.iter().all(|head| head == second),
-      "volume {id:?} is served at its second snapshot {second:?}, not an older one: {heads:?}"
+  for (id, position) in &adopted {
+    assert_eq!(
+      *position,
+      Some(2),
+      "volume {id:?}'s takeover adopted its second head, which c then holds, not the first: {adopted:?}"
     );
   }
-  let count = |node: usize, name: &str| {
-    counters[node]
-      .as_ref()
-      .ok()
-      .and_then(|counters| {
-        counters
-          .iter()
-          .find(|(counter, _)| *counter == name)
-          .map(|(_, n)| *n)
-      })
-      .unwrap_or(0)
-  };
-  assert!(
-    count(0, "fleet.takeover.listed_by_authority") >= 2,
-    "b listed both copies by their authority, for c's round and its own: {counters:?}"
-  );
 }
 
 /// Creates, snapshots and places volumes on `daemons[0]` — each head held by `daemons[1]` — until one's

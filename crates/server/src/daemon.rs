@@ -6800,6 +6800,125 @@ mod tests {
     );
   }
 
+  /// A-251 (b), shape (i) as one rule, the moved case: an install moves a retired owner's copies to the successor
+  /// (`fleet::reconcile_held_authority`), and a holder restored warm then routes such a copy to the successor as a live
+  /// owner, so neither its routing nor its authority alone names the retired host. Do: retire the owner of a record this
+  /// node holds, run the authority reconcile, forget the copy's lineage, and answer the successor's page. Expect: the
+  /// copy's acceptor records the owner it moved from, the page lists the copy, and
+  /// `fleet.takeover.listed_by_moved_from` counts it.
+  #[test]
+  fn a_copy_moved_to_the_successor_is_listed_by_the_owner_it_moved_from() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([37; 16]);
+    let (moved_from, page, counted) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      crate::fleet::reconcile_held_authority(state);
+      let moved_from = state.holder_records.get(&object).and_then(|acceptor| {
+        (acceptor.owner() == successor)
+          .then(|| acceptor.moved_from())
+          .flatten()
+      });
+      state.departed_owners.remove(&object);
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      let counted = state
+        .refusals
+        .get("fleet.takeover.listed_by_moved_from")
+        .copied()
+        .unwrap_or(0);
+      (moved_from.map(|from| from == departed), page, counted)
+    });
+    assert_eq!(
+      moved_from,
+      Some(true),
+      "the install moved the copy from the retired owner"
+    );
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "listed by the owner it moved from: {page:?}"
+    );
+    assert_eq!(counted, 1);
+  }
+
+  /// A-251 (b), shape (i) as one rule, the asker's own object: a copy under the asker's own authority, which no install
+  /// moved from the retired host's line, is never listed in the retired host's round, though the configuration names the
+  /// asker its successor there too. Listing it would raise its fence to the round's epoch and could refuse the asker's
+  /// own writes. Do: retire an owner; hold one of the successor's own objects whose successor in the round is the
+  /// successor; answer the successor's page. Expect: the page lists only the retired owner's copy.
+  #[test]
+  fn the_askers_own_object_is_never_listed_in_another_hosts_round() {
+    use slates_db::register::{
+      Acceptor, Authority, HostEpoch, HostPrepare, HostPromise, ObjectId, Record,
+    };
+    let object = ObjectId([41; 16]);
+    let (page, own) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let regional = state.council.configuration().clone();
+      let own = (0..=u8::MAX)
+        .map(|seed| ObjectId([seed; 16]))
+        .find(|other| *other != object && regional.successor(departed, *other) == Some(successor))
+        .unwrap();
+      let generation = state.fleet.configuration().version;
+      let mut askers = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: successor,
+        },
+      );
+      askers
+        .accept(&Record {
+          owner: successor,
+          object: own,
+          sequence: 0,
+          epoch: HostEpoch(1),
+          generation,
+          value: b"live".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(own, askers);
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation,
+        after: None,
+        named: Vec::new(),
+      };
+      (
+        crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode()),
+        own,
+      )
+    });
+    let page = HostPromise::decode(&page).expect("the page answers");
+    let listed: Vec<ObjectId> = page.entries.iter().map(|(listed, _)| *listed).collect();
+    assert_eq!(listed, vec![object], "only the retired owner's copy");
+    assert!(!listed.contains(&own));
+  }
+
   /// A-251 (b), the successor's own empty promise: a successor that holds nothing of an object in whose cohort it is
   /// promises that by name to itself, as any member does, since its open gate alone is no promise. Do: at f = 1, this
   /// node the successor of an object it holds nothing of, and the third member's page listing it. Expect: the object is
