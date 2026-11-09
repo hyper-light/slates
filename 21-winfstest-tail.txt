@@ -1,0 +1,20 @@
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-conformance v0.1.0 (D:\a\slates\slates\crates\conformance)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-2c7cdad7ce755194\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+   Compiling rcgen v0.13.2
+   Compiling xtask v0.1.0 (D:\a\slates\slates\xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 32s
+     Running `target\debug\xtask.exe conformance run --suite winfstest --records target/rec --scratch target/scr --keep`
+conformance: wrote target/rec\native-windows-winfsp.winfstest.json
+conformance: native-windows-winfsp × winfstest: RAN(20 files, 628 cases: 255 passed, 373 failed (373 expected, 0 unexpected, 0 listed-now-passing), 0 needs-root, 0 todo; 2026-11-09; Microsoft Windows [Version 10.0.26100.33674])
+conformance: scratch kept at \\?\D:\a\slates\slates\target\scr\native-windows-winfsp
+exit 0
