@@ -8540,76 +8540,14 @@ fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_
 #[cfg(target_os = "linux")]
 const HELD_FILE_BYTES: usize = 1 << 20;
 
-/// The volume `id`'s `referenced_bytes`.
-#[cfg(target_os = "linux")]
-fn referenced_bytes(instance: &str, id: &str) -> u64 {
-  let (code, out, err) = run(instance, &["status", id]);
-  assert_eq!(code, 0, "status: {err}");
-  value_of(&out, "referenced_bytes").parse().unwrap()
-}
-
-/// The files volume `id` keeps for a mount past a takeover (U10): `status` names them only when there are some.
-#[cfg(target_os = "linux")]
-fn takeover_kept(instance: &str, id: &str) -> u64 {
-  let (code, out, err) = run(instance, &["status", id]);
-  assert_eq!(code, 0, "status: {err}");
-  out
-    .lines()
-    .find_map(|line| line.strip_prefix("takeover_kept: "))
-    .map_or(0, |count| count.trim().parse().unwrap())
-}
-
-/// Holds U10's rule for one file whose last descriptor just closed: it comes to be kept and stays charged at least
-/// `charged` bytes; unmounting `path` frees it, to `freed` bytes referenced and nothing kept.
-#[cfg(target_os = "linux")]
-fn a_kept_file_is_charged_until_its_mount_ends(
-  instance: &str,
-  id: &str,
-  path: &str,
-  charged: u64,
-  freed: u64,
-) {
-  let deadline = Instant::now() + WAIT_FOR;
-  while takeover_kept(instance, id) == 0 && Instant::now() < deadline {
-    pause();
-  }
-  assert_eq!(
-    takeover_kept(instance, id),
-    1,
-    "once both descriptors closed, their releases gave back the opens they held and the file is kept for its mount"
-  );
-  assert!(
-    referenced_bytes(instance, id) >= charged,
-    "a kept file stays charged to the volume"
-  );
-  let (code, _, err) = unmount_through_the_cli(instance, path);
-  assert_eq!(code, 0, "slates unmount: {err}");
-  let deadline = Instant::now() + WAIT_FOR;
-  while referenced_bytes(instance, id) > freed && Instant::now() < deadline {
-    pause();
-  }
-  assert_eq!(
-    referenced_bytes(instance, id),
-    freed,
-    "the file's bytes come back at the mount's end"
-  );
-  assert_eq!(
-    takeover_kept(instance, id),
-    0,
-    "nothing is kept once the mount ended"
-  );
-}
-
 /// The handles a dead daemon issued give back their references at their release through its successor (goal item 4 of
 /// 2026-10-22; A-61, A-152; AC-3.4). Do: write a file through a mount and open it twice; unlink it through the mount,
 /// whose barrier publishes the open file with both opens; `SIGKILL` the daemon and wait for the anchor's successor;
 /// close one descriptor, drop the other's cached pages and read through it; then close it. Expect the file's bytes
-/// through the open descriptor and the volume's `referenced_bytes` still counting the file while either is open. Once
-/// both are closed, the file is kept for what no publication counted (U10, the supervisor's decision of 2026-11-07: kept
-/// after a restart, charged to the quota, counted in status, freed at unmount), so `referenced_bytes` still counts it and
-/// `takeover_kept` is 1; the unmount frees it, `referenced_bytes` back where it was before the file and `takeover_kept`
-/// gone. Before A-152 the successor gave back nothing for a handle it never issued, and no release could reach the
-/// count. Linux only, to a kernel that can resend (6.9+), where a mount survives its daemon.
+/// through the open descriptor, the volume's `referenced_bytes` still counting the file while either is open, and once
+/// both are closed `referenced_bytes` back where it was before the file. Before the fix the successor gave back nothing
+/// for a handle it never issued, so the file stayed referenced until the mount ended. Linux only, to a kernel that can
+/// resend (6.9+), where a mount survives its daemon.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
@@ -8633,7 +8571,11 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
     path: fresh_mount_point(),
   };
   fuse_mount_and_check(&instance, &id, &mount.path);
-  let referenced = || referenced_bytes(&instance, &id);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
   let before = referenced();
   let path = format!("{}/held.bin", mount.path);
   let bytes = vec![0x5Au8; HELD_FILE_BYTES];
@@ -8666,7 +8608,16 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
     "the file stays referenced while a descriptor holds it"
   );
   drop(second);
-  a_kept_file_is_charged_until_its_mount_ends(&instance, &id, &mount.path, before + held, before);
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the file's bytes come back once both descriptors closed: their releases gave back the opens they held"
+  );
   drop(mount);
   drop(anchor);
 }

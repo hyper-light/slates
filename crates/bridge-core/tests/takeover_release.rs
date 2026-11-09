@@ -149,9 +149,26 @@ fn an_unlinked_open_file(vol: &mut Volume, store: &mut Store, more: usize) -> (u
   (attr.ino, handles)
 }
 
-/// After the kernel has let go of `f` on a mount that survived the takeover (U10, the supervisor's option 2): every
-/// reference was given back (`what`), so the file is kept only for that mount, counted; and it is reclaimed when the
-/// mount ends.
+/// After the kernel has let go of `f` on the mount that survived the takeover: its last reference went back with the
+/// kernel's `FORGET` (`what`), and a `FORGET` comes only once the kernel holds nothing of the inode, no handle included
+/// (a handle holds a lookup). So the file is reclaimed at once, not kept for the mount: U10 keeps a file only while a
+/// mount may hold it through a handle no publication counted, and the mount that forgot it cannot.
+fn reclaimed_at_the_forget(vol: &mut Volume, store: &mut Store, f: u64, what: &str) {
+  assert_eq!(
+    vol.takeover_kept(),
+    0,
+    "{what}: nothing kept for a mount that forgot the file"
+  );
+  let cx = recorded_cx();
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut bridge =
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, &mut handles, None);
+  assert!(bridge.getattr(oid(f), &cx).is_err(), "{what}: reclaimed");
+}
+
+/// After the kernel has let go of `f` on a mount that survived the takeover with no `FORGET` to say so (U10, the
+/// supervisor's option 2): every reference the successor knows was given back (`what`), so the file is kept only for
+/// that mount, counted; and it is reclaimed when the mount ends.
 fn kept_until_the_mount_ends(vol: &mut Volume, store: &mut Store, f: u64, what: &str) {
   assert_eq!(
     vol.takeover_kept(),
@@ -207,12 +224,8 @@ fn a_release_of_a_handle_opened_before_a_takeover_gives_back_its_reference() {
     "the kernel's lookup still holds the file after its handle's release"
   );
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    readable(&mut bridge, &cx, f),
-    "kept after the kernel lets go: the mount that survived may hold a handle no publication counted (U10)"
-  );
   drop(bridge);
-  kept_until_the_mount_ends(
+  reclaimed_at_the_forget(
     &mut recovered,
     &mut after,
     f,
@@ -253,12 +266,8 @@ fn a_release_after_a_takeover_never_gives_back_a_reference_another_handle_still_
     "a release repeated gives back nothing more"
   );
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    readable(&mut bridge, &cx, f),
-    "kept after the kernel lets go: the mount that survived may hold a handle no publication counted (U10)"
-  );
   drop(bridge);
-  kept_until_the_mount_ends(&mut recovered, &mut after, f, "reclaimed at the forget");
+  reclaimed_at_the_forget(&mut recovered, &mut after, f, "reclaimed at the forget");
 }
 
 /// Goal item 4, the window between a publication and the death: a handle opened after the last publication left no
@@ -302,12 +311,8 @@ fn a_handle_opened_after_the_last_publication_gives_back_no_more_than_the_image_
     );
   }
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    readable(&mut bridge, &cx, f),
-    "kept after the kernel lets go: the mount that survived may hold a handle no publication counted (U10)"
-  );
   drop(bridge);
-  kept_until_the_mount_ends(
+  reclaimed_at_the_forget(
     &mut recovered,
     &mut after,
     f,
@@ -348,12 +353,8 @@ fn a_reissued_handle_value_on_the_same_file_balances_across_the_takeover() {
   );
   bridge.release(oid(f), &cx, reissued).unwrap();
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    readable(&mut bridge, &cx, f),
-    "kept after the kernel lets go: the mount that survived may hold a handle no publication counted (U10)"
-  );
   drop(bridge);
-  kept_until_the_mount_ends(
+  reclaimed_at_the_forget(
     &mut recovered,
     &mut after,
     f,
@@ -421,12 +422,8 @@ fn a_handle_released_after_the_last_publication_leaves_no_open_behind() {
     bridge.release(oid(f), &cx, *fh).unwrap();
   }
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    readable(&mut bridge, &cx, f),
-    "kept after the kernel lets go: the mount that survived may hold a handle no publication counted (U10)"
-  );
   drop(bridge);
-  kept_until_the_mount_ends(
+  reclaimed_at_the_forget(
     &mut recovered,
     &mut after,
     f,

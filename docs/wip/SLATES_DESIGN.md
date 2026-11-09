@@ -19051,6 +19051,16 @@ Applied in the same change to:
   virtio-fs mounts, so the sweep alone never ran for an ordinary one). A file made after the takeover, and every file outside a takeover, is reclaimed at its
   last close as before. This replaces A-152's "reclaimed at the kernel's forget" for pre-takeover files on a surviving
   mount: the successor cannot know a handle no publication counted is not still open.
+  - **2026-11-09, never kept for a mount that forgot it.** A `FORGET` comes only once the kernel holds nothing of the
+    inode, no handle included (a handle holds a lookup), so a file whose last reference went back with a mount's
+    `FORGET`, live or replayed from the write log, is reclaimed at once unless another mount that survived the takeover
+    may still hold it (`Volume::forget_for`, `keeps_for_takeover_besides`). Found by
+    `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back` (a1b44bb1's replayed
+    `FORGET`): with the first U10 rule it failed on both Linux arches (diag-bug-sweep-27, run 42515180074), the file kept
+    until the mount ended; after, 3 of 3 on adacachy2. A-152's five takeover tests, which end with the kernel's `FORGET`,
+    expect the reclaim at the forget again, as they did before U10, and the real-mount release test the bytes back once
+    both descriptors close. A file is kept only while the successor cannot know: unlinked while a handle no image
+    counted may be open.
   - `a_file_a_handle_no_publication_counted_may_hold_is_kept_until_its_mount_ends` (`crates/bridge-core/tests/
     takeover_release.rs`): the file unlinked after the takeover still read through the uncounted handle, counted kept,
     and reclaimed when the mount ends; a file made after the takeover reclaimed at once.

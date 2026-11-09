@@ -5255,6 +5255,18 @@ impl Volume {
   /// unmount). Never drops below zero. Reclaims the inode if this brings the count to zero and it
   /// is an orphan, at this terminal step.
   pub fn unreference_n(&mut self, store: &mut Store, no: InodeNo, n: u64) -> Result<(), VfsError> {
+    self.unreference_by(store, no, n, None)
+  }
+
+  /// [`Volume::unreference_n`], with the owner that is known to hold nothing of `no` any more (`let_go`: a `FORGET`'s
+  /// sender), which a file is never kept for (U10).
+  fn unreference_by(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    n: u64,
+    let_go: Option<RefOwner>,
+  ) -> Result<(), VfsError> {
     let remaining = match self.references.get_mut(&no) {
       Some(count) => {
         let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*count);
@@ -5267,7 +5279,10 @@ impl Volume {
       }
       None => 0,
     };
-    if remaining == 0 && self.orphans.contains_key(&no) && self.keeps_for_takeover(no) {
+    if remaining == 0
+      && self.orphans.contains_key(&no)
+      && self.keeps_for_takeover_besides(no, let_go)
+    {
       // A file a mount that survived a takeover may still hold through a handle no publication counted: kept until that
       // mount ends (U10).
       self.takeover_kept.insert(no);
@@ -5348,7 +5363,9 @@ impl Volume {
       return Ok(());
     }
     self.debit_attachment(attachment, no, drop);
-    self.unreference_n(store, no, u64::from(drop))
+    // A `FORGET` comes only once the kernel holds nothing of the inode, no handle included (a handle holds a lookup), so
+    // the mount that sent it is not one that may hold the file through a handle no publication counted (U10).
+    self.unreference_by(store, no, u64::from(drop), Some(attachment))
   }
 
   /// Sweeps every reference `attachment` holds in one bounded batch at its teardown (an unmount or a
@@ -5419,7 +5436,19 @@ impl Volume {
   /// Whether a file of number `no` that leaves the namespace unheld is kept (U10): a mount that survived a takeover may
   /// hold it through a handle no publication counted, which only a file made before the takeover can be.
   fn keeps_for_takeover(&self, no: InodeNo) -> bool {
-    !self.takeover_holders.is_empty() && no < self.takeover_below
+    self.keeps_for_takeover_besides(no, None)
+  }
+
+  /// [`Volume::keeps_for_takeover`], leaving out `let_go`, a mount known to hold nothing of `no` (its `FORGET` came):
+  /// another mount that survived the takeover may still hold it, and only then is it kept. On adacachy2 and CI's Linux
+  /// runners, a file the kernel had let go before the daemon died, its `FORGET` replayed by the successor, stayed kept
+  /// until the mount ended (`the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`).
+  fn keeps_for_takeover_besides(&self, no: InodeNo, let_go: Option<RefOwner>) -> bool {
+    no < self.takeover_below
+      && self
+        .takeover_holders
+        .iter()
+        .any(|holder| let_go != Some(RefOwner::Attachment(*holder)))
   }
 
   /// The orphans kept for mounts that survived a takeover (U10): what `slates status` reports.
