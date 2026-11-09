@@ -30,6 +30,12 @@
 //! fixtures' 1,000-client primary-kill rung, the owner unable to commit and the session full of `LeaseUnconfirmed`
 //! replies), so the origin's resend and its `OwnerUnreachable` never came.
 //!
+//! **A dead session.** A session whose peer is gone without a word is judged where a borrower hands it back
+//! (`fleet::return_sessions`, the transport's `peer_silent_past`), and the link dials again; every borrower's hold is
+//! bounded, so a borrowed session is judged within its window plus one hold. One sitting unborrowed in its slot is the
+//! link's discovery refresh's to catch. That division is why no timer judges it (the bug record of 2026-11-09, a dead
+//! record session was lent on). The lane's forwards on a dropped session are answered unanswered by its next settle.
+//!
 //! **What a session change does.** An exchange is tied to the session it was begun on (its connection id). If the
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
 //! loss always was, and the caller's refusal and retry path takes it from there.
