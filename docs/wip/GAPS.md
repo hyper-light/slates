@@ -1,5 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A rebased work was restated into other bytes: fixed (perf, 2026-11-09, §4.16 "Rebase, the only corrective path").**
+> A rename over a file, rebased and submitted, left the destination with the moved bytes followed by its own: 20 bytes
+> where 10 were renamed in. An edit that replaced bytes came back with the work's own byte kept and an inserted one
+> deleted. `rebased_from` restated a rename as a whole-file insert, and restated net ops (one pass over the head) at
+> their head offsets in a journal that is replayed one operation at a time. A rename is now restated as a `Rename`, and
+> each op where the pass stands when it reaches it. The oracle `a_rebased_work_submits_as_it_would_have` holds a rebased
+> work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
+> red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
+>
+> **Open and owed (found by perf, 2026-11-09, §4.16 "Composition at seal"): an edit after a rename is accepted and
+> lost.** A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
+> bytes alone. This is on main with no rebase involved. The verdict skips a renamed-into path's content ops
+> (`decide_content`) and copies the source's head bytes (`merge_rename`). The chain entry's `Applied::Copied { dst, from }`
+> has no ops to replay, and replay maps an entry's effects before committing any, so a second `Spliced` effect cannot
+> carry them. Owed: `Copied` carries the destination's ops, mapped through the source's deltas (a chain-entry format
+> change), and the rebase restates them after the `Rename`. Red test, parked: `an_edit_after_a_rename_over_a_file_is_merged_with_it`
+> (`crates/server/tests/green_post_state.rs`). The rebase oracle's generator stays out of this case until then.
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never

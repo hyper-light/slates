@@ -3197,6 +3197,8 @@ impl Green {
     use crate::increment::VolumeOp;
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
+    // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
+    let mut moved_from: BTreeSet<String> = BTreeSet::new();
     for effect in effects {
       match effect {
         Effect::Special(path, node) => {
@@ -3207,19 +3209,29 @@ impl Green {
           journal.push(VolumeOp::Mknod { path, node, mode });
         }
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
+        // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
+        // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
+        // replayed over a head that holds the destination it would add them to that file's own.
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from)) => {
+          journal.push(VolumeOp::Rename {
+            from: from.clone(),
+            to: path.clone(),
+          });
+          moved_from.insert(from);
+          changed.insert(path, Some(bytes));
+        }
         Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
-          for op in &ops {
-            if let Some(volume_op) = content_volume_op(&path, op) {
-              journal.push(volume_op);
-            }
-          }
+          let head_len = self.content.get(&path).map_or(0, |head| head.len() as u64);
+          journal.extend(content_volume_ops(&path, &ops, head_len));
           changed.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
-          journal.push(VolumeOp::Unlink { path: path.clone() });
+          if !moved_from.remove(&path) {
+            journal.push(VolumeOp::Unlink { path: path.clone() });
+          }
           changed.insert(path, None);
         }
         Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
@@ -3247,36 +3259,56 @@ impl Green {
   }
 }
 
-/// Restates a mapped content op as a declared operation (head coordinates; the post-state offset is
-/// re-derived when the rebased journal is next composed, so it is dropped here). Returns `None` for a
-/// non-content op kind.
-fn content_volume_op(path: &str, op: &Op) -> Option<crate::increment::VolumeOp> {
+/// Restates a file's mapped content ops as declared operations, in head coordinates. The ops are one pass over the
+/// head's `head_len` bytes ([`apply`]: each at its offset in the head, in order), while a journal is replayed one
+/// operation at a time over the file as the operations before it left it. So each op is restated where [`apply`] stands
+/// when it reaches it: past the output so far, with the head left from its cursor still after it. Restated at their
+/// head offsets as they stand, an insert followed by a delete at the same offset deleted the inserted byte. The
+/// post-state offset is re-derived when the rebased journal is next composed, so it is dropped here; an op of another
+/// kind restates as nothing.
+fn content_volume_ops(path: &str, ops: &[Op], head_len: u64) -> Vec<crate::increment::VolumeOp> {
   use crate::increment::VolumeOp;
-  let path = path.to_owned();
-  Some(match op.kind {
-    OpKind::Overwrite => VolumeOp::Overwrite {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Insert => VolumeOp::Insert {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Extend => VolumeOp::Extend {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Delete => VolumeOp::Delete {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Truncate => VolumeOp::Truncate { path, len: op.len },
-    _ => return None,
-  })
+  let mut restated = Vec::with_capacity(ops.len());
+  // `pos`: the cursor in the head; `out`: the length [`apply`] has written, where the next op stands in the journal.
+  let (mut pos, mut out) = (0u64, 0u64);
+  for op in ops {
+    if op.at > pos {
+      out = out.saturating_add(op.at.min(head_len).saturating_sub(pos));
+      pos = op.at;
+    }
+    let path = path.to_owned();
+    let (at, len) = (out, op.len);
+    match op.kind {
+      OpKind::Overwrite => {
+        restated.push(VolumeOp::Overwrite { path, at, len });
+        out = out.saturating_add(len);
+        pos = pos.saturating_add(len);
+      }
+      OpKind::Insert => {
+        restated.push(VolumeOp::Insert { path, at, len });
+        out = out.saturating_add(len);
+      }
+      OpKind::Extend => {
+        restated.push(VolumeOp::Extend { path, at, len });
+        out = out.saturating_add(len);
+      }
+      OpKind::Delete => {
+        restated.push(VolumeOp::Delete {
+          path,
+          at,
+          len: len.min(head_len.saturating_sub(pos)),
+        });
+        pos = pos.saturating_add(len);
+      }
+      // [`apply`] keeps nothing of the head past a truncate: the file is cut where its output stands.
+      OpKind::Truncate => {
+        restated.push(VolumeOp::Truncate { path, len: out });
+        pos = head_len;
+      }
+      _ => {}
+    }
+  }
+  restated
 }
 
 /// Files one per-dimension merge result into the accepted effects or the conflict windows.
