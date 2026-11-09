@@ -15605,10 +15605,10 @@ Applied in the same change to:
 - §4.8 A-200's status: the note on a candidate's copy surviving its own restart.
 - GAPS: the 2026-11-08 entry; BENCHMARKS: the three-arm measurement.
 - `crates/vfs`:
-  - `recover.rs`: `HeldPiece`, `HELD_PIECE_KEY_BYTES`, `ShardImage.held` as pieces, `IMAGE_VERSION` 24 → 25, and
+  - `recover.rs`: `HeldPiece`, `HELD_PIECE_KEY_BYTES`, `ShardImage.held` as pieces, `IMAGE_VERSION` 25 → 26, and
     `read_header`.
   - `checkpoint_log.rs`: `ShardDelta.held_put` and `held_removed`, folded by `apply` as the call records are, and
-    `DELTA_VERSION` 7 → 8.
+    `DELTA_VERSION` 8 → 9.
   - `error.rs`: `VfsError::RecoveryVersion { found, expected }`.
 - `crates/server`:
   - `tracked.rs` (new): `Tracked`, a map that marks every key reached mutably since its owner last published.

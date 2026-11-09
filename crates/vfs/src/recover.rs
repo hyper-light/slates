@@ -79,11 +79,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
 /// 22 (A-231, 2026-11-05) the held connections' byte states. 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
-/// 25 (A-270, 2026-11-09) what the shard holds for other owners is keyed pieces ([`HeldPiece`]) instead of one opaque
+/// 26 (A-270, 2026-11-09) what the shard holds for other owners is keyed pieces ([`HeldPiece`]) instead of one opaque
 /// image, so a delta carries only the pieces that changed.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-pub const IMAGE_VERSION: u16 = 25;
+pub const IMAGE_VERSION: u16 = 26;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

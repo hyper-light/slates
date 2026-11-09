@@ -133,7 +133,7 @@
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
 > - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image was changing (it is built: A-270, image version 25, delta version 8), and two
+>   format raft-5's incremental held image was changing (it is built: A-270, image version 26, delta version 9), and two
 >   format changes at once would collide. Owed when that lands:
 >   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
@@ -15024,7 +15024,7 @@ with all its entries), rebuilt and compared byte for byte, so an acknowledgement
 Now the held image is keyed pieces, and a delta carries only those put and removed: the same test holds the late median
 to one record's, and a live write costs 65–79 µs (BENCHMARKS, interleaved at load 42–113).
 - Held registers and live copies are tracked maps, so no change goes unmarked.
-- The format versions moved (image 25, delta 8), and another build's journal is refused `RecoveryVersion`, never
+- The format versions moved (image 26, delta 9), and another build's journal is refused `RecoveryVersion`, never
   misread.
 
 Open:
