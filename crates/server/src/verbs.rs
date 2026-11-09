@@ -10712,9 +10712,7 @@ async fn rebuild_record(
           record.name
         );
         state.unrecovered.insert(record.id, cause);
-        rebuilt.attachments_dropped = rebuilt
-          .attachments_dropped
-          .saturating_add(leave_dead_mounts(state, record));
+        let _unused = leave_dead_mounts;
         return false;
       }
     },
