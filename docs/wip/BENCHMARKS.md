@@ -12188,3 +12188,7 @@ end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
   cycle's are better on W1.
 - At 1,000 clients main drops none and the two figures agree; W1's submit, rebase and cycle p99 are worse there.
 - Main's drops are fixed on their own branch (agents/perf-replies); the comparison against main with that fix is owed.
+- These tables' end-to-end submit figure holds every submit, accepted or not, beside a per-attempt figure of accepted
+  submits alone. Since 2026-11-09 (after them) the harness files an operation under its outcome, as it files an attempt,
+  so `operation SubmitAccepted` and `operation SubmitConflict` compare with their `latency` rows; the comparison owed
+  above uses them.

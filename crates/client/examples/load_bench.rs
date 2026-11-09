@@ -218,6 +218,41 @@ struct Tally {
   max_drain_gap_ns: u64,
 }
 
+impl Tally {
+  /// Records one logical operation of `kind`, from its first send to its final answer, resends included.
+  fn operation_took(&mut self, kind: Kind, ns: u64) {
+    self.operations.entry(kind).or_default().push(ns);
+  }
+
+  /// Adds a worker's tally into this one.
+  fn absorb(&mut self, mut tally: Tally) {
+    for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
+      self.latencies.entry(kind).or_default().append(&mut samples);
+    }
+    for (kind, mut samples) in std::mem::take(&mut tally.operations) {
+      self
+        .operations
+        .entry(kind)
+        .or_default()
+        .append(&mut samples);
+    }
+    self.submits.append(&mut tally.submits);
+    for (why, count) in tally.refusals {
+      *self.refusals.entry(why).or_default() += count;
+    }
+    self.starved += tally.starved;
+    self.rebase_conflicts += tally.rebase_conflicts;
+    self.max_sweep_ns = self.max_sweep_ns.max(tally.max_sweep_ns);
+    self.reconnects += tally.reconnects;
+    self.resent += tally.resent;
+    self.max_outage_ns = self.max_outage_ns.max(tally.max_outage_ns);
+    self.backpressure += tally.backpressure;
+    self.retried += tally.retried;
+    self.unconfirmed += tally.unconfirmed;
+    self.max_drain_gap_ns = self.max_drain_gap_ns.max(tally.max_drain_gap_ns);
+  }
+}
+
 /// splitmix64: a reproducible plan without a dependency.
 struct Rng(u64);
 
@@ -935,68 +970,77 @@ impl Worker {
       };
       answered = true;
       self.tally.answered += 1;
-      let agent = &mut self.agents[a];
-      let Some((_, sent_ns, kind)) = agent.inflight.take() else {
-        continue;
-      };
-      if let ReplyBody::Refused { refusal } = &reply
-        && retryable_under_its_id(refusal)
-      {
-        // Bounded: past the client's reconnect budget times the patience, the outcome is left unknown for the oracle.
-        let waited = now.saturating_sub(sent_ns);
-        let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
-        if waited > budget {
-          // Given up: the client need no longer keep its acknowledgement below the id.
-          self.conns[agent.conn].client.release_retryable(word);
-          agent.inflight = Some((word, sent_ns, kind));
-          agent.give_up(
-            &mut self.tally,
-            &format!("{kind:?}: still refused retryable after {waited} ns"),
-          );
-          continue;
-        }
-        agent.retry = Some((word, sent_ns, kind));
-        agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
-        self
-          .ready
-          .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
-        continue;
-      }
-      let for_now = matches!(
-        &reply,
-        ReplyBody::Refused {
-          refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
-        }
-      );
-      let refused = matches!(&reply, ReplyBody::Refused { .. });
-      let first = if for_now { None } else { agent.op_since.take() };
-      agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
-      if !refused && let Some(first) = first {
-        self
-          .tally
-          .operations
-          .entry(kind)
-          .or_default()
-          .push(now.saturating_sub(first));
-      }
-      if agent.step != Step::Done {
-        let wait = if for_now {
-          agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
-          agent.pause_ns
-        } else {
-          agent.pause_ns = 0;
-          self.think_ns
-        };
-        self
-          .ready
-          .push(std::cmp::Reverse((now.saturating_add(wait), a)));
-      }
+      self.take_answer(a, word, reply, now);
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
     // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited, never past a request
     // it still awaits.
     if answered && let Err(e) = self.conns[c].client.begin_ack_if_due() {
       self.fail_connection(c, &format!("acknowledge: {e}"));
+    }
+  }
+
+  /// Moves client `a` on with `reply`, the answer to its request `word`, arrived at `now`: a retryable refusal is
+  /// resent under its id (or given up past the patience); any other answer advances the client and, once it is final,
+  /// records the logical operation from its first send.
+  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, now: u64) {
+    let agent = &mut self.agents[a];
+    let Some((_, sent_ns, kind)) = agent.inflight.take() else {
+      return;
+    };
+    if let ReplyBody::Refused { refusal } = &reply
+      && retryable_under_its_id(refusal)
+    {
+      // Bounded: past the client's reconnect budget times the patience, the outcome is left unknown for the oracle.
+      let waited = now.saturating_sub(sent_ns);
+      let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
+      if waited > budget {
+        // Given up: the client need no longer keep its acknowledgement below the id.
+        self.conns[agent.conn].client.release_retryable(word);
+        agent.inflight = Some((word, sent_ns, kind));
+        agent.give_up(
+          &mut self.tally,
+          &format!("{kind:?}: still refused retryable after {waited} ns"),
+        );
+        return;
+      }
+      agent.retry = Some((word, sent_ns, kind));
+      agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+      self
+        .ready
+        .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
+      return;
+    }
+    let for_now = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
+      }
+    );
+    let refused = matches!(&reply, ReplyBody::Refused { .. });
+    // A submit's operation is filed under its outcome, as its attempt's latency is (`Agent::submitted`).
+    let outcome = match &reply {
+      ReplyBody::Submitted { version: None, .. } => Kind::SubmitConflict,
+      _ => kind,
+    };
+    let first = if for_now { None } else { agent.op_since.take() };
+    agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
+    if !refused && let Some(first) = first {
+      self
+        .tally
+        .operation_took(outcome, now.saturating_sub(first));
+    }
+    if agent.step != Step::Done {
+      let wait = if for_now {
+        agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+        agent.pause_ns
+      } else {
+        agent.pause_ns = 0;
+        self.think_ns
+      };
+      self
+        .ready
+        .push(std::cmp::Reverse((now.saturating_add(wait), a)));
     }
   }
 
@@ -1819,35 +1863,8 @@ fn level(
   });
   let wall = epoch.elapsed();
   let mut total = Tally::default();
-  for mut tally in tallies {
-    for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
-      total
-        .latencies
-        .entry(kind)
-        .or_default()
-        .append(&mut samples);
-    }
-    for (kind, mut samples) in std::mem::take(&mut tally.operations) {
-      total
-        .operations
-        .entry(kind)
-        .or_default()
-        .append(&mut samples);
-    }
-    total.submits.append(&mut tally.submits);
-    for (why, count) in tally.refusals {
-      *total.refusals.entry(why).or_default() += count;
-    }
-    total.starved += tally.starved;
-    total.rebase_conflicts += tally.rebase_conflicts;
-    total.max_sweep_ns = total.max_sweep_ns.max(tally.max_sweep_ns);
-    total.reconnects += tally.reconnects;
-    total.resent += tally.resent;
-    total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
-    total.backpressure += tally.backpressure;
-    total.retried += tally.retried;
-    total.unconfirmed += tally.unconfirmed;
-    total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
+  for tally in tallies {
+    total.absorb(tally);
   }
   println!(
     "level\t{n}\twall_ns\t{}\tworkers\t{workers}",
