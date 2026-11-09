@@ -570,6 +570,14 @@ impl Daemon {
     })
   }
 
+  /// Who this node knows to vote in its region's council now ([`RegionalCouncil::known_voters`]): on a learner, the voters
+  /// its last fetched view named. A one-shot control-shard observation.
+  ///
+  /// [`RegionalCouncil::known_voters`]: slates_cluster::config_group::RegionalCouncil::known_voters
+  pub fn council_known_voters(&self) -> Result<Vec<slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.council.known_voters())
+  }
+
   /// The root's committed voter configuration — `Ok(None)` during initialization or a joint change, observed
   /// state kept apart from the typed refusal of an observation the daemon could not make.
   pub fn root_voters(&self) -> Result<Option<Vec<slates_db::register::HostId>>, ObserveError> {
@@ -1080,6 +1088,15 @@ impl Daemon {
       let settled = regional.settled.get(&member)?.generation;
       let current = regional.neighbourhoods.get(&member)?.generation;
       Some((settled, current))
+    })
+  }
+
+  /// This node's council configuration fetches as a learner (`slates_ipc::protocol::LearnerReport`): the version it
+  /// holds, the version after its last fetch, how many members that fetch asked and how long ago. A one-shot
+  /// control-shard observation.
+  pub fn learner_fetches(&self) -> Result<slates_ipc::protocol::LearnerReport, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::verbs::learner_report(s)
     })
   }
 
@@ -3890,6 +3907,7 @@ async fn init_shard(
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
+    learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
     record_sessions: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),

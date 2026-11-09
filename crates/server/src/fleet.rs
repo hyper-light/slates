@@ -4618,7 +4618,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .holds_for(peer, state.fleet.host())
   {
     DirectContact::Holder
-  } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
+  } else if state.council.known_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
@@ -4760,6 +4760,18 @@ fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u6
   }
 }
 
+/// A learner's last council configuration fetch ([`drive_learner_fetch`]): when it asked (the runtime clock), how many
+/// members it asked, and the council version it held once the replies were adopted. Read by status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LearnerFetchLog {
+  /// When the last fetch asked, or `None` before any.
+  pub(crate) asked_at_ns: Option<u64>,
+  /// The members it asked.
+  pub(crate) asked: u32,
+  /// The council version held after its replies were adopted.
+  pub(crate) fetched_version: u64,
+}
+
 /// An uninitialized learner's fetch pace: when its next fetch is due and the wait after that one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LearnerPace {
@@ -4817,6 +4829,11 @@ const LEARNER_FETCH_PACED: &str = "fleet.learner.fetch_paced";
 
 /// Counter: configuration fetch requests a learner sent, root and council (one per voter asked).
 const LEARNER_FETCHES: &str = "fleet.learner.fetches";
+
+/// The status count under which a learner with evidence it is behind records a period with no session to any member of
+/// its region to ask: what a fetch that never happened leaves, where before it left nothing at all.
+/// Format: a refusal name in the daemon's status report.
+const LEARNER_FETCH_NO_SESSION: &str = "fleet.learner.no_session";
 
 /// The member id the link should address now (task #22). A change — the peer restarted — removes the
 /// previous member's record entry (the session to its previous incarnation is dead by definition), drops a
@@ -5493,6 +5510,11 @@ const REPORT_REFUSED: &str = "fleet.report.refused";
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const REPORT_SENT: &str = "fleet.report.sent";
 
+/// The status count under which a member records a period whose report found no session to send it on: a report that
+/// was not sent, which [`REPORT_SENT`] does not count.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const REPORT_NO_SESSION: &str = "fleet.report.no_session";
+
 /// This node's neighbourhood change the council has not settled yet (§4.8 "Neighbourhood changes"): the
 /// council's configuration version and the version its current neighbourhood was fixed at, when it differs from
 /// its settled one and this node has installed that configuration; `None` when settled, or while this node's
@@ -5573,9 +5595,13 @@ async fn report_settlement(
   .await;
 }
 
-/// Sends a report this node makes about itself to the council (§4.8): proposed at once when this node leads
-/// the council, else sent to every voter it holds a session to over [`REPORT_STREAM`], where the leader
-/// proposes it. Counted [`REPORT_SENT`]. The sessions return with the replies; a late reply is dropped (the
+/// Sends a report this node makes about itself to the council (§4.8): proposed at once when this node leads the
+/// council, else sent to every member of its region it holds a session to over [`REPORT_STREAM`], where the leader
+/// proposes it and any other member answers `NotLeader`. Counted [`REPORT_SENT`], or [`REPORT_NO_SESSION`] with no one
+/// to send it to. Not to the voters alone: on a learner they are its join state's, which nothing updates, so a learner
+/// that joined from the bootstrapper reported to nobody once that voter left, and its settlements and takeover
+/// confirmations never reached the council (CI diag-raft-chaos-learner-56 run 1: `fleet.report.sent` 662 with the node's
+/// neighbourhood unsettled for a whole fleet wait). The sessions return with the replies; a late reply is dropped (the
 /// caller reports again next period if the configuration does not show it).
 pub(crate) async fn send_council_report(
   command: slates_cluster::config_group::ConfigCommand,
@@ -5584,17 +5610,35 @@ pub(crate) async fn send_council_report(
   in_flight: &mut Vec<Dispatch>,
 ) {
   let request = command.encode();
-  let voters = state::with_state(|s| {
-    s.count(REPORT_SENT, 1);
+  let Some(targets) = state::with_state(|s| {
     if s.council.is_leader() {
+      s.count(REPORT_SENT, 1);
       let _ = s.council.report(local, command);
-      return Vec::new();
+      return None;
     }
-    s.council.voters()
+    Some(
+      s.record_sessions
+        .keys()
+        .copied()
+        .filter(|host| *host != local && same_region(s, *host))
+        .collect::<Vec<HostId>>(),
+    )
   })
-  .unwrap_or_default();
+  .flatten() else {
+    return;
+  };
   let sessions = take_sessions("fleet.lent_to.send_council_report", |host| {
-    host != local && voters.contains(&host)
+    targets.contains(&host)
+  });
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      if sessions.is_empty() {
+        REPORT_NO_SESSION
+      } else {
+        REPORT_SENT
+      },
+      1,
+    );
   });
   if sessions.is_empty() {
     return;
@@ -6280,7 +6324,7 @@ async fn drive_config_council(
     })
     .unwrap_or(false);
     if wanted {
-      drive_learner_fetch(&voters, budget, in_flight).await;
+      drive_learner_fetch(budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         s.config_refresh_wanted = false;
         let still = !s.council.initialized();
@@ -6736,19 +6780,17 @@ async fn drive_root_learner_fetch(
   });
 }
 
-/// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from
-/// the council voters it has a session to and adopts the newest (§4.8, D-14 — the council is a small elected
-/// set, so a non-voter learns the configuration rather than voting on it; the adopted configuration is then
-/// installed into placement by [`sync_config_from_council`] exactly as a voter's committed one is). The
-/// bare fetch is broadcast to every voter session and the highest-version reply adopted, so a lagging
-/// voter's stale copy never holds the learner back; every borrowed session is returned. A design refinement
-/// (owed) is the piggyback rule — fetching only when a stale-configuration refusal names a newer version
-/// (§4.8), rather than polling each period — but polling is correct and the config-commit rate is near zero.
-async fn drive_learner_fetch(
-  voters: &[HostId],
-  budget: CommitBudget,
-  in_flight: &mut Vec<Dispatch>,
-) {
+/// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from every
+/// member of its region it holds a session to, and adopts the newest (§4.8, D-14 — the council is a small elected set,
+/// so a non-voter learns the configuration rather than voting on it; the adopted configuration is then installed into
+/// placement by [`sync_config_from_council`] exactly as a voter's committed one is). Any member can answer: what a member
+/// serves is a configuration it applied, so a committed one, the answer is empty unless it is newer than the asker's,
+/// and adoption only moves forward, so a lagging member's copy never holds the learner back. Asked of voters alone, a
+/// learner was stranded: its voters are those of its join state, which a fetched configuration does not update, so
+/// once a learner that joined from the bootstrapper lost it, it had no one to ask (CI diag-raft-chaos-mesh-52: both
+/// non-voters at version 8 against 11 and 12 for a whole fleet wait). A learner fetches only on evidence that it is
+/// behind (`drive_config_council`), so a converged region sends nothing. Every borrowed session is returned.
+async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>) {
   let regional_peers: Vec<HostId> = state::with_state(|s| {
     s.record_sessions
       .keys()
@@ -6758,9 +6800,10 @@ async fn drive_learner_fetch(
   })
   .unwrap_or_default();
   let sessions = take_sessions("fleet.lent_to.drive_learner_fetch", |host| {
-    regional_peers.contains(&host) && (voters.is_empty() || voters.contains(&host))
+    regional_peers.contains(&host)
   });
   if sessions.is_empty() {
+    let _ = state::with_state_counted(|s| s.count(LEARNER_FETCH_NO_SESSION, 1));
     return;
   }
   // The fetch carries this learner's current configuration version, so a voter returns the configuration
@@ -6783,11 +6826,14 @@ async fn drive_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
+  let asked_at_ns = futures::now_ns();
   let _ = state::with_state_counted(|s| {
     s.count(
       LEARNER_FETCHES,
       u64::try_from(sent.len()).unwrap_or(u64::MAX),
     );
+    s.learner_fetch.asked_at_ns = Some(asked_at_ns);
+    s.learner_fetch.asked = u32::try_from(sent.len()).unwrap_or(u32::MAX);
   });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
@@ -6809,6 +6855,7 @@ async fn drive_learner_fetch(
     for (peer, bytes) in &fetched {
       crate::consensus::adopt_fetch(s, false, *peer, bytes);
     }
+    s.learner_fetch.fetched_version = s.council.configuration().version;
   });
 }
 

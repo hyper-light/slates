@@ -3501,6 +3501,23 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       0
     },
+    learner: if is_control_shard(state) {
+      learner_report(state)
+    } else {
+      slates_ipc::protocol::LearnerReport::default()
+    },
+  }
+}
+
+/// This node's council configuration fetches as a learner, for status ([`slates_ipc::protocol::LearnerReport`]).
+pub(crate) fn learner_report(state: &ShardState) -> slates_ipc::protocol::LearnerReport {
+  let now = slates_rt::futures::now_ns();
+  let log = state.learner_fetch;
+  slates_ipc::protocol::LearnerReport {
+    council_version: state.council.configuration().version,
+    fetched_version: log.fetched_version,
+    asked: log.asked,
+    last_asked_ago_ns: log.asked_at_ns.map(|at| now.saturating_sub(at)),
   }
 }
 
@@ -3687,6 +3704,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     peers_unmeshed: shards
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
+    learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
   }
 }
 

@@ -186,7 +186,10 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 `fleet_peers_probed` (peers with a formed probe session), `fleet_peers_in_contact` (the members it keeps direct
 contact with: its holders and the voters, and every member while it votes) and `fleet_peers_unmeshed` (those of them
 not probed yet: its mesh is up at 0; two members that neither hold for each other nor vote keep no contact, so
-`fleet_peers_probed` need not reach the member count less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
+`fleet_peers_probed` need not reach the member count less one), `fleet_learner: council_version=… fetched_version=…
+asked=… last_asked_ago_ms=…` (as a learner: the council version it holds, the version after its last configuration
+fetch, how many members that fetch asked, and how long ago, `never` before any; a node held at an old version says
+here whether it is asking), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
 `fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
 finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
 it has installed; each admission, retirement, settlement and takeover confirmation advances it); then

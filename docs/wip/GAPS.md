@@ -9212,6 +9212,55 @@ new process. In simulation the session ended one round trip after its first pack
     `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
   - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
 
+### 2026-11-08: a learner lost the only voters it knew and stopped learning configurations (fixed)
+
+- **Found** by raft-chaos's five-node flow (diag-raft-chaos-mesh-52, runs 2 and 7 of 8): after the bootstrap voter was
+  replaced, both non-voters stayed at configuration version 8 for a 40 s fleet wait while the voters reached 11 and 12.
+- **Cause:** a learner fetched only from its join state's voters, which a fetched configuration does not update. With no
+  session to any of them it asked no one and counted nothing.
+- **Fixed:** a regional learner asks every member of its region it holds a session to; `fleet.learner.no_session` counts
+  a period with nobody to ask. Test `a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone`: without the
+  fix 8 of 8 failed on macOS and Linux (CI diag-live-fixes-45), with it 24 of 24 passed (diag-live-fixes-46). Bug doc:
+  `docs/bugs/2026-11-08-a-learner-lost-the-only-voters-it-knew.md`.
+- **Same list, two more uses, fixed:** a learner's reports (`send_council_report`: without the fix 5 of 8 left a node
+  unsettled, diag-live-fixes-51; with it 23 of 24, diag-live-fixes-52) and its contact rule (`known_voters`, learned from
+  the fetch reply: without it 8 of 8 failed, diag-live-fixes-54; with it 32 of 32, diag-live-fixes-55, and the report test
+  60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
+  the next one.
+- **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+
+### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
+
+- **The window.** A successor needs a recovery quorum in every cohort of `recovery_cohorts(departed, object)`. When the
+  departed host still owed its confirmation of an earlier takeover, its retirement carries that host
+  (`Retirement::unconfirmed`), so every object of the departed host is also judged through the earlier host's settled
+  cohort, including objects that cohort never held. With the earlier host and the departed host both gone from it, the
+  object is counted `fleet.takeover.lost` and never adopted.
+- **Measured** (diag-live-fixes-50, fresh-member x24, the stopped holder held 57 to 163 ms, so not condemned): 4 runs of
+  24 logged it, each with the object's creator the crashed owner and the short cohort the replaced member's old one
+  (`has 1 of 2 needed`, `retired [replaced, crashed owner]`). How much of that the report fix removes is not yet
+  measured. Each lost verdict in the re-measure is to be classified by whether the failures stayed within f.
+- **Ruling (2026-11-08).** Such a cohort cannot constrain an object it never held, so the verdict is false, but a false
+  "lost" that needs a second failure inside the takeover window is beyond f at f = 1 and stays a recorded limit. One in a
+  run whose failures stayed within f is a defect against §4.8, however rare, and then the sound rule below is built with
+  its wire and configuration cost accepted (R4). §4.8 is unchanged until then.
+- **Why `object.creator() == departed` fails.** A retired host can return under its old member id
+  (`RegionalConfiguration::admits`). D creates O and is falsely retired; S adopts O and confirms; D is re-admitted; S dies
+  and D adopts O back; D dies owing S's takeover. O's creator is D, and its newest record may sit only on S's cohort.
+- **Why an epoch test fails.** A record's epoch is a per-object ballot, not a statement of who wrote it: an adopted record
+  takes the round's epoch, from another host's numbering, and later writes keep it (`takeover.rs` `adopt`, `fleet.rs`
+  `max(head.epoch, host_epoch)`). D creates O at epoch 1 and is falsely retired (`epochs[D]` 2); S adopts O at round epoch
+  2 and keeps writing it on S's cohort; D returns with final host epoch 2; S dies and D adopts O at 3 or more; D dies. A
+  promiser in both cohorts shows O at epoch 2, written by S at an earlier sequence, and it matches "D's final epoch", so the
+  rule would drop the cohort holding S's newer commits. A writer check alone does not close it: a record D wrote at round
+  epoch 2 in an earlier stint matches as well.
+- **The sound rule, if it is built.** Skip a carried cohort only on proof of a write by the departed host in its final
+  stint: holders report the record's writer and the configuration generation it was written under in their promises
+  (`Accepted` carries neither today), compared with the host's last admission version, which the configuration would have
+  to keep (bounded by the members). Successor ranking and lineage stay configuration-only; only `ready_objects` at the
+  successor changes, and its lost verdict must wait for the promises. The db model comes first, with the reverse red-check
+  that dropping the cohort for adopted objects loses a record.
+
 ### 2026-10-09: every shard sampled memory pressure and sent its hold to every shard (fixed)
 
 - Every shard runs a reap loop, and each one ran `refresh_pressure_hold`: N samplers, each sending N holds a second,
