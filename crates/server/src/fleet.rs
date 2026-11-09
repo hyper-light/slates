@@ -1789,12 +1789,22 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// authority only advances.
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
+  // A move away from a retired owner is recorded with the copy (A-251): once the authority names the successor, only
+  // that record says the copy was the retired owner's, which a takeover round's listing needs.
+  let retired: std::collections::BTreeSet<HostId> = state
+    .council
+    .configuration()
+    .retired
+    .keys()
+    .copied()
+    .collect();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
     if let Some(owner) = state.fleet.object_owner(object)
       && let Some(acceptor) = state.holder_records.get_mut(&object)
     {
-      let _ = acceptor.install_authority(Authority { generation, owner });
+      let from_retired = retired.contains(&acceptor.owner());
+      let _ = acceptor.move_authority(Authority { generation, owner }, from_retired);
     }
   }
 }
@@ -4901,6 +4911,18 @@ fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u6
   }
 }
 
+/// A learner's last council configuration fetch ([`drive_learner_fetch`]): when it asked (the runtime clock), how many
+/// members it asked, and the council version it held once the replies were adopted. Read by status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LearnerFetchLog {
+  /// When the last fetch asked, or `None` before any.
+  pub(crate) asked_at_ns: Option<u64>,
+  /// The members it asked.
+  pub(crate) asked: u32,
+  /// The council version held after its replies were adopted.
+  pub(crate) fetched_version: u64,
+}
+
 /// An uninitialized learner's fetch pace: when its next fetch is due and the wait after that one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LearnerPace {
@@ -6955,11 +6977,14 @@ async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
+  let asked_at_ns = futures::now_ns();
   let _ = state::with_state_counted(|s| {
     s.count(
       LEARNER_FETCHES,
       u64::try_from(sent.len()).unwrap_or(u64::MAX),
     );
+    s.learner_fetch.asked_at_ns = Some(asked_at_ns);
+    s.learner_fetch.asked = u32::try_from(sent.len()).unwrap_or(u32::MAX);
   });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
@@ -6981,6 +7006,7 @@ async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>
     for (peer, bytes) in &fetched {
       crate::consensus::adopt_fetch(s, false, *peer, bytes);
     }
+    s.learner_fetch.fetched_version = s.council.configuration().version;
   });
 }
 
@@ -7673,18 +7699,49 @@ async fn peer_recipient(
   anchor: u64,
   budget: CommitBudget,
 ) -> Option<hyper_seal::recipient::RecipientPublic> {
-  if let Some(Some(known)) = state::with_state(|s| s.peer_recipients.get(&anchor).cloned()) {
+  if let Some(Some(known)) =
+    state::with_state(|s| kept_recipient(&s.peer_recipients, anchor, member))
+  {
     return Some(known);
   }
   let answer = request_peer(member, RECIPIENT_STREAM, &[], budget).await?;
   let public = crate::seal_keys::decode_public(&answer)?;
   let kept = public.clone();
   state::with_state(|s| {
-    if s.peer_recipients.len() < s.config.fleet_peer_capacity.max(1) {
-      s.peer_recipients.insert(anchor, kept);
-    }
+    let capacity = s.config.fleet_peer_capacity.max(1);
+    keep_recipient(&mut s.peer_recipients, capacity, anchor, member, kept);
   });
   Some(public)
+}
+
+/// The recipient key kept for the node at `anchor`, when it was learned from `member`: a node back at its anchor with
+/// fresh RAM (the same certificate, so the same anchor) has a new member id and a recipient of its own, so a key learned
+/// from its predecessor is not its key. Kept by anchor alone, the predecessor's key was used for the replacement for
+/// good: every pair wrapped to it was refused (1,583 of 1,583, diag-live-durability-72), so the replacement could open
+/// no key it was sent (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
+fn kept_recipient(
+  kept: &std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
+  anchor: u64,
+  member: HostId,
+) -> Option<hyper_seal::recipient::RecipientPublic> {
+  kept
+    .get(&anchor)
+    .filter(|(learned_from, _)| *learned_from == member)
+    .map(|(_, public)| public.clone())
+}
+
+/// Keeps `public`, learned from `member` at `anchor`: replacing what the anchor's earlier member gave, or a new anchor
+/// while fewer than `capacity` are kept (the bound `pairs_delivered` keeps too).
+fn keep_recipient(
+  kept: &mut std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
+  capacity: usize,
+  anchor: u64,
+  member: HostId,
+  public: hyper_seal::recipient::RecipientPublic,
+) {
+  if kept.len() < capacity || kept.contains_key(&anchor) {
+    kept.insert(anchor, (member, public));
+  }
 }
 
 /// One request to `host` over its record session, within the round's budget: the reply, or `None` when no session to
@@ -8219,6 +8276,41 @@ mod discovery_wait_tests {
 
 #[cfg(test)]
 mod tests {
+
+  /// A node back at its anchor with fresh RAM (its store destroyed, the same certificate) has a recipient of its own: the
+  /// key learned from its predecessor is not used to deliver to it, and its own replaces the predecessor's even with the
+  /// cache full. Kept by anchor alone, every pair the survivors sent the replacement was wrapped to the destroyed node's
+  /// key and refused (1,583 of 1,583, diag-live-durability-72): the replacement could open no key it was sent.
+  #[test]
+  fn a_recipient_learned_from_a_predecessor_is_not_used_for_its_replacement() {
+    let destroyed = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let fresh = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let (anchor, predecessor, replacement) = (7, HostId(1), HostId(2));
+    // Shape: a cache with room for this one anchor alone.
+    let capacity = 1;
+    let mut kept = std::collections::BTreeMap::new();
+    super::keep_recipient(&mut kept, capacity, anchor, predecessor, destroyed.clone());
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, predecessor),
+      Some(destroyed),
+      "the predecessor's key, for the predecessor"
+    );
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, replacement),
+      None,
+      "the replacement at the same anchor is asked for its own key"
+    );
+    super::keep_recipient(&mut kept, capacity, anchor, replacement, fresh.clone());
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, replacement),
+      Some(fresh),
+      "the replacement's key replaces the predecessor's, the cache full"
+    );
+  }
 
   /// A region of five members at `f = 1` with one neighbourhood of all of them, and an object host 1 created.
   fn content_region() -> (slates_db::register::RegionalConfiguration, ObjectId, u64) {

@@ -135,6 +135,12 @@ fn report() -> ReplyBody {
         },
         peers_in_contact: 3,
         peers_unmeshed: 1,
+        learner: slates_ipc::protocol::LearnerReport {
+          council_version: 193,
+          fetched_version: 197,
+          asked: 4,
+          last_asked_ago_ns: Some(199),
+        },
       },
     }),
   }
