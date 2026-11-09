@@ -176,6 +176,92 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
   assert_eq!(fixed_ctx.quantum_ns(), QUANTUM_NS);
 }
 
+/// Shape: the loaded test's prior, the top of a quiet wake on the hosts measured (1.7-10 µs on Apple silicon,
+/// Linux and Windows, A-223), so queueing behind spinners lifts the mean far past it.
+const QUIET_PRIOR_NS: u64 = 10_000;
+/// Shape: how far past the quiet prior the loaded mean must rise before the test judges anything: a mean that
+/// stayed near it saw no queueing, and the run proves nothing (the non-vacuity bound).
+const QUEUED_FACTOR: u64 = 10;
+/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so every window
+/// the floor keeps has turned over at least once and the seed has expired from it.
+const LOADED_KICKS: u64 = 4 << SHIFT;
+/// Shape: kicked parks the loaded test drives at most, waiting for the spinners' queueing to show in the mean
+/// (a run in which the scheduler happened to place the woken shard well needs more kicks to show it).
+const MOST_LOADED_KICKS: u64 = 16 << SHIFT;
+/// Shape: how far under the loaded mean the idle window must sit. A window that follows the mean is the mean;
+/// one that reads the unqueued wake sits an order of magnitude under it.
+const WINDOW_UNDER_MEAN: u64 = 4;
+/// Shape: spinning threads per logical CPU, as the A/B bar loads a machine (two a CPU, A-223).
+const SPINNERS_PER_CPU: usize = 2;
+
+/// A-223 (i): a tracking shard kicked while asleep beside more spinning threads than CPUs learns wakes
+/// that include its queueing for a CPU. Its mean rises, and the step quantum follows it. Its idle window
+/// must not: the window prices what a park costs the shard, and time spent runnable waiting for a CPU,
+/// which its own spinning lengthens, costs no CPU. The window reads the floor of its confirmed wakes, so it
+/// stays near the unqueued wake while the mean climbs (the shard's idle ratio is 1 here, so the window is
+/// the estimate it reads).
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
+  let tracking = WakeTracking {
+    prior_ns: QUIET_PRIOR_NS,
+    shift: SHIFT,
+    idle_ratio: 1,
+  };
+  let rt = LocalRuntime::new(&config(QUIET_PRIOR_NS, Some(tracking))).unwrap();
+  let ctx = rt.context();
+  let (tx, rx) = channel::<Waker>();
+  rt.spawn(async move {
+    for _ in 0..MOST_LOADED_KICKS {
+      PendOnce {
+        wakers: tx.clone(),
+        polled: false,
+      }
+      .await;
+    }
+  })
+  .unwrap();
+  let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+  let stop = std::sync::atomic::AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    for _ in 0..cpus * SPINNERS_PER_CPU {
+      scope.spawn(|| {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      });
+    }
+    let mut kicks = 0;
+    while kicks < LOADED_KICKS
+      || (ctx.counters().wake_cost_ns < QUEUED_FACTOR * QUIET_PRIOR_NS && kicks < MOST_LOADED_KICKS)
+    {
+      step_until_idle(ctx);
+      park_and_kick(ctx, &rx);
+      kicks += 1;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+  });
+  step_until_idle(ctx);
+  let counters = ctx.counters();
+  assert!(
+    counters.wake_samples >= 2 << SHIFT,
+    "enough kicks met a sleeping shard to turn the floor's windows over: {counters:?}"
+  );
+  assert!(
+    counters.wake_cost_ns >= QUEUED_FACTOR * QUIET_PRIOR_NS,
+    "the spinners queued the woken shard, so its mean rose far past the quiet prior: {counters:?}"
+  );
+  assert_eq!(
+    ctx.quantum_ns(),
+    counters.wake_cost_ns,
+    "the step quantum still reads the mean"
+  );
+  assert!(
+    counters.idle_window_ns <= counters.wake_cost_ns / WINDOW_UNDER_MEAN,
+    "the idle window reads the unqueued wake, not the queued mean: {counters:?}"
+  );
+}
+
 /// How a held poll spends its hold.
 #[derive(Clone, Copy, Debug)]
 enum Hold {

@@ -100,6 +100,9 @@ pub struct Counters {
   pub wake_unslept: u64,
   /// The online wake estimate, nanoseconds (the step quantum while the shard tracks one).
   pub wake_cost_ns: u64,
+  /// The idle spin window now, nanoseconds: how long the shard spins after client activity before it parks
+  /// (§4.7), as its wake tracking derives it; its configured spin while it tracks no estimate.
+  pub idle_window_ns: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -645,6 +648,7 @@ impl ShardContext {
       .try_borrow()
       .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
+    c.idle_window_ns = self.spin_window_ns();
     c
   }
 
