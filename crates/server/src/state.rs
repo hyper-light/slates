@@ -756,6 +756,9 @@ pub struct ShardState {
   pub config_refresh_wanted: bool,
   /// When an uninitialized council learner fetches next, and the wait after it (`fleet::next_learner_wait`).
   pub(crate) council_learner_pace: crate::fleet::LearnerPace,
+  /// This node's last council configuration fetch as a learner: when it asked, how many, and the version it held after
+  /// (`fleet::drive_learner_fetch`), for status.
+  pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
