@@ -1,0 +1,102 @@
+name: diag-liveness-a223-floor
+
+# Diagnostics only, never on main (A-223 window-rule plan, step 3): the floor fix (2389b0d9). On every runner the
+# gates and the machine and rt suites, then provision_bench at 2 shards and the derived count, quiet and with two
+# spinning shell loops per logical CPU, three rounds each, every shard's wake mean and floor kept. Results go to
+# diag-results/liveness-33-<os>, read by git fetch.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  FIX_SHA: 2389b0d9056d01482f1635a1e1ca0c7eb5d23d13
+
+jobs:
+  floor:
+    name: A-223 floor (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The gates and the suites
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          git worktree add ../src "$FIX_SHA" > /dev/null 2>&1
+          cd ../src
+          export CARGO_TARGET_DIR=../target
+          git log -1 --format='fix %h %s' | cut -c1-90 | tee -a $R
+          status=0; cargo fmt --all --check > ../fmt.log 2>&1 || status=$?; echo "== fmt exit $status" | tee -a $R
+          status=0; cargo xtask check > ../xtask.log 2>&1 || status=$?; tail -3 ../xtask.log | cut -c1-200 | tee -a $R; echo "== xtask check exit $status" | tee -a $R
+          case "${{ matrix.os }}" in
+            windows-*) status=0; cargo clippy --locked -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?;;
+            *) status=0; cargo clippy --locked --workspace --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?;;
+          esac
+          grep -E '^error' -A6 ../clippy.log | head -30 | cut -c1-200 | tee -a $R; echo "== clippy exit $status" | tee -a $R
+          status=0; cargo test --locked -p slates-machine -p slates-rt > ../test.log 2>&1 || status=$?
+          grep -E '^test .*FAILED|^test result: FAILED|panicked|a_loaded_shards|the_floor|the_seed|an_estimate_with' ../test.log | cut -c1-400 | tee -a $R
+          echo "ok lines $(grep -c '^test result: ok' ../test.log)" | tee -a $R
+          echo "== tests exit $status" | tee -a $R
+          cargo build --release --locked -p slates-client --example provision_bench > ../build.log 2>&1 || { echo "== build failed" | tee -a $R; tail -20 ../build.log | tee -a $R; }
+      - name: The floor, quiet and loaded, three rounds
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          B="../target/release/examples/provision_bench$ext"
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          for cond in busy quiet; do
+            for shards in 2 derived; do
+              for round in 1 2 3; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond shards=$shards round=$round at $(date -u +%H:%M:%S)" | tee -a $R
+                if [ $shards = derived ]; then unset PROVISION_BENCH_SHARDS; else export PROVISION_BENCH_SHARDS=$shards; fi
+                timeout 1500 "$B" > ../run.log 2>&1; status=$?
+                unset PROVISION_BENCH_SHARDS
+                for p in $pids; do kill "$p" 2>/dev/null; done
+                wait 2>/dev/null
+                grep -E 'provisioning histogram|_cpu_|parks per 1000|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|panicked' ../run.log | cut -c1-900 | tee -a $R
+                echo "== exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-33-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-33 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
