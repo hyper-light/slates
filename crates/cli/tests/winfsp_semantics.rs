@@ -865,12 +865,13 @@ fn developer_mode() -> bool {
   output.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("0x1"))
 }
 
-/// A-275 (who may make a link, NTFS's rule judged by the drive). Do: on the drive, as a caller whose token holds no
-/// privilege (a standard user without `SeCreateSymbolicLinkPrivilege`), make a file link with no flag. Expect, outside
-/// Developer Mode, `ERROR_PRIVILEGE_NOT_HELD`, as NTFS answers, and no link; under Developer Mode the link, A-275's
-/// stated deviation (the flag NTFS asks for there never reaches a file system, so the drive cannot ask for it).
+/// A-275 (who may make a link, NTFS's rule). Do: on the drive, as a caller whose token holds no privilege (a standard
+/// user without `SeCreateSymbolicLinkPrivilege`), make a file link with `CreateSymbolicLinkW` and no flag. Expect
+/// `ERROR_PRIVILEGE_NOT_HELD` and no link, with Developer Mode on or off, as on NTFS (diagnostics run 42715955734's NTFS
+/// control: 1314 in both modes). `CreateSymbolicLinkW` refuses such a caller itself before any file system is asked,
+/// so on its path A-275's Developer Mode deviation never arises.
 #[test]
-fn a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode() {
+fn a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused() {
   if !live_mount_runs() {
     return;
   }
@@ -882,23 +883,15 @@ fn a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode() 
   eprintln!(
     "A-275 an unprivileged CreateSymbolicLinkW on the drive, no flag, Developer Mode {developer}: {made:?}"
   );
-  if developer {
-    assert_eq!(
-      made,
-      Ok(()),
-      "under Developer Mode the drive allows it (A-275's stated deviation)"
-    );
-  } else {
-    assert_eq!(
-      made,
-      Err(ERROR_PRIVILEGE_NOT_HELD),
-      "refused as NTFS refuses"
-    );
-    assert!(
-      std::fs::symlink_metadata(drive.path("refused-link")).is_err(),
-      "no link is left"
-    );
-  }
+  assert_eq!(
+    made,
+    Err(ERROR_PRIVILEGE_NOT_HELD),
+    "refused as NTFS refuses it"
+  );
+  assert!(
+    std::fs::symlink_metadata(drive.path("refused-link")).is_err(),
+    "no link is left"
+  );
 }
 
 /// A-275 (who may make a link, NTFS's rule). Do: on the drive, as the test's own caller (an administrator, whose token

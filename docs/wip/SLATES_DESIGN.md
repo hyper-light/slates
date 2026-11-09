@@ -14429,7 +14429,9 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     a file link, whatever its target; and a link relative to the drive's root (`\x\y`) is kept relative to its own
     directory, so moved, it reaches what that path names from its new directory, where NTFS keeps it naming `\x\y`.
     And who may make one is NTFS's rule judged by the drive, with one deviation: under Developer Mode it allows a
-    caller who did not pass `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, since that flag never reaches a file system.
+    program without the privilege that writes a link's reparse buffer itself without
+    `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, since that flag never reaches a file system (`CreateSymbolicLinkW`
+    refuses such a caller itself, so its callers get NTFS's answers).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
 - **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
@@ -16288,7 +16290,12 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
     at the set. Otherwise it answers `STATUS_PRIVILEGE_NOT_HELD`, which Windows reports as `ERROR_PRIVILEGE_NOT_HELD`,
     NTFS's answer.
   - Stated deviations from NTFS. (a) WinFsp never passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file
-    system, so under Developer Mode the drive allows a caller who did not pass it, where NTFS refuses it. (b) The privilege
+    system, so under Developer Mode the drive allows a program without the privilege that sets a link's buffer itself
+    (`FSCTL_SET_REPARSE_POINT`) without that flag, where NTFS may refuse it. A `CreateSymbolicLinkW` caller never meets
+    this: `CreateSymbolicLinkW` itself refuses a caller without the privilege that did not pass the flag, before any file
+    system is asked, so on its path the drive answers as NTFS in every case measured (a token with no privilege, the
+    flag and Developer Mode each off and on: `ERROR_PRIVILEGE_NOT_HELD` three times and the link made once, on the
+    drive and on the runner's NTFS alike, diagnostics run 42715955734). (b) The privilege
     must be enabled in the token at the open, where NTFS asks it enabled at the set. `CreateSymbolicLinkW` enables it
     around its whole operation, before its create, so on that path the two agree; a program that never enables it is
     refused, as on NTFS. Only a program that enables it after its open and before its `FSCTL_SET_REPARSE_POINT` is
@@ -16296,11 +16303,11 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
     (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT` or a write access, or through one a
     successor restored after a takeover (which kept no token), is judged as one without the privilege: allowed under
     Developer Mode alone.
-  - Measured on the runner by `a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode` (`ERROR_PRIVILEGE_NOT_HELD`,
+  - Measured on the runner by `a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused` (`ERROR_PRIVILEGE_NOT_HELD`,
     no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
     `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag` and
-    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`: PENDING-PRIVILEGE. An NTFS control (the same token
-    and flag on the runner's own disk, Developer Mode on and off): PENDING-NTFS. The daemon holds no privilege (R10).
+    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`: PENDING-PRIVILEGE. The NTFS control (the same token and
+    flags on the runner's own disk, Developer Mode off and on) gave the same four answers as the drive. The daemon holds no privilege (R10).
 - **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
   its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
   relative link (prefixed with the volume's name) and an absolute one alike (`src/sys/create.c` 893-996, v2.1), so the
