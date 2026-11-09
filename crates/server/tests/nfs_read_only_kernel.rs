@@ -4,7 +4,7 @@
 //! for writing through it, and a file is created beside it. The kernel decides a v3 open from the ACCESS reply alone (v3
 //! has no OPEN), and a v4 open from the server's OPEN, so only a kernel mount shows what an application sees: the
 //! bridge's own tests drive the procedures and never meet the kernel's open. Over v4 every refusal is `EROFS`. Over v3 an
-//! open for writing is `EACCES`, the most a v3 server can say (A-260): Linux turns an ACCESS bit the server did not grant
+//! open for writing is `EACCES`, the most a v3 server can say (A-269): Linux turns an ACCESS bit the server did not grant
 //! into `-EACCES` (`fs/nfs/dir.c` v6.8, `nfs_do_access`, lines 3219–3221); a change that reaches the server, the create,
 //! is `EROFS`.
 //!
@@ -38,7 +38,7 @@ const NFS3_OPTIONS: &str = "vers=3,tcp,nolock,noresvport,soft,timeo=10,retrans=2
 const NFS4_OPTIONS: &str = "vers=4.2,proto=tcp,soft,timeo=10,retrans=2,noresvport,actimeo=1";
 /// Format: POSIX `EROFS`, a read-only file system, on Linux.
 const EROFS: i32 = 30;
-/// Format: POSIX `EACCES`, permission denied, on Linux: an NFSv3 open for writing on a read-only attachment (A-260).
+/// Format: POSIX `EACCES`, permission denied, on Linux: an NFSv3 open for writing on a read-only attachment (A-269).
 const EACCES: i32 = 13;
 /// Format: the bytes the file holds, written through the volume's writable mount.
 const FIRST: &[u8] = b"the file's first bytes";
@@ -148,7 +148,7 @@ fn opens_for_writing(file: &Path) -> [Option<i32>; 4] {
 /// GAPS (2026-11-08), found by conformance's read-only run: a read-only attachment refuses an open for writing through
 /// the kernel's own NFS clients. Do: write `f` through the volume's writable mount; mount a read attachment of the volume
 /// over NFSv3 and over NFSv4.2; through each, open `f` with `O_WRONLY`, `O_RDWR` and `O_RDONLY|O_TRUNC`, and create a
-/// file beside it. Expect over v4 each refused `EROFS`; over v3 each open refused `EACCES` (A-260, the v3 limit) and the
+/// file beside it. Expect over v4 each refused `EROFS`; over v3 each open refused `EACCES` (A-269, the v3 limit) and the
 /// create `EROFS`; and a read-only open reading the first bytes. Before the fix both clients granted `O_WRONLY` and
 /// `O_RDWR`, and v4 answered the truncation `EACCES` (diag-slabs-42, run 42517407649).
 #[test]

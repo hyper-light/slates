@@ -50,7 +50,7 @@ v3 open from that reply, and v4's OPEN asked the same ACCESS; the truncation's S
 was refused by the state id's check before the attachment's. Now ACCESS grants no MODIFY, EXTEND or DELETE where the
 bridge refuses a change (`change_refusal`); a v4 OPEN for writing asks the owner extension `CHANGE_ALLOWED` first and
 answers its `NFS4ERR_ROFS`; and a change under a state id is refused ROFS before its state id is judged (`state_io`).
-Over NFSv3 the open is then `EACCES`, the most a v3 server can say (A-260). The test,
+Over NFSv3 the open is then `EACCES`, the most a v3 server can say (A-269). The test,
 `a_read_only_attachment_refuses_an_open_for_writing_through_the_kernels_nfs_clients`
 (`crates/server/tests/nfs_read_only_kernel.rs`, Linux CI as root): red on main (diag-slabs-42, run 42517407649: v3
 `[granted, granted, EROFS]`, v4 `[granted, granted, EACCES]`), green with the fix (diag-slabs-43, run 42517769901). The
