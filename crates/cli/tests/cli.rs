@@ -3699,6 +3699,83 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
   }
 }
 
+/// Whether a status refusal line (`shard N refused <counter>: <count>`) is one forming a fleet may show: superseded link
+/// work, and the events of formation's ordinary work that the counter map carries beside refusals.
+fn formation_counter_allowed(line: &str) -> bool {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  let Some(counter) = line
+    .split_whitespace()
+    .nth(3)
+    .and_then(|counter| counter.strip_suffix(':'))
+  else {
+    return false;
+  };
+  [
+    "fleet.discovery.invalidated",
+    "fleet.link.stale_return",
+    "fleet.accept.replaced",
+    "fleet.fan.sent",
+    "fleet.fan.unchanged",
+    // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+    // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
+    // announcement pass's lent sessions and sends.
+    "fleet.discovery.pages",
+    "fleet.learner.fetches",
+    "fleet.learner.fetch_paced",
+    "fleet.plane.announce_lends",
+    "fleet.plane.announcements_sent",
+    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
+    // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
+    CONTENT_PURGED,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+    GIVE_BACK_LEFT,
+    // A record link dropped because its anchor's learned member became another incarnation
+    // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
+    // superseded link work — exactly what this assertion permits — and it is counted during formation
+    // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
+    "fleet.link.invalid.member_changed",
+  ]
+  .contains(&counter)
+}
+
+/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
+/// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
+/// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
+#[test]
+fn the_formation_check_allows_every_reap_tick_event() {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  for counter in [
+    CONTENT_PURGED,
+    GIVE_BACK_LEFT,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+  ] {
+    let line = format!("shard 0 refused {counter}: 1");
+    assert!(
+      formation_counter_allowed(&line),
+      "the formation check allows {line:?}"
+    );
+  }
+}
+
 /// Every process derived the same fleet from the one manifest: the same three member ids (its own among
 /// them, distinct per node) and both peers probed.
 fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
@@ -3740,39 +3817,7 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
         .refusals
         .split(';')
         .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-          [
-            "fleet.discovery.invalidated:",
-            "fleet.link.stale_return:",
-            "fleet.accept.replaced:",
-            "fleet.fan.sent:",
-            "fleet.fan.unchanged:",
-            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
-            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
-            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
-            "fleet.discovery.pages:",
-            "fleet.learner.fetches:",
-            "fleet.learner.fetch_paced:",
-            "fleet.plane.announce_lends:",
-            "fleet.plane.announcements_sent:",
-            "content.purged_bytes:",
-            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
-            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
-            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
-            "content.ticks.sealing:",
-            "content.ticks.deferred:",
-            "content.ticks.busy:",
-            "content.ticks.idle:",
-            "content.prefaulted_bytes:",
-            // A record link dropped because its anchor's learned member became another incarnation
-            // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
-            // superseded link work — exactly what this assertion permits — and it is counted during formation
-            // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
-            "fleet.link.invalid.member_changed:",
-          ]
-          .iter()
-          .any(|counter| line.split_whitespace().nth(3) == Some(counter))
-        }),
+        .all(formation_counter_allowed),
       "only superseded link work may end during formation: {views:?}"
     );
   }
@@ -12573,11 +12618,70 @@ fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_ke
   );
 }
 
+/// Makes a volume named `name` over a host directory in `scratch`, removes the directory and restarts the daemon in
+/// order (`SIGTERM`, no kernel mount involved), so the successor holds the volume's record but could not rebuild it.
+/// Returns the volume's id and the removed base.
+#[cfg(unix)]
+fn an_unrecovered_volume(instance: &str, scratch: &ScratchDir, name: &str) -> (String, String) {
+  let base = format!("{}/{name}-base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      name,
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("rmdir {base}"));
+  restart_in_order(instance);
+  (id, base)
+}
+
+/// Stops the instance's daemon with `SIGTERM` and waits for its successor.
+#[cfg(unix)]
+fn restart_in_order(instance: &str) {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(instance, Some(stopped), &[]);
+}
+
+/// `slates <verb...>` on the unrecovered volume is refused `NotRecovered`, by kind.
+#[cfg(unix)]
+fn refused_not_recovered(instance: &str, verb: &[&str]) {
+  let (code, out, err) = run(instance, verb);
+  assert_ne!(
+    code, 0,
+    "{verb:?} on a volume recovery could not rebuild: {out}"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "{verb:?} is refused because recovery could not rebuild the volume, by kind: {err}"
+  );
+}
+
 /// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
 /// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
-/// state: the recovery refusal by kind. Do: create a volume over a host directory, remove the directory, and restart the
-/// daemon in order (no kernel mount is involved). Expect: `volume list` still shows the volume, and its `status` is
-/// refused `NotRecovered`, naming the missing base.
+/// state: the recovery refusal by kind. The sweep of 2026-11-08 (GAPS): `volume list` names why on the volume's line,
+/// and the verbs that would change it refuse typed, a share included, though a share touches only the catalog. Do:
+/// create a volume over a host directory, remove the directory, and restart the daemon in order (no kernel mount is
+/// involved). Expect: `volume list` shows the volume with `not_recovered=BaseMissing`; its `status`, a `volume snapshot`
+/// and a `share` are each refused `NotRecovered`, naming the missing base.
 #[cfg(unix)]
 #[test]
 fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
@@ -12592,43 +12696,74 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   let scratch = ScratchDir {
     path: build_output_dir("slates-unrecovered"),
   };
-  let base = format!("{}/base", scratch.path);
-  shell(&format!("mkdir {base}"));
-  let (code, out, err) = run(
-    &instance,
-    &[
-      "volume",
-      "create",
-      "unrecovered",
-      "--bounded",
-      "8MiB",
-      "--base",
-      &base,
-    ],
-  );
-  assert_eq!(code, 0, "{err}");
-  let id = value_of(&out, "id");
-  shell(&format!("rmdir {base}"));
-  let stopped = daemon_pid(&instance).expect("the daemon answers");
-  assert!(
-    Command::new("kill")
-      .args(["-TERM", &stopped.to_string()])
-      .status()
-      .unwrap()
-      .success(),
-    "SIGTERM sent"
-  );
-  await_daemon(&instance, Some(stopped), &[]);
+  let (id, base) = an_unrecovered_volume(&instance, &scratch, "unrecovered");
   let (code, out, err) = run(&instance, &["volume", "list"]);
   assert_eq!(code, 0, "{err}");
   assert!(
-    out.contains("unrecovered"),
-    "the catalog still lists the volume: {out}"
+    out
+      .lines()
+      .any(|line| line.contains(" unrecovered ") && line.ends_with(" not_recovered=BaseMissing")),
+    "the catalog lists the volume, naming why it was not rebuilt: {out}"
   );
   let (code, out, err) = run(&instance, &["status", &id]);
   assert_ne!(code, 0, "the volume was not rebuilt: {out}");
   assert!(
     err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
     "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  refused_not_recovered(&instance, &["volume", "snapshot", &id]);
+  refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
+/// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
+/// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
+/// in order, then `volume destroy` it. Expect: the destroy succeeds; `volume list` no longer names it and its `status`
+/// answers `NotFound`; its name can be given to a new volume; and after a second restart nothing is reported not
+/// rebuilt and the volume is still gone.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_destroyed_and_stays_gone() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's destroy: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-undestroyed-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-undestroyed"),
+  };
+  let (id, _) = an_unrecovered_volume(&instance, &scratch, "undestroyed");
+  let (code, out, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(
+    code, 0,
+    "a volume recovery could not rebuild is destroyed: {out}{err}"
+  );
+  assert_gone(&instance, &id);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "undestroyed", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "the destroyed volume's name is free: {err}");
+  restart_in_order(&instance);
+  assert_gone(&instance, &id);
+}
+
+/// `volume list` names no `undestroyed` volume recovery could not rebuild, and `status` of `id` answers `NotFound`.
+#[cfg(unix)]
+fn assert_gone(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.contains("not_recovered="),
+    "no volume is listed as not rebuilt: {out}"
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_ne!(code, 0, "the destroyed volume has no status: {out}");
+  assert!(
+    err.contains("NotFound"),
+    "the destroyed volume is not found: {err}"
   );
 }

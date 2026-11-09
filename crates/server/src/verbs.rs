@@ -8587,6 +8587,8 @@ pub(crate) fn end_attachment(
     state.attachments.revoke(mount.registry);
     state.attachments.drain(mount.registry);
   }
+  // What NFSv4 clients held open through it is held no longer: no request is served under it again (A-260).
+  crate::nfs_state::release_attachment(state, record.volume, record.id);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -8759,6 +8761,9 @@ fn resize(
 
 fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
   if let Some(reply) = crate::merge_service::destroy_merge_volume(state, principal, volume) {
+    return reply;
+  }
+  if let Some(reply) = destroy_unrecovered(state, principal, volume) {
     return reply;
   }
   let (handle, record) = match find(state, volume) {
@@ -8948,18 +8953,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       // If this volume is a clone, capture its pin on the origin snapshot before the record goes, so
       // the pin can be released once its destroy completes (§4.5): the origin can then reclaim that
       // snapshot. Best-effort — the origin may be gone or on another shard.
-      let origin_pin = state
-        .db
-        .partition()
-        .lineage(id)
-        .map(|e| (e.origin_volume, e.origin_snapshot))
-        .or_else(
-          || match state.db.partition().volume(id).map(|record| &record.base) {
-            // An image volume's pin on the snapshot it was built from goes with it (A-160).
-            Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
-            _ => None,
-          },
-        );
+      let origin_pin = origin_pin_of(state, id);
       let now = state.clock.monotonic_ns();
       let name = state
         .db
@@ -8982,17 +8976,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       if let Some(name) = name {
         release_name_alias(state, id, &name);
       }
-      if let Some((origin_volume, origin_snapshot)) = origin_pin
-        && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
-      {
-        unpin_origin(
-          state,
-          origin_handle,
-          SnapshotId {
-            value: origin_snapshot.value,
-          },
-        );
-      }
+      release_origin_pin(state, origin_pin);
       if let Ok(slot) = state.volumes.remove(handle) {
         release_slot_credits(state, &slot);
       }
@@ -9002,6 +8986,112 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any
+}
+
+/// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
+/// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
+fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSnapshotId)> {
+  state
+    .db
+    .partition()
+    .lineage(id)
+    .map(|e| (e.origin_volume, e.origin_snapshot))
+    .or_else(
+      || match state.db.partition().volume(id).map(|record| &record.base) {
+        Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
+        _ => None,
+      },
+    )
+}
+
+/// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
+/// Best-effort: the origin may be gone or on another shard.
+fn release_origin_pin(state: &mut ShardState, origin_pin: Option<(DbVolumeId, DbSnapshotId)>) {
+  if let Some((origin_volume, origin_snapshot)) = origin_pin
+    && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
+  {
+    unpin_origin(
+      state,
+      origin_handle,
+      SnapshotId {
+        value: origin_snapshot.value,
+      },
+    );
+  }
+}
+
+/// Destroys a volume recovery could not rebuild (§4.8; GAPS, 2026-11-08), or `None` for any other volume. It has no
+/// slot and holds nothing in this process, so, as a merge volume's destroy is, it is recorded in one step: its
+/// attachments' records end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its snapshots'
+/// records, its lineage and its keys with it and leaves the tombstone a fleet's holders release its copies by. Its name
+/// alias and its pin on an origin's snapshot are given back. Nothing is materialized. Before, every verb on such a
+/// volume answered `NotRecovered`, `destroy` too, so its record stayed for good (banned item 8).
+fn destroy_unrecovered(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if !state.unrecovered.contains_key(&id) {
+    return None;
+  }
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    state.unrecovered.remove(&id);
+    return Some(refused(Refusal::NotFound));
+  };
+  if !rights_of(&record, principal).admin {
+    return Some(forbidden("destroy"));
+  }
+  // A volume whose snapshot a green names as its origin is held with it (A-217), as a rebuilt one is.
+  if state
+    .db
+    .partition()
+    .green_origin_refs()
+    .any(|(_, held)| held.volume == id)
+  {
+    return Some(refused(refusal_of_vfs(&slates_vfs::VfsError::Pinned)));
+  }
+  Some(match record_unrecovered_destroy(state, &record) {
+    Ok(()) => ReplyBody::Destroyed,
+    Err(e) => refused(refusal_of_db(&e)),
+  })
+}
+
+/// Records [`destroy_unrecovered`]'s one step for `record`, then gives back what the volume held outside the catalog.
+/// A refusal part-way leaves what was recorded: a `Destroying` volume is completed at the next start
+/// (`complete_recovered_destroys`), and one still unrecovered is destroyed again.
+fn record_unrecovered_destroy(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Result<(), DbError> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)?;
+  }
+  let origin_pin = origin_pin_of(state, record.id);
+  let now = state.clock.monotonic_ns();
+  for op in [
+    Op::VolumeStateChanged {
+      id: record.id,
+      state: VolumeState::Destroying,
+    },
+    Op::LeaseReleased { volume: record.id },
+    Op::VolumeDestroyed { id: record.id },
+  ] {
+    state.db.mutate(&mut state.segment, &op, now)?;
+  }
+  state.unrecovered.remove(&record.id);
+  release_name_alias(state, record.id, &record.name);
+  release_origin_pin(state, origin_pin);
+  crate::live_ship::forget(state, record.id);
+  retire_local_tombstones(state);
+  Ok(())
 }
 
 /// Returns every credit a torn-down volume held to the shard's ledgers (§4.2 accounting through
@@ -9995,6 +10085,7 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
         .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
       overlay: matches!(v.base, BaseRecord::Path { .. }),
       live_shipped: v.policy.live_shipped,
+      not_recovered: state.unrecovered.get(&v.id).cloned(),
     })
     .collect();
   ReplyBody::Listed { volumes }
@@ -10824,6 +10915,9 @@ async fn rebuild_records(
       let (snapshots, attachments) = reconcile_lost(state, record);
       rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
       rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+      // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
+      // files no one holds (A-260): the image carries none of these holds.
+      crate::nfs_state::hold_recovered(state, record.id);
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));
