@@ -158,6 +158,23 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-09, A-271): a replacement at its own anchor could be the successor of a live volume
+> whose key it never received.** In the store-destroyed takeover (main, release on the Mac: 5 of 5 replacement-as-
+> successor runs out of 8 failed), the destroyed candidate's replacement came back under the same anchor with a new
+> member id. The owner's pair for that anchor had been accepted by the destroyed incarnation, and `covers_candidates`
+> counted the anchor, so writes went durable on a key the replacement never held. Its rebuild then made a fresh
+> lineage key through `seal_keys::lineage`, failed to open the log under it, and was refused `open`, final for the
+> head: it waited for a head that could not move (`takeover_waits_new_head` 368 to 381 a run), and the key it made
+> stayed recorded where `adopt_lineage` keeps one. Now:
+> - a candidate is covered only when its current member id accepted the anchor's pair (`covered_anchor`), for the
+>   durability gate (`covers_candidates`) and the period's re-checkpoint (`coverable_now`);
+> - a reader never makes a key: `seal_keys::recorded_lineage` and `recorded_namer` for every rebuild and successor
+>   path; a sealed log with no keys here is refused `no_key`;
+> - a `no_key` refusal waits for the key, checked locally from the refused entry's sealing with no fetch, fetches once
+>   when it unwraps or the head moves, and past `NO_KEY_WAIT_NS` (ten liveness budgets) is answered
+>   `takeover_no_key_exhausted`. Counted: `takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`.
+> Before, a successor retried each period and re-fetched the whole log 104 to 204 times a run.
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its

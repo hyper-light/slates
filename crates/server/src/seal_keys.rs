@@ -223,8 +223,10 @@ pub fn recorded_lineage(
   volume: slates_db::catalog::VolumeId,
   account: u64,
 ) -> Result<Option<WrappingKey>, SealKeyError> {
-  // Red first: makes a key when none is recorded, as `lineage` does.
-  lineage(state, volume, account).map(Some)
+  Ok(
+    recorded_lineage_secret(state, volume, account)
+      .map(|(id, secret)| WrappingKey::new(id, KEY_GENERATION, secret)),
+  )
 }
 
 /// The namer of `volume` if its lineage and naming keys are both recorded here, or none; never made ([`recorded_lineage`]).
@@ -233,8 +235,19 @@ pub fn recorded_namer(
   volume: slates_db::catalog::VolumeId,
   account: u64,
 ) -> Result<Option<hyper_seal::name::Namer>, SealKeyError> {
-  // Red first: makes the keys when none are recorded, as `namer` does.
-  namer(state, volume, account).map(Some)
+  let Some(lineage_key) = recorded_lineage(state, volume, account)? else {
+    return Ok(None);
+  };
+  let Some(record) = state
+    .db
+    .partition()
+    .seal_key(&slates_db::catalog::SealKeyOwner::Naming { volume })
+    .cloned()
+  else {
+    return Ok(None);
+  };
+  let secret = lineage_key.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?;
+  Ok(Some(hyper_seal::name::Namer::new(&secret)?))
 }
 
 /// The key `record` holds, unwrapped under `parent`.

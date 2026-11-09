@@ -1216,11 +1216,8 @@ fn covered_anchor(
   anchors: &BTreeMap<HostId, u64>,
   delivered: &BTreeMap<u64, HostId>,
 ) -> Option<u64> {
-  // Red first: a pair delivered to the anchor counts, whichever incarnation accepted it.
-  anchors
-    .get(&candidate)
-    .copied()
-    .filter(|anchor| delivered.contains_key(anchor))
+  let anchor = *anchors.get(&candidate)?;
+  (delivered.get(&anchor) == Some(&candidate)).then_some(anchor)
 }
 
 /// Whether a successor among `volume`'s remote candidates (those still in the neighbourhood) can open its log: its
@@ -1233,8 +1230,9 @@ fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
   let Some(live) = state.live.shipping.get(&volume) else {
     return true;
   };
+  // Each candidate's anchor only once this shard's pair to it was accepted by that very candidate ([`covered_anchor`]).
   let wanted: Vec<Option<u64>> = remote_candidates(state, volume)
-    .map(|candidate| state.member_anchors.get(&candidate).copied())
+    .map(|candidate| covered_anchor(candidate, &state.member_anchors, &state.pairs_delivered))
     .collect();
   log_covers(
     &wanted,
@@ -1283,10 +1281,7 @@ fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item
 /// then owes one ([`period`]), so the log is checkpointed again once the pairs are there.
 fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
   remote_candidates(state, volume).all(|candidate| {
-    state
-      .member_anchors
-      .get(&candidate)
-      .is_some_and(|anchor| state.pairs_delivered.contains_key(anchor))
+    covered_anchor(candidate, &state.member_anchors, &state.pairs_delivered).is_some()
   })
 }
 
@@ -2716,7 +2711,15 @@ pub(crate) async fn fetch(
     slates_rt::futures::now_ns(),
     key_here,
   ) {
-    NextFetch::Fetch => {}
+    NextFetch::Fetch => {
+      if key_here
+        && refused
+          .as_ref()
+          .is_some_and(|refused| refused.why == REFUSED_NO_KEY)
+      {
+        let _ = state::with_state(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
+      }
+    }
     NextFetch::WaitsNewHead => return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD),
     NextFetch::WaitsKey => return Err(LIVE_TAKEOVER_WAITS_KEY),
     NextFetch::KeyExhausted => return Err(LIVE_TAKEOVER_NO_KEY_EXHAUSTED),
@@ -2782,6 +2785,9 @@ enum NextFetch {
 /// Counter: a takeover holding no key for the adopted log, waiting for one at its head ([`next_fetch`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_TAKEOVER_WAITS_KEY: &str = "fleet.live.takeover_waits_key";
+/// Counter: a takeover that fetched the log again because the key it lacked has come ([`next_fetch`]): once per arrival.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_KEY_ARRIVED: &str = "fleet.live.takeover_key_arrived";
 /// Counter: a takeover whose key for the adopted log did not come within [`NO_KEY_WAIT_NS`]: no longer waited for at
 /// that head, answered typed.
 /// Format: a counter name in the daemon's status report.
@@ -2806,11 +2812,16 @@ fn next_fetch(refused: Option<&Refused>, adopted: Head, now: u64, key_here: bool
   match refused {
     None => NextFetch::Fetch,
     Some(refused) if refused.why == REFUSED_LINEAGE || refused.head != adopted => NextFetch::Fetch,
-    Some(_) => {
-      // Red first: every other refusal is final at its head.
-      let _ = (now, key_here);
-      NextFetch::WaitsNewHead
+    Some(refused) if refused.why == REFUSED_NO_KEY => {
+      if now.saturating_sub(refused.since) >= NO_KEY_WAIT_NS {
+        NextFetch::KeyExhausted
+      } else if key_here {
+        NextFetch::Fetch
+      } else {
+        NextFetch::WaitsKey
+      }
     }
+    Some(_) => NextFetch::WaitsNewHead,
   }
 }
 
@@ -2915,8 +2926,9 @@ fn sealed_body(payload: &[u8]) -> Option<SealedBody> {
 /// not move with its owner dead (`fleet.live.takeover_waits_new_head` 368 to 381 times a run, 2026-11-09), and the key
 /// it made stayed recorded in the way of the right one.
 fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static str> {
-  // Red first: proceeds whatever this node holds.
-  let _ = (sealed, keys_recorded);
+  if sealed && !keys_recorded {
+    return Err(REFUSED_NO_KEY);
+  }
   Ok(())
 }
 
@@ -2953,9 +2965,28 @@ fn rebuild(
     crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
       .map_err(|_| REFUSED_LINEAGE)?;
   }
+  // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
+  let sealed = fetched
+    .payloads
+    .first()
+    .is_some_and(|payload| sealed_body(payload).is_some());
+  let account = crate::seal_keys::tenant_of(owner);
+  let keys = if sealed {
+    crate::seal_keys::recorded_lineage(state, id, account)
+      .ok()
+      .flatten()
+      .zip(
+        crate::seal_keys::recorded_namer(state, id, account)
+          .ok()
+          .flatten(),
+      )
+  } else {
+    None
+  };
+  keys_for_rebuild(sealed, keys.is_some())?;
   let mut publications = Vec::new();
   for payload in &fetched.payloads {
-    publications.push(open_payload(state, id, owner, payload).ok_or(REFUSED_OPEN)?);
+    publications.push(open_payload(keys.as_ref(), payload).ok_or(REFUSED_OPEN)?);
   }
   let mut image = None;
   let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
@@ -3032,18 +3063,14 @@ fn open_body(
 
 /// One payload's body, opened under the volume's lineage key when sealed.
 fn open_payload(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
+  keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
   payload: &[u8],
 ) -> Option<LivePublication> {
   let (header, body) = payload.split_at_checked(2)?;
   let bytes = if header.get(1) == Some(&BODY_SEALED) {
     let sealed = <SealedBody as Wire>::decode(&mut &body[..]).ok()?;
-    let account = crate::seal_keys::tenant_of(owner);
-    let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-    let namer = crate::seal_keys::namer(state, id, account).ok()?;
-    open_body(&lineage, &namer, sealed.pieces)?
+    let (lineage, namer) = keys?;
+    open_body(lineage, namer, sealed.pieces)?
   } else {
     body.to_vec()
   };
@@ -3450,6 +3477,32 @@ mod tests {
       ),
       None,
       "no anchor known"
+    );
+  }
+
+  /// A-271's retention invariant: a holder's log begins at the newest whole entry it holds, so a successor reads the
+  /// newest entry's key from the first payload it fetches. Do keep two deltas, then a whole entry, then a delta. Expect
+  /// the whole entry first and the earlier deltas gone. If this ever changes, a fetch must read the newest whole entry
+  /// that names this node, not the first payload (A-271's named fallback).
+  #[test]
+  fn a_holders_log_begins_at_the_newest_whole_entry_it_holds() {
+    let mut held = Held {
+      replica: Replica::new(HostId(1), ObjectId([4; 16])),
+      entries: VecDeque::new(),
+      bytes: 0,
+    };
+    for payload in [
+      vec![KIND_DELTA, 1],
+      vec![KIND_DELTA, 2],
+      vec![KIND_WHOLE, 3],
+      vec![KIND_DELTA, 4],
+    ] {
+      keep(&mut held, &payload, 1 << 20).unwrap();
+    }
+    assert_eq!(
+      held.entries.iter().cloned().collect::<Vec<_>>(),
+      vec![vec![KIND_WHOLE, 3], vec![KIND_DELTA, 4]],
+      "the newest whole entry first, what came before it dropped"
     );
   }
 

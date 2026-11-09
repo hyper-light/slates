@@ -19809,3 +19809,39 @@ Applied in the same change to:
   - The reset, frame, parameter and connection unit tests.
   - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
     (`crates/server/tests/fleet.rs`).
+
+### A-271 — A live volume's key reaches its successor before a write is durable on it; a successor never makes the key up, and waits for a missing one by event, bounded (accepted 2026-11-09)
+
+A node whose store is destroyed comes back under the same anchor with a new member id and none of its predecessor's
+keys. The owner's pair for that anchor had been accepted by the predecessor, and the durability gate counted the
+anchor (`covers_candidates`), so writes went durable on a key the replacement never received. As successor, its
+rebuild made a key on the spot, failed to open the log, refused the head for good, and kept the made-up key where the
+right one would go.
+
+- **Covered means accepted by the current incarnation.** A candidate counts toward a whole entry's cover only when
+  this shard's pair to its anchor was accepted by its current member id (`pairs_delivered` keeps the accepting member;
+  `covered_anchor`). New writes wait until a replacement accepts its redelivered pair (`fleet::deliver_pairs` already
+  owes one to a new incarnation).
+- **The pair is per (anchor, owner shard) by design** (`seal_keys::pair_for_delivery` reuses it), so the whole entry
+  already written for the anchor opens for the replacement the moment it accepts: no re-seal, no second whole entry. A
+  change to per-incarnation pairs must bring back a re-seal on acceptance and a read of the newest whole entry naming
+  the current incarnation.
+- **A holder's log begins at its newest whole entry or install image** (`live_ship::keep` and `serve_install` drop what
+  came before). A successor's fetch therefore reads the newest entry's key from the first payload. Pinned by
+  `a_holders_log_begins_at_the_newest_whole_entry_it_holds`; if retention changes, the fetch must read the newest whole
+  entry that names the successor (the fallback named here).
+- **A reader never makes a key.** Minting belongs to the owner's seal path (`seal_keys::lineage`, `namer`). Every
+  rebuild and successor path reads `recorded_lineage` and `recorded_namer`, and a sealed log with no keys recorded is
+  refused `no_key`, distinct from `open` (a payload that fails under keys held).
+- **A missing key is waited for by event, bounded.** The refusal keeps the head, the whole entry's sealing (a few
+  kilobytes, not the log) and when it began. Each attempt checks locally whether the key now unwraps; the log is
+  fetched once when it does or when the head moves; past `NO_KEY_WAIT_NS` (ten liveness budgets, `OBSERVE_BUDGET_NS`)
+  the takeover is answered `no_key_exhausted`, typed and counted, never waited on. The window this bounds: an owner
+  dying after a replacement joined and before it accepted its pair.
+
+Held by `a_pair_accepted_by_a_predecessor_at_the_same_anchor_does_not_cover_its_replacement`,
+`a_sealed_log_this_node_holds_no_key_for_is_refused_for_the_missing_key`,
+`a_missing_key_is_waited_for_and_the_log_fetched_once_it_comes`, `a_holders_log_begins_at_the_newest_whole_entry_it_holds`
+(`crates/server/src/live_ship.rs`) and `a_reader_without_the_key_records_none_and_adopts_the_right_one`
+(`crates/server/tests/seal.rs`). Owed: a deterministic skip in ranking computed from the durable whole entry's cover,
+model-first, if the bounded wait proves not enough.

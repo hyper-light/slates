@@ -4205,8 +4205,8 @@ fn opened_archive(
     return None;
   }
   let account = crate::seal_keys::tenant_of(owner);
-  let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-  let namer = crate::seal_keys::namer(state, id, account).ok()?;
+  let lineage = crate::seal_keys::recorded_lineage(state, id, account).ok()??;
+  let namer = crate::seal_keys::recorded_namer(state, id, account).ok()??;
   slates_cluster::envelope::open(&archive, &lineage, &namer).ok()
 }
 
