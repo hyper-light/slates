@@ -1253,9 +1253,7 @@ impl BarrierThread {
     let ran = match self.outcome.try_recv() {
       Ok(ran) => ran,
       Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-        Err(HostError::Unavailable(ERRNO_IO))
-      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(HostError::Unavailable(ERRNO_IO)),
     };
     self.join();
     Some(ran)
