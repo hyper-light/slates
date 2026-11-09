@@ -55,7 +55,10 @@ successor (`slates_db::takeover::copy_falls_to`). Routing plays no part.
   - `the_askers_own_object_is_never_listed_in_another_hosts_round` (a real shard): red with the literal rule.
   - `a_copy_falls_to_one_round_by_its_authority_alone`: red with the round unchecked; its first cut missed that.
   - `a_successor_holding_nothing_of_an_object_promises_so_by_name` (a real shard): red with no self-answer.
-- **Owed:** the held image persisting the moved-from owner, after raft-7.
+- `a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed` (a real shard, a held image written and restored):
+  red with the image not keeping the field, and with the reconcile recording no move.
+- `an_acceptor_keeps_only_the_last_retired_owner_its_authority_moved_from`: red with a move from a live owner recorded.
+- The held image keeps the field (image version 23).
 
 The process test is step (d): `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`.
 

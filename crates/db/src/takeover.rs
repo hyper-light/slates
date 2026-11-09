@@ -123,16 +123,21 @@ pub fn readiness(
 /// Promises `object` to the successor `prepare` names: installs its authority under the round's generation and runs the
 /// prepare through the object's acceptor, raising its fence to the round's epoch. The highest record held, `None` when
 /// the acceptor holds nothing of it, or the refusal (a fence already above the epoch, or a generation newer than the
-/// round's). A page's listing and a by-name answer promise alike.
+/// round's). A page's listing and a by-name answer promise alike. `from_retired`: whether the copy's current owner is a
+/// retired host, so the install records it as the owner the authority moved from ([`Acceptor::move_authority`]).
 pub fn promise_object(
   acceptor: &mut Acceptor,
   object: ObjectId,
   prepare: &HostPrepare,
+  from_retired: bool,
 ) -> Result<Option<Accepted>, RegisterError> {
-  acceptor.install_authority(Authority {
-    generation: prepare.generation,
-    owner: prepare.owner,
-  })?;
+  acceptor.move_authority(
+    Authority {
+      generation: prepare.generation,
+      owner: prepare.owner,
+    },
+    from_retired,
+  )?;
   let promise = acceptor.prepare(&Prepare {
     owner: prepare.owner,
     object,
@@ -256,7 +261,8 @@ pub fn answer_by_name(
       answer.refused = answer.refused.saturating_add(1);
       continue;
     }
-    match promise_object(acceptor, *object, prepare) {
+    let from_retired = regional.retired.contains_key(&acceptor.owner());
+    match promise_object(acceptor, *object, prepare, from_retired) {
       Ok(Some(highest)) => {
         let size = HostPromise::entry_bytes(&highest);
         if used.saturating_add(size) > budget && answered(&answer.promise) {
@@ -490,6 +496,63 @@ mod tests {
     );
   }
 
+  /// A-251's persisted field, as the supervisor bounded it: an install records the owner it moved the authority from only
+  /// when that owner is retired, one owner overwritten by the next such move, never a list. Do: move a copy from a
+  /// retired host to its successor, then from that successor (retired too) to the next; then install a new live owner
+  /// with an ordinary install. Expect: the first owner, then the second, kept through the ordinary install.
+  #[test]
+  fn an_acceptor_keeps_only_the_last_retired_owner_its_authority_moved_from() {
+    let generation = 3;
+    let (first, second, third, live) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let mut copy = acceptor(HostId(9), first, generation, None);
+    assert_eq!(copy.moved_from(), None);
+    copy
+      .move_authority(
+        Authority {
+          generation,
+          owner: second,
+        },
+        true,
+      )
+      .unwrap();
+    assert_eq!(copy.moved_from(), Some(first));
+    copy
+      .move_authority(
+        Authority {
+          generation,
+          owner: third,
+        },
+        true,
+      )
+      .unwrap();
+    assert_eq!(copy.moved_from(), Some(second), "overwritten, one owner");
+    copy
+      .move_authority(
+        Authority {
+          generation,
+          owner: live,
+        },
+        false,
+      )
+      .unwrap();
+    assert_eq!(
+      copy.moved_from(),
+      Some(second),
+      "a move from a live owner records nothing"
+    );
+    copy
+      .install_authority(Authority {
+        generation,
+        owner: third,
+      })
+      .unwrap();
+    assert_eq!(
+      copy.moved_from(),
+      Some(second),
+      "nor does an ordinary install"
+    );
+  }
+
   /// Shape (i) as one rule: a copy an install moved from the retired host to its successor still falls to that successor
   /// in the retired host's round, by the owner it moved from; the successor's own object, which no install moved from
   /// the round's line, never does, though the configuration may name it successor of that object too. Do: in a retired
@@ -509,10 +572,13 @@ mod tests {
     let generation = regional.version;
     let mut moved = acceptor(holder, departed, generation, Some((theirs[0], 1)));
     moved
-      .install_authority(Authority {
-        generation,
-        owner: asker,
-      })
+      .move_authority(
+        Authority {
+          generation,
+          owner: asker,
+        },
+        true,
+      )
       .unwrap();
     assert_eq!(moved.moved_from(), Some(departed));
     assert!(
@@ -608,7 +674,8 @@ mod tests {
         &HostPrepare {
           epoch: HostEpoch(6),
           ..prepare.clone()
-        }
+        },
+        false
       )
       .is_err(),
       "the copy's fence was raised to the asker's epoch"
@@ -651,6 +718,7 @@ mod tests {
         epoch: HostEpoch(9),
         ..prepare.clone()
       },
+      true,
     )
     .unwrap();
     let mut acceptors = BTreeMap::from([(theirs[0], fenced)]);

@@ -460,11 +460,19 @@ fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> Ho
   };
   let mut used = slates_db::register::HOST_PROMISE_HEADER_BYTES;
   let mut last = prepare.after;
+  let retired: BTreeSet<HostId> = state
+    .council
+    .configuration()
+    .retired
+    .keys()
+    .copied()
+    .collect();
   for object in objects {
     let Some(acceptor) = state.holder_records.get_mut(&object) else {
       continue;
     };
-    match promise_object(acceptor, object, prepare) {
+    let from_retired = retired.contains(&acceptor.owner());
+    match promise_object(acceptor, object, prepare, from_retired) {
       Ok(Some(highest)) => {
         let size = HostPromise::entry_bytes(&highest);
         if !promise.entries.is_empty() && used.saturating_add(size) > budget {
@@ -726,11 +734,19 @@ fn promise_local_copies(
   };
   let mut learned = Vec::new();
   let mut fenced = None;
+  let retired: BTreeSet<HostId> = state
+    .council
+    .configuration()
+    .retired
+    .keys()
+    .copied()
+    .collect();
   for object in objects {
     let Some(acceptor) = state.holder_records.get_mut(&object) else {
       continue;
     };
-    match promise_object(acceptor, object, &prepare) {
+    let from_retired = retired.contains(&acceptor.owner());
+    match promise_object(acceptor, object, &prepare, from_retired) {
       Ok(Some(highest)) => learned.push((object, highest)),
       Ok(None) => {}
       Err(RegisterError::StaleEpoch { current }) => {
@@ -1253,7 +1269,7 @@ mod tests {
       after: None,
       named: Vec::new(),
     };
-    let refusal = promise_object(&mut acceptor, object, &prepare).unwrap_err();
+    let refusal = promise_object(&mut acceptor, object, &prepare, false).unwrap_err();
     let mut promise = HostPromise {
       holder: RegisterHost(2),
       departed: host,
@@ -1310,7 +1326,10 @@ mod tests {
       named: Vec::new(),
     };
     let mut empty = Acceptor::new(RegisterHost(2), authority);
-    assert_eq!(promise_object(&mut empty, object, &prepare), Ok(None));
+    assert_eq!(
+      promise_object(&mut empty, object, &prepare, false),
+      Ok(None)
+    );
     let mut holding = Acceptor::new(RegisterHost(2), authority);
     holding
       .accept(&Record {
@@ -1323,7 +1342,7 @@ mod tests {
       })
       .unwrap();
     assert!(matches!(
-      promise_object(&mut holding, object, &prepare),
+      promise_object(&mut holding, object, &prepare, false),
       Ok(Some(_))
     ));
   }

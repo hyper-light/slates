@@ -37,6 +37,7 @@
 //!
 //! - `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`: the minimal history, red on today's rule.
 //! - `the_named_rule_with_moved_from_listing_holds_no_loss_on_every_history` (proptest): the chosen rule.
+//! - `the_chain_or_asker_rule_learns_the_askers_own_object`: the counterexample that rejects the literal one rule.
 //! - `the_nemesis_breaks_today_s_rule_and_each_shape_is_measured`: over generated histories, what each rule and shape
 //!   loses with the nemesis off and on, and each shape's cost per write.
 
@@ -626,6 +627,61 @@ fn today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out() {
   let named = run(&history, CountingRule::NamedAnswer, Listing::Routing);
   assert!(losses(&history, &named).is_empty());
   assert_eq!(named.adopted[&object].sequence, 2);
+}
+
+/// The counterexample that rejects "the chain or the asker" as the one rule, by hand: f = 1; the retired host's object on
+/// the cohort {retired, a, b}, held by a and b under the chain's authority; and one of the asker's own live objects,
+/// held by a under the asker's authority. Do: run the round under that rule and under the chosen one. Expect: under
+/// "the chain or the asker" a's page lists the asker's own object, so the round learns it (and a promise of it would
+/// raise its fence to the round's epoch); under the chosen rule it does not, and the retired host's object is adopted
+/// either way.
+#[test]
+fn the_chain_or_asker_rule_learns_the_askers_own_object() {
+  let (a, b) = (HostId(2), HostId(3));
+  let (retired_object, own_object) = (object_id(0), object_id(1));
+  let copy = |sequence| Copy {
+    record: record(sequence),
+    in_chain: true,
+  };
+  let history = History {
+    quorum: Quorum { f: 1 },
+    survivors: vec![SUCCESSOR, a, b],
+    objects: BTreeMap::from([
+      (
+        retired_object,
+        Object {
+          foreign: false,
+          cohorts: vec![vec![DEPARTED, a, b]],
+          held: BTreeMap::from([(a, copy(1)), (b, copy(1))]),
+          committed: Some(1),
+        },
+      ),
+      (
+        own_object,
+        Object {
+          foreign: true,
+          cohorts: vec![vec![SUCCESSOR, a, b]],
+          held: BTreeMap::from([(a, copy(4))]),
+          committed: None,
+        },
+      ),
+    ]),
+    omitted: BTreeMap::new(),
+    moved: BTreeSet::new(),
+    page_entries: 2,
+    gate_open: true,
+    schedule: vec![0, 1],
+  };
+  let literal = run(&history, CountingRule::NamedAnswer, Listing::ChainOrAsker);
+  assert_eq!(
+    foreign_learned(&history, &literal),
+    1,
+    "the asker's own object was learned in another host's round"
+  );
+  let chosen = run(&history, CountingRule::NamedAnswer, Listing::MovedFrom);
+  assert_eq!(foreign_learned(&history, &chosen), 0);
+  assert!(losses(&history, &literal).is_empty() && losses(&history, &chosen).is_empty());
+  assert!(chosen.adopted.contains_key(&retired_object));
 }
 
 proptest! {

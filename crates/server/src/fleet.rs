@@ -1789,12 +1789,22 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// authority only advances.
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
+  // A move away from a retired owner is recorded with the copy (A-251): once the authority names the successor, only
+  // that record says the copy was the retired owner's, which a takeover round's listing needs.
+  let retired: std::collections::BTreeSet<HostId> = state
+    .council
+    .configuration()
+    .retired
+    .keys()
+    .copied()
+    .collect();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
     if let Some(owner) = state.fleet.object_owner(object)
       && let Some(acceptor) = state.holder_records.get_mut(&object)
     {
-      let _ = acceptor.install_authority(Authority { generation, owner });
+      let from_retired = retired.contains(&acceptor.owner());
+      let _ = acceptor.move_authority(Authority { generation, owner }, from_retired);
     }
   }
 }

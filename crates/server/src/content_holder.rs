@@ -149,12 +149,16 @@ pub(crate) const CONTENT_ANSWERED_EMPTY: &str = "fleet.content.answered_empty";
 pub(crate) const CONTENT_UNPUBLISHED: &str = "fleet.content.unpublished";
 
 /// One held register as a recovery image keeps it (§4.8 "persistence before reply"): the owner and configuration
-/// generation it serves under, the epoch its fence has seen, and every position it accepted.
+/// generation it serves under, the retired owner an install last moved that authority from (A-251), the epoch its fence
+/// has seen, and every position it accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 struct HeldRegister {
   object: [u8; 16],
   owner: u64,
   generation: u64,
+  /// The retired owner an install last moved this register's authority from (`Acceptor::moved_from`), if any: once a
+  /// takeover's install moved the copy to the successor, only this says it was the retired owner's.
+  moved_from: Option<u64>,
   promised: u64,
   accepted: Vec<HeldPosition>,
 }
@@ -197,6 +201,7 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
         object: object.0,
         owner: acceptor.owner().0,
         generation: acceptor.generation(),
+        moved_from: acceptor.moved_from().map(|host| host.0),
         promised: promised.0,
         accepted: accepted
           .into_iter()
@@ -289,7 +294,8 @@ pub(crate) fn restore_held_registers(
       },
       HostEpoch(register.promised),
       accepted,
-    );
+    )
+    .with_moved_from(register.moved_from.map(HostId));
     state.holder_records.insert(object, acceptor);
     // The routing view is not persisted, and every install reaches a held object only through it: the takeover's
     // resolve moves it to its successor, the authority reconcile raises it to the installed generation, and a page

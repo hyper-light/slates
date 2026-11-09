@@ -77,9 +77,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
+/// 23 (A-251, 2026-11-09) each held register carries the retired owner an install last moved its authority from, so a
+/// takeover round lists a copy the install moved to the successor after a warm restart too. An image of another version
+/// is refused, as every version change before it was.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 22;
+const IMAGE_VERSION: u16 = 23;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

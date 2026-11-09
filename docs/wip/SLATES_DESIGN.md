@@ -19886,12 +19886,17 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
   - **Measured over 1,000 histories (2,950 objects).** The model gives copies an authority an install may move, and
     holds the asker's own objects:
     - routing plus a chain path (the first shape (i) built) lost 204 records;
-    - the literal "chain or the asker" lost none, but learned the asker's own objects in every history;
+    - the literal "chain or the asker" lost none, but learned the asker's own objects in every history; its minimal
+      counterexample is `the_chain_or_asker_rule_learns_the_askers_own_object`;
     - this rule lost none and learned none.
     The first two are rejected.
   - **Cost.** No write: the authority and its last move are kept with the copy.
-  - **Owed.** The held image does not yet persist `moved_from`. It waits on raft-7's new image format (raft, the
-    supervisor), and until then a warm restart forgets an earlier move.
+  - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
+    retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
+    holds one owner, overwritten by the next such move, never a list.
+  - **The image.** The held image carries the field (`HeldRegister::moved_from`), so a warm restart keeps it, and the
+    image layout is version 23. Agreed with raft's raft-7 (A-270, image 23, delta 6): whichever of the two lands second
+    takes the next number. An image of another version is refused typed, as every version change before it was.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.

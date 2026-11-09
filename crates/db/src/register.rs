@@ -1522,8 +1522,8 @@ impl Acceptor {
     self.authority.owner
   }
 
-  /// The owner an install last moved this acceptor's authority from, `None` when no install has changed its owner
-  /// (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::with_moved_from`]).
+  /// The retired owner an install last moved this acceptor's authority from ([`Acceptor::move_authority`]), `None` when
+  /// none has (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::with_moved_from`]).
   pub fn moved_from(&self) -> Option<HostId> {
     self.moved_from
   }
@@ -1678,10 +1678,24 @@ impl Acceptor {
         current: self.authority.generation,
       });
     }
-    if authority.owner != self.authority.owner {
-      self.moved_from = Some(self.authority.owner);
-    }
     self.authority = authority;
+    Ok(())
+  }
+
+  /// Installs `authority` as [`install_authority`](Acceptor::install_authority) does, and when it moves the authority
+  /// away from an owner the caller knows is retired (`from_retired`: a takeover moving a retired owner's copy to its
+  /// successor), records that owner as [`moved_from`](Acceptor::moved_from) (A-251). One owner, overwritten by the next
+  /// such move, never a growing list; an install that changes no owner, or moves from a live one, leaves it as it was.
+  pub fn move_authority(
+    &mut self,
+    authority: Authority,
+    from_retired: bool,
+  ) -> Result<(), RegisterError> {
+    let previous = self.authority.owner;
+    self.install_authority(authority)?;
+    if from_retired && previous != authority.owner {
+      self.moved_from = Some(previous);
+    }
     Ok(())
   }
 
