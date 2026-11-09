@@ -367,6 +367,20 @@ pub enum FileChange {
   DelegationCleared(Other),
 }
 
+/// A change to the files the NFSv4 state holds alive (A-260): an open or a delegation made of the file the handle
+/// names (`Took`), or one of them ended (`Gave`), however it ended: a CLOSE, a FREE_STATEID, a DELEGRETURN, a
+/// revocation, or a client's purge (its lease lapsed, it rebooted, it was destroyed). The daemon takes one volume
+/// reference per open and per delegation, so a file removed while one is held keeps serving at a link count of zero
+/// until the last of them goes (POSIX unlink-while-open), which is what lets the server answer
+/// `OPEN4_RESULT_PRESERVE_UNLINKED` and its clients send the REMOVE instead of a silly rename (RFC 8881 §18.16.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holding {
+  /// An open or a delegation of the file was made.
+  Took(Nfsfh3),
+  /// An open or a delegation of the file ended.
+  Gave(Nfsfh3),
+}
+
 /// One owner shard's NFSv4 file state: its opens and lock states, bounded.
 pub struct FileState {
   tag: OwnerTag,
@@ -390,6 +404,10 @@ pub struct FileState {
   /// the state is durable (`None` for a standalone server, which records nothing). Drained after
   /// every operation, so it holds one operation's changes at most.
   changes: Option<Vec<FileChange>>,
+  /// The opens made and ended since the last [`FileState::take_holdings`] (A-260), when the state is durable, for the
+  /// daemon to take and give back the volume references they hold (`None` for a standalone server, which holds
+  /// nothing). Drained after every operation, so it holds one operation's at most: a purge's, every open of a client.
+  holdings: Option<Vec<Holding>>,
 }
 
 impl FileState {
@@ -408,6 +426,7 @@ impl FileState {
       quiet_ns: 0,
       outbox: Vec::new(),
       changes: None,
+      holdings: None,
     }
   }
 
@@ -465,7 +484,34 @@ impl FileState {
       state.delegations.restore(record);
     }
     state.changes = Some(Vec::new());
+    // What the restore put back is held already: a recovery takes its holds from the same records (A-260), so only
+    // the changes made from here are queued.
+    state.holdings = Some(Vec::new());
+    state.delegations.hold_files();
     state
+  }
+
+  /// The opens and delegations made and ended since the last call (A-260), each a volume reference to take or give
+  /// back; none for a standalone server.
+  pub fn take_holdings(&mut self) -> Vec<Holding> {
+    let mut holdings = self
+      .holdings
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default();
+    holdings.extend(self.delegations.take_holdings());
+    holdings
+  }
+
+  /// The file of every open and delegation held (A-260), one handle per open and per delegation: the volume
+  /// references a recovery takes again from the records this state was restored from.
+  pub fn held_files(&self) -> Vec<Nfsfh3> {
+    self
+      .opens
+      .values()
+      .map(|open| open.fh.clone())
+      .chain(self.delegations.held_files())
+      .collect()
   }
 
   /// The changes since the last call, for the owner's partition to record (§4.6 A-37); none for a
@@ -588,6 +634,9 @@ impl FileState {
     );
     self.by_file.insert(key, other);
     self.journal_open(&other);
+    if let Some(holdings) = self.holdings.as_mut() {
+      holdings.push(Holding::Took(fh.clone()));
+    }
     Ok(Stateid { seqid: 1, other })
   }
 
@@ -1162,6 +1211,9 @@ impl FileState {
       self
         .by_file
         .remove(&(identity(&open.fh), open.clientid, open.owner, open.uid));
+      if let Some(holdings) = self.holdings.as_mut() {
+        holdings.push(Holding::Gave(open.fh));
+      }
     }
   }
 }
