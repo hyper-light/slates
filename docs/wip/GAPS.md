@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A reply carried home past a full channel was dropped: fixed (perf, 2026-11-09; §4.3 "backpressure, never a drop",
+> CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then dropped the result
+> (`xshard.reply_dropped`), and `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship, the merge plane's
+> deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full channel; a task refused at
+> admission answered its client once (`AnswerUnstarted`). Each lost its reply, and the client waited out its deadline:
+> 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. Now every one waits for room for as long as the shard it
+> goes to lives (a task of the sending shard carries it); only a shard gone leaves a reply undelivered. Failing first:
+> `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`).
+> Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, and every direct `send_control` of a reply in
+> `crates/server/src`. Siblings reported, not changed (not replies, each counted where lost): a client handed to a shard
+> (`daemon.rs`, `HANDOFF_LOST`), a released client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`),
+> and a Windows DAX holder's record (`shards.rs`, `tell_holder`).
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
