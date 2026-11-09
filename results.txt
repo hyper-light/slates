@@ -1,0 +1,52 @@
+runner windows-latest, 4 CPUs, Mon Nov  9 18:11:46 UTC 2026, commit 972210ae
+== cargo test --locked -q -p slates-wire
+test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.39s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-db
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.15s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.15s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.35s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.92s
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-anchor -- --test-threads=1
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.92s
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.49s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --lib
+test result: ok. 221 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.84s
+== exit 0
+== cargo test --locked -q -p slates-server --test consumers
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+== exit 0
+== cargo test --locked -q -p slates-server --test presentations
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test live_ship
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test forward_retry
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness
+an_observation_of_a_starved_shard_is_answered --- FAILED
+thread 'an_observation_of_a_starved_shard_is_answered' (7940) panicked at crates\server\tests\liveness.rs:833:3:
+    an_observation_of_a_starved_shard_is_answered
+test result: FAILED. 10 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 30.58s
+== exit 101
