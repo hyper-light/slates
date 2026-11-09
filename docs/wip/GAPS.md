@@ -619,6 +619,13 @@
 >   (`snapshot_cadence.rs`, red on CI run 42385009677;
 >   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
 >   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.
+>   **Amended 2026-11-09 (A-243's amendment):** the work is charged in the committing thread's CPU time, not on the
+>   wall. Charged on the wall, a commit preempted under load was charged its wait, so the trigger came early when the
+>   machine was busiest. `snapshot_cadence.rs` failed on a Mac 3 of 6 at load 69–112 and in B10's Mac gate at load
+>   62–78 (`snapshot_cadence.rs:272`, "a snapshot came before the approach stopped 3 times"). Red first:
+>   `time_off_the_cpu_inside_timed_work_is_not_charged`, where a 50 ms sleep was charged 1.26 s on the wall. **Open
+>   until the Mac gate judges it:** on adacachy, main passed every round under 24 busy loops, so the failure is
+>   reproduced only on the Mac.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards

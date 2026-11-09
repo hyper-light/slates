@@ -557,6 +557,60 @@ pub(crate) fn read(handle: u64) -> Option<CpuReading> {
   })
 }
 
+/// The calling thread's CPU time, nanoseconds: what it has run, never the time it waited for a core or slept (A-243's
+/// snapshot trigger charges a commit's replay work by it). Linux and macOS: `CLOCK_THREAD_CPUTIME_ID`, user plus system
+/// time, through rustix. Windows: `GetThreadTimes`' kernel plus user time through the calling thread's pseudo-handle;
+/// the scheduler charges it a tick at a time (15.6 ms by default), so one short span reads zero or a whole tick, and a
+/// sum over many spans is unbiased [B: Microsoft Learn, "GetThreadTimes"]. `None` where no clock is read (Miri).
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+pub fn calling_thread_cpu_ns() -> Option<u64> {
+  let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+  nanos(
+    u64::try_from(reading.tv_sec).ok()?,
+    u64::try_from(reading.tv_nsec).ok()?,
+  )
+}
+
+/// The calling thread's CPU time, nanoseconds: see the Linux and macOS form.
+#[cfg(all(windows, not(miri)))]
+pub fn calling_thread_cpu_ns() -> Option<u64> {
+  use windows_sys::Win32::Foundation::FILETIME;
+  use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+  /// Format: nanoseconds per `FILETIME` unit (100 ns).
+  const NS_PER_FILETIME_UNIT: u64 = 100;
+  let unset = FILETIME {
+    dwLowDateTime: 0,
+    dwHighDateTime: 0,
+  };
+  let (mut created, mut exited, mut kernel, mut user) = (unset, unset, unset, unset);
+  // SAFETY: `GetCurrentThread` is the calling thread's pseudo-handle, valid for the call with every access right and
+  // never closed; the four values are this frame's own, written by the call, and the status is checked before they are
+  // read.
+  let timed = unsafe {
+    GetThreadTimes(
+      GetCurrentThread(),
+      &mut created,
+      &mut exited,
+      &mut kernel,
+      &mut user,
+    )
+  };
+  if timed == 0 {
+    return None;
+  }
+  let units =
+    |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+  units(kernel)
+    .checked_add(units(user))?
+    .checked_mul(NS_PER_FILETIME_UNIT)
+}
+
+/// No clock here.
+#[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
+pub fn calling_thread_cpu_ns() -> Option<u64> {
+  None
+}
+
 /// No clock here.
 #[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
 pub(crate) fn current() -> Option<u64> {
@@ -581,7 +635,7 @@ const CLOCK_BITS: u64 = (1 << TID_SHIFT) - 1;
 const TAG: u64 = 1 << 63;
 
 /// Seconds and nanoseconds as nanoseconds.
-#[cfg(all(target_os = "linux", not(miri)))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
 fn nanos(seconds: u64, nanos: u64) -> Option<u64> {
   /// Format: nanoseconds per second.
   const NS_PER_SECOND: u64 = 1_000_000_000;

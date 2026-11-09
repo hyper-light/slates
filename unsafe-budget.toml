@@ -337,7 +337,11 @@ slates-mem = 63
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 101
+# 2026-11-09 (+1, A-243's trigger in CPU time, compiled only for Windows): `thread_clock::calling_thread_cpu_ns` reads
+#   the calling thread's `GetThreadTimes` through its pseudo-handle, which windows-sys does not wrap safely. Linux and
+#   macOS read the same clock through rustix's safe `ClockId::ThreadCPUTime`, so they add no site. Opening the thread
+#   by id, as `read` does, would cost an open and a close on every commit.
+slates-rt = 102
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
