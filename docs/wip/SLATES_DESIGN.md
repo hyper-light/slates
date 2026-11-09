@@ -1661,10 +1661,12 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   `rebase(work_volume, to?) → Rebased{version} | Conflict{windows}` (move the work volume's base to
   a newer green version by mapping its pending operations; unchanged on conflict);
   `advance(attachment, version)` (re-pin a green attachment; targeted invalidations);
-  `versions(green, from?, limit?)` and `changed_since(green, version, paths?, after?)` (reads of the chain
-  and the per-dimension histories; `changed_since` names every path any dimension of which changed after the version,
-  as `advance` invalidates by, a page a reply in path order past `after`, so an answer of any length is walked and a path
-  changed when the walk began is answered once, 2026-11-08, A-264); `edit(volume, path, at, delete_len, bytes)` (an SDK write
+  `versions(green, from?, limit?)` and `changed_since(green, version, from?)` (reads of the chain
+  and of the change index, the paths each version changed, recorded as it commits; `changed_since` names every path any
+  dimension of which changed after the version, as `advance` invalidates by, each at the last version it changed at, a
+  page a reply in version order from a cursor of a version and a count, each page ending at a full reply or at its slice
+  of the shard's step, so a page costs the changes it passes and never the tree, and a path changed when the walk began
+  is answered once; a version past the head is `UnknownBase`, 2026-11-09, A-264); `edit(volume, path, at, delete_len, bytes)` (an SDK write
   that declares a true insert or delete). A mount write to a green volume is `EROFS`; an SDK
   write is `ReadOnlyVolume`.
 
@@ -8036,8 +8038,8 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
 between the two versions names (O(changed) by structural sharing); no attachment's view changes
 without `advance`; `status(green)` reports the head, the attachment's version, and
-`changed_since(version, paths)` from the last-changed index so a work volume learns early which
-of its pending paths green has moved under (awareness, never load-bearing).
+`changed_since(version)` from the change index (the paths each version changed, A-264) so a work volume learns early
+which of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
 in-flight submissions retry by identity). Green owner loss in a fleet: Degraded for the
@@ -19528,17 +19530,27 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
   status's `drifted`, the merge verbs' conflict and invalidation lists), recorded open in GAPS; a volume recovered
   under a longer name is not refused.
 
-### A-264 — `changed_since` is answered a page at a time, and names every dimension (accepted 2026-11-08)
-Applied in the same change to: §4.16 (the merge verbs), `crates/merge/src/engine.rs` (`Green::changed_since_after`),
-`crates/ipc/src/protocol.rs` (`ChangedSince { green, version, after }`, `ChangedSince { paths, more }`),
-`crates/server/src/verbs.rs`, `crates/client/src/client.rs` (the walk, and the async form as a chain), GAPS,
-`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`.
-- **Paged:** the whole answer was one reply, refused at 800 changed files. A page now holds what one reply chunk holds,
-  in path order past the last path; `more` is a flag, so a page with one long path need not hold it twice.
+### A-264 — `changed_since` is answered a page at a time from a change index, and names every dimension (accepted 2026-11-08, revised 2026-11-09)
+Applied in the same change to: §4.16 (the merge verbs, the status read), `crates/merge/src/engine.rs` (the change
+index: `changes`, `latest_change`, `links_to`, `Green::changes_after`, `ChangeAt`, `Green::changes_reservation`; the
+seeks in `history_at`, `history_touches`, `present_at`), `crates/ipc/src/protocol.rs` (`ChangedSince { green, version,
+from }`, `ChangedSince { paths, next }`, `ChangedCursor`), `crates/server/src/verbs.rs` (`changed_since`,
+`CHANGED_SLICE_PERMILLE`, the submit's reservation), `crates/client/src/client.rs` (the walk, and the async form as a
+chain), GAPS, `docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`.
+- **Paged:** the whole answer was one reply, refused at 800 changed files. A page now holds what one reply chunk holds.
 - **Every dimension:** it read the content index alone, so a symlink, mode, xattr, special, directory or link moved under
-  a work went unreported. It is `changed_between(v, head)`, walked lazily over every dimension's history.
-- **Cost, measured** (the kernel tree, 97,229 paths, 2,000 submits, release): a whole walk 1.0 to 4.4 ms against the
-  content index's 0.37 to 1.49 ms, 1.3 to 2.7 times; a page 16 to 22 µs at the larger answers.
+  a work went unreported. It answers `changed_between(v, head)`'s paths.
+- **From a change index, sliced (2026-11-09):** the first cut walked every dimension's path-keyed histories, so a page
+  cost the green's tree, not the span: about 1 ms a page on the kernel tree whatever the span, and ten times the tree
+  cost ten times that. Each version now records the paths it changed as it commits (O(changed)), and the answer is read
+  in version order from a cursor of a version and a count, each path once at the last version it changed at; a page
+  ends at a full reply or at half the shard's step, so it may hold no path and still carry a cursor. The index folds with
+  the histories, keeping each path's last change below the floor (so a version there, and a green restored from a
+  checkpoint, are answered as the histories answer them), and is charged with them. A version past the head is refused
+  `UnknownBase`.
+- **Seeks:** `history_touches`, `history_at` and `present_at` scanned a path's whole history; histories are in version
+  order, so each is one `partition_point`.
+- **Cost, measured:** a page of 150 entries from the change index costs 0.25 to 1.7 µs at every span, on the kernel tree (97,229 paths) and on ten copies of it (972,290), where the path-keyed walk cost 17 to 33 µs a page at the dense spans and 0.6 to 1.4 ms at the sparse ones, and ten times the tree 90 to 236 µs and 10 to 22 ms (2,000 submits; release; this Mac at load 37 to 41; the two alternated ABBA; 2026-11-09). The index answers `changed_between(v, head)` at every version measured.
 - **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
   an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.
 

@@ -80,6 +80,14 @@ proptest! {
     for version in at..=head {
       prop_assert_eq!(restored.files_at(version), green.files_at(version), "files at {}", version);
     }
+    // What changed since any version, below the checkpoint and the fold too, is each path whose last change is after
+    // it: the change index answers it as the histories do, in the green and in its restoration (A-264).
+    for version in 0..=head {
+      let expected = green.changed_between(version, head);
+      prop_assert_eq!(&green.changed_since(version), &expected, "changed since {}", version);
+      prop_assert_eq!(&restored.changed_since(version), &expected, "restored, changed since {}", version);
+    }
+    prop_assert_eq!(restored.changes_recounted(), restored.changes_bytes());
     if let Some((increment, version)) = accepted.iter().find(|(_, version)| *version <= at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
     }

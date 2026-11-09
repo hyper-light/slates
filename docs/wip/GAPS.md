@@ -7,12 +7,14 @@
 > chain. A new volume's name is bounded so its summary fits one page (4,025 bytes; `InvalidName` past it). 3,000 volumes
 > list on two shards, and a walk under churn lists each survivor once
 > (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
-> - **`changed_since`, the same shape: fixed the same way (A-264, 2026-11-08).** Refused at 800 changed files; now paged
->   in path order after the last path, a walk answering every path changed before it began exactly once. And it reports
->   every dimension (`changed_between(v, head)`), where it read the content index alone: 1.3 to 2.7 times the
->   content-only cost over a walk on the kernel tree, no second index. One path always
->   fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the longest an edit
->   carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one page when it lands
+> - **`changed_since`, the same shape: fixed the same way (A-264, 2026-11-08, revised 2026-11-09).** Refused at 800
+>   changed files; now paged from a change index (the paths each version changed, recorded as it commits) in version
+>   order, each page ending at a full reply or its slice of the shard's step, so a page costs the changes it passes and
+>   never the tree. It reports every dimension (`changed_between(v, head)`), where it read the content index alone. One
+>   path always fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the
+>   longest an edit carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one
+>   page when it lands. **Open:** `changed_between` itself, which `advance` invalidates by, still walks every path's
+>   histories (now by seeks, but every path); it can read the same index
 >   (`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`).
 > - **Still open, the same one-reply shape**, by their code and not reproduced: `audit`, `grants`, a status's `drifted`
 >   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs

@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use slates_client::Client;
+use slates_client::Refusal;
+use slates_ipc::protocol::{ChangedCursor, ReplyBody, RequestBody};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -102,29 +104,30 @@ fn a_green_answers_every_path_it_changed_however_many() {
   daemon.stop();
 }
 
-/// One page of a changed-since answer through the wire, as the client walks it: its paths and whether more follow.
+/// One page of a changed-since answer through the wire, as the client walks it: its paths and where the next begins.
 fn page(
   client: &mut Client,
   green: slates_client::VolumeId,
   version: u64,
-  after: Option<String>,
-) -> (Vec<String>, bool) {
+  from: Option<ChangedCursor>,
+) -> (Vec<String>, Option<ChangedCursor>) {
   match client
-    .call(&slates_ipc::protocol::RequestBody::ChangedSince {
+    .call(&RequestBody::ChangedSince {
       green,
       version,
-      after,
+      from,
     })
     .unwrap()
   {
-    slates_ipc::protocol::ReplyBody::ChangedSince { paths, more } => (paths, more),
+    ReplyBody::ChangedSince { paths, next } => (paths, next),
     other => panic!("a changed-since page: {other:?}"),
   }
 }
 
 /// §4.16. Do: submit a work that changed 3,000 files and walk the answer a page at a time; before each page after the
-/// first, submit another work that changes one new file. Expect: more than one page, every path changed when the walk
-/// began answered exactly once, none twice, and the pages in path order.
+/// first, submit another work that creates one new file. Expect: more than one page, each page's cursor past the last,
+/// every path changed when the walk began answered exactly once, and each new file answered once as the walk reaches
+/// its version.
 #[test]
 fn a_path_changed_before_the_walk_is_answered_exactly_once_while_the_green_moves_on() {
   let (daemon, instance) = daemon("churn");
@@ -132,6 +135,7 @@ fn a_path_changed_before_the_walk_is_answered_exactly_once_while_the_green_moves
   let paths: Vec<String> = (0..CHANGED_FILES).map(path).collect();
   let (green, base) = green_with_changes(&mut client, &paths);
   let mut answered: Vec<String> = Vec::new();
+  let mut from = None;
   let mut pages = 0usize;
   loop {
     if pages > 0 {
@@ -143,18 +147,18 @@ fn a_path_changed_before_the_walk_is_answered_exactly_once_while_the_green_moves
         .unwrap();
       client.submit(work).unwrap();
     }
-    let (page_paths, more) = page(&mut client, green, base, answered.last().cloned());
+    let (page_paths, next) = page(&mut client, green, base, from);
     pages += 1;
-    assert!(
-      page_paths.windows(2).all(|pair| pair[0] < pair[1])
-        && answered
-          .last()
-          .is_none_or(|last| page_paths.first().is_none_or(|first| first > last)),
-      "page {pages} continues in path order"
-    );
     answered.extend(page_paths);
-    if !more {
-      break;
+    match next {
+      Some(next) => {
+        assert!(
+          from.is_none_or(|from| next > from),
+          "page {pages}'s cursor moves on"
+        );
+        from = Some(next);
+      }
+      None => break,
     }
   }
   eprintln!(
@@ -171,6 +175,36 @@ fn a_path_changed_before_the_walk_is_answered_exactly_once_while_the_green_moves
       "{path}, changed before the walk, is answered"
     );
   }
+  let created = seen.iter().filter(|p| p.starts_with("churn/")).count();
+  assert_eq!(
+    created,
+    pages - 1,
+    "each file created during the walk, once"
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// §4.16 (A-264). Do: ask a green what changed since a version past its head. Expect: `UnknownBase`, as a base past
+/// the head is refused everywhere a green is read at a version: there is no such version to compare against.
+#[test]
+fn a_version_past_the_head_is_refused_as_an_unknown_base() {
+  let (daemon, instance) = daemon("unknown");
+  let mut client = connect(&instance);
+  let green = client.create_green("unknown-green", false).unwrap();
+  let head = client.versions(green).unwrap();
+  let past = client.call(&RequestBody::ChangedSince {
+    green,
+    version: head + 1,
+    from: None,
+  });
+  assert!(
+    matches!(
+      past,
+      Err(slates_client::ClientError::Refused(Refusal::UnknownBase { version, .. })) if version == head + 1
+    ),
+    "past the head: {past:?}"
+  );
   drop(client);
   daemon.stop();
 }

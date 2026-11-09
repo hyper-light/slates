@@ -2928,7 +2928,7 @@ fn merge_submit_scenario() {
   let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
     green,
     version: 0,
-    after: None,
+    from: None,
   }) else {
     panic!("changed_since");
   };
@@ -2936,7 +2936,7 @@ fn merge_submit_scenario() {
   let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
     green,
     version: 1,
-    after: None,
+    from: None,
   }) else {
     panic!("changed_since");
   };
@@ -3798,7 +3798,7 @@ fn role_kind_mismatch_part(
   let changed_since_plain = RequestBody::ChangedSince {
     green: p,
     version: 0,
-    after: None,
+    from: None,
   };
   assert_eq!(refusal_of(client, &changed_since_plain), Refusal::NotGreen);
   let work_over_plain = RequestBody::CreateWork {
@@ -4384,13 +4384,17 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
 }
 
 /// The merge-retention balance: what the green charged equals what the engine holds beyond its
-/// files (history plus the rejected cache), the running history total equals its recount, and the
-/// fold floor is where the oldest reachable version stands.
+/// files (history, the change index and the rejected cache), the running history and index totals equal their
+/// recounts, and the fold floor is where the oldest reachable version stands.
 fn assert_balanced(retention: &slates_server::merge_service::MergeRetention, floor: u64) {
   assert_eq!(
     retention.charged,
-    retention.history + retention.rejected,
+    retention.history + retention.changes + retention.rejected,
     "the charge is exactly the retained bytes: {retention:?}"
+  );
+  assert_eq!(
+    retention.changes, retention.changes_recounted,
+    "the change index's running total is its recount: {retention:?}"
   );
   assert_eq!(
     retention.history, retention.history_recounted,

@@ -4028,8 +4028,8 @@ fn dispatch_inner(
     RequestBody::ChangedSince {
       green,
       version,
-      after,
-    } => changed_since(state, principal, green, version, after.as_deref()),
+      from,
+    } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::Edit {
       work,
@@ -5823,14 +5823,20 @@ fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> Reply
   }
 }
 
-/// The files a green changed strictly after `version` (§4.16): the read a lagging work uses to know
-/// what green moved under it before it rebases.
+/// One page of the paths a green changed strictly after `version` (§4.16, A-264): the read a lagging work uses to know
+/// what the green moved under it before it rebases. Read from the green's change index from `from`, in version order,
+/// answering each path at the last version it changed at; the page ends when the next path would not fit one reply chunk
+/// or when the page has spent its slice of the shard's step ([`CHANGED_SLICE_PERMILLE`]), and its cursor names the first
+/// entry it did not pass. So a page costs the entries it passes, never the green's tree, and never more than its slice:
+/// before 2026-11-09 a page walked every path of every dimension, about 1 ms a page on a kernel tree whatever the span,
+/// and ten times that on ten times the tree. A version past the head is refused `UnknownBase`; one below the fold floor
+/// is answered, as the index keeps each path's last change there.
 fn changed_since(
   state: &ShardState,
   principal: &Principal,
   green: VolumeId,
   version: u64,
-  after: Option<&str>,
+  from: Option<slates_ipc::protocol::ChangedCursor>,
 ) -> ReplyBody {
   let record = match crate::merge_service::require_green(state, principal, green, "changed_since") {
     Ok(record) => record,
@@ -5839,28 +5845,65 @@ fn changed_since(
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
+  if version > engine.head() {
+    return refused(Refusal::UnknownBase { green, version });
+  }
+  let slice = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(CHANGED_SLICE_PERMILLE)
+    / PERMILLE;
+  let started = slates_rt::futures::now_ns();
   let room = changed_page_room();
   let mut used = 0usize;
   let mut paths = Vec::new();
-  let mut more = false;
-  for path in engine.changed_since_after(version, after) {
-    let bytes = encoded_len(path);
+  let mut next = None;
+  let cursor = from.map(|at| (at.version, usize::try_from(at.passed).unwrap_or(usize::MAX)));
+  for (passed, change) in engine.changes_after(version, cursor).enumerate() {
+    // Where a page that stops before this entry continues: this version, this many of its entries passed (a version
+    // holds far fewer than 2^32 paths; the green's memory is bounded long before).
+    let here = slates_ipc::protocol::ChangedCursor {
+      version: change.version,
+      passed: u32::try_from(change.index).unwrap_or(u32::MAX),
+    };
+    if passed > 0
+      && passed % CHANGED_CLOCK_EVERY == 0
+      && slates_rt::futures::now_ns().saturating_sub(started) >= slice
+    {
+      next = Some(here);
+      break;
+    }
+    if !change.last {
+      continue;
+    }
+    let path = change.path.to_owned();
+    let bytes = encoded_len(&path);
     if !paths.is_empty() && used.saturating_add(bytes) > room {
-      more = true;
+      next = Some(here);
       break;
     }
     used = used.saturating_add(bytes);
-    paths.push(path.clone());
+    paths.push(path);
   }
-  ReplyBody::ChangedSince { paths, more }
+  ReplyBody::ChangedSince { paths, next }
 }
 
-/// The bytes a `changed_since` page's paths may take: one reply chunk less the page's own framing.
+/// Shape: a `changed_since` page's slice of the shard's step budget, parts per thousand: half, as a destroy slice's, so
+/// one page never takes the whole step from the shard's other clients (§4.3).
+const CHANGED_SLICE_PERMILLE: u64 = 500;
+/// Shape: the change-index entries a page passes between two looks at the clock: a look costs about what passing a
+/// few entries does, so one each 64 keeps the looks a small share and a page's overrun of its slice within 64 entries.
+const CHANGED_CLOCK_EVERY: usize = 64;
+
+/// The bytes a `changed_since` page's paths may take: one reply chunk less the page's own framing, its cursor included.
 fn changed_page_room() -> usize {
   let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
   let empty = ReplyBody::ChangedSince {
     paths: Vec::new(),
-    more: true,
+    next: Some(slates_ipc::protocol::ChangedCursor {
+      version: u64::MAX,
+      passed: u32::MAX,
+    }),
   };
   chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
 }
@@ -6618,7 +6661,13 @@ fn submit(
   let Some(engine) = state.greens.get(&green_id) else {
     return refused(Refusal::NotFound);
   };
-  let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
+  // The change index grows with the version too (A-264), charged with the history it indexes.
+  let secured = u64::try_from(
+    engine
+      .history_reservation(&inc)
+      .saturating_add(engine.changes_reservation(&inc)),
+  )
+  .unwrap_or(u64::MAX);
   // An accepted work is reset to its green at the new version, where it holds nothing of its own
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live

@@ -487,13 +487,14 @@ impl ListChain {
   }
 }
 
-/// A green's `changed_since` answer walked page by page (§4.16): the paths taken so far, and the last of them, after
-/// which the next page is asked. One reply holds one page, so an answer of any length is a walk.
+/// A green's `changed_since` answer walked page by page (§4.16, A-264): the paths taken so far, each once, and where the
+/// next page continues. One reply holds one page, so an answer of any length is a walk.
 #[derive(Debug)]
 struct ChangedChain {
   green: VolumeId,
   version: u64,
-  paths: Vec<String>,
+  from: Option<slates_ipc::protocol::ChangedCursor>,
+  paths: std::collections::BTreeSet<String>,
 }
 
 impl ChangedChain {
@@ -501,34 +502,44 @@ impl ChangedChain {
     ChangedChain {
       green,
       version,
-      paths: Vec::new(),
+      from: None,
+      paths: std::collections::BTreeSet::new(),
     }
   }
 
-  /// The request for the next page: after the last path taken.
+  /// The request for the next page: from where the last stopped.
   fn request(&self) -> RequestBody {
     RequestBody::ChangedSince {
       green: self.green,
       version: self.version,
-      after: self.paths.last().cloned(),
+      from: self.from,
     }
   }
 
-  /// Takes one page's reply: whether more follow. A page that says more but brings no path is refused, so a walk
-  /// always ends.
+  /// Takes one page's reply: whether more follow. A cursor that does not move past the last is refused, so a walk
+  /// always ends (a page may hold no path: it stopped where the shard's slice was spent).
   fn take(&mut self, body: ReplyBody) -> Result<bool, ClientError> {
-    let ReplyBody::ChangedSince { paths, more } = resolved(body)? else {
+    let ReplyBody::ChangedSince { paths, next } = resolved(body)? else {
       return Err(ClientError::UnexpectedReply {
         verb: "changed_since",
       });
     };
-    if more && paths.is_empty() {
-      return Err(ClientError::UnexpectedReply {
-        verb: "changed_since",
-      });
-    }
     self.paths.extend(paths);
-    Ok(more)
+    match next {
+      None => Ok(false),
+      Some(next) if self.from.is_none_or(|from| next > from) => {
+        self.from = Some(next);
+        Ok(true)
+      }
+      Some(_) => Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      }),
+    }
+  }
+
+  /// The answer: every path taken, in path order, each once.
+  fn into_paths(self) -> Vec<String> {
+    self.paths.into_iter().collect()
   }
 }
 
@@ -3037,7 +3048,12 @@ impl Client {
       }
     };
     if !more {
-      return Ok(self.changed_chains.remove(&word).map(|chain| chain.paths));
+      return Ok(
+        self
+          .changed_chains
+          .remove(&word)
+          .map(ChangedChain::into_paths),
+      );
     }
     let request = chain.request();
     match self.begin(&request) {
@@ -3439,8 +3455,8 @@ impl Client {
     }
   }
 
-  /// The files a green changed strictly after `version` (§4.16), in path order: the answer walked a page at a time,
-  /// as one reply holds one page, so an answer of any length is answered.
+  /// The paths a green changed strictly after `version` in any dimension (§4.16), in path order, each once: the answer
+  /// walked a page at a time, as one reply holds one page, so an answer of any length is answered.
   pub fn changed_since(
     &mut self,
     green: VolumeId,
@@ -3450,7 +3466,7 @@ impl Client {
     loop {
       let reply = self.call(&chain.request())?;
       if !chain.take(reply)? {
-        return Ok(chain.paths);
+        return Ok(chain.into_paths());
       }
     }
   }

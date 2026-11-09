@@ -369,6 +369,10 @@ pub struct MergeRetention {
   pub history: u64,
   /// The same, recounted from the histories (the balance check).
   pub history_recounted: u64,
+  /// The change index's bytes (the paths each version changed, A-264), as the engine's running total.
+  pub changes: u64,
+  /// The same, recounted from the index (the balance check).
+  pub changes_recounted: u64,
   /// The rejected-result cache's bytes.
   pub rejected: u64,
   /// The bytes the green has charged to the shard's budget as retention.
@@ -394,6 +398,8 @@ pub(crate) fn merge_retention(state: &ShardState, green: DbVolumeId) -> MergeRet
     content: as_u64(retained.content),
     history: as_u64(retained.history),
     history_recounted: as_u64(engine.history_bytes_recounted()),
+    changes: as_u64(retained.changes),
+    changes_recounted: as_u64(engine.changes_recounted()),
     rejected: as_u64(retained.rejected),
     charged: state.green_retention.get(&green).copied().unwrap_or(0),
     folded_below: engine.folded_below(),
