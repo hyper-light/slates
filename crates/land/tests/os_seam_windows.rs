@@ -223,6 +223,37 @@ fn a_move_onto_a_name_that_exists_is_refused_and_replaces_nothing() {
   );
 }
 
+/// A-262 and §4.15 step 8: what a landing records as placed is what the disk keeps. Do: write a temporary, give it a
+/// writable mode and a read-only one in turn, place it, read its fingerprint through its own handle, close it, and read
+/// it again by name. Expect: the two readings equal, `ARCHIVE` among the kept bits. NTFS marks a written file `ARCHIVE`
+/// when its handle closes, so a writer that cleared the bit with `FILE_ATTRIBUTE_NORMAL` recorded a witness the file
+/// left at once, without its change time moving: the next landing over it was refused `LandingConflict` (both
+/// runners, `snapshot_landing`, 2026-11-09).
+#[test]
+fn a_placed_file_keeps_after_its_close_what_was_read_before_it() {
+  use slates_vfs::host::HostFs;
+  for (name, mode) in [("writable", 0o644), ("read-only", 0o444)] {
+    let space = Workspace::new(&format!("archive-{name}"));
+    let (mut writer, dir) = space.writer();
+    let file = writer.create_temp(dir, ".slates-temporary").unwrap();
+    writer.write_at(file, 0, b"landed").unwrap();
+    writer.set_mode(file, mode).unwrap();
+    writer.place(file, dir, name).unwrap();
+    let before = writer.fstat(file).unwrap();
+    writer.close_file(file);
+    let after = writer.entry_fingerprint(dir, name).unwrap();
+    assert_eq!(
+      before, after,
+      "{name}: what was read before the close is what the disk kept"
+    );
+    assert_ne!(
+      after.windows & slates_vfs::inode::WindowsAttributes::ARCHIVE,
+      0,
+      "{name}: a written file is marked for archiving, as NTFS marks it: {after:?}"
+    );
+  }
+}
+
 /// AUD-29-04: placing a landed file never replaces. Do: write a temporary and place it at a name that exists. Expect:
 /// `EEXIST`, the name's bytes as they were; at a free name the same temporary lands whole.
 #[test]

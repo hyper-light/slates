@@ -56,10 +56,10 @@ use windows_sys::Win32::Foundation::{
   STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-  FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-  FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-  FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
+  DELETE, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+  FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE,
+  FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+  FILE_TRAVERSE, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
   GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
 
@@ -802,11 +802,15 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The one POSIX bit Windows keeps on the file: no write bit makes it read-only. `ARCHIVE` is kept as NTFS made it
+  /// (A-262: a new file's bits): cleared here, NTFS set it again when the written handle closed, without moving the change
+  /// time, so the placed file's witness differed from the disk at once and the next landing over it was refused
+  /// `LandingConflict` (both runners, 2026-11-09).
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     let attributes = if mode & WRITE_BITS == 0 {
-      FILE_ATTRIBUTE_READONLY
+      FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY
     } else {
-      FILE_ATTRIBUTE_NORMAL
+      FILE_ATTRIBUTE_ARCHIVE
     };
     set_basic(
       self.file(file)?,
