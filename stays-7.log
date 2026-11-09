@@ -1,0 +1,93 @@
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120108: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589768: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120108: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589768: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+slates daemon: fleet_sessions_per_plane = 1938: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+slates daemon: fleet_session_receive_bytes = 120108: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+slates daemon: read_ahead_bytes = 77589768: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+slates daemon: fleet_tasks_per_shard = 5173: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+LD-IMAGE wall_ns 1794256190890437351 head 18 bytes 82707
+LD-TAKE wall_ns 1794256190891716316 from 14917005734749834261 reply Ok(Some(18))
+LD-LANE install wall_ns 1794256190891867930 holder 14827596285358691033 bytes 82792 budget_ns 30000000000 took_ns 1250858 answered true cut false
+LD-IMAGE wall_ns 1794256192009128205 head 1899 bytes 8212765
+LD-IMAGE wall_ns 1794256193215839438 head 3786 bytes 16490483
+LD-TL stopped_on_install Some(30865) after 150.326374ms
+LD-TL resume wall_ns 1794256213292140713
+LD-TAKE wall_ns 1794256213306996506 from 14917005734749834261 reply Ok(Some(3786))
+LD-LANE install wall_ns 1794256213308694534 holder 14742936998798726028 bytes 16490568 budget_ns 30000000000 took_ns 20090413249 answered true cut false
+LD-IMAGE wall_ns 1794256213811976955 head 37613 bytes 164971886
+LD-TAKE wall_ns 1794256215235218619 from 14917005734749834261 reply Ok(Some(37613))
+LD-LANE install wall_ns 1794256215272519601 holder 14742936998798726028 bytes 164971971 budget_ns 30000000000 took_ns 1160864766 answered true cut false
+LD-TL caught Some(6.175371903s)
+LD-TL durable Some(39228) then Some(39230) after 17.460018ms
+LD-TL writes 39206
+LD-WHY wall_ns 1794256190888478443 off_chain holder 14827596285358691033 reported Some(13) head Some(17) checkpoint Some(0) oldest Some(14) retained 4 bytes 19064 retain_bytes 5012
+LD-WHY wall_ns 1794256213308744709 behind_tail holder 14742936998798726028 reported Some(3786) head Some(37612) checkpoint Some(3786) oldest Some(35752) retained 1861 bytes 16490462 retain_bytes 16490483
+LD-S 682 owner Some(37613) holder Some(3786)
+LD-S 1037 owner Some(37613) holder Some(3786)
+LD-S 1169 owner Some(37683) holder Some(3786)
+LD-S 1287 owner Some(37747) holder Some(3786)
+LD-S 1414 owner Some(37801) holder Some(3786)
+LD-S 1527 owner Some(37870) holder Some(3786)
+LD-S 1628 owner Some(37930) holder Some(3786)
+LD-S 1747 owner Some(38012) holder Some(3786)
+LD-S 1968 owner Some(38028) holder Some(37613)
+LD-S 2090 owner Some(38230) holder Some(37624)
+LD-S 2208 owner Some(38255) holder Some(37666)
+LD-S 2325 owner Some(38308) holder Some(37708)
+LD-S 2438 owner Some(38339) holder Some(37752)
+LD-S 2558 owner Some(38366) holder Some(37802)
+LD-S 2664 owner Some(38397) holder Some(37851)
+LD-S 2786 owner Some(38438) holder Some(37897)
+LD-S 2896 owner Some(38475) holder Some(37940)
+LD-S 3002 owner Some(38511) holder Some(37970)
+LD-S 3109 owner Some(38542) holder Some(38002)
+LD-S 3222 owner Some(38587) holder Some(38040)
+LD-S 3352 owner Some(38610) holder Some(38076)
+LD-S 3458 owner Some(38640) holder Some(38109)
+LD-S 3576 owner Some(38667) holder Some(38142)
+LD-S 3687 owner Some(38698) holder Some(38174)
+LD-S 3812 owner Some(38726) holder Some(38203)
+LD-S 3930 owner Some(38761) holder Some(38228)
+LD-S 4050 owner Some(38810) holder Some(38256)
+LD-S 4166 owner Some(38834) holder Some(38313)
+LD-S 4282 owner Some(38880) holder Some(38377)
+LD-S 4422 owner Some(38908) holder Some(38419)
+LD-S 4543 owner Some(38930) holder Some(38455)
+LD-S 4677 owner Some(38939) holder Some(38507)
+LD-S 4794 owner Some(38985) holder Some(38547)
+LD-S 4928 owner Some(39049) holder Some(38618)
+LD-S 5028 owner Some(39082) holder Some(38668)
+LD-S 5144 owner Some(39114) holder Some(38730)
+LD-S 5256 owner Some(39142) holder Some(38795)
+LD-S 5383 owner Some(39149) holder Some(38844)
+LD-S 5503 owner Some(39159) holder Some(38910)
+LD-S 5604 owner Some(39166) holder Some(38950)
+LD-S 5715 owner Some(39180) holder Some(38987)
+LD-S 5816 owner Some(39192) holder Some(39025)
+LD-S 5921 owner Some(39205) holder Some(39073)
+LD-S 6027 owner Some(39216) holder Some(39117)
+LD-S 6133 owner Some(39223) holder Some(39166)
+LD-BATCH wall_ns 1794256190885283119 holder 14742936998798726028 entries 2 took_ns 259141 answered true
+LD-BATCH wall_ns 1794256190888497562 holder 14827596285358691033 entries 2 took_ns 1078428 answered true
+LD-BATCH wall_ns 1794256190895058537 holder 14827596285358691033 entries 3 took_ns 1667567 answered true
+LD-BATCH wall_ns 1794256190900275584 holder 14827596285358691033 entries 7 took_ns 5184127 answered true
+LD-BATCH wall_ns 1794256190902366560 holder 14827596285358691033 entries 4 took_ns 2062193 answered true
+LD-BATCH wall_ns 1794256190904533492 holder 14827596285358691033 entries 3 took_ns 2139049 answered true
+LD-BATCH wall_ns 1794256190905008429 holder 14827596285358691033 entries 3 took_ns 439974 answered true
+LD-BATCH wall_ns 1794256190908852012 holder 14742936998798726028 entries 2 took_ns 2819807 answered true
+LD-BATCH wall_ns 1794256190918174045 holder 14742936998798726028 entries 12 took_ns 6935721 answered true
+LD-BATCH wall_ns 1794256190918615982 holder 14742936998798726028 entries 3 took_ns 385462 answered true
+LD-BATCH wall_ns 1794256190920432835 holder 14827596285358691033 entries 2 took_ns 992699 answered true
+LD-BATCH wall_ns 1794256190921969795 holder 14827596285358691033 entries 3 took_ns 1515678 answered true
+LD-BATCH wall_ns 1794256190925980981 holder 14827596285358691033 entries 2 took_ns 2654177 answered true
+LD-BATCH wall_ns 1794256190928003084 holder 14827596285358691033 entries 3 took_ns 1990185 answered true
+LD-BATCH wall_ns 1794256190930971525 holder 14742936998798726028 entries 3 took_ns 1481156 answered true
+LD-BATCH wall_ns 1794256191933235057 holder 14742936998798726028 entries 7 took_ns 1002112644 answered false
+LD-BATCH wall_ns 1794256217092234847 holder 14742936998798726028 entries 588 took_ns 1798213195 answered true
+LD-BATCH wall_ns 1794256218428190718 holder 14742936998798726028 entries 525 took_ns 1333780787 answered true
+LD-BATCH wall_ns 1794256219316216905 holder 14742936998798726028 entries 390 took_ns 885926567 answered true
