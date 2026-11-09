@@ -1,1 +1,2 @@
 native-linux-fuse: conformance: read-only probe, pjdfstest's EROFS cases over a read attachment: 10 of 14 answered EROFS; 3 opens of an existing file answered EACCES, NFSv3's limit (no OPEN: the client decides an open from ACCESS); the others: truncate/10.t `truncate ro/f 1234` answered "EACCES"
+native-linux-nfs4: conformance: read-only probe, pjdfstest's EROFS cases over a read attachment: 13 of 14 answered EROFS; the others: truncate/10.t `truncate ro/f 1234` answered "EACCES"
