@@ -8816,17 +8816,7 @@ fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_cou
     "recovery could not rebuild the volume whose base is gone"
   );
   assert!(err.contains("NotRecovered"), "{err}");
-  // The anchor's stderr is forwarded by a thread, so the successor's recovery line may land a moment after it serves.
-  let deadline = Instant::now() + WAIT_FOR;
-  let mut recovered: Vec<String> = Vec::new();
-  while recovered.is_empty() && Instant::now() < deadline {
-    recovered.extend(
-      lines
-        .try_iter()
-        .filter(|line| line.contains("reconciled out")),
-    );
-    pause();
-  }
+  let recovered = recovery_lines(&lines);
   assert!(
     recovered
       .iter()
@@ -8849,6 +8839,23 @@ fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_cou
   );
   drop(mount);
   drop(anchor);
+}
+
+/// The daemon's recovery lines (`reconciled out …`) among the anchor's forwarded `lines`, waited for within
+/// [`WAIT_FOR`]: the anchor's stderr is forwarded by a thread, so a successor's line may land a moment after it serves.
+#[cfg(target_os = "linux")]
+fn recovery_lines(lines: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut recovered: Vec<String> = Vec::new();
+  while recovered.is_empty() && Instant::now() < deadline {
+    recovered.extend(
+      lines
+        .try_iter()
+        .filter(|line| line.contains("reconciled out")),
+    );
+    pause();
+  }
+  recovered
 }
 
 /// Writes [`LOOKED_UP_FILES`] files through the mount at `writer` and looks each up through the mount at `looker`.
