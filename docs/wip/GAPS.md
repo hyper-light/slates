@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The fault probe can read a page fault as free under load (found 2026-11-09 by the A-223 plan; open, owner
+> liveness).** `slates_machine::probes::faults` takes `base_ns` as the median of map, touch every page and unmap,
+> less the median of map and unmap alone, over 256 pages, with a saturating subtraction. The two medians are taken in
+> separate measurements, so under load the second can come within 256 ns of the first or pass it, and the cost reads 0.
+> - **Seen:** `profile::tests::a_profile_measures_within_its_budget_and_round_trips_through_json` asserts
+>   `faults.base_ns > 0` and failed in 1 of 10 full `slates-machine` suite runs on main 39c1a9e4 on fedora-2 (32 CPUs,
+>   load 21-34), and in 0 of 10 runs of the test alone. The A-223 branch read the same: 0 of 10 alone, 1 of 3 and 0 of 10
+>   in the suite.
+> - **Why it matters:** consumers take `faults.base_ns.max(1)` (`config.rs`, `region.rs`), so nothing divides by zero.
+>   But a 1 ns fault then feeds derived bounds, among them the arena region (`pages = 100 × 2 × syscall / fault`) and the
+>   pre-fault slice. Owed: a failing test that drives the probe to a zero difference, and a probe that refuses or
+>   re-measures a non-positive difference rather than reporting it.
+
 > **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window it scales, open).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
