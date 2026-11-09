@@ -1,0 +1,22 @@
+{
+  "guard": {
+    "result": "success",
+    "outputs": {}
+  },
+  "wheels": {
+    "result": "success",
+    "outputs": {}
+  },
+  "sdist": {
+    "result": "success",
+    "outputs": {}
+  },
+  "check": {
+    "result": "success",
+    "outputs": {}
+  },
+  "publish": {
+    "result": "skipped",
+    "outputs": {}
+  }
+}
