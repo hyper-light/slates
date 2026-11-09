@@ -9185,8 +9185,13 @@ new process. In simulation the session ended one round trip after its first pack
     read 0 resets: b's session had been lent, replaced or judged dead before any packet reached the new process on it,
     so no reset was owed. The product behaved; the test did not hold its precondition.
     - `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` now reads the precondition from b's own
-      state at the moment a comes back: the same session to a by connection id (`Daemon::fleet_record_session_id`, held
-      or lent, not replaced), and neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved.
+      state once the new a has started: b held its session to the old a until the new a met it, so it is the same
+      session by connection id (`Daemon::fleet_record_session_id`, held or lent, not replaced) or a reset was already
+      counted on b (the new a resets only a session it never knew); and neither `fleet.link.invalid.believed_dead` nor
+      `fleet.link.out_of_contact` moved. Read as the same session alone, it raced the reset: under one busy CPU b's own
+      traffic drew the reset during the new a's start, and diag-69 (9644ec2b) judged 1 of 16 runs vacuous whose four
+      restarts all reset and reached in 214–375 ms. Read at the stop, it never held (0 of 12 on a Mac): b's link to a
+      changed as the old a's port closed.
     - A run without it is recorded and a restarted again, at most `RESET_ATTEMPTS` (4) times.
     - Where it held, the test requires:
       - a reset sent by the restarted a (its demultiplexers' `resets_sent`);

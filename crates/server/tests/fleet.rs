@@ -16740,8 +16740,9 @@ const RESET_ATTEMPTS: usize = 4;
 /// What one restart of a showed from b.
 #[derive(Debug)]
 struct ResetAttempt {
-  /// Whether b still held the same session to a when a came back: the same connection id as before the stop (held or
-  /// lent, not replaced), and neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since.
+  /// Whether b held its session to the old a until the new a met it, read once the new a has started: the same connection
+  /// id as before the stop (held or lent, not replaced), or a reset already counted on b; and neither
+  /// `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since.
   held: bool,
   /// Resets the restarted a's demultiplexers sent over the attempt (to b's old session, and to c's).
   sent_by_a: u64,
@@ -16778,10 +16779,16 @@ fn restart_and_reach(
   daemons.remove(0).stop();
   daemons.insert(0, restart());
   let restarted = Instant::now();
-  let (dead, out, _) = link_counters(&daemons[1]);
+  let (dead, out, resets_by_now) = link_counters(&daemons[1]);
   let session_after = daemons[1].fleet_record_session_id(a_host).unwrap();
+  // b held its session to the old a until the new a answered it: still the same session now, or already reset. A reset
+  // is sent only for a session the new process never knew, which on b's link to a is one b held to the old a, so a
+  // reset counted by now says the session lasted until the new a met it. Read as the same session alone, the
+  // precondition raced the reset itself: under one busy CPU the new a's start was slow enough for b's own traffic to
+  // draw the reset first, and a run whose four restarts all reset and reached was judged vacuous (diag-69, 1 of 16).
+  // Read at the stop instead, it never held: b's link to a changed as the old a's port closed (0 of 12 on a Mac).
   let held = session_before.is_some()
-    && session_after == session_before
+    && (session_after == session_before || resets_by_now > before.2)
     && dead == before.0
     && out == before.1;
   let mut reset_seen = None;
@@ -16828,8 +16835,10 @@ fn restart_and_reach(
 /// Do: three nodes; a volume owned by a, read through b; restart a with its identity on its ports; read through b until
 /// a answers.
 ///
-/// The precondition is read from b's own state: when a comes back b still holds the same session to the old a, by
-/// connection id, held or lent, and its liveness has not judged a dead. Under load b can lose it first: at load 170–232
+/// The precondition is read from b's own state once the new a has started: b held its session to the old a until the
+/// new a met it, so it is the same session by connection id, held or lent, or a reset was already counted on b, which
+/// the new a sends only for a session it never knew; and b's liveness has not judged a dead. A reset that lands during
+/// the new a's start counts, and must still show as the cause below. Under load b can lose it first: at load 170–232
 /// its liveness judged a dead while it was down (`believed_dead` 1, `out_of_contact` 1); at load 46–48 its session was
 /// lent or replaced first (main's parked runs, GAPS). Such a run is not the reset case: it is recorded, and a is
 /// restarted again, at most [`RESET_ATTEMPTS`] times.

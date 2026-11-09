@@ -62,7 +62,9 @@ lost or wrongly answered: the forwards were refused and retried.
   - **Hardened for load (2026-11-09).** The test failed at load 46–48 (main's parked runs) and at 170–232 (the
     supervisor's Mac gate) with no reset to see: b's session to a had been lent, replaced or judged dead first, so no
     packet reached the new process on it. The test now reads the precondition from b's own state at the moment a comes
-    back:
+    back. b held its session to the old a until the new a met it: still the same session, or a reset already counted
+    (read as the same session alone, it raced the reset itself, and diag-69 judged 1 of 16 runs vacuous whose four
+    restarts all reset and reached):
     - the same session to a, by connection id, held or lent (`Daemon::fleet_record_session_id`);
     - neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since before the stop.
 
