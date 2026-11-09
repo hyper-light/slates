@@ -42,5 +42,20 @@ unlink was then refused with nowhere to report it. The bridge now answers `autho
 method, `authorize_write` without a change) and `CanDelete` asks it first, so the delete is refused
 `STATUS_MEDIA_WRITE_PROTECTED` before Windows marks the file.
 
+**Found by conformance's read-only pjdfstest run** (CI run 42498995934, through the kernel's own NFS clients): over
+NFSv3 and NFSv4 `open(O_WRONLY)` and `open(O_RDWR)` of an existing file were granted, and v4's `open(O_RDONLY|O_TRUNC)`
+answered `EACCES`. The bridge's tests had driven the procedures and never met the kernel's open. ACCESS
+(`granted_access`, `crates/bridge-nfs/src/procedures.rs`) granted the write bits from the mode alone; the kernel decides a
+v3 open from that reply, and v4's OPEN asked the same ACCESS; the truncation's SETATTR under the open's read state id
+was refused by the state id's check before the attachment's. Now ACCESS grants no MODIFY, EXTEND or DELETE where the
+bridge refuses a change (`change_refusal`); a v4 OPEN for writing asks the owner extension `CHANGE_ALLOWED` first and
+answers its `NFS4ERR_ROFS`; and a change under a state id is refused ROFS before its state id is judged (`state_io`).
+Over NFSv3 the open is then `EACCES`, the most a v3 server can say (A-258). The test,
+`a_read_only_attachment_refuses_an_open_for_writing_through_the_kernels_nfs_clients`
+(`crates/server/tests/nfs_read_only_kernel.rs`, Linux CI as root): red on main (diag-slabs-42, run 42517407649: v3
+`[granted, granted, EROFS]`, v4 `[granted, granted, EACCES]`), green with the fix (diag-slabs-43, run 42517769901). The
+bridge's `a_write_through_a_read_only_export_is_refused` now holds ACCESS and `CHANGE_ALLOWED`, red with the mask taken
+out.
+
 **Unchanged.** An attachment with no rights at all is still refused for permission (`crates/server/tests/virtiofs.rs`'s
 unenrolled guest, `EPERM`). Ownership refusals (`chmod`, `chown`, a sticky directory) stay `EPERM`/`NFS3ERR_PERM`.

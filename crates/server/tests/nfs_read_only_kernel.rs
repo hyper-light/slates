@@ -1,9 +1,12 @@
 //! A read-only attachment through the Linux kernel's own NFS clients (§4.6 "A read-only attachment is a read-only file
 //! system"; GAPS, 2026-11-08): a volume's read attachment is mounted with `mount -t nfs -o vers=3` and `mount -t nfs4
 //! -o vers=4.2`, with the conformance lane's options (`xtask/src/conformance/slates.rs`), and an existing file is opened
-//! for writing through it. The promise is `EROFS` at the open. The kernel decides a v3 open from the ACCESS reply alone
-//! (v3 has no OPEN), and a v4 open from the server's OPEN, so only a kernel mount shows what an application sees: the
-//! bridge's own tests drive the procedures and never meet the kernel's open.
+//! for writing through it, and a file is created beside it. The kernel decides a v3 open from the ACCESS reply alone (v3
+//! has no OPEN), and a v4 open from the server's OPEN, so only a kernel mount shows what an application sees: the
+//! bridge's own tests drive the procedures and never meet the kernel's open. Over v4 every refusal is `EROFS`. Over v3 an
+//! open for writing is `EACCES`, the most a v3 server can say (A-258): Linux turns an ACCESS bit the server did not grant
+//! into `-EACCES` (`fs/nfs/dir.c` v6.8, `nfs_do_access`, lines 3219–3221); a change that reaches the server, the create,
+//! is `EROFS`.
 //!
 //! Found by conformance's read-only pjdfstest run (CI run 42498995934): `open(O_WRONLY)` and `open(O_RDWR)` of an
 //! existing file succeeded over both versions, and v4's `open(O_RDONLY|O_TRUNC)` answered `EACCES`.
@@ -35,6 +38,8 @@ const NFS3_OPTIONS: &str = "vers=3,tcp,nolock,noresvport,soft,timeo=10,retrans=2
 const NFS4_OPTIONS: &str = "vers=4.2,proto=tcp,soft,timeo=10,retrans=2,noresvport,actimeo=1";
 /// Format: POSIX `EROFS`, a read-only file system, on Linux.
 const EROFS: i32 = 30;
+/// Format: POSIX `EACCES`, permission denied, on Linux: an NFSv3 open for writing on a read-only attachment (A-258).
+const EACCES: i32 = 13;
 /// Format: the bytes the file holds, written through the volume's writable mount.
 const FIRST: &[u8] = b"the file's first bytes";
 
@@ -119,12 +124,13 @@ fn read_only_export(instance: &str, name: &str) -> String {
   format!("/{name}@{:x}.{token_hex}", attachment.attachment)
 }
 
-/// The errno of each way of opening the existing `file` for writing: `O_WRONLY`, `O_RDWR`, `O_RDONLY|O_TRUNC`. `None`
-/// for an open that succeeded.
+/// The errno of each way of opening the existing `file` for writing (`O_WRONLY`, `O_RDWR`, `O_RDONLY|O_TRUNC`), then of
+/// creating a file beside it. `None` for one that succeeded.
 #[allow(clippy::disallowed_methods)] // opens through the kernel mount under test
-fn opens_for_writing(file: &Path) -> [Option<i32>; 3] {
+fn opens_for_writing(file: &Path) -> [Option<i32>; 4] {
   let open =
     |options: &mut std::fs::OpenOptions| options.open(file).err().and_then(|e| e.raw_os_error());
+  let beside = file.with_extension("new");
   [
     open(std::fs::OpenOptions::new().write(true)),
     open(std::fs::OpenOptions::new().read(true).write(true)),
@@ -133,14 +139,18 @@ fn opens_for_writing(file: &Path) -> [Option<i32>; 3] {
         .read(true)
         .custom_flags(rustix::fs::OFlags::TRUNC.bits().try_into().unwrap()),
     ),
+    std::fs::write(&beside, FIRST)
+      .err()
+      .and_then(|e| e.raw_os_error()),
   ]
 }
 
-/// GAPS (2026-11-08), found by conformance's read-only run: a read-only attachment refuses an open for writing with
-/// `EROFS` through the kernel's own NFS clients, as the change of 2026-11-08 promised. Do: write `f` through the
-/// volume's writable mount; mount a read attachment of the volume over NFSv3 and over NFSv4.2; open `f` through each
-/// with `O_WRONLY`, `O_RDWR` and `O_RDONLY|O_TRUNC`. Expect each open refused `EROFS`, a read-only open to read the first
-/// bytes, and `f` to hold them still.
+/// GAPS (2026-11-08), found by conformance's read-only run: a read-only attachment refuses an open for writing through
+/// the kernel's own NFS clients. Do: write `f` through the volume's writable mount; mount a read attachment of the volume
+/// over NFSv3 and over NFSv4.2; through each, open `f` with `O_WRONLY`, `O_RDWR` and `O_RDONLY|O_TRUNC`, and create a
+/// file beside it. Expect over v4 each refused `EROFS`; over v3 each open refused `EACCES` (A-258, the v3 limit) and the
+/// create `EROFS`; and a read-only open reading the first bytes. Before the fix both clients granted `O_WRONLY` and
+/// `O_RDWR`, and v4 answered the truncation `EACCES` (diag-slabs-42, run 42517407649).
 #[test]
 fn a_read_only_attachment_refuses_an_open_for_writing_through_the_kernels_nfs_clients() {
   if let Some(reason) = skip_reason() {
@@ -171,8 +181,15 @@ fn a_read_only_attachment_refuses_an_open_for_writing_through_the_kernels_nfs_cl
   }
   assert_eq!(
     found,
-    vec![("nfs", [Some(EROFS); 3]), ("nfs4", [Some(EROFS); 3])],
-    "each open for writing, O_WRONLY, O_RDWR and O_RDONLY|O_TRUNC, is refused EROFS through each kernel client"
+    vec![
+      (
+        "nfs",
+        [Some(EACCES), Some(EACCES), Some(EACCES), Some(EROFS)]
+      ),
+      ("nfs4", [Some(EROFS); 4])
+    ],
+    "O_WRONLY, O_RDWR, O_RDONLY|O_TRUNC, then a create: v4 refuses each EROFS; v3 refuses each open EACCES, its limit, \
+     and the create EROFS"
   );
   daemon.stop();
 }

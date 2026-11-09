@@ -14554,6 +14554,18 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   to its records, from reading the harness (no suite mounts read-only, and pjdfstest's `EROFS` cases are FreeBSD-only),
   and its expected-failure lists have no `EROFS` entries.
   Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+  - **The open over a kernel NFS mount: fixed 2026-11-08 (slabs; found by conformance's read-only pjdfstest run, CI run
+    42498995934).** Through a read attachment the kernel's v3 and v4 clients granted `open(O_WRONLY)` and `open(O_RDWR)`
+    of an existing file, and v4 answered `open(O_RDONLY|O_TRUNC)` `EACCES`: ACCESS granted the write bits from the mode
+    alone, the kernel decides a v3 open from it, and v4's OPEN asked the same ACCESS. Now ACCESS grants no write bit
+    where the bridge refuses a change, a v4 OPEN for writing asks `CHANGE_ALLOWED` first and answers `NFS4ERR_ROFS`, and
+    a change under a state id is refused ROFS before its state id is judged. Through the kernel
+    (`crates/server/tests/nfs_read_only_kernel.rs`): on main, v3 `[granted, granted, EROFS]` and v4 `[granted, granted,
+    EACCES]` (diag-slabs-42, run 42517407649); with the fix, v4 `EROFS` for each and v3 `EACCES` for each open
+    (diag-slabs-43, run 42517769901, with workspace clippy, the NFS bridge and the server's kernel NFS suites green). v3's
+    `EACCES` at open is its limit, not a miss (A-258). The bridge's read-only export test is red with the ACCESS mask
+    taken out (granted 29 for 1). Conformance's probe counts the v3 opens as that limit (its 0fad3bb2), and its run on
+    this fix (diag-conformance-32) is owed.
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
