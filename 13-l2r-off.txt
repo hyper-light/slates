@@ -1,0 +1,5 @@
+Local-to-remote symbolic link evaluation is: DISABLED
+Local-to-local symbolic link evaluation is: ENABLED
+Local-to-remote symbolic link evaluation is: DISABLED
+Remote-to-local symbolic link evaluation is: DISABLED
+Remote-to-remote symbolic link evaluation is: DISABLED

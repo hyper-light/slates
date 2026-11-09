@@ -1,0 +1,7 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test symbolic_links_made_through_the_drive_are_followed_and_read_back ... slates anchor: instance wslinks7308 up; daemon pid 8052; 2 shards
+A-275 fsutil behavior query SymlinkEvaluation: Local-to-local symbolic link evaluation is: ENABLED
+A-275 fsutil fsinfo drivetype E:: E: - Fixed Drive
+A-275 a drive link to \\localhost\C$\Windows\win.ini: Ok(Ok(92))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.67s
+exit 0
