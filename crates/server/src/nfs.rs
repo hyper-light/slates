@@ -1213,7 +1213,7 @@ fn stale_write_back(
     crate::nfs_writeback::note_connection(s, connection, held, inherited);
     crate::nfs_writeback::judge(s, connection, (handle.volume, handle.inode), at, data)
   })?;
-  if verdict == crate::nfs_writeback::Verdict::Apply {
+  if verdict.applies() {
     return None;
   }
   Some((AcceptStatus::Success, io_failure_reply(NFSPROC3_WRITE)?))

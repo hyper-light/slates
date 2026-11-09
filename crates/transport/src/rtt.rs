@@ -29,6 +29,8 @@ const PTO_RTTVAR_MULTIPLIER: u64 = 4;
 /// Format: RFC 9002 §6.2.1 — before any RTT sample, the PTO is twice the initial RTT. A protocol
 /// constant (the "2 ×" of `2 * kInitialRtt`).
 const INITIAL_PTO_MULTIPLIER: u64 = 2;
+/// Derived: the probe timeout before any RTT sample, [`INITIAL_PTO_MULTIPLIER`] × `kInitialRtt` (666 ms).
+pub(crate) const INITIAL_PTO_NS: u64 = INITIAL_PTO_MULTIPLIER * INITIAL_RTT_NS;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the numerator. A protocol constant.
 const TIME_THRESHOLD_NUMERATOR: u64 = 9;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the denominator. A protocol constant.
@@ -121,7 +123,7 @@ impl RttEstimator {
   /// is the right ceiling for establishing a connection, where the in-progress sample is not yet a
   /// trustworthy basis for giving up.
   pub fn initial_pto(&self) -> u64 {
-    INITIAL_PTO_MULTIPLIER.saturating_mul(INITIAL_RTT_NS)
+    INITIAL_PTO_NS
   }
 
   /// The smoothed RTT (nanoseconds), for the connection's diagnostics and assertions.

@@ -44,7 +44,6 @@ use std::os::windows::io::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
-use std::thread::JoinHandle;
 
 use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
@@ -2267,7 +2266,9 @@ pub enum Outcome {
 pub struct MountThread {
   commands: Option<SyncSender<Command>>,
   outcomes: Receiver<Outcome>,
-  thread: Option<JoinHandle<()>>,
+  /// Joined on the mount's shard, which is marked as waiting on it meanwhile (A-228's transitive wait). Boxed: a mount
+  /// thread is handed back inside refusals, which stay small.
+  thread: Option<Box<slates_rt::registry::WaitedThread<()>>>,
 }
 
 impl MountThread {
@@ -2285,9 +2286,9 @@ impl MountThread {
     let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
     let (outcome_tx, outcomes) = sync_channel::<Outcome>(OUTCOME_BOUND);
     let mount_point = mount_point.to_owned();
-    let thread = std::thread::Builder::new()
-      .name("slates-winfsp".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-winfsp".to_owned()),
+      move || {
         run_mount(
           &mount_point,
           read_only,
@@ -2297,12 +2298,13 @@ impl MountThread {
           open_bound,
           inherited,
         );
-      })
-      .map_err(|_| WinFspError::MountThread)?;
+      },
+    )
+    .map_err(|_| WinFspError::MountThread)?;
     Ok(MountThread {
       commands: Some(commands),
       outcomes,
-      thread: Some(thread),
+      thread: Some(Box::new(thread)),
     })
   }
 
