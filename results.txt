@@ -1,0 +1,2524 @@
+leg b-arm, 4 CPUs, Mon Nov  9 20:23:04 UTC 2026, tree 9916294376f0b7aa8fe6ce2b74500b78bdde099e
+== release build exit 0
+   r1     Finished `release` profile [optimized] target(s) in 0.09s
+   r1      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-6130 destroyed at 250.482198ms
+   r1 chaos a candidate's store destroyed mid-stream: replacement answering at 395.996481ms
+   r1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.597450481s
+   r1 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (6131) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 5266013214536421166
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 12325850009557119793
+   r1   fleet_settled_generation: 8
+   r1   fleet_neighbourhood_generation: 8
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5277547128608124720: lent=false cwnd=130934 srtt_ns=749019 pto_ns=3903439 spurious_losses=0 persistent_collapses=0 consumed=9393 mtu=65496
+   r1   fleet_session 7413017019936217156: lent=false cwnd=130934 srtt_ns=894277 pto_ns=3923701 spurious_losses=0 persistent_collapses=0 consumed=5661 mtu=65496
+   r1   shard 0 refused fleet.live.held: 4
+   r1   shard 0 refused fleet.live.install_taken: 2
+   r1   shard 0 refused fleet.plane.announce_lends: 4
+   r1   shard 0 refused fleet.plane.announcements_sent: 4
+   r1   shard 0 refused fleet.report.sent: 1
+   r1   shard 0 refused fleet.seal.pair_refused: 1564
+   r1   shard 0 refused fleet.seal.pair_served: 1564
+   r1   shard 0 live held 66e053b42b391844000100000000003b head=147 durable=none owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=none moving_to=none recorded=none
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 5277547128608124720
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 1185101620559978856
+   r1   fleet_settled_generation: 5
+   r1   fleet_neighbourhood_generation: 5
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5266013214536421166: lent=false cwnd=130934 srtt_ns=1162781 pto_ns=4770973 spurious_losses=0 persistent_collapses=0 consumed=40352 mtu=65496
+   r1   fleet_session 7413017019936217156: lent=false cwnd=130934 srtt_ns=995158 pto_ns=5118102 spurious_losses=0 persistent_collapses=0 consumed=44648 mtu=65496
+   r1   shard 0 refused fleet.link.peer_reset: 1
+   r1   shard 0 refused fleet.live.held: 148
+   r1   shard 0 refused fleet.plane.address_unresolved: 2
+   r1   shard 0 refused fleet.plane.announce_lends: 5
+   r1   shard 0 refused fleet.plane.announcements_sent: 5
+   r1   shard 0 refused fleet.report.sent: 3
+   r1   shard 0 refused fleet.seal.pair_no_session: 1
+   r1   shard 0 refused fleet.seal.pair_served: 6
+   r1   shard 0 refused fleet.seal.pair_unanswered: 775
+   r1   shard 0 refused fleet.seal.pair_undelivered: 776
+   r1   shard 0 refused fleet.takeover.page_unbound: 5
+   r1   shard 0 refused fleet.takeover.page_unmatched: 1
+   r1   shard 0 live held 66e053b42b391844000100000000003b head=147 durable=none owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=none moving_to=none recorded=none
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 7413017019936217156
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 0
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 629593552267968507
+   r1   fleet_settled_generation: 5
+   r1   fleet_neighbourhood_generation: 5
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5266013214536421166: lent=false cwnd=130934 srtt_ns=829620 pto_ns=3648292 spurious_losses=0 persistent_collapses=0 consumed=2136 mtu=65496
+   r1   fleet_session 5277547128608124720: lent=false cwnd=130934 srtt_ns=656769 pto_ns=2366461 spurious_losses=0 persistent_collapses=0 consumed=12198 mtu=65496
+   r1   shard 0 refused fleet.live.link_lost: 1
+   r1   shard 0 refused fleet.live.no_session: 398
+   r1   shard 0 refused fleet.live.unanswered: 398
+   r1   shard 0 refused fleet.plane.address_unresolved: 5
+   r1   shard 0 refused fleet.plane.announce_lends: 5
+   r1   shard 0 refused fleet.plane.announcements_sent: 5
+   r1   shard 0 refused fleet.report.sent: 4
+   r1   shard 0 refused fleet.seal.pair_no_session: 1
+   r1   shard 0 refused fleet.seal.pair_served: 6
+   r1   shard 0 refused fleet.seal.pair_unanswered: 789
+   r1   shard 0 refused fleet.seal.pair_undelivered: 790
+   r1   shard 0 refused fleet.ship.catalog.placed: 2
+   r1   shard 0 refused fleet.ship.catalog.short: 1
+   r1   shard 0 refused fleet.ship.head.no_session: 5
+   r1   shard 0 refused fleet.ship.head.placed: 1
+   r1   shard 0 refused fleet.ship.head.short: 1
+   r1   shard 0 refused fleet.takeover.page_unbound: 1
+   r1   shard 0 refused fleet.takeover.page_unmatched: 5
+   r1   shard 0 refused fleet.takeover.stale_configuration: 1
+   r1   shard 1 refused fleet.live.appended: 148
+   r1   shard 1 refused fleet.live.awaited: 146
+   r1   shard 1 refused fleet.live.durable: 148
+   r1   shard 1 refused fleet.live.held_back.keys: 404
+   r1   shard 1 refused fleet.live.held_back.placement: 1
+   r1   shard 1 refused fleet.live.holders_recorded: 1
+   r1   shard 1 refused fleet.live.holders_short: 397
+   r1   shard 1 refused fleet.live.holders_transition: 1
+   r1   shard 1 refused fleet.live.install_built: 399
+   r1   shard 1 refused fleet.live.install_image: 1
+   r1   shard 1 refused fleet.live.resolved: 145
+   r1   shard 1 refused fleet.live.whole: 1
+   r1   shard 1 live shipping 66e053b42b391844000100000000003b head=147 durable=147 owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=5277547128608124720,5892800780438978265 moving_to=5266013214536421166,5277547128608124720,5892800780438978265 recorded=5277547128608124720,5892800780438978265
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 5266013214536421166
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 12325850009557119793
+   r1   fleet_settled_generation: 8
+   r1   fleet_neighbourhood_generation: 8
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5277547128608124720: lent=false cwnd=130934 srtt_ns=104487 pto_ns=1104487 spurious_losses=0 persistent_collapses=0 consumed=9833 mtu=65496
+   r1   fleet_session 7413017019936217156: lent=false cwnd=130934 srtt_ns=107655 pto_ns=1107655 spurious_losses=0 persistent_collapses=0 consumed=6101 mtu=65496
+   r1   shard 0 refused fleet.live.held: 4
+   r1   shard 0 refused fleet.live.install_taken: 2
+   r1   shard 0 refused fleet.plane.announce_lends: 4
+   r1   shard 0 refused fleet.plane.announcements_sent: 4
+   r1   shard 0 refused fleet.report.sent: 1
+   r1   shard 0 refused fleet.seal.pair_refused: 3125
+   r1   shard 0 refused fleet.seal.pair_served: 3125
+   r1   shard 0 live held 66e053b42b391844000100000000003b head=147 durable=none owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=none moving_to=none recorded=none
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 5277547128608124720
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 1185101620559978856
+   r1   fleet_settled_generation: 5
+   r1   fleet_neighbourhood_generation: 5
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5266013214536421166: lent=false cwnd=130934 srtt_ns=89336 pto_ns=1089336 spurious_losses=0 persistent_collapses=0 consumed=80572 mtu=65496
+   r1   fleet_session 7413017019936217156: lent=false cwnd=130934 srtt_ns=108891 pto_ns=1108891 spurious_losses=0 persistent_collapses=0 consumed=84868 mtu=65496
+   r1   shard 0 refused fleet.link.peer_reset: 1
+   r1   shard 0 refused fleet.live.held: 148
+   r1   shard 0 refused fleet.plane.address_unresolved: 2
+   r1   shard 0 refused fleet.plane.announce_lends: 5
+   r1   shard 0 refused fleet.plane.announcements_sent: 5
+   r1   shard 0 refused fleet.report.sent: 3
+   r1   shard 0 refused fleet.seal.pair_no_session: 2
+   r1   shard 0 refused fleet.seal.pair_served: 6
+   r1   shard 0 refused fleet.seal.pair_unanswered: 1554
+   r1   shard 0 refused fleet.seal.pair_undelivered: 1556
+   r1   shard 0 refused fleet.takeover.page_unbound: 5
+   r1   shard 0 refused fleet.takeover.page_unmatched: 1
+   r1   shard 0 live held 66e053b42b391844000100000000003b head=147 durable=none owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=none moving_to=none recorded=none
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 7413017019936217156
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 5266013214536421166 5277547128608124720 7413017019936217156
+   r1   fleet_peers_probed: 2
+   r1   fleet_held_records: 0
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 11
+   r1   anchor: 629593552267968507
+   r1   fleet_settled_generation: 5
+   r1   fleet_neighbourhood_generation: 5
+   r1   fleet_peers_in_contact: 2
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 5266013214536421166: lent=false cwnd=130934 srtt_ns=103862 pto_ns=1103862 spurious_losses=0 persistent_collapses=0 consumed=2576 mtu=65496
+   r1   fleet_session 5277547128608124720: lent=false cwnd=130934 srtt_ns=134816 pto_ns=1134816 spurious_losses=0 persistent_collapses=0 consumed=12638 mtu=65496
+   r1   shard 0 refused fleet.live.link_lost: 1
+   r1   shard 0 refused fleet.live.no_session: 789
+   r1   shard 0 refused fleet.live.unanswered: 789
+   r1   shard 0 refused fleet.plane.address_unresolved: 5
+   r1   shard 0 refused fleet.plane.announce_lends: 5
+   r1   shard 0 refused fleet.plane.announcements_sent: 5
+   r1   shard 0 refused fleet.report.sent: 4
+   r1   shard 0 refused fleet.seal.pair_no_session: 1
+   r1   shard 0 refused fleet.seal.pair_served: 6
+   r1   shard 0 refused fleet.seal.pair_unanswered: 1571
+   r1   shard 0 refused fleet.seal.pair_undelivered: 1572
+   r1   shard 0 refused fleet.ship.catalog.placed: 2
+   r1   shard 0 refused fleet.ship.catalog.short: 1
+   r1   shard 0 refused fleet.ship.head.no_session: 5
+   r1   shard 0 refused fleet.ship.head.placed: 1
+   r1   shard 0 refused fleet.ship.head.short: 1
+   r1   shard 0 refused fleet.takeover.page_unbound: 1
+   r1   shard 0 refused fleet.takeover.page_unmatched: 5
+   r1   shard 0 refused fleet.takeover.stale_configuration: 1
+   r1   shard 1 refused fleet.live.appended: 148
+   r1   shard 1 refused fleet.live.awaited: 146
+   r1   shard 1 refused fleet.live.durable: 148
+   r1   shard 1 refused fleet.live.held_back.keys: 795
+   r1   shard 1 refused fleet.live.held_back.placement: 1
+   r1   shard 1 refused fleet.live.holders_recorded: 1
+   r1   shard 1 refused fleet.live.holders_short: 788
+   r1   shard 1 refused fleet.live.holders_transition: 1
+   r1   shard 1 refused fleet.live.install_built: 790
+   r1   shard 1 refused fleet.live.install_image: 1
+   r1   shard 1 refused fleet.live.resolved: 145
+   r1   shard 1 refused fleet.live.whole: 1
+   r1   shard 1 live shipping 66e053b42b391844000100000000003b head=147 durable=147 owed=false epoch=1 identity=fe6935877de5fff3737ad7106436836c955cf1b7d018b528cf5c1be42874e91e fence=1 holders=5277547128608124720,5892800780438978265 moving_to=5266013214536421166,5277547128608124720,5892800780438978265 recorded=5277547128608124720,5892800780438978265
+   r1     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r1 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 84.46s
+== run 1 exit 101
+   r2     Finished `release` profile [optimized] target(s) in 0.09s
+   r2      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r2 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-12818 destroyed at 336.302624ms
+   r2 chaos a candidate's store destroyed mid-stream: replacement answering at 521.667575ms
+   r2 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.6149861s
+   r2 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (12819) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 3939205778948723457
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 12429109321128575062
+   r2   fleet_settled_generation: 5
+   r2   fleet_neighbourhood_generation: 5
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 10500146343906486036: lent=false cwnd=130934 srtt_ns=531488 pto_ns=2375952 spurious_losses=0 persistent_collapses=0 consumed=7844 mtu=65496
+   r2   fleet_session 17342852404668620952: lent=false cwnd=130934 srtt_ns=858590 pto_ns=4237990 spurious_losses=0 persistent_collapses=0 consumed=5630 mtu=65496
+   r2   shard 0 refused fleet.live.held: 2
+   r2   shard 0 refused fleet.live.install_taken: 2
+   r2   shard 0 refused fleet.plane.announce_lends: 4
+   r2   shard 0 refused fleet.plane.announcements_sent: 4
+   r2   shard 0 refused fleet.record.refused.foreign_generation: 6
+   r2   shard 0 refused fleet.seal.pair_refused: 1493
+   r2   shard 0 refused fleet.seal.pair_served: 1493
+   r2   shard 0 live held 91b80377b629a7140001000000000025 head=160 durable=none owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=none moving_to=none recorded=none
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 10500146343906486036
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 0
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 16005746213094025450
+   r2   fleet_settled_generation: 5
+   r2   fleet_neighbourhood_generation: 5
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 3939205778948723457: lent=false cwnd=130934 srtt_ns=1745140 pto_ns=8673160 spurious_losses=0 persistent_collapses=0 consumed=39677 mtu=65496
+   r2   fleet_session 17342852404668620952: lent=false cwnd=130934 srtt_ns=1069636 pto_ns=4220636 spurious_losses=0 persistent_collapses=0 consumed=48941 mtu=65496
+   r2   shard 0 refused fleet.live.link_lost: 1
+   r2   shard 0 refused fleet.live.no_session: 393
+   r2   shard 0 refused fleet.live.unanswered: 392
+   r2   shard 0 refused fleet.plane.address_unresolved: 19
+   r2   shard 0 refused fleet.plane.announce_lends: 5
+   r2   shard 0 refused fleet.plane.announcements_sent: 5
+   r2   shard 0 refused fleet.report.sent: 3
+   r2   shard 0 refused fleet.seal.pair_served: 6
+   r2   shard 0 refused fleet.seal.pair_unanswered: 746
+   r2   shard 0 refused fleet.seal.pair_undelivered: 746
+   r2   shard 0 refused fleet.ship.catalog.placed: 3
+   r2   shard 0 refused fleet.ship.catalog.short: 3
+   r2   shard 0 refused fleet.ship.head.no_session: 2
+   r2   shard 0 refused fleet.ship.head.placed: 3
+   r2   shard 0 refused fleet.ship.head.short: 3
+   r2   shard 0 refused fleet.takeover.page_unbound: 6
+   r2   shard 0 refused fleet.takeover.page_unmatched: 2
+   r2   shard 1 refused fleet.live.appended: 161
+   r2   shard 1 refused fleet.live.awaited: 160
+   r2   shard 1 refused fleet.live.durable: 161
+   r2   shard 1 refused fleet.live.held_back.keys: 397
+   r2   shard 1 refused fleet.live.held_back.placement: 1
+   r2   shard 1 refused fleet.live.holders_recorded: 1
+   r2   shard 1 refused fleet.live.holders_short: 373
+   r2   shard 1 refused fleet.live.holders_transition: 2
+   r2   shard 1 refused fleet.live.install_built: 394
+   r2   shard 1 refused fleet.live.install_image: 3
+   r2   shard 1 refused fleet.live.resolved: 159
+   r2   shard 1 refused fleet.live.whole: 1
+   r2   shard 1 live shipping 91b80377b629a7140001000000000025 head=160 durable=160 owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=8624091258342742269,17342852404668620952 moving_to=3939205778948723457,17342852404668620952 recorded=8624091258342742269,17342852404668620952
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 17342852404668620952
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 10281935854534281882
+   r2   fleet_settled_generation: 6
+   r2   fleet_neighbourhood_generation: 6
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 3939205778948723457: lent=false cwnd=130934 srtt_ns=1700870 pto_ns=8294442 spurious_losses=0 persistent_collapses=0 consumed=1797 mtu=65496
+   r2   fleet_session 10500146343906486036: lent=false cwnd=130934 srtt_ns=611747 pto_ns=1611747 spurious_losses=0 persistent_collapses=0 consumed=5618 mtu=65496
+   r2   shard 0 refused fleet.live.held: 140
+   r2   shard 0 refused fleet.live.install_taken: 1
+   r2   shard 0 refused fleet.plane.address_unresolved: 21
+   r2   shard 0 refused fleet.plane.announce_lends: 5
+   r2   shard 0 refused fleet.plane.announcements_sent: 5
+   r2   shard 0 refused fleet.report.sent: 4
+   r2   shard 0 refused fleet.seal.pair_no_session: 5
+   r2   shard 0 refused fleet.seal.pair_served: 6
+   r2   shard 0 refused fleet.seal.pair_unanswered: 747
+   r2   shard 0 refused fleet.seal.pair_undelivered: 752
+   r2   shard 0 refused fleet.takeover.page_unbound: 2
+   r2   shard 0 refused fleet.takeover.page_unmatched: 6
+   r2   shard 0 refused fleet.takeover.stale_configuration: 2
+   r2   shard 0 live held 91b80377b629a7140001000000000025 head=160 durable=none owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=none moving_to=none recorded=none
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 3939205778948723457
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 12429109321128575062
+   r2   fleet_settled_generation: 5
+   r2   fleet_neighbourhood_generation: 5
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 10500146343906486036: lent=false cwnd=130934 srtt_ns=114326 pto_ns=1114326 spurious_losses=0 persistent_collapses=0 consumed=8284 mtu=65496
+   r2   fleet_session 17342852404668620952: lent=false cwnd=130934 srtt_ns=111492 pto_ns=1111492 spurious_losses=0 persistent_collapses=0 consumed=6070 mtu=65496
+   r2   shard 0 refused fleet.live.held: 2
+   r2   shard 0 refused fleet.live.install_taken: 2
+   r2   shard 0 refused fleet.plane.announce_lends: 4
+   r2   shard 0 refused fleet.plane.announcements_sent: 4
+   r2   shard 0 refused fleet.record.refused.foreign_generation: 6
+   r2   shard 0 refused fleet.seal.pair_refused: 3053
+   r2   shard 0 refused fleet.seal.pair_served: 3053
+   r2   shard 0 live held 91b80377b629a7140001000000000025 head=160 durable=none owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=none moving_to=none recorded=none
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 10500146343906486036
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 0
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 16005746213094025450
+   r2   fleet_settled_generation: 5
+   r2   fleet_neighbourhood_generation: 5
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 3939205778948723457: lent=false cwnd=130934 srtt_ns=93698 pto_ns=1093698 spurious_losses=0 persistent_collapses=0 consumed=79775 mtu=65496
+   r2   fleet_session 17342852404668620952: lent=false cwnd=130934 srtt_ns=118596 pto_ns=1118596 spurious_losses=0 persistent_collapses=0 consumed=88957 mtu=65496
+   r2   shard 0 refused fleet.live.link_lost: 1
+   r2   shard 0 refused fleet.live.no_session: 782
+   r2   shard 0 refused fleet.live.unanswered: 781
+   r2   shard 0 refused fleet.plane.address_unresolved: 19
+   r2   shard 0 refused fleet.plane.announce_lends: 5
+   r2   shard 0 refused fleet.plane.announcements_sent: 5
+   r2   shard 0 refused fleet.report.sent: 3
+   r2   shard 0 refused fleet.seal.pair_served: 6
+   r2   shard 0 refused fleet.seal.pair_unanswered: 1524
+   r2   shard 0 refused fleet.seal.pair_undelivered: 1524
+   r2   shard 0 refused fleet.ship.catalog.placed: 3
+   r2   shard 0 refused fleet.ship.catalog.short: 3
+   r2   shard 0 refused fleet.ship.head.no_session: 2
+   r2   shard 0 refused fleet.ship.head.placed: 3
+   r2   shard 0 refused fleet.ship.head.short: 3
+   r2   shard 0 refused fleet.takeover.page_unbound: 6
+   r2   shard 0 refused fleet.takeover.page_unmatched: 2
+   r2   shard 1 refused fleet.live.appended: 161
+   r2   shard 1 refused fleet.live.awaited: 160
+   r2   shard 1 refused fleet.live.durable: 161
+   r2   shard 1 refused fleet.live.held_back.keys: 786
+   r2   shard 1 refused fleet.live.held_back.placement: 1
+   r2   shard 1 refused fleet.live.holders_recorded: 1
+   r2   shard 1 refused fleet.live.holders_short: 762
+   r2   shard 1 refused fleet.live.holders_transition: 2
+   r2   shard 1 refused fleet.live.install_built: 783
+   r2   shard 1 refused fleet.live.install_image: 3
+   r2   shard 1 refused fleet.live.resolved: 159
+   r2   shard 1 refused fleet.live.whole: 1
+   r2   shard 1 live shipping 91b80377b629a7140001000000000025 head=160 durable=160 owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=8624091258342742269,17342852404668620952 moving_to=3939205778948723457,17342852404668620952 recorded=8624091258342742269,17342852404668620952
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 17342852404668620952
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 3939205778948723457 10500146343906486036 17342852404668620952
+   r2   fleet_peers_probed: 2
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 10281935854534281882
+   r2   fleet_settled_generation: 6
+   r2   fleet_neighbourhood_generation: 6
+   r2   fleet_peers_in_contact: 2
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 3939205778948723457: lent=false cwnd=130934 srtt_ns=92852 pto_ns=1092852 spurious_losses=0 persistent_collapses=0 consumed=2227 mtu=65496
+   r2   fleet_session 10500146343906486036: lent=false cwnd=130934 srtt_ns=118769 pto_ns=1118769 spurious_losses=0 persistent_collapses=0 consumed=6058 mtu=65496
+   r2   shard 0 refused fleet.live.held: 140
+   r2   shard 0 refused fleet.live.install_taken: 1
+   r2   shard 0 refused fleet.plane.address_unresolved: 21
+   r2   shard 0 refused fleet.plane.announce_lends: 5
+   r2   shard 0 refused fleet.plane.announcements_sent: 5
+   r2   shard 0 refused fleet.report.sent: 4
+   r2   shard 0 refused fleet.seal.pair_no_session: 5
+   r2   shard 0 refused fleet.seal.pair_served: 6
+   r2   shard 0 refused fleet.seal.pair_unanswered: 1529
+   r2   shard 0 refused fleet.seal.pair_undelivered: 1534
+   r2   shard 0 refused fleet.takeover.page_unbound: 2
+   r2   shard 0 refused fleet.takeover.page_unmatched: 6
+   r2   shard 0 refused fleet.takeover.stale_configuration: 2
+   r2   shard 0 live held 91b80377b629a7140001000000000025 head=160 durable=none owed=false epoch=1 identity=6072cda5ce44aef078b2ce8eca9a78ca2c19a866c78774d269e622a9dc0a18ca fence=1 holders=none moving_to=none recorded=none
+   r2     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r2 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.80s
+== run 2 exit 101
+   r3     Finished `release` profile [optimized] target(s) in 0.09s
+   r3      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r3 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-19355 destroyed at 220.553301ms
+   r3 chaos a candidate's store destroyed mid-stream: replacement answering at 367.882105ms
+   r3 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.607869348s
+   r3 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (19356) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 8706079486992573522
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 0
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 12464199324571438648
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 1288537098845642964: lent=false cwnd=130934 srtt_ns=471825 pto_ns=2608713 spurious_losses=0 persistent_collapses=0 consumed=14855 mtu=65496
+   r3   fleet_session 14698277346750693290: lent=false cwnd=130934 srtt_ns=946350 pto_ns=4921894 spurious_losses=0 persistent_collapses=0 consumed=2677 mtu=65496
+   r3   shard 0 refused fleet.live.link_lost: 2
+   r3   shard 0 refused fleet.live.no_session: 395
+   r3   shard 0 refused fleet.live.unanswered: 395
+   r3   shard 0 refused fleet.plane.address_unresolved: 14
+   r3   shard 0 refused fleet.plane.announce_lends: 6
+   r3   shard 0 refused fleet.plane.announcements_sent: 6
+   r3   shard 0 refused fleet.report.sent: 5
+   r3   shard 0 refused fleet.seal.pair_no_session: 1
+   r3   shard 0 refused fleet.seal.pair_served: 6
+   r3   shard 0 refused fleet.seal.pair_unanswered: 783
+   r3   shard 0 refused fleet.seal.pair_undelivered: 784
+   r3   shard 0 refused fleet.ship.catalog.placed: 2
+   r3   shard 0 refused fleet.ship.catalog.short: 1
+   r3   shard 0 refused fleet.ship.head.no_session: 14
+   r3   shard 0 refused fleet.ship.head.placed: 1
+   r3   shard 0 refused fleet.ship.head.short: 1
+   r3   shard 0 refused fleet.takeover.page_unbound: 3
+   r3   shard 0 refused fleet.takeover.page_unmatched: 7
+   r3   shard 0 refused fleet.takeover.stale_configuration: 3
+   r3   shard 1 refused fleet.live.appended: 202
+   r3   shard 1 refused fleet.live.awaited: 200
+   r3   shard 1 refused fleet.live.durable: 202
+   r3   shard 1 refused fleet.live.held_back.keys: 390
+   r3   shard 1 refused fleet.live.held_back.placement: 12
+   r3   shard 1 refused fleet.live.holders_recorded: 1
+   r3   shard 1 refused fleet.live.holders_short: 384
+   r3   shard 1 refused fleet.live.holders_transition: 1
+   r3   shard 1 refused fleet.live.install_built: 404
+   r3   shard 1 refused fleet.live.install_image: 1
+   r3   shard 1 refused fleet.live.resolved: 199
+   r3   shard 1 refused fleet.live.whole: 1
+   r3   shard 1 live shipping 78d2352aa881e4520001000000000046 head=201 durable=201 owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=1288537098845642964,14639329923839428787 moving_to=1288537098845642964,14639329923839428787,14698277346750693290 recorded=1288537098845642964,14639329923839428787
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 14698277346750693290
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 2
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 7251292985484790645
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 1288537098845642964: lent=false cwnd=130934 srtt_ns=535408 pto_ns=1915712 spurious_losses=0 persistent_collapses=0 consumed=9303 mtu=65496
+   r3   fleet_session 8706079486992573522: lent=false cwnd=130934 srtt_ns=373289 pto_ns=1373289 spurious_losses=0 persistent_collapses=0 consumed=5829 mtu=65496
+   r3   shard 0 refused fleet.live.held: 15
+   r3   shard 0 refused fleet.live.hold_refused: 9
+   r3   shard 0 refused fleet.live.hold_refused.not_a_member: 9
+   r3   shard 0 refused fleet.live.install_taken: 1
+   r3   shard 0 refused fleet.plane.announce_lends: 4
+   r3   shard 0 refused fleet.plane.announcements_sent: 4
+   r3   shard 0 refused fleet.report.sent: 3
+   r3   shard 0 refused fleet.seal.pair_refused: 1543
+   r3   shard 0 refused fleet.seal.pair_served: 1543
+   r3   shard 0 live held 78d2352aa881e4520001000000000046 head=201 durable=none owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=none moving_to=none recorded=none
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 1288537098845642964
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 2
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 13498991111042504483
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 8706079486992573522: lent=false cwnd=130934 srtt_ns=567969 pto_ns=2659497 spurious_losses=0 persistent_collapses=0 consumed=44038 mtu=65496
+   r3   fleet_session 14698277346750693290: lent=false cwnd=130934 srtt_ns=492494 pto_ns=2253758 spurious_losses=0 persistent_collapses=0 consumed=39946 mtu=65496
+   r3   shard 0 refused fleet.link.peer_reset: 1
+   r3   shard 0 refused fleet.live.held: 202
+   r3   shard 0 refused fleet.plane.address_unresolved: 11
+   r3   shard 0 refused fleet.plane.announce_lends: 5
+   r3   shard 0 refused fleet.plane.announcements_sent: 5
+   r3   shard 0 refused fleet.report.sent: 3
+   r3   shard 0 refused fleet.seal.pair_served: 6
+   r3   shard 0 refused fleet.seal.pair_unanswered: 760
+   r3   shard 0 refused fleet.seal.pair_undelivered: 760
+   r3   shard 0 refused fleet.takeover.page_unbound: 7
+   r3   shard 0 refused fleet.takeover.page_unmatched: 3
+   r3   shard 0 live held 78d2352aa881e4520001000000000046 head=201 durable=none owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=none moving_to=none recorded=none
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 8706079486992573522
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 0
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 12464199324571438648
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 1288537098845642964: lent=false cwnd=130934 srtt_ns=123981 pto_ns=1123981 spurious_losses=0 persistent_collapses=0 consumed=15305 mtu=65496
+   r3   fleet_session 14698277346750693290: lent=false cwnd=130934 srtt_ns=123694 pto_ns=1123694 spurious_losses=0 persistent_collapses=0 consumed=3117 mtu=65496
+   r3   shard 0 refused fleet.live.link_lost: 2
+   r3   shard 0 refused fleet.live.no_session: 785
+   r3   shard 0 refused fleet.live.unanswered: 785
+   r3   shard 0 refused fleet.plane.address_unresolved: 14
+   r3   shard 0 refused fleet.plane.announce_lends: 6
+   r3   shard 0 refused fleet.plane.announcements_sent: 6
+   r3   shard 0 refused fleet.report.sent: 5
+   r3   shard 0 refused fleet.seal.pair_no_session: 1
+   r3   shard 0 refused fleet.seal.pair_served: 6
+   r3   shard 0 refused fleet.seal.pair_unanswered: 1563
+   r3   shard 0 refused fleet.seal.pair_undelivered: 1564
+   r3   shard 0 refused fleet.ship.catalog.placed: 2
+   r3   shard 0 refused fleet.ship.catalog.short: 1
+   r3   shard 0 refused fleet.ship.head.no_session: 14
+   r3   shard 0 refused fleet.ship.head.placed: 1
+   r3   shard 0 refused fleet.ship.head.short: 1
+   r3   shard 0 refused fleet.takeover.page_unbound: 3
+   r3   shard 0 refused fleet.takeover.page_unmatched: 7
+   r3   shard 0 refused fleet.takeover.stale_configuration: 3
+   r3   shard 1 refused fleet.live.appended: 202
+   r3   shard 1 refused fleet.live.awaited: 200
+   r3   shard 1 refused fleet.live.durable: 202
+   r3   shard 1 refused fleet.live.held_back.keys: 780
+   r3   shard 1 refused fleet.live.held_back.placement: 12
+   r3   shard 1 refused fleet.live.holders_recorded: 1
+   r3   shard 1 refused fleet.live.holders_short: 774
+   r3   shard 1 refused fleet.live.holders_transition: 1
+   r3   shard 1 refused fleet.live.install_built: 794
+   r3   shard 1 refused fleet.live.install_image: 1
+   r3   shard 1 refused fleet.live.resolved: 199
+   r3   shard 1 refused fleet.live.whole: 1
+   r3   shard 1 live shipping 78d2352aa881e4520001000000000046 head=201 durable=201 owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=1288537098845642964,14639329923839428787 moving_to=1288537098845642964,14639329923839428787,14698277346750693290 recorded=1288537098845642964,14639329923839428787
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 14698277346750693290
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 2
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 7251292985484790645
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 1288537098845642964: lent=false cwnd=130934 srtt_ns=114438 pto_ns=1114438 spurious_losses=0 persistent_collapses=0 consumed=9743 mtu=65496
+   r3   fleet_session 8706079486992573522: lent=false cwnd=130934 srtt_ns=116473 pto_ns=1116473 spurious_losses=0 persistent_collapses=0 consumed=6269 mtu=65496
+   r3   shard 0 refused fleet.live.held: 15
+   r3   shard 0 refused fleet.live.hold_refused: 9
+   r3   shard 0 refused fleet.live.hold_refused.not_a_member: 9
+   r3   shard 0 refused fleet.live.install_taken: 1
+   r3   shard 0 refused fleet.plane.announce_lends: 4
+   r3   shard 0 refused fleet.plane.announcements_sent: 4
+   r3   shard 0 refused fleet.report.sent: 3
+   r3   shard 0 refused fleet.seal.pair_refused: 3103
+   r3   shard 0 refused fleet.seal.pair_served: 3103
+   r3   shard 0 live held 78d2352aa881e4520001000000000046 head=201 durable=none owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=none moving_to=none recorded=none
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 1288537098845642964
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 1288537098845642964 8706079486992573522 14698277346750693290
+   r3   fleet_peers_probed: 2
+   r3   fleet_held_records: 2
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 11
+   r3   anchor: 13498991111042504483
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_peers_in_contact: 2
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 8706079486992573522: lent=false cwnd=130934 srtt_ns=156156 pto_ns=1156156 spurious_losses=0 persistent_collapses=0 consumed=84166 mtu=65496
+   r3   fleet_session 14698277346750693290: lent=false cwnd=130934 srtt_ns=96672 pto_ns=1096672 spurious_losses=0 persistent_collapses=0 consumed=80064 mtu=65496
+   r3   shard 0 refused fleet.link.peer_reset: 1
+   r3   shard 0 refused fleet.live.held: 202
+   r3   shard 0 refused fleet.plane.address_unresolved: 11
+   r3   shard 0 refused fleet.plane.announce_lends: 5
+   r3   shard 0 refused fleet.plane.announcements_sent: 5
+   r3   shard 0 refused fleet.report.sent: 3
+   r3   shard 0 refused fleet.seal.pair_served: 6
+   r3   shard 0 refused fleet.seal.pair_unanswered: 1540
+   r3   shard 0 refused fleet.seal.pair_undelivered: 1540
+   r3   shard 0 refused fleet.takeover.page_unbound: 7
+   r3   shard 0 refused fleet.takeover.page_unmatched: 3
+   r3   shard 0 live held 78d2352aa881e4520001000000000046 head=201 durable=none owed=false epoch=1 identity=e001dc87f358d4708f719b606024d545b2a79a7a427c680aa421002ecd6ba072 fence=1 holders=none moving_to=none recorded=none
+   r3     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r3 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 84.43s
+== run 3 exit 101
+   r4     Finished `release` profile [optimized] target(s) in 0.09s
+   r4      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r4 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-26031 destroyed at 192.757602ms
+   r4 chaos a candidate's store destroyed mid-stream: replacement answering at 329.975641ms
+   r4 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.570866683s
+   r4 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (26032) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 2344687328877604041
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 9649366806661408409
+   r4   fleet_settled_generation: 7
+   r4   fleet_neighbourhood_generation: 7
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 1000206757277746895: lent=false cwnd=130934 srtt_ns=1421957 pto_ns=8302397 spurious_losses=0 persistent_collapses=0 consumed=8699 mtu=65496
+   r4   fleet_session 2693796730434218356: lent=false cwnd=130934 srtt_ns=365685 pto_ns=1365685 spurious_losses=0 persistent_collapses=0 consumed=5843 mtu=65496
+   r4   shard 0 refused fleet.live.held: 3
+   r4   shard 0 refused fleet.live.install_taken: 1
+   r4   shard 0 refused fleet.plane.announce_lends: 4
+   r4   shard 0 refused fleet.plane.announcements_sent: 4
+   r4   shard 0 refused fleet.report.sent: 2
+   r4   shard 0 refused fleet.seal.pair_refused: 1539
+   r4   shard 0 refused fleet.seal.pair_served: 1539
+   r4   shard 0 live held 256249da9ea3e9740001000000000040 head=202 durable=none owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=none moving_to=none recorded=none
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 1000206757277746895
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 6268082489153093268
+   r4   fleet_settled_generation: 7
+   r4   fleet_neighbourhood_generation: 7
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 2344687328877604041: lent=false cwnd=130934 srtt_ns=1242816 pto_ns=4893024 spurious_losses=0 persistent_collapses=0 consumed=40139 mtu=65496
+   r4   fleet_session 2693796730434218356: lent=false cwnd=130934 srtt_ns=1030277 pto_ns=4235609 spurious_losses=0 persistent_collapses=0 consumed=43833 mtu=65496
+   r4   shard 0 refused fleet.link.peer_reset: 1
+   r4   shard 0 refused fleet.live.held: 199
+   r4   shard 0 refused fleet.live.install_taken: 1
+   r4   shard 0 refused fleet.plane.address_unresolved: 12
+   r4   shard 0 refused fleet.plane.announce_lends: 5
+   r4   shard 0 refused fleet.plane.announcements_sent: 5
+   r4   shard 0 refused fleet.report.sent: 3
+   r4   shard 0 refused fleet.seal.pair_no_session: 1
+   r4   shard 0 refused fleet.seal.pair_served: 6
+   r4   shard 0 refused fleet.seal.pair_unanswered: 760
+   r4   shard 0 refused fleet.seal.pair_undelivered: 761
+   r4   shard 0 refused fleet.takeover.page_unbound: 6
+   r4   shard 0 refused fleet.takeover.page_unmatched: 2
+   r4   shard 0 live held 256249da9ea3e9740001000000000040 head=202 durable=none owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=none moving_to=none recorded=none
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 2693796730434218356
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 0
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 15273836475700230978
+   r4   fleet_settled_generation: 5
+   r4   fleet_neighbourhood_generation: 5
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 1000206757277746895: lent=false cwnd=130934 srtt_ns=1248097 pto_ns=5470009 spurious_losses=0 persistent_collapses=0 consumed=14769 mtu=65496
+   r4   fleet_session 2344687328877604041: lent=false cwnd=130934 srtt_ns=1019230 pto_ns=4221962 spurious_losses=0 persistent_collapses=0 consumed=2088 mtu=65496
+   r4   shard 0 refused fleet.live.link_lost: 1
+   r4   shard 0 refused fleet.live.no_session: 394
+   r4   shard 0 refused fleet.live.unanswered: 394
+   r4   shard 0 refused fleet.plane.address_unresolved: 3
+   r4   shard 0 refused fleet.plane.announce_lends: 5
+   r4   shard 0 refused fleet.plane.announcements_sent: 5
+   r4   shard 0 refused fleet.report.sent: 4
+   r4   shard 0 refused fleet.seal.pair_no_session: 2
+   r4   shard 0 refused fleet.seal.pair_served: 6
+   r4   shard 0 refused fleet.seal.pair_unanswered: 782
+   r4   shard 0 refused fleet.seal.pair_undelivered: 784
+   r4   shard 0 refused fleet.ship.catalog.placed: 2
+   r4   shard 0 refused fleet.ship.catalog.short: 1
+   r4   shard 0 refused fleet.ship.head.placed: 2
+   r4   shard 0 refused fleet.ship.head.short: 1
+   r4   shard 0 refused fleet.takeover.page_unbound: 2
+   r4   shard 0 refused fleet.takeover.page_unmatched: 6
+   r4   shard 0 refused fleet.takeover.stale_configuration: 2
+   r4   shard 1 refused fleet.live.appended: 203
+   r4   shard 1 refused fleet.live.awaited: 201
+   r4   shard 1 refused fleet.live.durable: 203
+   r4   shard 1 refused fleet.live.held_back.keys: 400
+   r4   shard 1 refused fleet.live.held_back.placement: 1
+   r4   shard 1 refused fleet.live.holders_recorded: 1
+   r4   shard 1 refused fleet.live.holders_short: 394
+   r4   shard 1 refused fleet.live.holders_transition: 1
+   r4   shard 1 refused fleet.live.install_built: 395
+   r4   shard 1 refused fleet.live.install_image: 2
+   r4   shard 1 refused fleet.live.resolved: 200
+   r4   shard 1 refused fleet.live.whole: 1
+   r4   shard 1 live shipping 256249da9ea3e9740001000000000040 head=202 durable=202 owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=1000206757277746895,11582022184447132645 moving_to=1000206757277746895,2344687328877604041,11582022184447132645 recorded=1000206757277746895,11582022184447132645
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 2344687328877604041
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 9649366806661408409
+   r4   fleet_settled_generation: 7
+   r4   fleet_neighbourhood_generation: 7
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 1000206757277746895: lent=false cwnd=130934 srtt_ns=122425 pto_ns=1122425 spurious_losses=0 persistent_collapses=0 consumed=9139 mtu=65496
+   r4   fleet_session 2693796730434218356: lent=false cwnd=130934 srtt_ns=147702 pto_ns=1147702 spurious_losses=0 persistent_collapses=0 consumed=6283 mtu=65496
+   r4   shard 0 refused fleet.live.held: 3
+   r4   shard 0 refused fleet.live.install_taken: 1
+   r4   shard 0 refused fleet.plane.announce_lends: 4
+   r4   shard 0 refused fleet.plane.announcements_sent: 4
+   r4   shard 0 refused fleet.report.sent: 2
+   r4   shard 0 refused fleet.seal.pair_refused: 3102
+   r4   shard 0 refused fleet.seal.pair_served: 3102
+   r4   shard 0 live held 256249da9ea3e9740001000000000040 head=202 durable=none owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=none moving_to=none recorded=none
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 1000206757277746895
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 6268082489153093268
+   r4   fleet_settled_generation: 7
+   r4   fleet_neighbourhood_generation: 7
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 2344687328877604041: lent=false cwnd=130934 srtt_ns=118945 pto_ns=1118945 spurious_losses=0 persistent_collapses=0 consumed=80359 mtu=65496
+   r4   fleet_session 2693796730434218356: lent=false cwnd=130934 srtt_ns=141343 pto_ns=1141343 spurious_losses=0 persistent_collapses=0 consumed=84063 mtu=65496
+   r4   shard 0 refused fleet.link.peer_reset: 1
+   r4   shard 0 refused fleet.live.held: 199
+   r4   shard 0 refused fleet.live.install_taken: 1
+   r4   shard 0 refused fleet.plane.address_unresolved: 12
+   r4   shard 0 refused fleet.plane.announce_lends: 5
+   r4   shard 0 refused fleet.plane.announcements_sent: 5
+   r4   shard 0 refused fleet.report.sent: 3
+   r4   shard 0 refused fleet.seal.pair_no_session: 1
+   r4   shard 0 refused fleet.seal.pair_served: 6
+   r4   shard 0 refused fleet.seal.pair_unanswered: 1541
+   r4   shard 0 refused fleet.seal.pair_undelivered: 1542
+   r4   shard 0 refused fleet.takeover.page_unbound: 6
+   r4   shard 0 refused fleet.takeover.page_unmatched: 2
+   r4   shard 0 live held 256249da9ea3e9740001000000000040 head=202 durable=none owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=none moving_to=none recorded=none
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 2693796730434218356
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 1000206757277746895 2344687328877604041 2693796730434218356
+   r4   fleet_peers_probed: 2
+   r4   fleet_held_records: 0
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 11
+   r4   anchor: 15273836475700230978
+   r4   fleet_settled_generation: 5
+   r4   fleet_neighbourhood_generation: 5
+   r4   fleet_peers_in_contact: 2
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 1000206757277746895: lent=false cwnd=130934 srtt_ns=113233 pto_ns=1113233 spurious_losses=0 persistent_collapses=0 consumed=15219 mtu=65496
+   r4   fleet_session 2344687328877604041: lent=false cwnd=130934 srtt_ns=144798 pto_ns=1144798 spurious_losses=0 persistent_collapses=0 consumed=2528 mtu=65496
+   r4   shard 0 refused fleet.live.link_lost: 1
+   r4   shard 0 refused fleet.live.no_session: 784
+   r4   shard 0 refused fleet.live.unanswered: 784
+   r4   shard 0 refused fleet.plane.address_unresolved: 3
+   r4   shard 0 refused fleet.plane.announce_lends: 5
+   r4   shard 0 refused fleet.plane.announcements_sent: 5
+   r4   shard 0 refused fleet.report.sent: 4
+   r4   shard 0 refused fleet.seal.pair_no_session: 3
+   r4   shard 0 refused fleet.seal.pair_served: 6
+   r4   shard 0 refused fleet.seal.pair_unanswered: 1561
+   r4   shard 0 refused fleet.seal.pair_undelivered: 1564
+   r4   shard 0 refused fleet.ship.catalog.placed: 2
+   r4   shard 0 refused fleet.ship.catalog.short: 1
+   r4   shard 0 refused fleet.ship.head.placed: 2
+   r4   shard 0 refused fleet.ship.head.short: 1
+   r4   shard 0 refused fleet.takeover.page_unbound: 2
+   r4   shard 0 refused fleet.takeover.page_unmatched: 6
+   r4   shard 0 refused fleet.takeover.stale_configuration: 2
+   r4   shard 1 refused fleet.live.appended: 203
+   r4   shard 1 refused fleet.live.awaited: 201
+   r4   shard 1 refused fleet.live.durable: 203
+   r4   shard 1 refused fleet.live.held_back.keys: 790
+   r4   shard 1 refused fleet.live.held_back.placement: 1
+   r4   shard 1 refused fleet.live.holders_recorded: 1
+   r4   shard 1 refused fleet.live.holders_short: 784
+   r4   shard 1 refused fleet.live.holders_transition: 1
+   r4   shard 1 refused fleet.live.install_built: 785
+   r4   shard 1 refused fleet.live.install_image: 2
+   r4   shard 1 refused fleet.live.resolved: 200
+   r4   shard 1 refused fleet.live.whole: 1
+   r4   shard 1 live shipping 256249da9ea3e9740001000000000040 head=202 durable=202 owed=false epoch=1 identity=307bcf252dd5fdf9d6a8340137c859d55bcef66d1bc459b58edb9c48f24558b1 fence=1 holders=1000206757277746895,11582022184447132645 moving_to=1000206757277746895,2344687328877604041,11582022184447132645 recorded=1000206757277746895,11582022184447132645
+   r4     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r4 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 84.36s
+== run 4 exit 101
+   r5     Finished `release` profile [optimized] target(s) in 0.09s
+   r5      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r5 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-32649 destroyed at 200.53014ms
+   r5 chaos a candidate's store destroyed mid-stream: replacement answering at 323.64793ms
+   r5 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.486014748s
+   r5 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (32650) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 4018330060847975349
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 9779488230729643135
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 7396906889432548957: lent=false cwnd=130934 srtt_ns=222165 pto_ns=1222165 spurious_losses=0 persistent_collapses=0 consumed=6307 mtu=65496
+   r5   fleet_session 10361258194088044277: lent=false cwnd=130934 srtt_ns=208435 pto_ns=1208435 spurious_losses=0 persistent_collapses=0 consumed=6611 mtu=65496
+   r5   shard 0 refused fleet.live.held: 4
+   r5   shard 0 refused fleet.live.hold_refused: 13
+   r5   shard 0 refused fleet.live.hold_refused.not_a_member: 13
+   r5   shard 0 refused fleet.live.install_taken: 1
+   r5   shard 0 refused fleet.plane.announce_lends: 4
+   r5   shard 0 refused fleet.plane.announcements_sent: 4
+   r5   shard 0 refused fleet.record.refused.configuration_stale: 4
+   r5   shard 0 refused fleet.report.sent: 1
+   r5   shard 0 refused fleet.seal.pair_refused: 1591
+   r5   shard 0 refused fleet.seal.pair_served: 1591
+   r5   shard 0 live held 8fca956e64b926f50001000000000024 head=176 durable=none owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=none moving_to=none recorded=none
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 7396906889432548957
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 12581120275745481493
+   r5   fleet_settled_generation: 5
+   r5   fleet_neighbourhood_generation: 5
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 4018330060847975349: lent=false cwnd=130934 srtt_ns=144544 pto_ns=1144544 spurious_losses=0 persistent_collapses=0 consumed=41476 mtu=65496
+   r5   fleet_session 10361258194088044277: lent=false cwnd=130934 srtt_ns=164521 pto_ns=1164521 spurious_losses=0 persistent_collapses=0 consumed=44844 mtu=65496
+   r5   shard 0 refused fleet.link.peer_reset: 1
+   r5   shard 0 refused fleet.live.held: 171
+   r5   shard 0 refused fleet.live.install_taken: 1
+   r5   shard 0 refused fleet.plane.address_unresolved: 2
+   r5   shard 0 refused fleet.plane.announce_lends: 6
+   r5   shard 0 refused fleet.plane.announcements_sent: 6
+   r5   shard 0 refused fleet.report.sent: 3
+   r5   shard 0 refused fleet.seal.pair_no_session: 3
+   r5   shard 0 refused fleet.seal.pair_served: 6
+   r5   shard 0 refused fleet.seal.pair_unanswered: 795
+   r5   shard 0 refused fleet.seal.pair_undelivered: 798
+   r5   shard 0 refused fleet.takeover.page_unbound: 6
+   r5   shard 0 refused fleet.takeover.page_unmatched: 2
+   r5   shard 0 live held 8fca956e64b926f50001000000000024 head=176 durable=none owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=none moving_to=none recorded=none
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 10361258194088044277
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 0
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 13910319125804366343
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 4018330060847975349: lent=false cwnd=130934 srtt_ns=208645 pto_ns=1208645 spurious_losses=0 persistent_collapses=0 consumed=2164 mtu=65496
+   r5   fleet_session 7396906889432548957: lent=false cwnd=130934 srtt_ns=199350 pto_ns=1199350 spurious_losses=0 persistent_collapses=0 consumed=13307 mtu=65496
+   r5   shard 0 refused fleet.live.link_lost: 2
+   r5   shard 0 refused fleet.live.no_session: 400
+   r5   shard 0 refused fleet.live.unanswered: 401
+   r5   shard 0 refused fleet.plane.address_unresolved: 15
+   r5   shard 0 refused fleet.plane.announce_lends: 6
+   r5   shard 0 refused fleet.plane.announcements_sent: 6
+   r5   shard 0 refused fleet.report.sent: 5
+   r5   shard 0 refused fleet.seal.pair_served: 6
+   r5   shard 0 refused fleet.seal.pair_unanswered: 796
+   r5   shard 0 refused fleet.seal.pair_undelivered: 796
+   r5   shard 0 refused fleet.ship.catalog.placed: 3
+   r5   shard 0 refused fleet.ship.catalog.short: 2
+   r5   shard 0 refused fleet.ship.head.no_session: 13
+   r5   shard 0 refused fleet.ship.head.placed: 2
+   r5   shard 0 refused fleet.ship.head.short: 2
+   r5   shard 0 refused fleet.takeover.page_unbound: 2
+   r5   shard 0 refused fleet.takeover.page_unmatched: 6
+   r5   shard 0 refused fleet.takeover.stale_configuration: 2
+   r5   shard 1 refused fleet.live.appended: 177
+   r5   shard 1 refused fleet.live.awaited: 175
+   r5   shard 1 refused fleet.live.durable: 177
+   r5   shard 1 refused fleet.live.held_back.keys: 397
+   r5   shard 1 refused fleet.live.held_back.placement: 13
+   r5   shard 1 refused fleet.live.holders_recorded: 1
+   r5   shard 1 refused fleet.live.holders_short: 389
+   r5   shard 1 refused fleet.live.holders_transition: 2
+   r5   shard 1 refused fleet.live.install_built: 415
+   r5   shard 1 refused fleet.live.install_image: 2
+   r5   shard 1 refused fleet.live.resolved: 174
+   r5   shard 1 refused fleet.live.whole: 1
+   r5   shard 1 live shipping 8fca956e64b926f50001000000000024 head=176 durable=176 owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=7396906889432548957,17903238727252610750 moving_to=4018330060847975349,7396906889432548957 recorded=7396906889432548957,17903238727252610750
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 4018330060847975349
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 9779488230729643135
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 7396906889432548957: lent=false cwnd=130934 srtt_ns=97528 pto_ns=1097528 spurious_losses=0 persistent_collapses=0 consumed=6747 mtu=65496
+   r5   fleet_session 10361258194088044277: lent=false cwnd=130934 srtt_ns=122677 pto_ns=1122677 spurious_losses=0 persistent_collapses=0 consumed=7051 mtu=65496
+   r5   shard 0 refused fleet.live.held: 4
+   r5   shard 0 refused fleet.live.hold_refused: 13
+   r5   shard 0 refused fleet.live.hold_refused.not_a_member: 13
+   r5   shard 0 refused fleet.live.install_taken: 1
+   r5   shard 0 refused fleet.plane.announce_lends: 4
+   r5   shard 0 refused fleet.plane.announcements_sent: 4
+   r5   shard 0 refused fleet.record.refused.configuration_stale: 4
+   r5   shard 0 refused fleet.report.sent: 1
+   r5   shard 0 refused fleet.seal.pair_refused: 3150
+   r5   shard 0 refused fleet.seal.pair_served: 3150
+   r5   shard 0 live held 8fca956e64b926f50001000000000024 head=176 durable=none owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=none moving_to=none recorded=none
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 7396906889432548957
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 12581120275745481493
+   r5   fleet_settled_generation: 5
+   r5   fleet_neighbourhood_generation: 5
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 4018330060847975349: lent=false cwnd=130934 srtt_ns=91774 pto_ns=1091774 spurious_losses=0 persistent_collapses=0 consumed=81594 mtu=65496
+   r5   fleet_session 10361258194088044277: lent=false cwnd=130934 srtt_ns=103611 pto_ns=1103611 spurious_losses=0 persistent_collapses=0 consumed=85074 mtu=65496
+   r5   shard 0 refused fleet.link.peer_reset: 1
+   r5   shard 0 refused fleet.live.held: 171
+   r5   shard 0 refused fleet.live.install_taken: 1
+   r5   shard 0 refused fleet.plane.address_unresolved: 2
+   r5   shard 0 refused fleet.plane.announce_lends: 6
+   r5   shard 0 refused fleet.plane.announcements_sent: 6
+   r5   shard 0 refused fleet.report.sent: 3
+   r5   shard 0 refused fleet.seal.pair_no_session: 4
+   r5   shard 0 refused fleet.seal.pair_served: 6
+   r5   shard 0 refused fleet.seal.pair_unanswered: 1574
+   r5   shard 0 refused fleet.seal.pair_undelivered: 1578
+   r5   shard 0 refused fleet.takeover.page_unbound: 6
+   r5   shard 0 refused fleet.takeover.page_unmatched: 2
+   r5   shard 0 live held 8fca956e64b926f50001000000000024 head=176 durable=none owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=none moving_to=none recorded=none
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 10361258194088044277
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4018330060847975349 7396906889432548957 10361258194088044277
+   r5   fleet_peers_probed: 2
+   r5   fleet_held_records: 0
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 11
+   r5   anchor: 13910319125804366343
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_peers_in_contact: 2
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 4018330060847975349: lent=false cwnd=130934 srtt_ns=179065 pto_ns=1179065 spurious_losses=0 persistent_collapses=0 consumed=2604 mtu=65496
+   r5   fleet_session 7396906889432548957: lent=false cwnd=130934 srtt_ns=125243 pto_ns=1125243 spurious_losses=0 persistent_collapses=0 consumed=13747 mtu=65496
+   r5   shard 0 refused fleet.live.link_lost: 2
+   r5   shard 0 refused fleet.live.no_session: 791
+   r5   shard 0 refused fleet.live.unanswered: 792
+   r5   shard 0 refused fleet.plane.address_unresolved: 15
+   r5   shard 0 refused fleet.plane.announce_lends: 6
+   r5   shard 0 refused fleet.plane.announcements_sent: 6
+   r5   shard 0 refused fleet.report.sent: 5
+   r5   shard 0 refused fleet.seal.pair_served: 6
+   r5   shard 0 refused fleet.seal.pair_unanswered: 1578
+   r5   shard 0 refused fleet.seal.pair_undelivered: 1578
+   r5   shard 0 refused fleet.ship.catalog.placed: 3
+   r5   shard 0 refused fleet.ship.catalog.short: 2
+   r5   shard 0 refused fleet.ship.head.no_session: 13
+   r5   shard 0 refused fleet.ship.head.placed: 2
+   r5   shard 0 refused fleet.ship.head.short: 2
+   r5   shard 0 refused fleet.takeover.page_unbound: 2
+   r5   shard 0 refused fleet.takeover.page_unmatched: 6
+   r5   shard 0 refused fleet.takeover.stale_configuration: 2
+   r5   shard 1 refused fleet.live.appended: 177
+   r5   shard 1 refused fleet.live.awaited: 175
+   r5   shard 1 refused fleet.live.durable: 177
+   r5   shard 1 refused fleet.live.held_back.keys: 788
+   r5   shard 1 refused fleet.live.held_back.placement: 13
+   r5   shard 1 refused fleet.live.holders_recorded: 1
+   r5   shard 1 refused fleet.live.holders_short: 780
+   r5   shard 1 refused fleet.live.holders_transition: 2
+   r5   shard 1 refused fleet.live.install_built: 806
+   r5   shard 1 refused fleet.live.install_image: 2
+   r5   shard 1 refused fleet.live.resolved: 174
+   r5   shard 1 refused fleet.live.whole: 1
+   r5   shard 1 live shipping 8fca956e64b926f50001000000000024 head=176 durable=176 owed=false epoch=1 identity=f76c5cf10976e8f1a7e2c7534bc9ba8e1848906429a6deb24886efc6d54b8276 fence=1 holders=7396906889432548957,17903238727252610750 moving_to=4018330060847975349,7396906889432548957 recorded=7396906889432548957,17903238727252610750
+   r5     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r5 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.43s
+== run 5 exit 101
+   r6     Finished `release` profile [optimized] target(s) in 0.09s
+   r6      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r6 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-40126 destroyed at 158.264707ms
+   r6 chaos a candidate's store destroyed mid-stream: replacement answering at 306.867291ms
+   r6 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 849.022661ms
+   r6 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (40127) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 11256220468804880425
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 2
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 17162750946507683197
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 4445497432929040180: lent=false cwnd=130934 srtt_ns=276691 pto_ns=1276691 spurious_losses=0 persistent_collapses=0 consumed=7097 mtu=65496
+   r6   fleet_session 14797426014043643386: lent=false cwnd=130934 srtt_ns=384817 pto_ns=1384817 spurious_losses=0 persistent_collapses=0 consumed=6359 mtu=65496
+   r6   shard 0 refused fleet.live.held: 2
+   r6   shard 0 refused fleet.live.install_taken: 2
+   r6   shard 0 refused fleet.plane.announce_lends: 4
+   r6   shard 0 refused fleet.plane.announcements_sent: 4
+   r6   shard 0 refused fleet.seal.pair_refused: 1500
+   r6   shard 0 refused fleet.seal.pair_served: 1500
+   r6   shard 0 live held cd5b048f45321dfa000100000000002c head=246 durable=none owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=none moving_to=none recorded=none
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 14797426014043643386
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 0
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 13067129948251173238
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 4445497432929040180: lent=false cwnd=130934 srtt_ns=552221 pto_ns=2592793 spurious_losses=0 persistent_collapses=0 consumed=15875 mtu=65496
+   r6   fleet_session 11256220468804880425: lent=false cwnd=130934 srtt_ns=386854 pto_ns=1386854 spurious_losses=0 persistent_collapses=0 consumed=2030 mtu=65496
+   r6   shard 0 refused fleet.live.link_lost: 1
+   r6   shard 0 refused fleet.live.no_session: 395
+   r6   shard 0 refused fleet.live.unanswered: 395
+   r6   shard 0 refused fleet.plane.address_unresolved: 20
+   r6   shard 0 refused fleet.plane.announce_lends: 5
+   r6   shard 0 refused fleet.plane.announcements_sent: 5
+   r6   shard 0 refused fleet.report.sent: 4
+   r6   shard 0 refused fleet.seal.pair_served: 6
+   r6   shard 0 refused fleet.seal.pair_unanswered: 752
+   r6   shard 0 refused fleet.seal.pair_undelivered: 752
+   r6   shard 0 refused fleet.ship.catalog.placed: 2
+   r6   shard 0 refused fleet.ship.catalog.short: 1
+   r6   shard 0 refused fleet.ship.head.no_session: 20
+   r6   shard 0 refused fleet.ship.head.placed: 1
+   r6   shard 0 refused fleet.ship.head.short: 1
+   r6   shard 0 refused fleet.takeover.page_unbound: 2
+   r6   shard 0 refused fleet.takeover.page_unmatched: 6
+   r6   shard 0 refused fleet.takeover.stale_configuration: 2
+   r6   shard 1 refused fleet.live.appended: 247
+   r6   shard 1 refused fleet.live.awaited: 246
+   r6   shard 1 refused fleet.live.durable: 247
+   r6   shard 1 refused fleet.live.held_back.keys: 397
+   r6   shard 1 refused fleet.live.held_back.placement: 1
+   r6   shard 1 refused fleet.live.holders_recorded: 1
+   r6   shard 1 refused fleet.live.holders_short: 376
+   r6   shard 1 refused fleet.live.holders_transition: 1
+   r6   shard 1 refused fleet.live.install_built: 396
+   r6   shard 1 refused fleet.live.install_image: 2
+   r6   shard 1 refused fleet.live.resolved: 245
+   r6   shard 1 refused fleet.live.whole: 1
+   r6   shard 1 live shipping cd5b048f45321dfa000100000000002c head=246 durable=246 owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=3111016118077640161,4445497432929040180 moving_to=3111016118077640161,4445497432929040180,11256220468804880425 recorded=3111016118077640161,4445497432929040180
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 4445497432929040180
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 2
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 6293766800284190770
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 11256220468804880425: lent=false cwnd=130934 srtt_ns=599205 pto_ns=2002921 spurious_losses=0 persistent_collapses=0 consumed=39508 mtu=65496
+   r6   fleet_session 14797426014043643386: lent=false cwnd=130934 srtt_ns=365529 pto_ns=1365529 spurious_losses=0 persistent_collapses=0 consumed=42657 mtu=65496
+   r6   shard 0 refused fleet.live.held: 247
+   r6   shard 0 refused fleet.plane.address_unresolved: 18
+   r6   shard 0 refused fleet.plane.announce_lends: 5
+   r6   shard 0 refused fleet.plane.announcements_sent: 5
+   r6   shard 0 refused fleet.report.sent: 3
+   r6   shard 0 refused fleet.seal.pair_served: 6
+   r6   shard 0 refused fleet.seal.pair_unanswered: 748
+   r6   shard 0 refused fleet.seal.pair_undelivered: 748
+   r6   shard 0 refused fleet.takeover.page_unbound: 6
+   r6   shard 0 refused fleet.takeover.page_unmatched: 2
+   r6   shard 0 live held cd5b048f45321dfa000100000000002c head=246 durable=none owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=none moving_to=none recorded=none
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 11256220468804880425
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 2
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 17162750946507683197
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 4445497432929040180: lent=false cwnd=130934 srtt_ns=136202 pto_ns=1136202 spurious_losses=0 persistent_collapses=0 consumed=7537 mtu=65496
+   r6   fleet_session 14797426014043643386: lent=false cwnd=130934 srtt_ns=121235 pto_ns=1121235 spurious_losses=0 persistent_collapses=0 consumed=6799 mtu=65496
+   r6   shard 0 refused fleet.live.held: 2
+   r6   shard 0 refused fleet.live.install_taken: 2
+   r6   shard 0 refused fleet.plane.announce_lends: 4
+   r6   shard 0 refused fleet.plane.announcements_sent: 4
+   r6   shard 0 refused fleet.seal.pair_refused: 3060
+   r6   shard 0 refused fleet.seal.pair_served: 3060
+   r6   shard 0 live held cd5b048f45321dfa000100000000002c head=246 durable=none owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=none moving_to=none recorded=none
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 14797426014043643386
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 0
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 13067129948251173238
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 4445497432929040180: lent=false cwnd=130934 srtt_ns=127871 pto_ns=1127871 spurious_losses=0 persistent_collapses=0 consumed=16315 mtu=65496
+   r6   fleet_session 11256220468804880425: lent=false cwnd=130934 srtt_ns=107184 pto_ns=1107184 spurious_losses=0 persistent_collapses=0 consumed=2460 mtu=65496
+   r6   shard 0 refused fleet.live.link_lost: 1
+   r6   shard 0 refused fleet.live.no_session: 785
+   r6   shard 0 refused fleet.live.unanswered: 785
+   r6   shard 0 refused fleet.plane.address_unresolved: 20
+   r6   shard 0 refused fleet.plane.announce_lends: 5
+   r6   shard 0 refused fleet.plane.announcements_sent: 5
+   r6   shard 0 refused fleet.report.sent: 4
+   r6   shard 0 refused fleet.seal.pair_served: 6
+   r6   shard 0 refused fleet.seal.pair_unanswered: 1532
+   r6   shard 0 refused fleet.seal.pair_undelivered: 1532
+   r6   shard 0 refused fleet.ship.catalog.placed: 2
+   r6   shard 0 refused fleet.ship.catalog.short: 1
+   r6   shard 0 refused fleet.ship.head.no_session: 20
+   r6   shard 0 refused fleet.ship.head.placed: 1
+   r6   shard 0 refused fleet.ship.head.short: 1
+   r6   shard 0 refused fleet.takeover.page_unbound: 2
+   r6   shard 0 refused fleet.takeover.page_unmatched: 6
+   r6   shard 0 refused fleet.takeover.stale_configuration: 2
+   r6   shard 1 refused fleet.live.appended: 247
+   r6   shard 1 refused fleet.live.awaited: 246
+   r6   shard 1 refused fleet.live.durable: 247
+   r6   shard 1 refused fleet.live.held_back.keys: 787
+   r6   shard 1 refused fleet.live.held_back.placement: 1
+   r6   shard 1 refused fleet.live.holders_recorded: 1
+   r6   shard 1 refused fleet.live.holders_short: 766
+   r6   shard 1 refused fleet.live.holders_transition: 1
+   r6   shard 1 refused fleet.live.install_built: 786
+   r6   shard 1 refused fleet.live.install_image: 2
+   r6   shard 1 refused fleet.live.resolved: 245
+   r6   shard 1 refused fleet.live.whole: 1
+   r6   shard 1 live shipping cd5b048f45321dfa000100000000002c head=246 durable=246 owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=3111016118077640161,4445497432929040180 moving_to=3111016118077640161,4445497432929040180,11256220468804880425 recorded=3111016118077640161,4445497432929040180
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 4445497432929040180
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 4445497432929040180 11256220468804880425 14797426014043643386
+   r6   fleet_peers_probed: 2
+   r6   fleet_held_records: 2
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 10
+   r6   anchor: 6293766800284190770
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_peers_in_contact: 2
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 11256220468804880425: lent=false cwnd=130934 srtt_ns=117375 pto_ns=1117375 spurious_losses=0 persistent_collapses=0 consumed=79738 mtu=65496
+   r6   fleet_session 14797426014043643386: lent=false cwnd=130934 srtt_ns=119153 pto_ns=1119153 spurious_losses=0 persistent_collapses=0 consumed=82877 mtu=65496
+   r6   shard 0 refused fleet.live.held: 247
+   r6   shard 0 refused fleet.plane.address_unresolved: 18
+   r6   shard 0 refused fleet.plane.announce_lends: 5
+   r6   shard 0 refused fleet.plane.announcements_sent: 5
+   r6   shard 0 refused fleet.report.sent: 3
+   r6   shard 0 refused fleet.seal.pair_served: 6
+   r6   shard 0 refused fleet.seal.pair_unanswered: 1528
+   r6   shard 0 refused fleet.seal.pair_undelivered: 1528
+   r6   shard 0 refused fleet.takeover.page_unbound: 6
+   r6   shard 0 refused fleet.takeover.page_unmatched: 2
+   r6   shard 0 live held cd5b048f45321dfa000100000000002c head=246 durable=none owed=false epoch=1 identity=352f9cf25d4123f4aa134f416c0299419350383a26ccdf04c80f7d54931b92ba fence=1 holders=none moving_to=none recorded=none
+   r6     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r6 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 82.67s
+== run 6 exit 101
+   r7     Finished `release` profile [optimized] target(s) in 0.08s
+   r7      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r7 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-46889 destroyed at 221.394097ms
+   r7 chaos a candidate's store destroyed mid-stream: replacement answering at 357.234258ms
+   r7 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.53796657s
+   r7 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (46890) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 18179439152833718615
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 2
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 11254316977608475085
+   r7   fleet_settled_generation: 5
+   r7   fleet_neighbourhood_generation: 5
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 3840220245794034479: lent=false cwnd=130934 srtt_ns=614305 pto_ns=3191761 spurious_losses=0 persistent_collapses=0 consumed=8704 mtu=65496
+   r7   fleet_session 4144767931106419876: lent=false cwnd=130934 srtt_ns=538463 pto_ns=2405791 spurious_losses=0 persistent_collapses=0 consumed=5856 mtu=65496
+   r7   shard 0 refused fleet.live.held: 17
+   r7   shard 0 refused fleet.live.hold_refused: 8
+   r7   shard 0 refused fleet.live.hold_refused.not_a_member: 8
+   r7   shard 0 refused fleet.live.install_taken: 1
+   r7   shard 0 refused fleet.plane.announce_lends: 4
+   r7   shard 0 refused fleet.plane.announcements_sent: 4
+   r7   shard 0 refused fleet.record.refused.configuration_stale: 1
+   r7   shard 0 refused fleet.seal.pair_refused: 1573
+   r7   shard 0 refused fleet.seal.pair_served: 1573
+   r7   shard 0 live held 39852c79320764a40001000000000024 head=165 durable=none owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=none moving_to=none recorded=none
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 3840220245794034479
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 2
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 13309295401866011444
+   r7   fleet_settled_generation: 5
+   r7   fleet_neighbourhood_generation: 5
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 4144767931106419876: lent=false cwnd=130934 srtt_ns=524093 pto_ns=1605409 spurious_losses=0 persistent_collapses=0 consumed=44028 mtu=65496
+   r7   fleet_session 18179439152833718615: lent=false cwnd=130934 srtt_ns=415918 pto_ns=1660486 spurious_losses=0 persistent_collapses=0 consumed=40762 mtu=65496
+   r7   shard 0 refused fleet.link.peer_reset: 1
+   r7   shard 0 refused fleet.live.held: 166
+   r7   shard 0 refused fleet.plane.address_unresolved: 2
+   r7   shard 0 refused fleet.plane.announce_lends: 6
+   r7   shard 0 refused fleet.plane.announcements_sent: 6
+   r7   shard 0 refused fleet.report.sent: 3
+   r7   shard 0 refused fleet.seal.pair_no_session: 4
+   r7   shard 0 refused fleet.seal.pair_served: 6
+   r7   shard 0 refused fleet.seal.pair_unanswered: 782
+   r7   shard 0 refused fleet.seal.pair_undelivered: 786
+   r7   shard 0 refused fleet.takeover.page_unbound: 5
+   r7   shard 0 refused fleet.takeover.page_unmatched: 1
+   r7   shard 0 live held 39852c79320764a40001000000000024 head=165 durable=none owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=none moving_to=none recorded=none
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 4144767931106419876
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 0
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 11885473825091917314
+   r7   fleet_settled_generation: 8
+   r7   fleet_neighbourhood_generation: 8
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 3840220245794034479: lent=false cwnd=130934 srtt_ns=471581 pto_ns=1703821 spurious_losses=0 persistent_collapses=0 consumed=13219 mtu=65496
+   r7   fleet_session 18179439152833718615: lent=false cwnd=130934 srtt_ns=567731 pto_ns=1579923 spurious_losses=0 persistent_collapses=0 consumed=2764 mtu=65496
+   r7   shard 0 refused fleet.live.link_lost: 2
+   r7   shard 0 refused fleet.live.no_session: 398
+   r7   shard 0 refused fleet.live.unanswered: 399
+   r7   shard 0 refused fleet.plane.address_unresolved: 13
+   r7   shard 0 refused fleet.plane.announce_lends: 5
+   r7   shard 0 refused fleet.plane.announcements_sent: 5
+   r7   shard 0 refused fleet.report.sent: 7
+   r7   shard 0 refused fleet.seal.pair_no_session: 1
+   r7   shard 0 refused fleet.seal.pair_served: 6
+   r7   shard 0 refused fleet.seal.pair_unanswered: 793
+   r7   shard 0 refused fleet.seal.pair_undelivered: 794
+   r7   shard 0 refused fleet.ship.catalog.placed: 2
+   r7   shard 0 refused fleet.ship.catalog.short: 2
+   r7   shard 0 refused fleet.ship.head.no_session: 4
+   r7   shard 0 refused fleet.ship.head.placed: 2
+   r7   shard 0 refused fleet.takeover.page_unbound: 1
+   r7   shard 0 refused fleet.takeover.page_unmatched: 5
+   r7   shard 0 refused fleet.takeover.stale_configuration: 1
+   r7   shard 1 refused fleet.live.appended: 166
+   r7   shard 1 refused fleet.live.awaited: 164
+   r7   shard 1 refused fleet.live.durable: 166
+   r7   shard 1 refused fleet.live.held_back.keys: 402
+   r7   shard 1 refused fleet.live.held_back.placement: 3
+   r7   shard 1 refused fleet.live.holders_recorded: 1
+   r7   shard 1 refused fleet.live.holders_short: 399
+   r7   shard 1 refused fleet.live.holders_transition: 1
+   r7   shard 1 refused fleet.live.install_built: 407
+   r7   shard 1 refused fleet.live.install_image: 1
+   r7   shard 1 refused fleet.live.resolved: 163
+   r7   shard 1 refused fleet.live.whole: 1
+   r7   shard 1 live shipping 39852c79320764a40001000000000024 head=165 durable=165 owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=3840220245794034479,12186326081804241724 moving_to=3840220245794034479,12186326081804241724,18179439152833718615 recorded=3840220245794034479,12186326081804241724
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 18179439152833718615
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 2
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 11254316977608475085
+   r7   fleet_settled_generation: 5
+   r7   fleet_neighbourhood_generation: 5
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 3840220245794034479: lent=false cwnd=130934 srtt_ns=109628 pto_ns=1109628 spurious_losses=0 persistent_collapses=0 consumed=9144 mtu=65496
+   r7   fleet_session 4144767931106419876: lent=false cwnd=130934 srtt_ns=109060 pto_ns=1109060 spurious_losses=0 persistent_collapses=0 consumed=6296 mtu=65496
+   r7   shard 0 refused fleet.live.held: 17
+   r7   shard 0 refused fleet.live.hold_refused: 8
+   r7   shard 0 refused fleet.live.hold_refused.not_a_member: 8
+   r7   shard 0 refused fleet.live.install_taken: 1
+   r7   shard 0 refused fleet.plane.announce_lends: 4
+   r7   shard 0 refused fleet.plane.announcements_sent: 4
+   r7   shard 0 refused fleet.record.refused.configuration_stale: 1
+   r7   shard 0 refused fleet.seal.pair_refused: 3135
+   r7   shard 0 refused fleet.seal.pair_served: 3135
+   r7   shard 0 live held 39852c79320764a40001000000000024 head=165 durable=none owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=none moving_to=none recorded=none
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 3840220245794034479
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 2
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 13309295401866011444
+   r7   fleet_settled_generation: 5
+   r7   fleet_neighbourhood_generation: 5
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 4144767931106419876: lent=false cwnd=130934 srtt_ns=117052 pto_ns=1117052 spurious_losses=0 persistent_collapses=0 consumed=84258 mtu=65496
+   r7   fleet_session 18179439152833718615: lent=false cwnd=130934 srtt_ns=92691 pto_ns=1092691 spurious_losses=0 persistent_collapses=0 consumed=80972 mtu=65496
+   r7   shard 0 refused fleet.link.peer_reset: 1
+   r7   shard 0 refused fleet.live.held: 166
+   r7   shard 0 refused fleet.plane.address_unresolved: 2
+   r7   shard 0 refused fleet.plane.announce_lends: 6
+   r7   shard 0 refused fleet.plane.announcements_sent: 6
+   r7   shard 0 refused fleet.report.sent: 3
+   r7   shard 0 refused fleet.seal.pair_no_session: 4
+   r7   shard 0 refused fleet.seal.pair_served: 6
+   r7   shard 0 refused fleet.seal.pair_unanswered: 1562
+   r7   shard 0 refused fleet.seal.pair_undelivered: 1566
+   r7   shard 0 refused fleet.takeover.page_unbound: 5
+   r7   shard 0 refused fleet.takeover.page_unmatched: 1
+   r7   shard 0 live held 39852c79320764a40001000000000024 head=165 durable=none owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=none moving_to=none recorded=none
+   r7   anchor_hold_refusals: 0
+   r7   anchor_log_lines_refused: 0
+   r7   fleet_host: 4144767931106419876
+   r7   fleet_host_epoch: 1
+   r7   fleet_members: 3840220245794034479 4144767931106419876 18179439152833718615
+   r7   fleet_peers_probed: 2
+   r7   fleet_held_records: 0
+   r7   fleet_takeovers_pending: 0
+   r7   fleet_configuration_version: 11
+   r7   anchor: 11885473825091917314
+   r7   fleet_settled_generation: 8
+   r7   fleet_neighbourhood_generation: 8
+   r7   fleet_peers_in_contact: 2
+   r7   fleet_peers_unmeshed: 0
+   r7   fleet_session 3840220245794034479: lent=false cwnd=130934 srtt_ns=106729 pto_ns=1106729 spurious_losses=0 persistent_collapses=0 consumed=13659 mtu=65496
+   r7   fleet_session 18179439152833718615: lent=false cwnd=130934 srtt_ns=101910 pto_ns=1101910 spurious_losses=0 persistent_collapses=0 consumed=3204 mtu=65496
+   r7   shard 0 refused fleet.live.link_lost: 2
+   r7   shard 0 refused fleet.live.no_session: 788
+   r7   shard 0 refused fleet.live.unanswered: 789
+   r7   shard 0 refused fleet.plane.address_unresolved: 13
+   r7   shard 0 refused fleet.plane.announce_lends: 5
+   r7   shard 0 refused fleet.plane.announcements_sent: 5
+   r7   shard 0 refused fleet.report.sent: 7
+   r7   shard 0 refused fleet.seal.pair_no_session: 1
+   r7   shard 0 refused fleet.seal.pair_served: 6
+   r7   shard 0 refused fleet.seal.pair_unanswered: 1573
+   r7   shard 0 refused fleet.seal.pair_undelivered: 1574
+   r7   shard 0 refused fleet.ship.catalog.placed: 2
+   r7   shard 0 refused fleet.ship.catalog.short: 2
+   r7   shard 0 refused fleet.ship.head.no_session: 4
+   r7   shard 0 refused fleet.ship.head.placed: 2
+   r7   shard 0 refused fleet.takeover.page_unbound: 1
+   r7   shard 0 refused fleet.takeover.page_unmatched: 5
+   r7   shard 0 refused fleet.takeover.stale_configuration: 1
+   r7   shard 1 refused fleet.live.appended: 166
+   r7   shard 1 refused fleet.live.awaited: 164
+   r7   shard 1 refused fleet.live.durable: 166
+   r7   shard 1 refused fleet.live.held_back.keys: 792
+   r7   shard 1 refused fleet.live.held_back.placement: 3
+   r7   shard 1 refused fleet.live.holders_recorded: 1
+   r7   shard 1 refused fleet.live.holders_short: 789
+   r7   shard 1 refused fleet.live.holders_transition: 1
+   r7   shard 1 refused fleet.live.install_built: 797
+   r7   shard 1 refused fleet.live.install_image: 1
+   r7   shard 1 refused fleet.live.resolved: 163
+   r7   shard 1 refused fleet.live.whole: 1
+   r7   shard 1 live shipping 39852c79320764a40001000000000024 head=165 durable=165 owed=false epoch=1 identity=6d2e020f1f069eab189ee1bec3b2fb25b0fe804034745e8714630c95c82f0b55 fence=1 holders=3840220245794034479,12186326081804241724 moving_to=3840220245794034479,12186326081804241724,18179439152833718615 recorded=3840220245794034479,12186326081804241724
+   r7     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r7 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.63s
+== run 7 exit 101
+   r8     Finished `release` profile [optimized] target(s) in 0.09s
+   r8      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r8 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-53533 destroyed at 239.615339ms
+   r8 chaos a candidate's store destroyed mid-stream: replacement answering at 387.704519ms
+   r8 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.506416922s
+   r8 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (53534) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 2168197548289083928
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 2
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 7295523311051000067
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 4378284799115154601: lent=false cwnd=130934 srtt_ns=189258 pto_ns=1189258 spurious_losses=0 persistent_collapses=0 consumed=8732 mtu=65496
+   r8   fleet_session 11546438318935166882: lent=false cwnd=130934 srtt_ns=208689 pto_ns=1208689 spurious_losses=0 persistent_collapses=0 consumed=6566 mtu=65496
+   r8   shard 0 refused fleet.live.held: 2
+   r8   shard 0 refused fleet.live.install_taken: 1
+   r8   shard 0 refused fleet.plane.announce_lends: 4
+   r8   shard 0 refused fleet.plane.announcements_sent: 4
+   r8   shard 0 refused fleet.report.sent: 2
+   r8   shard 0 refused fleet.seal.pair_refused: 1575
+   r8   shard 0 refused fleet.seal.pair_served: 1575
+   r8   shard 0 live held a03d3079b516cfa20001000000000027 head=146 durable=none owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=none moving_to=none recorded=none
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 4378284799115154601
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 2
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 12518510728440182308
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 2168197548289083928: lent=false cwnd=130934 srtt_ns=146504 pto_ns=1146504 spurious_losses=0 persistent_collapses=0 consumed=41364 mtu=65496
+   r8   fleet_session 11546438318935166882: lent=false cwnd=130934 srtt_ns=276255 pto_ns=1276255 spurious_losses=0 persistent_collapses=0 consumed=44956 mtu=65496
+   r8   shard 0 refused fleet.link.peer_reset: 1
+   r8   shard 0 refused fleet.live.held: 108
+   r8   shard 0 refused fleet.live.install_taken: 1
+   r8   shard 0 refused fleet.plane.address_unresolved: 11
+   r8   shard 0 refused fleet.plane.announce_lends: 5
+   r8   shard 0 refused fleet.plane.announcements_sent: 5
+   r8   shard 0 refused fleet.report.sent: 3
+   r8   shard 0 refused fleet.seal.pair_served: 6
+   r8   shard 0 refused fleet.seal.pair_unanswered: 780
+   r8   shard 0 refused fleet.seal.pair_undelivered: 780
+   r8   shard 0 refused fleet.takeover.page_unbound: 7
+   r8   shard 0 refused fleet.takeover.page_unmatched: 3
+   r8   shard 0 live held a03d3079b516cfa20001000000000027 head=146 durable=none owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=none moving_to=none recorded=none
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 11546438318935166882
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 0
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 3464624715296462459
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 2168197548289083928: lent=false cwnd=130934 srtt_ns=166712 pto_ns=1166712 spurious_losses=0 persistent_collapses=0 consumed=2040 mtu=65496
+   r8   fleet_session 4378284799115154601: lent=false cwnd=130934 srtt_ns=196569 pto_ns=1196569 spurious_losses=0 persistent_collapses=0 consumed=10882 mtu=65496
+   r8   shard 0 refused fleet.live.link_lost: 1
+   r8   shard 0 refused fleet.live.no_session: 403
+   r8   shard 0 refused fleet.live.unanswered: 401
+   r8   shard 0 refused fleet.plane.address_unresolved: 14
+   r8   shard 0 refused fleet.plane.announce_lends: 5
+   r8   shard 0 refused fleet.plane.announcements_sent: 5
+   r8   shard 0 refused fleet.report.sent: 8
+   r8   shard 0 refused fleet.seal.pair_no_session: 1
+   r8   shard 0 refused fleet.seal.pair_served: 6
+   r8   shard 0 refused fleet.seal.pair_unanswered: 795
+   r8   shard 0 refused fleet.seal.pair_undelivered: 796
+   r8   shard 0 refused fleet.ship.catalog.placed: 2
+   r8   shard 0 refused fleet.ship.catalog.short: 1
+   r8   shard 0 refused fleet.ship.head.no_session: 1
+   r8   shard 0 refused fleet.ship.head.placed: 2
+   r8   shard 0 refused fleet.ship.head.short: 1
+   r8   shard 0 refused fleet.takeover.page_unbound: 3
+   r8   shard 0 refused fleet.takeover.page_unmatched: 7
+   r8   shard 0 refused fleet.takeover.stale_configuration: 3
+   r8   shard 1 refused fleet.live.appended: 147
+   r8   shard 1 refused fleet.live.awaited: 146
+   r8   shard 1 refused fleet.live.durable: 147
+   r8   shard 1 refused fleet.live.held_back.keys: 404
+   r8   shard 1 refused fleet.live.held_back.placement: 2
+   r8   shard 1 refused fleet.live.holders_recorded: 1
+   r8   shard 1 refused fleet.live.holders_short: 399
+   r8   shard 1 refused fleet.live.holders_transition: 1
+   r8   shard 1 refused fleet.live.install_built: 402
+   r8   shard 1 refused fleet.live.install_image: 2
+   r8   shard 1 refused fleet.live.resolved: 145
+   r8   shard 1 refused fleet.live.whole: 1
+   r8   shard 1 live shipping a03d3079b516cfa20001000000000027 head=146 durable=146 owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=4378284799115154601,17815836004748186256 moving_to=2168197548289083928,4378284799115154601,17815836004748186256 recorded=4378284799115154601,17815836004748186256
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 2168197548289083928
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 2
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 7295523311051000067
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 4378284799115154601: lent=false cwnd=130934 srtt_ns=118399 pto_ns=1118399 spurious_losses=0 persistent_collapses=0 consumed=9172 mtu=65496
+   r8   fleet_session 11546438318935166882: lent=false cwnd=130934 srtt_ns=118077 pto_ns=1118077 spurious_losses=0 persistent_collapses=0 consumed=7006 mtu=65496
+   r8   shard 0 refused fleet.live.held: 2
+   r8   shard 0 refused fleet.live.install_taken: 1
+   r8   shard 0 refused fleet.plane.announce_lends: 4
+   r8   shard 0 refused fleet.plane.announcements_sent: 4
+   r8   shard 0 refused fleet.report.sent: 2
+   r8   shard 0 refused fleet.seal.pair_refused: 3135
+   r8   shard 0 refused fleet.seal.pair_served: 3135
+   r8   shard 0 live held a03d3079b516cfa20001000000000027 head=146 durable=none owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=none moving_to=none recorded=none
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 4378284799115154601
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 2
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 12518510728440182308
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 2168197548289083928: lent=false cwnd=130934 srtt_ns=102803 pto_ns=1102803 spurious_losses=0 persistent_collapses=0 consumed=81574 mtu=65496
+   r8   fleet_session 11546438318935166882: lent=false cwnd=130934 srtt_ns=134060 pto_ns=1134060 spurious_losses=0 persistent_collapses=0 consumed=85176 mtu=65496
+   r8   shard 0 refused fleet.link.peer_reset: 1
+   r8   shard 0 refused fleet.live.held: 108
+   r8   shard 0 refused fleet.live.install_taken: 1
+   r8   shard 0 refused fleet.plane.address_unresolved: 11
+   r8   shard 0 refused fleet.plane.announce_lends: 5
+   r8   shard 0 refused fleet.plane.announcements_sent: 5
+   r8   shard 0 refused fleet.report.sent: 3
+   r8   shard 0 refused fleet.seal.pair_served: 6
+   r8   shard 0 refused fleet.seal.pair_unanswered: 1560
+   r8   shard 0 refused fleet.seal.pair_undelivered: 1560
+   r8   shard 0 refused fleet.takeover.page_unbound: 7
+   r8   shard 0 refused fleet.takeover.page_unmatched: 3
+   r8   shard 0 live held a03d3079b516cfa20001000000000027 head=146 durable=none owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=none moving_to=none recorded=none
+   r8   anchor_hold_refusals: 0
+   r8   anchor_log_lines_refused: 0
+   r8   fleet_host: 11546438318935166882
+   r8   fleet_host_epoch: 1
+   r8   fleet_members: 2168197548289083928 4378284799115154601 11546438318935166882
+   r8   fleet_peers_probed: 2
+   r8   fleet_held_records: 0
+   r8   fleet_takeovers_pending: 0
+   r8   fleet_configuration_version: 12
+   r8   anchor: 3464624715296462459
+   r8   fleet_settled_generation: 7
+   r8   fleet_neighbourhood_generation: 7
+   r8   fleet_peers_in_contact: 2
+   r8   fleet_peers_unmeshed: 0
+   r8   fleet_session 2168197548289083928: lent=false cwnd=130934 srtt_ns=107217 pto_ns=1107217 spurious_losses=0 persistent_collapses=0 consumed=2470 mtu=65496
+   r8   fleet_session 4378284799115154601: lent=false cwnd=130934 srtt_ns=123497 pto_ns=1123497 spurious_losses=0 persistent_collapses=0 consumed=11322 mtu=65496
+   r8   shard 0 refused fleet.live.link_lost: 1
+   r8   shard 0 refused fleet.live.no_session: 793
+   r8   shard 0 refused fleet.live.unanswered: 791
+   r8   shard 0 refused fleet.plane.address_unresolved: 14
+   r8   shard 0 refused fleet.plane.announce_lends: 5
+   r8   shard 0 refused fleet.plane.announcements_sent: 5
+   r8   shard 0 refused fleet.report.sent: 8
+   r8   shard 0 refused fleet.seal.pair_no_session: 1
+   r8   shard 0 refused fleet.seal.pair_served: 6
+   r8   shard 0 refused fleet.seal.pair_unanswered: 1575
+   r8   shard 0 refused fleet.seal.pair_undelivered: 1576
+   r8   shard 0 refused fleet.ship.catalog.placed: 2
+   r8   shard 0 refused fleet.ship.catalog.short: 1
+   r8   shard 0 refused fleet.ship.head.no_session: 1
+   r8   shard 0 refused fleet.ship.head.placed: 2
+   r8   shard 0 refused fleet.ship.head.short: 1
+   r8   shard 0 refused fleet.takeover.page_unbound: 3
+   r8   shard 0 refused fleet.takeover.page_unmatched: 7
+   r8   shard 0 refused fleet.takeover.stale_configuration: 3
+   r8   shard 1 refused fleet.live.appended: 147
+   r8   shard 1 refused fleet.live.awaited: 146
+   r8   shard 1 refused fleet.live.durable: 147
+   r8   shard 1 refused fleet.live.held_back.keys: 794
+   r8   shard 1 refused fleet.live.held_back.placement: 2
+   r8   shard 1 refused fleet.live.holders_recorded: 1
+   r8   shard 1 refused fleet.live.holders_short: 789
+   r8   shard 1 refused fleet.live.holders_transition: 1
+   r8   shard 1 refused fleet.live.install_built: 792
+   r8   shard 1 refused fleet.live.install_image: 2
+   r8   shard 1 refused fleet.live.resolved: 145
+   r8   shard 1 refused fleet.live.whole: 1
+   r8   shard 1 live shipping a03d3079b516cfa20001000000000027 head=146 durable=146 owed=false epoch=1 identity=bf7847422626080247ba773a411c933044ac607a07e791b03bbdf3031ff84d99 fence=1 holders=4378284799115154601,17815836004748186256 moving_to=2168197548289083928,4378284799115154601,17815836004748186256 recorded=4378284799115154601,17815836004748186256
+   r8     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r8 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.62s
+== run 8 exit 101
+   r9     Finished `release` profile [optimized] target(s) in 0.09s
+   r9      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r9 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-61066 destroyed at 184.040717ms
+   r9 chaos a candidate's store destroyed mid-stream: replacement answering at 443.831537ms
+   r9 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.63351234s
+   r9 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (61067) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 2086334623263703477
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 0
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 13184501321319685874
+   r9   fleet_settled_generation: 8
+   r9   fleet_neighbourhood_generation: 8
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 1645881289055181647: lent=false cwnd=130934 srtt_ns=206427 pto_ns=1206427 spurious_losses=0 persistent_collapses=0 consumed=12630 mtu=65496
+   r9   fleet_session 18352635799080267238: lent=false cwnd=130934 srtt_ns=154924 pto_ns=1154924 spurious_losses=0 persistent_collapses=0 consumed=2138 mtu=65496
+   r9   shard 0 refused fleet.live.link_lost: 1
+   r9   shard 0 refused fleet.live.no_session: 401
+   r9   shard 0 refused fleet.live.unanswered: 401
+   r9   shard 0 refused fleet.plane.address_unresolved: 14
+   r9   shard 0 refused fleet.plane.announce_lends: 5
+   r9   shard 0 refused fleet.plane.announcements_sent: 5
+   r9   shard 0 refused fleet.report.sent: 7
+   r9   shard 0 refused fleet.seal.pair_served: 6
+   r9   shard 0 refused fleet.seal.pair_unanswered: 796
+   r9   shard 0 refused fleet.seal.pair_undelivered: 796
+   r9   shard 0 refused fleet.ship.catalog.placed: 2
+   r9   shard 0 refused fleet.ship.catalog.short: 1
+   r9   shard 0 refused fleet.ship.head.no_session: 1
+   r9   shard 0 refused fleet.ship.head.placed: 2
+   r9   shard 0 refused fleet.ship.head.short: 1
+   r9   shard 0 refused fleet.takeover.page_unbound: 2
+   r9   shard 0 refused fleet.takeover.page_unmatched: 6
+   r9   shard 0 refused fleet.takeover.stale_configuration: 2
+   r9   shard 1 refused fleet.live.appended: 211
+   r9   shard 1 refused fleet.live.awaited: 209
+   r9   shard 1 refused fleet.live.durable: 211
+   r9   shard 1 refused fleet.live.held_back.keys: 406
+   r9   shard 1 refused fleet.live.held_back.placement: 2
+   r9   shard 1 refused fleet.live.holders_recorded: 1
+   r9   shard 1 refused fleet.live.holders_short: 400
+   r9   shard 1 refused fleet.live.holders_transition: 1
+   r9   shard 1 refused fleet.live.install_built: 403
+   r9   shard 1 refused fleet.live.install_image: 2
+   r9   shard 1 refused fleet.live.resolved: 208
+   r9   shard 1 refused fleet.live.whole: 1
+   r9   shard 1 live shipping 1cf42649363b41b5000100000000004b head=210 durable=210 owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=1645881289055181647,2420049622467767084 moving_to=1645881289055181647,2420049622467767084,18352635799080267238 recorded=1645881289055181647,2420049622467767084
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 18352635799080267238
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 2
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 108241790311382278
+   r9   fleet_settled_generation: 8
+   r9   fleet_neighbourhood_generation: 8
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 1645881289055181647: lent=false cwnd=130934 srtt_ns=196535 pto_ns=1196535 spurious_losses=0 persistent_collapses=0 consumed=10133 mtu=65496
+   r9   fleet_session 2086334623263703477: lent=false cwnd=130934 srtt_ns=414273 pto_ns=2236745 spurious_losses=0 persistent_collapses=0 consumed=5663 mtu=65496
+   r9   shard 0 refused fleet.live.held: 4
+   r9   shard 0 refused fleet.live.install_taken: 2
+   r9   shard 0 refused fleet.plane.announce_lends: 4
+   r9   shard 0 refused fleet.plane.announcements_sent: 4
+   r9   shard 0 refused fleet.report.sent: 1
+   r9   shard 0 refused fleet.seal.pair_refused: 1593
+   r9   shard 0 refused fleet.seal.pair_served: 1593
+   r9   shard 0 live held 1cf42649363b41b5000100000000004b head=210 durable=none owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=none moving_to=none recorded=none
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 1645881289055181647
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 2
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 8508505437717764524
+   r9   fleet_settled_generation: 5
+   r9   fleet_neighbourhood_generation: 5
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 2086334623263703477: lent=false cwnd=130934 srtt_ns=162271 pto_ns=1162271 spurious_losses=0 persistent_collapses=0 consumed=44956 mtu=65496
+   r9   fleet_session 18352635799080267238: lent=false cwnd=130934 srtt_ns=262346 pto_ns=1399442 spurious_losses=0 persistent_collapses=0 consumed=41068 mtu=65496
+   r9   shard 0 refused fleet.link.peer_reset: 1
+   r9   shard 0 refused fleet.live.held: 154
+   r9   shard 0 refused fleet.live.install_taken: 1
+   r9   shard 0 refused fleet.plane.address_unresolved: 2
+   r9   shard 0 refused fleet.plane.announce_lends: 5
+   r9   shard 0 refused fleet.plane.announcements_sent: 5
+   r9   shard 0 refused fleet.report.sent: 3
+   r9   shard 0 refused fleet.seal.pair_no_session: 1
+   r9   shard 0 refused fleet.seal.pair_served: 6
+   r9   shard 0 refused fleet.seal.pair_unanswered: 797
+   r9   shard 0 refused fleet.seal.pair_undelivered: 798
+   r9   shard 0 refused fleet.takeover.page_unbound: 6
+   r9   shard 0 refused fleet.takeover.page_unmatched: 2
+   r9   shard 0 live held 1cf42649363b41b5000100000000004b head=210 durable=none owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=none moving_to=none recorded=none
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 2086334623263703477
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 0
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 13184501321319685874
+   r9   fleet_settled_generation: 8
+   r9   fleet_neighbourhood_generation: 8
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 1645881289055181647: lent=false cwnd=130934 srtt_ns=116502 pto_ns=1116502 spurious_losses=0 persistent_collapses=0 consumed=13080 mtu=65496
+   r9   fleet_session 18352635799080267238: lent=false cwnd=130934 srtt_ns=111539 pto_ns=1111539 spurious_losses=0 persistent_collapses=0 consumed=2578 mtu=65496
+   r9   shard 0 refused fleet.live.link_lost: 1
+   r9   shard 0 refused fleet.live.no_session: 792
+   r9   shard 0 refused fleet.live.unanswered: 792
+   r9   shard 0 refused fleet.plane.address_unresolved: 14
+   r9   shard 0 refused fleet.plane.announce_lends: 5
+   r9   shard 0 refused fleet.plane.announcements_sent: 5
+   r9   shard 0 refused fleet.report.sent: 7
+   r9   shard 0 refused fleet.seal.pair_served: 6
+   r9   shard 0 refused fleet.seal.pair_unanswered: 1578
+   r9   shard 0 refused fleet.seal.pair_undelivered: 1578
+   r9   shard 0 refused fleet.ship.catalog.placed: 2
+   r9   shard 0 refused fleet.ship.catalog.short: 1
+   r9   shard 0 refused fleet.ship.head.no_session: 1
+   r9   shard 0 refused fleet.ship.head.placed: 2
+   r9   shard 0 refused fleet.ship.head.short: 1
+   r9   shard 0 refused fleet.takeover.page_unbound: 2
+   r9   shard 0 refused fleet.takeover.page_unmatched: 6
+   r9   shard 0 refused fleet.takeover.stale_configuration: 2
+   r9   shard 1 refused fleet.live.appended: 211
+   r9   shard 1 refused fleet.live.awaited: 209
+   r9   shard 1 refused fleet.live.durable: 211
+   r9   shard 1 refused fleet.live.held_back.keys: 797
+   r9   shard 1 refused fleet.live.held_back.placement: 2
+   r9   shard 1 refused fleet.live.holders_recorded: 1
+   r9   shard 1 refused fleet.live.holders_short: 791
+   r9   shard 1 refused fleet.live.holders_transition: 1
+   r9   shard 1 refused fleet.live.install_built: 794
+   r9   shard 1 refused fleet.live.install_image: 2
+   r9   shard 1 refused fleet.live.resolved: 208
+   r9   shard 1 refused fleet.live.whole: 1
+   r9   shard 1 live shipping 1cf42649363b41b5000100000000004b head=210 durable=210 owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=1645881289055181647,2420049622467767084 moving_to=1645881289055181647,2420049622467767084,18352635799080267238 recorded=1645881289055181647,2420049622467767084
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 18352635799080267238
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 2
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 108241790311382278
+   r9   fleet_settled_generation: 8
+   r9   fleet_neighbourhood_generation: 8
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 1645881289055181647: lent=false cwnd=130934 srtt_ns=121448 pto_ns=1121448 spurious_losses=0 persistent_collapses=0 consumed=10573 mtu=65496
+   r9   fleet_session 2086334623263703477: lent=false cwnd=130934 srtt_ns=108318 pto_ns=1108318 spurious_losses=0 persistent_collapses=0 consumed=6103 mtu=65496
+   r9   shard 0 refused fleet.live.held: 4
+   r9   shard 0 refused fleet.live.install_taken: 2
+   r9   shard 0 refused fleet.plane.announce_lends: 4
+   r9   shard 0 refused fleet.plane.announcements_sent: 4
+   r9   shard 0 refused fleet.report.sent: 1
+   r9   shard 0 refused fleet.seal.pair_refused: 3154
+   r9   shard 0 refused fleet.seal.pair_served: 3154
+   r9   shard 0 live held 1cf42649363b41b5000100000000004b head=210 durable=none owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=none moving_to=none recorded=none
+   r9   anchor_hold_refusals: 0
+   r9   anchor_log_lines_refused: 0
+   r9   fleet_host: 1645881289055181647
+   r9   fleet_host_epoch: 1
+   r9   fleet_members: 1645881289055181647 2086334623263703477 18352635799080267238
+   r9   fleet_peers_probed: 2
+   r9   fleet_held_records: 2
+   r9   fleet_takeovers_pending: 0
+   r9   fleet_configuration_version: 12
+   r9   anchor: 8508505437717764524
+   r9   fleet_settled_generation: 5
+   r9   fleet_neighbourhood_generation: 5
+   r9   fleet_peers_in_contact: 2
+   r9   fleet_peers_unmeshed: 0
+   r9   fleet_session 2086334623263703477: lent=false cwnd=130934 srtt_ns=121955 pto_ns=1121955 spurious_losses=0 persistent_collapses=0 consumed=85084 mtu=65496
+   r9   fleet_session 18352635799080267238: lent=false cwnd=130934 srtt_ns=101790 pto_ns=1101790 spurious_losses=0 persistent_collapses=0 consumed=81288 mtu=65496
+   r9   shard 0 refused fleet.link.peer_reset: 1
+   r9   shard 0 refused fleet.live.held: 154
+   r9   shard 0 refused fleet.live.install_taken: 1
+   r9   shard 0 refused fleet.plane.address_unresolved: 2
+   r9   shard 0 refused fleet.plane.announce_lends: 5
+   r9   shard 0 refused fleet.plane.announcements_sent: 5
+   r9   shard 0 refused fleet.report.sent: 3
+   r9   shard 0 refused fleet.seal.pair_no_session: 2
+   r9   shard 0 refused fleet.seal.pair_served: 6
+   r9   shard 0 refused fleet.seal.pair_unanswered: 1576
+   r9   shard 0 refused fleet.seal.pair_undelivered: 1578
+   r9   shard 0 refused fleet.takeover.page_unbound: 6
+   r9   shard 0 refused fleet.takeover.page_unmatched: 2
+   r9   shard 0 live held 1cf42649363b41b5000100000000004b head=210 durable=none owed=false epoch=1 identity=5306169be6e4f88f2246702c73ae546c3a578fadbd5c17a630b509eae741a89e fence=1 holders=none moving_to=none recorded=none
+   r9     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r9 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 84.41s
+== run 9 exit 101
+   r10     Finished `release` profile [optimized] target(s) in 0.09s
+   r10      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r10 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-68843 destroyed at 266.602162ms
+   r10 chaos a candidate's store destroyed mid-stream: replacement answering at 571.009263ms
+   r10 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 985.038383ms
+   r10 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (68844) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 17564873023362396069
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 2
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 4965306528698932805
+   r10   fleet_settled_generation: 5
+   r10   fleet_neighbourhood_generation: 5
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14137337522775500577: lent=false cwnd=130934 srtt_ns=192670 pto_ns=1192670 spurious_losses=0 persistent_collapses=0 consumed=6359 mtu=65496
+   r10   fleet_session 14549885622817237814: lent=false cwnd=130934 srtt_ns=191355 pto_ns=1191355 spurious_losses=0 persistent_collapses=0 consumed=7097 mtu=65496
+   r10   shard 0 refused fleet.live.held: 2
+   r10   shard 0 refused fleet.live.install_taken: 2
+   r10   shard 0 refused fleet.plane.announce_lends: 4
+   r10   shard 0 refused fleet.plane.announcements_sent: 4
+   r10   shard 0 refused fleet.seal.pair_refused: 1524
+   r10   shard 0 refused fleet.seal.pair_served: 1524
+   r10   shard 0 live held c431e992fad5a7210001000000000028 head=177 durable=none owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=none moving_to=none recorded=none
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 14137337522775500577
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 0
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 17373125179485695345
+   r10   fleet_settled_generation: 5
+   r10   fleet_neighbourhood_generation: 5
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14549885622817237814: lent=false cwnd=130934 srtt_ns=190245 pto_ns=1190245 spurious_losses=0 persistent_collapses=0 consumed=9969 mtu=65496
+   r10   fleet_session 17564873023362396069: lent=false cwnd=130934 srtt_ns=183147 pto_ns=1183147 spurious_losses=0 persistent_collapses=0 consumed=2030 mtu=65496
+   r10   shard 0 refused fleet.live.link_lost: 1
+   r10   shard 0 refused fleet.live.no_session: 394
+   r10   shard 0 refused fleet.live.unanswered: 394
+   r10   shard 0 refused fleet.plane.address_unresolved: 15
+   r10   shard 0 refused fleet.plane.announce_lends: 5
+   r10   shard 0 refused fleet.plane.announcements_sent: 5
+   r10   shard 0 refused fleet.report.sent: 5
+   r10   shard 0 refused fleet.seal.pair_served: 6
+   r10   shard 0 refused fleet.seal.pair_unanswered: 761
+   r10   shard 0 refused fleet.seal.pair_undelivered: 761
+   r10   shard 0 refused fleet.ship.catalog.placed: 3
+   r10   shard 0 refused fleet.ship.catalog.short: 1
+   r10   shard 0 refused fleet.ship.head.no_session: 1
+   r10   shard 0 refused fleet.ship.head.placed: 2
+   r10   shard 0 refused fleet.ship.head.short: 1
+   r10   shard 0 refused fleet.takeover.page_unbound: 2
+   r10   shard 0 refused fleet.takeover.page_unmatched: 6
+   r10   shard 0 refused fleet.takeover.stale_configuration: 2
+   r10   shard 1 refused fleet.live.appended: 178
+   r10   shard 1 refused fleet.live.awaited: 177
+   r10   shard 1 refused fleet.live.durable: 178
+   r10   shard 1 refused fleet.live.held_back.keys: 397
+   r10   shard 1 refused fleet.live.held_back.placement: 1
+   r10   shard 1 refused fleet.live.holders_recorded: 1
+   r10   shard 1 refused fleet.live.holders_short: 381
+   r10   shard 1 refused fleet.live.holders_transition: 1
+   r10   shard 1 refused fleet.live.install_built: 396
+   r10   shard 1 refused fleet.live.install_image: 2
+   r10   shard 1 refused fleet.live.resolved: 176
+   r10   shard 1 refused fleet.live.whole: 1
+   r10   shard 1 live shipping c431e992fad5a7210001000000000028 head=177 durable=177 owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=1053749213714062892,14549885622817237814 moving_to=1053749213714062892,14549885622817237814,17564873023362396069 recorded=1053749213714062892,14549885622817237814
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 14549885622817237814
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 2
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 17570175392721406798
+   r10   fleet_settled_generation: 6
+   r10   fleet_neighbourhood_generation: 6
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14137337522775500577: lent=false cwnd=130934 srtt_ns=216832 pto_ns=1216832 spurious_losses=0 persistent_collapses=0 consumed=44663 mtu=65496
+   r10   fleet_session 17564873023362396069: lent=false cwnd=130934 srtt_ns=219852 pto_ns=1219852 spurious_losses=0 persistent_collapses=0 consumed=40334 mtu=65496
+   r10   shard 0 refused fleet.live.held: 125
+   r10   shard 0 refused fleet.live.install_taken: 1
+   r10   shard 0 refused fleet.plane.address_unresolved: 13
+   r10   shard 0 refused fleet.plane.announce_lends: 5
+   r10   shard 0 refused fleet.plane.announcements_sent: 5
+   r10   shard 0 refused fleet.report.sent: 2
+   r10   shard 0 refused fleet.seal.pair_served: 6
+   r10   shard 0 refused fleet.seal.pair_unanswered: 764
+   r10   shard 0 refused fleet.seal.pair_undelivered: 764
+   r10   shard 0 refused fleet.takeover.page_unbound: 6
+   r10   shard 0 refused fleet.takeover.page_unmatched: 2
+   r10   shard 0 live held c431e992fad5a7210001000000000028 head=177 durable=none owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=none moving_to=none recorded=none
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 17564873023362396069
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 2
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 4965306528698932805
+   r10   fleet_settled_generation: 5
+   r10   fleet_neighbourhood_generation: 5
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14137337522775500577: lent=false cwnd=130934 srtt_ns=131747 pto_ns=1131747 spurious_losses=0 persistent_collapses=0 consumed=6799 mtu=65496
+   r10   fleet_session 14549885622817237814: lent=false cwnd=130934 srtt_ns=131191 pto_ns=1131191 spurious_losses=0 persistent_collapses=0 consumed=7537 mtu=65496
+   r10   shard 0 refused fleet.live.held: 2
+   r10   shard 0 refused fleet.live.install_taken: 2
+   r10   shard 0 refused fleet.plane.announce_lends: 4
+   r10   shard 0 refused fleet.plane.announcements_sent: 4
+   r10   shard 0 refused fleet.seal.pair_refused: 3085
+   r10   shard 0 refused fleet.seal.pair_served: 3085
+   r10   shard 0 live held c431e992fad5a7210001000000000028 head=177 durable=none owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=none moving_to=none recorded=none
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 14137337522775500577
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 0
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 17373125179485695345
+   r10   fleet_settled_generation: 5
+   r10   fleet_neighbourhood_generation: 5
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14549885622817237814: lent=false cwnd=130934 srtt_ns=117374 pto_ns=1117374 spurious_losses=0 persistent_collapses=0 consumed=10409 mtu=65496
+   r10   fleet_session 17564873023362396069: lent=false cwnd=130934 srtt_ns=119379 pto_ns=1119379 spurious_losses=0 persistent_collapses=0 consumed=2480 mtu=65496
+   r10   shard 0 refused fleet.live.link_lost: 1
+   r10   shard 0 refused fleet.live.no_session: 785
+   r10   shard 0 refused fleet.live.unanswered: 785
+   r10   shard 0 refused fleet.plane.address_unresolved: 15
+   r10   shard 0 refused fleet.plane.announce_lends: 5
+   r10   shard 0 refused fleet.plane.announcements_sent: 5
+   r10   shard 0 refused fleet.report.sent: 5
+   r10   shard 0 refused fleet.seal.pair_served: 6
+   r10   shard 0 refused fleet.seal.pair_unanswered: 1542
+   r10   shard 0 refused fleet.seal.pair_undelivered: 1542
+   r10   shard 0 refused fleet.ship.catalog.placed: 3
+   r10   shard 0 refused fleet.ship.catalog.short: 1
+   r10   shard 0 refused fleet.ship.head.no_session: 1
+   r10   shard 0 refused fleet.ship.head.placed: 2
+   r10   shard 0 refused fleet.ship.head.short: 1
+   r10   shard 0 refused fleet.takeover.page_unbound: 2
+   r10   shard 0 refused fleet.takeover.page_unmatched: 6
+   r10   shard 0 refused fleet.takeover.stale_configuration: 2
+   r10   shard 1 refused fleet.live.appended: 178
+   r10   shard 1 refused fleet.live.awaited: 177
+   r10   shard 1 refused fleet.live.durable: 178
+   r10   shard 1 refused fleet.live.held_back.keys: 788
+   r10   shard 1 refused fleet.live.held_back.placement: 1
+   r10   shard 1 refused fleet.live.holders_recorded: 1
+   r10   shard 1 refused fleet.live.holders_short: 772
+   r10   shard 1 refused fleet.live.holders_transition: 1
+   r10   shard 1 refused fleet.live.install_built: 787
+   r10   shard 1 refused fleet.live.install_image: 2
+   r10   shard 1 refused fleet.live.resolved: 176
+   r10   shard 1 refused fleet.live.whole: 1
+   r10   shard 1 live shipping c431e992fad5a7210001000000000028 head=177 durable=177 owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=1053749213714062892,14549885622817237814 moving_to=1053749213714062892,14549885622817237814,17564873023362396069 recorded=1053749213714062892,14549885622817237814
+   r10   anchor_hold_refusals: 0
+   r10   anchor_log_lines_refused: 0
+   r10   fleet_host: 14549885622817237814
+   r10   fleet_host_epoch: 1
+   r10   fleet_members: 14137337522775500577 14549885622817237814 17564873023362396069
+   r10   fleet_peers_probed: 2
+   r10   fleet_held_records: 2
+   r10   fleet_takeovers_pending: 0
+   r10   fleet_configuration_version: 10
+   r10   anchor: 17570175392721406798
+   r10   fleet_settled_generation: 6
+   r10   fleet_neighbourhood_generation: 6
+   r10   fleet_peers_in_contact: 2
+   r10   fleet_peers_unmeshed: 0
+   r10   fleet_session 14137337522775500577: lent=false cwnd=130934 srtt_ns=106144 pto_ns=1106144 spurious_losses=0 persistent_collapses=0 consumed=84883 mtu=65496
+   r10   fleet_session 17564873023362396069: lent=false cwnd=130934 srtt_ns=119042 pto_ns=1119042 spurious_losses=0 persistent_collapses=0 consumed=80350 mtu=65496
+   r10   shard 0 refused fleet.live.held: 125
+   r10   shard 0 refused fleet.live.install_taken: 1
+   r10   shard 0 refused fleet.plane.address_unresolved: 13
+   r10   shard 0 refused fleet.plane.announce_lends: 5
+   r10   shard 0 refused fleet.plane.announcements_sent: 5
+   r10   shard 0 refused fleet.report.sent: 2
+   r10   shard 0 refused fleet.seal.pair_no_session: 1
+   r10   shard 0 refused fleet.seal.pair_served: 6
+   r10   shard 0 refused fleet.seal.pair_unanswered: 1543
+   r10   shard 0 refused fleet.seal.pair_undelivered: 1544
+   r10   shard 0 refused fleet.takeover.page_unbound: 6
+   r10   shard 0 refused fleet.takeover.page_unmatched: 2
+   r10   shard 0 live held c431e992fad5a7210001000000000028 head=177 durable=none owed=false epoch=1 identity=603e27e53e6b1a8b5029524d18ac17a47c94f35aa2d6c493b12bfced928b6334 fence=1 holders=none moving_to=none recorded=none
+   r10     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r10 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 82.77s
+== run 10 exit 101
+   r11     Finished `release` profile [optimized] target(s) in 0.09s
+   r11      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r11 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-76265 destroyed at 191.707839ms
+   r11 chaos a candidate's store destroyed mid-stream: replacement answering at 333.680444ms
+   r11 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.48792088s
+   r11 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (76266) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 13544562244002572420
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 0
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 3902243353523723087
+   r11   fleet_settled_generation: 7
+   r11   fleet_neighbourhood_generation: 7
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 2311045820314768938: lent=false cwnd=130934 srtt_ns=421194 pto_ns=1421194 spurious_losses=0 persistent_collapses=0 consumed=16864 mtu=65496
+   r11   fleet_session 12734636181165387655: lent=false cwnd=130934 srtt_ns=665921 pto_ns=2838345 spurious_losses=0 persistent_collapses=0 consumed=2029 mtu=65496
+   r11   shard 0 refused fleet.live.link_lost: 1
+   r11   shard 0 refused fleet.live.no_session: 402
+   r11   shard 0 refused fleet.live.unanswered: 401
+   r11   shard 0 refused fleet.plane.address_unresolved: 14
+   r11   shard 0 refused fleet.plane.announce_lends: 5
+   r11   shard 0 refused fleet.plane.announcements_sent: 5
+   r11   shard 0 refused fleet.report.sent: 7
+   r11   shard 0 refused fleet.seal.pair_served: 6
+   r11   shard 0 refused fleet.seal.pair_unanswered: 796
+   r11   shard 0 refused fleet.seal.pair_undelivered: 796
+   r11   shard 0 refused fleet.ship.catalog.placed: 2
+   r11   shard 0 refused fleet.ship.catalog.short: 1
+   r11   shard 0 refused fleet.ship.head.no_session: 5
+   r11   shard 0 refused fleet.ship.head.placed: 1
+   r11   shard 0 refused fleet.ship.head.short: 1
+   r11   shard 0 refused fleet.takeover.page_unbound: 2
+   r11   shard 0 refused fleet.takeover.page_unmatched: 6
+   r11   shard 0 refused fleet.takeover.stale_configuration: 2
+   r11   shard 1 refused fleet.live.appended: 229
+   r11   shard 1 refused fleet.live.awaited: 228
+   r11   shard 1 refused fleet.live.durable: 229
+   r11   shard 1 refused fleet.live.held_back.keys: 404
+   r11   shard 1 refused fleet.live.held_back.placement: 2
+   r11   shard 1 refused fleet.live.holders_recorded: 1
+   r11   shard 1 refused fleet.live.holders_short: 399
+   r11   shard 1 refused fleet.live.holders_transition: 1
+   r11   shard 1 refused fleet.live.install_built: 401
+   r11   shard 1 refused fleet.live.install_image: 1
+   r11   shard 1 refused fleet.live.resolved: 227
+   r11   shard 1 refused fleet.live.whole: 1
+   r11   shard 1 live shipping bbf7f39947f0e8840001000000000028 head=228 durable=228 owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=2311045820314768938,17584797945053484088 moving_to=2311045820314768938,12734636181165387655,17584797945053484088 recorded=2311045820314768938,17584797945053484088
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 12734636181165387655
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 2
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 8955169799427165975
+   r11   fleet_settled_generation: 5
+   r11   fleet_neighbourhood_generation: 5
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 2311045820314768938: lent=false cwnd=130934 srtt_ns=880470 pto_ns=4869498 spurious_losses=0 persistent_collapses=0 consumed=9379 mtu=65496
+   r11   fleet_session 13544562244002572420: lent=false cwnd=130934 srtt_ns=396153 pto_ns=1396153 spurious_losses=0 persistent_collapses=0 consumed=5825 mtu=65496
+   r11   shard 0 refused fleet.live.held: 2
+   r11   shard 0 refused fleet.live.install_taken: 1
+   r11   shard 0 refused fleet.plane.announce_lends: 4
+   r11   shard 0 refused fleet.plane.announcements_sent: 4
+   r11   shard 0 refused fleet.seal.pair_refused: 1559
+   r11   shard 0 refused fleet.seal.pair_served: 1559
+   r11   shard 0 live held bbf7f39947f0e8840001000000000028 head=228 durable=none owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=none moving_to=none recorded=none
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 2311045820314768938
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 2
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 835902366069527042
+   r11   fleet_settled_generation: 7
+   r11   fleet_neighbourhood_generation: 7
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 12734636181165387655: lent=false cwnd=130934 srtt_ns=950348 pto_ns=3705344 spurious_losses=0 persistent_collapses=0 consumed=40353 mtu=65496
+   r11   fleet_session 13544562244002572420: lent=false cwnd=130934 srtt_ns=902375 pto_ns=4125915 spurious_losses=0 persistent_collapses=0 consumed=44007 mtu=65496
+   r11   shard 0 refused fleet.link.peer_reset: 1
+   r11   shard 0 refused fleet.live.held: 229
+   r11   shard 0 refused fleet.plane.address_unresolved: 11
+   r11   shard 0 refused fleet.plane.announce_lends: 5
+   r11   shard 0 refused fleet.plane.announcements_sent: 5
+   r11   shard 0 refused fleet.report.sent: 3
+   r11   shard 0 refused fleet.seal.pair_no_session: 1
+   r11   shard 0 refused fleet.seal.pair_served: 6
+   r11   shard 0 refused fleet.seal.pair_unanswered: 763
+   r11   shard 0 refused fleet.seal.pair_undelivered: 764
+   r11   shard 0 refused fleet.takeover.page_unbound: 6
+   r11   shard 0 refused fleet.takeover.page_unmatched: 2
+   r11   shard 0 live held bbf7f39947f0e8840001000000000028 head=228 durable=none owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=none moving_to=none recorded=none
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 13544562244002572420
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 0
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 3902243353523723087
+   r11   fleet_settled_generation: 7
+   r11   fleet_neighbourhood_generation: 7
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 2311045820314768938: lent=false cwnd=130934 srtt_ns=122427 pto_ns=1122427 spurious_losses=0 persistent_collapses=0 consumed=17304 mtu=65496
+   r11   fleet_session 12734636181165387655: lent=false cwnd=130934 srtt_ns=117194 pto_ns=1117194 spurious_losses=0 persistent_collapses=0 consumed=2459 mtu=65496
+   r11   shard 0 refused fleet.live.link_lost: 1
+   r11   shard 0 refused fleet.live.no_session: 792
+   r11   shard 0 refused fleet.live.unanswered: 791
+   r11   shard 0 refused fleet.plane.address_unresolved: 14
+   r11   shard 0 refused fleet.plane.announce_lends: 5
+   r11   shard 0 refused fleet.plane.announcements_sent: 5
+   r11   shard 0 refused fleet.report.sent: 7
+   r11   shard 0 refused fleet.seal.pair_served: 6
+   r11   shard 0 refused fleet.seal.pair_unanswered: 1576
+   r11   shard 0 refused fleet.seal.pair_undelivered: 1576
+   r11   shard 0 refused fleet.ship.catalog.placed: 2
+   r11   shard 0 refused fleet.ship.catalog.short: 1
+   r11   shard 0 refused fleet.ship.head.no_session: 5
+   r11   shard 0 refused fleet.ship.head.placed: 1
+   r11   shard 0 refused fleet.ship.head.short: 1
+   r11   shard 0 refused fleet.takeover.page_unbound: 2
+   r11   shard 0 refused fleet.takeover.page_unmatched: 6
+   r11   shard 0 refused fleet.takeover.stale_configuration: 2
+   r11   shard 1 refused fleet.live.appended: 229
+   r11   shard 1 refused fleet.live.awaited: 228
+   r11   shard 1 refused fleet.live.durable: 229
+   r11   shard 1 refused fleet.live.held_back.keys: 794
+   r11   shard 1 refused fleet.live.held_back.placement: 2
+   r11   shard 1 refused fleet.live.holders_recorded: 1
+   r11   shard 1 refused fleet.live.holders_short: 789
+   r11   shard 1 refused fleet.live.holders_transition: 1
+   r11   shard 1 refused fleet.live.install_built: 791
+   r11   shard 1 refused fleet.live.install_image: 1
+   r11   shard 1 refused fleet.live.resolved: 227
+   r11   shard 1 refused fleet.live.whole: 1
+   r11   shard 1 live shipping bbf7f39947f0e8840001000000000028 head=228 durable=228 owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=2311045820314768938,17584797945053484088 moving_to=2311045820314768938,12734636181165387655,17584797945053484088 recorded=2311045820314768938,17584797945053484088
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 12734636181165387655
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 2
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 8955169799427165975
+   r11   fleet_settled_generation: 5
+   r11   fleet_neighbourhood_generation: 5
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 2311045820314768938: lent=false cwnd=130934 srtt_ns=119400 pto_ns=1119400 spurious_losses=0 persistent_collapses=0 consumed=9819 mtu=65496
+   r11   fleet_session 13544562244002572420: lent=false cwnd=130934 srtt_ns=123404 pto_ns=1123404 spurious_losses=0 persistent_collapses=0 consumed=6265 mtu=65496
+   r11   shard 0 refused fleet.live.held: 2
+   r11   shard 0 refused fleet.live.install_taken: 1
+   r11   shard 0 refused fleet.plane.announce_lends: 4
+   r11   shard 0 refused fleet.plane.announcements_sent: 4
+   r11   shard 0 refused fleet.seal.pair_refused: 3119
+   r11   shard 0 refused fleet.seal.pair_served: 3119
+   r11   shard 0 live held bbf7f39947f0e8840001000000000028 head=228 durable=none owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=none moving_to=none recorded=none
+   r11   anchor_hold_refusals: 0
+   r11   anchor_log_lines_refused: 0
+   r11   fleet_host: 2311045820314768938
+   r11   fleet_host_epoch: 1
+   r11   fleet_members: 2311045820314768938 12734636181165387655 13544562244002572420
+   r11   fleet_peers_probed: 2
+   r11   fleet_held_records: 2
+   r11   fleet_takeovers_pending: 0
+   r11   fleet_configuration_version: 11
+   r11   anchor: 835902366069527042
+   r11   fleet_settled_generation: 7
+   r11   fleet_neighbourhood_generation: 7
+   r11   fleet_peers_in_contact: 2
+   r11   fleet_peers_unmeshed: 0
+   r11   fleet_session 12734636181165387655: lent=false cwnd=130934 srtt_ns=121241 pto_ns=1121241 spurious_losses=0 persistent_collapses=0 consumed=80471 mtu=65496
+   r11   fleet_session 13544562244002572420: lent=false cwnd=130934 srtt_ns=178559 pto_ns=1178559 spurious_losses=0 persistent_collapses=0 consumed=83931 mtu=65496
+   r11   shard 0 refused fleet.link.peer_reset: 1
+   r11   shard 0 refused fleet.live.held: 229
+   r11   shard 0 refused fleet.plane.address_unresolved: 11
+   r11   shard 0 refused fleet.plane.announce_lends: 5
+   r11   shard 0 refused fleet.plane.announcements_sent: 5
+   r11   shard 0 refused fleet.report.sent: 3
+   r11   shard 0 refused fleet.seal.pair_no_session: 1
+   r11   shard 0 refused fleet.seal.pair_served: 6
+   r11   shard 0 refused fleet.seal.pair_unanswered: 1543
+   r11   shard 0 refused fleet.seal.pair_undelivered: 1544
+   r11   shard 0 refused fleet.takeover.page_unbound: 6
+   r11   shard 0 refused fleet.takeover.page_unmatched: 2
+   r11   shard 0 live held bbf7f39947f0e8840001000000000028 head=228 durable=none owed=false epoch=1 identity=b3bea12ccf495a68a26b27a88ac6309b2a6fc293b734b54a3c5ea45cde23d9ba fence=1 holders=none moving_to=none recorded=none
+   r11     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r11 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.52s
+== run 11 exit 101
+   r12     Finished `release` profile [optimized] target(s) in 0.09s
+   r12      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r12 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-83069 destroyed at 193.358984ms
+   r12 chaos a candidate's store destroyed mid-stream: replacement answering at 515.715235ms
+   r12 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.764214048s
+   r12 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (83070) panicked at crates/cli/tests/live_chaos.rs:1413:7:
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 9696206196350962007
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 0
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 6698399402067354690
+   r12   fleet_settled_generation: 7
+   r12   fleet_neighbourhood_generation: 7
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 2619480077952738340: lent=false cwnd=130934 srtt_ns=696659 pto_ns=2390527 spurious_losses=0 persistent_collapses=0 consumed=13485 mtu=65496
+   r12   fleet_session 7616088304308906695: lent=false cwnd=130934 srtt_ns=592752 pto_ns=2641600 spurious_losses=0 persistent_collapses=0 consumed=2067 mtu=65496
+   r12   shard 0 refused fleet.live.link_lost: 1
+   r12   shard 0 refused fleet.live.no_session: 400
+   r12   shard 0 refused fleet.live.unanswered: 399
+   r12   shard 0 refused fleet.plane.address_unresolved: 14
+   r12   shard 0 refused fleet.plane.announce_lends: 5
+   r12   shard 0 refused fleet.plane.announcements_sent: 5
+   r12   shard 0 refused fleet.report.sent: 4
+   r12   shard 0 refused fleet.seal.pair_served: 6
+   r12   shard 0 refused fleet.seal.pair_unanswered: 772
+   r12   shard 0 refused fleet.seal.pair_undelivered: 772
+   r12   shard 0 refused fleet.ship.catalog.placed: 2
+   r12   shard 0 refused fleet.ship.catalog.short: 1
+   r12   shard 0 refused fleet.ship.head.no_session: 1
+   r12   shard 0 refused fleet.ship.head.placed: 2
+   r12   shard 0 refused fleet.ship.head.short: 1
+   r12   shard 0 refused fleet.takeover.page_unbound: 1
+   r12   shard 0 refused fleet.takeover.page_unmatched: 5
+   r12   shard 0 refused fleet.takeover.stale_configuration: 1
+   r12   shard 1 refused fleet.live.appended: 226
+   r12   shard 1 refused fleet.live.awaited: 225
+   r12   shard 1 refused fleet.live.durable: 226
+   r12   shard 1 refused fleet.live.held_back.keys: 401
+   r12   shard 1 refused fleet.live.held_back.placement: 1
+   r12   shard 1 refused fleet.live.holders_recorded: 1
+   r12   shard 1 refused fleet.live.holders_short: 387
+   r12   shard 1 refused fleet.live.holders_transition: 1
+   r12   shard 1 refused fleet.live.install_built: 401
+   r12   shard 1 refused fleet.live.install_image: 2
+   r12   shard 1 refused fleet.live.resolved: 224
+   r12   shard 1 refused fleet.live.whole: 1
+   r12   shard 1 live shipping 868fd829b270c9570001000000000028 head=225 durable=225 owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=2619480077952738340,7741413699442958220 moving_to=2619480077952738340,7616088304308906695,7741413699442958220 recorded=2619480077952738340,7741413699442958220
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 7616088304308906695
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 2
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 6999824298750564202
+   r12   fleet_settled_generation: 5
+   r12   fleet_neighbourhood_generation: 5
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 2619480077952738340: lent=false cwnd=130934 srtt_ns=973426 pto_ns=4984918 spurious_losses=0 persistent_collapses=0 consumed=7948 mtu=65496
+   r12   fleet_session 9696206196350962007: lent=false cwnd=130934 srtt_ns=623194 pto_ns=2312122 spurious_losses=0 persistent_collapses=0 consumed=5854 mtu=65496
+   r12   shard 0 refused fleet.live.held: 3
+   r12   shard 0 refused fleet.live.install_taken: 2
+   r12   shard 0 refused fleet.plane.announce_lends: 4
+   r12   shard 0 refused fleet.plane.announcements_sent: 4
+   r12   shard 0 refused fleet.seal.pair_refused: 1554
+   r12   shard 0 refused fleet.seal.pair_served: 1554
+   r12   shard 0 live held 868fd829b270c9570001000000000028 head=225 durable=none owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=none moving_to=none recorded=none
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 2619480077952738340
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 2
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 1482836300284615077
+   r12   fleet_settled_generation: 5
+   r12   fleet_neighbourhood_generation: 5
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 7616088304308906695: lent=true cwnd=130934 srtt_ns=859043 pto_ns=3778299 spurious_losses=0 persistent_collapses=0 consumed=40638 mtu=65496
+   r12   fleet_session 9696206196350962007: lent=false cwnd=130934 srtt_ns=656934 pto_ns=1656934 spurious_losses=0 persistent_collapses=0 consumed=44342 mtu=65496
+   r12   shard 0 refused fleet.link.peer_reset: 1
+   r12   shard 0 refused fleet.live.held: 171
+   r12   shard 0 refused fleet.live.install_taken: 1
+   r12   shard 0 refused fleet.plane.address_unresolved: 1
+   r12   shard 0 refused fleet.plane.announce_lends: 5
+   r12   shard 0 refused fleet.plane.announcements_sent: 5
+   r12   shard 0 refused fleet.report.sent: 3
+   r12   shard 0 refused fleet.seal.pair_no_session: 2
+   r12   shard 0 refused fleet.seal.pair_served: 6
+   r12   shard 0 refused fleet.seal.pair_unanswered: 783
+   r12   shard 0 refused fleet.seal.pair_undelivered: 785
+   r12   shard 0 refused fleet.takeover.page_unbound: 5
+   r12   shard 0 refused fleet.takeover.page_unmatched: 1
+   r12   shard 0 live held 868fd829b270c9570001000000000028 head=225 durable=none owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=none moving_to=none recorded=none
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 9696206196350962007
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 0
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 6698399402067354690
+   r12   fleet_settled_generation: 7
+   r12   fleet_neighbourhood_generation: 7
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 2619480077952738340: lent=false cwnd=130934 srtt_ns=115787 pto_ns=1115787 spurious_losses=0 persistent_collapses=0 consumed=13925 mtu=65496
+   r12   fleet_session 7616088304308906695: lent=false cwnd=130934 srtt_ns=157206 pto_ns=1157206 spurious_losses=0 persistent_collapses=0 consumed=2517 mtu=65496
+   r12   shard 0 refused fleet.live.link_lost: 1
+   r12   shard 0 refused fleet.live.no_session: 791
+   r12   shard 0 refused fleet.live.unanswered: 790
+   r12   shard 0 refused fleet.plane.address_unresolved: 14
+   r12   shard 0 refused fleet.plane.announce_lends: 5
+   r12   shard 0 refused fleet.plane.announcements_sent: 5
+   r12   shard 0 refused fleet.report.sent: 4
+   r12   shard 0 refused fleet.seal.pair_no_session: 1
+   r12   shard 0 refused fleet.seal.pair_served: 6
+   r12   shard 0 refused fleet.seal.pair_unanswered: 1553
+   r12   shard 0 refused fleet.seal.pair_undelivered: 1554
+   r12   shard 0 refused fleet.ship.catalog.placed: 2
+   r12   shard 0 refused fleet.ship.catalog.short: 1
+   r12   shard 0 refused fleet.ship.head.no_session: 1
+   r12   shard 0 refused fleet.ship.head.placed: 2
+   r12   shard 0 refused fleet.ship.head.short: 1
+   r12   shard 0 refused fleet.takeover.page_unbound: 1
+   r12   shard 0 refused fleet.takeover.page_unmatched: 5
+   r12   shard 0 refused fleet.takeover.stale_configuration: 1
+   r12   shard 1 refused fleet.live.appended: 226
+   r12   shard 1 refused fleet.live.awaited: 225
+   r12   shard 1 refused fleet.live.durable: 226
+   r12   shard 1 refused fleet.live.held_back.keys: 792
+   r12   shard 1 refused fleet.live.held_back.placement: 1
+   r12   shard 1 refused fleet.live.holders_recorded: 1
+   r12   shard 1 refused fleet.live.holders_short: 778
+   r12   shard 1 refused fleet.live.holders_transition: 1
+   r12   shard 1 refused fleet.live.install_built: 792
+   r12   shard 1 refused fleet.live.install_image: 2
+   r12   shard 1 refused fleet.live.resolved: 224
+   r12   shard 1 refused fleet.live.whole: 1
+   r12   shard 1 live shipping 868fd829b270c9570001000000000028 head=225 durable=225 owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=2619480077952738340,7741413699442958220 moving_to=2619480077952738340,7616088304308906695,7741413699442958220 recorded=2619480077952738340,7741413699442958220
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 7616088304308906695
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 2
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 6999824298750564202
+   r12   fleet_settled_generation: 5
+   r12   fleet_neighbourhood_generation: 5
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 2619480077952738340: lent=false cwnd=130934 srtt_ns=98817 pto_ns=1098817 spurious_losses=0 persistent_collapses=0 consumed=8388 mtu=65496
+   r12   fleet_session 9696206196350962007: lent=false cwnd=130934 srtt_ns=182825 pto_ns=1182825 spurious_losses=0 persistent_collapses=0 consumed=6294 mtu=65496
+   r12   shard 0 refused fleet.live.held: 3
+   r12   shard 0 refused fleet.live.install_taken: 2
+   r12   shard 0 refused fleet.plane.announce_lends: 4
+   r12   shard 0 refused fleet.plane.announcements_sent: 4
+   r12   shard 0 refused fleet.seal.pair_refused: 3117
+   r12   shard 0 refused fleet.seal.pair_served: 3117
+   r12   shard 0 live held 868fd829b270c9570001000000000028 head=225 durable=none owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=none moving_to=none recorded=none
+   r12   anchor_hold_refusals: 0
+   r12   anchor_log_lines_refused: 0
+   r12   fleet_host: 2619480077952738340
+   r12   fleet_host_epoch: 1
+   r12   fleet_members: 2619480077952738340 7616088304308906695 9696206196350962007
+   r12   fleet_peers_probed: 2
+   r12   fleet_held_records: 2
+   r12   fleet_takeovers_pending: 0
+   r12   fleet_configuration_version: 10
+   r12   anchor: 1482836300284615077
+   r12   fleet_settled_generation: 5
+   r12   fleet_neighbourhood_generation: 5
+   r12   fleet_peers_in_contact: 2
+   r12   fleet_peers_unmeshed: 0
+   r12   fleet_session 7616088304308906695: lent=false cwnd=130934 srtt_ns=117660 pto_ns=1117660 spurious_losses=0 persistent_collapses=0 consumed=80756 mtu=65496
+   r12   fleet_session 9696206196350962007: lent=false cwnd=130934 srtt_ns=173871 pto_ns=1173871 spurious_losses=0 persistent_collapses=0 consumed=84552 mtu=65496
+   r12   shard 0 refused fleet.link.peer_reset: 1
+   r12   shard 0 refused fleet.live.held: 171
+   r12   shard 0 refused fleet.live.install_taken: 1
+   r12   shard 0 refused fleet.plane.address_unresolved: 1
+   r12   shard 0 refused fleet.plane.announce_lends: 5
+   r12   shard 0 refused fleet.plane.announcements_sent: 5
+   r12   shard 0 refused fleet.report.sent: 3
+   r12   shard 0 refused fleet.seal.pair_no_session: 2
+   r12   shard 0 refused fleet.seal.pair_served: 6
+   r12   shard 0 refused fleet.seal.pair_unanswered: 1564
+   r12   shard 0 refused fleet.seal.pair_undelivered: 1566
+   r12   shard 0 refused fleet.takeover.page_unbound: 5
+   r12   shard 0 refused fleet.takeover.page_unmatched: 1
+   r12   shard 0 live held 868fd829b270c9570001000000000028 head=225 durable=none owed=false epoch=1 identity=11416b4e7a6d670b9d18239fd3554e05da169b7279d09887c3d833841bfaef42 fence=1 holders=none moving_to=none recorded=none
+   r12     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r12 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 83.82s
+== run 12 exit 101
