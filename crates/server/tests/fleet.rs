@@ -16740,9 +16740,11 @@ const RESET_ATTEMPTS: usize = 4;
 /// What one restart of a showed from b.
 #[derive(Debug)]
 struct ResetAttempt {
-  /// Whether b still held its link to a, unjudged, when a came back: its link entry present, and neither
-  /// `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since before the stop.
+  /// Whether b still held the same session to a when a came back: the same connection id as before the stop (held or
+  /// lent, not replaced), and neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since.
   held: bool,
+  /// Resets the restarted a's demultiplexers sent over the attempt (to b's old session, and to c's).
+  sent_by_a: u64,
   /// `fleet.link.peer_reset` counted on b over the attempt.
   resets: u64,
   /// Whether b's liveness judged a dead (`believed_dead` moved) before the reset was seen.
@@ -16772,16 +16774,16 @@ fn restart_and_reach(
 ) -> ResetAttempt {
   let a_host = daemons[0].member_identity().unwrap();
   let before = link_counters(&daemons[1]);
+  let session_before = daemons[1].fleet_record_session_id(a_host).unwrap();
   daemons.remove(0).stop();
   daemons.insert(0, restart());
   let restarted = Instant::now();
   let (dead, out, _) = link_counters(&daemons[1]);
-  let linked = daemons[1]
-    .fleet_record_links()
-    .unwrap()
-    .iter()
-    .any(|(host, _)| *host == a_host);
-  let held = linked && dead == before.0 && out == before.1;
+  let session_after = daemons[1].fleet_record_session_id(a_host).unwrap();
+  let held = session_before.is_some()
+    && session_after == session_before
+    && dead == before.0
+    && out == before.1;
   let mut reset_seen = None;
   let mut judged_first = false;
   let reached = loop {
@@ -16804,8 +16806,13 @@ fn restart_and_reach(
       break None;
     }
   };
+  let sent_by_a = daemons[0]
+    .fleet_demux_counters()
+    .map(|counters| counters.iter().map(|counter| counter.resets_sent).sum())
+    .unwrap_or(0);
   ResetAttempt {
     held,
+    sent_by_a,
     resets: link_counters(&daemons[1]).2 - before.2,
     judged_first,
     reached,
@@ -16821,17 +16828,17 @@ fn restart_and_reach(
 /// Do: three nodes; a volume owned by a, read through b; restart a with its identity on its ports; read through b until
 /// a answers.
 ///
-/// The precondition is read from b's own state: b still holds its link to the old a, unjudged, when a comes back. Under
-/// extreme load b's liveness can judge a dead while it is down (the supervisor's Mac gate at load 170–232: `believed_dead`
-/// 1, `out_of_contact` 1, no reset to make). Such a run is not the reset case: it is recorded, and a is restarted again,
-/// at most [`RESET_ATTEMPTS`] times.
+/// The precondition is read from b's own state: when a comes back b still holds the same session to the old a, by
+/// connection id, held or lent, and its liveness has not judged a dead. Under load b can lose it first: at load 170–232
+/// its liveness judged a dead while it was down (`believed_dead` 1, `out_of_contact` 1); at load 46–48 its session was
+/// lent or replaced first (main's parked runs, GAPS). Such a run is not the reset case: it is recorded, and a is
+/// restarted again, at most [`RESET_ATTEMPTS`] times.
 ///
 /// Expect: the precondition held in some attempt, and in each attempt where it held:
-/// - b counted the reset (`fleet.link.peer_reset`);
+/// - the restarted a sent a reset (its demultiplexers' `resets_sent`) and b counted one (`fleet.link.peer_reset`);
 /// - b's liveness had not judged a dead before it, so the reset moved the link;
 /// - a read through b reached the restarted a within [`RESET_REACH_BOUND`].
 #[test]
-#[ignore = "A-261: parked until it holds its own precondition (b still holding its session to the old a at the restart); on a Mac at load 46-48 it failed 2 of 3 with 0 resets while b reached the restarted a in 207-263 ms, its session lent or replaced first; GAPS A-261"]
 #[allow(clippy::cognitive_complexity)]
 fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   let _serial = serialize_fleet_tests();
@@ -16954,8 +16961,9 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   );
   for attempt in attempts.iter().filter(|attempt| attempt.held) {
     assert!(
-      attempt.resets >= 1 && attempt.reset_seen.is_some(),
-      "b's session to the old a was reset while its reads waited: {attempt:?}; {counters:?}"
+      attempt.sent_by_a >= 1 && attempt.resets >= 1 && attempt.reset_seen.is_some(),
+      "the restarted a sent a reset and b's session to the old a was reset while its reads waited: {attempt:?}; \
+       {counters:?}"
     );
     assert!(
       !attempt.judged_first,

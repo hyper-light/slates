@@ -4910,6 +4910,11 @@ async fn refresh_discovery(
         }
       } else {
         state.record_sessions.remove(&peer_host);
+        // A discovery page can be the first exchange to meet the restarted peer's reset (A-261): counted as a reset,
+        // as a borrower's return counts it, not left to read as an unexplained drop.
+        if session.peer_reset() {
+          state.count(LINK_PEER_RESET, 1);
+        }
       }
     });
   }

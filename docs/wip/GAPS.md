@@ -9079,7 +9079,22 @@ new process. In simulation the session ended one round trip after its first pack
     loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
     bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
     here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
-  - **The process test is parked `#[ignore]` (2026-11-09, the supervisor, landing it).** `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` passed 15 of 15 a side on three CI runners (diag-61), but on a Mac at load 46 to 48 it failed 2 of 3 runs, and at load 232 the stack gate's one. Each failure read 0 resets while b's first read reached the restarted a in 207 to 263 ms: b's forward found its session lent (`fleet.forward.session_out`) or the link already judged the old a dead, so no packet reached the new process on the old session and no reset was owed. The product behaved; the test does not hold its precondition. Owed (raft-chaos): assert b still holds its session to the old a when a restarts, retry within a bound when it does not, and count the runs in which the reset path ran, then un-ignore it.
+  - **The process test holds its own precondition (2026-11-09; parked `#[ignore]` by the supervisor on landing, un-ignored
+    in the same change).** It had failed 2 of 3 on a Mac at load 46 to 48 and the stack gate's one at load 232. Each
+    read 0 resets: b's session had been lent, replaced or judged dead before any packet reached the new process on it,
+    so no reset was owed. The product behaved; the test did not hold its precondition.
+    - `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` now reads the precondition from b's own
+      state at the moment a comes back: the same session to a by connection id (`Daemon::fleet_record_session_id`, held
+      or lent, not replaced), and neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved.
+    - A run without it is recorded and a restarted again, at most `RESET_ATTEMPTS` (4) times.
+    - Where it held, the test requires:
+      - a reset sent by the restarted a (its demultiplexers' `resets_sent`);
+      - one counted by b, seen while its reads waited;
+      - b's liveness not having judged a dead first;
+      - a read reaching the new a within ten liveness budgets.
+    - It prints how many runs held the precondition, the count of runs in which the reset path ran.
+    - A reset met first by a discovery page now counts `fleet.link.peer_reset` too (`fleet::refresh_discovery`); it
+      dropped the link uncounted before.
 
 ### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
 
