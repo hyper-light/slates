@@ -33,7 +33,7 @@ the server.
 **A name no page could hold.** A `create` request carried names up to 4,062 bytes, and the summary of such a volume
 does not fit any page. A daemon that admits a volume it cannot list has the same bug in a smaller form. A new volume's
 name is now refused `InvalidName` past `longest_listable_name`: the page's room less a summary with an empty name,
-4,025 bytes. That holds for every verb that names a new volume (`Create`, `CreateGreen`, `CreateWork`, `Clone`,
+4,012 bytes (4,025 until B8 gave a summary its `not_recovered` cause, whose fixed part the bound leaves room for). That holds for every verb that names a new volume (`Create`, `CreateGreen`, `CreateWork`, `Clone`,
 `ImageBuild`, `ImageMerge`), checked before the verb runs. A volume recovered under a longer name is not refused.
 `the_longest_name_a_create_carries_is_listed` failed with the paging alone (`refused: BadRequest { reason: "reply too
 large for the bulk area" }` for a 4,062-byte name) and passes with the bound.
@@ -45,7 +45,7 @@ large for the bulk area" }` for a 4,062-byte name) and passes with the bound.
   - A walk a page at a time, destroying one unlisted volume and creating one before each page: 2,991 volumes in 37
     pages, each survivor listed once and none twice. A destroyed volume may still be listed until its teardown's
     slices end (a destroy is answered first); under load 198 one was, so the test asserts only what the walk promises.
-  - The longest admitted name, 4,025 bytes, listed.
+  - The longest admitted name, 4,012 bytes, listed.
 - `crates/cli/tests/cli.rs`, `volume_list_answers_a_listing_longer_than_one_reply` (`SLATES_TEST_CLI=1`): 400 volumes
   made and listed through the CLI, plain and JSON, each once.
 - The reproduction again on the fixed binary: `volume list` exited 0 at every count from 100 to 2,000 with one line a
@@ -59,3 +59,10 @@ large for the bulk area" }` for a 4,062-byte name) and passes with the bound.
 - A volume status's `drifted` list, and the conflict lists of `Submitted`, `Rebased` and `GrantRequired`, and
   `Advanced`'s `invalidated`: unbounded by their code; not reproduced.
 - There is no snapshot listing: a volume's status counts its snapshots.
+
+**And a recovery cause** (the merge of main B8, 2026-11-09). B8 gave a summary `not_recovered`, a cause whose text is an
+overlay base's recorded path or the host's refusal, of any length, so one long cause made a page that holds it too large
+again. A listed summary now keeps its cause's text only as far as one page holds it alone (`listed`, the reason cut
+before the path, at character boundaries), and the longest listable name leaves room for every cause's fixed part
+(4,012 bytes). Test: `a_listed_volume_fits_a_page_whatever_its_recovery_cause_says` (`crates/server/src/verbs.rs`: a
+longest name with 10,000-byte path and reason fits no page uncut, and fits one cut, its name whole).

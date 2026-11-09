@@ -8664,6 +8664,9 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   if let Some(reply) = crate::merge_service::destroy_merge_volume(state, principal, volume) {
     return reply;
   }
+  if let Some(reply) = destroy_unrecovered(state, principal, volume) {
+    return reply;
+  }
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
@@ -8851,18 +8854,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       // If this volume is a clone, capture its pin on the origin snapshot before the record goes, so
       // the pin can be released once its destroy completes (§4.5): the origin can then reclaim that
       // snapshot. Best-effort — the origin may be gone or on another shard.
-      let origin_pin = state
-        .db
-        .partition()
-        .lineage(id)
-        .map(|e| (e.origin_volume, e.origin_snapshot))
-        .or_else(
-          || match state.db.partition().volume(id).map(|record| &record.base) {
-            // An image volume's pin on the snapshot it was built from goes with it (A-160).
-            Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
-            _ => None,
-          },
-        );
+      let origin_pin = origin_pin_of(state, id);
       let now = state.clock.monotonic_ns();
       let name = state
         .db
@@ -8885,17 +8877,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       if let Some(name) = name {
         release_name_alias(state, id, &name);
       }
-      if let Some((origin_volume, origin_snapshot)) = origin_pin
-        && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
-      {
-        unpin_origin(
-          state,
-          origin_handle,
-          SnapshotId {
-            value: origin_snapshot.value,
-          },
-        );
-      }
+      release_origin_pin(state, origin_pin);
       if let Ok(slot) = state.volumes.remove(handle) {
         release_slot_credits(state, &slot);
       }
@@ -8905,6 +8887,112 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any
+}
+
+/// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
+/// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
+fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSnapshotId)> {
+  state
+    .db
+    .partition()
+    .lineage(id)
+    .map(|e| (e.origin_volume, e.origin_snapshot))
+    .or_else(
+      || match state.db.partition().volume(id).map(|record| &record.base) {
+        Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
+        _ => None,
+      },
+    )
+}
+
+/// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
+/// Best-effort: the origin may be gone or on another shard.
+fn release_origin_pin(state: &mut ShardState, origin_pin: Option<(DbVolumeId, DbSnapshotId)>) {
+  if let Some((origin_volume, origin_snapshot)) = origin_pin
+    && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
+  {
+    unpin_origin(
+      state,
+      origin_handle,
+      SnapshotId {
+        value: origin_snapshot.value,
+      },
+    );
+  }
+}
+
+/// Destroys a volume recovery could not rebuild (§4.8; GAPS, 2026-11-08), or `None` for any other volume. It has no
+/// slot and holds nothing in this process, so, as a merge volume's destroy is, it is recorded in one step: its
+/// attachments' records end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its snapshots'
+/// records, its lineage and its keys with it and leaves the tombstone a fleet's holders release its copies by. Its name
+/// alias and its pin on an origin's snapshot are given back. Nothing is materialized. Before, every verb on such a
+/// volume answered `NotRecovered`, `destroy` too, so its record stayed for good (banned item 8).
+fn destroy_unrecovered(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if !state.unrecovered.contains_key(&id) {
+    return None;
+  }
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    state.unrecovered.remove(&id);
+    return Some(refused(Refusal::NotFound));
+  };
+  if !rights_of(&record, principal).admin {
+    return Some(forbidden("destroy"));
+  }
+  // A volume whose snapshot a green names as its origin is held with it (A-217), as a rebuilt one is.
+  if state
+    .db
+    .partition()
+    .green_origin_refs()
+    .any(|(_, held)| held.volume == id)
+  {
+    return Some(refused(refusal_of_vfs(&slates_vfs::VfsError::Pinned)));
+  }
+  Some(match record_unrecovered_destroy(state, &record) {
+    Ok(()) => ReplyBody::Destroyed,
+    Err(e) => refused(refusal_of_db(&e)),
+  })
+}
+
+/// Records [`destroy_unrecovered`]'s one step for `record`, then gives back what the volume held outside the catalog.
+/// A refusal part-way leaves what was recorded: a `Destroying` volume is completed at the next start
+/// (`complete_recovered_destroys`), and one still unrecovered is destroyed again.
+fn record_unrecovered_destroy(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Result<(), DbError> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)?;
+  }
+  let origin_pin = origin_pin_of(state, record.id);
+  let now = state.clock.monotonic_ns();
+  for op in [
+    Op::VolumeStateChanged {
+      id: record.id,
+      state: VolumeState::Destroying,
+    },
+    Op::LeaseReleased { volume: record.id },
+    Op::VolumeDestroyed { id: record.id },
+  ] {
+    state.db.mutate(&mut state.segment, &op, now)?;
+  }
+  state.unrecovered.remove(&record.id);
+  release_name_alias(state, record.id, &record.name);
+  release_origin_pin(state, origin_pin);
+  crate::live_ship::forget(state, record.id);
+  retire_local_tombstones(state);
+  Ok(())
 }
 
 /// Returns every credit a torn-down volume held to the shard's ledgers (§4.2 accounting through
@@ -9835,15 +9923,88 @@ fn new_volume_name(body: &RequestBody) -> Option<&str> {
 /// is refused `InvalidName` before anything is made. A `create` request carried names up to 4,062 bytes in a reply
 /// chunk of 4,096 (2026-11-08), whose summary no page held.
 fn longest_listable_name() -> usize {
-  let unnamed = VolumeSummary {
-    id: VolumeId::default(),
-    name: String::new(),
-    referenced_bytes: u64::MAX,
-    unique_bytes: u64::MAX,
-    overlay: false,
-    live_shipped: false,
+  let unnamed = bare_causes()
+    .into_iter()
+    .map(|cause| VolumeSummary {
+      id: VolumeId::default(),
+      name: String::new(),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: false,
+      live_shipped: false,
+      not_recovered: Some(cause),
+    })
+    .map(|summary| summary_bytes(&summary))
+    .max()
+    .unwrap_or(0);
+  list_page_room().saturating_sub(unnamed)
+}
+
+/// Format: every recovery cause with its text empty: the fixed part of the cause a listed volume may carry, which the
+/// longest listable name leaves room for.
+fn bare_causes() -> [slates_ipc::protocol::RecoveryCause; 8] {
+  use slates_ipc::protocol::RecoveryCause;
+  [
+    RecoveryCause::NoImage,
+    RecoveryCause::BlocksUnclaimed,
+    RecoveryCause::BaseMissing {
+      path: String::new(),
+    },
+    RecoveryCause::BaseOnOwnMount {
+      path: String::new(),
+    },
+    RecoveryCause::BaseUnavailable {
+      path: String::new(),
+      reason: String::new(),
+    },
+    RecoveryCause::OriginNotRecovered,
+    RecoveryCause::ImageRefused {
+      reason: String::new(),
+    },
+    RecoveryCause::ResourcesUnavailable {
+      reason: String::new(),
+    },
+  ]
+}
+
+/// `summary` as a listing page carries it (§4.4 `list`): whole when it fits a page alone, else with its recovery
+/// cause's text (the overlay base's path, a refusal's reason) shortened until it does. Its name, at most
+/// [`longest_listable_name`], always fits beside a cause's fixed part, so only the cause's text is ever cut; the cause
+/// names an unrecovered volume's trouble, and a path or a reason of any length cannot refuse the listing it is in.
+fn listed(mut summary: VolumeSummary) -> VolumeSummary {
+  let over = summary_bytes(&summary).saturating_sub(list_page_room());
+  if over > 0
+    && let Some(cause) = summary.not_recovered.as_mut()
+  {
+    shorten_cause(cause, over);
+  }
+  summary
+}
+
+/// Cuts at least `over` bytes from `cause`'s text, its reason before its path, each at a character boundary.
+fn shorten_cause(cause: &mut slates_ipc::protocol::RecoveryCause, mut over: usize) {
+  use slates_ipc::protocol::RecoveryCause;
+  let texts: Vec<&mut String> = match cause {
+    RecoveryCause::BaseMissing { path } | RecoveryCause::BaseOnOwnMount { path } => vec![path],
+    RecoveryCause::BaseUnavailable { path, reason } => vec![reason, path],
+    RecoveryCause::ImageRefused { reason } | RecoveryCause::ResourcesUnavailable { reason } => {
+      vec![reason]
+    }
+    RecoveryCause::NoImage | RecoveryCause::BlocksUnclaimed | RecoveryCause::OriginNotRecovered => {
+      Vec::new()
+    }
   };
-  list_page_room().saturating_sub(summary_bytes(&unnamed))
+  for text in texts {
+    if over == 0 {
+      break;
+    }
+    let mut keep = text.len().saturating_sub(over);
+    while !text.is_char_boundary(keep) {
+      keep = keep.saturating_sub(1);
+    }
+    over = over.saturating_sub(text.len().saturating_sub(keep));
+    text.truncate(keep);
+  }
 }
 
 /// One shard's part of a listing page (§4.4 `list`, §4.3): the volumes it owns that the caller may read, past
@@ -9913,14 +10074,15 @@ fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>)
         .get(&v.id)
         .and_then(|h| state.volumes.get(*h).ok())
         .map(|s| s.volume.accounting());
-      VolumeSummary {
+      listed(VolumeSummary {
         id: to_wire_volume(v.id),
         name: v.name.clone(),
         referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
         unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
         overlay: matches!(v.base, BaseRecord::Path { .. }),
         live_shipped: v.policy.live_shipped,
-      }
+        not_recovered: state.unrecovered.get(&v.id).cloned(),
+      })
     })
     .collect();
   volumes.sort_by_key(|summary| summary.id);
@@ -12851,6 +13013,45 @@ mod tests {
     home_redirect, join_batch, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// §4.4 `list` (A-263 with B8's `not_recovered`). Do: list a summary with the longest listable name and an unrecovered
+  /// overlay's cause whose base path and reason run 10,000 bytes each, multi-byte characters among them; and one whose
+  /// cause is short. Expect: the first fits a page alone, its name whole and its cause the same variant shortened at
+  /// character boundaries; the second is listed unchanged. A cause's text comes from the host and the recorded base, so
+  /// without the cut one long path made the listing it was in "reply too large for the bulk area".
+  #[test]
+  fn a_listed_volume_fits_a_page_whatever_its_recovery_cause_says() {
+    use slates_ipc::protocol::{RecoveryCause, VolumeSummary};
+    let summary = |cause: RecoveryCause| VolumeSummary {
+      id: VolumeId::default(),
+      name: "n".repeat(super::longest_listable_name()),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: true,
+      live_shipped: false,
+      not_recovered: Some(cause),
+    };
+    let long = "é/".repeat(3_334);
+    let whole = summary(RecoveryCause::BaseUnavailable {
+      path: long.clone(),
+      reason: long,
+    });
+    assert!(
+      super::summary_bytes(&whole) > super::list_page_room(),
+      "uncut, it fits no page"
+    );
+    let listed = super::listed(whole);
+    assert!(super::summary_bytes(&listed) <= super::list_page_room());
+    assert_eq!(listed.name.len(), super::longest_listable_name());
+    assert!(matches!(
+      listed.not_recovered,
+      Some(RecoveryCause::BaseUnavailable { .. })
+    ));
+    let short = summary(RecoveryCause::BaseMissing {
+      path: String::new(),
+    });
+    assert_eq!(super::listed(short.clone()), short);
+  }
 
   /// A volume owned by `owner`, sharing it with each of `access`.
   fn volume_owned_by(
