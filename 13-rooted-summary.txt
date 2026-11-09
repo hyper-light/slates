@@ -1,0 +1,8 @@
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-0bf3c6c5352b74c6\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
+test a_link_relative_to_the_drives_root_follows_its_directory_when_moved ... slates anchor: instance wsrooted5556 up; daemon pid 856; 2 shards
+thread 'a_link_relative_to_the_drives_root_follows_its_directory_when_moved' (4016) panicked at crates\cli\tests\winfsp_semantics.rs:989:3:
+assertion `left != right` failed: FSCTL_SET_REPARSE_POINT: A required privilege is not held by the client. (os error 1314)
+  left: 0
+ right: 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.68s
+exit 101
