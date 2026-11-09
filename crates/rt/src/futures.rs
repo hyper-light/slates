@@ -45,6 +45,18 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// Diagnostics only (A-223, the window-rule arms): a fixed idle window in nanoseconds from
+/// `SLATES_DIAG_IDLE_WINDOW_NS`, read once; `None` when unset, and the window is derived as on the branch.
+#[allow(clippy::disallowed_methods)]
+pub fn diag_idle_window_ns() -> Option<u64> {
+  static WINDOW: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+  *WINDOW.get_or_init(|| {
+    std::env::var("SLATES_DIAG_IDLE_WINDOW_NS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+  })
+}
+
 /// The current shard's online wake estimate in nanoseconds (the configured step budget when it tracks
 /// none). `None` off a shard thread.
 pub fn wake_cost_ns() -> Option<u64> {

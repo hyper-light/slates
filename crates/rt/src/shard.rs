@@ -1431,6 +1431,9 @@ impl ShardContext {
   /// the mean counts the wait a woken shard spends runnable for a CPU, which costs no CPU and which a
   /// spinning shard lengthens itself, so a window on the mean fed on its own spinning (A-223).
   fn spin_window_ns(&self) -> u64 {
+    if let Some(window) = crate::futures::diag_idle_window_ns() {
+      return window;
+    }
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
       estimate.floor_ns().max(1).saturating_mul(self.idle_ratio)
     })
