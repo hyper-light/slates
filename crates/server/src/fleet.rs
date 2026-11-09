@@ -7558,18 +7558,49 @@ async fn peer_recipient(
   anchor: u64,
   budget: CommitBudget,
 ) -> Option<hyper_seal::recipient::RecipientPublic> {
-  if let Some(Some(known)) = state::with_state(|s| s.peer_recipients.get(&anchor).cloned()) {
+  if let Some(Some(known)) =
+    state::with_state(|s| kept_recipient(&s.peer_recipients, anchor, member))
+  {
     return Some(known);
   }
   let answer = request_peer(member, RECIPIENT_STREAM, &[], budget).await?;
   let public = crate::seal_keys::decode_public(&answer)?;
   let kept = public.clone();
   state::with_state(|s| {
-    if s.peer_recipients.len() < s.config.fleet_peer_capacity.max(1) {
-      s.peer_recipients.insert(anchor, kept);
-    }
+    let capacity = s.config.fleet_peer_capacity.max(1);
+    keep_recipient(&mut s.peer_recipients, capacity, anchor, member, kept);
   });
   Some(public)
+}
+
+/// The recipient key kept for the node at `anchor`, when it was learned from `member`: a node back at its anchor with
+/// fresh RAM (the same certificate, so the same anchor) has a new member id and a recipient of its own, so a key learned
+/// from its predecessor is not its key. Kept by anchor alone, the predecessor's key was used for the replacement for
+/// good: every pair wrapped to it was refused (1,583 of 1,583, diag-live-durability-72), so the replacement could open
+/// no key it was sent (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
+fn kept_recipient(
+  kept: &std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
+  anchor: u64,
+  member: HostId,
+) -> Option<hyper_seal::recipient::RecipientPublic> {
+  kept
+    .get(&anchor)
+    .filter(|(learned_from, _)| *learned_from == member)
+    .map(|(_, public)| public.clone())
+}
+
+/// Keeps `public`, learned from `member` at `anchor`: replacing what the anchor's earlier member gave, or a new anchor
+/// while fewer than `capacity` are kept (the bound `pairs_delivered` keeps too).
+fn keep_recipient(
+  kept: &mut std::collections::BTreeMap<u64, (HostId, hyper_seal::recipient::RecipientPublic)>,
+  capacity: usize,
+  anchor: u64,
+  member: HostId,
+  public: hyper_seal::recipient::RecipientPublic,
+) {
+  if kept.len() < capacity || kept.contains_key(&anchor) {
+    kept.insert(anchor, (member, public));
+  }
 }
 
 /// One request to `host` over its record session, within the round's budget: the reply, or `None` when no session to
@@ -8104,6 +8135,41 @@ mod discovery_wait_tests {
 
 #[cfg(test)]
 mod tests {
+
+  /// A node back at its anchor with fresh RAM (its store destroyed, the same certificate) has a recipient of its own: the
+  /// key learned from its predecessor is not used to deliver to it, and its own replaces the predecessor's even with the
+  /// cache full. Kept by anchor alone, every pair the survivors sent the replacement was wrapped to the destroyed node's
+  /// key and refused (1,583 of 1,583, diag-live-durability-72): the replacement could open no key it was sent.
+  #[test]
+  fn a_recipient_learned_from_a_predecessor_is_not_used_for_its_replacement() {
+    let destroyed = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let fresh = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let (anchor, predecessor, replacement) = (7, HostId(1), HostId(2));
+    // Shape: a cache with room for this one anchor alone.
+    let capacity = 1;
+    let mut kept = std::collections::BTreeMap::new();
+    super::keep_recipient(&mut kept, capacity, anchor, predecessor, destroyed.clone());
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, predecessor),
+      Some(destroyed),
+      "the predecessor's key, for the predecessor"
+    );
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, replacement),
+      None,
+      "the replacement at the same anchor is asked for its own key"
+    );
+    super::keep_recipient(&mut kept, capacity, anchor, replacement, fresh.clone());
+    assert_eq!(
+      super::kept_recipient(&kept, anchor, replacement),
+      Some(fresh),
+      "the replacement's key replaces the predecessor's, the cache full"
+    );
+  }
 
   /// A region of five members at `f = 1` with one neighbourhood of all of them, and an object host 1 created.
   fn content_region() -> (slates_db::register::RegionalConfiguration, ObjectId, u64) {
