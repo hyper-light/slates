@@ -8,6 +8,14 @@ mod guest;
 
 #[cfg(target_os = "linux")]
 fn main() {
+  // Run by a guest's `Escalate` as a planted setuid program (A-94): it says the effective uid it runs with, and is no
+  // `/init`.
+  if std::env::args().nth(1).as_deref() == Some(slates_guest_probe::protocol::REPORT_EUID) {
+    use std::io::Write;
+    let said = writeln!(std::io::stdout(), "{}", rustix::process::geteuid().as_raw());
+    // A refused write exits non-zero; the guest that ran it reports the empty answer as a refusal.
+    std::process::exit(i32::from(said.is_err()));
+  }
   guest::run()
 }
 
