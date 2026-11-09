@@ -1041,6 +1041,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
   live.image_anchors = anchors;
   live.owes_image = false;
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-IMAGE wall_ns {} head {} bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), head.position, live.whole.as_ref().map_or(0, |(_, image)| image.len())).as_bytes());
   state.count(LIVE_IMAGE, 1);
 }
 
@@ -1605,7 +1606,9 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     stream: slates_cluster::live::LIVE_STATE_STREAM,
     bytes: install.encode(),
     image: Some(*head),
-    watched: watch_install(live.cut_installs.get(&holder).copied(), *head),
+    // Diag only (live-durability-69, never on main): SLATES_DIAG_WATCH_OFF=1 sends every install unwatched.
+    watched: watch_install(live.cut_installs.get(&holder).copied(), *head)
+      && std::env::var("SLATES_DIAG_WATCH_OFF").is_err(),
   };
   (Some(send), false)
 }
@@ -1859,6 +1862,8 @@ async fn ship_lane(
       lost: holder_lost,
       silence_ns: crate::daemon::LIVENESS_BUDGET_NS,
     });
+    let diag_had = !sessions.is_empty();
+    let diag_began = slates_rt::futures::now_ns();
     let exchanged = slates_cluster::live::exchange_watched(
       (send.stream, &send.bytes),
       sessions,
@@ -1867,6 +1872,9 @@ async fn ship_lane(
       |_, _| true,
     )
     .await;
+    if diag_had && send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+      let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-LANE install wall_ns {} holder {} bytes {} budget_ns {} took_ns {} answered {} cut {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), holder.0, send.bytes.len(), exchange.max_deadline_ns(), slates_rt::futures::now_ns().saturating_sub(diag_began), !exchanged.replies.is_empty(), exchanged.cut.contains(&holder)).as_bytes());
+    }
     if let Some(image) = send.image
       && exchanged.cut.contains(&holder)
     {
@@ -1925,8 +1933,12 @@ fn exchange_budget(
       .checked_div(endpoint.congestion_window().max(1))
       .unwrap_or(0)
   });
+  // Diag only (live-durability-69, never on main): an install's budget held at a floor, standing in for the uncapped case.
+  let floor_ns = if bytes >= 65_536 {
+    std::env::var("SLATES_DIAG_INSTALL_FLOOR_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).map_or(0, |ms| ms.saturating_mul(1_000_000))
+  } else { 0 };
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
+    live.deadline_ns.saturating_add(transfer_ns).max(floor_ns),
     live.poll_interval_ns,
   )
 }
@@ -2326,6 +2338,15 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  // Diag only (live-durability-69, never on main): the first install served after the file `any` appears stops this
+  // daemon before it answers, its pid left in `stopped`.
+  if let Ok(dir) = std::env::var("SLATES_DIAG_STOP_DIR") {
+    let pid = std::process::id();
+    if std::fs::remove_file(format!("{dir}/{pid}")).is_ok() {
+      let _ = std::fs::write(format!("{dir}/stopped"), pid.to_string());
+      let _ = std::process::Command::new("kill").args(["-STOP", &pid.to_string()]).status();
+    }
+  }
   let object = slates_db::live::object_of_state(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -2359,6 +2380,7 @@ pub(crate) fn serve_install(
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
+  let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-TAKE wall_ns {} from {} reply {:?}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), peer.0, reply.as_ref().map(|head| head.map(|head| head.position)).map_err(|error| format!("{error:?}"))).as_bytes());
   encode_reply(&reply)
 }
 
