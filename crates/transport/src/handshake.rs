@@ -80,6 +80,13 @@ impl Identity {
   pub fn certificate(&self) -> CertificateDer<'static> {
     self.cert.clone()
   }
+
+  /// This identity's stateless reset key (`crate::reset`, A-261), derived from its private key, which only this node
+  /// holds: the same identity derives the same key after a restart, and no peer, which sees only the certificate,
+  /// can. `None` when the provider offers no SHA-256 suite.
+  pub fn reset_key(&self) -> Option<crate::reset::ResetKey> {
+    crate::reset::ResetKey::derive(self.key.secret_der())
+  }
 }
 
 /// The aws-lc-rs crypto provider (AWS-LC, the workspace's one cryptographic library), with rustls' standard groups

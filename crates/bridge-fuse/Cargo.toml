@@ -13,6 +13,8 @@ slates-machine = { workspace = true }
 slates-vfs = { workspace = true }
 slates-bridge-core = { workspace = true }
 slates-mem = { workspace = true }
+# A join a shard waits on, marked so the watchdog reads it as the joined thread runs (A-228's transitive wait).
+slates-rt = { workspace = true }
 slates-base = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

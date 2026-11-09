@@ -1100,7 +1100,8 @@ fn serve_write(
 
 /// The node a message writes back from the kernel's page cache: `Some` for a `WRITE` carrying
 /// [`crate::abi::WRITE_CACHE`], `None` for any other message, a process's own `write(2)` included. A transport that
-/// tracks what its kernel holds stale routes these through [`serve_cache_write`] (`crate::channel`).
+/// tracks what its kernel holds stale judges these by the dirty-page write-back rule
+/// ([`crate::coherence::judge_writeback`]; `crate::channel`, `crate::guest_writeback`).
 pub fn cache_writeback(message: &[u8]) -> Option<u64> {
   let request = Request::parse(message).ok()?;
   if request.opcode != Some(Opcode::Write) {
@@ -1108,92 +1109,6 @@ pub fn cache_writeback(message: &[u8]) -> Option<u64> {
   }
   let write = WriteIn::parse(Opcode::Write.to_wire(), request.body).ok()?;
   (write.write_flags & crate::abi::WRITE_CACHE != 0).then_some(request.header.nodeid)
-}
-
-/// The parts of a write of `len` bytes at `offset` that lie outside `stale` (ascending, disjoint byte ranges), each as
-/// its file offset and its range within the write's data. A cache write-back applies exactly these, and the daemon logs
-/// exactly these for replay (A-63), so what is applied and what a recovery replays cannot disagree (§4.6, the
-/// dirty-page write-back rule in `crate::channel`).
-pub fn unmasked_segments(
-  offset: u64,
-  len: usize,
-  stale: &[std::ops::Range<u64>],
-) -> Vec<(u64, std::ops::Range<usize>)> {
-  let end = offset.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-  let within = |at: u64| {
-    usize::try_from(at.saturating_sub(offset))
-      .unwrap_or(len)
-      .min(len)
-  };
-  let mut segments = Vec::new();
-  let mut cursor = offset;
-  for range in stale {
-    if range.end <= cursor {
-      continue;
-    }
-    if range.start >= end {
-      break;
-    }
-    if range.start > cursor {
-      segments.push((cursor, within(cursor)..within(range.start)));
-    }
-    cursor = range.end;
-    if cursor >= end {
-      break;
-    }
-  }
-  if cursor < end {
-    segments.push((cursor, within(cursor)..len));
-  }
-  segments
-}
-
-/// Serves a cache write-back whose file changed through another path since the kernel last confirmed it: applies only
-/// the parts outside `stale` ([`unmasked_segments`]) and answers the whole size, since the page then holds what one
-/// shared page cache would — the store the process made, and the other path's newer bytes where they differ
-/// (`crate::channel`, the dirty-page write-back rule). Returns the reply's length and the bytes kept back.
-pub fn serve_cache_write(
-  message: &[u8],
-  bridge: &mut dyn Bridge,
-  cx: &OpContext,
-  stale: &[std::ops::Range<u64>],
-  out: &mut [u8],
-) -> (usize, u64) {
-  let parsed = Request::parse(message).ok().and_then(|request| {
-    let write = WriteIn::parse(Opcode::Write.to_wire(), request.body).ok()?;
-    Some((request.header.unique, request.header.nodeid, write))
-  });
-  let Some((unique, nodeid, write)) = parsed else {
-    return (refuse_with_eio(message, out), 0);
-  };
-  let object = ObjectId {
-    inode: nodeid,
-    generation: 0,
-  };
-  let segments = unmasked_segments(write.offset, write.data.len(), stale);
-  let applied: usize = segments.iter().map(|(_, range)| range.len()).sum();
-  let kept_back = u64::try_from(write.data.len().saturating_sub(applied)).unwrap_or(u64::MAX);
-  // The bytes before a short or refused segment count as written — the kept-back ones included, since the page
-  // holds what it should there — so a short segment answers a short write from that point, as a short write does.
-  let mut answered = write.data.len();
-  for (at, range) in segments {
-    let Some(bytes) = write.data.get(range.clone()) else {
-      continue;
-    };
-    match bridge.write(object, cx, at, bytes) {
-      Ok(wrote) => {
-        let wrote = usize::try_from(wrote).unwrap_or(0);
-        if wrote < bytes.len() {
-          answered = range.start.saturating_add(wrote);
-          break;
-        }
-      }
-      Err(e) => return (reply_err(unique, e, out), kept_back),
-    }
-  }
-  let size = u32::try_from(answered).unwrap_or(u32::MAX);
-  let reply = reply(unique, Ok(WriteOut { size }), |o| o.to_bytes(), out);
-  (reply, kept_back)
 }
 
 /// Answers `message` with `EIO` alone, its unique id read from the header (nothing, for a message too short to name
