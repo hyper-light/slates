@@ -89,7 +89,9 @@ with no content hunks. Its existing deterministic golden vector was updated for 
 
 NFS MKNOD and Linux FUSE MKNOD create these kinds. Attributes and directory listings report the
 actual type. Device MKNOD remains refused; NFS uses BADTYPE, as RFC 1813 §3.3.11 requires when a
-server supports some special types but not the requested one. Truncated-request tests exercise
+server supports some special types but not the requested one. (Since A-268, 2026-11-08, it answers `PERM`, after
+`EXIST` for a taken name and `ACCES` for an unwritable directory: the Linux client turned BADTYPE into its internal
+errno 527.) Truncated-request tests exercise
 every cut of each new parser and verify that no name appears. FSKit and WinFsp return explicit
 unsupported-operation errors; they do not project these nodes as ordinary files.
 

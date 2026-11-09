@@ -9,8 +9,8 @@ use slates_bridge_nfs::nfs::Nfsfh3;
 use slates_bridge_nfs::v4::Nfsstat4;
 use slates_bridge_nfs::v4::delegation::{Conflict, DelegationRecord};
 use slates_bridge_nfs::v4::files::{
-  FileChange, FileState, IoAuthority, IoWant, LockRefused, LockRequest, Locker, Share, owner_tag,
-  share,
+  FileChange, FileState, Holding, IoAuthority, IoWant, LockRefused, LockRequest, Locker, Share,
+  owner_tag, share,
 };
 use slates_bridge_nfs::v4::lock::{LockKind, Range};
 use slates_db::catalog::VolumeId;
@@ -569,4 +569,96 @@ fn the_gate_updated_by_changed_inodes_equals_a_whole_rebuild() {
     .unwrap();
   files.delegate_write(B, &write, 0, QUIET).unwrap();
   check(&mut files, "a write grant");
+}
+
+/// A-260. Do: through a durable owner's file state, open a file, open it again under the same open-owner (an upgrade),
+/// grant a read delegation of it, return the delegation, close the open, then open two files for one client and purge
+/// the client. Expect: one hold taken per new open and per delegation and none for the upgrade, one given back at each
+/// end however it ended, and nothing queued for the opens a restore puts back (a recovery takes those from the same
+/// records) nor by a standalone server, which holds nothing in a volume.
+#[test]
+fn every_open_and_delegation_takes_one_hold_and_gives_it_back_at_its_end() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  let opened = files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
+  assert_eq!(
+    files.take_holdings(),
+    vec![Holding::Took(fh.clone())],
+    "a new open takes one hold, its upgrade none"
+  );
+  let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
+  files.return_delegation(&delegation, A, &fh).unwrap();
+  assert_eq!(
+    files.take_holdings(),
+    vec![Holding::Took(fh.clone()), Holding::Gave(fh.clone())],
+    "a delegation holds the file from its grant to its return"
+  );
+  let current = slates_bridge_nfs::v4::types::Stateid {
+    seqid: 0,
+    other: opened.other,
+  };
+  files.close(&current, &fh, A).unwrap();
+  assert_eq!(
+    files.take_holdings(),
+    vec![Holding::Gave(fh.clone())],
+    "the close gives the open's hold back"
+  );
+  let (first, second) = (handle(11, 1), handle(12, 1));
+  // The restore below is made from these two opens' records alone.
+  files.take_changes();
+  for held in [&first, &second] {
+    files
+      .open(B, b"b".to_vec(), OPENER, held, read_write())
+      .unwrap();
+  }
+  let restored = FileState::restore(
+    owner_tag(0, 2),
+    BOUND,
+    BOUND,
+    files
+      .take_changes()
+      .into_iter()
+      .filter_map(|change| match change {
+        FileChange::OpenSet(record) => Some(record),
+        _ => None,
+      })
+      .collect(),
+    Vec::new(),
+    Vec::new(),
+  );
+  assert_eq!(
+    restored.held_files().len(),
+    2,
+    "a restore keeps both opens to hold again"
+  );
+  let mut restored = restored;
+  assert_eq!(
+    restored.take_holdings(),
+    Vec::new(),
+    "a restore queues nothing"
+  );
+  files.take_holdings();
+  files.purge(B);
+  let mut gave = files.take_holdings();
+  gave.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+  let mut expected = vec![Holding::Gave(first), Holding::Gave(second)];
+  expected.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+  assert_eq!(
+    gave, expected,
+    "a client's purge gives back each of its opens' holds"
+  );
+  let mut standalone = FileState::standalone();
+  standalone
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
+  assert_eq!(
+    standalone.take_holdings(),
+    Vec::new(),
+    "a standalone server holds nothing"
+  );
 }
