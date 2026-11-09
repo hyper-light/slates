@@ -165,6 +165,11 @@ pub struct SealJob {
   /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
   /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
   pub healing: bool,
+  /// For a healing job that cannot restore the holders the shipped head names (one is no longer a member, or one has
+  /// not acknowledged within the membership horizon): it places on the current cohort instead, and once recorded the
+  /// head is republished at the next sequence naming that set, since a holder never takes a new value at a position it
+  /// holds (§4.10 "the healer"; 2026-11-08). False for every other job.
+  pub republish: bool,
   /// For a mirror shipment (`crate::mirror`): the mirror holders of its content that acknowledged its head and
   /// catalog records. Placed in the mirror once `f + 1` hold both. Empty for a home seal.
   pub records_acked: Vec<HostId>,

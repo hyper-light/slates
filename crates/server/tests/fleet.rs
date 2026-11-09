@@ -9620,6 +9620,403 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
   );
 }
 
+/// Shape: how long the owner's session to its first-ranked content candidate is held out while the seal places, so the
+/// seal's first content round reaches no one and the hedged round places the content on the other candidate alone:
+/// past the first hedge (one heartbeat before any reading) and its round, and short of a council election.
+const FIRST_CANDIDATE_HOLD_NS: u64 = LIVENESS_BUDGET_NS;
+
+/// Shape: how many times [`a_heal_leaves_the_head_naming_holders_that_hold_the_content`] has the named holder lose the
+/// content: the first loss leaves the first-ranked candidate holding a copy the head does not name, and the second is
+/// the one a heal that offers that candidate first never restores.
+const HEALER_LOSSES: usize = 2;
+
+/// Shape: the coordinator periods the named holders get to hold the content whole again after a loss: three of the
+/// healer's at-rest periods (one placed snapshot per hundred periods, `fleet::HEAL_PERIODS_AT_REST`), so a healer that
+/// restores the named set does so several times over within it.
+const NAMED_SET_PERIODS: u64 = 300;
+
+/// §4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs …"; §4.8 "Promotion and takeover":
+/// after a recorded content holder loses the content and the healer runs, the holders a successor reads, the ones the
+/// shipped head names, hold the content whole, and a successor serves it once the owner dies. Do place a snapshot on
+/// the owner and its second-ranked candidate only, by holding the owner's session to the first-ranked one out while
+/// the seal places, so the head names the second; drop that holder's copy; let the healer run; then kill the owner.
+/// Expect every head the survivors hold to name holders that hold the content, within three healer periods, and the
+/// successor to read the file back byte for byte. Found reading why `a_holder_that_lost_placed_content_is_repaired_by_
+/// the_healer` failed under the suite's load (2026-11-08): the healer re-offers to the first-ranked candidate only, and
+/// a placement it re-records under another holder set never reaches the head the holders keep, since a head is never
+/// rewritten at its sequence.
+#[test]
+fn a_heal_leaves_the_head_naming_holders_that_hold_the_content() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "renamed-holders";
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("setup: the volume was not created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  write_hello_over_nfs(&daemons[0], name);
+  let object = ObjectId(id.bytes);
+  // The content candidates in the owner's put order: the seal's first round goes to the first remote one.
+  let order: Vec<HostId> = daemons[0]
+    .placement_candidates(object)
+    .unwrap()
+    .into_iter()
+    .filter(|host| *host != hosts[0])
+    .collect();
+  let index_of = |host: HostId| hosts.iter().position(|known| *known == host).unwrap();
+  let (first, second) = (index_of(order[0]), index_of(order[1]));
+  let hold = daemons[0].hold_record_session(hosts[first], FIRST_CANDIDATE_HOLD_NS);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("setup: the snapshot was not taken");
+  };
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&all, &mut client, id, snapshot);
+  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+  let heads_held = poll_all_hold(&survivors, object);
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  let named_at_seal = named_holders(&daemons[second], object);
+  let setup = placed
+    && heads_held
+    && manifest.is_some_and(|manifest| {
+      daemons[second].fleet_holder_content(manifest) == Ok(true)
+        && daemons[first].fleet_holder_content(manifest) == Ok(false)
+    })
+    && named_at_seal.as_ref().is_some_and(|holders| {
+      holders.contains(&hosts[second].0) && !holders.contains(&hosts[first].0)
+    });
+  let Some(manifest) = manifest.filter(|_| setup) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!(
+      "setup: the content placed on the second-ranked candidate alone and the head names it (hold {hold:?}, placed \
+       {placed}, heads held {heads_held}, named {named_at_seal:?}, first {first}, second {second})"
+    );
+  };
+
+  // The named holder loses the content twice, the healer running after each. On the first, the first-ranked
+  // candidate has nothing, so a heal that offers it first must send it bytes; that outlasts the hedge delay, the round
+  // hedges, and the named holder is refilled too. That leaves the first-ranked candidate holding the content though the
+  // head does not name it: the state the flaky healer test reached when its own seal hedged. On the second loss a heal
+  // that offers it first is answered at once, places there, and never offers the named holder.
+  let (losses, views) = lose_and_heal(&daemons, hosts[0], object, second, manifest);
+
+  // The owner dies; its successor serves the content.
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, daemons[successor_index].instance(), id);
+  let got = served.then(|| read_hello_over_nfs(&daemons[successor_index], name));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  for (loss, (forgotten, lost, whole, holding)) in losses.iter().enumerate() {
+    assert!(
+      *forgotten == Ok(true) && *lost,
+      "loss {}: the named holder lost the content (forgotten={forgotten:?}, lost={lost})",
+      loss + 1
+    );
+    assert!(
+      *whole,
+      "loss {}: every head the survivors hold names holders that hold the content: heads name {views:?}; holding a, b, \
+       c {holding:?}; named at the seal {named_at_seal:?}",
+      loss + 1
+    );
+  }
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the successor (index {}) reads the file back byte for byte",
+    successor_index + 1
+  );
+}
+
+/// What one loss of the named holder's copy came to: whether the copy was dropped and seen gone, whether every head the
+/// survivors hold came to name holders that hold the content, and each daemon's holding after.
+type HealedLoss = (
+  Result<bool, ObserveError>,
+  bool,
+  bool,
+  Vec<Result<bool, ObserveError>>,
+);
+
+/// Has `daemons[holder]` lose its copy of `manifest` [`HEALER_LOSSES`] times, waiting after each for every head the
+/// survivors hold of `object` to name holders that hold it ([`NAMED_SET_PERIODS`]): each loss's outcome, and the heads
+/// as last seen.
+fn lose_and_heal(
+  daemons: &[Daemon],
+  owner: HostId,
+  object: ObjectId,
+  holder: usize,
+  manifest: [u8; 32],
+) -> (Vec<HealedLoss>, Vec<Option<Vec<u64>>>) {
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut losses = Vec::new();
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  for _ in 0..HEALER_LOSSES {
+    let forgotten = daemons[holder].drop_held_content(manifest);
+    let lost = daemons[holder].fleet_holder_content(manifest) == Ok(false);
+    let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+      views = daemons[1..]
+        .iter()
+        .map(|daemon| named_holders(daemon, object))
+        .collect();
+      Ok(heads_name_holders_that_hold(
+        daemons, owner, &views, manifest,
+      ))
+    });
+    let holding = daemons
+      .iter()
+      .map(|daemon| daemon.fleet_holder_content(manifest))
+      .collect();
+    losses.push((forgotten, lost, whole, holding));
+  }
+  (losses, views)
+}
+
+/// A sealed volume, its manifest, the holders its shipped head names, and the index of one of them past the owner.
+type SealedNamed = (VolumeId, [u8; 32], Option<Vec<u64>>, usize);
+
+/// Seals `name` on the owner (`daemons[0]`) and finds the holder its shipped head names past the owner: the volume, its
+/// manifest, the holders the head names, and that holder's index; why not, when the setup did not complete.
+fn sealed_with_a_named_remote(
+  instance: &str,
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  name: &str,
+) -> Result<SealedNamed, String> {
+  let id = seal_hello_on_owner(instance, daemons, name)?;
+  let object = ObjectId(id.bytes);
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  let (named, remote) = named_remote(daemons, hosts, object);
+  match (manifest, remote) {
+    (Some(manifest), Some(remote)) => Ok((id, manifest, named, remote)),
+    _ => Err(format!(
+      "the head names a remote holder: manifest {manifest:?}, named {named:?}"
+    )),
+  }
+}
+
+/// What a client sees of volume `id` in its status: the head, the snapshot and attachment counts, the bytes it
+/// references and its lease epoch; `None` when the status does not answer a report.
+fn client_view(
+  client: &mut Client,
+  id: VolumeId,
+) -> Option<(SnapshotId, u32, u32, u64, Option<u64>)> {
+  match client.call(&RequestBody::Status { volume: id }) {
+    ReplyBody::Status { report } => Some((
+      report.head,
+      report.snapshots,
+      report.attachments,
+      report.referenced_bytes,
+      report.lease_epoch,
+    )),
+    _ => None,
+  }
+}
+
+/// The holders the head names as one of `daemons` (other than the owner, `daemons[0]`) holds it, and the index of the
+/// first of `daemons` past the owner that the head names.
+fn named_remote(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  object: ObjectId,
+) -> (Option<Vec<u64>>, Option<usize>) {
+  let named = (1..daemons.len()).find_map(|index| named_holders(&daemons[index], object));
+  let remote = named
+    .as_ref()
+    .and_then(|holders| (1..daemons.len()).find(|index| holders.contains(&hosts[*index].0)));
+  (named, remote)
+}
+
+/// The content holders the head `daemon` holds for `object` names, or `None` when it holds no head.
+fn named_holders(daemon: &Daemon, object: ObjectId) -> Option<Vec<u64>> {
+  daemon
+    .fleet_holder_head(object)
+    .ok()
+    .flatten()
+    .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+    .map(|head| head.content_holders)
+}
+
+/// Whether the heads in `views` (one per daemon, `None` where it holds none) are at least one, and each names, besides
+/// `owner`, only members among `daemons` that hold `manifest` whole: the holders a successor would fetch from.
+fn heads_name_holders_that_hold(
+  daemons: &[Daemon],
+  owner: HostId,
+  views: &[Option<Vec<u64>>],
+  manifest: [u8; 32],
+) -> bool {
+  let held: Vec<&Vec<u64>> = views.iter().flatten().collect();
+  !held.is_empty()
+    && held.iter().all(|holders| {
+      holders.iter().filter(|host| **host != owner.0).all(|host| {
+        daemons
+          .iter()
+          .find(|daemon| {
+            daemon
+              .member_identity()
+              .is_ok_and(|member| member.0 == *host)
+          })
+          .is_some_and(|daemon| daemon.fleet_holder_content(manifest) == Ok(true))
+      })
+    })
+}
+
+/// Waits for one of `daemons` to take `object` over (its head placed there), then reads `name`'s file back from it:
+/// whether one did, and the bytes read.
+fn successor_reads(
+  daemons: &[Daemon],
+  object: ObjectId,
+  id: VolumeId,
+  name: &str,
+) -> (bool, Option<Vec<u8>>) {
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut successor = None;
+  let took_over = poll_until(&survivors, SERVE_DEADLINE, || {
+    successor = daemons
+      .iter()
+      .position(|daemon| daemon.fleet_head_placed(object) == Ok(true));
+    Ok(successor.is_some())
+  });
+  let got = successor.and_then(|index| {
+    poll_status_answers(&survivors, daemons[index].instance(), id)
+      .then(|| read_hello_over_nfs(&daemons[index], name))
+  });
+  (took_over, got)
+}
+
+/// §4.10 "the healer"; §4.8 "Promotion and takeover": a holder the shipped head names that leaves the fleet is replaced
+/// by a heal, and the head is republished naming holders that hold the content, so the owner's later death is survived.
+/// Do seal a snapshot on a five-node `f = 1` fleet, stop the remote holder the head names and let the survivors retire
+/// it, let the healer run, then kill the owner. Expect every head a survivor holds to name only members that hold the
+/// content, within three healer periods of the retirement; the owner to have republished the head with nothing a client
+/// sees changed (the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes); and a
+/// survivor to take the volume over and read the file back byte for byte. Two failures, one after the fleet absorbed the other: within `f`. Before, a heal re-recorded the
+/// placement on the current cohort but the head kept naming the departed holder, since a head is never rewritten at its
+/// sequence (2026-11-08).
+#[test]
+fn a_heal_republishes_the_head_once_a_named_holder_has_left() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "departed-holder";
+  let (id, manifest, named_at_seal, departing) =
+    match sealed_with_a_named_remote(&instance_a, &daemons, &hosts, name) {
+      Ok(sealed) => sealed,
+      Err(why) => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("setup: {why}");
+      }
+    };
+  let object = ObjectId(id.bytes);
+  // What a client sees of the volume before the heal: a republish must change none of it but the placement.
+  let mut client = Client::connect(&instance_a);
+  let before = client_view(&mut client, id);
+  let read_before = read_hello_over_nfs(&daemons[0], name);
+
+  // The named holder leaves the fleet; the survivors retire it.
+  let gone = hosts[departing];
+  daemons.remove(departing).stop();
+  let retired = poll_survivors_retire(&daemons, gone);
+  // The healer replaces it, and the head is republished naming members that hold the content.
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    views = daemons[1..]
+      .iter()
+      .map(|daemon| named_holders(daemon, object))
+      .collect();
+    Ok(heads_name_holders_that_hold(
+      &daemons, hosts[0], &views, manifest,
+    ))
+  });
+  let after = client_view(&mut client, id);
+  let read_after = read_hello_over_nfs(&daemons[0], name);
+  let republished = daemons[0]
+    .fleet_refusals()
+    .map(|counters| counters.get("fleet.heal.republished").copied().unwrap_or(0));
+
+  // The owner dies; a survivor takes the volume over and serves it.
+  let owner = hosts[0];
+  daemons.remove(0).stop();
+  let (took_over, got) = successor_reads(&daemons, object, id, name);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    retired,
+    "the survivors retired the departed holder {gone:?}"
+  );
+  assert!(
+    whole,
+    "every head the survivors hold names members that hold the content: heads name {views:?}; named at the seal \
+     {named_at_seal:?}; departed {gone:?}; republished {republished:?}"
+  );
+  assert!(
+    republished.as_ref().is_ok_and(|count| *count > 0),
+    "the owner republished the head: {republished:?}"
+  );
+  assert!(
+    before.is_some() && before == after && read_before == read_after,
+    "a republish changes nothing a client sees but the placement: status (head, snapshots, attachments, referenced, \
+     lease epoch) {before:?} → {after:?}; the file read the same: {}",
+    read_before == read_after
+  );
+  assert!(
+    took_over,
+    "a survivor took over the dead owner {owner:?}'s volume"
+  );
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the successor reads the file back byte for byte"
+  );
+}
+
 /// AC (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 /// subtrees; the healer replays puts that never reached f+1"; §4.8 "Derived constants": "healer cadence from
 /// the measured put-failure rate"; §4.8 "Recovery": a restarted holder "holds nothing for others until
@@ -9665,19 +10062,36 @@ fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
   };
   let object = ObjectId(id.bytes);
   let manifest = daemons[0].fleet_head_manifest(object);
+  // A holder the shipped head names: the one a successor would fetch from. A copy outside the named set (a hedged
+  // round's straggler) is not one the placement promised, and dropping it tested nothing the healer owes.
+  let named: Vec<u64> = (1..n)
+    .find_map(|index| {
+      daemons[index]
+        .fleet_holder_head(object)
+        .ok()
+        .flatten()
+        .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+    })
+    .map(|head| head.content_holders)
+    .unwrap_or_default();
   let holder_index = manifest
     .as_ref()
     .ok()
     .copied()
     .flatten()
     .and_then(|manifest| {
-      (1..n).find(|index| daemons[*index].fleet_holder_content(manifest) == Ok(true))
+      (1..n).find(|index| {
+        named.contains(&hosts[*index].0)
+          && daemons[*index].fleet_holder_content(manifest) == Ok(true)
+      })
     });
   let (Ok(Some(manifest)), Some(holder_index)) = (&manifest, holder_index) else {
     for daemon in daemons {
       daemon.stop();
     }
-    panic!("the sealed content placed on a recorded holder: {manifest:?} {holder_index:?}");
+    panic!(
+      "the sealed content placed on a holder the head names: {manifest:?} {holder_index:?}, named {named:?}"
+    );
   };
   let manifest = *manifest;
   let repairs_before = daemons[0].fleet_repairs(object);
