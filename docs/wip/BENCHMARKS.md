@@ -11996,3 +11996,22 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
+
+## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
+
+Recorded so no one reads them as a result. The command, per run: `bash rungs12-a228/run.sh` (and `run2.sh`) on adacachy
+(AMD Ryzen 9 9950X3D2, 32 CPUs, Linux 7.2.9-2-cachyos): a release build of main `1ed67337` with the harness's share fix
+(`agents/fixtures-load-scale-share`), then `load_scale.rs` at 3,000 clients, one client node, `--hot-files 2400
+--reply-patience 60 --per-connection 32 --think-us 0`, Linux v7.4-rc1 `kernel/`, in a `systemd-run --user` unit at
+`CPUWeight=1`, `Nice=19`, `CPUQuota=800%`, a quarter of available memory, with a 100 ms sampler of every shard thread's
+`/proc` state, `wchan` and `schedstat` outside the unit.
+
+| Run | Load 1 m min/median/max | Agents done at the 1,800 s bound | Unit CPU | Samples in `do_freezer_trap` | Run-queue wait / timeslice | Wedged / starved / spinning / lapsed |
+|---|---|---|---|---|---|---|
+| `r3k-clean` | 38.4 / 94.5 / 195.4 | 236 of 3,000 | 127 s | about 98% | 0.11 ms | 0 / 0 / 0 / 0 |
+| `r3k-clean-2` | 22.6 / 46.4 / 151.6 | 191 of 3,000 | 124 s | about 98% | 0.12 ms | 0 / 0 / 0 / 0 |
+
+Invalid: a cgroup freezer held the fleet, not the scheduler (GAPS, "A capped unit on adacachy can be frozen"). Neither
+reached its oracle, so neither has latencies. The healthy reference for the wait per timeslice is `rungs9/ab-clean-2`, 0.10
+ms. Step 5 is closed without a third run: A-228 stands on its own red and green evidence.
+
