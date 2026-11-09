@@ -2945,6 +2945,28 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
+  /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
+  pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_discovery_hold = peer;
+    })
+  }
+
+  /// Test support: makes this node's record session to `peer` drop everything it receives from the forward lane's next
+  /// borrow of it: a session whose peer is gone without a word (a restarted process that kept its member id, a reset
+  /// that was lost). Once, so the session the link dials to replace it is healthy. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_deaf_session = Some(peer);
+      // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
+      // too, and their recovery would read as this one's.
+      s.dead_session_dropped_at.clear();
+      s.dead_session_recovered_ns = None;
+    })
+  }
+
   /// Test support: leaves every forwarded verb on `volume` unanswered while set, on the session that keeps carrying
   /// this node's other replies (`None` lifts it, and the held verbs are served then). An owner alive and answering
   /// others but never this exchange, as the 205 submits a restarted primary could not commit were (fixtures' 1,000-client
@@ -3949,6 +3971,10 @@ async fn init_shard(
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
     injected_forward_silence: None,
+    injected_deaf_session: None,
+    injected_discovery_hold: None,
+    dead_session_dropped_at: std::collections::BTreeMap::new(),
+    dead_session_recovered_ns: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,

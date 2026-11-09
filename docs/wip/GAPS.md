@@ -672,6 +672,29 @@
 >   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
 >   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
 >
+> - **A dead record session was lent on, because nobody that held it judged it** (found 2026-11-08 on the f = 1
+>   primary-kill rung). The restarted primary kept its member id, and borrowers kept the client node's session to it out
+>   of its slot, so the link never replaced it: requests through the client node waited 25 to 135 s. Now
+>   `fleet::return_sessions` drops a session returned silent past the transport's one rule (`peer_silent_past`), and the
+>   link redials. Deaf-session test with discovery held: red 5 of 5, green 5 of 5, dropped 0 to 209 ms past its 1,998 ms
+>   window (that lateness is the lane's return cadence, since the judgement runs only when a borrower returns),
+>   answered on the replacement 26 to 336 ms later. **The division, so no timer is added "just in case":**
+>   `return_sessions` judges every borrowed session (every borrower's hold is bounded by a derived budget), the link's
+>   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
+>   sooner where it is heard
+>   (`docs/bugs/2026-11-09-a-dead-record-session-was-lent-on-for-want-of-anyone-judging-it.md`).
+>
+> - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
+>   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
+>   about 20,000 queued behind the stream credit the forwarder turned in one poll until its stall budget: client-0's
+>   control shard spun about 1.09 s, 6 of 6 runs, and its anchor killed it. A turn now ends early only for a newly
+>   queued forward, and the forwarder yields between turns: 0 of 6, one restart a run, oracle 0. With it, a turn costs
+>   what changed (completed and progressed exchanges), and the endpoint's completed set, which grew with every exchange
+>   a record session completed, holds only open ones
+>   (`docs/bugs/2026-11-08-a-forward-lane-turned-without-end-while-its-forwards-waited-on-the-stream-credit.md`).
+>   `slates_cluster`'s `take_completed_replies` still asks each of a dispatch's exchanges: a lookup a holder, since a
+>   second consumer of the completed set would take the lane's.
+>
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
 >   never answered them stayed open for good while the session carried other replies. Progress is now its own
