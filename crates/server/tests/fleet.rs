@@ -639,6 +639,90 @@ fn a_two_member_survivor_suspects_its_dead_peer_and_never_condemns_it() {
 /// incarnation always overrides). Chosen high on purpose; the exact value is immaterial past that.
 const FALSE_DEATH_INCARNATION: u64 = 1_000;
 
+/// Derived: the coordinator periods a membership horizon spans (`lease::horizon_ns`, rounded up): how long a peer may go
+/// unanswered before it is suspected, so how long a probe or a backed-off fetch may take before the fleet acts on it.
+fn horizon_periods() -> u64 {
+  slates_server::lease::horizon_ns().div_ceil(HEARTBEAT_NS)
+}
+
+/// Derived: the coordinator periods one liveness budget spans: how long a refused dial waits before it is tried again.
+fn liveness_periods() -> u64 {
+  LIVENESS_BUDGET_NS.div_ceil(HEARTBEAT_NS)
+}
+
+/// Derived: the coordinator periods one consensus commit round may take: its base period and up to
+/// [`ELECTION_MARGIN`](slates_cluster::timing::ELECTION_MARGIN) one-period extensions (`timing::round_budget`).
+fn commit_periods() -> u64 {
+  slates_cluster::timing::ELECTION_MARGIN.saturating_add(1)
+}
+
+/// Derived: the coordinator periods one council election may take: the base and the span of the slowest observed
+/// daemon's council timing (`Daemon::council_timing`, the "fleet timing" each daemon logs), the floor's where one does
+/// not answer.
+fn election_periods(daemons: &[&Daemon]) -> u64 {
+  let floor = slates_cluster::timing::ElectionTiming::floor();
+  daemons
+    .iter()
+    .map(|daemon| daemon.council_timing().unwrap_or(floor))
+    .map(|timing| u64::from(timing.base_periods).saturating_add(u64::from(timing.span_periods)))
+    .max()
+    .unwrap_or(0)
+}
+
+/// Derived: the coordinator periods a council takes to confirm a member dead before retiring it: the death window, the
+/// slowest observed council timing's base (`fleet::stable_dead_council_members`), the floor's where one does not answer.
+fn death_window_periods(daemons: &[&Daemon]) -> u64 {
+  let floor = slates_cluster::timing::ElectionTiming::floor();
+  daemons
+    .iter()
+    .map(|daemon| u64::from(daemon.council_timing().unwrap_or(floor).base_periods))
+    .max()
+    .unwrap_or(0)
+}
+
+/// Derived: the coordinator periods `members` take to form their direct probe mesh: a membership horizon for each probe
+/// to be answered, and a liveness budget for each peer's one refused dial.
+fn mesh_formation_periods(members: usize) -> u64 {
+  let peers = u64::try_from(members.saturating_sub(1)).unwrap_or(u64::MAX);
+  horizon_periods().saturating_add(peers.saturating_mul(liveness_periods()))
+}
+
+/// Derived: the coordinator periods the joint changes that seat a council of `2f + 1` take: two commits (enter and
+/// leave the joint configuration) for each of the `2f` seats beyond the bootstrapper's.
+fn seat_commits(quorum: Quorum) -> u64 {
+  u64::from(quorum.f).saturating_mul(4)
+}
+
+/// Derived: the coordinator periods a fresh fleet of `daemons` takes to commit its initial membership and be ready: one
+/// election, a commit for each member's admission and each seat's joint change, a membership horizon for an
+/// uninitialized learner's backed-off join fetch (`fleet::next_learner_wait` doubles up to it), and the one period a
+/// node's readiness follows its council by.
+fn initial_consensus_periods(daemons: &[&Daemon], quorum: Quorum) -> u64 {
+  let admissions = u64::try_from(daemons.len().saturating_sub(1)).unwrap_or(u64::MAX);
+  election_periods(daemons)
+    .saturating_add(
+      admissions
+        .saturating_add(seat_commits(quorum))
+        .saturating_mul(commit_periods()),
+    )
+    .saturating_add(horizon_periods())
+    .saturating_add(1)
+}
+
+/// Derived: the coordinator periods the council takes to commit its voter set once the fleet has formed: one election
+/// and each seat's joint change.
+fn seats_committed_periods(daemons: &[&Daemon], quorum: Quorum) -> u64 {
+  election_periods(daemons).saturating_add(seat_commits(quorum).saturating_mul(commit_periods()))
+}
+
+/// Derived: the coordinator periods a learner takes to learn a member's retirement once its death is held: the death
+/// window, the retirement's commit, the period its divergence is seen in, and its fetch round.
+fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
+  death_window_periods(daemons)
+    .saturating_add(commit_periods().saturating_mul(2))
+    .saturating_add(1)
+}
+
 /// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds, then
 /// returns `true`. **Robust to noisy and heavy CPU load:** the wait is charged against the fleet's own forward
 /// progress — the fleet-coordinator **periods** each of `daemons` has executed ([`Daemon::fleet_progress`],
@@ -3075,18 +3159,23 @@ fn settle_initial_consensus(
   // window with none), not a fixed wall-clock wait: under 36 spinners on an 18-core Mac fleets formed in 3 to 10 s
   // mostly, but now and then in 37 to 108 s, past the fixed 30 s this used, while every coordinator kept turning.
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let settled = poll_until(&observed, formation_deadline(), || {
-    let mut voters = std::collections::BTreeMap::<RegionId, Vec<HostId>>::new();
-    for (region, bootstrapper) in &bootstrappers {
-      let Some(settled) = region_voters(bootstrapper, &regional[region], quorum)? else {
-        return Ok(false);
-      };
-      voters.insert(*region, settled);
-    }
-    all_hold(daemons.iter().zip(&assigned).map(|(daemon, region)| {
-      initial_member_committed(daemon, &regional[region], &voters[region], &root_voters)
-    }))
-  });
+  let settled = poll_for_periods(
+    &observed,
+    formation_deadline(),
+    initial_consensus_periods(&observed, quorum),
+    || {
+      let mut voters = std::collections::BTreeMap::<RegionId, Vec<HostId>>::new();
+      for (region, bootstrapper) in &bootstrappers {
+        let Some(settled) = region_voters(bootstrapper, &regional[region], quorum)? else {
+          return Ok(false);
+        };
+        voters.insert(*region, settled);
+      }
+      all_hold(daemons.iter().zip(&assigned).map(|(daemon, region)| {
+        initial_member_committed(daemon, &regional[region], &voters[region], &root_voters)
+      }))
+    },
+  );
   assert!(
     settled,
     "initial membership did not commit: expected regions={regional:?} root={root_voters:?}; {}",
@@ -6882,13 +6971,17 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
   // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md) — so the voters are read from the
   // committed voter set, never predicted from the ids.
   let mut voters: Vec<HostId> = Vec::new();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
   assert!(
-    audit_wait(&daemons.iter().collect::<Vec<_>>(), || daemons[0]
-      .council_voters()
-      .map(|committed| {
+    poll_for_periods(
+      &observed,
+      formation_deadline(),
+      seats_committed_periods(&observed, Quorum { f: 1 }),
+      || daemons[0].council_voters().map(|committed| {
         voters = committed.unwrap_or_default();
         voters.len() == 3
-      })),
+      })
+    ),
     "the council's initial voter set committed: {voters:?}"
   );
   let learner_hosts: Vec<HostId> = hosts
@@ -6927,9 +7020,11 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
     .iter()
     .position(|(host, _)| *host == observed_host)
     .expect("the observed learner survives");
-  let learned = poll_until(
-    &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+  let surviving: Vec<&Daemon> = survivors.iter().map(|(_, d)| d).collect();
+  let learned = poll_for_periods(
+    &surviving,
     COUNCIL_RETIRE_DEADLINE,
+    retirement_learned_periods(&surviving),
     || {
       let daemon = &survivors[observed_pos].1;
       Ok(
@@ -7293,9 +7388,12 @@ const SILENT_PEER_PERIODS: u64 = 100;
 /// returns as soon as the mesh is up and tolerates a slower-forming larger mesh.
 fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  if poll_until(&observed, formation_deadline(), || {
-    all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed()))
-  }) {
+  if poll_for_periods(
+    &observed,
+    formation_deadline(),
+    mesh_formation_periods(daemons.len()),
+    || all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed())),
+  ) {
     // Non-vacuity: the sessions each node had formed when the mesh passed. A fleet of several whose node formed none
     // was judged meshed over nothing, as a bootstrapped node was until the others were admitted, until 2026-11-07.
     let formed: Vec<usize> = daemons
