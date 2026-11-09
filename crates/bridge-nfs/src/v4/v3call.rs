@@ -91,6 +91,12 @@ pub fn handle_only(fh: &Nfsfh3) -> Vec<u8> {
   writer.into_bytes()
 }
 
+/// A result that is a status and nothing else (`crate::procedures::extension::CHANGE_ALLOWED`).
+pub fn status_only(result: &[u8]) -> Result<Nfsstat3, Malformed> {
+  let mut reader = XdrReader::new(result);
+  Nfsstat3::decode(&mut reader).map_err(|_| Malformed)
+}
+
 /// Arguments that are a directory handle and a name (LOOKUP, REMOVE, RMDIR).
 pub fn dir_name(dir: &Nfsfh3, name: &str) -> Vec<u8> {
   let mut writer = XdrWriter::new();
