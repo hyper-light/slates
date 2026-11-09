@@ -2394,6 +2394,9 @@ impl RegionalConfiguration {
           unconfirmed,
         },
       );
+    } else {
+      // Retired with no neighbourhood to recover through: nothing will confirm its objects adopted (A-272).
+      self.record_dropped_unconfirmed(member);
     }
     self.prune_retirements();
     self.bound_retirements();
@@ -2620,7 +2623,13 @@ impl RegionalConfiguration {
     let mut departed = owner;
     for _ in 0..=self.retired.len() {
       if !self.retired.contains_key(&departed) {
-        return Lineage::Settled;
+        // Settled only on evidence: a pruned retirement, every survivor having confirmed after adopting. One dropped
+        // unconfirmed proves nothing (A-272).
+        return if self.dropped_unconfirmed.contains(&departed) {
+          Lineage::Unresolved
+        } else {
+          Lineage::Settled
+        };
       }
       let Some(successor) = self.successor(departed, object) else {
         return Lineage::Lost;
@@ -2633,10 +2642,11 @@ impl RegionalConfiguration {
           successor,
         };
       } else {
-        return Lineage::Settled;
+        // A ranked successor neither a member nor a kept retirement: its absence is no evidence of adoption (A-272).
+        return Lineage::Unresolved;
       }
     }
-    Lineage::Settled
+    Lineage::Unresolved
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
@@ -2679,6 +2689,16 @@ impl RegionalConfiguration {
   /// oldest (by the version that retired it, the id breaking a tie) beyond it. A takeover whose retirement is
   /// dropped this way can no longer name its successors, so its objects stay unowned; a node sees the loss as a
   /// recovery owner that names a retirement no longer kept.
+  /// Records `host` among [`dropped_unconfirmed`](RegionalConfiguration::dropped_unconfirmed), in id order.
+  fn record_dropped_unconfirmed(&mut self, host: HostId) {
+    if let Err(position) = self
+      .dropped_unconfirmed
+      .binary_search_by_key(&host.0, |dropped| dropped.0)
+    {
+      self.dropped_unconfirmed.insert(position, host);
+    }
+  }
+
   fn bound_retirements(&mut self) {
     while self.retired.len() > self.retirement_bound() {
       let oldest = self
@@ -2688,7 +2708,18 @@ impl RegionalConfiguration {
         .map(|(host, _)| *host);
       match oldest {
         Some(host) => {
+          // Dropped before every survivor confirmed (one that retired first never did; its own retirement carried the
+          // takeover): recorded, so its line reads unresolved, never settled.
+          let unconfirmed = self.retired.get(&host).is_some_and(|retirement| {
+            !retirement
+              .survivors
+              .iter()
+              .all(|survivor| retirement.confirmed.contains(survivor))
+          });
           self.retired.remove(&host);
+          if unconfirmed {
+            self.record_dropped_unconfirmed(host);
+          }
         }
         None => break,
       }

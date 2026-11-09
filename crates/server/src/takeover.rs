@@ -1080,9 +1080,7 @@ fn share_done(
   nothing_lost: bool,
   every_page: bool,
 ) -> bool {
-  // Red first: a lost object counts as done, as before.
-  let _ = nothing_lost;
-  current && unfenced && nothing_learned && every_page
+  current && unfenced && nothing_learned && nothing_lost && every_page
 }
 
 #[cfg(test)]

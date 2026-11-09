@@ -158,6 +158,31 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
+> A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
+> what it had learned, and confirmed its share. The retirement was then pruned, `RegionalConfiguration::lineage` read
+> the object's line as settled, and `takeover::resolve_held_objects` reclaimed every holder's copy: record, content,
+> merge replica. In the store-destroyed flow the settled cohort was [owner, A, old B]; with two gone the object was
+> lost, though the replacement held its live log (diag-live-durability-66 arm: `fleet.takeover.lost` 6). No run
+> reclaimed yet. Now a round with a lost object does not confirm (`takeover::share_done`). A ranked successor that is
+> neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+> retired with nothing to recover through all read `Lineage::Unresolved`
+> (`RegionalConfiguration::dropped_unconfirmed`), and `Unresolved` never reclaims. The sweep for the same inference
+> from absence, every path that frees a held record, held content, a merge replica or a live log:
+> - `takeover::resolve_held_objects` on `Settled`: the defect, fixed.
+> - `takeover::resolve_held_objects` on `stale_after_confirmation` (a holder outside the successor's placement once
+>   the successor confirmed): sound now that a confirmation means every learned object was adopted; before, it could
+>   follow a lost object. Fixed by the same rule.
+> - `tombstone::on_held` and `live_ship::let_go` (from `fleet::after_held_record`): a durably accepted tombstone.
+>   Positive evidence.
+> - `fleet`'s retired tombstones: routing only, at the tombstone's retirement. Positive.
+> - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
+> - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
+> - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
+> **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
+> rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
+> now (here, the replacement that holds the live log).
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
