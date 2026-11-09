@@ -9229,6 +9229,23 @@ new process. In simulation the session ended one round trip after its first pack
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
 
+### 2026-11-09: the formation check falls behind each new event counter (open)
+
+- **Found** on B10's Linux gate (adacachy2, 3fd1de00): three CLI fleet tests failed at "only superseded link work may end
+  during formation", deterministically:
+  - `a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits`
+  - `a_terminated_council_leader_process_hands_off_before_it_exits`
+  - `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death`
+- **Cause.** Each forming node counted `fleet.learner.no_session` once, a counter learner-3 added (310d7010). The check's
+  list of allowed counters (`formation_counter_allowed` in `crates/cli/tests/cli.rs`) did not know it. The Mac gate does
+  not run these tests. The same thing happened before with `content.give_back.left_for_next_tick` (c2d87528, A-226).
+- **Fixed for this counter:** the list allows it beside the other learner lines.
+- **The class stays open.** The status map mixes events of normal work with refusals, and the list is kept by hand, so
+  every new event counter fails formation until someone adds it.
+- **The structural fix (not built):** the daemon names its event counters as events. It either exports one list of them
+  beside their definitions, which the check reads, as it already does for the reap-tick constants, or it reports them
+  apart from refusals in status. Then the check cannot fall behind a new counter. Owner: live-fixes.
+
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
 
 - **The window.** A successor needs a recovery quorum in every cohort of `recovery_cohorts(departed, object)`. When the
