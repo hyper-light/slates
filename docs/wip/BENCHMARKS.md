@@ -8648,6 +8648,59 @@ that window cannot be survived under any membership scheme, so a flow that kills
 for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
 it in 6 of 6 x86 runs.
 
+### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
+
+**The change.** A lane's install exchange ends only on its reply or its deadline, and the deadline has no ceiling (up to
+77 s and 614 s measured, diag-live-durability-56). The watch ended it early once the owner kept no direct contact with
+the holder (`keeps_direct_contact_with`) and the session had acknowledged nothing for a silence. That silence was first
+a fixed liveness budget (1 s, `agents/live-durability-watch-2`), then the session's own persistent-congestion duration:
+three probe timeouts, each at least the initial 666 ms (`agents/live-durability-watch-3`). On the simulated fabric the
+fixed second cut a live holder whose acknowledgements a queue held back 1.1 to 2.0 s apart; the duration never did.
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, the watch switched on or off
+in one binary.
+
+**diag-live-durability-65: a holder restarted mid-install** (watch-2's rule, 12 restarts and 10 rolling partitions a
+leg, at the budgets the code computes and at a 30 s floor on installs of 64 KiB or more):
+
+| leg | restarts over 1 s | catch-up median | worst | partitions passed | cuts |
+|---|---|---|---|---|---|
+| real, off, x86 | 1 of 12 | 31 ms | 3.87 s | 10 of 10 | 0 |
+| real, on, x86 | 0 of 12 | 24 ms | 0.05 s | 10 of 10 | 0 |
+| real, off, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| real, on, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| floor, off, x86 | 4 of 12 | 894 ms | 7.01 s | 10 of 10 | 0 |
+| floor, on, x86 | 2 of 12 | 25 ms | 32.42 s | 10 of 10 | 1 |
+| floor, off, arm | 7 of 12 | 2,038 ms | 13.05 s | 10 of 10 | 0 |
+| floor, on, arm | 1 of 12 | 21 ms | 29.14 s | 10 of 10 | 0 |
+
+The watch's case does not occur in this flow: the restarted holder's successor answers under its id 3 to 27 ms after
+the kill, so the owner never loses contact, and no kept restart log shows a cut. diag-67 and -68 meant to stop a holder
+for good but armed the stop for any daemon, and the other candidate stopped itself: none of 96 runs reached the case.
+
+**diag-live-durability-70: a holder stopped on its install for 20 s, then resumed** (watch-3's rule, 30 s floor, the
+stop armed for the target alone, 12 runs a leg, 48 of 48 passed, every one stopped on its install). Catch-up is from the
+resume until the holder is within 50 entries of the owner's head; none = not within 50 s:
+
+| leg | the stopped holder's exchange | catch-up, each run (s) | median | not caught |
+|---|---|---|---|---|
+| off, x86 | held 20.1 s, then answered (the stale install) | 2.05 3.88 2.67 none 2.35 2.22 1.31 none 2.01 none none 2.06 | 2.14 s | 4 of 12 |
+| on, x86 | cut, median 2.12 s (12 of 12) | 1.88 2.04 2.86 none 27.73 11.06 none 1.86 2.16 none none 2.22 | 2.19 s | 4 of 12 |
+| off, arm | held 20.1 s, then answered | 3.68 none 6.40 1.84 33.83 6.20 3.32 6.40 4.09 2.01 1.29 2.35 | 3.68 s | 1 of 12 |
+| on, arm | cut, median 3.48 s (12 of 12) | 1.66 1.80 2.35 3.44 1.61 3.72 1.35 3.95 3.03 1.72 1.68 1.87 | 1.84 s | 0 of 12 |
+
+Mann–Whitney, off slower than on: x86 U = 68.5 of 144, z = −0.21, p ≈ 0.84 (even; 4 of 12 over 4 s or not caught
+off, 6 on); arm U = 111.5 of 144, z = 2.28, p ≈ 0.023 (6 of 12 off, 0 on), the two sets overlapping (on's worst
+3.95 s against off's median 3.68 s).
+
+**Reading.** The watch does what its rule says: the stopped holder's exchange was cut every time, a little past 2 s on
+x86 and later on arm, where the session's probe timeout is larger. On x86 catch-up after the resume is even, with the
+watch's tail worse (27.7 s against 3.88 s worst). On arm it is likely faster with the watch, but no mechanism is known:
+the freed lane leads to a holder that is stopped anyway, and answering the stale install on resume caught up in most
+runs as fast as a fresh image. **Held, not landed:** the decision waits on why arm's runs without the watch stall after
+the resume (GAPS). If it is the stale install answered late, the watch earns its place on arm; if it is the slow
+catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
+are that slow catch-up.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The

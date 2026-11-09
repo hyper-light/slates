@@ -250,7 +250,20 @@
 > whole of a 30 s budget in 12 of 12 runs (30.01 to 30.02 s, -58), though the owner had dropped it from membership 1 to
 > 15 s in; the transport has no idle timeout. A bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was
 > answered. Owed: end the exchange when the owner stops keeping contact with the holder, re-sending safely if it was a
-> false suspicion.
+> false suspicion. **Measured, held (2026-11-09):** an exchange ended once the owner lost contact with the holder and
+> the session went silent for its own persistent-congestion duration (RFC 9002 §7.6.1, floored at three initial probe
+> timeouts) cut a stopped holder's exchange in 24 of 24 runs. After the holder resumed, catch-up was even on x86
+> (p ≈ 0.84), and likely faster on arm (p ≈ 0.023: 6 of 12 runs over 4 s or never caught up without the watch, 0 of 12
+> with it), but no mechanism is known for the arm gain (diag-live-durability-70; BENCHMARKS "The install watch,
+> measured"). **Open: why arm's runs without the watch stall after the holder resumes.** If it is the stale install
+> answered late, the watch earns its place on arm; if it is the slow catch-up below, fixing that may erase the
+> difference. The watch is held unlanded on `agents/live-durability-watch-3` until then.
+
+> **Open (live-durability, 2026-11-09): a holder resumed after a stop mid-install did not catch up within 50 s.** In 4 of
+> 12 runs on x86 with the install watch on or off alike, and 1 of 12 (off) on arm; the rest caught up in a median of 1.8
+> to 3.7 s (diag-live-durability-70: the holder stopped on its install for 20 s under a 30 s install floor, then
+> resumed). Where those runs wait after the resume, and what the holder and the owner each take its head to be, is not
+> yet measured. The restart flow's open note on holders below the tail ("a holder repeating the head") may be the same.
 
 > **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
 > 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of
