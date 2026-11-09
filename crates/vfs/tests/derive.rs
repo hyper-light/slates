@@ -533,3 +533,49 @@ fn a_derivation_over_a_journal_that_dropped_part_of_the_work_is_refused() {
     short.map(|doc| doc.files.len())
   );
 }
+
+/// A-262, stage 1 (the merge does not carry the bits yet). Do: from one base, derive four works: one that sets only a
+/// file's Windows attribute bits, one that changes nothing, one that rewrites the file's first bytes, and one that
+/// rewrites them and sets the bits too. Expect: the bits-only work's ops document is the unchanged work's, byte for
+/// byte, and the rewrite's is the same with the bits or without. The merge reads only this document, so two increments
+/// that differ only in the bits get the same verdict and never a conflict, until the merge's own dimension carries
+/// them (A-262 stage 2).
+#[test]
+fn windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them() {
+  use slates_vfs::inode::{Kind, WindowsAttributes};
+  let hidden = WindowsAttributes::kept(0x2 | 0x4, Kind::File);
+  let derive_after = |set_bits: bool, rewrite: bool| {
+    let (mut store, mut vol, base) = base_with_f();
+    let f = vol.resolve(&store, "/f").unwrap().inode;
+    if rewrite {
+      vol.write(&mut store, f, 0, b"rewritten").unwrap();
+    }
+    if set_bits {
+      vol.set_windows_attributes(&mut store, f, hidden).unwrap();
+      assert_eq!(
+        vol.windows_attributes(&store, f).unwrap(),
+        hidden,
+        "the bits were set"
+      );
+    }
+    vol.derive(&store, base).unwrap()
+  };
+  let unchanged = derive_after(false, false);
+  let bits_only = derive_after(true, false);
+  assert_eq!(
+    bits_only, unchanged,
+    "a bits-only work derives the unchanged document"
+  );
+  assert_eq!(bits_only.encode(), unchanged.encode(), "byte for byte");
+  let rewrite = derive_after(false, true);
+  let rewrite_and_bits = derive_after(true, true);
+  assert_ne!(
+    rewrite, unchanged,
+    "non-vacuous: a rewrite is in the document"
+  );
+  assert_eq!(
+    rewrite_and_bits.encode(),
+    rewrite.encode(),
+    "the bits beside a rewrite change nothing in its document"
+  );
+}

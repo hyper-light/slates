@@ -208,6 +208,7 @@ mod tests {
       uid: 0,
       gid: 0,
       birth_ns: 1,
+      windows: 0,
     }
   }
 

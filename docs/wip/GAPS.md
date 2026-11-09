@@ -1,5 +1,33 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
+> block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
+> internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
+> name is `EEXIST`, an unwritable directory `EACCES`, then `EPERM`, as a local file system without device nodes answers
+> `mknod`. No list changes: no case expects `EPERM` from a device `mknod`.
+
+> **The WinFsp drive keeps Windows' attribute bits, and a file's read-only state is its mode: built for the volume and
+> the drive (2026-11-08, §4.6; A-262).** A-209 had left HIDDEN, SYSTEM, ARCHIVE and READONLY out ("the volume's
+> permission is POSIX's mode"), so `SetFileAttributes` answered success and kept nothing and every file reported
+> `NORMAL`. Now a file's READONLY is its mode's write bits (DrvFs's and Samba's mapping), and the other bits, with a
+> directory's READONLY, are kept in the inode's two bytes of tail padding (168 B, unchanged; tree_heap 260, 275 and 293
+> B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). The Windows base plane reads
+> them since stage 3's base half: a fingerprint carries the disk's bits apart from a DrvFs-mapped mode (until then the
+> Windows base reported the attribute word itself as the mode, `0x20` as `0o040`). **Still owed under A-262:** a Windows
+> landing applying them (it waits on a Windows landing writer, which does not exist; Linux and macOS carry them
+> unapplied), and the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge
+> drops them).
+
+> **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
+> §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
+> handle answered `NFS4ERR_STALE`), and the server never answered `OPEN4_RESULT_PRESERVE_UNLINKED`, so the Linux client
+> renamed every such file to `.nfs*` until the close (pjdfstest `unlink/14.t:4`; git, editors and sqlite do it, and a
+> landing would carry the name). Every open and delegation now holds its file, from its record's commit to its end's
+> (a CLOSE, a return, a revocation, a client's purge), the hold taken again from the journal at a recovery and given
+> back at its attachment's end. Red tests: a removed open file's GETATTR answered `NFS4ERR_STALE`; now it serves at nlink
+> 0 with its bytes until its last close, also across a daemon restart, and its 64 KiB come back at the close or at its
+> client's lease lapse. Still owed: NFSv3 has no open, so its clients' silly renames stay (NFS-OPEN on the NFSv3 lists).
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
@@ -158,6 +186,51 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
+> waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
+> whose answers a queue held back 1.1 to 2.0 s apart. The transport now makes the one judgement,
+> `Endpoint::peer_silent_past(floor)`: an answer owed and nothing authenticated back for max(floor, three probe
+> timeouts each at least the initial one; RFC 9002 §7.6.1, §6.2.2). A gone peer is judged at 2,008 ms against its
+> 1,998 ms duration. A peer behind a queue, its answers up to 4.09 s apart, is never judged silent. An idle session
+> owes nothing and is never silent. On loopback a stopped peer is judged about 2 s into its silence, not 1 s
+> (fleet-transport §5 status; tests in `crates/transport/tests/exchanges.rs`).
+
+> **Open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
+> `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
+> field (`dropped_unconfirmed`); an old entry is refused only because it runs out of bytes there (`Truncated`), and a
+> new one at an old build because bytes are left over (`LengthMismatch`). Every caller refuses rather than defaults:
+> - a retained council's base and view at restart (`retention::restore`);
+> - snapshots (`fold::for_saved`, `fold::install`);
+> - a learner's fetch and a join (`consensus`).
+> So a mixed fleet stops typed, but by accident of length: a later change that keeps the length, or appends a field
+> whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
+> mismatch.
+
+> **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
+> A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
+> what it had learned, and confirmed its share. The retirement was then pruned, `RegionalConfiguration::lineage` read
+> the object's line as settled, and `takeover::resolve_held_objects` reclaimed every holder's copy: record, content,
+> merge replica. In the store-destroyed flow the settled cohort was [owner, A, old B]; with two gone the object was
+> lost, though the replacement held its live log (diag-live-durability-66 arm: `fleet.takeover.lost` 6). No run
+> reclaimed yet. Now a round with a lost object does not confirm (`takeover::share_done`). A ranked successor that is
+> neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+> retired with nothing to recover through all read `Lineage::Unresolved`
+> (`RegionalConfiguration::dropped_unconfirmed`), and `Unresolved` never reclaims. The sweep for the same inference
+> from absence, every path that frees a held record, held content, a merge replica or a live log:
+> - `takeover::resolve_held_objects` on `Settled`: the defect, fixed.
+> - `takeover::resolve_held_objects` on `stale_after_confirmation` (a holder outside the successor's placement once
+>   the successor confirmed): sound now that a confirmation means every learned object was adopted; before, it could
+>   follow a lost object. Fixed by the same rule.
+> - `tombstone::on_held` and `live_ship::let_go` (from `fleet::after_held_record`): a durably accepted tombstone.
+>   Positive evidence.
+> - `fleet`'s retired tombstones: routing only, at the tombstone's retirement. Positive.
+> - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
+> - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
+> - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
+> **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
+> rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
+> now (here, the replacement that holds the live log).
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
@@ -205,7 +278,20 @@
 > whole of a 30 s budget in 12 of 12 runs (30.01 to 30.02 s, -58), though the owner had dropped it from membership 1 to
 > 15 s in; the transport has no idle timeout. A bytes-only ceiling would be wrong: a 404 MB install took 21.6 s and was
 > answered. Owed: end the exchange when the owner stops keeping contact with the holder, re-sending safely if it was a
-> false suspicion.
+> false suspicion. **Measured, held (2026-11-09):** an exchange ended once the owner lost contact with the holder and
+> the session went silent for its own persistent-congestion duration (RFC 9002 §7.6.1, floored at three initial probe
+> timeouts) cut a stopped holder's exchange in 24 of 24 runs. After the holder resumed, catch-up was even on x86
+> (p ≈ 0.84), and likely faster on arm (p ≈ 0.023: 6 of 12 runs over 4 s or never caught up without the watch, 0 of 12
+> with it), but no mechanism is known for the arm gain (diag-live-durability-70; BENCHMARKS "The install watch,
+> measured"). **Open: why arm's runs without the watch stall after the holder resumes.** If it is the stale install
+> answered late, the watch earns its place on arm; if it is the slow catch-up below, fixing that may erase the
+> difference. The watch is held unlanded on `agents/live-durability-watch-3` until then.
+
+> **Open (live-durability, 2026-11-09): a holder resumed after a stop mid-install did not catch up within 50 s.** In 4 of
+> 12 runs on x86 with the install watch on or off alike, and 1 of 12 (off) on arm; the rest caught up in a median of 1.8
+> to 3.7 s (diag-live-durability-70: the holder stopped on its install for 20 s under a 30 s install floor, then
+> resumed). Where those runs wait after the resume, and what the holder and the owner each take its head to be, is not
+> yet measured. The restart flow's open note on holders below the tail ("a holder repeating the head") may be the same.
 
 > **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
 > 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of
@@ -388,7 +474,7 @@
 >   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
 
 > **A volume recovery could not rebuild (2026-11-06): its status names why, and Windows unmount passes over it
-> (fixed); destroying it (open).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
+> (fixed); destroying it (fixed 2026-11-08).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
 > `NotFound`. It now answers `Refusal::NotRecovered { cause }`, a closed `RecoveryCause` kept from recovery
 > (`docs/bugs/2026-11-06-a-listed-volume-recovery-could-not-rebuild-answered-not-found.md`). Windows `slates unmount`
 > asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
@@ -398,9 +484,23 @@
 > tests 6, the CLI flow 86) and red with it removed (diag-slabs-26, run 42319805390: "refused: NotFound"). On Windows,
 > on both runners, the unmount test green (diag-slabs-24, run 42319805783: the WinFsp suite 16), red with the old loop
 > (diag-slabs-25, run 42319805958: the drive was found first and the unrecovered volume never named), and red with the
-> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound"). Open:
-> - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
->   and the catalog record stays: a destroy must be able to remove a record with no live slot.
+> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound").
+> - **Destroying such a volume: fixed 2026-11-08 (slabs).** `destroy` was refused `NotRecovered` too, so the record, its
+>   snapshots' records and its name stayed for good (banned item 8). It now removes a record with no live slot in one
+>   step: the volume's attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, and its name alias,
+>   its origin pin and its live shipping are given back, with nothing materialized. The sweep: `volume list` names the
+>   cause (`not_recovered=<kind>`; JSON `"not_recovered"`), and `share`, which read only the catalog and went through,
+>   is refused `NotRecovered` with every catalog-only lookup (`find_record`). Proven on macOS: the destroy test red
+>   before (`refused: NotRecovered`) and green after, the volume still gone after a second restart; the sweep test red
+>   at the list line before and at the share with `find_record`'s check taken out. On Linux at b7dc93c9 (merged with
+>   main 92dcd16c; diag-slabs-40, run 42506866309): workspace clippy, the whole server suite and both tests green, the
+>   CLI flow 94 of 95, its one failure the fleet formation test (`three_daemon_processes_deploy_a_fleet_…`, untouched
+>   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
+>   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
+>   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
+> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
+>   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
+>   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
@@ -1245,7 +1345,8 @@
 > (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the four Windows
 > features the drive does not keep (attribute bits, security descriptors, reparse points and symbolic links, named
 > streams). The fifth, a settable creation time, was built in A-259 (2026-11-08): the drive reports the volume's
-> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The
+> attribute bits followed in A-262 (2026-11-08), their 18 cases off (373 to 355), leaving three stated differences. The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
 > test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
@@ -14743,6 +14844,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   to its records, from reading the harness (no suite mounts read-only, and pjdfstest's `EROFS` cases are FreeBSD-only),
   and its expected-failure lists have no `EROFS` entries.
   Record: `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+  - **The open over a kernel NFS mount: fixed 2026-11-08 (slabs; found by conformance's read-only pjdfstest run, CI run
+    42498995934).** Through a read attachment the kernel's v3 and v4 clients granted `open(O_WRONLY)` and `open(O_RDWR)`
+    of an existing file, and v4 answered `open(O_RDONLY|O_TRUNC)` `EACCES`: ACCESS granted the write bits from the mode
+    alone, the kernel decides a v3 open from it, and v4's OPEN asked the same ACCESS. Now ACCESS grants no write bit
+    where the bridge refuses a change, a v4 OPEN for writing asks `CHANGE_ALLOWED` first and answers `NFS4ERR_ROFS`, and
+    a change under a state id is refused ROFS before its state id is judged. Through the kernel
+    (`crates/server/tests/nfs_read_only_kernel.rs`): on main, v3 `[granted, granted, EROFS]` and v4 `[granted, granted,
+    EACCES]` (diag-slabs-42, run 42517407649); with the fix, v4 `EROFS` for each and v3 `EACCES` for each open
+    (diag-slabs-43, run 42517769901, with workspace clippy, the NFS bridge and the server's kernel NFS suites green). v3's
+    `EACCES` at open is its limit, not a miss (A-269). The bridge's read-only export test is red with the ACCESS mask
+    taken out (granted 29 for 1). Conformance's probe counts the v3 opens as that limit (its 0fad3bb2). Its run on this
+    fix (diag-conformance-32, run 42523564648): v3 10 of 14 `EROFS` and the three opens at the limit, v4 13 of 14; the
+    other in each, `truncate/10.t`'s path truncate, answers `EACCES`, which is the protocol's limit on v3 and v4 alike,
+    not a slates defect: the client asks ACCESS for a regular file's write without an open, and Linux's own server
+    leaves the bit out for a read-only export (`fs/nfsd/vfs.c` `nfsd_permission`, `nfsd_access`), so knfsd gives the same
+    `EACCES` (A-269; the supervisor's decision (a): the write bits stay withheld over v4, since granting them makes
+    `access(W_OK)` call a read-only file writable).
 - **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
   so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
   kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
