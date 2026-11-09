@@ -4070,6 +4070,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
   // remembered at it (`live_ship::note_rebuild`).
   let adopted_head = live.as_ref().map(|fetched| fetched.head);
+  let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -4138,8 +4139,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   .await;
   if let Some(adopted) = adopted_head {
     match &served {
-      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
-      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None, adopted_sealing),
+      Some(Err(refusal)) => {
+        crate::live_ship::note_rebuild(object, adopted, Some(refusal), adopted_sealing)
+      }
       None => {}
     }
   }

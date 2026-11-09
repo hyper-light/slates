@@ -196,6 +196,10 @@ pub fn namer(
 }
 
 /// The lineage key of `volume`, owned by `account`, under its tenant key: what seals the volume's chunks for holders.
+/// It is MADE and recorded when none is: only the volume's owner calls this, on its seal path, where the key comes into
+/// being. Every reader (a takeover's rebuild, a successor opening what it adopted) asks [`recorded_lineage`], which makes
+/// none: a key made on a read path opens nothing the owner sealed, and since [`adopt_lineage`] keeps a recorded lineage
+/// it would stand in the way of the right one for good (A-271).
 pub fn lineage(
   state: &mut crate::state::ShardState,
   volume: slates_db::catalog::VolumeId,
@@ -211,6 +215,26 @@ pub fn lineage(
       Ok(key)
     }
   }
+}
+
+/// The lineage key of `volume` as recorded here, or none: the readers' lookup. It never makes one ([`lineage`]).
+pub fn recorded_lineage(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u64,
+) -> Result<Option<WrappingKey>, SealKeyError> {
+  // Red first: makes a key when none is recorded, as `lineage` does.
+  lineage(state, volume, account).map(Some)
+}
+
+/// The namer of `volume` if its lineage and naming keys are both recorded here, or none; never made ([`recorded_lineage`]).
+pub fn recorded_namer(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u64,
+) -> Result<Option<hyper_seal::name::Namer>, SealKeyError> {
+  // Red first: makes the keys when none are recorded, as `namer` does.
+  namer(state, volume, account).map(Some)
 }
 
 /// The key `record` holds, unwrapped under `parent`.
