@@ -234,6 +234,8 @@ enum Op<T> {
   Create {
     path: String,
     is_dir: bool,
+    /// The Win32 attribute word the caller created with (A-262).
+    attributes: u32,
   },
   Read {
     object: T,
@@ -263,6 +265,9 @@ enum Op<T> {
   },
   Truncate {
     object: T,
+    /// The Win32 attribute word of the overwrite, and whether it supersedes the file's (A-262).
+    attributes: u32,
+    replace: bool,
   },
   /// `MoveFileEx` and its kin: `replace` is WinFsp's `ReplaceIfExists`, the caller's `MOVEFILE_REPLACE_EXISTING`
   /// (A-209: a move not asked to replace must refuse a taken name, `t/base/04.t`).
@@ -286,6 +291,8 @@ enum Op<T> {
     mtime: Option<i64>,
     ctime: Option<i64>,
     btime: Option<i64>,
+    /// The Win32 attribute word to give the object, or `None` for "as it is" (`INVALID_FILE_ATTRIBUTES`; A-262).
+    attributes: Option<u32>,
   },
   /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
   /// deletion. A directory with any child refuses (A-209, `t/base/03.t`): the delete itself runs in Cleanup, which
@@ -595,7 +602,15 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Open { path } => Op::Open { path },
     Op::PurgeResolve { object, ancestor } => Op::PurgeResolve { object, ancestor },
     Op::PurgeOpen { path, object } => Op::PurgeOpen { path, object },
-    Op::Create { path, is_dir } => Op::Create { path, is_dir },
+    Op::Create {
+      path,
+      is_dir,
+      attributes,
+    } => Op::Create {
+      path,
+      is_dir,
+      attributes,
+    },
     Op::Read {
       object,
       offset,
@@ -628,8 +643,14 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       object: ledger.get(object)?,
       new_size,
     },
-    Op::Truncate { object } => Op::Truncate {
+    Op::Truncate {
+      object,
+      attributes,
+      replace,
+    } => Op::Truncate {
       object: ledger.get(object)?,
+      attributes,
+      replace,
     },
     Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
     Op::CanDelete { object } => Op::CanDelete {
@@ -645,12 +666,14 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       mtime,
       ctime,
       btime,
+      attributes,
     } => Op::SetTimes {
       object: ledger.get(object)?,
       atime,
       mtime,
       ctime,
       btime,
+      attributes,
     },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
@@ -718,7 +741,7 @@ impl Served {
 /// kind, the size for both file and allocation size (page-granular), and the times as `FILETIME`.
 fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
   Ok(FileInfo {
-    file_attributes: file_attributes(attr.kind)?,
+    file_attributes: crate::node_attributes(attr)?,
     reparse_tag: 0,
     allocation_size: attr.size,
     file_size: attr.size,
@@ -797,7 +820,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       let fh = bridge.open(object, cx, 0)?;
       object_reply(&attr, fh)?
     }
-    Op::Create { path, is_dir } => op_create(bridge, cx, &path, is_dir)?,
+    Op::Create {
+      path,
+      is_dir,
+      attributes,
+    } => op_create(bridge, cx, &path, (is_dir, attributes))?,
     Op::Read {
       object,
       offset,
@@ -858,7 +885,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       )?;
       object_reply(&attr, 0)?
     }
-    Op::Truncate { object } => {
+    Op::Truncate {
+      object,
+      attributes,
+      replace,
+    } => {
       let attr = bridge.setattr(
         object.object,
         cx,
@@ -867,6 +898,9 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
           ..SetAttr::default()
         },
       )?;
+      // An overwrite gives the file the caller's attributes and marks it archived (A-262).
+      let word = crate::overwritten_attributes(crate::node_attributes(&attr)?, attributes, replace);
+      let attr = bridge.setattr(object.object, cx, crate::attribute_changes(&attr, word))?;
       object_reply(&attr, 0)?
     }
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
@@ -880,17 +914,21 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       mtime,
       ctime,
       btime,
+      attributes,
     } => op_set_times(
       bridge,
       cx,
       object.object,
-      SetAttr {
-        atime,
-        mtime,
-        ctime,
-        btime,
-        ..SetAttr::default()
-      },
+      (
+        SetAttr {
+          atime,
+          mtime,
+          ctime,
+          btime,
+          ..SetAttr::default()
+        },
+        attributes,
+      ),
     )?,
     Op::Flush { object } => {
       bridge.flush(object.object, cx, object.fh)?;
@@ -936,20 +974,28 @@ fn op_create(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   path: &str,
-  is_dir: bool,
+  (is_dir, attributes): (bool, u32),
 ) -> Result<Reply, VfsError> {
   let (name, parent_id) = match split_parent(bridge, cx, path)? {
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
   };
-  if is_dir {
+  let (attr, fh) = if is_dir {
     let attr = bridge.mkdir(parent_id, cx, name, DEFAULT_DIR_MODE)?;
     let fh = bridge.opendir(ObjectId::new(attr.ino, attr.generation), cx)?;
-    object_reply(&attr, fh)
+    (attr, fh)
   } else {
-    let (attr, fh) = bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?;
-    object_reply(&attr, fh)
-  }
+    bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?
+  };
+  // The object takes the attributes it was created with (A-262): a file's `READONLY` becomes its mode, after the open
+  // that made it, whose handle keeps the write access it was granted, as on NTFS.
+  let word = crate::created_attributes(attributes, is_dir);
+  let attr = bridge.setattr(
+    ObjectId::new(attr.ino, attr.generation),
+    cx,
+    crate::attribute_changes(&attr, word),
+  )?;
+  object_reply(&attr, fh)
 }
 
 /// Renames `from` to `to` by resolving each path's parent and final name.
@@ -969,6 +1015,13 @@ fn op_rename(
     Err(status) => return Ok(Reply::Err(status)),
   };
   if replace && replaces_a_directory(bridge, cx, (old_parent, from_name), (new_parent, to_name))? {
+    return Err(VfsError::NotPermitted);
+  }
+  // Windows never replaces a read-only file (`ERROR_ACCESS_DENIED`, A-262, `t/base/04.t` case 10).
+  if replace
+    && let Ok(target) = bridge.lookup(new_parent, cx, to_name)
+    && crate::refuses_replacement(&target)
+  {
     return Err(VfsError::NotPermitted);
   }
   bridge.rename(
@@ -1036,8 +1089,20 @@ fn op_set_times(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,
-  times: SetAttr,
+  (times, attributes): (SetAttr, Option<u32>),
 ) -> Result<Reply, VfsError> {
+  // `SetFileAttributes` replaces the object's attribute word (A-262): a file's `READONLY` is its mode.
+  let times = match attributes {
+    Some(word) => {
+      let changes = crate::attribute_changes(&bridge.getattr(object, cx)?, word);
+      SetAttr {
+        mode: changes.mode,
+        windows: changes.windows,
+        ..times
+      }
+    }
+    None => times,
+  };
   let attr = if times == SetAttr::default() {
     bridge.getattr(object, cx)?
   } else {
@@ -1062,7 +1127,12 @@ fn op_can_delete(
   fh: u64,
 ) -> Result<Reply, VfsError> {
   bridge.authorize_change(cx)?;
-  if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
+  let attr = bridge.getattr(object, cx)?;
+  // A read-only file refuses its deletion (A-262, `t/base/01.t` case 13): Windows answers `ERROR_ACCESS_DENIED`.
+  if crate::refuses_replacement(&attr) {
+    return Ok(Reply::Err(crate::status_cannot_delete()));
+  }
+  if !matches!(attr.kind, Kind::Dir) {
     return Ok(Reply::Ok);
   }
   let rows = bridge.readdir(object, cx, fh, 0, DOTS_AND_ONE_CHILD)?;
@@ -1382,7 +1452,7 @@ extern "C" fn create(
   file_name: Pwstr,
   create_options: u32,
   _granted_access: u32,
-  _file_attributes: u32,
+  file_attributes: u32,
   _security_descriptor: PSecurityDescriptor,
   _allocation_size: u64,
   p_context: *mut Pvoid,
@@ -1393,7 +1463,11 @@ extern "C" fn create(
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
   let is_dir = create_options & ffi::FILE_DIRECTORY_FILE != 0;
-  match handler.call(Op::Create { path, is_dir }) {
+  match handler.call(Op::Create {
+    path,
+    is_dir,
+    attributes: file_attributes,
+  }) {
     Reply::Opened { context, info } => finish_open(context, info, p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
@@ -1427,15 +1501,19 @@ extern "C" fn open_trampoline(
 extern "C" fn overwrite(
   fs: *mut FileSystem,
   context: Pvoid,
-  _file_attributes: u32,
-  _replace: Boolean,
+  file_attributes: u32,
+  replace: Boolean,
   _allocation_size: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  match handler.call(Op::Truncate { object }) {
+  match handler.call(Op::Truncate {
+    object,
+    attributes: file_attributes,
+    replace: replace != 0,
+  }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` handled by put_info.
       unsafe { put_info(p_info, info) };
@@ -1606,15 +1684,15 @@ extern "C" fn get_file_info(
 extern "C" fn set_basic_info(
   fs: *mut FileSystem,
   context: Pvoid,
-  _file_attributes: u32,
+  file_attributes: u32,
   creation_time: u64,
   last_access_time: u64,
   last_write_time: u64,
   change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // The creation, access, write and change times are applied (A-209, A-259); the attribute bits are not kept by the
-  // volume (A-209's stated difference), and the object's live info is returned so the caller sees what it holds.
+  // The attribute word, the creation, access, write and change times are applied (A-209, A-259, A-262), and the
+  // object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1624,6 +1702,7 @@ extern "C" fn set_basic_info(
     mtime: crate::unix_ns_from_filetime(last_write_time),
     ctime: crate::unix_ns_from_filetime(change_time),
     btime: crate::unix_ns_from_filetime(creation_time),
+    attributes: (file_attributes != crate::INVALID_FILE_ATTRIBUTES).then_some(file_attributes),
   }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.

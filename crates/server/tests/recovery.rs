@@ -3318,32 +3318,23 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 
 /// A-226, a give-back holds its shard no longer than a slice: do start a one-shard daemon over a fresh anchor (its
 /// journal has seen none of its recovery memory written, so its first idle ticks give back both checkpoint slots and
-/// the whole log, 18 GB a shard on a 128 GiB Mac) and probe the shard with a volume's status through those ticks; then
-/// leave it alone until the give-back finishes (the probes are other work, so while they run it takes a step a tick), and
-/// probe it for as long again with nothing left to give back, the test's own noise floor. Expect the recovery give-back
-/// counted in the first window (the non-vacuity count) and nothing more given back in the second, and the first window's
-/// longest probe no more than `FLOOR_MULTIPLE` times the second's. A closed-loop probe meets one stall as one sample,
-/// so the longest probe is the judge and the p99 and p999 are printed beside it. A host too loaded to judge by (its
-/// quiet probe past `JUDGED_FLOOR`) skips that judge loudly. Then do restart the daemon over the same anchor and give
-/// its recovery memory back a step at a time, as the idle tick does; expect the p99 step to have held its shard no
-/// more than `STEP_QUANTA` step quanta of the shard thread's own CPU. That judge runs wherever a thread clock is fine enough to
-/// time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
+/// the whole log, 18 GB a shard on a 128 GiB Mac), probe the shard with a volume's status while those ticks run, leave
+/// it alone until the journal has nothing left to give back, and probe it again. Expect the recovery give-back counted
+/// (the non-vacuity count) and nothing more given back once it had finished. The probes' latencies are printed and not
+/// judged: a probe's wall time on a loaded host says what the host did (10.4 ms against 2.2 ms at load 65 on Linux,
+/// with nothing of the shard's own in it). Then do restart the daemon over the same anchor and give its recovery memory
+/// back a step at a time, as the idle tick does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
+/// step quanta of the shard thread's own CPU, which load does not inflate. That judge runs wherever a thread clock is
+/// fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
 /// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
-/// Windows. Red-checked with the slice made unbounded
-/// (one step a whole region, as before A-226's slices). Before the give-back was sliced, one step marked
-/// 18,325,143,552 bytes reusable in 18 to 21 ms (macOS) while every probe that reached the shard waited.
+/// Windows. Red-checked with the slice made unbounded (one step a whole region, as before A-226's slices). Before the
+/// give-back was sliced, one step marked 18,325,143,552 bytes reusable in 18 to 21 ms (macOS) while every probe that
+/// reached the shard waited.
 #[test]
-fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
+fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
   /// Shape: a probe window, in reap ticks (`LIVENESS_BUDGET_NS` each): the first tick after the volume's create sees
   /// allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
   const WINDOW_TICKS: u64 = 4;
-  /// Shape: how many times the quiet window's longest probe the give-back window's may be: past that, a probe waited
-  /// on the shard's own work, not on the noise both windows share (18–21 ms against about 1 ms before A-226's slices).
-  const FLOOR_MULTIPLE: u32 = 4;
-  /// Shape: the longest quiet probe this test can judge by: a host whose own noise holds a probe longer than a
-  /// give-back step costs (18–21 ms on macOS) cannot tell the two, so the test says so and judges nothing (a loaded
-  /// development machine: 160–350 ms at load 89–114 on 18 cores, 2026-11-06).
-  const JUDGED_FLOOR: Duration = Duration::from_millis(5);
   let profile = common::machine_profile();
   let instance = format!("srv-recovery-slices-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
@@ -3368,7 +3359,8 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
   // window is what a probe meets beside those steps. Left alone, the shard then finishes, so the quiet window starts
   // with nothing left to give back.
   let giving_back = longest_probe(&mut client, volume, window);
-  let after_give_back = give_back_finished(window, || returned(&daemon));
+  give_back_finished(&daemon);
+  let after_give_back = returned(&daemon);
   let quiet = longest_probe(&mut client, volume, window);
   let after_quiet = returned(&daemon);
   println!(
@@ -3384,17 +3376,6 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
       "nothing was left to give back in the second"
     );
   }
-  if quiet > JUDGED_FLOOR {
-    println!(
-      "SKIPPED (loudly), the probe's judge: this host's own noise held a quiet probe {quiet:?}, past the \
-       {JUDGED_FLOOR:?} the test can judge a give-back step by; the step's own CPU below still judges"
-    );
-  } else {
-    assert!(
-      giving_back <= quiet.saturating_mul(FLOOR_MULTIPLE),
-      "a probe waited {giving_back:?} on the give-back, against {quiet:?} with nothing to give back"
-    );
-  }
   daemon.stop();
   // The judge every Linux and macOS host can apply: a restarted daemon has not seen its recovery memory written, so it
   // gives all of it back again, and each step's CPU on the shard's own thread clock is what the step held the shard.
@@ -3404,24 +3385,31 @@ fn a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor() {
   drop(anchor);
 }
 
-/// Leaves the shard alone until the recovery bytes `returned` reads have stopped moving (and moved), up to
-/// `SETTLE_WINDOWS`: the bytes given back. Each look is itself a task on the shard, so it is made a window apart.
-fn give_back_finished(window: Duration, returned: impl Fn() -> u64) -> u64 {
-  /// Shape: the windows the give-back may take before the test calls it unfinished: a loaded host's slices are small,
-  /// and a look interrupts it, so 18 GB may take several (two at load 90 on 18 cores, 2026-11-07).
-  const SETTLE_WINDOWS: u32 = 8;
-  let mut given_back = returned();
-  for _ in 0..SETTLE_WINDOWS {
+/// Leaves the shard alone until its give-back has finished: until the journal has no dead recovery memory left to give
+/// back, which is the give-back's own completion. Until 2026-11-08 this waited for the bytes given back to stand still
+/// over a window, and on a loaded host (load 41 to 62) a give-back between two reap ticks stood still with some left: 2
+/// of 7 runs then gave back the rest in the quiet window. Each look is itself a task on the shard, which ends the
+/// give-back for that tick, so they are a reap tick apart. Fails only if `STALLED_TICKS` pass with nothing more given
+/// back.
+fn give_back_finished(daemon: &Daemon) {
+  /// Shape: the reap ticks with no progress before the test calls the give-back stuck: well past a loaded host's gaps
+  /// between ticks that find the shard idle.
+  const STALLED_TICKS: u32 = 60;
+  let tick = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let mut left = daemon.recovery_left_to_give_back().unwrap();
+  let mut stalled = 0;
+  while left > 0 {
+    assert!(
+      stalled < STALLED_TICKS,
+      "the give-back made no progress for {STALLED_TICKS} reap ticks, {left} bytes left"
+    );
     #[allow(clippy::disallowed_methods)]
     // a test leaving the shard alone, which is the state it needs
-    std::thread::sleep(window);
-    let now = returned();
-    if now > 0 && now == given_back {
-      break;
-    }
-    given_back = now;
+    std::thread::sleep(tick);
+    let now = daemon.recovery_left_to_give_back().unwrap();
+    stalled = if now < left { 0 } else { stalled + 1 };
+    left = now;
   }
-  given_back
 }
 
 /// Gives `daemon`'s recovery memory back a step at a time, as the idle tick does, and holds its p99 step to
@@ -5026,4 +5014,294 @@ fn held_base_refuses_destroys(client: &mut Client, overlay: VolumeId, snapshot: 
     client.destroy(overlay).is_err(),
     "and so is the volume it belongs to"
   );
+}
+
+/// The bytes an unlinked open file holds in the tests below: more than any directory entry or attribute change moves
+/// the volume's referenced bytes, so the hold is seen in them. One NFSv4 WRITE carries it.
+/// Shape: 64 KiB, within one WRITE of the daemon's transfer size.
+const HELD_BYTES: usize = 64 * 1024;
+
+/// The file handle of the file `name` the session's `at` reaches (GETFH).
+fn handle_of(session: &mut common::nfs4::Session, capability: &str, name: &str) -> Vec<u8> {
+  let body = session
+    .at(capability, &[name], |args| {
+      args.u32(slates_bridge_nfs::v4::compound::op::GETFH)
+    })
+    .unwrap_or_else(|status| panic!("GETFH of {name} answered {status}"));
+  slates_bridge_nfs::xdr::XdrReader::new(&body)
+    .opaque(slates_bridge_nfs::nfs::MAX_FH)
+    .unwrap()
+    .to_vec()
+}
+
+/// WRITE of `bytes` at offset zero to the file `fh` under the open `stateid`, `FILE_SYNC`.
+fn write_held(session: &mut common::nfs4::Session, fh: &[u8], stateid: &[u8], bytes: &[u8]) {
+  /// Format: `FILE_SYNC4` (RFC 8881 §18.32).
+  const FILE_SYNC4: u32 = 2;
+  session
+    .on(fh, |args| {
+      args.u32(slates_bridge_nfs::v4::compound::op::WRITE);
+      args.fixed(stateid);
+      args.u64(0);
+      args.u32(FILE_SYNC4);
+      args.opaque(bytes);
+    })
+    .unwrap_or_else(|status| panic!("WRITE answered {status}"));
+}
+
+/// GETATTR of the file `fh` names: its link count and size, or the status that refused it.
+#[allow(clippy::unwrap_in_result)] // a malformed reply is a failed test
+fn links_and_size(session: &mut common::nfs4::Session, fh: &[u8]) -> Result<(u32, u64), u32> {
+  /// Format: `FATTR4_SIZE` (attribute 4) in the bitmap's first word, `FATTR4_NUMLINKS` (35) in its second.
+  const SIZE_WORD: u32 = 1 << 4;
+  const NUMLINKS_WORD: u32 = 1 << (35 - 32);
+  let body = session.on(fh, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::GETATTR);
+    args.u32(2);
+    args.u32(SIZE_WORD);
+    args.u32(NUMLINKS_WORD);
+  })?;
+  let mut body = slates_bridge_nfs::xdr::XdrReader::new(&body);
+  let words = body.u32().unwrap();
+  for _ in 0..words {
+    body.u32().unwrap();
+  }
+  let values = body.opaque(usize::MAX).unwrap().to_vec();
+  let mut values = slates_bridge_nfs::xdr::XdrReader::new(&values);
+  // The values come in attribute order: the size (4), then the link count (35).
+  let size = values.u64().unwrap();
+  let links = values.u32().unwrap();
+  Ok((links, size))
+}
+
+/// READ of the whole of the file `fh` under the open `stateid`: its bytes, or the status that refused it.
+#[allow(clippy::unwrap_in_result)] // a malformed reply is a failed test
+fn read_held(
+  session: &mut common::nfs4::Session,
+  fh: &[u8],
+  stateid: &[u8],
+) -> Result<Vec<u8>, u32> {
+  let body = session.on(fh, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::READ);
+    args.fixed(stateid);
+    args.u64(0);
+    args.u32(u32::try_from(HELD_BYTES).unwrap());
+  })?;
+  let mut body = slates_bridge_nfs::xdr::XdrReader::new(&body);
+  let _eof = body.bool().unwrap();
+  Ok(body.opaque(usize::MAX).unwrap().to_vec())
+}
+
+/// REMOVE of `name` from the volume's root, as `unlink` sends it: its status.
+fn remove_name(session: &mut common::nfs4::Session, capability: &str, name: &str) -> u32 {
+  match session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::REMOVE);
+    args.opaque(name.as_bytes());
+  }) {
+    Ok(_) => 0,
+    Err(status) => status,
+  }
+}
+
+/// CLOSE of the open `stateid` of the file `fh`, by handle, as a client closes a file whose name is gone.
+fn close_held(session: &mut common::nfs4::Session, fh: &[u8], stateid: &[u8]) -> Result<(), u32> {
+  session
+    .on(fh, |args| {
+      args.u32(slates_bridge_nfs::v4::compound::op::CLOSE);
+      args.u32(0); // seqid, unused in NFSv4.1
+      args.fixed(stateid);
+    })
+    .map(|_| ())
+}
+
+/// The bytes the volume `id` references, read until `settled` holds of them or the restart oracle's wait passes:
+/// a hold's release reaches the volume as the call that ends it is served, a lapsed client's as its purge is.
+fn referenced_until(client: &mut Client, id: VolumeId, settled: impl Fn(u64) -> bool) -> u64 {
+  let started = Instant::now();
+  loop {
+    let referenced = client.status(id).unwrap().referenced_bytes;
+    // Each status is a round trip to the daemon, which paces the loop.
+    if settled(referenced) || started.elapsed() >= START_WAIT {
+      return referenced;
+    }
+  }
+}
+
+/// What a test made and holds: the open's state id, the file's handle, and the bytes written to it.
+struct Held {
+  stateid: Vec<u8>,
+  fh: Vec<u8>,
+  bytes: Vec<u8>,
+}
+
+/// Creates `name` through an NFSv4 OPEN of the session's open-owner `owner`, writes [`HELD_BYTES`] to it under that
+/// open, then removes its name while the open stays.
+fn open_write_and_remove(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (owner, name): (&[u8], &str),
+) -> Held {
+  let opened = open_guarded(session, capability, (owner, name)).expect("the OPEN");
+  let stateid = opened[..STATEID_BYTES].to_vec();
+  let fh = handle_of(session, capability, name);
+  let bytes: Vec<u8> = (0..HELD_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  write_held(session, &fh, &stateid, &bytes);
+  assert_eq!(
+    remove_name(session, capability, name),
+    0,
+    "REMOVE of the open file"
+  );
+  Held { stateid, fh, bytes }
+}
+
+/// Asserts the removed file `held` still serves through its open: GETATTR by its handle answers a link count of zero
+/// and its size, and READ under the open answers its bytes (POSIX unlink-while-open; A-260).
+fn assert_kept_at_nlink_zero(session: &mut common::nfs4::Session, held: &Held, when: &str) {
+  assert_eq!(
+    links_and_size(session, &held.fh),
+    Ok((0, u64::try_from(held.bytes.len()).unwrap())),
+    "{when}: the removed open file answers GETATTR by its handle, at nlink 0 with its size"
+  );
+  assert_eq!(
+    read_held(session, &held.fh, &held.stateid).as_deref(),
+    Ok(held.bytes.as_slice()),
+    "{when}: the removed open file reads its bytes under its open"
+  );
+}
+
+/// A-260. Do: through the daemon's NFSv4.1 transport, OPEN a new file, write 64 KiB to it, REMOVE its name while the
+/// open stays, then CLOSE it by its handle. Expect: until the CLOSE the file answers GETATTR by its handle at a link
+/// count of zero and reads its bytes, and the volume still references them; at the CLOSE its space comes back (POSIX
+/// unlink-while-open, which the server promises its clients with `OPEN4_RESULT_PRESERVE_UNLINKED` so they send the
+/// REMOVE instead of a silly rename). Before, an NFSv4 open held nothing in the volume, so the REMOVE reclaimed the
+/// file at once and its handle answered `NFS4ERR_STALE`.
+#[test]
+fn a_file_removed_while_open_over_nfsv4_serves_until_its_last_close() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-unlinked-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("v4unlinked", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let id = client.create(&scratch("unlinked")).unwrap();
+  let capability = capability_path(&daemon, "unlinked");
+  let empty = client.status(id).unwrap().referenced_bytes;
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut session = common::nfs4::Session::open(port, b"unlinked-holder");
+
+  let held = open_write_and_remove(&mut session, &capability, (b"holder", "held"));
+  assert_kept_at_nlink_zero(&mut session, &held, "after the REMOVE");
+  let holding = client.status(id).unwrap().referenced_bytes;
+  assert!(
+    holding >= empty + u64::try_from(HELD_BYTES).unwrap(),
+    "the removed open file's bytes stay referenced until its last close ({empty} empty, {holding} held)"
+  );
+  close_held(&mut session, &held.fh, &held.stateid).expect("the CLOSE by handle");
+  let closed = referenced_until(&mut client, id, |bytes| bytes <= empty);
+  assert_eq!(closed, empty, "the last close frees the file's space");
+  assert_eq!(
+    links_and_size(&mut session, &held.fh),
+    Err(NFS4ERR_STALE),
+    "after its last close the removed file is gone"
+  );
+  daemon.stop();
+  drop(anchor);
+}
+
+/// Format: `NFS4ERR_STALE` (RFC 8881 §15.1.2.7): a file handle that names no object any more.
+const NFS4ERR_STALE: u32 = 70;
+
+/// A-260, across a takeover. Do: OPEN, write and REMOVE a file through NFSv4.1 as above, and a second one that is also
+/// closed; stop the daemon and start a successor over the same anchor; then GETATTR, READ and CLOSE the first by its
+/// handle on the same session. Expect: the successor serves the removed file at nlink 0 with its bytes (the open is
+/// journaled in the partition, A-37, and its hold is taken again from that record before the recovery reclaims files
+/// no one holds), the closed one's space is gone, and the CLOSE frees the rest.
+#[test]
+fn a_file_removed_while_open_over_nfsv4_serves_across_a_daemon_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-unlinked-restart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("v4unlinkedrestart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let id = client.create(&scratch("unlinked")).unwrap();
+  let capability = capability_path(&first, "unlinked");
+  let empty = client.status(id).unwrap().referenced_bytes;
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut session = common::nfs4::Session::open(port, b"unlinked-restart");
+  let held = open_write_and_remove(&mut session, &capability, (b"holder", "held"));
+  let closed = open_write_and_remove(&mut session, &capability, (b"closer", "closed"));
+  close_held(&mut session, &closed.fh, &closed.stateid).expect("the CLOSE before the restart");
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  session.reconnect(port);
+  let mut client = connect(&instance);
+  assert_kept_at_nlink_zero(&mut session, &held, "after the restart");
+  let holding = client.status(id).unwrap().referenced_bytes;
+  let one = u64::try_from(HELD_BYTES).unwrap();
+  assert!(
+    holding >= empty + one && holding < empty + 2 * one,
+    "after the restart only the open file's bytes stay referenced ({empty} empty, {holding} held)"
+  );
+  close_held(&mut session, &held.fh, &held.stateid).expect("the CLOSE after the restart");
+  assert_eq!(
+    referenced_until(&mut client, id, |bytes| bytes <= empty),
+    empty,
+    "the last close after the restart frees the file's space"
+  );
+  second.stop();
+  drop(anchor);
+}
+
+/// A-260, a lease that lapses. Do: with a client table of one and a short lease, OPEN, write and REMOVE a file through
+/// one NFSv4.1 client, let its lease lapse without a renewal, then start a second client (its EXCHANGE_ID expires the
+/// lapsed one, RFC 8881 §8.3). Expect: the removed file is kept while its client's lease holds, and its space comes
+/// back once the lapsed client's state is purged, though nothing ever closed it.
+#[test]
+fn a_file_removed_while_open_over_nfsv4_is_freed_when_its_clients_lease_lapses() {
+  /// Shape: the lease the test runs under, short enough to wait out, long past a served compound.
+  const LEASE: Duration = Duration::from_secs(2);
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-unlinked-lease-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1))
+    .with_failover_slo(u64::try_from(LEASE.as_nanos()).unwrap());
+  // One client at a time, so a second client's EXCHANGE_ID expires the lapsed first (the courteous server's rule).
+  config.nfs_v4.clients = 1;
+  let anchor = held_anchor("v4unlinkedlease", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let id = client.create(&scratch("unlinked")).unwrap();
+  let capability = capability_path(&daemon, "unlinked");
+  let empty = client.status(id).unwrap().referenced_bytes;
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut lapsing = common::nfs4::Session::open(port, b"unlinked-lapsing");
+  let held = open_write_and_remove(&mut lapsing, &capability, (b"holder", "held"));
+  assert_kept_at_nlink_zero(&mut lapsing, &held, "while the lease holds");
+  #[allow(clippy::disallowed_methods)]
+  // the test waits out a lease, sending nothing that would renew it
+  std::thread::sleep(LEASE + LEASE / 2);
+  let _successor = common::nfs4::Session::open(port, b"unlinked-successor");
+  assert_eq!(
+    referenced_until(&mut client, id, |bytes| bytes <= empty),
+    empty,
+    "the lapsed client's purge frees the removed file it held open"
+  );
+  daemon.stop();
+  drop(anchor);
 }

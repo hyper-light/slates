@@ -9,6 +9,16 @@
 //! cannot be committed rolls the partition back to its durable state (the database's own rule), and
 //! the state in memory is then rebuilt from those same records — what a restart would build — and the
 //! call is answered `NFS4ERR_SERVERFAULT`.
+//!
+//! Every open and delegation also holds its file in the volume (A-260): one reference per open and per delegation,
+//! owned by [`RefOwner::NfsState`] of the attachment whose handle made it, taken when its record commits and given
+//! back when the record of its end does. A file removed while one is held keeps serving at a link count of zero, and
+//! its space comes back at the last end, as POSIX's unlink-while-open has it; the server promises its clients as much
+//! with `OPEN4_RESULT_PRESERVE_UNLINKED`, so they send the REMOVE instead of renaming the file aside (`.nfs*`, a name
+//! a landing would carry). The journal is these holds' only record: the recovery image carries none, and a recovery
+//! takes them again from the journaled opens and delegations before it reclaims the files no one holds
+//! ([`hold_recovered`]). An attachment's end gives its holds back ([`release_attachment`]). They are bounded by the
+//! state's own bounds, the opens and the delegations it may record.
 
 use slates_bridge_nfs::v4::compound::Server as V4Server;
 use slates_bridge_nfs::v4::files::{FileChange, FileState, LockRecord, OpenRecord, Share};
@@ -20,6 +30,11 @@ use slates_db::catalog::{
   NfsCallbackRecord, NfsChannelRecord, NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord,
   NfsPurgeRecord, NfsSessionRecord,
 };
+
+use slates_bridge_nfs::handle::FileHandle;
+use slates_bridge_nfs::nfs::Nfsfh3;
+use slates_bridge_nfs::v4::files::Holding;
+use slates_vfs::ids::{InodeNo, RefOwner};
 
 use crate::state::ShardState;
 
@@ -63,6 +78,8 @@ pub(crate) fn record_files(s: &mut ShardState, reply: Option<&[u8]>) -> bool {
     return true;
   };
   let changes = files.take_changes();
+  // Taken with the changes: a call whose changes cannot be recorded never happened, and its holdings go with it.
+  let holdings = files.take_holdings();
   // The store's recall gate follows the delegations (A-79): each inode whose holders changed (a grant, return,
   // revocation, or a client's purge) is updated alone (A-80: a whole rebuild walked every delegation on every grant).
   for inode in files.take_changed_inodes() {
@@ -88,6 +105,9 @@ pub(crate) fn record_files(s: &mut ShardState, reply: Option<&[u8]>) -> bool {
     ops.extend(crate::nfs_replay::committed_op(s, &call));
   }
   if commit(s, &ops) {
+    for holding in holdings {
+      hold(s, holding);
+    }
     return true;
   }
   s.nfs_v4_files = file_state(s);
@@ -96,6 +116,98 @@ pub(crate) fn record_files(s: &mut ShardState, reply: Option<&[u8]>) -> bool {
     s.store.recall_gate.reset(std::collections::BTreeMap::new());
   }
   false
+}
+
+/// Counter: holds an NFSv4 open or delegation could not take or give back in its volume (A-260): the file was gone
+/// already (a handle to a reclaimed file, which the next call by it is told is stale), or its volume is not served
+/// here. Format: a refusal name in the status report.
+const HOLD_REFUSED: &str = "nfs4.hold_refused";
+
+/// Counter: holds taken again from the partition's journaled opens and delegations by a recovery (A-260): the
+/// non-vacuity check that the restart oracle's file was held through the recovery, not reclaimed and served by luck.
+/// Format: a counter name in the status report.
+const HOLDS_RECOVERED: &str = "nfs4.hold_recovered";
+
+/// Takes or gives back the volume reference one NFSv4 open or delegation holds (A-260). A handle of a snapshot
+/// attachment names an object of its read-only view, which no REMOVE reaches, so it holds nothing; a refusal is
+/// counted, never answered: the open it belongs to was recorded and answered already.
+fn hold(s: &mut ShardState, holding: Holding) {
+  let (fh, took) = match holding {
+    Holding::Took(fh) => (fh, true),
+    Holding::Gave(fh) => (fh, false),
+  };
+  if hold_file(s, &fh, took).is_none() {
+    s.count(HOLD_REFUSED, 1);
+  }
+}
+
+/// The hold of the file `fh` names taken (`took`) or given back, or `None` when it could not be.
+fn hold_file(s: &mut ShardState, fh: &Nfsfh3, took: bool) -> Option<()> {
+  let handle = FileHandle::from_fh(fh).ok()?;
+  let record = s.db.partition().attachment(handle.attachment)?;
+  if record.snapshot.is_some() {
+    return Some(());
+  }
+  let slot = *s.by_id.get(&handle.volume)?;
+  let ShardState { volumes, store, .. } = s;
+  let volume = &mut volumes.get_mut(slot).ok()?.volume;
+  let owner = RefOwner::NfsState(handle.attachment);
+  let inode = InodeNo(handle.inode);
+  if took {
+    volume.reference_for(store, inode, owner).ok()
+  } else {
+    volume.forget_for(store, inode, owner, 1).ok()
+  }
+}
+
+/// Takes again, for the volume `volume` a recovery just rebuilt, the hold of every NFSv4 open and delegation its
+/// partition journaled (A-260), before the recovery settles its references and reclaims the files no one holds: the
+/// recovery image carries none of these holds, so a file removed while open keeps serving across the restart, and one
+/// whose last open ended before it is reclaimed. Returns the holds taken.
+pub(crate) fn hold_recovered(s: &mut ShardState, volume: slates_db::catalog::VolumeId) -> usize {
+  let partition = s.db.partition();
+  let held: Vec<Nfsfh3> = partition
+    .nfs_opens()
+    .map(|record| Nfsfh3(record.fh.clone()))
+    .chain(
+      partition
+        .nfs_delegations()
+        .map(|record| Nfsfh3(record.fh.clone())),
+    )
+    .filter(|fh| FileHandle::from_fh(fh).is_ok_and(|handle| handle.volume == volume))
+    .collect();
+  let mut taken = 0usize;
+  for fh in held {
+    match hold_file(s, &fh, true) {
+      Some(()) => taken = taken.saturating_add(1),
+      None => s.count(HOLD_REFUSED, 1),
+    }
+  }
+  s.count(HOLDS_RECOVERED, u64::try_from(taken).unwrap_or(u64::MAX));
+  taken
+}
+
+/// Gives back every hold the NFSv4 opens and delegations made through the attachment `attachment` have in its volume
+/// `volume` (A-260), as the attachment ends: its mount's requests are refused from now on, so nothing it holds open can
+/// be read or closed through it. The opens stay in the file state until their client closes them or is purged, and
+/// their give-backs then find nothing to give.
+pub(crate) fn release_attachment(
+  s: &mut ShardState,
+  volume: slates_db::catalog::VolumeId,
+  attachment: u64,
+) {
+  let Some(slot) = s.by_id.get(&volume).copied() else {
+    return;
+  };
+  let ShardState { volumes, store, .. } = s;
+  let released = volumes.get_mut(slot).map(|slot| {
+    slot
+      .volume
+      .sweep_attachment(store, RefOwner::NfsState(attachment))
+  });
+  if !matches!(released, Ok(Ok(()))) {
+    s.count(HOLD_REFUSED, 1);
+  }
 }
 
 /// Records the changes the listener's client table made. `false` when they could not be recorded; the
