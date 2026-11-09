@@ -16,13 +16,14 @@ pub(super) struct MountExport {
 }
 
 impl MountExport {
-  /// Obtains a write mount's capability through the ordinary, authorized client path.
+  /// Obtains a mount's capability through the ordinary, authorized client path: a write attachment, or a read one when
+  /// `read_only`.
   pub(super) fn attach(
     instance: &str,
     id: &str,
     name: &str,
     server: &str,
-    deadlines: Deadlines,
+    (deadlines, read_only): (Deadlines, bool),
   ) -> Result<Self, Failure> {
     let volume = VolumeId {
       bytes: u128::from_str_radix(id, 16)
@@ -32,7 +33,14 @@ impl MountExport {
     let mut client = Client::connect(instance, deadlines)
       .map_err(|error| Failure(format!("mount client: {error}")))?;
     let attached = client
-      .attach_mount(volume, Intent::Write)
+      .attach_mount(
+        volume,
+        if read_only {
+          Intent::Read
+        } else {
+          Intent::Write
+        },
+      )
       .map_err(|error| Failure(format!("attach host mount: {error}")))?;
     let mut export = Self {
       client,
@@ -162,7 +170,8 @@ mod tests {
       })
       .unwrap();
     let id = format!("{:032x}", u128::from_be_bytes(volume.bytes));
-    let export = MountExport::attach(&instance, &id, "adapter", "127.0.0.1", deadlines).unwrap();
+    let export =
+      MountExport::attach(&instance, &id, "adapter", "127.0.0.1", (deadlines, false)).unwrap();
     let port = client.status(volume).unwrap().nfs_port.unwrap();
     assert_eq!(
       mount_status(port, "127.0.0.1:/adapter"),
@@ -184,14 +193,16 @@ mod tests {
       2,
       "detached capability refused"
     );
-    let abandoned = MountExport::attach(&instance, &id, "adapter", "127.0.0.1", deadlines).unwrap();
+    let abandoned =
+      MountExport::attach(&instance, &id, "adapter", "127.0.0.1", (deadlines, false)).unwrap();
     drop(abandoned);
     assert_eq!(
       client.status(volume).unwrap().attachments,
       0,
       "failed mount cleaned up"
     );
-    let unmounted = MountExport::attach(&instance, &id, "adapter", "127.0.0.1", deadlines).unwrap();
+    let unmounted =
+      MountExport::attach(&instance, &id, "adapter", "127.0.0.1", (deadlines, false)).unwrap();
     assert_eq!(mount_status(port, unmounted.source()), 0);
     assert_eq!(mount_call(port, unmounted.source(), 3), None);
     assert_eq!(

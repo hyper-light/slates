@@ -342,15 +342,19 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
   }
 }
 
-/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`), judged by the watchdog's
-/// rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
+/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`): its progress and its busiest
+/// thread's CPU, judged by the watchdog's rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
 /// its one step, so it is alive while its CPU progresses and has run less than a window of it. With no reading (no
 /// process clock, or the process already gone) the wall window stands alone, as for a shard with no thread clock.
 fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+  // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
+  // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
+  // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
+  // read nothing is judged spinning, and the progress alone judges a start wedged.
   let cpu = supervisor
     .child_pid()
     .and_then(slates_machine::process_clock::process_cpu)
-    .map(|reading| (reading.spent_ns, reading.progress));
+    .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
   let look = Look {
     steps: 0,
     parked: false,
@@ -375,7 +379,7 @@ fn start_stuck(verdict: Verdict) -> Option<String> {
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
     Verdict::Spinning { cpu_ns } => Some(format!(
-      "ran {} ms of CPU without beating (the {} ms liveness window)",
+      "ran {} ms of CPU on one thread without beating (the {} ms liveness window)",
       cpu_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
@@ -404,17 +408,16 @@ fn observe(
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
   // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
   slates_machine::log_line!(
-    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or runs \
-     that much CPU without its first beat, in its own CPU time ({})",
+    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or one of \
+     its threads runs that much CPU without its first beat, in its own CPU time ({})",
     LIVENESS_BUDGET_NS / NS_PER_MS,
-    if supervisor
+    match supervisor
       .child_pid()
       .and_then(slates_machine::process_clock::process_cpu)
-      .is_some()
     {
-      "read from the OS"
-    } else {
-      "none read here: the wall window stands alone"
+      Some(cpu) if cpu.busiest_thread_ns.is_some() => "read from the OS, each thread's",
+      Some(_) => "read from the OS; its threads not, so nothing is judged spinning",
+      None => "none read here: the wall window stands alone",
     }
   );
   let mut kill_sent = false;
