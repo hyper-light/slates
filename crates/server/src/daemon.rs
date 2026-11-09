@@ -1102,6 +1102,15 @@ impl Daemon {
     })
   }
 
+  /// This node's council configuration fetches as a learner (`slates_ipc::protocol::LearnerReport`): the version it
+  /// holds, the version after its last fetch, how many members that fetch asked and how long ago. A one-shot
+  /// control-shard observation.
+  pub fn learner_fetches(&self) -> Result<slates_ipc::protocol::LearnerReport, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::verbs::learner_report(s)
+    })
+  }
+
   /// Test support: the regional configuration version this daemon's placement has installed and the one its
   /// council holds (§4.8): equal once the coordinator has installed what the council committed. A test reads
   /// them to show which configurations its daemons stood at when an answer depended on it. A one-shot
@@ -3807,6 +3816,7 @@ fn init_shard(
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
+    learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
     record_sessions: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),

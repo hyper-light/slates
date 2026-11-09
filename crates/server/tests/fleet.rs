@@ -723,6 +723,25 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
     .saturating_add(1)
 }
 
+/// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
+/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
+/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
+  horizon_periods()
+    .saturating_add(death_window_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(1)
+}
+
+/// Derived: the coordinator periods the survivors take to settle their neighbourhoods after a voter's departure:
+/// learning it ([`departure_learned_periods`]), the commit that re-places their records on the moved cohort, the period
+/// a settlement is reported in, and the settlement's commit.
+fn departure_settled_periods(daemons: &[&Daemon]) -> u64 {
+  departure_learned_periods(daemons)
+    .saturating_add(commit_periods().saturating_mul(2))
+    .saturating_add(1)
+}
+
 /// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds, then
 /// returns `true`. **Robust to noisy and heavy CPU load:** the wait is charged against the fleet's own forward
 /// progress — the fleet-coordinator **periods** each of `daemons` has executed ([`Daemon::fleet_progress`],
@@ -7032,26 +7051,32 @@ fn a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone() {
   } = fleet_that_lost_its_bootstrap_voter();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let mut versions: Vec<Result<(u64, u64), ObserveError>> = Vec::new();
-  let caught_up = poll_until(&observed, formation_deadline(), || {
-    versions = daemons.iter().map(Daemon::configuration_versions).collect();
-    let councils: Vec<u64> = versions
-      .iter()
-      .filter_map(|version| version.as_ref().ok().map(|(_, council)| *council))
-      .collect();
-    let newest = councils.iter().copied().max().unwrap_or(0);
-    Ok(
-      councils.len() == daemons.len()
-        && newest > before
-        && councils.iter().all(|council| *council == newest),
-    )
-  });
+  let caught_up = poll_for_periods(
+    &observed,
+    formation_deadline(),
+    departure_learned_periods(&observed),
+    || {
+      versions = daemons.iter().map(Daemon::configuration_versions).collect();
+      let councils: Vec<u64> = versions
+        .iter()
+        .filter_map(|version| version.as_ref().ok().map(|(_, council)| *council))
+        .collect();
+      let newest = councils.iter().copied().max().unwrap_or(0);
+      Ok(
+        councils.len() == daemons.len()
+          && newest > before
+          && councils.iter().all(|council| *council == newest),
+      )
+    },
+  );
+  let fetches: Vec<_> = daemons.iter().map(Daemon::learner_fetches).collect();
   for daemon in daemons {
     daemon.stop();
   }
   assert!(
     caught_up,
     "every survivor's council passed version {before} and reached the newest (installed, council) per survivor: \
-     {versions:?}; the learners' views at the stop {known:?}"
+     {versions:?}; the learners' views at the stop {known:?}; each survivor's learner fetches {fetches:?}"
   );
 }
 
@@ -7078,24 +7103,28 @@ fn a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone() 
   } = fleet_that_lost_its_bootstrap_voter();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let mut views: Vec<SettlementView> = Vec::new();
-  let settled = poll_until(&observed, formation_deadline(), || {
-    views = daemons
-      .iter()
-      .map(|daemon| {
-        (
-          daemon
-            .member_identity()
-            .and_then(|member| daemon.council_settlement(member)),
-          daemon.configuration_versions(),
-        )
-      })
-      .collect();
-    let councils: Vec<u64> = views
-      .iter()
-      .filter_map(|(_, version)| version.as_ref().ok().map(|(_, council)| *council))
-      .collect();
-    let newest = councils.iter().copied().max().unwrap_or(0);
-    Ok(
+  let settled = poll_for_periods(
+    &observed,
+    formation_deadline(),
+    departure_settled_periods(&observed),
+    || {
+      views = daemons
+        .iter()
+        .map(|daemon| {
+          (
+            daemon
+              .member_identity()
+              .and_then(|member| daemon.council_settlement(member)),
+            daemon.configuration_versions(),
+          )
+        })
+        .collect();
+      let councils: Vec<u64> = views
+        .iter()
+        .filter_map(|(_, version)| version.as_ref().ok().map(|(_, council)| *council))
+        .collect();
+      let newest = councils.iter().copied().max().unwrap_or(0);
+      Ok(
       councils.len() == daemons.len()
         && newest > before
         && councils.iter().all(|council| *council == newest)
@@ -7103,14 +7132,16 @@ fn a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone() 
           matches!(generations, Ok(Some((settled, current))) if settled == current)
         }),
     )
-  });
+    },
+  );
+  let fetches: Vec<_> = daemons.iter().map(Daemon::learner_fetches).collect();
   for daemon in daemons {
     daemon.stop();
   }
   assert!(
     settled,
     "every survivor's neighbourhood settled at the newest configuration past version {before}, (settled, current) and \
-     (installed, council) per survivor: {views:?}; the learners' views at the stop {known:?}"
+     (installed, council) per survivor: {views:?}; the learners' views at the stop {known:?}; each survivor's learner fetches {fetches:?}"
   );
 }
 
@@ -7137,54 +7168,60 @@ fn a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone() {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let mut views: Vec<VotersView> = Vec::new();
   let mut leaders: Vec<Vec<HostId>> = Vec::new();
-  let agreed = poll_until(&observed, formation_deadline(), || {
-    views = daemons
-      .iter()
-      .map(|daemon| (daemon.council_known_voters(), daemon.fleet_contacts()))
-      .collect();
-    leaders = daemons
-      .iter()
-      .filter(|daemon| daemon.council_leads() == Ok(true))
-      .filter_map(|daemon| daemon.council_voters().ok().flatten())
-      .collect();
-    let Some(voters) = leaders.first().map(|voters| {
-      let mut sorted = voters.clone();
-      sorted.sort_unstable();
-      sorted
-    }) else {
-      return Ok(false);
-    };
-    let newest = daemons
-      .iter()
-      .filter_map(|daemon| daemon.configuration_versions().ok())
-      .map(|(_, council)| council)
-      .max()
-      .unwrap_or(0);
-    Ok(
-      newest > before
-        && voters.len() == 3
-        && views.iter().all(|(known_voters, contacts)| {
-          let named = known_voters.as_ref().is_ok_and(|named| {
-            let mut sorted = named.clone();
-            sorted.sort_unstable();
-            sorted == voters
-          });
-          let in_contact = contacts.as_ref().is_ok_and(|contacts| {
-            contacts.iter().all(|(peer, reason)| {
-              !voters.contains(peer) || !reason.starts_with("OutsideNeighbourhood")
-            })
-          });
-          named && in_contact
-        }),
-    )
-  });
+  let agreed = poll_for_periods(
+    &observed,
+    formation_deadline(),
+    departure_learned_periods(&observed),
+    || {
+      views = daemons
+        .iter()
+        .map(|daemon| (daemon.council_known_voters(), daemon.fleet_contacts()))
+        .collect();
+      leaders = daemons
+        .iter()
+        .filter(|daemon| daemon.council_leads() == Ok(true))
+        .filter_map(|daemon| daemon.council_voters().ok().flatten())
+        .collect();
+      let Some(voters) = leaders.first().map(|voters| {
+        let mut sorted = voters.clone();
+        sorted.sort_unstable();
+        sorted
+      }) else {
+        return Ok(false);
+      };
+      let newest = daemons
+        .iter()
+        .filter_map(|daemon| daemon.configuration_versions().ok())
+        .map(|(_, council)| council)
+        .max()
+        .unwrap_or(0);
+      Ok(
+        newest > before
+          && voters.len() == 3
+          && views.iter().all(|(known_voters, contacts)| {
+            let named = known_voters.as_ref().is_ok_and(|named| {
+              let mut sorted = named.clone();
+              sorted.sort_unstable();
+              sorted == voters
+            });
+            let in_contact = contacts.as_ref().is_ok_and(|contacts| {
+              contacts.iter().all(|(peer, reason)| {
+                !voters.contains(peer) || !reason.starts_with("OutsideNeighbourhood")
+              })
+            });
+            named && in_contact
+          }),
+      )
+    },
+  );
+  let fetches: Vec<_> = daemons.iter().map(Daemon::learner_fetches).collect();
   for daemon in daemons {
     daemon.stop();
   }
   assert!(
     agreed,
     "every survivor named the leader's voters and kept contact with each: leaders' voters {leaders:?}; (known voters, \
-     contacts) per survivor {views:?}; the learners' views at the stop {known:?}"
+     contacts) per survivor {views:?}; the learners' views at the stop {known:?}; each survivor's learner fetches {fetches:?}"
   );
 }
 

@@ -4746,6 +4746,18 @@ fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u6
   }
 }
 
+/// A learner's last council configuration fetch ([`drive_learner_fetch`]): when it asked (the runtime clock), how many
+/// members it asked, and the council version it held once the replies were adopted. Read by status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LearnerFetchLog {
+  /// When the last fetch asked, or `None` before any.
+  pub(crate) asked_at_ns: Option<u64>,
+  /// The members it asked.
+  pub(crate) asked: u32,
+  /// The council version held after its replies were adopted.
+  pub(crate) fetched_version: u64,
+}
+
 /// An uninitialized learner's fetch pace: when its next fetch is due and the wait after that one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LearnerPace {
@@ -6800,11 +6812,14 @@ async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
+  let asked_at_ns = futures::now_ns();
   let _ = state::with_state_counted(|s| {
     s.count(
       LEARNER_FETCHES,
       u64::try_from(sent.len()).unwrap_or(u64::MAX),
     );
+    s.learner_fetch.asked_at_ns = Some(asked_at_ns);
+    s.learner_fetch.asked = u32::try_from(sent.len()).unwrap_or(u32::MAX);
   });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
@@ -6826,6 +6841,7 @@ async fn drive_learner_fetch(budget: CommitBudget, in_flight: &mut Vec<Dispatch>
     for (peer, bytes) in &fetched {
       crate::consensus::adopt_fetch(s, false, *peer, bytes);
     }
+    s.learner_fetch.fetched_version = s.council.configuration().version;
   });
 }
 
