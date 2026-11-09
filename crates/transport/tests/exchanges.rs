@@ -1017,3 +1017,142 @@ async fn slots_work(endpoint: &mut Endpoint, bulk: usize) -> Result<SlotOutcome,
     bulk_done_at_ping,
   })
 }
+
+/// Shape: the least silence a caller waits for before judging its peer dead (`peer_silent_past`'s floor), the daemon's
+/// liveness budget.
+const SILENCE_FLOOR_NS: u64 = NS_PER_SECOND;
+/// Shape: how often these tests look at the judgement, a hundredth of the floor.
+const LOOK_NS: u64 = 10 * MS;
+
+/// What a session saw of its peer's silence over one request: when it first judged the peer silent past its duration
+/// (since the request began), the duration it judged by then, the longest silence it saw, and whether the request was
+/// answered.
+#[derive(Debug)]
+struct Silence {
+  judged_at: Option<u64>,
+  duration: u64,
+  longest: u64,
+  answered: bool,
+}
+
+/// Sends `bytes` of `kind` and drives the session a look at a time until it is answered or `bound_ns` passes, watching
+/// `peer_silent_past(SILENCE_FLOOR_NS)`; given a rate, a warm exchange runs and then a link at that rate is added on
+/// both directions.
+async fn watch_silence(
+  mut endpoint: Endpoint,
+  link: Option<u64>,
+  kind: u64,
+  bytes: usize,
+  bound_ns: u64,
+) -> (Endpoint, Result<Silence, String>) {
+  if let Some(rate) = link {
+    // The warm exchange the link is added after: the session's sample is the quiet path's.
+    let _ = within(
+      NS_PER_SECOND,
+      endpoint.request(PING, Priority::Control, b"warm"),
+    )
+    .await;
+    let link = sim_udp_add_link(SimLink {
+      rate_bits_per_second: rate,
+      queue_bytes: 1 << 20,
+    });
+    sim_udp_set_path(SimPath::in_order(0, 0).through(link));
+  }
+  let began = slates_rt::futures::now_ns();
+  let id = match endpoint.begin(kind, Priority::Bulk, &vec![0xB5; bytes]) {
+    Ok(id) => id,
+    Err(e) => return (endpoint, Err(format!("begin: {e:?}"))),
+  };
+  let mut seen = Silence {
+    judged_at: None,
+    duration: 0,
+    longest: 0,
+    answered: false,
+  };
+  while slates_rt::futures::now_ns().saturating_sub(began) < bound_ns {
+    if endpoint.take_reply(id).is_some() {
+      seen.answered = true;
+      break;
+    }
+    if let Some(Err(e)) = within(LOOK_NS, endpoint.drive()).await {
+      return (endpoint, Err(format!("drive: {e:?}")));
+    }
+    seen.longest = seen.longest.max(endpoint.peer_silence_ns().unwrap_or(0));
+    if seen.judged_at.is_none() && endpoint.peer_silent_past(SILENCE_FLOOR_NS) {
+      seen.judged_at = Some(slates_rt::futures::now_ns().saturating_sub(began));
+      seen.duration = endpoint.persistent_congestion_duration();
+    }
+  }
+  sim_udp_set_path(SimPath::NONE);
+  endpoint.abandon_all();
+  (endpoint, Ok(seen))
+}
+
+/// A peer gone mid-exchange (its session dropped, nothing answered) is judged silent past its duration no sooner than
+/// the longer of the floor and three probe timeouts each at least the initial one (RFC 9002 §7.6.1, §6.2.2: about 2 s
+/// here, from a sub-millisecond sample), and within a look after. Before, a caller judged its own fixed second, which on
+/// the fabric cut a live holder whose answers a queue held back (2026-11-08).
+#[test]
+fn a_gone_peer_is_judged_silent_only_past_its_persistent_congestion_duration() {
+  let report = run_session(1, Net::clean(MS), 64, ServerMode::DieAfter(0), |endpoint| {
+    watch_silence(endpoint, None, ECHO, 100, 30 * NS_PER_SECOND)
+  });
+  let seen = report.client.unwrap();
+  let judged = seen.judged_at.expect("the gone peer was judged silent");
+  let due = SILENCE_FLOOR_NS.max(seen.duration);
+  assert!(
+    seen.duration >= 3 * 666 * MS,
+    "three initial probe timeouts at least: {seen:?}"
+  );
+  assert!(
+    judged >= due && judged <= due + 2 * LOOK_NS,
+    "judged at {judged} ns, against its duration of {due} ns: {seen:?}"
+  );
+}
+
+/// A peer answering behind a deep queue shared by both directions (a 256 kbit/s link, no MTU on the path, so path-MTU
+/// discovery sends 64 KB datagrams of 2 s each) is never judged silent, and its answer arrives. Non-vacuous: its answers
+/// came more than the floor apart, so a fixed second would have judged it dead.
+#[test]
+fn a_peer_answering_behind_a_queue_is_never_judged_silent() {
+  let report = run_session(1, Net::clean(0), 64, ServerMode::Serve, |endpoint| {
+    watch_silence(endpoint, Some(256_000), BULK, 60_000, 120 * NS_PER_SECOND)
+  });
+  let seen = report.client.unwrap();
+  assert!(seen.answered, "answered: {seen:?}");
+  assert_eq!(seen.judged_at, None, "never judged silent: {seen:?}");
+  assert!(
+    seen.longest > SILENCE_FLOOR_NS,
+    "its answers came more than the floor apart: {seen:?}"
+  );
+}
+
+/// A session that asked nothing since its peer last answered is never silent, however long it idles: silence is an
+/// answer owed and not given, not time since the last packet.
+#[test]
+fn an_idle_session_owes_nothing_and_is_never_silent() {
+  let report = run_session(
+    1,
+    Net::clean(MS),
+    64,
+    ServerMode::Serve,
+    |mut endpoint: Endpoint| async move {
+      let answered = within(
+        NS_PER_SECOND,
+        endpoint.request(PING, Priority::Control, b"one"),
+      )
+      .await;
+      let _ = within(10 * NS_PER_SECOND, std::future::pending::<()>()).await;
+      let silence = endpoint.peer_silence_ns();
+      let silent = endpoint.peer_silent_past(SILENCE_FLOOR_NS);
+      let outcome = match answered {
+        Some(Ok(_)) => Ok((silence, silent)),
+        other => Err(format!("the ping was not answered: {other:?}")),
+      };
+      (endpoint, outcome)
+    },
+  );
+  let (silence, silent) = report.client.unwrap();
+  assert_eq!(silence, None, "nothing owed after ten idle seconds");
+  assert!(!silent, "never silent");
+}

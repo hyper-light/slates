@@ -29,6 +29,8 @@ const PTO_RTTVAR_MULTIPLIER: u64 = 4;
 /// Format: RFC 9002 §6.2.1 — before any RTT sample, the PTO is twice the initial RTT. A protocol
 /// constant (the "2 ×" of `2 * kInitialRtt`).
 const INITIAL_PTO_MULTIPLIER: u64 = 2;
+/// Derived: the probe timeout before any RTT sample, [`INITIAL_PTO_MULTIPLIER`] × `kInitialRtt` (666 ms).
+pub(crate) const INITIAL_PTO_NS: u64 = INITIAL_PTO_MULTIPLIER * INITIAL_RTT_NS;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the numerator. A protocol constant.
 const TIME_THRESHOLD_NUMERATOR: u64 = 9;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the denominator. A protocol constant.
@@ -121,7 +123,7 @@ impl RttEstimator {
   /// is the right ceiling for establishing a connection, where the in-progress sample is not yet a
   /// trustworthy basis for giving up.
   pub fn initial_pto(&self) -> u64 {
-    INITIAL_PTO_MULTIPLIER.saturating_mul(INITIAL_RTT_NS)
+    INITIAL_PTO_NS
   }
 
   /// The smoothed RTT (nanoseconds), for the connection's diagnostics and assertions.
@@ -173,6 +175,18 @@ impl RttEstimator {
       .saturating_mul(PERSISTENT_CONGESTION_THRESHOLD)
   }
 
+  /// [`persistent_congestion_duration`](RttEstimator::persistent_congestion_duration) with its probe timeout floored
+  /// at the initial one (§6.2.2): how long a path whose sample may predate the traffic now on it must acknowledge
+  /// nothing before it is taken for gone. A sample from an idle path says nothing of the queue that traffic builds; a
+  /// probe timeout drawn from it (a millisecond on a quiet link) would take a live peer behind that queue for a dead
+  /// one, where the initial RTT is the RFC's assumption for a path not yet measured.
+  pub fn persistent_congestion_duration_floored(&self, max_ack_delay: u64) -> u64 {
+    self
+      .pto(max_ack_delay)
+      .max(self.initial_pto())
+      .saturating_mul(PERSISTENT_CONGESTION_THRESHOLD)
+  }
+
   /// The RTT variation (nanoseconds).
   pub fn rttvar(&self) -> u64 {
     self.rttvar
@@ -190,6 +204,28 @@ mod tests {
 
   /// A millisecond in nanoseconds, so the samples read as round times.
   const MS: u64 = 1_000_000;
+
+  /// The persistent-congestion duration a dead path is judged by never falls below three initial probe timeouts: a
+  /// sub-millisecond sample from an idle link gives 3 × 666 ms, not 3 × 1 ms, and a sample past the initial RTT gives
+  /// three of its own probe timeouts (RFC 9002 §7.6.1, floored by §6.2.2).
+  #[test]
+  fn the_duration_a_dead_path_is_judged_by_is_floored_at_three_initial_probe_timeouts() {
+    let mut idle = RttEstimator::new();
+    idle.on_sample(MS / 2, 0);
+    assert_eq!(
+      idle.persistent_congestion_duration_floored(0),
+      3 * 2 * 333 * MS,
+      "an idle link's sample: three initial probe timeouts"
+    );
+    let mut slow = RttEstimator::new();
+    slow.on_sample(800 * MS, 0);
+    // PTO = 800 + 4 × 400 = 2,400 ms, past the initial 666.
+    assert_eq!(
+      slow.persistent_congestion_duration_floored(0),
+      3 * 2_400 * MS,
+      "a slow path's sample: three of its own probe timeouts"
+    );
+  }
 
   /// Before any sample the PTO is twice the initial RTT (RFC 9002 §6.2.2), so the connection has a
   /// timeout to arm from the very first packet.
