@@ -2626,10 +2626,22 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         fenced_at_or_above(&survivors, &volume, epoch),
       );
     }
-    None => verdict.check(
-      "NoLoss (successor)",
-      vec!["no survivor served the volume within the fleet wait".to_owned()],
-    ),
+    None => {
+      verdict.check(
+        "NoLoss (successor)",
+        vec!["no survivor served the volume within the fleet wait".to_owned()],
+      );
+      // A-272: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave every
+      // copy where it is (`fleet.takeover.lost` counted, `reclaimed` none), for the round that can still recover it.
+      verdict.check(
+        "NoLoss (copies kept while unserved)",
+        survivors
+          .iter()
+          .filter(|survivor| counter(survivor, "fleet.takeover.reclaimed") > 0)
+          .map(|survivor| format!("{survivor} reclaimed its copy of a volume nobody serves"))
+          .collect(),
+      );
+    }
   }
   drop(fleet);
   verdict.judge();
