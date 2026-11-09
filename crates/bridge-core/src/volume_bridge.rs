@@ -620,6 +620,7 @@ fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
     atime: attrs.atime,
     mtime: attrs.mtime,
     ctime: attrs.ctime,
+    btime: attrs.btime,
     change: observed.change,
   }
 }
@@ -1344,7 +1345,11 @@ impl Bridge for VolumeBridge<'_> {
         None => self.volume.chown(self.store, inode, uid, gid),
       }?;
     }
-    if changes.atime.is_some() || changes.mtime.is_some() || changes.ctime.is_some() {
+    if changes.atime.is_some()
+      || changes.mtime.is_some()
+      || changes.ctime.is_some()
+      || changes.btime.is_some()
+    {
       match host_for(&mut self.host, self.volume.is_overlay())? {
         Some(host) => self.volume.with_host(host).set_times(
           self.store,
@@ -1352,7 +1357,7 @@ impl Bridge for VolumeBridge<'_> {
           changes.atime,
           changes.mtime,
           changes.ctime,
-          None,
+          changes.btime,
         ),
         None => self.volume.set_times(
           self.store,
@@ -1360,7 +1365,7 @@ impl Bridge for VolumeBridge<'_> {
           changes.atime,
           changes.mtime,
           changes.ctime,
-          None,
+          changes.btime,
         ),
       }?;
     }

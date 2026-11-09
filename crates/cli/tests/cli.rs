@@ -770,6 +770,84 @@ fn a_stuck_start_is_killed_and_restarted() {
   );
 }
 
+/// The CPU the daemon of an anchor started with `shards` shards has run by the time it answers: what its start cost.
+#[cfg(unix)]
+fn start_cpu_ns(instance: &str, shards: usize) -> u64 {
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    instance,
+    &[],
+    &shards.to_string(),
+  );
+  await_serving(&mut stderr, instance, false);
+  let pid = await_daemon(instance, None, &[]);
+  let spent = slates_machine::process_clock::process_cpu(pid)
+    .map(|reading| reading.spent_ns)
+    .unwrap();
+  drop(anchor);
+  spent
+}
+
+/// A-228, §2.6 boot step 1: a start is judged by the watchdog's rule, one thread at a time, never by the sum of its threads.
+/// Do: measure what one shard adds to a start's CPU (a start of as many shards as the machine runs at once, less a start of
+/// one, over the shards between), then start an anchor with enough shards that their starts sum past three liveness
+/// windows. Expect: the daemon serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's
+/// summed CPU, held it to one window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio,
+/// though no thread came near a window.
+#[cfg(unix)]
+#[test]
+fn a_start_whose_shards_sum_past_a_window_comes_up() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the many-shard start: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let window = slates_server::daemon::LIVENESS_BUDGET_NS;
+  let at_once = std::thread::available_parallelism()
+    .map_or(2, usize::from)
+    .max(2);
+  let one = start_cpu_ns(&format!("cli-sum-one-{}", std::process::id()), 1);
+  let many = start_cpu_ns(&format!("cli-sum-many-{}", std::process::id()), at_once);
+  let per_shard = many.saturating_sub(one) / u64::try_from(at_once - 1).unwrap();
+  assert!(
+    per_shard > 0,
+    "a shard costs its start something: {one} ns, {many} ns"
+  );
+  let shards = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  eprintln!(
+    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {shards} shards sum past three windows"
+  );
+  let instance = format!("cli-sum-{}", std::process::id());
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    &instance,
+    &[],
+    &shards.to_string(),
+  );
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut kills = Vec::new();
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = std::io::BufRead::read_line(&mut stderr, &mut line).unwrap();
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    // Looked for anywhere in a line: the anchor's and the daemon's lines share one pipe and can arrive glued.
+    if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
+      break;
+    }
+    if line.contains(START_KILL_LINE) {
+      kills.push(line.trim_end().to_owned());
+    }
+  }
+  let served = line.contains(&serving_line);
+  drop(anchor);
+  assert!(
+    kills.is_empty() && served,
+    "a start of {shards} shards: served {served}, the anchor's start kills {kills:?}"
+  );
+}
+
 /// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
 

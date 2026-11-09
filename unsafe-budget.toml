@@ -215,7 +215,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 63
+slates-machine = 70
+# 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
+#   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
+#   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
+#   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
+#   (none). None has a safe wrapper.
 # 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
 #   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
 #   Neither call has a safe wrapper in rustix.
