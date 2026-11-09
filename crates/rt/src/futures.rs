@@ -62,6 +62,13 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
     .ok_or(RtError::NotOnShardThread)?
 }
 
+/// Spawns a joinable task on the current shard that the shard runs alone until it ends: no other task is polled
+/// meanwhile, and each of its yields still ends a step (`ShardContext::spawn_alone`). A daemon's shard start, whose
+/// recovery yields between slices while nothing else may yet reach the shard's state, is the use.
+pub fn spawn_alone<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  registry::with_current(|ctx| ctx.spawn_alone(boxed(future))).ok_or(RtError::NotOnShardThread)?
+}
+
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
   registry::with_current(|ctx| {
@@ -100,6 +107,12 @@ impl Future for Join {
     registry::with_current(|ctx| ctx.poll_join(id, cx.waker()))
       .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
   }
+}
+
+/// The task polls this shard has made; `None` off a shard thread. Read across a [`yield_now`], more than the yielding
+/// task's own return is another task having run meanwhile.
+pub fn polls_so_far() -> Option<u64> {
+  registry::with_current(|ctx| ctx.counters().polls)
 }
 
 /// Yields once: the task is re-queued and resumes after the rest of the batch.

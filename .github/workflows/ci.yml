@@ -497,19 +497,19 @@ jobs:
       # linted, and its Unix-only DAX reply type and an `opcode` only Unix read failed `-D warnings` for Windows unseen
       # (found by `cargo xwin clippy` from a Mac).
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
       #
       # The binary is what this lane was widened for: its Windows signal handling was compiled by nothing
-      # until 2026-10-20. Its *other* targets are Unix by nature — the bin's own `cfg(test)` modules and the
-      # `vfs_tails` example use inherited descriptors, `slates-bridge-nfs` and `slates-bridge-oci` — and
-      # `--all-targets` pulled them in here, where they cannot compile. They are not left unlinted: the
-      # ubuntu and macOS gates lint the whole workspace with `--all-targets`, which is where a Unix-only
-      # target belongs. Narrowing keeps this lane about the Windows artifact.
-      - name: Clippy the shipped Windows binary
-        run: cargo clippy -p slates-cli -- -D warnings
+      # until 2026-10-20. All its targets are linted here, examples included: a target that is Unix by nature gates
+      # itself with a stated reason (a test module `cfg(all(test, unix))`; an example a paired `main` whose Windows arm
+      # says why, as `journal_bench` does), so it still compiles. Until 2026-11-08 this step linted the binary alone, and
+      # three `slates-cli` examples that did not compile for Windows went unseen (`nfs_writeback_ab`, from e2eac8db,
+      # `nfs_large_write` and `vfs_tails`); `slates-land`'s `land_bench` joined the crate list above for the same reason.
+      - name: Clippy the shipped Windows binary and every other slates-cli target
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The binary's one Windows test target, the WinFsp mount through the command, linted on its own for the same
       # reason: the rest of its targets are Unix by nature.
       - name: Clippy the WinFsp CLI tests (native Windows)
@@ -667,6 +667,12 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # A daemon keeps its beat through a recovery longer than a liveness window (recovery slicing): the one recovery test
+      # that drives no NFS loopback or rustix, so it runs here as well as with the Unix recovery oracle.
+      - name: Test a daemon's beat through a long recovery (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test recovery_slicing -- --nocapture
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -962,10 +968,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           cargo clippy -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-anchor
-          -p slates-bridge-winfsp -p slates-mcp -p slates-cluster --all-targets -- -D warnings
-      - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
+          -p slates-bridge-winfsp -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
+      # Every slates-cli target, examples included, as on x86_64 (windows-lint says why).
+      - name: Clippy the shipped binary and every other slates-cli target natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards --test start_judgment --test held_rendezvous --test winfsp --test winfsp_semantics -- -D warnings
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
@@ -1224,7 +1231,7 @@ jobs:
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
       - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
-        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness --test alone
 
   windows-nightly:
     name: windows (every push to main and nightly)
@@ -1263,19 +1270,19 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster --all-targets -- -D warnings
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
       # The shipped Windows binary, linted without `--all-targets` and as a step of its own so its exit code
       # is checked on its own (the Windows shell is `pwsh`, where a native command failing mid-script does not
       # end the script — only the last line decides the step, which would mask this).
       #
       # The binary is what this lane was widened for: its Windows signal handling was compiled by nothing
-      # until 2026-10-20. Its *other* targets are Unix by nature — the bin's own `cfg(test)` modules and the
-      # `vfs_tails` example use inherited descriptors, `slates-bridge-nfs` and `slates-bridge-oci` — and
-      # `--all-targets` pulled them in here, where they cannot compile. They are not left unlinted: the
-      # ubuntu and macOS gates lint the whole workspace with `--all-targets`, which is where a Unix-only
-      # target belongs. Narrowing keeps this lane about the Windows artifact.
-      - name: Clippy the shipped Windows binary
-        run: cargo clippy -p slates-cli -- -D warnings
+      # until 2026-10-20. All its targets are linted here, examples included: a target that is Unix by nature gates
+      # itself with a stated reason (a test module `cfg(all(test, unix))`; an example a paired `main` whose Windows arm
+      # says why, as `journal_bench` does), so it still compiles. Until 2026-11-08 this step linted the binary alone, and
+      # three `slates-cli` examples that did not compile for Windows went unseen (`nfs_writeback_ab`, from e2eac8db,
+      # `nfs_large_write` and `vfs_tails`); `slates-land`'s `land_bench` joined the crate list above for the same reason.
+      - name: Clippy the shipped Windows binary and every other slates-cli target
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The Win32 paths a native runner exercises, including the **full daemon lifecycle end to end**
       # (an in-process daemon a client reaches through the Win32 rendezvous, driving the whole verb set)
       # — no longer owed now that the rendezvous is proven; the cross-process anchor-restart path stays
