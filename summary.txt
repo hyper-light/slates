@@ -1,0 +1,15 @@
+run 42508255276 commit e5ded5fe7df05d341c985ede3e3eca7ad7a29999 ubuntu-latest runs=success
+== out/liveness-1.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.008627078s at most in 3.010232465s; largest beat gap 93.440437ms; the watchdog looked 30 times and withheld the beat at 0
+.spinning shard: a window of its CPU (1.006911947s) took 1.704262825s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 2.01282548s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.55s
+== out/liveness-2.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.009007744s at most in 3.011328578s; largest beat gap 100.695528ms; the watchdog looked 29 times and withheld the beat at 0
+.spinning shard: a window of its CPU (1.009652922s) took 2.048857024s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 2.016397104s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.58s
+== out/liveness-3.log
+starved shard: 63 spinners at nice 0, its CPU clock stood still for 3.00731918s at most in 3.009166482s; largest beat gap 100.656915ms; the watchdog looked 29 times and withheld the beat at 0
+spinning shard: a window of its CPU (1.008964094s) took 1.911841431s of wall; 0 beat(s) after; the beat stopped true; its CPU by the end 2.015064691s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.52s
+== out/pollers.log
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
