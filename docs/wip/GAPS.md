@@ -15403,6 +15403,13 @@ runs on the box at load average 74 to 93, and never alone.
   4,194,304 for 0. The server's end of a mount now sweeps its attachment's references (§4.6, "A FUSE mount's end gives
   back its lookups"). Test: `the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end`
   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-09-an-unmounted-fuse-mounts-lookups-stayed-counted.md`.
+- **Open, a test race (slabs, low priority; found 2026-11-09):**
+  `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
+  asserts a `mkdir` through the mount answers `EIO` once the stand-in server refuses its barrier; once, the `mkdir`
+  succeeded with nothing on standard error, so the refusal had not applied when the `mkdir` was served. Count: 1 failure
+  (diag-slabs-46, run 42669640876, on main 92dcd16c's base), 3 of 3 passes later (adacachy2 at 0bed9680, 15803af2 and
+  7789447e). The test drives the bridge through its own stand-in server, not `crates/server/src/fuse.rs`. Owed: find
+  what the refusal waits on and make the test wait for it.
 - **A sibling, fixed 2026-11-09 (slabs; found reading the unrecovered destroy):** a FUSE mount the predecessor kept, of
   a volume its successor could not rebuild, was left in place answering `ENOTCONN`, as A-102 makes every dead mount, but
   recovery skipped the rest of A-102 for it (`reconcile_lost` runs only for a rebuilt volume): it was not counted
