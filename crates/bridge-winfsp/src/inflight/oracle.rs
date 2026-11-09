@@ -175,6 +175,8 @@ struct Driver {
   held: BTreeMap<usize, u64>,
   ignored: u64,
   violations: Vec<String>,
+  /// Opens whose confirmation the receive worker waited for the shard to apply before it went on (audit step 7, cut (c)).
+  held_on_confirm: u64,
 }
 
 impl Driver {
@@ -363,6 +365,8 @@ impl Edges for Model<'_> {
   }
 
   fn confirm_open(&mut self, context: u64) -> Result<(), String> {
+    // The worker waits here for the shard to apply the confirmation: a round on its path.
+    self.driver.held_on_confirm += 1;
     self.ledger.confirmed(context).map_err(text)
   }
 
@@ -639,4 +643,20 @@ fn a_crash_after_any_store_to_held_memory_loses_no_open_and_answers_every_reques
     }
   }
   assert!(scenarios > tail.len(), "only {scenarios} scenarios ran");
+}
+
+/// Audit step 7, cut (c). Do: serve the workload, whose three files are each opened. Expect: the receive worker never waits
+/// for the shard to confirm an open it has just handed the driver: it posts the confirmation and takes its next request,
+/// and the shard's FIFO channel applies the confirmation ahead of that request. Before, every open held the worker for a
+/// shard round: 9.9 us at the mean on arm64 quiet and 139.6 us loaded (diag-winfsp-overlap-50, run 42506936806).
+#[test]
+fn an_opens_confirmation_does_not_hold_the_receive_worker() {
+  let mut held = fresh();
+  life(&mut held, true, None).unwrap();
+  check(&mut held, "the workload");
+  assert_eq!(
+    held.driver.held_on_confirm, 0,
+    "the receive worker waited for {} confirmations of opens it had handed the driver",
+    held.driver.held_on_confirm
+  );
 }
