@@ -4994,7 +4994,12 @@ needs a listing the recovered plane has not read yet reads it then rather than t
 base snapshot is judged complete against its directories' listings read from the host, uncached, so their first real
 listing still renumbers their untouched entries (A-151; 2026-11-08,
 `docs/bugs/2026-11-08-a-pinned-snapshot-was-refused-as-a-greens-base-after-a-restart.md`). Missing resources
-return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+return `RecoveryIncomplete`/`BaseUnavailable`, never empty success. A volume whose record survives but which recovery
+cannot rebuild at all is listed with its cause (`VolumeSummary::not_recovered`), and every verb on it answers
+`NotRecovered { cause }` but its destroy. The destroy removes the record, which has no live slot, in one step, as a merge
+volume's does: its attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its
+snapshots' records, lineage and keys and leaves its tombstone, with nothing materialized (2026-11-08,
+`docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`).
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -13043,7 +13048,10 @@ Applied in the same change to:
 - the benches' global `sync` replaced by `sync -f PATH` (`mixed/copy_tree.sh`, `mem/per_file.sh`, `mem/per_entry.sh`,
   `nfs/large_io.sh`).
 
-Status: built 2026-10-08.
+Status: built 2026-10-08. Since 2026-11-09 only an exit before the daemon served counts toward the bound (the
+supervision block's serving word, which the daemon marks once its start, recovery included, is done): a daemon killed
+while serving had recovered, and counting it backed off a test that killed a serving daemon twenty times
+(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`).
 - What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
   over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
   160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
@@ -14653,8 +14661,10 @@ Status: built 2026-11-06.
   is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
   ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
   (`JournalStep::GiveBack { quarters }`). The test of the shard held is
-  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
-  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+  `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step`: each step's CPU on the shard thread's own clock, which load
+  does not inflate. Until 2026-11-08 it also held a probe's longest wait against a quiet floor, which on a loaded host
+  measured the host (10.4 ms against 2.2 ms at load 65), and waited for the bytes given back to stand still, where it
+  now waits on the journal having nothing left to give back.
 - The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
   area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
   records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
