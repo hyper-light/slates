@@ -1222,7 +1222,9 @@
 >   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
 >   (with A-257's whole replay, state A under load on main 80be552a: unsliced 198 spinning lines and 203 restarts for 5
 >   kills, no restart whole; sliced 0 lines, every restart read back whole; the first CPU figures here measured fenced
->   replays and are withdrawn, the comparison owed); the records' sort computes each key once (it recomputed the lineage depth,
+>   replays and were withdrawn; measured again 2026-11-09, shard 0's recovery CPU sliced is within 10% of unsliced in
+>   every 5-restart comparison, +1.5% to +1.9% pooled at 100 works and −12.7% at 1,000, and a takeover is not
+>   stretched: BENCHMARKS, "Recovery sliced against unsliced"); the records' sort computes each key once (it recomputed the lineage depth,
 >   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
 >   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
 >   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over

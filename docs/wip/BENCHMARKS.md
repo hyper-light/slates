@@ -12276,3 +12276,95 @@ Invalid: a cgroup freezer held the fleet, not the scheduler (GAPS, "A capped uni
 reached its oracle, so neither has latencies. The healthy reference for the wait per timeslice is `rungs9/ab-clean-2`, 0.10
 ms. Step 5 is closed without a third run: A-228 stands on its own red and green evidence.
 
+
+## Recovery sliced against unsliced: shard 0's recovery CPU and the takeover's latency (A-228; 2026-11-08 and 09)
+
+A shard's start runs alone, and its recovery yields between units (GAPS, "recovery in one poll closed"). These runs
+measure what slicing costs, which was owed once the first CPU figures were withdrawn as fenced replays. They also check
+whether slicing stretches a takeover.
+
+### Shard 0's recovery CPU
+
+**Command.** `ab-final.sh` with `recrun-sliced.sh` (kept with this record's session, `liveness/slice4`). Each run uses
+loadtest-scale's harness to build merge state over `linux-v7.4-rc1/kernel`:
+`load_bench --keep-works --clients N --hot-files 800 --per-connection 32 --rounds 3`. It records what the daemon
+acknowledged, then kills the anchored daemon 5 times. Each restart is read back by content, so a fenced green fails the
+run. The figure is shard 0's CPU from the boot line (`shard 0 initialized in ... µs, ... µs of its CPU, in S slices`),
+one a restart.
+- **Arms.** Main 80be552a, unsliced, with the boot line's CPU added; slice6, sliced. Release builds, no LTO.
+- **States.** State A is 1,000 works and state B is 100.
+- **Conditions.** Quiet means a run started under a one-minute load of 30; loaded means 8 `nice -n 19` spinners a CPU.
+- **Order.** Rounds alternate the build order.
+
+**Hardware and load.** adas-macbook-pro-2, Apple M5 Max, 18 CPUs, 128 GB, macOS, 2026-11-08 and 09, shared with other
+agents. Two runs started without a quiet spell (load 35 to 46), and the log says which.
+
+| State B, ms | unsliced: median [the 5 restarts] | sliced: median [the 5 restarts] | change |
+|---|---|---|---|
+| quiet r1 | 139.2 [113.8 116.2 140.7 155.1 139.2] | 137.8 [115.4 137.8 135.2 180.2 158.2] | −1.0% |
+| quiet r2 | 220.6 [190.0 216.9 220.6 235.7 256.1] | 209.2 [209.2 193.2 203.9 240.5 266.8] | −5.2% |
+| quiet r3 | unpaired: the machine stalled (below) | | |
+| quiet r4 | 225.1 [196.8 204.0 225.1 232.8 255.5] | 215.4 [208.9 207.8 215.4 225.3 259.3] | −4.3% |
+| loaded r1 | [183.6 211.9 221.7 234.7 178.7] | [210.1 227.1 235.1 181.5 191.8] | −0.8% |
+| loaded r2 | [207.5 218.6 174.4 183.9 210.7] | [213.5 219.2 186.2 188.7 206.8] | −0.3% |
+| loaded r3 | [215.0 180.6 201.0 206.9 189.2] | [213.5 215.0 185.2 186.1 210.0] | +4.5% |
+| loaded r4 | [199.4 184.6 192.2 205.3 215.7] | [205.5 231.5 175.8 204.9 203.3] | +2.7% |
+
+Pooled over the paired rounds: quiet 204.0 to 207.8 ms (+1.9%, 15 restarts each); loaded 203.1 to 206.1 ms (+1.5%, 20
+each). Every 5-run comparison is within 10%.
+
+| State A quiet, ms | unsliced: every restart | sliced: every restart | change of medians |
+|---|---|---|---|
+| r1 | 1419.0 1384.8 1402.1 1090.3 1118.9 | 1133.0 1210.9 1213.2 1169.6 1086.9 | −15.5% |
+| r2 | 1354.8 1296.7 1372.3 1407.2 1395.1 | 1124.1 1109.9 1182.2 1131.6 1183.6 | −17.5% |
+| r3 | 1140.5 1222.6 1250.0 1295.8 1287.3, then 1258.6 1308.3 | 1135.3 927.0 892.0 937.6 923.3 | −25.8% |
+
+Round 3's unsliced run restarted 7 times for 5 kills, and its change is over the first five. Pooled: 1296.7 to 1131.6 ms
+(−12.7%).
+
+State A loaded has no CPU comparison. The unsliced build crash-looped in all three rounds (14, 194 and 198 heartbeat
+lapses), so shard 0's boot line never reported. The sliced build recovered in about 926 ms with 0 spinning lines, and
+every restart read back whole.
+
+**Round 3's state B quiet: a machine stall, not slicing.** Both arms had heartbeat lapses in the same minutes:
+- the unsliced run, 18:24:01 to 18:24:24 UTC: 2 lapses, and its harness aborted in setup;
+- the sliced run, 18:24:24 to 18:26:07 UTC: 5 lapses, and the watchdog verdict "shard 0 is wedged: no step, no CPU
+  progress and no wait for a CPU for 1116 ms".
+
+The shard ran no CPU and nothing was waiting for one. On the same Mac, the supervisor's B8 gate saw a whole-process
+stall of about 20 s at 18:23 UTC: the server library took 127 s to build against 5 s, with about 80 GB in the memory
+compressor.
+
+### The takeover's latency
+
+A takeover runs no sliced code. The successor rebuilds the green with the unsliced `replay_green`; `spawn_alone` and
+`RecoverySlices` run only in a shard's own start.
+
+**Command.** `run.sh` (kept with this record's session, `liveness/takeover-ship`). It runs the two green-takeover fleet
+tests, `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` and
+`a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor`, each alone. There are 8 rounds each,
+with the build order alternating. A diagnostic line times the owner's `stop()` to the successor's placed version 3.
+- **Arms.** Main 80be552a, unsliced, against slice6 7074a17e, sliced; debug test binaries.
+- **Conditions.** Quiet ran at load 6 to 7 (one run at 17 to 20). Loaded ran beside 2 `nice -n 19` spinners a CPU, at
+  load 25 to 77.
+
+All 64 runs passed. adas-mac-studio.local-2, 32 CPUs, macOS, 2026-11-09.
+
+| ms | quiet unsliced | quiet sliced | loaded unsliced | loaded sliced |
+|---|---|---|---|---|
+| median | 2380 | 2195 | 2349 | 2362 |
+| p75 | 4577 | 2548 | 2844 | 3959 |
+| max | 8835 | 4949 | 5152 | 6749 |
+| runs over 3.5 s | 6 of 16 | 4 of 16 | 4 of 16 | 5 of 16 |
+
+Every run, the share test then the every-version test, each list rounds 1 to 8:
+- quiet unsliced: 2434 8835 2130 2329 2328 2431 2320 4577 | 2040 4753 1935 4520 2224 4756 2236 4933
+- quiet sliced: 2019 2117 2127 2548 2059 2242 2335 2140 | 4857 4949 4845 2148 1921 2136 2337 4744
+- loaded unsliced: 2455 2503 2316 3949 2844 3735 1922 2290 | 2289 1967 1985 2044 1840 5152 2381 3980
+- loaded sliced: 2345 6749 2415 5047 1977 1957 2047 4720 | 2566 2378 1979 2033 4104 3959 2097 2295
+
+Both arms show the same two modes, about 2.0 to 2.5 s and about 4 to 5 s. The slow mode is a step of about 2.5 s that
+both arms hit at similar rates, so slicing does not stretch a takeover. The step is the failure detector's timer
+floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
+pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
+owner led the council.
