@@ -790,7 +790,8 @@ const TRUNCATE_OF_A_FILE: &str = "truncate/10.t";
 /// which has no OPEN, and a truncate by path over either version, which asks for write without an open. A server cannot
 /// answer ACCESS with an error instead, since the client asks every right in one call and caches the answer, so its
 /// reads and lookups would fail too. Every change that reaches the server still answers [`READ_ONLY_ANSWER`] (the
-/// supervisor's decision, 2026-11-08 and 2026-11-09, from slabs' reading; A-258).
+/// supervisor's decision, 2026-11-08 and 2026-11-09, from slabs' reading; recorded in slabs' read-only NFS limit
+/// amendment, `agents/slabs-nfs-rofs`).
 const ACCESS_LIMIT: &str = "EACCES";
 /// Format: where [`ACCESS_LIMIT`] comes from, as the probe's note names it: the Linux client's ACCESS check and its
 /// permission hook, and knfsd's answer for a read-only export.
