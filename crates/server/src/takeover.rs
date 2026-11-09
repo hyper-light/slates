@@ -234,7 +234,8 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
           },
         );
       }
-      Lineage::Lost => {}
+      // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272).
+      Lineage::Lost | Lineage::Unresolved => {}
       Lineage::Settled => reclaim(state, object),
     }
   }
@@ -1053,19 +1054,58 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   let Some(take) = state.host_takeovers.get(&departed) else {
     return false;
   };
-  take.generation == regional.version
-    && take.fenced.is_none()
-    && take.learned.is_empty()
-    && regional
+  share_done(
+    take.generation == regional.version,
+    take.fenced.is_none(),
+    take.learned.is_empty(),
+    take.lost.is_empty(),
+    regional
       .recovery_hosts(departed)
       .into_iter()
       .filter(|host| *host != local && regional.members.contains(host))
-      .all(|host| take.pages.get(&host).is_some_and(|page| page.complete))
+      .all(|host| take.pages.get(&host).is_some_and(|page| page.complete)),
+  )
+}
+
+/// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
+/// complete, and every object it learned adopted, none lost (A-272). A confirmation is what lets the retirement be
+/// pruned, and a pruned retirement settles its objects' lines, where every holder reclaims its copy. So a round that
+/// declared an object lost (its settled cohort left with fewer members than its recovery quorum) must not confirm:
+/// its retirement stays kept, and its holders keep their copies. Before, the lost object was dropped from those
+/// learned, and the round confirmed as though it had been adopted.
+fn share_done(
+  current: bool,
+  unfenced: bool,
+  nothing_learned: bool,
+  nothing_lost: bool,
+  every_page: bool,
+) -> bool {
+  current && unfenced && nothing_learned && nothing_lost && every_page
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-272: a round that declared an object lost does not confirm its share. Do ask whether a share is done with every
+  /// page complete and nothing left learned, with and without a lost object. Expect done only with none lost. Before, a
+  /// lost object counted as done, the round confirmed, and the retirement's pruning settled the object's line, where
+  /// every holder reclaims its copy.
+  #[test]
+  fn a_round_that_lost_an_object_does_not_confirm_its_share() {
+    assert!(
+      !share_done(true, true, true, false, true),
+      "an object lost: not done, the retirement stays kept"
+    );
+    assert!(
+      share_done(true, true, true, true, true),
+      "every object adopted: done"
+    );
+    assert!(
+      !share_done(true, true, false, true, true),
+      "an object still learned: not done"
+    );
+  }
   use crate::head::{HeadKey, HeadSealing};
   use slates_db::register::{Authority, HostEpoch, HostId as RegisterHost, Record};
 

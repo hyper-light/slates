@@ -2241,6 +2241,12 @@ impl compound::Backend for RoutedBackend {
     futures::now_ns()
   }
 
+  /// Every open and delegation the daemon records holds its file in the volume (A-260, `crate::nfs_state::hold`),
+  /// whichever shard owns the file, and the hold is taken again from the partition's records after a restart.
+  fn preserves_unlinked(&self) -> bool {
+    true
+  }
+
   fn owns_file(&self, fh: &Nfsfh3) -> bool {
     let mut args = XdrWriter::new();
     fh.encode(&mut args);

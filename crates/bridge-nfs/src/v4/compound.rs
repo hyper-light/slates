@@ -66,6 +66,12 @@ pub trait Backend {
   fn renew_home(&mut self, clientid: u64) {
     let _ = clientid;
   }
+  /// Whether a file removed while an open or a delegation of it is held stays reachable by its handle until the last
+  /// of them ends (A-260): what `OPEN4_RESULT_PRESERVE_UNLINKED` promises the client. A server whose opens hold
+  /// nothing in its volumes (the standalone one) promises nothing, and its clients rename a removed open file aside.
+  fn preserves_unlinked(&self) -> bool {
+    false
+  }
   /// Whether the file `fh` names is owned by the shard serving this compound (A-78: a delegation is granted only
   /// there). A server with one owner owns every file.
   fn owns_file(&self, fh: &Nfsfh3) -> bool {
@@ -240,6 +246,10 @@ const MAY_DELEGATE_READ: u32 = 1;
 const MAY_DELEGATE_WRITE: u32 = 2;
 /// Format: `OPEN4_RESULT_LOCKTYPE_POSIX`: this server's locks follow POSIX (RFC 8881 §18.16.3).
 const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 4;
+/// Format: `OPEN4_RESULT_PRESERVE_UNLINKED`: a file removed while this open or a delegation of it is held stays
+/// reachable by its handle until the last of them ends, so the client sends the REMOVE rather than a silly rename
+/// (RFC 8881 §18.16.4; A-260).
+const OPEN4_RESULT_PRESERVE_UNLINKED: u32 = 8;
 /// Format: `opentype4` `OPEN4_CREATE`.
 const OPEN4_CREATE: u32 = 1;
 /// Format: `createmode4` values (RFC 8881 §18.16.1).
@@ -2121,7 +2131,11 @@ async fn open<B: Backend>(
   let mut body = XdrWriter::new();
   stateid.encode(&mut body);
   body.fixed(&change_info(&opened.dir));
-  body.u32(OPEN4_RESULT_LOCKTYPE_POSIX);
+  body.u32(if backend.preserves_unlinked() {
+    OPEN4_RESULT_LOCKTYPE_POSIX | OPEN4_RESULT_PRESERVE_UNLINKED
+  } else {
+    OPEN4_RESULT_LOCKTYPE_POSIX
+  });
   opened.attrset.encode(&mut body);
   match delegation {
     Some((OPEN_DELEGATE_WRITE, delegation)) => encode_write_delegation(&mut body, &delegation),
@@ -2441,6 +2455,15 @@ async fn check_open_access<B: Backend>(
     needed |= access3::READ;
   }
   if access & share::WRITE != 0 {
+    // A read-only attachment refuses an open for writing as a read-only file system does (§4.6), before the ACCESS
+    // check below would answer `NFS4ERR_ACCESS` for the write bit it no longer grants (GAPS, 2026-11-08).
+    let result = backend
+      .call_v3(extension::CHANGE_ALLOWED, v3call::handle_only(fh))
+      .await;
+    let status = v3call::status_only(&result).map_err(|_| Nfsstat4::Serverfault)?;
+    if status != Nfsstat3::Ok {
+      return Err(Nfsstat4::of_v3(status));
+    }
     needed |= access3::MODIFY;
   }
   let result = backend
