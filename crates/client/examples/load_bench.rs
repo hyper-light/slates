@@ -93,6 +93,11 @@ enum Kind {
   ReadHead,
   Rebase,
   Destroy,
+  /// A round's edit and merge as its client sees it: from sending its first edit to its submit's first verdict, an
+  /// accept or a conflict, every request between included (the goal's own measure: a whole edit and merge).
+  Cycle,
+  /// A round from its first edit to its accept, conflicts and their resolution included.
+  Round,
 }
 
 /// What a submit came back with.
@@ -167,6 +172,10 @@ struct Agent {
   /// submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits), and only the same id
   /// meets its completion record; the client keeps its acknowledgement below the id until the resend.
   retry: Option<(u64, u64, Kind)>,
+  /// When the round's first edit was sent: the start of its [`Kind::Cycle`] (cleared at its first verdict) and of its
+  /// [`Kind::Round`] (cleared at its accept).
+  cycle_since: Option<u64>,
+  round_since: Option<u64>,
   /// The pause before this client sends again after a refusal for now (`LeaseUnconfirmed`, `AcknowledgementOwed`, a
   /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
   /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
@@ -484,6 +493,10 @@ impl Agent {
         record(tally, kind, elapsed);
       }
       (Step::Edit(n), ReplyBody::Edited) => {
+        if n == 0 && self.round_since.is_none() {
+          self.cycle_since = Some(sent_ns);
+          self.round_since = Some(sent_ns);
+        }
         self.step = if n + 1 < self.slots().len() {
           Step::Edit(n + 1)
         } else {
@@ -575,6 +588,14 @@ impl Agent {
     tally: &mut Tally,
   ) {
     let elapsed = at.1.saturating_sub(at.0);
+    if let Some(start) = self.cycle_since.take() {
+      record(tally, Kind::Cycle, at.1.saturating_sub(start));
+    }
+    if version.is_some()
+      && let Some(start) = self.round_since.take()
+    {
+      record(tally, Kind::Round, at.1.saturating_sub(start));
+    }
     let outcome = match version {
       Some(v) => Outcome::Accepted(v),
       None => Outcome::Conflict(
@@ -1664,6 +1685,8 @@ fn spread(
       resolutions: 0,
       inflight: None,
       retry: None,
+      cycle_since: None,
+      round_since: None,
       pause_ns: 0,
     });
   }

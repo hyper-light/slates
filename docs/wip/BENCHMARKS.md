@@ -12116,3 +12116,44 @@ message. Main 80be552a, W1 8cf40742 and this, the anchor recipe, 3,000 clients, 
 30 (other agents' builds), oracle 0 in every run. SubmitAccepted p99, every round, ms: main 118.4, 50.7, 51.6, 72.2,
 49.4, 40.5; W1 77.2, 71.0, 55.0, 59.0, 53.8, 55.5; this 130.7, 493.0, 95.4, 194.6, 75.3, 76.3. Wall: main 7.79–12.62 s,
 W1 3.59–5.40, this 4.66–8.45. Kept as `w4-sliced-batches.patch` in perf's scratch; not landed.
+
+**Like for like: the whole cycle, and equal offered load (2026-11-09, the supervisor's two measurements).** At a fixed
+3,000 clients with one request each in flight W1 serves about 1.6 times main's verdict rate, so the one owner holds a
+longer queue and a verdict waits longer by Little's law. Two comparisons that take the rate out. Main 80be552a against
+agents/perf-w1 f3d2f5c5, each with a temporary owner-CPU diagnostic (thread CPU per verdict and per rebase run on the
+green's owner shard, `perf/tools/owner_cpu_patch.py`, not committed), the same harness (`load_bench` with the new `Cycle`
+and `Round` rows), the anchor recipe, interleaved and reversed on alternate rounds, 5 rounds each,
+adas-mac-studio.local-2, load 9.6 to 22.5, oracle 0 in every run. `Cycle` is a round from sending its first edit to its
+submit's first verdict (4 edits, the append, the submit); `Round` is to its accept, conflicts resolved. Milliseconds, p99
+in every round:
+
+| | main | W1 |
+|---|---|---|
+| 1,000 clients, Cycle p99 | 93.7, 77.2, 91.5, 96.0, 89.1 | 129.2, 86.8, 87.0, 115.0, 99.1 |
+| 1,000 clients, Cycle p50 | 69.4, 68.2, 68.5, 71.9, 71.5 | 43.2, 45.3, 44.7, 48.9, 49.1 |
+| 1,000 clients, Round p99 | 1,231.6, 1,175.9, 1,187.0, 1,225.3, 1,234.2 | 617.0, 627.0, 604.8, 686.4, 673.9 |
+| 1,000 clients, owner µs a verdict / a rebase | 35.6–39.5 / 25.7–26.7 | 21.9–24.8 / 12.3–13.7 |
+| 3,000 clients, Cycle p99 | 402.3, 419.7, 380.7, 401.5, 435.9 | 279.8, 231.1, 257.8, 239.9, 239.3 |
+| 3,000 clients, Cycle p50 | 218.6, 207.9, 208.3, 224.8, 217.5 | 147.6, 138.3, 143.6, 140.0, 139.5 |
+| 3,000 clients, Round p99 | 8,159.9, 7,324.4, 7,465.3, 7,746.0, 7,961.8 | 3,761.9, 3,463.5, 3,692.8, 3,652.6, 3,489.0 |
+| 3,000 clients, owner µs a verdict / a rebase | 47.9–52.2 / 27.0–30.6 | 21.5–22.5 / 11.8–12.8 |
+
+**Equal offered load.** Main unpaced; W1's clients paced with `--think-us 19000`, found by trying 1,000 to 22,000 µs
+(think time 22,000 gave 5,673 verdicts/s, 16,000 gave 8,217), so both run main's verdict rate at 3,000 clients. 5 rounds
+each, interleaved, load 19.0 to 22.5. Verdicts a second: main 6,018, 6,739, 6,662, 6,308, 6,973; W1 6,880, 7,182, 6,913,
+6,824, 6,907 (W1 slightly the higher). p99 in every round, milliseconds:
+
+| | main | W1 |
+|---|---|---|
+| SubmitAccepted | 52.7, 48.6, 44.5, 55.2, 43.0 | 26.2, 22.9, 22.4, 26.3, 22.3 |
+| SubmitConflict | 53.6, 50.6, 44.9, 61.8, 46.5 | 33.3, 32.6, 35.2, 32.2, 32.6 |
+| Rebase | 54.1, 59.0, 63.0, 63.8, 42.7 | 5.2, 4.1, 3.5, 24.2, 5.5 |
+| owner µs a verdict / a rebase | 48.7–53.7 / 27.5–31.0 | 23.5–24.7 / 12.8–14.0 |
+
+- At the same verdict rate W1's verdicts are faster at p99 than main's, and the owner spends 46–52% of main's CPU on a
+  verdict and 44–48% on a rebase: its per-verdict cost has not regressed, it fell.
+- At a fixed number of clients the verdict's p99 rose because throughput rose (3,000 clients: 1.6 times main's verdicts a
+  second) and the owner's queue with it.
+- The whole cycle's p99 is better at 3,000 clients (231–280 ms against 381–436). At 1,000 clients it is not: 86.8–129.2
+  against 77.2–96.0, the medians of the rounds 99.1 against 91.5, though its median and the round to accept are far
+  better (Round p99 605–686 against 1,176–1,234).
