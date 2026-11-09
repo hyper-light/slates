@@ -1826,7 +1826,10 @@ enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-
 struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
-               body: Body, identity: Option<Blake3>, born: Epoch, flags }
+               body: Body, identity: Option<Blake3>, born: Epoch, flags,
+               windows: WindowsAttributes /* A-262: HIDDEN, SYSTEM, ARCHIVE, OFFLINE, NOT_CONTENT_INDEXED, and a
+                                             directory's READONLY (a file's is its mode), at Windows' values, in the
+                                             two bytes of tail padding, so no inode grows */ }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
             Base { witness: Option<Handle<Witness>>, pinned: ExtentList, fd: Option<BaseFd>, lost: bool } }
 struct Extent { off: u64, len: u64, src: ExtentSrc } enum ExtentSrc { Chunk{chunk: ChunkHandle, off: u32}, Zero, Base{fd: BaseFd} }
@@ -2060,7 +2063,14 @@ an open for writing (a write access mode or `O_TRUNC`) and at every mutating ver
 before they reach a shard, and its `CanDelete` asks the bridge (`authorize_change`) before Windows marks a file for a
 delete that happens at the reply-less cleanup; the wire answers `ReadOnlyVolume`. An attachment with no rights at all is refused for
 permission (`EPERM`, `NFS3ERR_PERM`, `STATUS_ACCESS_DENIED`). A kernel that mounts the attachment `ro` (Linux FUSE,
-macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Until 2026-11-08 the bridge granted
+macOS NFS) refuses most changes itself before the request, with the same `EROFS`. Over NFS an ACCESS reply grants no
+write bit to such an attachment, and an NFSv4 OPEN for writing answers `NFS4ERR_ROFS`. NFSv3 has no OPEN: the client
+decides an open from ACCESS, and Linux reports an ungranted bit as `EACCES`, so over v3 an open for writing answers
+`EACCES` and every change that reaches the server `EROFS` (A-269, v3's limit). A path `truncate(2)` and `access(2)`
+for writing answer `EACCES` over v3 and v4 alike: the client asks ACCESS for a regular file's write without an open
+(`nfs_permission`), and no NFS server can make ACCESS say `EROFS`. Linux's own server answers a read-only export the
+same way (`fs/nfsd/vfs.c`, `nfsd_permission` refuses `nfserr_rofs`, and `nfsd_access` leaves the bit out rather than
+fail the call), so this is the protocol's limit, not a slates defect (A-269). Until 2026-11-08 the bridge granted
 an open for writing and answered each change `NotPermitted`
 (`docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`).
 
@@ -2778,6 +2788,23 @@ therefore one implementation shared by both versions.
     client, session and state id therefore names an instance no earlier life used.
   - Kept records come back even if a smaller bound was derived since; only new state is refused until
     the tables are back under their bounds.
+- **An open holds its file (A-260, built 2026-11-08).** Every open and every delegation holds one reference on its
+  file in the volume, owned by `RefOwner::NfsState` of the attachment whose handle made it. It is taken when the
+  record of the open or grant commits and given back when the record of its end does: a CLOSE, FREE_STATEID,
+  DELEGRETURN, a revocation, or a client's purge (its lease lapsed, it rebooted, it was destroyed). A file removed while
+  one is held keeps serving by its handle at a link count of zero, and its space comes back at the last end (POSIX's
+  unlink-while-open). The server promises this with `OPEN4_RESULT_PRESERVE_UNLINKED` (RFC 8881 §18.16.4), and the
+  Linux client then sends the REMOVE instead of renaming the file aside to `.nfs*` (kernel commit 43245eca, 2022), a
+  name a landing would carry. The standalone server's opens hold nothing, so it makes no such promise.
+  - The partition's journal is these holds' only record. The recovery image carries none; a recovery takes them again
+    from the journaled opens and delegations before it settles references and reclaims the files no one holds
+    (`nfs_state::hold_recovered`). So a removed open file is served across a restart, and one whose last open ended
+    before the restart is reclaimed by it.
+  - An attachment's end gives back every hold made through it (`nfs_state::release_attachment`): no request is served
+    under it again. Its opens stay in the file state until their client closes them or is purged, and those
+    give-backs find nothing left to give.
+  - A hold is bounded by the state's own bounds (the opens and the delegations it may record). A removed file's space
+    is charged at the REMOVE, as for any reference (§4.2), and freed at the reclaim.
 - **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file, **acting uid**),
   upgraded and advanced by a reopen;
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
@@ -3022,9 +3049,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of four stated differences (attribute bits, security descriptors, reparse points and symbolic links,
-> named streams; the fifth, a settable creation time, was built in A-259 and `t/base/06.t` case 5 came off the
-> list). Four Win32 bugs it found are fixed with failing tests first
+> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
+> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -12077,7 +12104,7 @@ Status: built 2026-10-05 (condition 4).
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
   writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE).
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268).
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -14396,7 +14423,9 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   slates does not claim, five Windows features, each a reason on the reviewed list:
   - **ATTRIBUTES**: no Windows attribute bits. Every file reports `FILE_ATTRIBUTE_NORMAL` and every directory
     `FILE_ATTRIBUTE_DIRECTORY`; READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced (the volume's
-    permission is POSIX's mode).
+    permission is POSIX's mode). **Amended by A-262 (2026-11-08):** the volume keeps HIDDEN, SYSTEM, ARCHIVE, OFFLINE,
+    NOT_CONTENT_INDEXED and a directory's READONLY beside the mode, and a file's READONLY is its mode's write bits, so
+    the reason stands for READONLY and no longer for the rest; the 18 cases are off the list.
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
     volume's own rule; a DACL set or asked for at create is not kept.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
@@ -16180,6 +16209,136 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
+`docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
+(`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
+- **What was wrong.** A MKNOD of a block or character device, and NFSv4's CREATE of one, answered `NFS3ERR_BADTYPE`
+  (`NFS4ERR_BADTYPE` over v4), the status RFC 1813 §3.3.11 names for a type the server does not make. The Linux client
+  maps both to its internal `EBADTYPE`, errno 527, which reached every program as "Unknown error 527": 331 cases of a
+  full pjdfstest run over NFSv4, and the same over NFSv3 (CI run 42498995934 and a CachyOS run, 2026-11-08). It was
+  also answered before the name was looked at.
+- **Why EPERM.** On a local Linux file system a device node needs privilege (`CAP_MKNOD`, checked in `vfs_mknod`), and
+  slates never holds privilege (R10), so `EPERM` is what a local file system gives this same caller. RFC 1813's
+  `BADTYPE` describes a server that lacks the type, which is not slates' reason, and Linux turns it into a
+  kernel-internal errno that leaks to programs.
+- **The rule.** Slates makes no device nodes (A-26), so it answers as a local file system that cannot hold one, in the
+  order Linux's `vfs_mknod` checks: a taken name is `EXIST` (an exclusive create over NFS skips the client's own lookup,
+  so only the server can say so), a directory the caller may not write is `ACCES`, then `PERM`, which a client reports
+  as `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
+  requested".
+- **What it does not change.** A-26's boundary (no device node is made, on any path), FIFOs and sockets, and every
+  reviewed list: no pjdfstest case expects `EPERM` from a device `mknod` (each failing one expects success, or `EEXIST`
+  on a name the case before failed to make), so every listed case still fails, now reading `EPERM`.
+- **Proven** by `a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it` and
+  `a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first` (`crates/bridge-nfs/tests/procedures.rs`),
+  `a_device_create_is_refused_eperm_and_a_taken_name_eexist_first` (`crates/bridge-nfs/tests/v4.rs`), each red on the old
+  MKNOD with 10007, and through the Linux kernel's NFSv4 client by `a_device_node_is_refused_eperm`
+  (`crates/server/tests/nfs_v4_kernel.rs`, as root on CI).
+
+### A-262 — The volume keeps Windows' attribute bits beside the mode, and a file's read-only state is its mode (accepted 2026-11-08; the drive, the volume and the Windows base plane built; a Windows landing and the merge owed)
+Applied in the same change to: §4.5 (the inode), §4.6 (the Windows conformance status), A-209 (amended: ATTRIBUTES),
+GAPS, `docs/wip/conformance.md`, the winfstest list
+(`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 373 to 355 entries), `crates/vfs`
+(`inode::WindowsAttributes`, `Volume::set_windows_attributes` and the overlay's, the image v23 and delta v6 layouts),
+`crates/bridge-core` (`NodeAttr::windows`, `SetAttr::windows`, the owner rule, the AppleDouble view's refusal), the
+FUSE, NFS and FSKit bridges (each sets none), and `crates/bridge-winfsp` (the attribute decisions in `lib.rs`; create,
+overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
+- **Why A-209's reason no longer covers them.** A-209 left the bits out because "the volume's permission is POSIX's
+  mode": one permission model. That holds for `READONLY` alone. `HIDDEN`, `SYSTEM`, `ARCHIVE`, `OFFLINE` and
+  `NOT_CONTENT_INDEXED` are metadata, not permissions, and Windows tools rely on them: Git for Windows hides `.git`
+  (`core.hideDotFiles`), Explorer hides by them, and backups and `robocopy /A` read `ARCHIVE`. The drive answered
+  their `SetFileAttributes` success and kept nothing.
+- **The rule.**
+  - A file's `READONLY` is its mode's write bits, the one model. Setting it clears every class's write bit; clearing it
+    gives the owner's back. The drive reports `READONLY` for a file its owner may not write. This is WSL DrvFs's mapping,
+    and Samba's `map readonly`, so a POSIX tool sees what Windows set and the reverse.
+  - The other bits, and a directory's `READONLY` (Windows gives it no permission: Explorer reads it as a display
+    hint, and the mode keeps its POSIX meaning), are kept as metadata in `Inode::windows`, a `u16` at Windows' values.
+  - A file the volume makes is `ARCHIVE`, as NTFS and WinFsp's memfs mark every file they make. A create applies the
+    caller's word with `ARCHIVE`; an overwrite's supersede takes the caller's word and a plain overwrite adds it to the
+    file's, each with `ARCHIVE`; `SetBasicInfo` replaces the word, `INVALID_FILE_ATTRIBUTES` leaving it as it is.
+  - The Win32 rules on top: a read-only file refuses its delete (`STATUS_CANNOT_DELETE`, `ERROR_ACCESS_DENIED`) and a
+    rename replacing it (`ERROR_ACCESS_DENIED`). Setting the bits asks for the owner or root, as a mode change does.
+- **What it costs.** No inode grows: the `u16` sits in the two bytes of tail padding (measured with `offset_of!`;
+  `Inode` stays 168 bytes, `cargo run -p slates-vfs --example tree_heap` reads 260, 275 and 293 heap bytes per entry for
+  npm, pip and cargo trees, before and after). The image's inode gains two bytes (layout version 23, the delta's 6), with
+  a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
+- **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
+  them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
+  file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode. Since stage 3's base half
+  an overlay of a Windows directory reads them from its disk; an overlay of a Linux or macOS directory has none to read.
+- **Each stage's state.**
+  - **Stage 1, built 2026-11-08:** the volume, the image (layout 23), the drive, the list (373 to 355).
+  - **Stage 3's base half, built 2026-11-08:** the Windows base plane reads them. A fingerprint carries the disk's bits
+    apart from its mode (`Fingerprint::windows`, image layout 24, delta 7, `a_witness_encoding_is_its_golden_vector`), and
+    the Windows base reports a POSIX mode by DrvFs's mapping (`windows_mode_and_bits` in `crates/base/src/lib.rs`: a
+    directory `S_IFDIR | 0o755`, a file `S_IFREG | 0o644`, `0o444` when `READONLY`, a reparse point `S_IFLNK | 0o777`).
+    An untouched base entry reports the disk's bits, and takes an outsider's change to them at its directory's relist,
+    as it takes an outsider's `chmod`
+    (`an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_their_change`, `crates/vfs/tests/base.rs`),
+    and on CI's Windows runner through an overlay of a real directory mounted as a drive
+    (`an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes`, `crates/cli/tests/winfsp.rs`:
+    an ordinary file is writable and deletable, an `attrib +R` one refuses both, an `attrib +H` one reads hidden).
+    It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
+    an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
+    delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
+  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). It waits on a Windows
+    landing writer, which does not exist yet (`crates/land`'s writer is `cfg(unix)`). Linux and macOS landings carry
+    the bits in the volume and apply none.
+  - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
+    identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
+- **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
+  operations declared through the SDK (`WorkState::journal`: edits and declarations, `WorkOp`), and no `WorkOp` carries
+  the bits, so no work can set them and two increments can never differ in them alone; a mounted work would be derived
+  from its volume's journal, and the volume's ops document carries none of them
+  (`windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them`, `crates/vfs/tests/derive.rs`:
+  a bits-only work derives the unchanged document byte for byte, and a rewrite derives the same with or without them).
+  A landing ignores them without error (`a_landing_ignores_windows_attribute_bits_without_error`,
+  `crates/land/tests/oracle.rs`: §4.15's worked example with the bits on an edited, a created and an untouched base file
+  lands `Done` and leaves the same disk, writing as many entries as without).
+- **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
+  `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
+  bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
+  drive's decisions unit-tested in `crates/bridge-winfsp/src/lib.rs`, and on CI's Windows runner by
+  `a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete` (`crates/cli/tests/winfsp_semantics.rs`) and
+  winfstest against the shortened list.
+
+### A-260 — An NFSv4 open or delegation holds its file, so a file removed while open is preserved (accepted 2026-11-08)
+Applied in the same change to: §4.6 (NFSv4 state, "An open holds its file"), GAPS, `docs/wip/conformance.md`, the
+NFSv4 pjdfstest list (`docs/wip/conformance/expected-failures/native-linux-nfs4.pjdfstest.txt`, `tests/unlink/14.t:4`
+struck), `crates/vfs` (`RefOwner::NfsState` and its settle), `crates/bridge-nfs` (`files::Holding`, `FileState`'s and
+`Delegations`' queues, `Backend::preserves_unlinked`, OPEN's result flags), and `crates/server` (`nfs_state::hold`,
+`hold_recovered`, `release_attachment`; the recovery and `end_attachment` call them).
+- **What was wrong.** An NFSv4 open lived only in the owner's file state and held nothing in the volume, so a REMOVE
+  reclaimed an open file at once and its handle answered `NFS4ERR_STALE`. The Linux client keeps POSIX's
+  unlink-while-open by renaming such a file aside (`.nfs<fileid><counter>`) unless the server answers its OPEN with
+  `OPEN4_RESULT_PRESERVE_UNLINKED`, which this server never did: every tool that removes a file it holds open (git,
+  editors, sqlite) left a `.nfs*` name in the volume until the close, a name a landing would carry. pjdfstest listed it
+  as `unlink/14.t:4` (NFS-OPEN).
+- **The rule.** Every open and delegation holds one volume reference on its file from the commit of its record to the
+  commit of its end's, owned by `RefOwner::NfsState(attachment)`. The journal is the holds' only record, and a
+  recovery takes them again from it before reclaiming unheld files. An attachment's end gives its holds back. The OPEN
+  reply carries `OPEN4_RESULT_PRESERVE_UNLINKED` from a server whose backend holds (the daemon's), and not from the
+  standalone server's.
+- **Why a third owner kind.** A kernel's references (a FUSE mount's, owned by its attachment) are carried in the
+  recovery image and settled by their attachment's survival; NFSv4 state is journaled and must be counted from its
+  journal. One count for both would let a recovery double a hold, or reclaim a file a FUSE kernel still holds.
+- **What it does not change.** The wire of the state extension procedures and of the journaled records, the recovery
+  image, NFSv3 (stateless: its client's silly rename stays, NFS-OPEN on the NFSv3 lists), and how a client's state ends.
+- **Proven** by `a_file_removed_while_open_over_nfsv4_serves_until_its_last_close`,
+  `..._serves_across_a_daemon_restart` and `..._is_freed_when_its_clients_lease_lapses`
+  (`crates/server/tests/recovery.rs`, each red on the old server: `NFS4ERR_STALE` at the first GETATTR by handle; the
+  restart one red again with the recovery's re-take removed, and the lease one with a purge's give-backs removed, its
+  file's 65,536 bytes kept), `every_open_and_delegation_takes_one_hold_and_gives_it_back_at_its_end`
+  (`crates/bridge-nfs/tests/v4_delegation.rs`), and through the Linux kernel's v4.1 and v4.2 clients by
+  `an_unlinked_open_file_keeps_serving_with_no_silly_rename` (`crates/server/tests/nfs_v4_kernel.rs`; with the
+  daemon's promise turned off, the kernel's client renamed the unlinked open file to `.nfs000100000000000b00000009`,
+  2026-11-08, Linux 7.2), the unlinked-open leg of `nfsv4_opens_and_locks_survive_a_daemon_restart`
+  (`crates/cli/tests/nfs_v4_restart.rs`, across a `SIGKILL`), and pjdfstest's `unlink/14.t:4` over the NFSv4 transport
+  (6,972 passed and 1,798 failed against the struck list, every failure listed). Record:
+  `docs/bugs/2026-11-08-an-nfsv4-file-removed-while-open-was-reclaimed-at-once.md`.
 
 ### A-259 — The WinFsp drive reports and keeps the creation time a caller sets (accepted 2026-11-08)
 Applied in the same change to: §4.6 (the Windows conformance status and its stated differences), A-53 (amended),
@@ -18947,6 +19106,45 @@ Applied in the same change to:
   successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
 - **Evidence.** See the bug record's verification.
 
+### A-269 — Through a read-only NFS attachment, what ACCESS decides answers `EACCES`: v3's open for writing, and a path truncate and `access(W_OK)` over v3 and v4 (accepted 2026-11-08, the supervisor's decisions)
+Applied in the same change to:
+- §4.6 ("A read-only attachment is a read-only file system");
+- `crates/bridge-nfs/src/procedures.rs` (`access_result`, `change_refusal`, `extension::CHANGE_ALLOWED`, `state_io`),
+  `crates/bridge-nfs/src/v4/compound.rs` (`check_open_access`), `crates/bridge-nfs/src/v4/v3call.rs` (`status_only`);
+- the tests: `crates/server/tests/nfs_read_only_kernel.rs`, and `a_write_through_a_read_only_export_is_refused`
+  (`crates/bridge-nfs/tests/procedures.rs`);
+- GAPS; `docs/bugs/2026-11-08-a-read-only-attachment-was-not-a-read-only-file-system.md`.
+
+- **What §4.6 said.** A read-only attachment refuses every change as POSIX's read-only file system does: `EROFS`, at the
+  open for an open for writing and at every mutating verb.
+- **What it says now.** It still does, over every transport, with the exceptions ACCESS decides. Over NFSv3 an open for
+  writing answers `EACCES`, and every change that reaches the server answers `EROFS`. Over NFSv3 and NFSv4 a path
+  `truncate(2)` and `access(2)` for writing answer `EACCES`. Every other refusal over NFSv4, the open's included, is
+  `EROFS`.
+- **Why.** NFSv3 has no OPEN: a client decides `open(2)` from the ACCESS reply. Linux asks every ACCESS bit in one call
+  and caches the answer (`fs/nfs/dir.c` at v6.8, `nfs_do_access`, lines 3201–3207), and reports a bit the server did
+  not grant as `-EACCES` (lines 3219–3221). The only other answer a server has is an error on the ACCESS call itself,
+  which that one call carries for every bit, so it would refuse reads and lookups too. Over NFSv4 a regular file's open
+  skips ACCESS (`nfs_permission`, lines 3286–3288) and the server's OPEN decides, so `NFS4ERR_ROFS` reaches the
+  application as `EROFS`. Measured through the kernel's own clients on CI: v3 `EACCES` for `O_WRONLY`, `O_RDWR` and
+  `O_RDONLY|O_TRUNC`, v4 `EROFS` for each (diag-slabs-43, run 42517769901); every other change `EROFS` over both
+  (conformance's read-only run, 42498995934; the kernel test's create probe re-runs it). EROFS at a v3 open
+  would need a kernel mount made read-only (`-o ro`), which a read attachment under a writable mount is not.
+- **The truncate, and why the write bit stays withheld over v4 too (the supervisor's decision (a), 2026-11-08).** A path
+  `truncate(2)` checks write permission before any SETATTR, and Linux's `nfs_permission` sends a regular file's write
+  without an open through ACCESS on v4 as on v3, so it answers `EACCES` over both (conformance's run on this fix,
+  diag-conformance-32, run 42523564648: v3 10 of 14 `EROFS` with the three opens at the limit, v4 13 of 14; the other in
+  each is `truncate/10.t`). Granting the write bits in v4's ACCESS would turn the truncate into `EROFS` but make
+  `access(W_OK)` report a read-only file writable to every caller that checks first (`test -w`, editors, git): a wrong
+  answer, where `EACCES` is a refusal. Linux's own server gives a Linux client exactly these answers for a read-only
+  export: `fs/nfsd/vfs.c` (Linux v7.4-rc1) `nfsd_permission` (about line 2871) answers `nfserr_rofs` to any write,
+  attribute or truncate access on a read-only export or mount, and `nfsd_access` (about line 855) treats `nfserr_rofs`,
+  `nfserr_acces` and `nfserr_perm` alike: "simply don't 'or' in the access bit". So `access(W_OK)` and the truncate are
+  `EACCES`, and every WRITE and SETATTR is `EROFS`, from the incumbent too. (The knfsd lines are the supervisor's
+  reading of loadtest-scale's dataset tree; `fs/nfs/dir.c` at v6.8 is read here.) A local read-only file system answers
+  `access(W_OK)` `EROFS` from the mount's own flag, which no NFS server can reach through ACCESS.
+- **Evidence.** GAPS, the read-only attachment's entry; the bug record's "Found by conformance".
+
 ### A-256 — A base directory recovery cannot reacquire costs only its own untouched entries (accepted 2026-11-08, the supervisor's confirmation)
 Applied in the same change to (the code and tests in 4db8c179, this entry and A-153's pointer after them):
 - §4.8 ("Required persistence and protocol invariants");
@@ -19831,6 +20029,45 @@ Applied in the same change to:
   - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
     (`crates/server/tests/fleet.rs`).
 
+### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
+
+A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
+line read as settled makes every holder reclaim its copy as stale (`takeover::resolve_held_objects`). The line was read
+as settled from absence: a retirement no longer kept, or a ranked successor neither a member nor a kept retirement. A
+retirement was pruned on its survivors' confirmations, and a survivor confirmed its share even when its round had
+declared an object lost (its settled cohort left with fewer members than its recovery quorum). So a takeover that
+adopted nothing could have every holder delete the copies the current members still held. The store-destroyed takeover
+lost its volume this way: its settled cohort was [owner, A, old B], and the replacement holding the live log was not
+in it.
+
+- **A share confirms only when every object its round learned was adopted** (`takeover::share_done`). A round with a
+  lost object leaves its retirement kept. A pruned retirement therefore means its objects were adopted.
+- **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
+  is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+  retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
+  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
+- **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
+- **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
+  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
+
+Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
+`a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
+`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
+flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
+§4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
+here; a lineage model is owed with (ii).
+
+**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
+the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
+old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
+- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
+- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
+- an installed snapshot (`fold::install` declines it);
+- a learner's fetch and a join (`consensus`).
+A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
+But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
+none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
+
 ### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
 Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
 `Listed { volumes, next }`), `crates/server/src/verbs.rs` (`list_part`, `list_page`, `longest_listable_name`,
@@ -19844,7 +20081,10 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
 - **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
   refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
   with room for a recovery cause's fixed part), so every volume a client can create is one it can list. An unrecovered
-  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it.
+  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
+  record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
+  room (1,023 bytes on macOS, 3,812 on Linux and Windows; `BaseUnavailable` with `ENAMETOOLONG` past it) and a reason,
+  the daemon's own text, at 256.
 - **Proven:** red first on main (3,000 volumes, refused); a walk under churn lists each of 2,991 survivors once in 37
   pages; the longest admitted name lists; 2,000 volumes list through the CLI, plain and JSON.
 - **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a

@@ -8572,6 +8572,8 @@ pub(crate) fn end_attachment(
     state.attachments.revoke(mount.registry);
     state.attachments.drain(mount.registry);
   }
+  // What NFSv4 clients held open through it is held no longer: no request is served under it again (A-260).
+  crate::nfs_state::release_attachment(state, record.volume, record.id);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -9982,9 +9984,76 @@ fn refused_before_dispatch(
   if republish && !state.consensus_ready {
     return Some(Refusal::ConsensusNotInitialized);
   }
-  new_volume_name(body)
-    .is_some_and(|name| name.len() > longest_listable_name())
-    .then_some(Refusal::InvalidName)
+  if new_volume_name(body).is_some_and(|name| name.len() > longest_listable_name()) {
+    return Some(Refusal::InvalidName);
+  }
+  match body {
+    RequestBody::Create {
+      base: Some(path), ..
+    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: PATH_TOO_LONG_ERRNO,
+    }),
+    _ => None,
+  }
+}
+
+/// Format: the longest path the platform resolves, in bytes: `PATH_MAX` less its terminating NUL on macOS (1,024,
+/// `<sys/syslimits.h>`) and on Linux and the other Unixes (4,096, `<linux/limits.h>`), and on Windows the long-path
+/// limit, 32,767 UTF-16 units of at most three UTF-8 bytes each.
+#[cfg(target_os = "macos")]
+const PLATFORM_PATH_BYTES: usize = 1_023;
+/// Format: see the macOS arm.
+#[cfg(all(unix, not(target_os = "macos")))]
+const PLATFORM_PATH_BYTES: usize = 4_095;
+/// Format: see the macOS arm.
+#[cfg(windows)]
+const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
+
+/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
+/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+#[cfg(unix)]
+const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
+/// Format: see the Unix arm.
+#[cfg(windows)]
+const PATH_TOO_LONG_ERRNO: i32 = 38;
+
+/// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
+/// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a
+/// byte count, a table's name), a short phrase beside one refusal's display. A reason built longer is cut here as it is
+/// recorded ([`recorded_reason`]), so the cause's bound does not rest on every display staying short.
+const RECOVERY_REASON_BYTES: usize = 256;
+
+/// Derived: the longest overlay base path a volume records, in bytes (§4.4 `create`, §4.8): the platform's path
+/// maximum, and no longer than one reply holds whole in the refusal every verb on the volume answers when recovery
+/// cannot reacquire the base (`NotRecovered { BaseUnavailable { path, reason } }` beside the longest reason), so
+/// `status` names the cause whole. A longer base is refused at `create`, `BaseUnavailable` with `ENAMETOOLONG`, before
+/// anything is made. A listing page shows the cause cut to fit beside the volume's name ([`listed`]); the record and
+/// the refusal keep it whole.
+pub fn longest_recordable_base() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let pathless = ReplyBody::Refused {
+    refusal: Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::BaseUnavailable {
+        path: String::new(),
+        reason: "r".repeat(RECOVERY_REASON_BYTES),
+      },
+    },
+  };
+  chunk
+    .saturating_sub(slates_ipc::protocol::framed_len(&pathless))
+    .min(PLATFORM_PATH_BYTES)
+}
+
+/// `reason` as a recovery cause records it: whole, as every reason the daemon builds is, or cut at a character boundary
+/// to [`RECOVERY_REASON_BYTES`].
+fn recorded_reason(mut reason: String) -> String {
+  let mut keep = reason.len().min(RECOVERY_REASON_BYTES);
+  while !reason.is_char_boundary(keep) {
+    keep = keep.saturating_sub(1);
+  }
+  reason.truncate(keep);
+  reason
 }
 
 /// The name of the volume a request would create, if it creates one.
@@ -11007,6 +11076,9 @@ async fn rebuild_records(
       let (snapshots, attachments) = reconcile_lost(state, record);
       rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
       rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+      // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
+      // files no one holds (A-260): the image carries none of these holds.
+      crate::nfs_state::hold_recovered(state, record.id);
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));
@@ -12644,7 +12716,7 @@ fn build_recovered_volume(
     }
   };
   let mut volume = rebuilt.map_err(|error| RecoveryCause::ImageRefused {
-    reason: error.to_string(),
+    reason: recorded_reason(error.to_string()),
   })?;
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
@@ -12657,7 +12729,9 @@ fn build_recovered_volume(
     let discarded = volume.discard_partial_releasing(&mut state.store, host);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(RecoveryCause::ImageRefused {
-      reason: format!("the image's quota exceeds the acknowledged size policy: {error}"),
+      reason: recorded_reason(format!(
+        "the image's quota exceeds the acknowledged size policy: {error}"
+      )),
     });
   }
   Ok((volume, opened.map(|(host, _)| host), image.prefix))
@@ -12665,7 +12739,9 @@ fn build_recovered_volume(
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
 fn resources(reason: String) -> RecoveryCause {
-  RecoveryCause::ResourcesUnavailable { reason }
+  RecoveryCause::ResourcesUnavailable {
+    reason: recorded_reason(reason),
+  }
 }
 
 /// Why the overlay's base at `path` could not be reacquired, by the host's refusal.
@@ -12676,7 +12752,7 @@ fn base_cause(path: &str, error: slates_vfs::host::HostError) -> RecoveryCause {
     slates_vfs::host::HostError::OwnMount(_) => RecoveryCause::BaseOnOwnMount { path },
     other => RecoveryCause::BaseUnavailable {
       path,
-      reason: other.to_string(),
+      reason: recorded_reason(other.to_string()),
     },
   }
 }
@@ -13093,6 +13169,35 @@ mod tests {
     home_redirect, join_batch, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// §4.8, §4.4 `status` (A-263 on B9). Do: frame the refusal a verb on an unrecovered overlay answers, its cause the
+  /// longest one a volume records: a base path of [`super::longest_recordable_base`] bytes and a reason of
+  /// [`super::RECOVERY_REASON_BYTES`]; and record a reason past that bound, multi-byte characters at the cut. Expect: the
+  /// refusal fits one reply chunk whole, the base is no longer than the platform's path maximum, and the long reason
+  /// is cut at a character boundary to the bound.
+  #[test]
+  fn the_longest_recorded_cause_fits_the_refusal_whole() {
+    use slates_ipc::protocol::RecoveryCause;
+    let longest = super::longest_recordable_base();
+    let refusal = ReplyBody::Refused {
+      refusal: Refusal::NotRecovered {
+        cause: RecoveryCause::BaseUnavailable {
+          path: "p".repeat(longest),
+          reason: "r".repeat(super::RECOVERY_REASON_BYTES),
+        },
+      },
+    };
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    let framed = slates_ipc::protocol::framed_len(&refusal);
+    eprintln!(
+      "the longest recorded base here: {longest} bytes; the refusal's own room: {} bytes",
+      chunk - (framed - longest)
+    );
+    assert!(framed <= chunk);
+    assert!(longest <= super::PLATFORM_PATH_BYTES);
+    let reason = super::recorded_reason("é".repeat(super::RECOVERY_REASON_BYTES));
+    assert!(reason.len() <= super::RECOVERY_REASON_BYTES && reason.chars().all(|c| c == 'é'));
+  }
 
   /// §4.4 `list` (A-263 with B8's `not_recovered`). Do: list a summary with the longest listable name and an unrecovered
   /// overlay's cause whose base path and reason run 10,000 bytes each, multi-byte characters among them; and one whose

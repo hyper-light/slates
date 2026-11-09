@@ -3748,6 +3748,83 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
   }
 }
 
+/// Whether a status refusal line (`shard N refused <counter>: <count>`) is one forming a fleet may show: superseded link
+/// work, and the events of formation's ordinary work that the counter map carries beside refusals.
+fn formation_counter_allowed(line: &str) -> bool {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  let Some(counter) = line
+    .split_whitespace()
+    .nth(3)
+    .and_then(|counter| counter.strip_suffix(':'))
+  else {
+    return false;
+  };
+  [
+    "fleet.discovery.invalidated",
+    "fleet.link.stale_return",
+    "fleet.accept.replaced",
+    "fleet.fan.sent",
+    "fleet.fan.unchanged",
+    // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+    // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
+    // announcement pass's lent sessions and sends.
+    "fleet.discovery.pages",
+    "fleet.learner.fetches",
+    "fleet.learner.fetch_paced",
+    "fleet.plane.announce_lends",
+    "fleet.plane.announcements_sent",
+    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
+    // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
+    CONTENT_PURGED,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+    GIVE_BACK_LEFT,
+    // A record link dropped because its anchor's learned member became another incarnation
+    // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
+    // superseded link work — exactly what this assertion permits — and it is counted during formation
+    // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
+    "fleet.link.invalid.member_changed",
+  ]
+  .contains(&counter)
+}
+
+/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
+/// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
+/// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
+#[test]
+fn the_formation_check_allows_every_reap_tick_event() {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  for counter in [
+    CONTENT_PURGED,
+    GIVE_BACK_LEFT,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+  ] {
+    let line = format!("shard 0 refused {counter}: 1");
+    assert!(
+      formation_counter_allowed(&line),
+      "the formation check allows {line:?}"
+    );
+  }
+}
+
 /// Every process derived the same fleet from the one manifest: the same three member ids (its own among
 /// them, distinct per node) and both peers probed.
 fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
@@ -3789,39 +3866,7 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
         .refusals
         .split(';')
         .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-          [
-            "fleet.discovery.invalidated:",
-            "fleet.link.stale_return:",
-            "fleet.accept.replaced:",
-            "fleet.fan.sent:",
-            "fleet.fan.unchanged:",
-            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
-            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
-            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
-            "fleet.discovery.pages:",
-            "fleet.learner.fetches:",
-            "fleet.learner.fetch_paced:",
-            "fleet.plane.announce_lends:",
-            "fleet.plane.announcements_sent:",
-            "content.purged_bytes:",
-            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
-            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
-            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
-            "content.ticks.sealing:",
-            "content.ticks.deferred:",
-            "content.ticks.busy:",
-            "content.ticks.idle:",
-            "content.prefaulted_bytes:",
-            // A record link dropped because its anchor's learned member became another incarnation
-            // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
-            // superseded link work — exactly what this assertion permits — and it is counted during formation
-            // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
-            "fleet.link.invalid.member_changed:",
-          ]
-          .iter()
-          .any(|counter| line.split_whitespace().nth(3) == Some(counter))
-        }),
+        .all(formation_counter_allowed),
       "only superseded link work may end during formation: {views:?}"
     );
   }
@@ -12717,6 +12762,91 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   );
   refused_not_recovered(&instance, &["volume", "snapshot", &id]);
   refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// A path under `root` exactly `bytes` long: components of at most 200 bytes, under the 255-byte name limit, so only
+/// the whole path's length is at stake.
+#[cfg(unix)]
+fn path_of_length(root: &str, bytes: usize) -> String {
+  let mut path = root.to_owned();
+  while path.len() < bytes {
+    let room = bytes - path.len() - 1;
+    path.push('/');
+    path.push_str(&"d".repeat(room.clamp(1, 200)));
+  }
+  assert_eq!(
+    path.len(),
+    bytes,
+    "a path of exactly {bytes} bytes under {root}"
+  );
+  path
+}
+
+/// §4.8, §4.4 `create` and `status` (A-263 on B9: the supervisor's bound on a recorded cause). A recovery cause names an
+/// overlay's base as recorded, so the base a volume records is bounded: the platform's path maximum, and no longer than
+/// the refusal every verb on an unrecovered volume answers holds whole (`slates_server::verbs::longest_recordable_base`).
+/// Do: create an overlay over a base of exactly that length, and try one a byte longer; snapshot the first, make its base
+/// unreadable to the daemon, and restart it in order. Expect: the longer base is refused `BaseUnavailable` before
+/// anything is made; the volume's `status` is refused `NotRecovered` naming `BaseUnavailable`, the whole base path and
+/// the host's refusal.
+#[cfg(unix)]
+#[test]
+fn the_longest_recorded_base_is_named_whole_by_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the longest recorded base: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-longbase-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-longbase"),
+  };
+  let longest = slates_server::verbs::longest_recordable_base();
+  let base = path_of_length(&scratch.path, longest);
+  shell(&format!("mkdir -p '{base}'"));
+  // Never made: it is refused before the daemon looks at the disk (on macOS no such directory can be made at all).
+  let longer = path_of_length(&scratch.path, longest + 1);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "too-long",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &longer,
+    ],
+  );
+  assert_ne!(code, 0, "a base past the bound is refused: {out}");
+  assert!(err.contains("BaseUnavailable"), "refused by kind: {err}");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "longest",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "a base of {longest} bytes is recorded: {err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("chmod 000 '{base}'"));
+  restart_in_order(&instance);
+  let (code, out, err) = run(&instance, &["status", &id]);
+  shell(&format!("chmod 755 '{base}'"));
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseUnavailable") && err.contains(&base),
+    "status names the {longest}-byte base whole, by kind: {err}"
+  );
 }
 
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
