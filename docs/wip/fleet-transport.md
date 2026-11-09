@@ -222,8 +222,7 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    the timer that arms it needs the runtime's timed receive), connection IDs, several frames per packet
    (an MTU budget), and loom on the state machine.
    **Status (2026-11-08): one judgement of a dead session.** `Endpoint::peer_silent_past(floor)` is the one
-   judgement for every caller that must end an exchange before its deadline (the live lane's watch, the forward
-   lane). It holds once this end has sent an ack-eliciting packet and nothing that opened under the session's keys
+   judgement for every caller that must end an exchange or a session on its peer's silence. It holds once this end has sent an ack-eliciting packet and nothing that opened under the session's keys
    has come back for max(floor, `Endpoint::persistent_congestion_duration`). That duration is RFC 9002 §7.6.1's
    three probe timeouts, each floored at the initial 666 ms (§6.2.2), since a sample from a quiet path says nothing
    of the queue later traffic builds. The clock starts at the first ack-eliciting send after the peer was last heard.
@@ -231,6 +230,14 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    never silent. Path-MTU probes ask nothing: an oversized one is dropped and answered by no one. On the fabric
    (`crates/transport/tests/exchanges.rs`): a gone peer was judged silent at 2,008 ms against its 1,998 ms duration,
    and a peer whose answers a shared queue held up to 4.09 s apart was never judged silent and answered.
+   **Its caller (2026-11-09):** `fleet::return_sessions` judges every record session a borrower hands back, with
+   the liveness budget as the floor, and drops a silent one so the link redials. Every borrower's hold is bounded,
+   so a borrowed session is judged within its window plus one hold. The judgement runs only on a return, so how late
+   past its window a silent session is dropped is the return cadence: 0 to 209 ms past a 1,998 ms window in
+   loadtest-scale's deaf-session test (5 of 5; the replacement answered 26 to 336 ms later). A session sitting
+   unborrowed in its slot is the link's discovery refresh's to catch, and a peer's stateless reset (A-261) ends one
+   sooner where it is heard, so no timer judges it. The install watch that would also call it is held, not landed
+   (BENCHMARKS "The install watch, measured").
    **Status (2026-09-13):** connection IDs landed earlier (`4dd4e6e`, one socket per plane). Every
    exchange now rides a **fresh stream id** (RFC 9000 §2.1): the kind in the low `STREAM_KIND_BITS`,
    a per-connection exchange sequence above (`Endpoint::request(kind, ..)`, `abandon_exchange`,
