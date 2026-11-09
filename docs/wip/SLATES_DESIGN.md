@@ -4310,7 +4310,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 > **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
 > term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
-> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below.
+> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below. Since
+> 2026-11-09 only the attachment's own principal's use renews it: no record is written by an identity a request merely
+> names, rather than the one its session authenticated (`use_attachment`).
 
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
@@ -14090,7 +14092,10 @@ the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates att
   - The term is the operator's failover SLO, derived as the write lease's: `derived!(failover_slo_ns, …)`, 10 s by
     default. A write attachment holds the lease, so its term is the lease's.
   - Every verb that names it (`Fs*`, `detach`, `advance`, `bind`) renews it once less than half the term is left:
-    one durable record per half term of use, never one per verb.
+    one durable record per half term of use, never one per verb. Only its own principal's use renews it, or ends it
+    at the lapse. Another principal's use writes nothing and is refused by the verb's own check. Amended 2026-11-09,
+    after fixtures' sweep: a use renewed it ahead of that check, so any channel that named the id kept another
+    account's attachment alive.
   - It ends at the lapse, by the reaper's sweep or the first use after, as a detach does. The write lease goes with
     it, recorded `AttachmentExpired`.
   - A later use is refused `AttachmentExpired`, never `NotFound`. The partition keeps the expired ids, at most its

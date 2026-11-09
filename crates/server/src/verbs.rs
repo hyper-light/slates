@@ -8397,7 +8397,7 @@ fn detach_of(
   attachment: u64,
 ) -> ReplyBody {
   // A CLI attachment past its term is refused as expired, never as unknown (A-230).
-  if let Err(refusal) = use_attachment(state, attachment) {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
   }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
@@ -8442,7 +8442,7 @@ fn bind_mount(
   path: &str,
 ) -> ReplyBody {
   // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  if let Err(refusal) = use_attachment(state, attachment) {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
   }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
@@ -8535,12 +8535,18 @@ pub(crate) enum Ending {
   Expired,
 }
 
-/// A verb's use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is renewed
-/// when less than half of the term is left, so a user at work keeps it with one durable record per half term, never one
-/// a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition recorded as
-/// expired is refused `AttachmentExpired`, never `NotFound`. Any other attachment, or none, passes, for the verb's own
-/// lookup to answer.
-pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<(), Refusal> {
+/// `principal`'s use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is
+/// renewed when less than half of the term is left, so a user at work keeps it with one durable record per half term,
+/// never one a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition
+/// recorded as expired is refused `AttachmentExpired`, never `NotFound`. Only the attachment's own principal's use
+/// renews or ends it: another's passes untouched, for the verb's own check to refuse `Forbidden` (before 2026-11-09 a
+/// use renewed the attachment ahead of that check, so any channel that named the id kept another account's attachment
+/// alive; fixtures' sweep after A-255). Any other attachment, or none, passes, for the verb's own lookup to answer.
+pub(crate) fn use_attachment(
+  state: &mut ShardState,
+  principal: &Principal,
+  attachment: u64,
+) -> Result<(), Refusal> {
   let expired = Refusal::AttachmentExpired { attachment };
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return if state.db.partition().attachment_expired(attachment) {
@@ -8549,6 +8555,9 @@ pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<
       Ok(())
     };
   };
+  if &record.principal != principal {
+    return Ok(());
+  }
   let Consumer::Termed { expires_ns } = record.consumer else {
     return Ok(());
   };

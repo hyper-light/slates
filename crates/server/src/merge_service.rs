@@ -970,7 +970,7 @@ pub(crate) fn advance(
   version: Option<u64>,
 ) -> ReplyBody {
   // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  if let Err(refusal) = crate::verbs::use_attachment(state, attachment) {
+  if let Err(refusal) = crate::verbs::use_attachment(state, principal, attachment) {
     return refused(refusal);
   }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {

@@ -18566,7 +18566,7 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
       .iter()
       .map(|holder| holder.fleet_held_record(catalog))
       .collect::<Result<Vec<_>, _>>()?;
-    Ok(versions.iter().any(|version| *version == Some(1)) && records.iter().any(Option::is_some))
+    Ok(versions.contains(&Some(1)) && records.iter().any(Option::is_some))
   });
   drop(everyone);
   daemons.remove(0).stop();

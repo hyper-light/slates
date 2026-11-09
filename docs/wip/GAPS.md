@@ -51,6 +51,14 @@
 > independent of this fix (`BaseUnavailable` at recovery; open, A-257, liveness).
 > `docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`.
 >
+> **Another principal's use renewed a CLI attachment's term: fixed (2026-11-09, §4.7, A-230; fixtures' sweep after
+> A-255).** Each verb that names an attachment renewed a termed one before checking that the caller was its principal,
+> so any channel that knew the id could keep another account's write attachment, and its write lease, alive past its
+> term. Now only the attachment's principal's use renews or ends it. Red-checked:
+> `a_cli_attachment_is_renewed_by_its_own_principals_use_alone` fails with the check out, the owner's late write
+> succeeding. The sweep's other identities were already checked against the session; the bug record lists where.
+> `docs/bugs/2026-11-09-another-principals-use-renewed-a-cli-attachments-term.md`.
+
 > **A submit resent after its green's takeover is answered its version: fixed (2026-11-09, §4.16, §4.8 Lookup; A-255).**
 > Before, the resend was refused `OwnerUnreachable` without end: its work, by whose id it routes, dies with its owner, and
 > the completion window with it. Now the completion rides the green's chain entries and merge records, which the
