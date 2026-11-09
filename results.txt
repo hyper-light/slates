@@ -1,0 +1,52 @@
+leg floor-off-x86, 4 CPUs, Mon Nov  9 06:12:38 UTC 2026, tree 715b38431e9cfa37aacc6c799f070d89ab41e053
+== release build exit 0
+   r1 LD-TL stopped_on_install None after 20.001561394s
+   r1 LD-TL writes 28603
+   r1 counts: installs 0 taken 0 images 1 why 0
+== run 1 exit 0
+   r2 LD-TL stopped_on_install None after 20.004936944s
+   r2 LD-TL writes 19454
+   r2 counts: installs 0 taken 0 images 0 why 0
+== run 2 exit 0
+   r3 LD-TL stopped_on_install None after 20.000653539s
+   r3 LD-TL writes 35825
+   r3 counts: installs 0 taken 0 images 0 why 0
+== run 3 exit 0
+   r4 LD-LANE install wall_ns 1794205108198245127 holder 4905277041258283016 bytes 212288 budget_ns 30000000000 took_ns 30001283772 answered false cut false
+   r4 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (12992) panicked at crates/cli/tests/live_chaos.rs:1371:7:
+   r4 counts: installs 1 taken 1 images 1 why 1
+== run 4 exit 101
+   r5 LD-LANE install wall_ns 1794205255565666581 holder 5998009266378826766 bytes 268412 budget_ns 30000000000 took_ns 30000927285 answered false cut false
+   r5 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (17386) panicked at crates/cli/tests/live_chaos.rs:1371:7:
+   r5 counts: installs 1 taken 1 images 1 why 1
+== run 5 exit 101
+   r6 LD-LANE install wall_ns 1794205397843463369 holder 9039492225445311058 bytes 324520 budget_ns 30000000000 took_ns 30001242024 answered false cut false
+   r6 thread 'diag_a_holder_stopped_mid_install_stays_stopped' (21939) panicked at crates/cli/tests/live_chaos.rs:1371:7:
+   r6 counts: installs 1 taken 1 images 1 why 1
+== run 6 exit 101
+   r7 LD-LANE install wall_ns 1794205510246690718 holder 12721135510740282987 bytes 108688 budget_ns 30000000000 took_ns 897048 answered true cut false
+   r7 LD-TL stopped_on_install None after 20.004810062s
+   r7 LD-TL writes 47840
+   r7 counts: installs 1 taken 1 images 2 why 1
+== run 7 exit 0
+   r8 LD-TL stopped_on_install None after 20.003833117s
+   r8 LD-TL writes 68290
+   r8 counts: installs 0 taken 0 images 1 why 0
+== run 8 exit 0
+   r9 LD-TL stopped_on_install None after 20.004392593s
+   r9 LD-TL writes 26724
+   r9 counts: installs 0 taken 0 images 1 why 0
+== run 9 exit 0
+   r10 LD-TL stopped_on_install None after 20.001099365s
+   r10 LD-TL writes 45953
+   r10 counts: installs 0 taken 0 images 1 why 0
+== run 10 exit 0
+   r11 LD-LANE install wall_ns 1794205622551501132 holder 3548127076693720289 bytes 61196 budget_ns 1000173986 took_ns 3426010 answered true cut false
+   r11 LD-TL stopped_on_install None after 20.002062139s
+   r11 LD-TL writes 37671
+   r11 counts: installs 1 taken 1 images 2 why 2
+== run 11 exit 0
+   r12 LD-TL stopped_on_install None after 20.004240472s
+   r12 LD-TL writes 26055
+   r12 counts: installs 0 taken 0 images 0 why 0
+== run 12 exit 0
