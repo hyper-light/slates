@@ -9232,6 +9232,37 @@ new process. In simulation the session ended one round trip after its first pack
   its copy, the home region is lost, and the promoted mirror serves the content. Owner: live-fixes, after the home
   healer fix and its siblings.
 
+### 2026-11-09: a fresh member that joins against a stale configuration holds no session for a whole fleet wait (open)
+
+- **Found** by raft-chaos's confirmation of learner-3 (diag-raft-chaos-ab-66, 00a2589f), under diag-60's one-CPU load.
+  The test `a_member_that_never_held_the_log_never_stands_in_for_its_holder` failed at `live_chaos.rs:410`, "the fleet
+  formed, or kept changing, within each fleet wait": 1 of 48 runs, 6 runners × 8, load 15 to 23.
+- **What the stuck node showed.** b is the fresh member that replaced a killed voter. Through the whole second
+  formation wait, t = 0 to 50.3 s:
+  - `fleet_peers_in_contact` 0 and `fleet_peers_unmeshed` 0, though it counted members 5 and `fleet_peers_probed` 4.
+    The other four nodes were each in contact with 4.
+  - `fleet_configuration_version` 0. Its council stood at the fetched v8, whose voters included the replaced member.
+  - `fleet_learner`: `asked` frozen at 3, and `last_asked_ago_ms` climbing from 179 to 50,648.
+  - `fleet.learner.no_session` climbing from 1 to 99, about 2 a second.
+  - The rest of the fleet reached v15, with b among its members, by t = 11.3 s.
+- **Both arms.**
+  - Before, main 84d1f59a (learner-3's base): diag-live-fixes-70, the same harness, test, load and count. 40 of 48
+    passed: 6 failed at :457 (the learner stall that learner-3 fixes) and 2 at :410.
+  - After, learner-3: 47 of 48 passed, with 1 at :410 (the run above) and none at :457.
+  - The base's two :410 failures show the same signature. In each, one node ends the wait with in contact 0 and
+    configuration version 0, as b did (runner 1 pair 8 and runner 3 pair 8, both node c). In each, another node also
+    sits at configuration v8 with only the bootstrap voter, in contact 3 of 4: that is the learner stall.
+  - So the stall is older than learner-3: 2 of 48 on the base, 1 of 48 with it.
+- **Hypothesis (unverified, read from the code and the counters, never run).** b holds a configuration that predates its
+  own admission. Its probe plane installs none (version 0), its contact rule keeps no peer, so it holds no session.
+  With no session it cannot fetch the configuration that includes it, and the cycle never breaks.
+  - A gap in the reading: learner-3's contact rule keeps a peer that the fetched voters name, and two of b's fetched
+    voters were alive and meshed elsewhere. So either b's membership held its peers not alive, or the rule ran on
+    something other than v8.
+  - raft-chaos's diag-raft-chaos-68 adds a status line per peer with its contact reason and b's membership belief,
+    which will decide between these.
+- **Owner:** live-fixes.
+
 ### 2026-11-09: a heal left the head naming a holder that had left the fleet (fixed)
 
 - **Found** fixing the healer (live-fixes). On a five-node `f = 1` fleet, after a holder the head named was stopped and
