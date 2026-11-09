@@ -15,6 +15,8 @@
 //!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
 //!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
 //!   the end until the size is reached. These two replays pass: alone, the operations do not wedge (an open bug).
+//! - `CreateSymbolicLinkW` must make a link Windows follows and reads back (`t/reparse/02.t` and `03.t`, A-TBD), as
+//!   git and npm make links on Windows; the drive answered `ERROR_INVALID_FUNCTION`, since it served no reparse point.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
@@ -627,4 +629,115 @@ fn a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete() {
   permissions.set_readonly(false);
   std::fs::set_permissions(&path, permissions).unwrap();
   std::fs::remove_file(&path).unwrap();
+}
+
+/// A-TBD, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
+/// link, a relative directory link and an absolute file link; read through each, read each link back, then remove the
+/// links. Expect: each link is made; reading through it gives its target's bytes; `read_link` gives the target it was
+/// made with; the file links report `REPARSE_POINT` and the directory link `DIRECTORY | REPARSE_POINT`; a link made
+/// before its target exists is followed once the target is made; removing a link leaves its target. Before, every
+/// `CreateSymbolicLinkW` on the drive answered `ERROR_INVALID_FUNCTION`.
+/// Format: `FILE_ATTRIBUTE_DIRECTORY` and `FILE_ATTRIBUTE_REPARSE_POINT`, the bits that tell a link's kind.
+const LINK_KIND_BITS: (u32, u32) = (0x10, 0x400);
+
+/// The directory and reparse-point bits of the drive's object `name`, the object itself rather than what it links to.
+fn link_kind(drive: &Drive, name: &str) -> u32 {
+  use std::os::windows::fs::MetadataExt;
+  let (directory, reparse_point) = LINK_KIND_BITS;
+  std::fs::symlink_metadata(drive.path(name))
+    .unwrap()
+    .file_attributes()
+    & (directory | reparse_point)
+}
+
+/// The relative and absolute file links of the symbolic-link test: made, read through, read back.
+fn file_links_are_followed(drive: &Drive) {
+  use std::os::windows::fs::symlink_file;
+  symlink_file("target.txt", drive.path("file-link")).expect("a relative file link is made");
+  assert_eq!(
+    std::fs::read(drive.path("file-link")).unwrap(),
+    b"the target"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("file-link")).unwrap(),
+    std::path::Path::new("target.txt")
+  );
+  assert_eq!(
+    link_kind(drive, "file-link"),
+    LINK_KIND_BITS.1,
+    "a file link"
+  );
+  let absolute = drive.path("target.txt");
+  symlink_file(&absolute, drive.path("absolute-link")).expect("an absolute file link is made");
+  assert_eq!(
+    std::fs::read(drive.path("absolute-link")).unwrap(),
+    b"the target"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("absolute-link")).unwrap(),
+    std::path::Path::new(&absolute)
+  );
+}
+
+/// The directory link of the symbolic-link test, and a link made before its target.
+fn directory_and_early_links_are_followed(drive: &Drive) {
+  use std::os::windows::fs::{symlink_dir, symlink_file};
+  symlink_dir("lib", drive.path("dir-link")).expect("a relative directory link is made");
+  assert_eq!(
+    std::fs::read(drive.path("dir-link\\inner.txt")).unwrap(),
+    b"inside lib"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("dir-link")).unwrap(),
+    std::path::Path::new("lib")
+  );
+  let (directory, reparse_point) = LINK_KIND_BITS;
+  assert_eq!(
+    link_kind(drive, "dir-link"),
+    directory | reparse_point,
+    "a directory link"
+  );
+  symlink_file("later.txt", drive.path("early-link")).expect("a link to a name not yet made");
+  assert!(
+    std::fs::read(drive.path("early-link")).is_err(),
+    "a dangling link opens nothing"
+  );
+  std::fs::write(drive.path("later.txt"), b"made later").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("early-link")).unwrap(),
+    b"made later"
+  );
+}
+
+/// A-TBD, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
+/// link, an absolute file link, a relative directory link and a link made before its target; read through each, read
+/// each link back, then remove the links. Expect: each link is made; reading through it gives its target's bytes;
+/// `read_link` gives the target it was made with; the file links report `REPARSE_POINT` and the directory link
+/// `DIRECTORY | REPARSE_POINT`; the early link opens nothing until its target is made; removing a link leaves its
+/// target. Before, every `CreateSymbolicLinkW` on the drive answered `ERROR_INVALID_FUNCTION`.
+#[test]
+fn symbolic_links_made_through_the_drive_are_followed_and_read_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("links");
+  std::fs::write(drive.path("target.txt"), b"the target").unwrap();
+  std::fs::create_dir(drive.path("lib")).unwrap();
+  std::fs::write(drive.path("lib\\inner.txt"), b"inside lib").unwrap();
+  file_links_are_followed(&drive);
+  directory_and_early_links_are_followed(&drive);
+  std::fs::remove_file(drive.path("file-link")).unwrap();
+  std::fs::remove_file(drive.path("absolute-link")).unwrap();
+  std::fs::remove_dir(drive.path("dir-link")).unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("target.txt")).unwrap(),
+    b"the target",
+    "the target outlives its links"
+  );
+  assert_eq!(
+    std::fs::read(drive.path("lib\\inner.txt")).unwrap(),
+    b"inside lib"
+  );
 }

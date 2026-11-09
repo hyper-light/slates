@@ -2558,7 +2558,7 @@ fn a_writes_accounting_equals_a_recount_after_every_step() {
 
 /// A-262. Do: create a file (the volume marks it `ARCHIVE`, as NTFS does), set `HIDDEN | SYSTEM` on a second and
 /// `READONLY | HIDDEN` on a directory, ask for a third file's `READONLY` (dropped: a file's read-only state is its
-/// mode), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
+/// mode), and `HIDDEN | DIRECTORY` on a symlink (a Windows directory link, A-TBD), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
 /// carries each inode's bits at Windows' values, and the rebuilt volume reports the same bits.
 #[test]
 fn windows_attributes_survive_an_image_and_a_rebuild() {
@@ -2575,6 +2575,7 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
     .create_file_no(&mut store, root, "readonly", 0o644)
     .unwrap();
   let dir = vol.mkdir_no(&mut store, root, "dir", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "link", "dir").unwrap();
   let set = |bits: u32, kind| WindowsAttributes::kept(bits, kind);
   let file = slates_vfs::inode::Kind::File;
   vol
@@ -2590,11 +2591,19 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
       set(0x1 | 0x2 | 0x10, slates_vfs::inode::Kind::Dir),
     )
     .unwrap();
+  vol
+    .set_windows_attributes(
+      &mut store,
+      link,
+      set(0x2 | 0x10 | 0x400, slates_vfs::inode::Kind::Symlink),
+    )
+    .unwrap();
   let expected = [
     (archived, 0x20),
     (hidden, 0x2 | 0x4),
     (readonly, 0x20),
     (dir, 0x1 | 0x2),
+    (link, 0x2 | 0x10),
     (root, 0),
   ];
   let image = vol.to_image(&store, None).unwrap();

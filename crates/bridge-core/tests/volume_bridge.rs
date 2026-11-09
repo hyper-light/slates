@@ -200,6 +200,45 @@ fn setattr_keeps_the_windows_attribute_bits_for_each_kind() {
   );
 }
 
+/// A-TBD. Do: create a symlink and a file through the bridge, then `setattr` the Win32 word `HIDDEN | DIRECTORY` on
+/// each, as the WinFsp drive marks a link `CreateSymbolicLink` made with `SYMBOLIC_LINK_FLAG_DIRECTORY`. Expect: the
+/// link keeps the directory bit (Windows reports a directory link as `DIRECTORY | REPARSE_POINT`, `t/reparse/03.t`)
+/// and the file drops it, in the reply and in a fresh `getattr`; the link's target is untouched.
+#[test]
+fn a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let link = bridge.symlink(oid(root), &cx, "link", "../dir").unwrap();
+  let (file, _fh) = bridge.create(oid(root), &cx, "file", 0o644, 0).unwrap();
+  let mut set = |ino, word| {
+    bridge
+      .setattr(
+        oid(ino),
+        &cx,
+        SetAttr {
+          windows: Some(word),
+          ..SetAttr::default()
+        },
+      )
+      .unwrap()
+      .windows
+  };
+  assert_eq!(
+    set(link.ino, 0x2 | 0x10),
+    0x2 | 0x10,
+    "a link keeps the directory bit"
+  );
+  assert_eq!(set(file.ino, 0x2 | 0x10), 0x2, "a file drops it");
+  assert_eq!(
+    bridge.getattr(oid(link.ino), &cx).unwrap().windows,
+    0x2 | 0x10
+  );
+  assert_eq!(bridge.readlink(oid(link.ino), &cx).unwrap(), "../dir");
+}
+
 /// A-259. Do: create a file through the bridge, then `setattr` only its birth time, as WinFsp's `SetFileTime` sets a
 /// creation time. Expect: the reply and a fresh `getattr` report the time set, the modification time left as it was,
 /// and a file made after it reporting its own birth time. Before, the bridge's attributes carried no birth time and its
