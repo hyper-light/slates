@@ -1,0 +1,79 @@
+# DIAG, not for main: why kube-proxy crash-loops on 4 of 5 KIND workers on ubuntu-26.04 (diag-release-13), against
+# 24.04, and whether raising the host's inotify limits keeps it up. Plain kind with the lane's cluster config; no slates.
+name: DIAG kube-proxy on KIND, 24.04 against 26.04 (not for main)
+'on':
+  push:
+    branches:
+    - diag-release-14
+permissions:
+  contents: read
+env:
+  DOWNLOAD_RETRIES: '20'
+  DOWNLOAD_RETRY_SECONDS: '60'
+  DOWNLOAD_TRY_SECONDS: '120'
+  KIND_URL: https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_URL: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+  KUBECTL_SHA256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
+jobs:
+  proxy:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - leg: 2404
+          image: ubuntu-24.04
+          raise: 'no'
+        - leg: 2604
+          image: ubuntu-latest
+          raise: 'no'
+        - leg: 2604-inotify
+          image: ubuntu-latest
+          raise: 'yes'
+    name: kube-proxy on ${{ matrix.leg }}
+    runs-on: ${{ matrix.image }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install kind and kubectl
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/kind-tools"; mkdir -p "$bin"
+        fetch() { curl --fail --silent --show-error --location --retry "$DOWNLOAD_RETRIES" --retry-delay "$DOWNLOAD_RETRY_SECONDS" --retry-all-errors --max-time "$DOWNLOAD_TRY_SECONDS" --output "$2" "$1"; }
+        fetch "$KIND_URL" "$bin/kind"; echo "$KIND_SHA256  $bin/kind" | sha256sum -c -
+        fetch "$KUBECTL_URL" "$bin/kubectl"; echo "$KUBECTL_SHA256  $bin/kubectl" | sha256sum -c -
+        chmod +x "$bin/kind" "$bin/kubectl"; echo "$bin" >> "$GITHUB_PATH"
+    - name: Raise the inotify limits (the raise leg only)
+      if: matrix.raise == 'yes'
+      run: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+    - name: Create the lane's cluster, wait, look, publish
+      shell: bash
+      run: |
+        set +e +o pipefail
+        out="$RUNNER_TEMP/summary.txt"; : > "$out"
+        say() { echo "$@" >> "$out"; }
+        run() { say "\$ $*"; "$@" 2>&1 | head -${N:-40} >> "$out"; }
+        say "image: $ImageOS $ImageVersion; kernel $(uname -r); raise=${{ matrix.raise }}; docker $(docker version --format '{{.Server.Version}}')"
+        N=20 run sh -c 'sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches fs.file-max fs.nr_open net.netfilter.nf_conntrack_max net.nf_conntrack_max kernel.pid_max; ulimit -n'
+        N=20 run sh -c 'lsmod | grep -E "^(ip_tables|ip6_tables|x_tables|nf_tables|iptable_|nf_conntrack|br_netfilter|xt_)" | cut -c1-60'
+        N=10 run sh -c 'ls /proc/sys/fs/inotify; cat /proc/sys/user/max_inotify_instances 2>/dev/null'
+        N=20 run kind create cluster --name proxy --config deploy/kind/cluster.yaml --wait 5m
+        sleep 120
+        N=40 run kubectl --context kind-proxy -n kube-system get pods -o wide
+        for p in $(kubectl --context kind-proxy -n kube-system get pods -l k8s-app=kube-proxy -o name); do
+          N=12 run sh -c "kubectl --context kind-proxy -n kube-system get $p -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo"
+          N=25 run kubectl --context kind-proxy -n kube-system logs $p --previous --tail=20
+          N=12 run kubectl --context kind-proxy -n kube-system logs $p --tail=8
+        done
+        N=12 run kubectl --context kind-proxy -n kube-system get pods -l k8s-app=kindnet -o wide
+        for n in $(kind get nodes --name proxy); do
+          N=8 run docker exec $n sh -c 'hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1'
+        done
+        N=10 run sh -c 'sudo find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | cut -d/ -f3 | sort -u | while read p; do cat /proc/$p/status 2>/dev/null | sed -n "s/^Uid:\t\([0-9]*\).*/\1/p"; done | sort | uniq -c'
+        N=20 run sh -c 'sudo dmesg -T | tail -20'
+        kind delete cluster --name proxy >/dev/null 2>&1
+        git config user.name diag-release; git config user.email diag-release@users.noreply.github.com
+        blob=$(git hash-object -w "$out"); tree=$(printf "100644 blob %s\tsummary.txt\n" "$blob" | git mktree)
+        c=$(echo "results of run ${{ github.run_id }}" | git commit-tree "$tree")
+        git push origin "$c:refs/heads/diag-results/release-14-proxy-${{ matrix.leg }}"
