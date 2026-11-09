@@ -105,7 +105,7 @@
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
 > - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image was changing (it is built: A-260, image version 23, delta version 6), and two
+>   format raft-5's incremental held image was changing (it is built: A-270, image version 23, delta version 6), and two
 >   format changes at once would collide. Owed when that lands:
 >   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
@@ -14720,7 +14720,7 @@ because sixteen daemons share the test process, and was the second partition.
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
 
-### 2026-11-08: a holder's acknowledgement published everything it held — fixed (A-260)
+### 2026-11-08: a holder's acknowledgement published everything it held — fixed (A-270)
 
 raft-4's c6e178aa made a candidate publish before it acknowledges a live entry, so its copies survive its own warm
 restart. But each publication carried the shard's whole held image (the content hold, every register, every live copy

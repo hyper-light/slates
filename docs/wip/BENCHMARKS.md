@@ -11997,7 +11997,7 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
 
-## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-260; 2026-11-08)
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-270; 2026-11-08)
 
 **Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
 (other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the

@@ -1,4 +1,4 @@
-//! A map that remembers which of its keys changed since its owner last published it (A-260; §4.8 persistence before
+//! A map that remembers which of its keys changed since its owner last published it (A-270; §4.8 persistence before
 //! reply). A shard's recovery publication carries what it holds for other owners as keyed pieces, and a delta carries
 //! only the pieces that changed. So the publication must know which changed, and a change it misses is an
 //! acknowledged record a warm restart no longer has.
@@ -129,7 +129,7 @@ impl<'a, K: Ord + Copy, V> IntoIterator for &'a Tracked<K, V> {
 mod tests {
   use super::Tracked;
 
-  /// A-260: do reach a map's values every mutable way, then publish. Expect each key reached marked, held or dropped,
+  /// A-270: do reach a map's values every mutable way, then publish. Expect each key reached marked, held or dropped,
   /// a read to mark nothing, and the marks gone once cleared, so a delta built from them carries every change.
   #[test]
   fn every_mutable_access_marks_its_key_and_a_read_marks_none() {

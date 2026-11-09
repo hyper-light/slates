@@ -11159,7 +11159,7 @@ fn read_journal(
   ))
 }
 
-/// Test support (A-260's oracle): whether the held pieces a restart would read from this shard's committed journal are
+/// Test support (A-270's oracle): whether the held pieces a restart would read from this shard's committed journal are
 /// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
 /// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
 pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {

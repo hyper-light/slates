@@ -34,7 +34,7 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// The delta format's history: 1 (A-68, 2026-10-04); 2 (A-126, 2026-10-09) a file changed only by writes to its chunked
 /// body is carried as its written windows (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call
 /// records changed and purged since the last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they
-/// changed; 5 (A-231, 2026-11-05) the held connections' byte states; 6 (A-260, 2026-11-08) what the shard holds for other
+/// changed; 5 (A-231, 2026-11-05) the held connections' byte states; 6 (A-270, 2026-11-08) what the shard holds for other
 /// owners as the pieces put and the keys removed since the last publication, never the whole held image.
 /// Format: the delta format's version, bumped with any change to the delta's types.
 pub const DELTA_VERSION: u16 = 6;
@@ -64,7 +64,7 @@ pub struct ShardDelta {
   pub volumes: Vec<KeyedRecord>,
   /// The volumes no longer held, in key order.
   pub removed: Vec<[u8; 16]>,
-  /// The held pieces put since the last publication (A-260), in key order, each whole.
+  /// The held pieces put since the last publication (A-270), in key order, each whole.
   pub held_put: Vec<HeldPiece>,
   /// The held pieces removed since the last publication, in key order.
   pub held_removed: Vec<[u8; HELD_PIECE_KEY_BYTES]>,
@@ -224,7 +224,7 @@ impl ShardDelta {
   }
 }
 
-/// Writes a delta's held pieces put and keys removed (A-260's format), each sorted by key, as `ShardDelta`'s `encode`
+/// Writes a delta's held pieces put and keys removed (A-270's format), each sorted by key, as `ShardDelta`'s `encode`
 /// writes its `held_put` and `held_removed`.
 fn encode_held(
   out: &mut Vec<u8>,
@@ -244,7 +244,7 @@ fn encode_held(
 }
 
 impl ShardImage {
-  /// Folds a delta's held pieces into this image (A-260): each piece put replaces or joins the one under its key, then
+  /// Folds a delta's held pieces into this image (A-270): each piece put replaces or joins the one under its key, then
   /// each key removed drops its piece. A delta never puts and removes one key.
   fn fold_held(&mut self, delta: &ShardDelta) {
     for piece in &delta.held_put {

@@ -168,7 +168,7 @@ struct HeldPosition {
   value: Vec<u8>,
 }
 
-/// Format: the kind byte of a held piece's key (A-260; `slates_vfs::recover::HeldPiece`): the content hold's image, the
+/// Format: the kind byte of a held piece's key (A-270; `slates_vfs::recover::HeldPiece`): the content hold's image, the
 /// mirror records, one held register, one live copy's head, and one live copy's entry. Key order is kind, then object,
 /// then position.
 const KIND_CONTENT: u8 = 0;
@@ -217,7 +217,7 @@ fn split_key(key: &PieceKey) -> (u8, [u8; 16], u64) {
   (kind, object, position)
 }
 
-/// What a holder keeps for other owners, as its shard's recovery image carries it (A-260): the content it holds
+/// What a holder keeps for other owners, as its shard's recovery image carries it (A-270): the content it holds
 /// (`ContentHold`'s own image, AUD-29-59) and the mirror records, each one whole piece; each register record it
 /// acknowledged, with its fence, one piece; and each copy of another owner's live log (A-200) as a head piece and a
 /// piece per entry, so a live write's publication carries the entry it added. A warm restart keeps the member id, so all
@@ -302,7 +302,7 @@ fn live_pieces(
   pieces
 }
 
-/// What of the held pieces the committed journal holds that the tracked maps cannot tell (A-260): the whole pieces'
+/// What of the held pieces the committed journal holds that the tracked maps cannot tell (A-270): the whole pieces'
 /// bytes, compared at each publication, and each live copy's published slots, so a delta drops the ones it no longer
 /// holds and adds only the new ones.
 #[derive(Debug, Default)]
@@ -311,7 +311,7 @@ pub(crate) struct PublishedHeld {
   live: BTreeMap<ObjectId, (u64, u64)>,
 }
 
-/// The held pieces a delta carries (A-260): those put and those removed since the last committed publication, and the
+/// The held pieces a delta carries (A-270): those put and those removed since the last committed publication, and the
 /// whole pieces as they now are, to adopt once it commits ([`held_committed`]).
 pub(crate) struct HeldChanges {
   /// The pieces put, each whole.
@@ -322,7 +322,7 @@ pub(crate) struct HeldChanges {
   pub(crate) whole: BTreeMap<PieceKey, Vec<u8>>,
 }
 
-/// What a delta carries of the held pieces since the last committed publication (A-260): a whole piece whose bytes
+/// What a delta carries of the held pieces since the last committed publication (A-270): a whole piece whose bytes
 /// differ; every register and live copy its tracked map marked, put when held and removed when not; and of a live copy,
 /// its head, the entries in slots past the published ones, and the published slots it dropped. The work is the changes',
 /// not the holder's.
@@ -384,7 +384,7 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   }
 }
 
-/// Adopts what a committed publication carried of the held pieces (A-260): `whole` as the published whole pieces, each
+/// Adopts what a committed publication carried of the held pieces (A-270): `whole` as the published whole pieces, each
 /// live copy's slots as published (every copy's after a checkpoint, `everything`; the marked ones' after a delta), the
 /// slot floor raised past them, and the tracked maps' marks cleared.
 pub(crate) fn held_committed(
@@ -438,7 +438,7 @@ pub(crate) fn whole_of(pieces: &[slates_vfs::recover::HeldPiece]) -> BTreeMap<Pi
     .collect()
 }
 
-/// What a recovered image's held pieces say was published (A-260), so the journal's next delta is judged against it.
+/// What a recovered image's held pieces say was published (A-270), so the journal's next delta is judged against it.
 pub(crate) fn published_from(pieces: &[slates_vfs::recover::HeldPiece]) -> PublishedHeld {
   let mut live: BTreeMap<ObjectId, (u64, u64)> = BTreeMap::new();
   for piece in pieces {
@@ -464,7 +464,7 @@ pub(crate) struct RecoveredHeld {
   live: Vec<crate::live_ship::HeldLive>,
 }
 
-/// Why a recovered image's held pieces were refused (A-260): never read as less than was held, since a holder that
+/// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
 /// cannot restore what it acknowledged must not serve as though it had.
 #[derive(Debug)]
 pub(crate) enum HeldRefused {
@@ -499,7 +499,7 @@ impl From<slates_wire::WireError> for HeldRefused {
   }
 }
 
-/// Splits a recovered image's held pieces (A-260), each live copy joined from its head and its entries in slot order.
+/// Splits a recovered image's held pieces (A-270), each live copy joined from its head and its entries in slot order.
 /// No pieces hold nothing; pieces that do not decode, or that leave a copy's entries short, are refused.
 pub(crate) fn split_held(
   pieces: &[slates_vfs::recover::HeldPiece],

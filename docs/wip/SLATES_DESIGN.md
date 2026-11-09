@@ -6221,7 +6221,7 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
 > kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound.
 >
-> **The held image is incremental (2026-11-08, A-260).** What a shard holds for other owners is now keyed pieces: the
+> **The held image is incremental (2026-11-08, A-270).** What a shard holds for other owners is now keyed pieces: the
 > content hold and the mirror records one piece each, one per held register, and of each live copy a head piece and one
 > piece per entry, keyed by slot. A delta carries the pieces put and the keys removed since the last publication, so an
 > acknowledgement's publication carries the entry it added. Persisting every acknowledged live entry now adds nothing
@@ -15465,7 +15465,7 @@ Applied in the same change to:
   holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
   owner (the bug record's siblings).
 
-### A-260 — What a shard holds for other owners is keyed pieces, and a delta carries only those that changed (accepted and built 2026-11-08, the supervisor's checkpoint_log rules for raft-5's incremental held image)
+### A-270 — What a shard holds for other owners is keyed pieces, and a delta carries only those that changed (accepted and built 2026-11-08, the supervisor's checkpoint_log rules for raft-5's incremental held image)
 
 Applied in the same change to:
 - §4.8 A-200's status: the note on a candidate's copy surviving its own restart.

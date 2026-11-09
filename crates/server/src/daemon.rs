@@ -2339,7 +2339,7 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-260): whether the held pieces this node's committed recovery journal carries are exactly what it
+  /// Test support (A-270): whether the held pieces this node's committed recovery journal carries are exactly what it
   /// holds now (`crate::verbs::committed_held_agrees`), on the shard that holds for other owners.
   pub fn held_journal_agrees(&self) -> Result<bool, ObserveError> {
     self.observe(self.shards.first().copied(), |s| {
@@ -6278,7 +6278,7 @@ mod tests {
       .install_configuration(configuration, &regional.members);
   }
 
-  /// One step of the held-pieces oracle's history (A-260): a change to what the shard holds, or a publication.
+  /// One step of the held-pieces oracle's history (A-270): a change to what the shard holds, or a publication.
   #[derive(Clone, Copy, Debug)]
   enum HeldStep {
     /// An entry kept after the last of live copy `copy` (made when it holds none).
@@ -6297,7 +6297,7 @@ mod tests {
     Checkpoint,
   }
 
-  /// A-260, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
+  /// A-270, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
   /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
   /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
   /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
