@@ -1,4 +1,4 @@
-name: DIAG raft-chaos A-261's hardened process test at extreme load (not for main)
+name: DIAG (diag-64 runners 2 and 3 again, which never started) raft-chaos A-261's hardened process test at extreme load (not for main)
 
 # Diagnostics branch of the raft-chaos agent; never merged. One arm, the committed tip of agents/raft-chaos-stateless-reset,
 # built as CI's gate builds the fleet tests (debug). Two conditions alternate run by run, the first swapped between
@@ -9,7 +9,7 @@ name: DIAG raft-chaos A-261's hardened process test at extreme load (not for mai
 
 on:
   push:
-    branches: [diag-raft-chaos-ab-64]
+    branches: [diag-raft-chaos-ab-69]
 
 permissions:
   contents: write
@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sample: [1, 2, 3]
+        sample: [2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,5 +70,5 @@ jobs:
           git rm -rq --cached . || true
           cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
           git add results.txt
-          git commit -qm "diag-raft-chaos-ab-64 results ${{ matrix.sample }}"
-          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-64-${{ matrix.sample }}"
+          git commit -qm "diag-raft-chaos-ab-69 results ${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-69-${{ matrix.sample }}"
