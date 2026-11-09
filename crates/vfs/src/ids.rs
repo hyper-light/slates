@@ -24,12 +24,19 @@ impl Epoch {
 /// still holds them — or an owner this process alone knows (a test harness, a host without a record), whose
 /// references die with the process. Two kinds, not one number, so a process-local key can never be taken for
 /// a durable id it happens to equal.
+///
+/// A third kind holds files for NFSv4 state (A-260): the opens and delegations clients made through a recorded
+/// attachment, by its durable id. Those are journaled in the owner's partition (A-37), not in the recovery image, so
+/// the image carries none of these references; a recovery takes them again from the journal before it reclaims the
+/// files no one holds, and a kernel's references (an attachment's) and a protocol's state never share a count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RefOwner {
   /// An owner known to this process only.
   Process(u64),
   /// A recorded attachment, by its durable id.
   Attachment(u64),
+  /// The NFSv4 opens and delegations made through a recorded attachment, by its durable id (A-260).
+  NfsState(u64),
 }
 
 /// An inode number: `(volume prefix, monotonic counter)`; never reused within a volume, and kept

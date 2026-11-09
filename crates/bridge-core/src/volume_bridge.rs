@@ -463,6 +463,21 @@ impl<'v> VolumeBridge<'v> {
 
   /// The neutral attributes of inode `no`: its stat (through the host for an overlay's base
   /// entry) and its kind (structural, always in the store).
+  /// Gives inode `inode` the Windows attribute bits a Win32 word `bits` asks (A-262), those
+  /// [`slates_vfs::inode::WindowsAttributes::kept`] keeps for its kind; an untouched base file is copied up first, its
+  /// metadata alone, as a `chmod` copies it.
+  fn set_windows_attributes(&mut self, inode: InodeNo, bits: u32) -> Result<(), VfsError> {
+    let kind = self.volume.kind(self.store, inode)?;
+    let kept = slates_vfs::inode::WindowsAttributes::kept(bits, kind);
+    match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .set_windows_attributes(self.store, inode, kept),
+      None => self.volume.set_windows_attributes(self.store, inode, kept),
+    }
+  }
+
   fn attr_of(&mut self, no: u64) -> Result<NodeAttr, VfsError> {
     let inode = InodeNo(no);
     let observed = match host_for(&mut self.host, self.volume.is_overlay())? {
@@ -621,6 +636,7 @@ fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
     mtime: attrs.mtime,
     ctime: attrs.ctime,
     btime: attrs.btime,
+    windows: observed.windows.bits(),
     change: observed.change,
   }
 }
@@ -1368,6 +1384,9 @@ impl Bridge for VolumeBridge<'_> {
           changes.btime,
         ),
       }?;
+    }
+    if let Some(bits) = changes.windows {
+      self.set_windows_attributes(inode, bits)?;
     }
     self.attr_of(ino)
   }

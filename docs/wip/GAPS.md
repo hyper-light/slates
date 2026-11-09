@@ -1,5 +1,33 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
+> block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
+> internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
+> name is `EEXIST`, an unwritable directory `EACCES`, then `EPERM`, as a local file system without device nodes answers
+> `mknod`. No list changes: no case expects `EPERM` from a device `mknod`.
+
+> **The WinFsp drive keeps Windows' attribute bits, and a file's read-only state is its mode: built for the volume and
+> the drive (2026-11-08, §4.6; A-262).** A-209 had left HIDDEN, SYSTEM, ARCHIVE and READONLY out ("the volume's
+> permission is POSIX's mode"), so `SetFileAttributes` answered success and kept nothing and every file reported
+> `NORMAL`. Now a file's READONLY is its mode's write bits (DrvFs's and Samba's mapping), and the other bits, with a
+> directory's READONLY, are kept in the inode's two bytes of tail padding (168 B, unchanged; tree_heap 260, 275 and 293
+> B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). The Windows base plane reads
+> them since stage 3's base half: a fingerprint carries the disk's bits apart from a DrvFs-mapped mode (until then the
+> Windows base reported the attribute word itself as the mode, `0x20` as `0o040`). **Still owed under A-262:** a Windows
+> landing applying them (it waits on a Windows landing writer, which does not exist; Linux and macOS carry them
+> unapplied), and the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge
+> drops them).
+
+> **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
+> §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
+> handle answered `NFS4ERR_STALE`), and the server never answered `OPEN4_RESULT_PRESERVE_UNLINKED`, so the Linux client
+> renamed every such file to `.nfs*` until the close (pjdfstest `unlink/14.t:4`; git, editors and sqlite do it, and a
+> landing would carry the name). Every open and delegation now holds its file, from its record's commit to its end's
+> (a CLOSE, a return, a revocation, a client's purge), the hold taken again from the journal at a recovery and given
+> back at its attachment's end. Red tests: a removed open file's GETATTR answered `NFS4ERR_STALE`; now it serves at nlink
+> 0 with its bytes until its last close, also across a daemon restart, and its 64 KiB come back at the close or at its
+> client's lease lapse. Still owed: NFSv3 has no open, so its clients' silly renames stay (NFS-OPEN on the NFSv3 lists).
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never
@@ -1317,7 +1345,8 @@
 > (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the four Windows
 > features the drive does not keep (attribute bits, security descriptors, reparse points and symbolic links, named
 > streams). The fifth, a settable creation time, was built in A-259 (2026-11-08): the drive reports the volume's
-> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> birth time and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 came off the list (374 to 373 entries). The
+> attribute bits followed in A-262 (2026-11-08), their 18 cases off (373 to 355), leaving three stated differences. The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
 > test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.

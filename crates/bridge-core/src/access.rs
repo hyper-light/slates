@@ -276,7 +276,8 @@ pub fn setattr_denial(
   authority: IoAuthority,
   owner_size_override: bool,
 ) -> Option<Denial> {
-  if changes.mode.is_some() && !owner_or_root(caller, node) {
+  // Windows' attribute bits are the file's metadata, as its mode is (A-262): the owner or root sets them.
+  if (changes.mode.is_some() || changes.windows.is_some()) && !owner_or_root(caller, node) {
     return Some(Denial::NotOwner);
   }
   if (changes.uid.is_some() || changes.gid.is_some())
@@ -364,6 +365,7 @@ mod tests {
       mtime: 0,
       ctime: 0,
       btime: 0,
+      windows: 0,
       change: 0,
     }
   }
@@ -677,6 +679,40 @@ mod tests {
       ),
       Some(Denial::NoAccess),
       "NFSv3 still refuses a non-owner the bits deny"
+    );
+  }
+
+  /// A-262. Do: ask to set a file's Windows attribute bits as a caller who may write it but does not own it, then as its
+  /// owner. Expect: the first is refused `NotOwner`, the second allowed: the bits are the file's metadata, set by its
+  /// owner or root as its mode is.
+  #[test]
+  fn windows_attribute_bits_ask_for_the_owner() {
+    let writable = node(Kind::File, 0o666, 1000, 1000);
+    let bits = SetAttr {
+      windows: Some(0x2),
+      ..SetAttr::default()
+    };
+    assert_eq!(
+      setattr_denial(
+        &user(1001, 1001, &[]),
+        &writable,
+        &bits,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      Some(Denial::NotOwner)
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(1000, 1000, &[]),
+        &writable,
+        &bits,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      None
     );
   }
 
