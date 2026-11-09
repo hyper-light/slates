@@ -241,6 +241,27 @@
 > rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
 > now (here, the replacement that holds the live log).
 
+> **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
+> predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
+> confirming its share of an earlier retirement records it as `unconfirmed`, and `RegionalConfiguration::recovery_cohorts`
+> then recovers **every** object of the host jointly with the predecessor's cohort, not only the objects it was taking
+> over from it. In the store-destroyed flow (diag-live-durability-77, x86 run 1): old b destroyed, the owner killed
+> before it confirmed old b's takeover; the owner's own volume, its cohort {owner, the replacement, c} short of the owner
+> alone, was recovered jointly with old b's {old b, owner, c}, of which only c was left; the survivor counted 8 objects
+> lost (A-272 keeps the copies; none is served). Owed, model first: whether the joint cohort may apply only to objects
+> whose line passes through the unconfirmed host, in §4.8's model text, with A-272 (ii)'s lineage model; a wrong
+> narrowing would lose data, so no change before it.
+
+> **Fixed (live-durability, 2026-11-09): the store-destroyed flow's mode B was the flow's own wait.** No survivor took
+> the volume over and every takeover counter read zero: 11 of 12 runs on A-271's tree (diag-live-durability-77) and 11
+> of 12 on main without it (-78), both arches; 3 of 3 passed on the Mac. The flow killed the owner once
+> `wait_council_seated` saw no joint and the same voters on every node, which holds before the replacement's voter
+> change begins: in 7 runs the replacement was not yet a voter and the owner's death left one live voter of three, in
+> 13 the change began after the wait and the owner died inside it, and in 1 the destroyed node's takeover was still
+> kept (the cohort finding above). `wait_recovered` now also needs every node's own member id among the voters and no
+> retirement kept, bounded by a fleet wait and naming what is missing. Red first:
+> `a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered`. Not a slates defect.
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
