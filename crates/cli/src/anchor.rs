@@ -344,23 +344,39 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
 
 /// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`): its progress and its busiest
 /// thread's CPU, judged by the watchdog's rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
-/// its one step, so it is alive while its CPU progresses and has run less than a window of it. With no reading (no
-/// process clock, or the process already gone) the wall window stands alone, as for a shard with no thread clock.
+/// its one step, so it is alive while its CPU progresses and has run less than a window of it, and starved, not stuck,
+/// while its CPU stands still with one of its threads runnable (`slates_rt::process_runnable`, A-228's rule). With no
+/// clock reading (the process already gone) the wall window stands alone, as for a shard with no thread clock.
 fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+  judge_start_of(supervisor.child_pid(), watch, now)
+}
+
+/// [`judge_start`] for the process `pid` names.
+fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict {
   // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
   // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
   // read nothing is judged spinning, and the progress alone judges a start wedged.
-  let cpu = supervisor
-    .child_pid()
+  let cpu = pid
     .and_then(slates_machine::process_clock::process_cpu)
     .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
+  // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
+  // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner).
+  let run = pid
+    .and_then(slates_rt::process_runnable)
+    .map(|runnable| slates_rt::RunReading {
+      state: if runnable {
+        slates_rt::RunState::Runnable
+      } else {
+        slates_rt::RunState::Blocked
+      },
+      waited_ns: None,
+    });
   let look = Look {
     steps: 0,
     parked: false,
     cpu,
-    // The anchor judges a whole process by its CPU time; a scheduler reading is of one thread (GAPS, A-228's siblings).
-    run: None,
+    run,
     now_ns: now,
   };
   let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
@@ -371,7 +387,7 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
 /// What a start's verdict says when it is to be killed: `None` while it is alive.
 fn start_stuck(verdict: Verdict) -> Option<String> {
   match verdict {
-    // A start has no scheduler reading, so it is never found starved; were it, it would not be stuck.
+    // A starved start, runnable with its CPU standing still, is not stuck (A-228).
     Verdict::Alive | Verdict::Starved { .. } => None,
     Verdict::Wedged { for_ns } => Some(format!(
       "made no progress for {} ms (the {} ms liveness window)",
@@ -750,5 +766,213 @@ mod lapse_tests {
     assert!(!dead, "half a watched budget after the wake");
     let (dead, _) = lapsed(watch, BUDGET, wake + BUDGET + TURN, BUDGET);
     assert!(dead, "a whole watched budget after the wake without a beat");
+  }
+}
+
+/// The start judgment against a real starved process. Linux and Windows only: macOS will not hold a process off its CPU
+/// on demand (`crates/server/tests/liveness.rs` measured 1.1 s at best).
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod tests {
+  // Test harness code: an unwrap here is a failed test, which is what it should be.
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+
+  /// Waits `span` on a channel nothing sends on (the lint wall bans `std::thread::sleep`).
+  fn wait(span: Duration) {
+    let (_hold, rx) = std::sync::mpsc::channel::<()>();
+    let _ = rx.recv_timeout(span);
+  }
+
+  /// Shape: a beat, how often the anchor judges a start (its look cadence).
+  const LOOK: Duration = Duration::from_nanos(HEARTBEAT_NS);
+  /// Shape: the liveness window a start is judged over.
+  const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+
+  /// A started process killed and reaped when dropped, however the test ends.
+  struct Child(std::process::Child);
+
+  impl Drop for Child {
+    fn drop(&mut self) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
+
+  /// Format: the kernel's scheduling weight of nice 0 to 19 (`sched_prio_to_weight`, kernel/sched/core.c).
+  #[cfg(target_os = "linux")]
+  const NICE_WEIGHT: [u64; 20] = [
+    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+  ];
+  /// Shape: spinners at nice 0 that hold a SCHED_IDLE thread off its CPU for seconds (63, `crates/server/tests/liveness.rs`).
+  #[cfg(target_os = "linux")]
+  const SPINNERS_AT_NICE_ZERO: u64 = 63;
+
+  /// The first CPU this process may run on: where the starved start and its spinners are put.
+  #[cfg(target_os = "linux")]
+  fn a_cpu() -> usize {
+    let allowed = rustix::thread::sched_getaffinity(None).unwrap();
+    (0..rustix::thread::CpuSet::MAX_CPU)
+      .find(|cpu| allowed.is_set(*cpu))
+      .unwrap()
+  }
+
+  /// A start held off `cpu`: a busy shell at SCHED_IDLE, pinned there (`chrt`, `taskset`, util-linux).
+  #[cfg(target_os = "linux")]
+  fn starved_start(cpu: usize) -> Child {
+    Child(
+      std::process::Command::new("chrt")
+        .args(["--idle", "0", "taskset", "-c", &cpu.to_string()])
+        .args(["sh", "-c", "while :; do :; done"])
+        .spawn()
+        .unwrap(),
+    )
+  }
+
+  /// Threads that outrank the start on `cpu` until `running` falls: at nice 0, or the nearest this process may take,
+  /// and enough of them by the kernel's weight of that nice to hold a SCHED_IDLE process off for seconds.
+  #[cfg(target_os = "linux")]
+  fn outranking(
+    cpu: usize,
+    running: &'static std::sync::atomic::AtomicBool,
+  ) -> Vec<std::thread::JoinHandle<()>> {
+    let inherited = rustix::process::getpriority_process(None).unwrap();
+    let weight = |nice: i32| {
+      usize::try_from(nice)
+        .ok()
+        .and_then(|nice| NICE_WEIGHT.get(nice))
+        .copied()
+        .unwrap_or(NICE_WEIGHT[0])
+    };
+    let count = (SPINNERS_AT_NICE_ZERO * NICE_WEIGHT[0]).div_ceil(weight(inherited));
+    (0..count)
+      .map(|_| {
+        std::thread::Builder::new()
+          .stack_size(64 * 1024)
+          .spawn(move || {
+            let mut set = rustix::thread::CpuSet::new();
+            set.set(cpu);
+            rustix::thread::sched_setaffinity(None, &set).unwrap();
+            let _ = rustix::process::setpriority_process(Some(rustix::thread::gettid()), 0);
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+              std::hint::spin_loop();
+            }
+          })
+          .unwrap()
+      })
+      .collect()
+  }
+
+  /// A start held off CPU 0: a busy PowerShell that puts itself there at the Idle priority class.
+  #[cfg(windows)]
+  fn starved_start(_cpu: usize) -> Child {
+    Child(
+      std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command"])
+        .arg(
+          "$p=[System.Diagnostics.Process]::GetCurrentProcess(); $p.ProcessorAffinity=[IntPtr]1; \
+           $p.PriorityClass='Idle'; while($true){}",
+        )
+        .spawn()
+        .unwrap(),
+    )
+  }
+
+  #[cfg(windows)]
+  fn a_cpu() -> usize {
+    0
+  }
+
+  /// Shape: busy processes at the High class that hold an Idle-class one off CPU 0 (four TIME_CRITICAL threads held an
+  /// IDLE thread off for all of 8.9 s, `crates/server/tests/liveness.rs`).
+  #[cfg(windows)]
+  const OUTRANKING_PROCESSES: usize = 4;
+
+  /// Processes that outrank the start on CPU 0, ended when the returned guards drop.
+  #[cfg(windows)]
+  fn outranking_processes() -> Vec<Child> {
+    (0..OUTRANKING_PROCESSES)
+      .map(|_| {
+        Child(
+          std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(
+              "$p=[System.Diagnostics.Process]::GetCurrentProcess(); $p.ProcessorAffinity=[IntPtr]1; \
+               $p.PriorityClass='High'; while($true){}",
+            )
+            .spawn()
+            .unwrap(),
+        )
+      })
+      .collect()
+  }
+
+  /// A-228's sibling in the anchor's start judgment (§2.6, §4.14). Do: start a busy process and hold it off its CPU with
+  /// higher-priority spinners there, as a start is held off on a loaded machine; judge it as the anchor judges a start,
+  /// a look a beat, until its CPU clock has stood still for two windows and three beats. Expect: never stuck. Before, a
+  /// start had no scheduler reading, so one whose CPU stood still a window was "made no progress"; on CI's Windows
+  /// runner `held_rendezvous` was killed so ("made no progress for 1014 ms; killing it"). Linux and Windows must see the
+  /// flat window or the test fails saying it did not starve.
+  #[test]
+  fn a_start_held_off_its_cpus_is_starved_not_stuck() {
+    {
+      let cpu = a_cpu();
+      let start = starved_start(cpu);
+      let pid = start.0.id();
+      let running: &'static std::sync::atomic::AtomicBool =
+        Box::leak(Box::new(std::sync::atomic::AtomicBool::new(true)));
+      #[cfg(target_os = "linux")]
+      let spinners = outranking(cpu, running);
+      #[cfg(windows)]
+      let spinners = outranking_processes();
+      // The busy start is judged from its first look once its clock reads.
+      let began = std::time::Instant::now();
+      while slates_machine::process_clock::process_cpu(pid).is_none() {
+        assert!(began.elapsed() < WINDOW * 10, "the start's clock reads");
+        wait(LOOK);
+      }
+      let flat_enough = WINDOW * 2 + LOOK * 3;
+      let watched = std::time::Instant::now();
+      let mut watch = ShardWatch::default();
+      let mut stuck = Vec::new();
+      let mut last = slates_machine::process_clock::process_cpu(pid).map(|cpu| cpu.progress);
+      let mut moved = std::time::Instant::now();
+      let mut longest_flat = Duration::ZERO;
+      let mut starved_looks = 0u32;
+      while watched.elapsed() < WINDOW * 10
+        && (watched.elapsed() < WINDOW * 3 || longest_flat < flat_enough)
+      {
+        wait(LOOK);
+        let now = u64::try_from(watched.elapsed().as_nanos()).unwrap();
+        let verdict = judge_start_of(Some(pid), &mut watch, now);
+        if matches!(verdict, Verdict::Starved { .. }) {
+          starved_looks += 1;
+        }
+        if let Some(said) = start_stuck(verdict) {
+          stuck.push(said);
+        }
+        let progress = slates_machine::process_clock::process_cpu(pid).map(|cpu| cpu.progress);
+        if progress != last {
+          last = progress;
+          moved = std::time::Instant::now();
+        }
+        longest_flat = longest_flat.max(moved.elapsed());
+      }
+      running.store(false, std::sync::atomic::Ordering::Relaxed);
+      drop(spinners);
+      drop(start);
+      println!(
+        "a start held off its CPU: its clock stood still {longest_flat:?} at most in {:?}; starved at {starved_looks} \
+         looks; stuck {stuck:?}",
+        watched.elapsed()
+      );
+      assert!(
+        longest_flat >= flat_enough,
+        "did not starve: the start's CPU clock stood still for {longest_flat:?} at most, under {flat_enough:?}"
+      );
+      assert!(
+        stuck.is_empty(),
+        "a start held off its CPU was judged stuck: {stuck:?} (its clock stood still {longest_flat:?})"
+      );
+    }
   }
 }
