@@ -1357,6 +1357,7 @@ dependencies = [
  "slates-db",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-test-seeds",
  "slates-vfs",
 ]
@@ -1414,6 +1415,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",
