@@ -502,6 +502,18 @@
 >   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
 >   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
+> **A FUSE mount the host's helper policy refuses is diagnosed, never predicted (decided 2026-11-09, the
+> supervisor's; slabs, in progress).** On a host whose `fusermount3` is confined by an AppArmor profile (Ubuntu 26.04;
+> the live-guest lane's finding, `docs/cli.md`), a `slates mount` outside the profile's directories answered only the
+> helper's "Permission denied". The decision: the mount is attempted as before and the kernel decides; when the helper
+> fails "Permission denied", slates looks for what an unprivileged user can read (AppArmor enabled, a profile file
+> attached to the helper) and answers `MountRefusedByHelperPolicy { helper, profile, policy_file, local_override }`,
+> otherwise the refusal it answered before. No directory list in code: re-implementing the profile's globs would be a
+> second authority, drift from local overrides, other distributions and the next profile, and refuse mounts the kernel
+> allows. The list lives in `docs/cli.md`, with the image and date it was measured. Test:
+> `a_mount_the_helpers_apparmor_profile_refuses_names_the_profile` (`crates/cli/tests/cli.rs`, Linux, on the 26.04
+> image with the build output outside the profile).
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this

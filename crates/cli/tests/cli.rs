@@ -8735,6 +8735,58 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   drop(anchor);
 }
 
+/// Format: the variable a lane sets when its build output lies where the host's mount helper policy refuses a FUSE
+/// mount (the 26.04 container bound at `/src`, `.github/workflows`), so this test's first mount must be refused there.
+#[cfg(target_os = "linux")]
+const ENV_HELPER_POLICY: &str = "SLATES_TEST_HELPER_POLICY";
+
+/// Decided 2026-11-09 (GAPS, the supervisor's): a FUSE mount the host's mount helper policy refuses is diagnosed after
+/// the kernel refuses it, never predicted. Ubuntu 26.04 confines `fusermount3` with an AppArmor profile that allows FUSE
+/// mounts only under some directories, and a `slates mount` elsewhere answered only the helper's "Permission denied".
+/// Do: on a host whose `fusermount3` has an AppArmor profile, with the build output outside what it allows
+/// ([`ENV_HELPER_POLICY`]), mount a volume at a build-output directory, then at a directory under `/mnt`. Expect the
+/// first refused `MountRefusedByHelperPolicy`, naming the profile and `/etc/apparmor.d/fusermount3`, and the second
+/// mounted. Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mount_the_helpers_apparmor_profile_refuses_names_the_profile() {
+  if std::env::var_os(ENV_HELPER_POLICY).is_none() || !live_mount_runs() {
+    eprintln!(
+      "SKIP: set {ENV_HELPER_POLICY}=1 where the build output lies outside fusermount3's AppArmor profile"
+    );
+    return;
+  }
+  if !std::path::Path::new("/etc/apparmor.d/fusermount3").exists() {
+    eprintln!("SKIP: this host's fusermount3 has no AppArmor profile");
+    return;
+  }
+  let instance = format!("cli-helperpolicy-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "policy", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let refused_at = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(&instance, &["mount", &id, &refused_at.path]);
+  assert_ne!(code, 0, "the helper's profile refuses {}", refused_at.path);
+  assert!(
+    err.contains("MountRefusedByHelperPolicy") && err.contains("/etc/apparmor.d/fusermount3"),
+    "the refusal names the helper's AppArmor profile and its policy file: {err}"
+  );
+  let allowed = MountPoint {
+    path: format!("/mnt/slates-policy-{}", std::process::id()),
+  };
+  shell(&format!("mkdir -p {}", allowed.path));
+  fuse_mount_and_check(&instance, &id, &allowed.path);
+  drop(allowed);
+  drop(refused_at);
+  drop(anchor);
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
