@@ -1,0 +1,79 @@
+# DIAG, not for main: the fleet suite through each_test on both Windows runners, with one forced hang (an ignored test, in
+# this diag commit only, that sleeps past its deadline) that must be reported by name.
+name: DIAG fleet deadlines (not for main)
+'on':
+  push:
+    branches:
+    - diag-release-*
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+  AWS_LC_SYS_PREBUILT_NASM: '0'
+jobs:
+  fleet:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: windows-latest
+          nasm: true
+        - runner: windows-11-arm
+          clang_cl: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.98.1
+    - name: Install NASM
+      uses: ilammy/setup-nasm@v1.5.2
+      if: ${{ matrix.nasm }}
+    - name: clang-cl for the C the daemon links (native arm64 Windows)
+      shell: pwsh
+      run: '$clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+
+        if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+
+        if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+
+        & $clang --version
+
+        (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+        "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+        "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+        '
+      if: ${{ matrix.clang_cl }}
+    - name: The fleet suite through each_test, with a forced hang
+      id: fleet
+      timeout-minutes: 35
+      env:
+        SLATES_FLEET_TRACE: '1'
+        SLATES_TEST_HEDGE_STARVATION_SECS: '20'
+        SLATES_TEST_RESTART_SLOWDOWN: '10'
+        SLATES_TEST_FLEET_DEADLINE_SECS: '120'
+      shell: bash
+      run: 'set -o pipefail
+
+        cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240 --run-ignored a_test_that_hangs_past_its_deadline_is_reported_by_name 2>&1 | tee "$RUNNER_TEMP/each.log"'
+    - name: Publish the results to a diag-results branch
+      if: always()
+      shell: bash
+      run: 'f="$RUNNER_TEMP/each.log"; [ -f "$f" ] || echo "no log" > "$f"
+
+        grep -E "^each_test:|^    \|" "$f" > "$RUNNER_TEMP/summary.txt" || true
+
+        echo "step outcome: ${{ steps.fleet.outcome }}" >> "$RUNNER_TEMP/summary.txt"
+
+        git config user.name diag-release; git config user.email diag-release@users.noreply.github.com
+
+        blob=$(git hash-object -w "$RUNNER_TEMP/summary.txt"); tree=$(printf "100644 blob %s\tsummary.txt\n" "$blob" | git mktree)
+
+        c=$(echo "results of run ${{ github.run_id }} on ${{ matrix.runner }}" | git commit-tree "$tree")
+
+        git push origin "$c:refs/heads/diag-results/release-8-${{ matrix.runner }}"'

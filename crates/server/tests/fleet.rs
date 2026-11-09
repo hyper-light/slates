@@ -17097,3 +17097,13 @@ fn a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share
     "node b's read was served once the named share was made (last: {after_share:?})"
   );
 }
+
+/// DIAG only (never on main): a test that hangs, for `each_test`'s deadline. Do: print a line, then sleep past the deadline.
+/// Expect: `each_test` kills it at its deadline and reports it `TIMED OUT` by name with this line kept.
+#[test]
+#[ignore = "diag only: hangs past each_test's deadline on purpose"]
+fn a_test_that_hangs_past_its_deadline_is_reported_by_name() {
+  println!("each_test diag: this test now hangs on purpose");
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_secs(600));
+}
