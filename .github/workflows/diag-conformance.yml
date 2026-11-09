@@ -1,0 +1,239 @@
+# Diagnostics for the conformance agent: never on main. Triggered only by pushes to diag-conformance-* branches.
+# conformance-18 (A-275), the narrowed privilege read: the symbolic-link tests with Developer Mode on and off,
+# winfstest against the 382-entry list recorded from this code, and the WinFsp CLI suite (job a275); and the WinFsp
+# drive's per-call latency, main (1c49c33f) against the branch, interleaved in one mount_bench process by
+# docs/wip/bench/fsbench/windows-ab.sh, quiet and with two spinners a logical CPU (job bench). Results go to
+# diag-results/conformance-<run>-<job>, read with git fetch.
+name: diag-conformance
+
+on:
+  push:
+    branches: ['diag-conformance-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  a275:
+    name: "A-275: the drive judges link privilege; winfstest recorded; NTFS control"
+    runs-on: windows-latest
+    timeout-minutes: 170
+    defaults:
+      run:
+        shell: bash
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-results/conformance-${{ github.run_id }}-a275
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUB'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUB
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; uname -a; } > results/00-image.txt
+          "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: a275-a275
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The symbolic-link tests with Developer Mode as the image has it, then the whole semantics file
+        timeout-minutes: 60
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set +e
+          reg query 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' > results/05-devmode.txt 2>&1
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact symbolic_links_made_through_the_drive_are_followed_and_read_back > results/10-links.log 2>&1
+          echo "exit $?" >> results/10-links.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/10-links.log > results/10-links-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused > results/11-refused.log 2>&1
+          echo "exit $?" >> results/11-refused.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/11-refused.log > results/11-refused-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_is_made_by_a_caller_holding_the_symlink_privilege > results/12-privileged.log 2>&1
+          echo "exit $?" >> results/12-privileged.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/12-privileged.log > results/12-privileged-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag > results/13-developer.log 2>&1
+          echo "exit $?" >> results/13-developer.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/13-developer.log > results/13-developer-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_relative_to_the_drives_root_follows_its_directory_when_moved > results/14-rooted.log 2>&1
+          echo "exit $?" >> results/14-rooted.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/14-rooted.log > results/14-rooted-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_raw_link_set_needs_the_privilege_enabled_at_its_open > results/14b-raw-enabled.log 2>&1
+          echo "exit $?" >> results/14b-raw-enabled.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/14b-raw-enabled.log > results/14b-raw-enabled-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 > results/15-semantics.log 2>&1
+          echo "exit $?" >> results/15-semantics.log
+          grep -E "^test |test result|panicked|exit " results/15-semantics.log > results/16-semantics-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: winfstest against the 382-entry list, recorded
+        timeout-minutes: 90
+        run: |
+          set +e
+          cargo xtask conformance run --suite winfstest --records target/rec --scratch target/scr --keep > results/20-winfstest.log 2>&1
+          echo "exit $?" >> results/20-winfstest.log
+          cp target/rec/native-windows-winfsp.winfstest.json results/30-record.json
+          tail -12 results/20-winfstest.log > results/21-winfstest-tail.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: The WinFsp CLI suite, as CI runs it
+        timeout-minutes: 90
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set +e
+          cargo test -p slates-cli --test winfsp -- --test-threads=1 > results/50-winfsp.log 2>&1
+          echo "exit $?" >> results/50-winfsp.log
+          grep -E "^test |test result|panicked|exit " results/50-winfsp.log > results/51-winfsp-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: Developer Mode off, the two privilege tests again
+        timeout-minutes: 30
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set +e
+          reg add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' /v AllowDevelopmentWithoutDevLicense /t REG_DWORD /d 0 /f > results/60-devmode-off.txt 2>&1
+          reg query 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' >> results/60-devmode-off.txt 2>&1
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused > results/61-refused-devmode-off.log 2>&1
+          echo "exit $?" >> results/61-refused-devmode-off.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/61-refused-devmode-off.log > results/61-refused-devmode-off-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag > results/62-developer-devmode-off.log 2>&1
+          echo "exit $?" >> results/62-developer-devmode-off.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/62-developer-devmode-off.log > results/62-developer-devmode-off-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact a_raw_link_set_needs_the_privilege_enabled_at_its_open > results/63-raw-enabled-devmode-off.log 2>&1
+          echo "exit $?" >> results/63-raw-enabled-devmode-off.log
+          grep -E "^test |test result|panicked|left|right|exit |os error|A-275|SKIP" results/63-raw-enabled-devmode-off.log > results/63-raw-enabled-devmode-off-summary.txt
+          "$RUNNER_TEMP/publish.sh"
+
+  bench:
+    name: "A-275: the WinFsp drive per-call latency, main against the branch"
+    runs-on: windows-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-results/conformance-${{ github.run_id }}-bench
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUB'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUB
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; uname -a; } > results/00-image.txt
+          "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: a275-bench
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Release builds of main (1c49c33f) and of the branch, and mount_bench
+        timeout-minutes: 90
+        run: |
+          set -e
+          git worktree add ../main 1c49c33f459561bc4c1fc90859f473a5253fbc2c
+          (cd ../main && cargo build --release --locked -p slates-cli --bin slates)
+          cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+          { echo "main $(git -C ../main rev-parse HEAD)"; echo "branch $(git rev-parse HEAD)"; } > results/05-builds.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: The A/B, three runs
+        timeout-minutes: 200
+        run: |
+          set +e
+          ARMS="main=$(cd ../main && pwd)/target/release/slates.exe a275=$PWD/target/release/slates.exe" \
+            BENCH=$PWD/target/release/examples/mount_bench.exe RUNS=3 SPINNERS_PER_CPU=2 \
+            AFTER_RUN='cp "$RUNNER_TEMP"/ab.log results/10-ab.log 2>/dev/null; "$RUNNER_TEMP/publish.sh"' \
+            bash docs/wip/bench/fsbench/windows-ab.sh > "$RUNNER_TEMP/ab.log" 2>&1
+          echo "exit $?" >> "$RUNNER_TEMP/ab.log"
+          cp "$RUNNER_TEMP/ab.log" results/10-ab.log
+          grep -E "^## |^\| (create|open) |^\*\*(quiet|contended)\*\*|exit " results/10-ab.log > results/11-ab-create-open.txt
+          "$RUNNER_TEMP/publish.sh"
