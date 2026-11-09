@@ -85,6 +85,50 @@ impl LocalQueue {
     }
   }
 
+  /// Takes `slot` alone when it is ready, leaving every other ready slot queued in its place: the drain of a shard a
+  /// task holds alone ([`crate::futures::spawn_alone`]). Empty when `slot` is not ready. Its pending flag stays set
+  /// until its poll begins, as with [`Self::take_ready`]; finding it costs the ready list's length, which a shard held
+  /// alone keeps to what arrived meanwhile.
+  pub fn take_slot(&self, slot: u32) -> Vec<u32> {
+    let pending = self
+      .pending
+      .get(usize::try_from(slot).unwrap_or(usize::MAX))
+      .is_some_and(Cell::get);
+    if !pending {
+      return Vec::new();
+    }
+    match (self.ready.try_borrow_mut(), self.draining.try_borrow_mut()) {
+      (Ok(mut ready), Ok(mut draining)) => {
+        if let Some(at) = ready.iter().position(|queued| *queued == slot) {
+          let _ = ready.remove(at);
+          draining.push(slot);
+        }
+        std::mem::take(&mut *draining)
+      }
+      _ => {
+        self.refused.set(self.refused.get().saturating_add(1));
+        Vec::new()
+      }
+    }
+  }
+
+  /// Puts slots a drain took and did not poll back at the front of the ready list, in their order, with their pending
+  /// flags still set: the rest of a batch when a task polled in it began to hold the shard alone.
+  pub fn put_back(&self, slots: &[u32]) {
+    match self.ready.try_borrow_mut() {
+      Ok(mut ready) => {
+        for slot in slots.iter().rev() {
+          ready.push_front(*slot);
+        }
+      }
+      Err(_) => {
+        // The slots stay pending with no place in the list, so a wake would not list them: each is a lost task,
+        // counted as every refused access is.
+        self.refused.set(self.refused.get().saturating_add(1));
+      }
+    }
+  }
+
   /// Returns the list taken by `take_ready`, cleared, so the next drain allocates nothing.
   pub fn finish_drain(&self, mut list: Vec<u32>) {
     if list.capacity() == 0 {
@@ -149,6 +193,34 @@ mod tests {
     q.finish_drain(list);
     q.push(2);
     assert_eq!(q.take_ready(usize::MAX), vec![2]);
+    assert_eq!(q.refused(), 0);
+  }
+
+  /// §4.3, a shard held alone (`ShardContext::spawn_alone`). Do: queue four slots, take the third alone, then put
+  /// back a batch's tail as a step that began a hold does. Expect: taking a slot takes it alone and leaves the others
+  /// in their order; a slot not ready is not taken; slots put back go to the front in their order, still pending, so a
+  /// wake for one is collapsed, and nothing is refused.
+  #[test]
+  fn a_slot_taken_alone_leaves_the_rest_in_order_and_a_put_back_tail_goes_first() {
+    let q = LocalQueue::new(8);
+    for slot in [4, 5, 6, 7] {
+      q.push(slot);
+    }
+    let alone = q.take_slot(6);
+    assert_eq!(alone, vec![6]);
+    q.clear_pending(6);
+    q.finish_drain(alone);
+    assert!(q.take_slot(6).is_empty(), "a slot not ready is not taken");
+    let batch = q.take_ready(2);
+    assert_eq!(batch, vec![4, 5]);
+    q.put_back(batch.get(1..).unwrap_or_default());
+    q.push(5);
+    q.finish_drain(batch);
+    assert_eq!(
+      q.take_ready(8),
+      vec![5, 7],
+      "the put-back slot first, its wake collapsed"
+    );
     assert_eq!(q.refused(), 0);
   }
 
