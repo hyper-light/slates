@@ -7110,6 +7110,11 @@ async fn run_record_plane(local: HostId) {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
     slates_rt::registry::with_current(|ctx| ctx.beat_progress());
+    // The merge record plane stamps each version with the period it first works it in, and judges its placement by
+    // it (`merge_service::PLACED_WITHIN_PERIOD`).
+    let _ = state::with_state(|s| {
+      s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+    });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
     // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers

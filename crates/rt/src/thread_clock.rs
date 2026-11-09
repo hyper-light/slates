@@ -308,6 +308,74 @@ pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {
   vec![None; handles.len()]
 }
 
+/// Whether any thread of process `pid` is runnable, on a CPU or waiting for one: what tells a starting process that is
+/// starved from one that is stuck, as [`run_readings`] tells a shard's thread (A-228's sibling: the anchor judges a
+/// start in the whole process's CPU time, and a start held off its CPUs for a window was killed as stuck, "made no
+/// progress for 1014 ms", on CI's Windows runner). `None` where the process is gone or nothing can be read.
+/// - Linux: the state in every `/proc/<pid>/task/<tid>/stat`.
+/// - macOS: `proc_pidinfo(PROC_PIDTASKALLINFO)`'s `pti_numrunning`, the threads in XNU's `TH_RUN`, running or on the run
+///   queue [B: XNU `bsd/kern/proc_info.c`, `fill_taskprocinfo`].
+/// - Windows: the process's threads in one system snapshot, their `ThreadState`.
+pub fn process_runnable(pid: u32) -> Option<bool> {
+  process_runnable_in(pid)
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+fn process_runnable_in(pid: u32) -> Option<bool> {
+  // structural: allow: a listing of the kernel's pseudo-directory of another process's threads; no host path is named.
+  let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+  let mut read_any = false;
+  for task in tasks.flatten() {
+    // structural: allow: a query of the kernel's pseudo-file for one thread of that process; no host path is named.
+    let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+      continue;
+    };
+    let Some(state) = state_of_stat(&stat) else {
+      continue;
+    };
+    read_any = true;
+    if state == RunState::Runnable {
+      return Some(true);
+    }
+  }
+  read_any.then_some(false)
+}
+
+#[cfg(all(target_os = "macos", not(miri)))]
+fn process_runnable_in(pid: u32) -> Option<bool> {
+  let pid = libc::c_int::try_from(pid).ok()?;
+  // SAFETY: an all-zero `proc_taskallinfo` is a valid value of the C struct (integers and byte arrays only).
+  let mut info: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
+  let size = libc::c_int::try_from(size_of::<libc::proc_taskallinfo>()).ok()?;
+  // SAFETY: `info` is this frame's own record of `size` bytes, the flavor's own struct; the call writes at most that many
+  // bytes and returns how many it wrote, checked before the record is read.
+  let wrote = unsafe {
+    libc::proc_pidinfo(
+      pid,
+      libc::PROC_PIDTASKALLINFO,
+      0,
+      (&raw mut info).cast(),
+      size,
+    )
+  };
+  (wrote == size).then_some(info.ptinfo.pti_numrunning > 0)
+}
+
+#[cfg(all(windows, not(miri)))]
+fn process_runnable_in(pid: u32) -> Option<bool> {
+  let snapshot = system_snapshot()?;
+  process_thread_states_in(&snapshot, pid).map(|states| {
+    states
+      .into_iter()
+      .any(|state| run_state_of_thread_state(state) == RunState::Runnable)
+  })
+}
+
+#[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
+fn process_runnable_in(_pid: u32) -> Option<bool> {
+  None
+}
+
 /// The state in a thread's `/proc/.../stat`: `R` is on a CPU or waiting for one, every other letter is off them both
 /// (sleeping, in the kernel, stopped, dead). `None` for a line with no state. The state follows the last `)`, since the
 /// thread's name, in parentheses before it, may hold anything.
@@ -368,6 +436,33 @@ const THREAD_STATE_AT: usize = 68;
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
   let bytes = bytes.get(at..at.checked_add(size_of::<u32>())?)?;
   Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Every thread's `ThreadState` of process `process` in a snapshot, walked as [`thread_state_in`] walks it; `None` for a
+/// process the snapshot does not hold or a record cut short.
+#[cfg(any(all(windows, not(miri)), test))]
+fn process_thread_states_in(snapshot: &[u8], process: u32) -> Option<Vec<u32>> {
+  let mut offset = 0usize;
+  loop {
+    let record = snapshot.get(offset..)?;
+    let next = usize::try_from(u32_at(record, 0)?).ok()?;
+    if u32_at(record, PROCESS_ID_AT)? == process {
+      let threads = usize::try_from(u32_at(record, THREAD_COUNT_AT)?).ok()?;
+      return (0..threads)
+        .map(|index| {
+          let at = PROCESS_RECORD.checked_add(index.checked_mul(THREAD_RECORD)?)?;
+          u32_at(
+            record.get(at..at.checked_add(THREAD_RECORD)?)?,
+            THREAD_STATE_AT,
+          )
+        })
+        .collect();
+    }
+    if next == 0 {
+      return None;
+    }
+    offset = offset.checked_add(next)?;
+  }
 }
 
 /// The `ThreadState` of thread `thread` of process `process` in a snapshot, walking its records with every offset and
@@ -697,6 +792,47 @@ mod tests {
     assert_eq!(thread_state_in(&far, 9, 70), None);
     let just_past = snapshot(&[(7, u32::try_from(PROCESS_RECORD * 2).unwrap(), &[])]);
     assert_eq!(thread_state_in(&just_past, 9, 70), None);
+  }
+
+  /// A-228's sibling, the anchor's start judgment, by use. Do: ask whether this test's own process has a runnable thread,
+  /// from the thread asking, which is on a CPU as it asks; and ask of a process id no process holds. Expect: runnable
+  /// on every platform with a reader (Linux, macOS, Windows), and no answer for the missing process.
+  #[test]
+  #[cfg(not(miri))]
+  fn a_running_process_reads_runnable() {
+    let readable = cfg!(any(target_os = "linux", target_os = "macos", windows));
+    let ours = super::process_runnable(std::process::id());
+    assert_eq!(
+      ours,
+      readable.then_some(true),
+      "this process, running as it asks"
+    );
+    assert_eq!(
+      super::process_runnable(u32::MAX - 1),
+      None,
+      "no such process"
+    );
+  }
+
+  /// A-228's sibling, the anchor's start judgment. Do: read every thread's state of each process in a snapshot of two,
+  /// and of one not in it, and of snapshots cut at every length. Expect: that process's states in order, and `None` for a
+  /// process not in it or a record cut short, without a panic.
+  #[test]
+  fn a_snapshot_gives_every_thread_state_of_the_process_asked_for() {
+    use super::{PROCESS_RECORD, THREAD_RECORD, process_thread_states_in};
+    let first_size = u32::try_from(PROCESS_RECORD + THREAD_RECORD).unwrap();
+    let bytes = snapshot(&[(7, first_size, &[(70, 5)]), (8, 0, &[(80, 1), (81, 5)])]);
+    assert_eq!(process_thread_states_in(&bytes, 7), Some(vec![5]));
+    assert_eq!(process_thread_states_in(&bytes, 8), Some(vec![1, 5]));
+    assert_eq!(process_thread_states_in(&bytes, 9), None, "no such process");
+    let whole = snapshot(&[(7, 0, &[(70, 5), (71, 2)])]);
+    for length in 0..whole.len() {
+      assert_eq!(
+        process_thread_states_in(&whole[..length], 7),
+        None,
+        "cut at {length}"
+      );
+    }
   }
 
   /// §4.14. Do: take the calling thread's clock handle, spin a while, and read it from another thread. Expect: a
