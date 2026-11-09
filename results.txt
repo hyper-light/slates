@@ -1,0 +1,86 @@
+leg fix-b-x86, 4 CPUs, Mon Nov  9 21:27:32 UTC 2026, tree 9aaf563d2efa601b28ef2d03dbc4df51272d63ca
+== release build exit 0
+   r1 LD-TL stopped_on_install Some(6733) after 216.109346ms
+   r1 LD-TL resume wall_ns 1794259978026010769
+   r1 LD-TL caught Some(33.648707996s)
+   r1 LD-TL durable Some(54242) then Some(54244) after 14.507012ms
+   r1 LD-TL writes 54196
+   r1 counts: installs 0 taken 3 images 4 why 0
+== run 1 exit 0
+   r2 LD-TL stopped_on_install Some(13429) after 226.36171ms
+   r2 LD-TL resume wall_ns 1794260036824031033
+   r2 LD-TL caught Some(3.62603058s)
+   r2 LD-TL durable Some(22863) then Some(22864) after 29.981439ms
+   r2 LD-TL writes 22843
+   r2 counts: installs 0 taken 3 images 4 why 0
+== run 2 exit 0
+   r3 LD-TL stopped_on_install Some(15990) after 231.624166ms
+   r3 LD-TL resume wall_ns 1794260064527056219
+   r3 LD-TL caught Some(3.401342457s)
+   r3 LD-TL durable Some(28180) then Some(28183) after 17.005409ms
+   r3 LD-TL writes 28165
+   r3 counts: installs 0 taken 3 images 4 why 0
+== run 3 exit 0
+   r4 LD-TL stopped_on_install Some(18430) after 248.518667ms
+   r4 LD-TL resume wall_ns 1794260092817094850
+   r4 LD-TL caught Some(5.934980123s)
+   r4 LD-TL durable Some(40307) then Some(40308) after 15.31154ms
+   r4 LD-TL writes 40286
+   r4 counts: installs 0 taken 2 images 4 why 0
+== run 4 exit 0
+   r5 LD-TL stopped_on_install Some(21320) after 803.469066ms
+   r5 LD-TL resume wall_ns 1794260123995502870
+   r5 LD-TL caught None
+   r5 LD-TL durable Some(16779) then Some(16783) after 11.710727ms
+   r5 LD-TL writes 16716
+   r5 counts: installs 0 taken 4 images 4 why 0
+== run 5 exit 0
+   r6 LD-TL stopped_on_install Some(29507) after 184.899925ms
+   r6 LD-TL resume wall_ns 1794260197855042222
+   r6 LD-TL caught Some(4.875231785s)
+   r6 LD-TL durable Some(29810) then Some(29817) after 18.014417ms
+   r6 LD-TL writes 29794
+   r6 counts: installs 0 taken 3 images 4 why 0
+== run 6 exit 0
+   r7 LD-TL stopped_on_install Some(32135) after 215.996158ms
+   r7 LD-TL resume wall_ns 1794260226769990652
+   r7 LD-TL caught Some(2.938308067s)
+   r7 LD-TL durable Some(20425) then Some(20427) after 24.760953ms
+   r7 LD-TL writes 20406
+   r7 counts: installs 0 taken 3 images 3 why 0
+== run 7 exit 0
+   r8 LD-TL stopped_on_install Some(34487) after 183.93805ms
+   r8 LD-TL resume wall_ns 1794260253665888706
+   r8 LD-TL caught Some(3.758204262s)
+   r8 LD-TL durable Some(33053) then Some(33055) after 12.870689ms
+   r8 LD-TL writes 33035
+   r8 counts: installs 0 taken 2 images 3 why 0
+== run 8 exit 0
+   r9 LD-TL stopped_on_install Some(36982) after 275.048726ms
+   r9 LD-TL resume wall_ns 1794260281532723341
+   r9 LD-TL caught Some(3.447591736s)
+   r9 LD-TL durable Some(31474) then Some(31476) after 9.043061ms
+   r9 LD-TL writes 31456
+   r9 counts: installs 0 taken 2 images 3 why 0
+== run 9 exit 0
+   r10 LD-TL stopped_on_install Some(39398) after 259.204723ms
+   r10 LD-TL resume wall_ns 1794260309987526404
+   r10 LD-TL caught Some(16.382563491s)
+   r10 LD-TL durable Some(32828) then Some(32830) after 16.173095ms
+   r10 LD-TL writes 32798
+   r10 counts: installs 0 taken 4 images 3 why 0
+== run 10 exit 0
+   r11 LD-TL stopped_on_install Some(43681) after 295.978658ms
+   r11 LD-TL resume wall_ns 1794260350730475790
+   r11 LD-TL caught Some(3.793174029s)
+   r11 LD-TL durable Some(18245) then Some(18247) after 15.268536ms
+   r11 LD-TL writes 18226
+   r11 counts: installs 0 taken 2 images 3 why 0
+== run 11 exit 0
+   r12 LD-TL stopped_on_install Some(46166) after 335.595251ms
+   r12 LD-TL resume wall_ns 1794260378585851025
+   r12 LD-TL caught Some(2.479635579s)
+   r12 LD-TL durable Some(28255) then Some(28267) after 13.2741ms
+   r12 LD-TL writes 28246
+   r12 counts: installs 0 taken 3 images 3 why 0
+== run 12 exit 0
