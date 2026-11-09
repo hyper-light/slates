@@ -154,9 +154,10 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::FSync | Opcode::FSyncDir => serve_flush(bridge, &request, cx, out, true),
     Opcode::Forget => serve_forget(bridge, &request, cx),
     Opcode::BatchForget => serve_batch_forget(bridge, &request, cx),
-    // DESTROY is the kernel's last request at unmount: the attachment's references are swept (the
-    // kernel does not guarantee a FORGET per outstanding reference, §4.6 `sweep_attachment`) and the
-    // reply is an empty success; it was ENOSYS before, so nothing was ever swept at unmount.
+    // DESTROY is the kernel's last request at unmount for a mount that asked for one: the attachment's
+    // references are swept (the kernel does not guarantee a FORGET per outstanding reference, §4.6
+    // `sweep_attachment`) and the reply is an empty success. An ordinary mount gets none, so the
+    // server's end of the mount sweeps too (`slates_server`'s `fuse::sweep_references`).
     Opcode::Destroy => serve_destroy(bridge, &request, cx, out),
     Opcode::MkNod => serve_mknod(bridge, &request, cx, out),
     Opcode::MkDir => serve_mkdir(bridge, &request, cx, out),

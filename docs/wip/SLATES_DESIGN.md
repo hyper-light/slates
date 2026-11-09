@@ -2591,6 +2591,13 @@ before the report is published, so a tool never reads attributes newer than the 
 > counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
 > `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
 > (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
+> **A FUSE mount's end gives back its lookups (2026-11-09).** An ordinary FUSE mount gets no `DESTROY` at its unmount,
+> and the kernel sends no `FORGET` for the inodes it still holds then, so the bridge's `DESTROY` sweep never ran for
+> one: every lookup the mount made stayed counted, and an unlinked file's bytes with it, until the next restart
+> (measured on Linux CI: 64 files looked up through a mount, unmounted, unlinked elsewhere, 4,194,304 bytes still held).
+> The server's end of a mount (`fuse::ended`) now sweeps the attachment's references (`sweep_references`, the bridge's
+> `sweep_attachment`), as a Shards stream's end does; a refused sweep is counted (`fuse.sweep_refused`)
+> (`docs/bugs/2026-11-09-an-unmounted-fuse-mounts-lookups-stayed-counted.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:

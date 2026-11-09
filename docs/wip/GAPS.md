@@ -15175,3 +15175,10 @@ runs on the box at load average 74 to 93, and never alone.
   (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
+- **A sibling, fixed 2026-11-09 (slabs; bug-sweep read it, measured here):** an ordinary FUSE mount gets no `DESTROY` at
+  its unmount and no `FORGET` for the inodes the kernel still holds then, so its lookups stayed counted until the next
+  restart. Measured on main through Linux FUSE (diag-slabs-44, run 42528067171): 64 files of 64 KiB looked up through a
+  read-only mount, the mount unmounted, the files unlinked through another mount, and `referenced_bytes` stayed at
+  4,194,304 for 0. The server's end of a mount now sweeps its attachment's references (§4.6, "A FUSE mount's end gives
+  back its lookups"). Test: `the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end`
+  (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-09-an-unmounted-fuse-mounts-lookups-stayed-counted.md`.

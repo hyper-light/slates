@@ -1387,7 +1387,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
 /// The mount has ended: its device dropped, its registry attachment revoked and drained, and its catalog
 /// attachment ended as a recorded operation (unless a `detach` or destroy already ended it).
 fn ended(s: &mut ShardState, attachment: u64) {
-  if let Some(mount) = s.fuse_mounts.remove(&attachment) {
+  if let Some(mut mount) = s.fuse_mounts.remove(&attachment) {
+    sweep_references(s, &mut mount);
     close_journal_reader(s, &mount);
     release_states(s, &mount);
     s.attachments.revoke(mount.registry);
@@ -1403,6 +1404,41 @@ fn ended(s: &mut ShardState, attachment: u64) {
     && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
   {
     s.count(UNMOUNT_REFUSED, 1);
+  }
+}
+
+/// Format: the refusal-ledger name of a sweep of an ended FUSE mount's references that its attachment or volume refused.
+const SWEEP_REFUSED: &str = "fuse.sweep_refused";
+
+/// Gives back every reference the kernel held through `mount` as it ends (§3 the teardown sweep, `sweep_attachment`):
+/// an ordinary FUSE mount gets no `DESTROY` at its unmount (the kernel sends one only to a mount that asked for it), and
+/// sends no `FORGET` for the inodes it still holds then, so before 2026-11-09 every lookup the mount made stayed counted,
+/// an unlinked file's bytes with it, until the next restart (diag-slabs-44: 64 files, 4,194,304 bytes). Idempotent, so a
+/// mount that did get a `DESTROY` loses nothing more. A volume already gone took the references with it.
+fn sweep_references(s: &mut ShardState, mount: &mut FuseMount) {
+  let Some(&handle) = s.by_id.get(&mount.volume) else {
+    return;
+  };
+  let Ok(cx) = s.attachments.begin(mount.registry) else {
+    s.count(SWEEP_REFUSED, 1);
+    return;
+  };
+  let swept = {
+    let ShardState { store, volumes, .. } = &mut *s;
+    volumes.get_mut(handle).ok().map(|slot| {
+      let mut bridge = VolumeBridge::attached(
+        mount.volume,
+        &mut slot.volume,
+        store,
+        &mut mount.handles,
+        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      );
+      slates_bridge_core::Bridge::sweep_attachment(&mut bridge, &cx)
+    })
+  };
+  s.attachments.end(mount.registry);
+  if !swept.is_some_and(|swept| swept.is_ok()) {
+    s.count(SWEEP_REFUSED, 1);
   }
 }
 
