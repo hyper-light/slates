@@ -2616,7 +2616,15 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   wait_council_seated(&fleet.instances);
   fleet.kill_node(owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
-  match wait_serving(&survivors, &volume, &outcomes) {
+  let served = wait_serving(&survivors, &volume, &outcomes);
+  // diag live-durability-75, never on main: who served, and each survivor's takeover counters.
+  eprintln!("LD-D72 destroyed {} successor {:?} replacement_served {}", instances[replaced_index], served.as_ref().map(|(s, t)| (s.to_string(), *t)), served.as_ref().is_some_and(|(s, _)| *s == instances[replaced_index].as_str()));
+  for survivor in &survivors {
+    let names = ["fleet.live.takeover_waits_key", "fleet.live.takeover_key_arrived", "fleet.live.takeover_no_key_exhausted", "fleet.live.takeover_refused.no_key", "fleet.takeover.reclaimed", "fleet.takeover.lost"];
+    let line: Vec<String> = names.iter().map(|n| format!("{}={}", n.rsplit('.').next().unwrap_or(n), counter(survivor, n))).collect();
+    eprintln!("LD-D72 counters {survivor} replacement {} {}", *survivor == instances[replaced_index].as_str(), line.join(" "));
+  }
+  match served {
     Some((successor, took)) => {
       verdict.note(format!("taken over by {successor} after {took:?}"));
       verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
