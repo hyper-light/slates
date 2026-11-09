@@ -1041,6 +1041,7 @@ impl Shipper {
       return self.owe(holder, self.entries_after(None));
     };
     if !self.on_chain(holder, &head) {
+      self.diag_install("off_chain", holder, Some(head));
       self.owed_install.insert(holder);
       return Next::Install;
     }
@@ -1058,6 +1059,9 @@ impl Shipper {
       Next::Nothing
     } else {
       let next = self.entries_after(Some(head.position));
+      if next == Next::Install {
+        self.diag_install("behind_tail", holder, Some(head));
+      }
       self.owe(holder, next)
     }
   }
@@ -1108,6 +1112,12 @@ impl Shipper {
   /// What `holder` last reported holding on this chain (`None`: nothing yet, or never on it).
   pub fn held_by(&self, holder: HostId) -> Option<Head> {
     self.held.get(&holder).copied()
+  }
+
+  /// Diag only (live-durability-70, never on main).
+  fn diag_install(&self, why: &str, holder: HostId, reported: Option<Head>) {
+    let bytes = self.retained.iter().fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("LD-WHY wall_ns {} {why} holder {} reported {:?} head {:?} checkpoint {:?} oldest {:?} retained {} bytes {bytes} retain_bytes {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_nanos()), holder.0, reported.map(|h| h.position), self.head.map(|h| h.position), self.checkpoint.map(|h| h.position), self.retained.front().map(|e| e.position), self.retained.len(), self.retain_bytes).as_bytes());
   }
 
   /// Whether `head`, reported by `holder`, is on this owner's chain: its head, its start, its last checkpoint, a retained
