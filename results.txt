@@ -1,0 +1,57 @@
+runner ubuntu-latest, 4 CPUs, Mon Nov  9 23:37:35 UTC 2026, tip 5305578a, sample 3, target/debug/deps/fleet-aef428ca1e6973e6
+== pair 1 spinners at 23:37:37, load 2.14 1.02 0.40
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 2, resets: 1, judged_first: false, reached: Some(193.538119ms), reset_seen: Some(193.538069ms) }]; b's forward and link counters [("fleet.forward.batch_done", 2), ("fleet.forward.begun", 2), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.session_out", 1), ("fleet.link.peer_reset", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 3.24s
+
+== pair 1 spinners exit 0, load 3.17 1.25 0.48
+== pair 1 one-cpu at 23:37:42, load 3.17 1.25 0.48
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 2, resets: 1, judged_first: false, reached: Some(174.196752ms), reset_seen: Some(174.196722ms) }]; b's forward and link counters [("fleet.forward.batch_done", 2), ("fleet.forward.batch_given_up", 1), ("fleet.forward.begun", 3), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.no_session", 1), ("fleet.forward.retried", 1), ("fleet.link.peer_reset", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 2.81s
+
+== pair 1 one-cpu exit 0, load 3.32 1.31 0.50
+== pair 2 spinners at 23:37:47, load 3.32 1.31 0.50
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 1, resets: 1, judged_first: false, reached: Some(216.946655ms), reset_seen: Some(216.946615ms) }]; b's forward and link counters [("fleet.forward.batch_done", 2), ("fleet.forward.begun", 2), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.session_out", 1), ("fleet.link.invalid.member_changed", 1), ("fleet.link.peer_reset", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 4.09s
+
+== pair 2 spinners exit 0, load 4.02 1.49 0.56
+== pair 2 one-cpu at 23:37:53, load 4.02 1.49 0.56
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 2, resets: 1, judged_first: false, reached: Some(538.025755ms), reset_seen: Some(538.025725ms) }]; b's forward and link counters [("fleet.forward.batch_done", 2), ("fleet.forward.begun", 2), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.session_out", 1), ("fleet.link.invalid.member_changed", 1), ("fleet.link.peer_reset", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 3.00s
+
+== pair 2 one-cpu exit 0, load 4.09 1.55 0.59
+== pair 3 spinners at 23:37:58, load 4.09 1.55 0.59
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 1, resets: 1, judged_first: false, reached: Some(722.677725ms), reset_seen: Some(722.677665ms) }]; b's forward and link counters [("fleet.forward.batch_done", 3), ("fleet.forward.batch_given_up", 1), ("fleet.forward.begun", 4), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.no_session", 1), ("fleet.forward.retried", 2), ("fleet.forward.session_replaced", 1), ("fleet.link.invalid.member_changed", 1), ("fleet.link.peer_reset", 1), ("fleet.link.stale_return", 2)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 4.62s
+
+== pair 3 spinners exit 0, load 4.89 1.75 0.66
+== pair 3 one-cpu at 23:38:05, load 4.74 1.77 0.67
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 2, resets: 1, judged_first: false, reached: Some(513.878944ms), reset_seen: Some(513.878904ms) }]; b's forward and link counters [("fleet.forward.batch_done", 3), ("fleet.forward.batch_given_up", 1), ("fleet.forward.begun", 4), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.no_session", 1), ("fleet.forward.retried", 2), ("fleet.forward.session_replaced", 1), ("fleet.link.peer_reset", 1), ("fleet.link.stale_return", 2)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 3.94s
+
+== pair 3 one-cpu exit 0, load 4.74 1.77 0.67
+== pair 4 spinners at 23:38:11, load 5.24 1.93 0.73
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 2, resets: 1, judged_first: false, reached: Some(734.56544ms), reset_seen: Some(734.56539ms) }]; b's forward and link counters [("fleet.forward.batch_done", 3), ("fleet.forward.batch_given_up", 1), ("fleet.forward.begun", 4), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.no_session", 1), ("fleet.forward.retried", 2), ("fleet.forward.session_replaced", 1), ("fleet.link.peer_reset", 1), ("fleet.link.stale_return", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 4.12s
+
+== pair 4 spinners exit 0, load 5.78 2.10 0.79
+== pair 4 one-cpu at 23:38:17, load 5.78 2.10 0.79
+1 restarts, 1 counted (a reset reached b before its liveness judged a dead); each: [ResetAttempt { counted: true, sent_by_a: 1, resets: 1, judged_first: false, reached: Some(205.649185ms), reset_seen: Some(205.649145ms) }]; b's forward and link counters [("fleet.forward.batch_done", 2), ("fleet.forward.batch_given_up", 1), ("fleet.forward.begun", 3), ("fleet.forward.client.control_started", 2), ("fleet.forward.client.delivered_home", 2), ("fleet.forward.client.resolved", 2), ("fleet.forward.client.to_control", 2), ("fleet.forward.no_session", 1), ("fleet.forward.retried", 1), ("fleet.link.peer_reset", 1)]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 2.94s
+
+== pair 4 one-cpu exit 0, load 5.56 2.11 0.80
