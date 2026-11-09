@@ -1,0 +1,73 @@
+name: "DIAG slabs -- the FUSE sweep and the unrecovered dead mount: both tests, clippy, FUSE suites and the CLI flow (not for main)"
+
+# Runs the kernel NFS test of a read attachment (crates/server/tests/nfs_read_only_kernel.rs) on ubuntu-latest, as root
+# through sudo, and publishes its output to a results branch named after the diag branch.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: FUSE unmount sweep on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUBLISH'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch own.txt
+          blob=$(git hash-object -w own.txt) || exit 0
+          tree=$(printf '100644 blob %s\town.txt\n' "$blob" | git mktree) || exit 0
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)") || exit 0
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+          PUBLISH
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and user_allow_other
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The unmount sweep measured
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          set +e
+          {
+            SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture the_lookups_an_unmounted_fuse_mount_held
+            echo "## unmount sweep exit $?"
+            SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --test-threads=1 --nocapture a_kept_fuse_mount_of_a_volume_recovery
+            echo "## dead mount exit $?"
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+            echo "## workspace clippy exit $?"
+            cargo test --locked -p slates-bridge-fuse
+            echo "## bridge fuse exit $?"
+            cargo test --locked -p slates-server --no-fail-fast
+            echo "## server suite exit $?"
+            SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- --test-threads=1
+            echo "## cli flow exit $?"
+          } 2>&1 | tee own.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: Fail on a failed step
+        if: always()
+        shell: bash
+        run: grep -c '^## .* exit 0$' own.txt | grep -qx 6
