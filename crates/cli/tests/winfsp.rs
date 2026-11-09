@@ -1287,8 +1287,10 @@ fn a_process_outside_the_anchor_cannot_take_either_holders_mount_handles() {
   );
 }
 
-/// A-198, Step 9.4. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
-/// the CLI's typed failure exit, the original daemon still serving, and the original drive still returning its file.
+/// A-198, Step 9.4; A-254. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
+/// the CLI's typed failure exit, refused at the instance's rendezvous before it creates anything (A-254: the owner is
+/// decided first), the original daemon still serving, and the original drive still returning its file. Before A-254
+/// the second daemon got as far as its segment and was refused there (`CreateFileMappingW`, the name a live section).
 #[test]
 fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
   if !live_mount_runs() {
@@ -1321,8 +1323,12 @@ fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
     "the foreign daemon must return the CLI's startup failure exit"
   );
   assert!(
-    error.contains("the name is already a live section") && error.contains("Some(183)"),
-    "the second daemon must reach and fail the existing-instance ownership check: {error}"
+    error.contains("a live process already holds instance") && error.contains("rendezvous"),
+    "the second daemon must be refused at the rendezvous, before it creates anything (A-254): {error}"
+  );
+  assert!(
+    !error.contains("CreateFileMappingW"),
+    "and never reach the segment, whose name the live daemon holds: {error}"
   );
   assert_eq!(daemon_pid(&fixture.instance), Some(owner));
   assert_eq!(

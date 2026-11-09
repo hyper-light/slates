@@ -15,7 +15,12 @@
   clippy::indexing_slicing
 )]
 
-use std::path::{Path, PathBuf};
+// `Path`, `Command`, `OS_DELTA` and `OS_BASE` serve only the OS rows (`os_rows`), which land through the Unix writer:
+// Windows has no landing writer yet, so there they would be unused (`cargo xwin clippy --examples`, 2026-11-08).
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::Instant;
 
@@ -47,8 +52,10 @@ const RUNS: usize = 5;
 /// Shape: the delta the simulated rows land (entries).
 const SIM_DELTA: usize = 1_000;
 /// Shape: the delta the OS rows land (entries), T-1.17's 10k.
+#[cfg(unix)]
 const OS_DELTA: usize = 10_000;
 /// Shape: the base tree the OS rows land into (entries), T-1.17's 10^6.
+#[cfg(unix)]
 const OS_BASE: usize = 1_000_000;
 /// Shape: files per directory of the generated trees.
 const PER_DIR: usize = 100;

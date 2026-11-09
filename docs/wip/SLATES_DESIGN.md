@@ -7137,6 +7137,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > CPU-time clock: `/proc/<pid>/schedstat`, read first, is the main thread's alone
 > (`docs/bugs/2026-11-07-the-linux-process-clock-read-the-main-thread-alone.md`). At the extremes, 0 progressing starts
 > were killed at 183-292 runnable processes, and a stuck start was killed at 1,001-1,294 ms on macOS, Linux and Windows.
+> Since 2026-11-08 the spinning half is judged on the start's busiest thread, as the rule is a thread's: the process's
+> summed CPU, held to one window, killed every start of 23 shards on a 32-CPU Studio and of 48 on an 18-CPU Mac
+> (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
 > A shard's recovery still runs as one poll, which the watchdog counts as spinning past a window of CPU: GAPS holds it
 > open.
 
@@ -19680,3 +19683,48 @@ Applied in the same change to: §4.6 (macOS fallback options, failure matrix), T
 - **What it does not change:** Linux's mounts (FUSE; conformance's own NFS options), Windows, or the daemon's answers:
   a stable reply still waits for durability up to the liveness budget and is then answered "try again", which the hard
   mount retries.
+
+### A-258 — A handshake gives up on time, not on a peer's resends; a dialer past its confirmation redials at once; an accepting end that abandons says so, sealed (accepted 2026-11-08)
+
+The fleet formed in 40 to 72 s instead of about a second on a loaded machine (load 127–244). Per-reason counters caught
+one of those formations (41.9 s, load about 170): an accepting end gave up its half of a handshake on the dialer's
+resends (`fleet.accept.stall.repeats`), and the dialer, already past its own side of TLS, waited out its confirmation
+deadline twice before it dialed afresh (`fleet.dial.stall.confirm_deadline`, then `fleet.dial.redial`).
+
+- **Repeats are bounded by time.** A resend of a flight this end has already answered is load's to spend: a dialer
+  slow to read the reply keeps resending, and each fragment of a resent flight counted as a repeat. So the accepting end
+  gave up on a live dialer within a second or two. A turn now gives up on repeats only at its derived deadline (33 × the
+  initial probe timeout, about 22 s). It answers them at its own backoff, and counts a resent flight once however many
+  fragments it spans (`Reassembly::RepeatRest`). `MAX_HANDSHAKE_RETRANSMITS` now bounds only waits paced by this end's
+  own timer.
+- **A dialer past its confirmation redials at once.** The second handshake budget on a socket
+  (`ESTABLISH_BUDGETS_BEFORE_REDIAL`, 2026-09-14) is for a peer that has not answered: one booting, or starved. A dialer
+  waiting on its confirmation has heard from its peer, and its peer's half is what is gone, so a second budget there
+  was 22 s more waiting on nothing (`fleet::keeps_its_socket`).
+- **An accepting end that abandons tells its dialer** (RFC 9000 §10.2.3, a SHOULD), in a close sealed under the
+  Handshake keys (`flight::SEALED_CLOSE_TAG`). The dialer then ends `PeerClosed` and redials within a round trip
+  instead of waiting out its deadline. It is sent only once the accepting end holds those keys; before that it has
+  answered nothing, and the dialer is still in its first budget, where waiting is right.
+  - **Why not the unprotected Initial-level close.** The RFC has a server also send its close in an Initial packet,
+    for a client that may not have the Handshake keys yet. In this dialect anyone who can send to a dialer's port could
+    forge one and cost the dialer its socket and a fresh dial. A dialer past the point where a close helps it holds the
+    Handshake keys already, since it has read the accepting end's sealed flight. So the close is sealed, and a dialer
+    ignores any close that does not open under those keys.
+  - Within the anti-amplification limit (RFC 9000 §8.1, which has no exemption for a close): the close is 22 bytes,
+    against an allowance of three times a received client flight of at least 1,200 bytes.
+  - A dialer sends no close: it may still retry on its socket.
+
+Applied in the same change to:
+- `crates/transport/src/endpoint.rs`: `HandshakeStall`, `handshake_stall`, `handshake_deadline`, the repeat handling
+  in `receive_flight`, `close_abandoned_handshake`, `is_peer_close`, `closes_sent`, and `EndpointError::PeerClosed`.
+- `crates/transport/src/flight.rs`: `Reassembly::RepeatRest`, `SEALED_CLOSE_TAG`, `seal_close`, `open_close`.
+- `crates/server/src/fleet.rs`: `keeps_its_socket`, and the `fleet.dial.stall.<reason>`, `fleet.accept.stall.<reason>`
+  and `fleet.dial.fault.<kind>` counters, `peer_closed` among them.
+- Bug record `docs/bugs/2026-11-08-an-accepting-end-gave-up-on-repeats-and-its-dialer-waited-out-two-deadlines.md`;
+  GAPS's formation entry.
+- Tests, each red-checked: `an_accepted_handshake_is_not_given_up_for_a_dialers_repeats`,
+  `a_dialer_that_only_repeats_is_given_up_at_the_handshakes_deadline`, `a_dialer_past_its_confirmation_redials_at_once`,
+  `a_dialer_hears_its_peer_abandon_the_handshake_within_a_round_trip` (red with no close sent),
+  `a_dialer_ignores_a_close_no_one_sealed` (red with a dialer that believed any close-shaped datagram), and the sealed
+  close's hostile-input tests in `flight.rs`.
+
