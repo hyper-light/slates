@@ -1,0 +1,2 @@
+tested 2e1220459e62388886f516558d8531691ed7d697 on ubuntu-24.04-arm
+clippy exit 0
