@@ -19576,7 +19576,7 @@ Applied in the same change to:
   `a_dialer_ignores_a_close_no_one_sealed` (red with a dialer that believed any close-shaped datagram), and the sealed
   close's hostile-input tests in `flight.rs`.
 
-### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object (accepted 2026-11-08; steps (a) and (b) built)
+### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
 
 A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
 every object of the retired host the holder did not list: listing nothing meant holding nothing. A holder whose page
@@ -19631,15 +19631,38 @@ The change, in four steps:
     asked again next period.
 - **(d), owed:** the process test.
 
-What (b) does not cover: an object that every holder of it leaves out of its pages, and the successor does not hold
-itself, is never learned. The round can then confirm without it under either rule. The model holds its nemesis to (b)'s
-scope (some survivor lists every object a survivor holds), and GAPS records the case.
+**How a successor learns the names (folded into (b), the supervisor's direction).** Asking by name helps only once
+the successor knows the name. An object that every holder leaves out of its pages, the successor's own learning
+included, is never learned, so the round confirms without it and NoLoss breaks silently. The model's nemesis now lets
+any holder leave out any object. Over 1,000 histories (2,950 objects), the named rule with today's routing-selected
+pages left 620 committed objects unlearned. Two shapes were run against that nemesis, neither a global catalog
+(D-14 forbids one for lookups, not a host's own recovery directory):
+- **(i), chosen: a holder lists a copy by the authority it was written under.** A page lists, and a successor learns of
+  its own, every copy whose acceptor's authority puts the object in this round with the asker its successor, by the
+  configuration's lineage (`slates_db::takeover::falls_to`, `RegionalConfiguration::lineage`). This is in addition to
+  what routing gives it. The authority is kept with the copy, so a warm restart keeps it. Following the lineage rather
+  than the recovery chain means a chained successor's own objects are never listed in its predecessor's round, so no
+  object is adopted in two rounds. An omission can then come only from a holder that does not answer, which the quorum
+  rule already covers.
+  - Measured: 0 records lost over the same histories.
+  - Cost: no write at all; it reads what each copy keeps.
+  - `initial_epoch` takes the same copies into account, so a routing-lost copy does not fence the round higher.
+  - Counted `fleet.takeover.listed_by_authority` when routing alone would have missed a copy.
+- **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
+  configuration group keeps membership, read by the successor for every name.
+  - Measured: 0 records lost over the same histories.
+  - Cost: one more committed record for every object created (2,950 over the 2,950 objects), on the create path.
+  - It loses nothing more than (i) does and costs a commit per create, so it is rejected.
+
+The successor answers itself by name too: under the named rule its open gate alone is no promise, so a successor
+holding nothing of an object in whose cohort it is must say so (`answer_own_copies_by_name`).
 
 Applied in the same change to:
 - `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, `promise_object`,
-  `answer_by_name`, with unit tests.
+  `falls_to`, `AcceptorStore`, `answer_by_name`, with unit tests.
 - `crates/db/src/register.rs`: `HostPrepare::named`, `HostPromise::nothing`, `Acceptor::authority`.
 - `crates/db/tests/takeover_model.rs` (new).
-- `crates/server/src/takeover.rs`: `ready_objects`, `fold_answers`, `begin_round`, `serve_host_prepare`, and the module
-  doc's account of the empty promise.
+- `crates/server/src/takeover.rs`: `ready_objects`, `fold_answers`, `begin_round`, `serve_host_prepare`, `list_page`,
+  `promise_local_copies`, `initial_epoch`, `answer_own_copies_by_name`, and the module doc's account of the empty
+  promise.
 - Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.

@@ -17,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::register::{
-  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, OBJECT_BYTES,
-  ObjectId, Prepare, Quorum, RegionalConfiguration, RegisterError,
+  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage,
+  OBJECT_BYTES, ObjectId, Prepare, Quorum, RegionalConfiguration, RegisterError,
 };
 
 /// Which answers count as a member's promise of an object.
@@ -156,6 +156,24 @@ impl AcceptorStore for BTreeMap<ObjectId, Acceptor> {
   }
 }
 
+/// Whether a holder's copy of `object`, its acceptor serving `serving`, falls to `asker` in `departed`'s takeover, by
+/// the committed configuration alone (A-251 (b), shape (i)): the object's line from the owner the copy was written under
+/// ends in `departed`'s round with `asker` its successor ([`RegionalConfiguration::lineage`]). Routing plays no part, and
+/// the authority is kept with the copy, so a warm restart keeps it. A copy under a live member's authority, or one
+/// whose line ends in another retired host's round (an unconfirmed successor's own object), does not fall here.
+pub fn falls_to(
+  regional: &RegionalConfiguration,
+  serving: HostId,
+  object: ObjectId,
+  departed: HostId,
+  asker: HostId,
+) -> bool {
+  matches!(
+    regional.lineage(serving, object),
+    Lineage::Successor { departed: round, successor } if round == departed && successor == asker
+  )
+}
+
 /// A holder's answer to a by-name question, and what it could not answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedAnswer {
@@ -163,7 +181,7 @@ pub struct NamedAnswer {
   /// epoch in `fenced`, and the copies it could not promise for any other reason in `unpromised`.
   pub promise: HostPromise,
   /// Named objects it refused to answer for this asker: the configuration names another successor, or the copy's
-  /// acceptor serves an owner outside the retired host's recovery chain. Such an object stays unanswered.
+  /// line ([`falls_to`]) puts it in another round or with a live owner. Such an object stays unanswered.
   pub refused: u32,
 }
 
@@ -172,8 +190,9 @@ pub struct NamedAnswer {
 /// (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`), so routing cannot be what decides.
 /// Two checks stand in its place, both from what the holder has itself:
 /// - `regional`, the committed configuration, names the asker the object's successor;
-/// - the object's acceptor, when there is one, serves an owner in the retired host's recovery chain, or the asker
-///   already (a page or an earlier answer installed it). A question never installs the asker over a live owner's object.
+/// - the object's acceptor, when there is one, serves an owner whose line puts the object in this round with the asker
+///   as successor ([`falls_to`]), or the asker already (a page or an earlier answer installed it). A question never
+///   installs the asker over a live owner's object, nor over another round's.
 ///
 /// A held copy is promised as a page promises it ([`promise_object`]) and reported; no acceptor means the holder holds
 /// nothing of the object, which it says for that object alone. The answer stops before `budget` bytes, at least one
@@ -185,7 +204,6 @@ pub fn answer_by_name(
   acceptors: &mut impl AcceptorStore,
   budget: usize,
 ) -> NamedAnswer {
-  let chain = regional.recovery_owners(prepare.departed);
   let mut answer = NamedAnswer {
     promise: HostPromise {
       holder,
@@ -216,7 +234,9 @@ pub fn answer_by_name(
       continue;
     };
     let serving = acceptor.authority().owner;
-    if serving != prepare.owner && !chain.contains(&serving) {
+    if serving != prepare.owner
+      && !falls_to(regional, serving, *object, prepare.departed, prepare.owner)
+    {
       answer.refused = answer.refused.saturating_add(1);
       continue;
     }
@@ -407,6 +427,51 @@ mod tests {
         .unwrap();
     }
     acceptor
+  }
+
+  /// Shape (i)'s rule, by the configuration alone: a copy under the retired host's authority falls to its successor in
+  /// its round; a copy under a live member's does not; and once that successor itself retires before confirming, the
+  /// object's line ends in the successor's own round, not the first one, so it is never listed in two rounds. Do: retire
+  /// host 1, then the successor of one of its objects before it confirms. Expect: before the second retirement the
+  /// object falls to that successor in host 1's round; after it, to the next successor in the successor's round, and in
+  /// host 1's round to no one, not even that next successor; a live member's copy falls nowhere.
+  #[test]
+  fn a_copy_falls_to_one_round_by_its_authority_alone() {
+    let (mut regional, asker, theirs, _) = retired_region();
+    let departed = HostId(1);
+    let object = theirs[0];
+    assert!(falls_to(&regional, departed, object, departed, asker));
+    let live = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != asker)
+      .unwrap();
+    assert!(
+      !falls_to(&regional, live, object, departed, asker),
+      "a live member's copy"
+    );
+    regional.take_over(asker, 3).unwrap();
+    let Lineage::Successor {
+      departed: round,
+      successor,
+    } = regional.lineage(departed, object)
+    else {
+      panic!(
+        "the object still has a successor: {:?}",
+        regional.lineage(departed, object)
+      );
+    };
+    assert_eq!(
+      round, asker,
+      "the line now ends in the retired successor's round"
+    );
+    assert!(!falls_to(&regional, departed, object, departed, asker));
+    assert!(falls_to(&regional, departed, object, asker, successor));
+    assert!(
+      !falls_to(&regional, departed, object, departed, successor),
+      "the new successor's own round, not the first host's, even though it is the successor named"
+    );
   }
 
   /// A-251 (b), the holder's side, with no routing at all (the warm-restarted holder's case): asked by name, a holder

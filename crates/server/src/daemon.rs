@@ -6557,12 +6557,12 @@ mod tests {
   }
 
   /// A-251 (b), the holder's side, the warm-restart case (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`):
-  /// a holder that lost a copy's routing leaves it out of its complete page, and answers for it when asked by name. Do:
-  /// retire the owner of a record this node holds, forget the copy's routing and lineage, then answer the successor's
-  /// page and its question by name. Expect: the page lists nothing and is complete; the answer by name reports the
-  /// record; an object this node has no record of is answered as held nothing of.
+  /// a holder that lost a copy's lineage still lists it, by the authority the copy was written under (shape (i)), and
+  /// answers by name for it and for what it holds nothing of. Do: retire the owner of a record this node holds, forget
+  /// the copy's lineage, then answer the successor's page and its question by name. Expect: the page lists the copy and
+  /// is complete; the answer by name reports the record, and an object this node has no record of as held nothing of.
   #[test]
-  fn a_holder_answers_by_name_for_a_copy_its_page_leaves_out() {
+  fn a_holder_lists_a_copy_whose_lineage_it_lost_and_answers_by_name() {
     use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let object = ObjectId([29; 16]);
     let (page, named, absent) = audit_on_shard(move |state| {
@@ -6595,10 +6595,16 @@ mod tests {
       (page, named, absent)
     });
     let page = HostPromise::decode(&page).expect("the page answers");
-    assert!(
-      page.entries.is_empty() && page.next.is_none(),
-      "the page leaves the copy out, complete: {page:?}"
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the page lists the copy by its authority: {page:?}"
     );
+    assert!(page.next.is_none(), "and is complete");
     let named = HostPromise::decode(&named).expect("the question answers");
     assert_eq!(
       named
@@ -6616,10 +6622,10 @@ mod tests {
     );
   }
 
-  /// A-251 (b), the successor's own copy: its routing can lose a copy it holds as any holder's can, so it answers
-  /// itself by name rather than counting its open gate. Do: at f = 1, this node the successor of an object it holds at
-  /// position 1; forget the copy's lineage here, so its own learning misses it; fold the third member's page listing an
-  /// older record (position 0). Expect: the object is adopted with this node's newer record, which it reported by name.
+  /// A-251 (b), the successor's own copy: its routing can lose a copy it holds as any holder's can, and its own copies
+  /// are listed by their authority as a holder's are. Do: at f = 1, this node the successor of an object it holds at
+  /// position 1; forget the copy's lineage here; fold the third member's page listing an older record (position 0).
+  /// Expect: the object is adopted with this node's newer record, not the third member's older one.
   #[test]
   fn a_successor_whose_routing_lost_its_own_copy_still_adopts_it() {
     use slates_db::register::{Accepted, HostEpoch, HostPromise, ObjectId};
@@ -6680,6 +6686,80 @@ mod tests {
     assert_eq!(
       ready[0].1.sequence, 1,
       "this node's newer copy, not the third member's older one: {ready:?}"
+    );
+  }
+
+  /// A-251 (b), the successor's own empty promise: a successor that holds nothing of an object in whose cohort it is
+  /// promises that by name to itself, as any member does, since its open gate alone is no promise. Do: at f = 1, this
+  /// node the successor of an object it holds nothing of, and the third member's page listing it. Expect: the object is
+  /// ready, its cohort's quorum of two made of the third member's report and this node's own named "nothing".
+  #[test]
+  fn a_successor_holding_nothing_of_an_object_promises_so_by_name() {
+    use slates_db::register::{Accepted, HostEpoch, HostPromise, ObjectId};
+    let (ready, object) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      // An object whose successor is this node (one of two survivors, by rendezvous), held here.
+      let held = (0..=u8::MAX)
+        .map(|seed| ObjectId([seed; 16]))
+        .find(|object| {
+          let departed = slates_db::HostId(local.0 ^ 1);
+          let third = slates_db::HostId(local.0 ^ 2);
+          let mut probe = slates_db::register::RegionalConfiguration::formed(
+            vec![local, departed, third],
+            slates_db::register::Quorum { f: 1 },
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          );
+          probe.take_over(departed, 3);
+          probe.successor(departed, *object) == Some(local)
+        })
+        .unwrap();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, held);
+      assert_eq!(successor, local);
+      let third = slates_db::HostId(local.0 ^ 2);
+      let regional = state.council.configuration().clone();
+      let object = (0..=u8::MAX)
+        .map(|seed| ObjectId([seed; 16]))
+        .find(|other| *other != held && regional.successor(departed, *other) == Some(local))
+        .unwrap();
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let requests = crate::takeover::begin_round(state, departed, local).unwrap();
+      let (_, page_request) = requests
+        .iter()
+        .find(|(host, _)| *host == third)
+        .unwrap()
+        .clone();
+      let listed = HostPromise {
+        holder: third,
+        departed,
+        epoch: page_request.epoch,
+        generation: page_request.generation,
+        entries: vec![(
+          object,
+          Accepted {
+            sequence: 0,
+            epoch: HostEpoch(1),
+            value: b"head".to_vec(),
+          },
+        )],
+        next: None,
+        fenced: None,
+        unpromised: 0,
+        nothing: Vec::new(),
+      };
+      crate::takeover::fold_answers(state, departed, vec![(third, listed, false)]);
+      (
+        crate::takeover::ready_objects(state, departed, local),
+        object,
+      )
+    });
+    assert!(
+      ready.iter().any(|(ready, _)| *ready == object),
+      "the third member's report and this node's own named nothing make the quorum: {ready:?}"
     );
   }
 

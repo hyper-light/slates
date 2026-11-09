@@ -31,8 +31,8 @@ same histories. Found while designing step (d)'s process test.
 **Tests.**
 - `a_complete_page_promises_nothing_of_an_object_it_did_not_list` (a real shard): after a complete, empty page the object
   is not ready and the next round asks about it by name; after the answer it is ready.
-- `a_holder_answers_by_name_for_a_copy_its_page_leaves_out` (a real shard, the copy's lineage forgotten): the page lists
-  nothing and is complete; the answer by name reports the record.
+- `a_holder_lists_a_copy_whose_lineage_it_lost_and_answers_by_name` (a real shard, the copy's lineage forgotten): its
+  page lists the copy by its authority, and by name it reports the record and says it holds nothing of an absent object.
 - `a_successor_whose_routing_lost_its_own_copy_still_adopts_it` (a real shard): the successor's own newer copy, its
   lineage forgotten, is adopted over a member's older record. Red with the successor not answering itself.
 - `a_holder_answers_each_named_object_from_its_own_records` and `a_named_answer_keeps_to_its_budget_and_reports_a_higher_fence`
@@ -40,8 +40,19 @@ same histories. Found while designing step (d)'s process test.
 - `a_named_question_and_its_answer_round_trip_and_a_page_keeps_its_bytes` and `a_hostile_named_list_is_refused`.
 - The model, `crates/db/tests/takeover_model.rs`.
 
-**Not closed here.** An object that every holder leaves out of its pages, and the successor does not hold, is never learned,
-so nothing asks about it by name, and a round can confirm without it (A-251, GAPS). The process test is step (d).
+**The names (folded in at the supervisor's direction).** An object every holder leaves out was never learned, so nothing
+asked about it by name: with the nemesis widened so any holder may omit any object, the named rule over today's pages
+left 620 committed objects unlearned over 1,000 histories. A holder now also lists, and a successor learns of its own,
+every copy whose acceptor's authority puts it in this round with the asker its successor, by the configuration's lineage
+(`slates_db::takeover::falls_to`; shape (i), 0 lost). The cohort-kept directory, shape (ii), lost nothing either but costs a
+commit per create, and is recorded in A-251 as measured and rejected.
+- `a_holder_lists_a_copy_whose_lineage_it_lost_and_answers_by_name` (a real shard): red with pages listing by routing alone.
+- `a_copy_falls_to_one_round_by_its_authority_alone`: red with the round unchecked. Its first cut missed that: a chained
+  successor's own round named the next successor too, until the case was added.
+- `a_successor_holding_nothing_of_an_object_promises_so_by_name` (a real shard): red with no self-answer.
+- Surviving, as expected: the successor learning its own copies by routing alone, since its self-answer still reaches the copy.
+
+The process test is step (d).
 
 **R3.** A question names the ids that fit one page after the request's fields (`named_per_question`, from `page_budget`). An
 answer is bounded by `page_budget`.

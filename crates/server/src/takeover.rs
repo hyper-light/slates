@@ -40,7 +40,8 @@ use slates_db::register::{
   Placement, Record, RegionalConfiguration, RegisterError, encode_refusal,
 };
 use slates_db::takeover::{
-  CountingRule, Heard, Readiness, answer_by_name, promise_object, readiness,
+  CountingRule, Heard, Readiness, answer_by_name, falls_to as falls_by_authority, promise_object,
+  readiness,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
@@ -349,6 +350,11 @@ pub(crate) fn serve_host_prepare(
   page.encode()
 }
 
+/// Counter: copies a page listed, or a successor learned of its own, by the copy's authority alone (A-251 (b), shape
+/// (i)): its routing did not give it. The non-vacuity count of the routing-free path. Format: a counter name in the
+/// daemon's status report.
+const TAKEOVER_LISTED_BY_AUTHORITY: &str = "fleet.takeover.listed_by_authority";
+
 /// Counter: objects a holder refused to answer by name (A-251 (b)): the configuration names another successor, or the
 /// copy's acceptor serves an owner outside the retired host's recovery chain. Such an object stays unanswered.
 const TAKEOVER_NAMED_REFUSED: &str = "fleet.takeover.named_refused";
@@ -410,19 +416,35 @@ fn refuse(state: &mut ShardState) -> Vec<u8> {
 
 /// The page of `prepare`'s answer this holder gives: see [`serve_host_prepare`].
 fn list_page(state: &mut ShardState, local: HostId, prepare: &HostPrepare) -> HostPromise {
+  let regional = state.council.configuration().clone();
+  let mut by_authority_only: u64 = 0;
   let objects: Vec<ObjectId> = state
     .holder_records
-    .keys()
-    .copied()
-    .filter(|object| prepare.after.is_none_or(|after| *object > after))
-    .filter(|object| {
-      state
+    .iter()
+    .filter(|(object, _)| prepare.after.is_none_or(|after| **object > after))
+    .filter(|(object, acceptor)| {
+      let routed = state
         .departed_owners
-        .get(object)
+        .get(*object)
         .is_some_and(|departed| departed.owner == prepare.departed)
-        && state.fleet.object_owner(*object) == Some(prepare.owner)
+        && state.fleet.object_owner(**object) == Some(prepare.owner);
+      // A-251 (b), shape (i): the copy's own authority, kept with it through a warm restart, decides too, so a
+      // copy whose routing was lost is still listed in the one round its line names.
+      let by_authority = falls_by_authority(
+        &regional,
+        acceptor.authority().owner,
+        **object,
+        prepare.departed,
+        prepare.owner,
+      );
+      by_authority_only = by_authority_only.saturating_add(u64::from(by_authority && !routed));
+      routed || by_authority
     })
+    .map(|(object, _)| *object)
     .collect();
+  if by_authority_only > 0 {
+    state.count(TAKEOVER_LISTED_BY_AUTHORITY, by_authority_only);
+  }
   let budget = page_budget();
   let mut promise = HostPromise {
     holder: local,
@@ -676,7 +698,16 @@ fn initial_epoch(
   state
     .holder_records
     .iter()
-    .filter(|(object, _)| falls_to(state, **object, departed, local))
+    .filter(|(object, acceptor)| {
+      falls_to(state, **object, departed, local)
+        || falls_by_authority(
+          regional,
+          acceptor.authority().owner,
+          **object,
+          departed,
+          local,
+        )
+    })
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
     .try_fold(bumped, |highest, (_, _, epoch, _)| {
       Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
@@ -701,12 +732,28 @@ fn promise_local_copies(
   epoch: HostEpoch,
   generation: u64,
 ) {
+  let regional = state.council.configuration().clone();
+  let mut by_authority_only: u64 = 0;
   let objects: Vec<ObjectId> = state
     .holder_records
-    .keys()
-    .copied()
-    .filter(|object| falls_to(state, *object, departed, local))
+    .iter()
+    .filter(|(object, acceptor)| {
+      let routed = falls_to(state, **object, departed, local);
+      let by_authority = falls_by_authority(
+        &regional,
+        acceptor.authority().owner,
+        **object,
+        departed,
+        local,
+      );
+      by_authority_only = by_authority_only.saturating_add(u64::from(by_authority && !routed));
+      routed || by_authority
+    })
+    .map(|(object, _)| *object)
     .collect();
+  if by_authority_only > 0 {
+    state.count(TAKEOVER_LISTED_BY_AUTHORITY, by_authority_only);
+  }
   let prepare = HostPrepare {
     departed,
     owner: local,

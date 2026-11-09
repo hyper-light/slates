@@ -5664,8 +5664,11 @@ be adopted. **Fixed so far, step (c):** a copy the holder cannot promise (`HostP
 nemesis. Over 2,000 histories today's rule lost 216 committed records with the nemesis on and none with it off; A-251's
 by-name rule lost none. **Step (b), built:** a successor asks by name for what a member's complete pages did not list,
 a holder answers from its own records with no routing filter, and the successor counts under
-`CountingRule::NamedAnswer`. Still owed: (d) the process test. **Not covered by (b):** an object that every holder of it leaves out of its pages, and the
-successor does not hold, is never learned, so a round can confirm without it under either rule (A-251).
+`CountingRule::NamedAnswer`. **The names, folded into (b):** an object that every holder leaves out was never learned
+(620 committed objects unlearned over 1,000 histories). A holder now lists a copy by the authority it was written under,
+through the configuration's lineage, as well as by routing (shape (i): 0 lost, no extra write). The object directory kept
+by the cohort (shape (ii): 0 lost, one more committed record per create) is measured and rejected (A-251). Still owed:
+(d) the process test.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one
