@@ -53,12 +53,24 @@ lost or wrongly answered: the forwards were refused and retried.
   - CI's interleaved A/B (diag-61; 3 runners, 15 runs a side, debug as the gate builds the fleet tests): before is
     this branch with the node's reset never sent; after is as committed.
     - After: every run counted exactly one `fleet.link.peer_reset`. The first read through b reached the restarted a
-      in 120 / 175 / 220 ms (min / median / max), within the test's one-liveness-budget bound.
+      in 120 / 175 / 220 ms (min / median / max), within the test's bound at the time, one liveness budget.
     - Before: no reset; the first read reached a in 166 / 206 / 284 ms, and every run failed only on the reset count.
   - **What this test does not show.** Without loadtest-scale's burst, b reached the restarted a on its first read in
     both arms. The stall of 25 to 135 s needs the burst that keeps b's lane holding the session. So this test proves the
     reset fires and the link moves; loadtest-scale's
     `a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one` is the test of the stall itself.
+  - **Hardened for extreme load (2026-11-09).** In the supervisor's Mac gate at load 170–232 on 18 cores, the test failed
+    with no reset to see: b's liveness had judged a dead while it was down (`fleet.link.invalid.believed_dead` 1,
+    `fleet.link.out_of_contact` 1) and dropped the session, so the run was not the reset case. The test now reads the
+    precondition from b's own state at the moment a comes back: its link to a present, and neither counter moved since
+    before the stop. A run without it is recorded and a restarted again, at most `RESET_ATTEMPTS` (4) times. The test
+    fails only if the precondition never held, or if, where it held, any of these is missing:
+    - the reset, seen while b's reads waited;
+    - b's liveness not having judged a dead before the reset, so the reset moved the link;
+    - a read reaching the restarted a within ten liveness budgets.
+
+    Time no longer judges the move: the counters do, so a load that stretches every wait cannot fail it falsely. It
+    prints how many restarts it took and in how many the reset path ran.
 
 **R3.** The token's 16 bytes, the 21-byte minimum and the 43-byte send length are RFC 9000 §10.3 constants. The
 interval between resets to one source is the initial probe timeout, 666 ms: RFC 9002 §6.2.2's 333 ms `kInitialRtt`,
