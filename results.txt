@@ -1,0 +1,19 @@
+green on macos-latest, 3 CPUs, Mon Nov  9 05:57:19 UTC 2026, head e50ba216ec90628c6dcbe784cf3ae5c1b2be0bd1
+== run 1 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 24.12s
+
+== run 2 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 23.44s
+
+== run 3 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 23.26s
+
+== run 4 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 23.69s
+
+== run 5 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 23.76s
+
+== run 6 exit 0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 24.06s
+
