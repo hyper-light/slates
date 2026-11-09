@@ -13029,7 +13029,10 @@ Applied in the same change to:
 - the benches' global `sync` replaced by `sync -f PATH` (`mixed/copy_tree.sh`, `mem/per_file.sh`, `mem/per_entry.sh`,
   `nfs/large_io.sh`).
 
-Status: built 2026-10-08.
+Status: built 2026-10-08. Since 2026-11-09 only an exit before the daemon served counts toward the bound (the
+supervision block's serving word, which the daemon marks once its start, recovery included, is done): a daemon killed
+while serving had recovered, and counting it backed off a test that killed a serving daemon twenty times
+(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`).
 - What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
   over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
   160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
