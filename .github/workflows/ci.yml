@@ -697,6 +697,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --lib -- --test-threads=1
+      # A daemon keeps its beat through a recovery longer than a liveness window (recovery slicing): the one recovery test
+      # that drives no NFS loopback or rustix, so it runs here as well as with the Unix recovery oracle.
+      - name: Test a daemon's beat through a long recovery (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test recovery_slicing -- --nocapture
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -1280,7 +1286,7 @@ jobs:
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
       - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
-        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness --test alone
 
   windows-nightly:
     name: windows (every push to main and nightly)

@@ -58,6 +58,35 @@ pub struct Watchdog {
   /// The stop signal: the thread sees this sender go away at its next turn.
   stop: Option<Sender<()>>,
   handle: Option<JoinHandle<()>>,
+  /// What the thread did, for whoever asks ([`Watchdog::turns`]).
+  turns: &'static Turns,
+}
+
+/// What the watchdog thread did, counted as it goes: how many times it looked at the shards, and at how many of those it
+/// withheld the beat because a shard was stuck. A gap in the beat with looks and no withheld one is the thread's own
+/// lateness (it was itself kept off a CPU), not the rule's verdict; only a withheld look is the rule's (A-228). Written by
+/// the thread alone, read by anyone; statistics, so relaxed. One per daemon, leaked for the process's life: a few words.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+pub struct Turns {
+  looks: std::sync::atomic::AtomicU64,
+  withheld: std::sync::atomic::AtomicU64,
+}
+
+impl Turns {
+  /// The looks so far, and of them those that withheld the beat for a stuck shard.
+  pub fn read(&self) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (self.looks.load(Relaxed), self.withheld.load(Relaxed))
+  }
+
+  fn looked(&self, withheld: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    self.looks.fetch_add(1, Relaxed);
+    if withheld {
+      self.withheld.fetch_add(1, Relaxed);
+    }
+  }
 }
 
 impl std::fmt::Debug for Watchdog {
@@ -84,13 +113,20 @@ impl Watchdog {
       HEARTBEAT_NS / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     );
+    let turns: &'static Turns = Box::leak(Box::default());
     let handle = std::thread::Builder::new()
       .name("slates-watchdog".to_owned())
-      .spawn(move || run(&segment, &holders, &control, &stop_signal))?;
+      .spawn(move || run(&segment, &holders, (&control, &stop_signal), turns))?;
     Ok(Watchdog {
       stop: Some(stop),
       handle: Some(handle),
+      turns,
     })
+  }
+
+  /// What the thread has done so far ([`Turns`]).
+  pub fn turns(&self) -> &'static Turns {
+    self.turns
   }
 
   /// Tells the thread the daemon is stopping, before the shutdown ends the control loop, so that end is not announced
@@ -271,8 +307,8 @@ impl ShardWatch {
 fn run(
   segment: &AnchorSegment,
   holders: &[SlotHolder],
-  control: &Receiver<()>,
-  stop: &Receiver<()>,
+  (control, stop): (&Receiver<()>, &Receiver<()>),
+  turns: &Turns,
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::default(); holders.len()];
@@ -313,6 +349,7 @@ fn run(
       report(said, holder.shard(), verdict);
       all_alive &= verdict.beats();
     }
+    turns.looked(!all_alive);
     if all_alive
       && !control_ended
       && let Ok(supervision) = segment.supervision()
