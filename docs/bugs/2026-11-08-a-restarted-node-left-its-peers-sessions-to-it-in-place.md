@@ -50,7 +50,15 @@ lost or wrongly answered: the forwards were refused and retried.
 - `a_reset_from_another_process_on_the_dialers_port_is_ignored`: 6 resets in the 4 s bound, one per initial probe
   timeout, and the accepting end still waiting at the bound.
 - The process test is loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`.
-  Its CI figures are added when the run reports.
+  - CI's interleaved A/B (diag-61; 3 runners, 15 runs a side, debug as the gate builds the fleet tests): before is
+    this branch with the node's reset never sent; after is as committed.
+    - After: every run counted exactly one `fleet.link.peer_reset`. The first read through b reached the restarted a
+      in 120 / 175 / 220 ms (min / median / max), within the test's one-liveness-budget bound.
+    - Before: no reset; the first read reached a in 166 / 206 / 284 ms, and every run failed only on the reset count.
+  - **What this test does not show.** Without loadtest-scale's burst, b reached the restarted a on its first read in
+    both arms. The stall of 25 to 135 s needs the burst that keeps b's lane holding the session. So this test proves the
+    reset fires and the link moves; loadtest-scale's
+    `a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one` is the test of the stall itself.
 
 **R3.** The token's 16 bytes, the 21-byte minimum and the 43-byte send length are RFC 9000 §10.3 constants. The
 interval between resets to one source is the initial probe timeout, 666 ms: RFC 9002 §6.2.2's 333 ms `kInitialRtt`,
