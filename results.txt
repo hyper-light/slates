@@ -1,0 +1,34 @@
+runner ubuntu-24.04-arm, 4 CPUs, Mon Nov  9 18:02:37 UTC 2026, tree 98cad8616984086eec974bc22279471d79532089
+== release build exit 0
+   quiet1 LD-JW loaded false killed->answered 54.548489ms joint_entered Some(1.889569414s) joint_closed Some(2.100124083s) polls 96 old 3861722474428146910 new 10860026180955201895
+== quiet run 1 exit 0
+   quiet2 LD-JW loaded false killed->answered 54.282563ms joint_entered Some(2.354016752s) joint_closed Some(2.56276283s) polls 136 old 5030163155297637767 new 233574609739996575
+== quiet run 2 exit 0
+   quiet3 LD-JW loaded false killed->answered 56.862298ms joint_entered Some(1.961713384s) joint_closed Some(2.180854457s) polls 97 old 11383100598961534631 new 17521231312543462560
+== quiet run 3 exit 0
+   quiet4 LD-JW loaded false killed->answered 57.027847ms joint_entered Some(1.528362595s) joint_closed Some(1.750504918s) polls 68 old 14839079189537160777 new 7693311074629232521
+== quiet run 4 exit 0
+   quiet5 LD-JW loaded false killed->answered 57.535022ms joint_entered Some(1.97689209s) joint_closed Some(2.104019372s) polls 72 old 10324568328799703526 new 5943478467732339217
+== quiet run 5 exit 0
+   quiet6 LD-JW loaded false killed->answered 54.372289ms joint_entered Some(1.945896211s) joint_closed Some(2.16468625s) polls 113 old 16081372037746849108 new 7935818731445351005
+== quiet run 6 exit 0
+   quiet7 LD-JW loaded false killed->answered 55.789309ms joint_entered Some(2.11091316s) joint_closed Some(2.320648696s) polls 132 old 326153603096397462 new 882951646439021798
+== quiet run 7 exit 0
+   quiet8 LD-JW loaded false killed->answered 55.561436ms joint_entered Some(2.045213408s) joint_closed Some(2.143741254s) polls 127 old 11974361576426385035 new 12229871471293136357
+== quiet run 8 exit 0
+   loaded1 LD-JW loaded true killed->answered 66.881107ms joint_entered Some(1.891367346s) joint_closed Some(2.121993655s) polls 70 old 14398074425110156129 new 2592723823058549357
+== loaded run 1 exit 0
+   loaded2 LD-JW loaded true killed->answered 72.448223ms joint_entered Some(2.125831732s) joint_closed Some(2.25031045s) polls 73 old 5902383056640553828 new 3959978900060731063
+== loaded run 2 exit 0
+   loaded3 LD-JW loaded true killed->answered 63.122811ms joint_entered Some(2.081171s) joint_closed Some(2.319706447s) polls 87 old 15895870522888210367 new 14125861368157207728
+== loaded run 3 exit 0
+   loaded4 LD-JW loaded true killed->answered 88.445617ms joint_entered Some(2.443170324s) joint_closed Some(2.866781471s) polls 81 old 6327424597147963483 new 5873845298995458039
+== loaded run 4 exit 0
+   loaded5 LD-JW loaded true killed->answered 114.981748ms joint_entered Some(1.957443267s) joint_closed Some(2.095989948s) polls 69 old 8700050289668214751 new 3185134568548768882
+== loaded run 5 exit 0
+   loaded6 LD-JW loaded true killed->answered 63.972356ms joint_entered Some(2.0014469s) joint_closed Some(2.214857135s) polls 73 old 2582423315343788879 new 9085122107765291026
+== loaded run 6 exit 0
+   loaded7 LD-JW loaded true killed->answered 75.368384ms joint_entered Some(2.065588374s) joint_closed Some(2.176605801s) polls 81 old 10361910088454968753 new 15157411916679866241
+== loaded run 7 exit 0
+   loaded8 LD-JW loaded true killed->answered 58.923027ms joint_entered Some(4.075380699s) joint_closed Some(5.258396857s) polls 183 old 4484549140694250178 new 10662827763971422667
+== loaded run 8 exit 0
