@@ -758,6 +758,7 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.head);
     put_bytes(&mut out, &adoption.catalog);
   }
+  encode_hosts(&mut out, &config.dropped_unconfirmed);
   out
 }
 
@@ -874,6 +875,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (settled, rest) = decode_settled_map(rest)?;
   let (retired, rest) = decode_retired(rest)?;
   let (adoptions, rest) = decode_adoptions(rest)?;
+  let (dropped_unconfirmed, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -886,6 +888,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     settled,
     retired,
     adoptions,
+    dropped_unconfirmed,
   })
 }
 

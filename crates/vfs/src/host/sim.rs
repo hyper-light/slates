@@ -46,6 +46,9 @@ struct SimNode {
   ctime_ns: i64,
   /// When the node was made, on the simulated clock: its birth time, which a rename keeps (A-151).
   birth_ns: i64,
+  /// The Windows attribute bits the node holds, as a Windows disk would (A-262); none unless a test sets them
+  /// ([`SimHost::set_windows_attributes`]).
+  windows: u16,
   children: BTreeMap<Box<str>, SimNode>,
 }
 
@@ -66,6 +69,7 @@ impl SimNode {
       uid: self.uid,
       gid: self.gid,
       birth_ns: if birth_times { self.birth_ns } else { 0 },
+      windows: self.windows,
     }
   }
 }
@@ -232,6 +236,7 @@ impl SimHost {
         mtime_ns: 0,
         ctime_ns: 0,
         birth_ns: 0,
+        windows: 0,
         children: BTreeMap::new(),
       },
       next_ino: 2,
@@ -527,6 +532,7 @@ impl SimHost {
       // A filesystem never stamps a birth time of zero, which hosts report for "none recorded"
       // ([`Fingerprint::birth_ns`]); the simulated clock starts at zero, so a file made then is stamped one nanosecond.
       birth_ns: self.now_ns.max(1),
+      windows: 0,
       children: BTreeMap::new(),
     }
   }
@@ -724,6 +730,17 @@ impl SimHost {
     }
     self.touch_parent(&fparent);
     self.touch_parent(&tparent);
+  }
+
+  /// Sets an entry's Windows attribute bits, as a user's `attrib +h` on a Windows disk does (a metadata-only change: the
+  /// change time moves; A-262).
+  pub fn set_windows_attributes(&mut self, path: &str, bits: u16) {
+    let parts = Self::split(path);
+    let now = self.now_ns;
+    if let Some(n) = self.node_mut(&parts) {
+      n.windows = bits;
+      n.ctime_ns = now;
+    }
   }
 
   /// Changes a file's mode (a metadata-only change).
