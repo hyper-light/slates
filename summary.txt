@@ -1,0 +1,221 @@
+image: ubuntu26 20261101.186.1; kernel 7.0.0-1019-azure; raise=yes; docker 29.4.2
+$ sh -c sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches fs.file-max fs.nr_open net.netfilter.nf_conntrack_max net.nf_conntrack_max kernel.pid_max; ulimit -n
+fs.inotify.max_user_instances = 512
+fs.inotify.max_user_watches = 524288
+fs.file-max = 9223372036854775807
+fs.nr_open = 2147483584
+net.netfilter.nf_conntrack_max = 262144
+net.nf_conntrack_max = 262144
+kernel.pid_max = 4194304
+65536
+$ sh -c lsmod | grep -E "^(ip_tables|ip6_tables|x_tables|nf_tables|iptable_|nf_conntrack|br_netfilter|xt_)" | cut -c1-60
+xt_MASQUERADE          16384  1
+xt_set                 20480  0
+xt_addrtype            12288  4
+xt_owner               12288  1
+xt_tcpudp              16384  0
+xt_conntrack           12288  2
+nf_conntrack          200704  3 xt_conntrack,nf_nat,xt_MASQU
+x_tables               65536  7 xt_conntrack,nft_compat,xt_t
+nf_tables             401408  77 nft_compat,nft_chain_nat
+$ sh -c ls /proc/sys/fs/inotify; cat /proc/sys/user/max_inotify_instances 2>/dev/null
+max_queued_events
+max_user_instances
+max_user_watches
+512
+$ kind create cluster --name proxy --config deploy/kind/cluster.yaml --wait 5m
+Creating cluster "proxy" ...
+ • Ensuring node image (kindest/node:v1.37.0) 🖼️  ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️
+ • Preparing nodes 📦 📦 📦 📦 📦 📦   ...
+ ✓ Preparing nodes 📦 📦 📦 📦 📦 📦 
+ • Writing configuration 📜  ...
+ ✓ Writing configuration 📜
+ • Starting control-plane 🕹️  ...
+ ✓ Starting control-plane 🕹️
+ • Installing CNI 🔌  ...
+ ✓ Installing CNI 🔌
+ • Installing StorageClass 💾  ...
+ ✓ Installing StorageClass 💾
+ • Joining worker nodes 🚜  ...
+ ✓ Joining worker nodes 🚜
+ • Waiting ≤ 5m0s for control-plane = Ready ⏳  ...
+ ✓ Waiting ≤ 5m0s for control-plane = Ready ⏳
+ • Ready after 6s 💚
+Set kubectl context to "kind-proxy"
+You can now use your cluster with:
+$ kubectl --context kind-proxy -n kube-system get pods -o wide
+NAME                                          READY   STATUS    RESTARTS   AGE     IP           NODE                  NOMINATED NODE   READINESS GATES
+coredns-559f6c778d-6zvcn                      1/1     Running   0          2m12s   10.244.0.2   proxy-control-plane   <none>           <none>
+coredns-559f6c778d-v4vsh                      1/1     Running   0          2m12s   10.244.0.4   proxy-control-plane   <none>           <none>
+etcd-proxy-control-plane                      1/1     Running   0          2m20s   172.18.0.5   proxy-control-plane   <none>           <none>
+kindnet-28h85                                 1/1     Running   0          2m7s    172.18.0.7   proxy-worker2         <none>           <none>
+kindnet-5bkn6                                 1/1     Running   0          2m12s   172.18.0.5   proxy-control-plane   <none>           <none>
+kindnet-lgjr4                                 1/1     Running   0          2m7s    172.18.0.6   proxy-worker5         <none>           <none>
+kindnet-rzz96                                 1/1     Running   0          2m7s    172.18.0.4   proxy-worker3         <none>           <none>
+kindnet-wrw84                                 1/1     Running   0          2m7s    172.18.0.3   proxy-worker          <none>           <none>
+kindnet-zhtqp                                 1/1     Running   0          2m7s    172.18.0.2   proxy-worker4         <none>           <none>
+kube-apiserver-proxy-control-plane            1/1     Running   0          2m20s   172.18.0.5   proxy-control-plane   <none>           <none>
+kube-controller-manager-proxy-control-plane   1/1     Running   0          2m20s   172.18.0.5   proxy-control-plane   <none>           <none>
+kube-proxy-cjn62                              1/1     Running   0          2m7s    172.18.0.7   proxy-worker2         <none>           <none>
+kube-proxy-crr4f                              1/1     Running   0          2m12s   172.18.0.5   proxy-control-plane   <none>           <none>
+kube-proxy-frs4b                              1/1     Running   0          2m7s    172.18.0.2   proxy-worker4         <none>           <none>
+kube-proxy-ggj6f                              1/1     Running   0          2m7s    172.18.0.4   proxy-worker3         <none>           <none>
+kube-proxy-m6hpn                              1/1     Running   0          2m7s    172.18.0.6   proxy-worker5         <none>           <none>
+kube-proxy-vnbqf                              1/1     Running   0          2m7s    172.18.0.3   proxy-worker          <none>           <none>
+kube-scheduler-proxy-control-plane            1/1     Running   0          2m20s   172.18.0.5   proxy-control-plane   <none>           <none>
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-cjn62 -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-worker2 restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-cjn62 --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-cjn62" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-cjn62 --tail=8
+I1109 23:14:20.781865       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:20.781997       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:20.784790       1 config.go:309] "Starting node config controller"
+I1109 23:14:20.787434       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:20.787442       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:20.883008       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 23:14:20.884440       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+I1109 23:14:20.883371       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-crr4f -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-control-plane restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-crr4f --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-crr4f" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-crr4f --tail=8
+I1109 23:14:12.736554       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:12.736593       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:12.736631       1 config.go:309] "Starting node config controller"
+I1109 23:14:12.736636       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:12.837163       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:12.837177       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+I1109 23:14:12.837169       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 23:14:12.837188       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-frs4b -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-worker4 restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-frs4b --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-frs4b" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-frs4b --tail=8
+I1109 23:14:19.445848       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:19.445853       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:19.447444       1 config.go:309] "Starting node config controller"
+I1109 23:14:19.447460       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:19.447465       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:19.546667       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+I1109 23:14:19.546699       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 23:14:19.546708       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-ggj6f -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-worker3 restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-ggj6f --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-ggj6f" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-ggj6f --tail=8
+I1109 23:14:20.795560       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:20.795564       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:20.796883       1 config.go:309] "Starting node config controller"
+I1109 23:14:20.797591       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:20.797601       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:20.895739       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+I1109 23:14:20.995955       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 23:14:20.995955       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-m6hpn -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-worker5 restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-m6hpn --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-m6hpn" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-m6hpn --tail=8
+I1109 23:14:20.653024       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:20.653030       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:20.653021       1 config.go:309] "Starting node config controller"
+I1109 23:14:20.653039       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:20.653043       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:20.753888       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+I1109 23:14:20.754257       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+I1109 23:14:20.754276       1 shared_informer.go:510] "Caches are synced" controller="service config"
+$ sh -c kubectl --context kind-proxy -n kube-system get pod/kube-proxy-vnbqf -o jsonpath='{.spec.nodeName} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}'; echo
+proxy-worker restarts=0 last=/
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-vnbqf --previous --tail=20
+Error from server (BadRequest): previous terminated container "kube-proxy" in pod "kube-proxy-vnbqf" not found
+$ kubectl --context kind-proxy -n kube-system logs pod/kube-proxy-vnbqf --tail=8
+I1109 23:14:18.944395       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 23:14:18.944462       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 23:14:18.952472       1 config.go:309] "Starting node config controller"
+I1109 23:14:18.952536       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 23:14:18.952543       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 23:14:19.048452       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 23:14:19.048524       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+I1109 23:14:19.048547       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+$ kubectl --context kind-proxy -n kube-system get pods -l k8s-app=kindnet -o wide
+NAME            READY   STATUS    RESTARTS   AGE     IP           NODE                  NOMINATED NODE   READINESS GATES
+kindnet-28h85   1/1     Running   0          2m7s    172.18.0.7   proxy-worker2         <none>           <none>
+kindnet-5bkn6   1/1     Running   0          2m12s   172.18.0.5   proxy-control-plane   <none>           <none>
+kindnet-lgjr4   1/1     Running   0          2m7s    172.18.0.6   proxy-worker5         <none>           <none>
+kindnet-rzz96   1/1     Running   0          2m7s    172.18.0.4   proxy-worker3         <none>           <none>
+kindnet-wrw84   1/1     Running   0          2m7s    172.18.0.3   proxy-worker          <none>           <none>
+kindnet-zhtqp   1/1     Running   0          2m7s    172.18.0.2   proxy-worker4         <none>           <none>
+$ docker exec proxy-worker4 sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-worker4
+512
+55
+18
+iptables v1.8.11 (nf_tables)
+262144
+$ docker exec proxy-worker sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-worker
+512
+55
+18
+iptables v1.8.11 (nf_tables)
+262144
+$ docker exec proxy-worker3 sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-worker3
+512
+55
+18
+iptables v1.8.11 (nf_tables)
+262144
+$ docker exec proxy-worker2 sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-worker2
+512
+55
+18
+iptables v1.8.11 (nf_tables)
+262144
+$ docker exec proxy-control-plane sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-control-plane
+512
+69
+45
+iptables v1.8.11 (nf_tables)
+262144
+$ docker exec proxy-worker5 sh -c hostname; cat /proc/sys/fs/inotify/max_user_instances; ls /proc/1/fdinfo | wc -l; find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l; iptables --version; cat /proc/sys/net/netfilter/nf_conntrack_max 2>&1
+proxy-worker5
+512
+55
+18
+iptables v1.8.11 (nf_tables)
+262144
+$ sh -c sudo find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | cut -d/ -f3 | sort -u | while read p; do cat /proc/$p/status 2>/dev/null | sed -n "s/^Uid:\t\([0-9]*\).*/\1/p"; done | sort | uniq -c
+     58 0
+      1 1001
+      1 983
+      1 989
+      1 995
+$ sh -c sudo dmesg -T | tail -20
+[Mon Nov  9 23:13:57 2026] eth0: renamed from veth75b7752
+[Mon Nov  9 23:13:57 2026] br-10076376d7d4: port 5(vethfe12c03) entered blocking state
+[Mon Nov  9 23:13:57 2026] br-10076376d7d4: port 5(vethfe12c03) entered forwarding state
+[Mon Nov  9 23:13:57 2026] eth0: renamed from veth6acc55d
+[Mon Nov  9 23:13:57 2026] br-10076376d7d4: port 6(veth8e8e69f) entered blocking state
+[Mon Nov  9 23:13:57 2026] br-10076376d7d4: port 6(veth8e8e69f) entered forwarding state
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[93]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[93]: Collecting audit messages is disabled.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:57 2026] coredump: 103(systemd-sysctl): Unsafe core_pattern used with fs.suid_dumpable=2: pipe handler or fully qualified core dump path required. Set kernel.core_pattern before fs.suid_dumpable.
+[Mon Nov  9 23:13:57 2026] systemd-journald[93]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:57 2026] systemd-journald[94]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:57 2026] systemd-journald[93]: Received client request to flush runtime journal.
+[Mon Nov  9 23:13:58 2026] hv_balloon: Max. dynamic memory size: 16384 MB
