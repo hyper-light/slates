@@ -2541,6 +2541,9 @@ struct ContentWork {
   /// This round's budget ([`content_budget`]): its collection stops at the owner shard's measured hedge
   /// delay, computed from the shard's put-latency window at the moment the work is handed out.
   budget: CommitBudget,
+  /// The hedge delay this round was judged against ([`hedge_delay_ns`] of the track's window), counted with a hedge
+  /// round so the delay the owner used can be compared with the p95 it measured.
+  hedge_delay_ns: u64,
 }
 
 /// The status refusal count under which the fleet loop records a snapshot it could not archive (a
@@ -3135,6 +3138,14 @@ impl LatencyWindow {
     self.readings_ns.is_empty()
   }
 
+  /// The smallest and largest reading the window holds, or none while it is empty: any percentile of it lies between.
+  pub fn range_ns(&self) -> Option<(u64, u64)> {
+    Some((
+      *self.readings_ns.iter().min()?,
+      *self.readings_ns.iter().max()?,
+    ))
+  }
+
   /// The p95 of the window's readings (nearest rank, the machine crate's percentile law), or `None`
   /// before any reading.
   pub fn p95_ns(&self) -> Option<u64> {
@@ -3318,17 +3329,24 @@ fn content_work(
     round: job.rounds,
     hedged,
     budget,
+    hedge_delay_ns: hedge_delay,
   })
 }
 
 /// Counter: a seal's content round sent to the remaining candidates, its first round outstanding past the measured hedge
 /// delay with no placement ([`hedge_delay_ns`], on the owner shard's clock).
 const SEAL_HEDGED: &str = "fleet.seal.hedged";
+/// Counter: the sum of the hedge delays the [`SEAL_HEDGED`] rounds were held for, nanoseconds; divided by their count,
+/// the delay the owner used, which the design makes its measured p95 put latency.
+const SEAL_HEDGE_DELAY_NS: &str = "fleet.seal.hedge_delay_ns";
 
-/// Counts a content round that hedges to `targets`.
-fn count_hedge_round(hedged: bool, targets: &[HostId]) {
+/// Counts a content round that hedges to `targets`, with the delay it was held for.
+fn count_hedge_round(hedged: bool, targets: &[HostId], delay_ns: u64) {
   if hedged && !targets.is_empty() {
-    state::with_state(|s| s.count(SEAL_HEDGED, 1));
+    state::with_state(|s| {
+      s.count(SEAL_HEDGED, 1);
+      s.count(SEAL_HEDGE_DELAY_NS, delay_ns);
+    });
   }
 }
 
@@ -3373,7 +3391,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
   let targets = hedge_targets(work.hedged, remote, hedge);
-  count_hedge_round(work.hedged, &targets);
+  count_hedge_round(work.hedged, &targets, work.hedge_delay_ns);
   let holders = take_sessions("fleet.lent_to.put_seal_content", |host| {
     targets.contains(&host)
   });

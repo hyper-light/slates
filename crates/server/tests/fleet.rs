@@ -9612,7 +9612,7 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   // Hold the first-round candidate's control shard, then seal again: the second put cannot be answered
   // by it, so the hedge must carry the seal to the other candidate on the measured p95.
   write_hello_over_nfs(&daemons[0], "hedged");
-  let hedged_before = seals_hedged(&daemons[0]);
+  let (hedged_before, delay_before) = hedge_counts(&daemons[0]);
   HEDGE_HOLD_RELEASED.store(false, std::sync::atomic::Ordering::Release);
   let hold =
     daemons[first_index].starve_control_shard_until(HEDGE_STARVATION_NS, &HEDGE_HOLD_RELEASED);
@@ -9634,12 +9634,19 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   let placed = poll_snapshot_placed(&all, &mut client, id, second);
   let placed_after = started.elapsed();
   HEDGE_HOLD_RELEASED.store(true, std::sync::atomic::Ordering::Release);
+  let (hedged_after, delay_after) = hedge_counts(&daemons[0]);
+  let delay_used_ns = delay_after
+    .saturating_sub(delay_before)
+    .checked_div(hedged_after.saturating_sub(hedged_before));
+  let readings = daemons[0].fleet_put_latency_range(object).ok().flatten();
   let manifest = daemons[0].fleet_head_manifest(object);
   let outcome = HedgeOutcome {
     measured,
     placed,
     placed_after,
     hedged,
+    delay_used_ns,
+    readings,
     hedge_holds: matches!(manifest, Ok(Some(manifest)) if daemons[hedge_index].fleet_holder_content(manifest) == Ok(true)),
     held_ns: hold.and_then(|done| done.answer()),
     after: daemons[0].fleet_put_latency(object),
@@ -9661,6 +9668,11 @@ struct HedgeOutcome {
   placed_after: Duration,
   /// Whether the owner sent a hedge round for the second seal while the first-round candidate was held.
   hedged: bool,
+  /// The hedge delay the owner held those rounds for, on average (`fleet.seal.hedge_delay_ns` over
+  /// `fleet.seal.hedged`), or none when it sent none.
+  delay_used_ns: Option<u64>,
+  /// The smallest and largest put-latency reading the owner held after the seal: its p95 lay between them.
+  readings: Option<(u64, u64)>,
   hedge_holds: bool,
   held_ns: Result<u64, ObserveError>,
   after: Result<(usize, Option<u64>), ObserveError>,
@@ -9668,14 +9680,23 @@ struct HedgeOutcome {
 
 /// How many hedge rounds `owner` has sent (`fleet.seal.hedged`), or none when it could not be read.
 fn seals_hedged(owner: &Daemon) -> u64 {
-  owner.fleet_refusals().map_or(0, |counters| {
-    counters.get("fleet.seal.hedged").copied().unwrap_or(0)
+  hedge_counts(owner).0
+}
+
+/// `owner`'s hedge rounds and the sum of the delays they were held for (`fleet.seal.hedged`,
+/// `fleet.seal.hedge_delay_ns`).
+fn hedge_counts(owner: &Daemon) -> (u64, u64) {
+  owner.fleet_refusals().map_or((0, 0), |counters| {
+    let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+    (of("fleet.seal.hedged"), of("fleet.seal.hedge_delay_ns"))
   })
 }
 
 /// The hedge history's assertions, on what a seal promises (§4.8 "hedged to the remaining candidates after the measured
-/// p95 put latency"): readings existed before the second seal; the owner sent a hedge round (`fleet.seal.hedged`), which
-/// it does only once its first round has gone the measured p95 without placing; and the seal placed, never hanging,
+/// p95 put latency"): readings existed before the second seal; the owner sent a hedge round (`fleet.seal.hedged`), held
+/// for a delay among its own put-latency readings, as its measured p95 is (`fleet.seal.hedge_delay_ns` against the
+/// window's range: counts, so no load moves them; a hedge held 300 s against readings of milliseconds passed before
+/// 2026-11-09); and the seal placed, never hanging,
 /// within the placement deadline, through whichever candidates acknowledged first. When it placed while the first-round
 /// candidate was still held (released at placement, before its ceiling), the hedge carried it: the hedged candidate holds
 /// the content and the put left further readings. A run so loaded that the hold reaches its ceiling releases the
@@ -9687,6 +9708,8 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     placed,
     placed_after,
     hedged,
+    delay_used_ns,
+    readings,
     hedge_holds,
     held_ns,
     after,
@@ -9694,8 +9717,8 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
   let hold_ns = HEDGE_STARVATION_NS;
   let placed_while_held = held_ns.as_ref().is_ok_and(|&held| held < hold_ns);
   eprintln!(
-    "hedge: measured before the hold {measured:?} (readings, p95 ns); hedged {hedged}; second seal placed after \
-     {placed_after:?}, held {held_ns:?} ns (placed while held: {placed_while_held}); readings after {after:?}"
+    "hedge: measured before the hold {measured:?} (readings, p95 ns); hedged {hedged} after a delay of \
+     {delay_used_ns:?} ns; second seal placed after {placed_after:?}, held {held_ns:?} ns (placed while held: {placed_while_held}); readings after {after:?}"
   );
   assert!(
     measured
@@ -9708,19 +9731,34 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     "the owner hedged the second seal once its first round went the measured p95 unplaced (held {held_ns:?} ns)"
   );
   assert!(
+    matches!((delay_used_ns, readings), (Some(delay), Some((low, high))) if (*low..=*high).contains(delay)),
+    "the hedge was held for the measured p95 put latency, which lies among the owner's readings: held {delay_used_ns:?} \
+     ns, readings from {readings:?} ns"
+  );
+  assert!(
     *placed,
     "the second seal placed within the placement deadline (after {placed_after:?}, held {held_ns:?} ns)"
   );
   if placed_while_held {
-    assert!(
-      hedge_holds,
-      "placed while the first-round candidate was held: the hedged candidate holds the content whole"
-    );
-    assert!(
-      matches!((after, measured), (Ok((count, _)), Ok((before, _))) if count > before),
-      "the hedged put left further readings: {measured:?} to {after:?}"
-    );
+    assert_the_hedge_carried_it(*hedge_holds, measured, after);
   }
+}
+
+/// Placed while the first-round candidate was held, the hedge carried the seal: the hedged candidate holds the content
+/// whole, and the hedged put left further readings than `measured` (`after`).
+fn assert_the_hedge_carried_it(
+  hedge_holds: bool,
+  measured: &Result<(usize, Option<u64>), ObserveError>,
+  after: &Result<(usize, Option<u64>), ObserveError>,
+) {
+  assert!(
+    hedge_holds,
+    "placed while the first-round candidate was held: the hedged candidate holds the content whole"
+  );
+  assert!(
+    matches!((after, measured), (Ok((count, _)), Ok((before, _))) if count > before),
+    "the hedged put left further readings: {measured:?} to {after:?}"
+  );
 }
 
 /// AC (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only differing

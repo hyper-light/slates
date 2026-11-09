@@ -2341,6 +2341,15 @@ impl Daemon {
     })
   }
 
+  /// The smallest and largest put-latency reading the owner shard of `object` holds for its content class, or `None`
+  /// before any: a hedge held for the measured p95 was held for a delay between them (test support).
+  pub fn fleet_put_latency_range(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<(u64, u64)>, ObserveError> {
+    self.observe(self.shard_of_object(object), |s| s.put_latency.range_ns())
+  }
+
   /// The **measured put latency** of the content class on the shard that owns `object` (§4.8 "Derived
   /// constants": "hedge delay = measured p95 put latency per class"): how many binding content
   /// acknowledgements that owner shard has timed, and their p95 in nanoseconds — the hedge trigger the next
