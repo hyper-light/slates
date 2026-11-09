@@ -6898,6 +6898,64 @@ mod tests {
     assert_eq!(counted, 1);
   }
 
+  /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved
+  /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
+  /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
+  /// the acceptors, routing and lineage, and restore them from the image; answer the successor's page. Expect: the
+  /// restored acceptor names the retired owner it moved from, and the page lists the copy.
+  #[test]
+  fn a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([43; 16]);
+    let (restored_from, departed, page) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      crate::fleet::reconcile_held_authority(state);
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let restored_from = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      (restored_from, departed, page)
+    });
+    assert_eq!(
+      restored_from,
+      Some(departed),
+      "the image kept the owner the copy moved from"
+    );
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the restored copy is listed: {page:?}"
+    );
+  }
+
   /// A-251 (b), shape (i) as one rule, the asker's own object: a copy under the asker's own authority, which no install
   /// moved from the retired host's line, is never listed in the retired host's round, though the configuration names the
   /// asker its successor there too. Listing it would raise its fence to the round's epoch and could refuse the asker's
