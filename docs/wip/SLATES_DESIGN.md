@@ -5450,6 +5450,14 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-08, the location budget).** A forward that does not know its volume's owner repeats the read-only
+> location round for one liveness budget, counted in its own polls at the fleet's poll interval (`verbs::LOCATION_POLLS`),
+> not on the wall: a starved control shard polls late rather than running out of time, so a false death is no longer
+> refused for the machine's load. One round can itself wait a liveness budget for peers that do not answer, so the
+> operator's failover SLO caps the whole. A client of a genuinely stuck owner therefore waits up to that SLO (10 s by
+> default), where it was refused after about 1 s: measured with the peers stopped, 9 polls ended by the 10 s ceiling. A
+> refusal before a takeover can finish would be a false one, and the SLO is the stated bound for that takeover.
+
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
