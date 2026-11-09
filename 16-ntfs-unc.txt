@@ -1,0 +1,3 @@
+L2R:0 (as the step before left it): read 7 lines
+Local-to-remote symbolic link evaluation is: ENABLED
+L2R:1: read 7 lines
