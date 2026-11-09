@@ -1,0 +1,14 @@
+thread 'the_linux_kernel_nfsv4_client_mounts_and_works_a_volume' (6596) panicked at crates/server/tests/nfs_v4_kernel.rs:817:3:
+assertion `left == right` failed: the unlinked open file left no name behind (a silly rename's .nfs* would be here)
+  left: [".nfs000100000000000b00000001"]
+ right: []
+test the_linux_kernel_nfsv4_client_mounts_and_works_a_volume ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+exit 101
+thread 'nfsv4_opens_and_locks_survive_a_daemon_restart' (7181) panicked at crates/cli/tests/nfs_v4_restart.rs:271:3:
+assertion `left == right` failed: the file unlinked before the restart reports a link count of zero
+  left: 1
+ right: 0
+test nfsv4_opens_and_locks_survive_a_daemon_restart ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s
+exit 101
