@@ -11125,18 +11125,17 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
     .flatten()
 }
 
-/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
-/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
-/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
-/// matching §4.8's "never an empty success".
-fn recover_images(state: &mut ShardState) -> RecoveredImages {
+/// The shard's journal as a restart reads it from its slice of the anchor content object (§4.8, A-68): the committed
+/// checkpoint with every valid delta after it applied, and the journal positioned after them; `None` without a content
+/// object or a slice in it.
+fn read_journal(
+  state: &ShardState,
+) -> Option<Result<(Option<ShardImage>, slates_vfs::checkpoint_log::Journal), slates_vfs::VfsError>> {
   let (start, end) = state.content_range;
   let (delta_start, delta_end) = state.delta_range;
-  let Some(object) = &state.content else {
-    return RecoveredImages::default();
-  };
+  let object = state.content.as_ref()?;
   if end <= start || end > object.len() {
-    return RecoveredImages::default();
+    return None;
   }
   let checkpoints = ContentView {
     object,
@@ -11153,7 +11152,32 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
       0
     },
   };
-  match slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log) {
+  Some(slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log))
+}
+
+/// Test support (A-251's oracle): whether the held pieces a restart would read from this shard's committed journal are
+/// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
+/// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
+pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
+  let committed = match read_journal(state) {
+    Some(Ok((Some(shard), _))) => shard.held,
+    Some(Ok((None, _))) | None => Vec::new(),
+    Some(Err(_)) => return false,
+  };
+  let mut held = crate::content_holder::held_image(state);
+  held.sort_by_key(|piece| piece.key);
+  committed == held
+}
+
+/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
+/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
+/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
+/// matching §4.8's "never an empty success".
+fn recover_images(state: &mut ShardState) -> RecoveredImages {
+  let Some(recovered) = read_journal(state) else {
+    return RecoveredImages::default();
+  };
+  match recovered {
     Ok((Some(shard), journal)) => {
       state.journal = journal;
       state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();

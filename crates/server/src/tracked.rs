@@ -98,6 +98,13 @@ impl<K: Ord + Copy, V> Tracked<K, V> {
     self.map.values_mut()
   }
 
+  /// Test support: drops every entry, as a restart's state begins; marks every key it held changed.
+  #[cfg(test)]
+  pub(crate) fn clear(&mut self) {
+    self.changed.extend(self.map.keys().copied());
+    self.map.clear();
+  }
+
   /// The keys reached mutably since the last [`Tracked::clear_changed`], held or since dropped, in order.
   pub(crate) fn changed(&self) -> &BTreeSet<K> {
     &self.changed

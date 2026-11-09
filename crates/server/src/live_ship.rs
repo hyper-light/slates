@@ -358,6 +358,30 @@ impl Held {
   }
 }
 
+#[cfg(test)]
+impl Held {
+  /// Test support (A-251's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
+  pub(crate) fn for_test(owner: HostId, object: ObjectId, first: u64) -> Held {
+    Held {
+      replica: Replica::new(owner, object),
+      entries: VecDeque::new(),
+      bytes: 0,
+      first,
+    }
+  }
+
+  /// Test support: keeps `payload` after the last entry, as an accepted entry is kept.
+  pub(crate) fn push_for_test(&mut self, payload: Vec<u8>) {
+    self.bytes = self.bytes.saturating_add(payload.len());
+    self.entries.push_back(payload);
+  }
+
+  /// Test support: drops every entry, as a whole entry or an install does.
+  pub(crate) fn clear_for_test(&mut self) {
+    self.clear_entries();
+  }
+}
+
 /// The node's live-shipping state, on every shard: the volumes this shard owns and ships, and (on the control shard)
 /// what this node holds for others.
 #[derive(Debug, Default)]

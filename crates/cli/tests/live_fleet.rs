@@ -2023,7 +2023,8 @@ fn a_candidates_copy_survives_its_own_daemons_restart() {
 /// takeover begins, since X, which leads the council, never condemns the owner. It was already stopped when X came back,
 /// so X's failure detector holds no entry for it and X keeps it a member (GAPS, "a restarted council leader").
 #[test]
-#[ignore = "a restarted council leader never condemns a member that died during its restart (GAPS)"]
+#[ignore = "since main's per-host principals, a survivor refuses the taken-over volume's reads NotShared: its owner is the \
+            creator's host (raft-7 A/B, 3 of 3 with and without the incremental held image; reported to the supervisor)"]
 fn a_candidates_restored_copy_serves_its_owners_takeover() {
   restart_flow(true);
 }
@@ -3412,31 +3413,6 @@ fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
 /// The pid of `instance`'s daemon, as its `status` reports it (under an anchor, the anchor's child).
 fn daemon_pid_of(instance: &str) -> String {
   value_of(&run_ready(instance, &["status"]), "pid")
-}
-
-/// Sends the signal `flag` (`-STOP`, `-CONT`, `-KILL`) to the process `pid`.
-fn signal_pid(pid: &str, flag: &str) {
-  let sent = Command::new("kill").args([flag, pid]).status().unwrap();
-  assert!(sent.success(), "kill {flag} {pid}");
-}
-
-/// Restarts `instance`'s daemon as a crash does, its anchor kept (a warm restart): kills the daemon's process (SIGKILL)
-/// and waits until its replacement answers.
-fn restart_warm(instance: &str) {
-  let pid = daemon_pid_of(instance);
-  signal_pid(&pid, "-KILL");
-  let started = Instant::now();
-  loop {
-    let (code, out, _) = run(instance, &["status"]);
-    if code == 0 && value_of(&out, "pid") != pid {
-      return;
-    }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "the anchor replaced {instance}'s daemon"
-    );
-    pause();
-  }
 }
 
 /// §4.8 "Promotion and takeover" across a voter's warm restart: do write a live volume's files (held by the owner and

@@ -2244,13 +2244,24 @@ fn streamed_shard(store: &mut Store) -> StreamedShard {
       reply: b"r4".to_vec(),
     },
   ];
-  (volumes, b"held replica image bytes".to_vec(), replies)
+  // Two held pieces (A-251), out of key order, so the streamed encoder's sort is compared too.
+  let held = vec![
+    slates_vfs::recover::HeldPiece {
+      key: [7; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"a later held piece".to_vec(),
+    },
+    slates_vfs::recover::HeldPiece {
+      key: [2; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"an earlier held piece".to_vec(),
+    },
+  ];
+  (volumes, held, replies)
 }
 
-/// A streamed shard's volumes by key, its held bytes and its replies.
+/// A streamed shard's volumes by key, its held pieces and its replies.
 type StreamedShard = (
   Vec<([u8; 16], Volume)>,
-  Vec<u8>,
+  Vec<slates_vfs::recover::HeldPiece>,
   Vec<slates_vfs::recover::HeldReply>,
 );
 
@@ -2266,7 +2277,7 @@ fn stream_into(
   slots: &mut Vec<u8>,
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -2293,7 +2304,7 @@ fn stream_into(
 fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &[slates_vfs::recover::HeldPiece],
   (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
@@ -2394,7 +2405,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &mut slots,
     &store,
     &volumes,
-    &held,
+    &mut held.clone(),
     (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
@@ -2436,7 +2447,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &mut slots,
     &store,
     &small_sorted,
-    &[],
+    &mut Vec::new(),
     (
       &mut Vec::new(),
       &mut Vec::new(),

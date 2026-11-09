@@ -2339,6 +2339,14 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-251): whether the held pieces this node's committed recovery journal carries are exactly what it
+  /// holds now (`crate::verbs::committed_held_agrees`), on the shard that holds for other owners.
+  pub fn held_journal_agrees(&self) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::verbs::committed_held_agrees(s)
+    })
+  }
+
   /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
   /// phase one would read from it.
   pub fn fleet_held_record(
@@ -6268,6 +6276,134 @@ mod tests {
     state
       .fleet
       .install_configuration(configuration, &regional.members);
+  }
+
+  /// One step of the held-pieces oracle's history (A-251): a change to what the shard holds, or a publication.
+  #[derive(Clone, Copy, Debug)]
+  enum HeldStep {
+    /// An entry kept after the last of live copy `copy` (made when it holds none).
+    Push(u8),
+    /// Live copy `copy`'s entries dropped, as a whole entry does.
+    Clear(u8),
+    /// Live copy `copy` let go.
+    Drop(u8),
+    /// A register record held for object `object`.
+    Hold(u8),
+    /// Object `object`'s register dropped.
+    Forget(u8),
+    /// A delta published: what `held_changes` carries, folded over the model.
+    Delta,
+    /// A checkpoint published: everything held.
+    Checkpoint,
+  }
+
+  /// A-251, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
+  /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
+  /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
+  /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
+  /// by a copy made again, or a key both put and removed fails here as a difference, before it is a record a restart
+  /// lost.
+  #[test]
+  fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
+    use proptest::strategy::Strategy;
+    let failures = audit_on_shard(|state| {
+      use slates_db::register::{Acceptor, Authority, HostId, ObjectId};
+      type Model = std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
+      let local = state.fleet.host();
+      let step = (0u8..7, 0u8..3).prop_map(|(kind, which)| match kind {
+        0 | 1 => HeldStep::Push(which),
+        2 => HeldStep::Clear(which),
+        3 => HeldStep::Drop(which),
+        4 => HeldStep::Hold(which),
+        5 => HeldStep::Forget(which),
+        _ if which == 0 => HeldStep::Checkpoint,
+        _ => HeldStep::Delta,
+      });
+      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
+        proptest::test_runner::Config {
+          cases: slates_test_seeds::cases(64),
+          ..proptest::test_runner::Config::default()
+        },
+      ));
+      // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
+      let cell = std::cell::RefCell::new(state);
+      let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {
+        let mut borrowed = cell.borrow_mut();
+        let state: &mut crate::state::ShardState = &mut borrowed;
+        state.holder_records.clear();
+        state.live.held.clear();
+        state.published_held = crate::content_holder::PublishedHeld::default();
+        crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+        let mut model: Model = Model::new();
+        let object = |which: u8| ObjectId([which.saturating_add(1); 16]);
+        for (at, step) in steps.iter().enumerate() {
+          match *step {
+            HeldStep::Push(which) => {
+              let first = state.live.slot_floor;
+              state
+                .live
+                .held
+                .entry(object(which))
+                .or_insert_with(|| crate::live_ship::Held::for_test(local, object(which), first))
+                .push_for_test(format!("entry {at}").into_bytes());
+            }
+            HeldStep::Clear(which) => {
+              if let Some(held) = state.live.held.get_mut(&object(which)) {
+                held.clear_for_test();
+              }
+            }
+            HeldStep::Drop(which) => {
+              state.live.held.remove(&object(which));
+            }
+            HeldStep::Hold(which) => {
+              state.holder_records.insert(
+                object(which),
+                Acceptor::new(
+                  local,
+                  Authority {
+                    generation: u64::try_from(at).unwrap(),
+                    owner: HostId(local.0 ^ 1),
+                  },
+                ),
+              );
+            }
+            HeldStep::Forget(which) => {
+              state.holder_records.remove(&object(which));
+            }
+            HeldStep::Delta => {
+              let changes = crate::content_holder::held_changes(state);
+              for piece in &changes.put {
+                proptest::prop_assert!(
+                  !changes.removed.contains(&piece.key),
+                  "step {at}: a key both put and removed"
+                );
+                model.insert(piece.key, piece.bytes.clone());
+              }
+              for key in &changes.removed {
+                model.remove(key);
+              }
+              crate::content_holder::held_committed(state, changes.whole, false);
+            }
+            HeldStep::Checkpoint => {
+              let image = crate::content_holder::held_image(state);
+              let whole = crate::content_holder::whole_of(&image);
+              model = image.into_iter().map(|piece| (piece.key, piece.bytes)).collect();
+              crate::content_holder::held_committed(state, whole, true);
+            }
+          }
+          if matches!(step, HeldStep::Delta | HeldStep::Checkpoint) {
+            let held: Model = crate::content_holder::held_image(state)
+              .into_iter()
+              .map(|piece| (piece.key, piece.bytes))
+              .collect();
+            proptest::prop_assert_eq!(&model, &held, "step {} ({:?}) of {:?}", at, step, steps);
+          }
+        }
+        Ok(())
+      });
+      outcome.err().map(|failure| format!("{failure}"))
+    });
+    assert_eq!(failures, None, "the folded held pieces equal what the shard holds");
   }
 
   /// §4.8 "Promotion and takeover", the f + 1 rule: do make the audit node the leader-to-be of a three-voter `f = 1`

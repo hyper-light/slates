@@ -277,7 +277,7 @@ fn main() {
           at,
           1,
           &mut [],
-          None,
+          (&mut [], &mut []),
           None,
           (&mut [], &mut []),
           (None, None),
@@ -294,7 +294,7 @@ fn main() {
         vol.encode_image_into(&store, None, &mut stream).unwrap();
         ShardImage::encode_finish(
           stream.buf(),
-          &[],
+          &mut Vec::new(),
           (
             &mut Vec::new(),
             &mut Vec::new(),
