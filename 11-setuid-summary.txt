@@ -1,0 +1,8 @@
+test a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+thread 'a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest' (7371) panicked at crates/cli/tests/guest_vhost.rs:1953:5:
+assertion `left == right` failed: a planted setuid-root program runs as nobody in qemu
+PROBE euid 0
+  left: Ran { euid: 0 }
+ right: Ran { euid: 65534 }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 1.42s
+exit 101
