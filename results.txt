@@ -1,0 +1,146 @@
+leg killed-x86, 4 CPUs, Mon Nov  9 22:59:51 UTC 2026, tree 3ca0ec78de097e51b67bd58f37e846cb8835e954
+== release build exit 0
+   r1     Finished `release` profile [optimized] target(s) in 0.10s
+   r1      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r1 chaos a candidate killed mid-stream: candidate chaos-killed-a-6453 killed at 163.698783ms; successor daemon 6665 answered at 227.107529ms
+   r1 chaos a candidate killed mid-stream: the fleet rejoined at 467.511319ms
+   r1 chaos a candidate killed mid-stream: 259 writes, 259 acknowledged: p50 1032 us, p99 8382 us, p999 114187 us, max 114187 us; 1 over 50ms (sent+took): 0.00s+114ms
+   r1 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(258), durable: Some(258), owed: false, epoch: Some(1), identity: Some("934a1a2d06750bfd78b99739bfcda4e07c63dd8465d14ff6d18140f4e3f4395e"), fence: 1, holders: ["995787048108008487", "11437307859580918186"], moving_to: [], recorded: ["995787048108008487", "11437307859580918186"] }); candidates [So
+   r1 chaos a candidate killed mid-stream: 54 samples, 42 heads seen
+   r1 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 14.501405ms
+   r1 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-c-6453", 3.022592959s))
+   r1 chaos a candidate killed mid-stream:
+   r1   candidate chaos-killed-a-6453 killed at 163.698783ms; successor daemon 6665 answered at 227.107529ms
+   r1   the fleet rejoined at 467.511319ms
+   r1   259 writes, 259 acknowledged: p50 1032 us, p99 8382 us, p999 114187 us, max 114187 us; 1 over 50ms (sent+took): 0.00s+114ms
+   r1   converged: true: owner Some(LiveState { holding: false, head: Some(258), durable: Some(258), owed: false, epoch: Some(1), identity: Some("934a1a2d06750bfd78b99739bfcda4e07c63dd8465d14ff6d18140f4e3f4395e"), fence: 1, holders: ["995787048108008487", "11437307859580918186"], moving_to: [], recorded: ["995787048108008487", "11437307859580918186"] }); candidates [Some(LiveState { holding: true, head:
+   r1   Convergence: held
+   r1   54 samples, 42 heads seen
+   r1   Agreement: held
+   r1   NoLoss (owner): held
+   r1   recovered from the candidate's loss after a further 14.501405ms
+   r1   after the owner's loss: Some(("chaos-killed-c-6453", 3.022592959s))
+   r1   NoLoss (successor): held
+   r1   StaleNeverCommits (fences): held
+   r1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.91s
+== run 1 exit 0
+   r2     Finished `release` profile [optimized] target(s) in 0.10s
+   r2      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r2 chaos a candidate killed mid-stream: candidate chaos-killed-a-6771 killed at 254.748867ms; successor daemon 7096 answered at 318.54806ms
+   r2 chaos a candidate killed mid-stream: the fleet rejoined at 553.459946ms
+   r2 chaos a candidate killed mid-stream: 237 writes, 237 acknowledged: p50 1075 us, p99 9446 us, p999 201957 us, max 201957 us; 1 over 50ms (sent+took): 0.00s+202ms
+   r2 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(236), durable: Some(236), owed: false, epoch: Some(1), identity: Some("b2dd06feeaef4f43c9fb11a42c4c391b9bcb7ac90dbf0447de05bcdd75d2ef79"), fence: 1, holders: ["4270328582023168913", "17227264334518918291"], moving_to: [], recorded: ["4270328582023168913", "17227264334518918291"] }); candidates [
+   r2 chaos a candidate killed mid-stream: 59 samples, 42 heads seen
+   r2 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 15.644583ms
+   r2 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-a-6771", 4.099382074s))
+   r2 chaos a candidate killed mid-stream:
+   r2   candidate chaos-killed-a-6771 killed at 254.748867ms; successor daemon 7096 answered at 318.54806ms
+   r2   the fleet rejoined at 553.459946ms
+   r2   237 writes, 237 acknowledged: p50 1075 us, p99 9446 us, p999 201957 us, max 201957 us; 1 over 50ms (sent+took): 0.00s+202ms
+   r2   converged: true: owner Some(LiveState { holding: false, head: Some(236), durable: Some(236), owed: false, epoch: Some(1), identity: Some("b2dd06feeaef4f43c9fb11a42c4c391b9bcb7ac90dbf0447de05bcdd75d2ef79"), fence: 1, holders: ["4270328582023168913", "17227264334518918291"], moving_to: [], recorded: ["4270328582023168913", "17227264334518918291"] }); candidates [Some(LiveState { holding: true, hea
+   r2   Convergence: held
+   r2   59 samples, 42 heads seen
+   r2   Agreement: held
+   r2   NoLoss (owner): held
+   r2   recovered from the candidate's loss after a further 15.644583ms
+   r2   after the owner's loss: Some(("chaos-killed-a-6771", 4.099382074s))
+   r2   NoLoss (successor): held
+   r2   StaleNeverCommits (fences): held
+   r2 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.87s
+== run 2 exit 0
+   r3     Finished `release` profile [optimized] target(s) in 0.10s
+   r3      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r3 chaos a candidate killed mid-stream: candidate chaos-killed-b-7196 killed at 175.135221ms; successor daemon 7548 answered at 228.355897ms
+   r3 chaos a candidate killed mid-stream: the fleet rejoined at 372.425958ms
+   r3 chaos a candidate killed mid-stream: 178 writes, 178 acknowledged: p50 465 us, p99 125921 us, p999 163821 us, max 163821 us; 2 over 50ms (sent+took): 0.00s+126ms 0.18s+164ms
+   r3 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(177), durable: Some(177), owed: false, epoch: Some(1), identity: Some("982c31ed1a2f579f837c06632448cfc1b806380b921867c1c6730a493a5af3aa"), fence: 1, holders: ["3976525633430270461", "7712484511506248718"], moving_to: [], recorded: ["3976525633430270461", "7712484511506248718"] }); candidates [So
+   r3 chaos a candidate killed mid-stream: 43 samples, 16 heads seen
+   r3 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 9.692138ms
+   r3 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-b-7196", 2.008113659s))
+   r3 chaos a candidate killed mid-stream:
+   r3   candidate chaos-killed-b-7196 killed at 175.135221ms; successor daemon 7548 answered at 228.355897ms
+   r3   the fleet rejoined at 372.425958ms
+   r3   178 writes, 178 acknowledged: p50 465 us, p99 125921 us, p999 163821 us, max 163821 us; 2 over 50ms (sent+took): 0.00s+126ms 0.18s+164ms
+   r3   converged: true: owner Some(LiveState { holding: false, head: Some(177), durable: Some(177), owed: false, epoch: Some(1), identity: Some("982c31ed1a2f579f837c06632448cfc1b806380b921867c1c6730a493a5af3aa"), fence: 1, holders: ["3976525633430270461", "7712484511506248718"], moving_to: [], recorded: ["3976525633430270461", "7712484511506248718"] }); candidates [Some(LiveState { holding: true, head:
+   r3   Convergence: held
+   r3   43 samples, 16 heads seen
+   r3   Agreement: held
+   r3   NoLoss (owner): held
+   r3   recovered from the candidate's loss after a further 9.692138ms
+   r3   after the owner's loss: Some(("chaos-killed-b-7196", 2.008113659s))
+   r3   NoLoss (successor): held
+   r3   StaleNeverCommits (fences): held
+   r3 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.46s
+== run 3 exit 0
+   r4     Finished `release` profile [optimized] target(s) in 0.10s
+   r4      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r4 chaos a candidate killed mid-stream: candidate chaos-killed-b-7626 killed at 156.044207ms; successor daemon 7963 answered at 227.664125ms
+   r4 chaos a candidate killed mid-stream: the fleet rejoined at 378.53955ms
+   r4 chaos a candidate killed mid-stream: 309 writes, 309 acknowledged: p50 580 us, p99 5704 us, p999 114967 us, max 114967 us; 1 over 50ms (sent+took): 0.00s+115ms
+   r4 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(308), durable: Some(308), owed: false, epoch: Some(1), identity: Some("8788112a1cc1188f39610a1cbd519abc7d06f319bf01e8c1530c281cbbfc8d5f"), fence: 1, holders: ["6612544121384311465", "17674766243072709543"], moving_to: [], recorded: ["6612544121384311465", "17674766243072709543"] }); candidates [
+   r4 chaos a candidate killed mid-stream: 44 samples, 31 heads seen
+   r4 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 7.334808ms
+   r4 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-c-7626", 2.251479794s))
+   r4 chaos a candidate killed mid-stream:
+   r4   candidate chaos-killed-b-7626 killed at 156.044207ms; successor daemon 7963 answered at 227.664125ms
+   r4   the fleet rejoined at 378.53955ms
+   r4   309 writes, 309 acknowledged: p50 580 us, p99 5704 us, p999 114967 us, max 114967 us; 1 over 50ms (sent+took): 0.00s+115ms
+   r4   converged: true: owner Some(LiveState { holding: false, head: Some(308), durable: Some(308), owed: false, epoch: Some(1), identity: Some("8788112a1cc1188f39610a1cbd519abc7d06f319bf01e8c1530c281cbbfc8d5f"), fence: 1, holders: ["6612544121384311465", "17674766243072709543"], moving_to: [], recorded: ["6612544121384311465", "17674766243072709543"] }); candidates [Some(LiveState { holding: true, hea
+   r4   Convergence: held
+   r4   44 samples, 31 heads seen
+   r4   Agreement: held
+   r4   NoLoss (owner): held
+   r4   recovered from the candidate's loss after a further 7.334808ms
+   r4   after the owner's loss: Some(("chaos-killed-c-7626", 2.251479794s))
+   r4   NoLoss (successor): held
+   r4   StaleNeverCommits (fences): held
+   r4 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 4.73s
+== run 4 exit 0
+   r5     Finished `release` profile [optimized] target(s) in 0.10s
+   r5      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r5 chaos a candidate killed mid-stream: candidate chaos-killed-a-8045 killed at 174.158904ms; successor daemon 8257 answered at 231.075509ms
+   r5 chaos a candidate killed mid-stream: the fleet rejoined at 395.009363ms
+   r5 chaos a candidate killed mid-stream: 334 writes, 334 acknowledged: p50 566 us, p99 7032 us, p999 125188 us, max 125188 us; 1 over 50ms (sent+took): 0.00s+125ms
+   r5 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(333), durable: Some(333), owed: false, epoch: Some(1), identity: Some("ead2ddf5869abcc05fff2cf720873832c917497187efa1005678841dd482da0a"), fence: 1, holders: ["194260375549264236", "6593623025093662496"], moving_to: [], recorded: ["194260375549264236", "6593623025093662496"] }); candidates [Some
+   r5 chaos a candidate killed mid-stream: 48 samples, 36 heads seen
+   r5 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 13.594833ms
+   r5 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-c-8045", 4.351510229s))
+   r5 chaos a candidate killed mid-stream:
+   r5   candidate chaos-killed-a-8045 killed at 174.158904ms; successor daemon 8257 answered at 231.075509ms
+   r5   the fleet rejoined at 395.009363ms
+   r5   334 writes, 334 acknowledged: p50 566 us, p99 7032 us, p999 125188 us, max 125188 us; 1 over 50ms (sent+took): 0.00s+125ms
+   r5   converged: true: owner Some(LiveState { holding: false, head: Some(333), durable: Some(333), owed: false, epoch: Some(1), identity: Some("ead2ddf5869abcc05fff2cf720873832c917497187efa1005678841dd482da0a"), fence: 1, holders: ["194260375549264236", "6593623025093662496"], moving_to: [], recorded: ["194260375549264236", "6593623025093662496"] }); candidates [Some(LiveState { holding: true, head: S
+   r5   Convergence: held
+   r5   48 samples, 36 heads seen
+   r5   Agreement: held
+   r5   NoLoss (owner): held
+   r5   recovered from the candidate's loss after a further 13.594833ms
+   r5   after the owner's loss: Some(("chaos-killed-c-8045", 4.351510229s))
+   r5   NoLoss (successor): held
+   r5   StaleNeverCommits (fences): held
+   r5 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.04s
+== run 5 exit 0
+   r6     Finished `release` profile [optimized] target(s) in 0.10s
+   r6      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r6 chaos a candidate killed mid-stream: candidate chaos-killed-b-8340 killed at 272.114929ms; successor daemon 8612 answered at 336.605072ms
+   r6 chaos a candidate killed mid-stream: the fleet rejoined at 425.609635ms
+   r6 chaos a candidate killed mid-stream: 199 writes, 199 acknowledged: p50 819 us, p99 13637 us, p999 187342 us, max 187342 us; 1 over 50ms (sent+took): 0.01s+187ms
+   r6 chaos a candidate killed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(199), durable: Some(199), owed: false, epoch: Some(1), identity: Some("68d1fc84ab6de3a78bae7db22b4af0db7376ea00f4f4f8357d597346be5053b5"), fence: 1, holders: ["3076256133362993537", "16051857203883381625"], moving_to: [], recorded: ["3076256133362993537", "16051857203883381625"] }); candidates [
+   r6 chaos a candidate killed mid-stream: 39 samples, 25 heads seen
+   r6 chaos a candidate killed mid-stream: recovered from the candidate's loss after a further 7.058274ms
+   r6 chaos a candidate killed mid-stream: after the owner's loss: Some(("chaos-killed-b-8340", 2.017053434s))
+   r6 chaos a candidate killed mid-stream:
+   r6   candidate chaos-killed-b-8340 killed at 272.114929ms; successor daemon 8612 answered at 336.605072ms
+   r6   the fleet rejoined at 425.609635ms
+   r6   199 writes, 199 acknowledged: p50 819 us, p99 13637 us, p999 187342 us, max 187342 us; 1 over 50ms (sent+took): 0.01s+187ms
+   r6   converged: true: owner Some(LiveState { holding: false, head: Some(199), durable: Some(199), owed: false, epoch: Some(1), identity: Some("68d1fc84ab6de3a78bae7db22b4af0db7376ea00f4f4f8357d597346be5053b5"), fence: 1, holders: ["3076256133362993537", "16051857203883381625"], moving_to: [], recorded: ["3076256133362993537", "16051857203883381625"] }); candidates [Some(LiveState { holding: true, hea
+   r6   Convergence: held
+   r6   39 samples, 25 heads seen
+   r6   Agreement: held
+   r6   NoLoss (owner): held
+   r6   recovered from the candidate's loss after a further 7.058274ms
+   r6   after the owner's loss: Some(("chaos-killed-b-8340", 2.017053434s))
+   r6   NoLoss (successor): held
+   r6   StaleNeverCommits (fences): held
+   r6 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 5.38s
+== run 6 exit 0
