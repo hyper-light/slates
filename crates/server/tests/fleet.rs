@@ -13768,6 +13768,262 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
   );
 }
 
+/// §4.8 ("a restarted host rejoins as a new member and holds nothing until its generation and retained state are
+/// validated") and §4.16 owner-loss recovery, for a green whose owner restarted after its survivors had taken it over
+/// (the bug record of 2026-11-09, a superseded green owner was never told). Do: on a settled three-node fleet at `f = 1`
+/// whose nodes keep their state across a restart, make a green and commit version 1 from a work; then, with both holders
+/// withholding merge records, submit a second work, so version 2 is appended on the owner and its submit waits; stop the
+/// owner; lift the holders' fault; wait until a survivor has taken the green over; restart the former owner over its own
+/// segment. Expect the former owner to answer the green's head as its successor does (version 1, the head the takeover
+/// adopted: version 2 was never acknowledged) and to hold no submit waiting on the green. Under load a restart outlasts
+/// the survivors' failure detection and this happens inside
+/// [`a_version_appended_before_its_owner_restarted_commits_once_it_is_back`]: the former owner kept the green as its own
+/// and re-shipped records its holders refused `Unauthorized` every period for good (7,895 in 440 s).
+#[test]
+fn a_green_taken_over_while_its_owner_restarted_is_answered_as_its_successor_answers_it() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["stepdown-a", "stepdown-b", "stepdown-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("stepdown-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so its volumes' content survives the owner's restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(&format!("stepdown-{node}-{pid}"), profile, &configs[node])
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, second, staged) = green_at_version_one_with_a_staged_work(&mut client);
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  // The second submit appends version 2 and waits for its record, which the holders withhold: no answer comes.
+  let unanswered = client
+    .try_call(
+      &RequestBody::Submit {
+        work: second,
+        evidence: Vec::new(),
+      },
+      LIVENESS_BUDGET_NS.saturating_mul(2),
+    )
+    .is_err();
+  drop(client);
+  daemons.remove(0).stop();
+  let lifted: Vec<_> = daemons
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  let taken_over_by = successor_of(&daemons, green, 1);
+  let taken_over = taken_over_by.is_some();
+  let successor = taken_over_by.unwrap_or(0);
+  // The successor's head, as it holds it: version 1 placed, version 2 not (a client of the successor is another principal
+  // than the green's creator, A-237, so it is read on the daemon).
+  let successor_head = match (
+    daemons[successor].merge_record_placed(green, 1),
+    daemons[successor].merge_record_placed(green, 2),
+  ) {
+    (Ok(true), Ok(false)) => Ok(1),
+    other => Err(format!("{other:?}")),
+  };
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  // The former owner, asked by the green's creator (a client on that node, as before the restart).
+  let mut former_head = Err(Box::new(ReplyBody::Refused {
+    refusal: Refusal::BadRequest {
+      reason: "never asked".to_owned(),
+    },
+  }));
+  let agreed = poll_until(&all, PLACEMENT_DEADLINE, || {
+    former_head = head_on(&daemons[0], green);
+    Ok(former_head == Ok(1))
+  });
+  let awaiting_after = daemons[0].merge_awaiting(green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    staged,
+    Ok(()),
+    "version 1 committed and the second work's edit was declared"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' fault was set and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(unanswered, "the submit waited for its withheld record");
+  assert!(taken_over, "a survivor took the green over");
+  assert_eq!(
+    successor_head,
+    Ok(1),
+    "the successor adopted the head its holders held: version 1"
+  );
+  assert!(
+    agreed,
+    "the former owner answers the green's head as its successor does: {former_head:?} against {successor_head:?}"
+  );
+  assert_eq!(
+    awaiting_after,
+    Ok(0),
+    "the former owner holds no submit waiting on the green it lost"
+  );
+}
+
+/// Through `client` on the green's owner: creates a green, commits version 1 from a work with one edit at the quorum,
+/// and creates a second work with one edit of its own, unsubmitted. Returns the green, the second work and the replies
+/// that were not as expected, if any.
+fn green_at_version_one_with_a_staged_work(
+  client: &mut Client,
+) -> (VolumeId, VolumeId, Result<(), Vec<ReplyBody>>) {
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create green: {created:?}");
+  };
+  let mut unexpected = Vec::new();
+  let mut work_with_edit = |name: &str, path: &str, bytes: &[u8]| {
+    let created = client.call(&RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    });
+    let ReplyBody::WorkCreated { id: work, .. } = created else {
+      panic!("create work {name}: {created:?}");
+    };
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    });
+    if !matches!(edited, ReplyBody::Edited) {
+      unexpected.push(edited);
+    }
+    work
+  };
+  let first = work_with_edit("work", "f", b"hello");
+  let second = work_with_edit("second", "g", b"again");
+  let submitted = client.call(&RequestBody::Submit {
+    work: first,
+    evidence: Vec::new(),
+  });
+  if !matches!(
+    submitted,
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ) {
+    unexpected.push(submitted);
+  }
+  let staged = if unexpected.is_empty() {
+    Ok(())
+  } else {
+    Err(unexpected)
+  };
+  (green, second, staged)
+}
+
+/// Which of `survivors` took `green` over: the first to hold it placed at `version` as its owner within the placement
+/// deadline (a holder reports no placed version), or `None`.
+fn successor_of(survivors: &[Daemon], green: VolumeId, version: u64) -> Option<usize> {
+  let mut successor = None;
+  poll_until(
+    &survivors.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      for (index, survivor) in survivors.iter().enumerate() {
+        if survivor.merge_record_placed(green, version)? {
+          successor = Some(index);
+          return Ok(true);
+        }
+      }
+      Ok(false)
+    },
+  );
+  successor
+}
+
+/// The head version of `green` as `node` answers it.
+fn head_on(node: &Daemon, green: VolumeId) -> Result<u64, Box<ReplyBody>> {
+  let mut client = Client::connect(node.instance());
+  match client
+    .try_call(&RequestBody::Versions { green }, *DEADLINE_NS)
+    .unwrap_or_else(|e| refused_placeholder(&e))
+  {
+    ReplyBody::Versions { head } => Ok(head),
+    other => Err(Box::new(other)),
+  }
+}
+
 /// §4.16 "Commit" (AUD-11) and §4.9 exactly-once across the owner's restart (the bug record of 2026-11-07, a submit
 /// resent after its owner restarted was applied twice). Goal 4's primary-kill rung found 83 versions on the green that
 /// no client was told, and their clients told later versions: a submit whose version was appended before the crash, and
