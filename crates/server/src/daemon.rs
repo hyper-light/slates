@@ -1066,6 +1066,37 @@ impl Daemon {
     }
   }
 
+  /// Test support: makes this node forget `object`'s routing and its retired owner's record on its control shard, as a
+  /// holder restored from a warm restart did before A-250
+  /// (`docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md`): its takeover pages, and as a successor
+  /// its own learning, leave the copy out, and only a question by name (A-251) reaches it. `Ok` once done, else the
+  /// typed refusal.
+  pub fn forget_object_routing(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.fleet.forget_object(object);
+      s.departed_owners.remove(&object);
+    })
+  }
+
+  /// Test support: the highest ledger position this node holds of `object`, read from its own records with no routing
+  /// in the way; `None` when it holds none. The typed refusal when the control shard could not answer.
+  pub fn held_position(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let (_, positions) = s.holder_records.get(&object)?.persisted();
+      positions
+        .into_iter()
+        .filter(|(held, _, _, _)| *held == object)
+        .map(|(_, sequence, _, _)| sequence)
+        .max()
+    })
+  }
+
   /// Test support: makes this node, as a holder, refuse every register record from `owners` — no
   /// acknowledgement, counted `fleet.record.refused_by_fault` — as a holder that never received them would,
   /// while the owners' council and report traffic on the same sessions still flows; so a test keeps a head off
