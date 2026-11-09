@@ -44,7 +44,6 @@ use std::os::windows::io::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
-use std::thread::JoinHandle;
 
 use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
@@ -279,13 +278,14 @@ enum Op<T> {
     object: T,
     new_size: u64,
   },
-  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
-  /// time (A-209, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
+  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification, change or
+  /// birth time (A-209 and A-259, `t/base/06.t`).
   SetTimes {
     object: T,
     atime: Option<i64>,
     mtime: Option<i64>,
     ctime: Option<i64>,
+    btime: Option<i64>,
   },
   /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
   /// deletion. A directory with any child refuses (A-209, `t/base/03.t`): the delete itself runs in Cleanup, which
@@ -644,11 +644,13 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       atime,
       mtime,
       ctime,
+      btime,
     } => Op::SetTimes {
       object: ledger.get(object)?,
       atime,
       mtime,
       ctime,
+      btime,
     },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
@@ -720,7 +722,7 @@ fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
     reparse_tag: 0,
     allocation_size: attr.size,
     file_size: attr.size,
-    creation_time: filetime_from_unix_ns(attr.ctime),
+    creation_time: filetime_from_unix_ns(attr.btime),
     last_access_time: filetime_from_unix_ns(attr.atime),
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
@@ -877,6 +879,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       atime,
       mtime,
       ctime,
+      btime,
     } => op_set_times(
       bridge,
       cx,
@@ -885,6 +888,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
         atime,
         mtime,
         ctime,
+        btime,
         ..SetAttr::default()
       },
     )?,
@@ -1603,14 +1607,14 @@ extern "C" fn set_basic_info(
   fs: *mut FileSystem,
   context: Pvoid,
   _file_attributes: u32,
-  _creation_time: u64,
+  creation_time: u64,
   last_access_time: u64,
   last_write_time: u64,
   change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // The access, write and change times are applied (A-209); the attribute bits and the creation time are not kept by
-  // the volume (A-209's stated differences), and the object's live info is returned so the caller sees what it holds.
+  // The creation, access, write and change times are applied (A-209, A-259); the attribute bits are not kept by the
+  // volume (A-209's stated difference), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1619,6 +1623,7 @@ extern "C" fn set_basic_info(
     atime: crate::unix_ns_from_filetime(last_access_time),
     mtime: crate::unix_ns_from_filetime(last_write_time),
     ctime: crate::unix_ns_from_filetime(change_time),
+    btime: crate::unix_ns_from_filetime(creation_time),
   }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.
@@ -2182,7 +2187,9 @@ pub enum Outcome {
 pub struct MountThread {
   commands: Option<SyncSender<Command>>,
   outcomes: Receiver<Outcome>,
-  thread: Option<JoinHandle<()>>,
+  /// Joined on the mount's shard, which is marked as waiting on it meanwhile (A-228's transitive wait). Boxed: a mount
+  /// thread is handed back inside refusals, which stay small.
+  thread: Option<Box<slates_rt::registry::WaitedThread<()>>>,
 }
 
 impl MountThread {
@@ -2200,9 +2207,9 @@ impl MountThread {
     let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
     let (outcome_tx, outcomes) = sync_channel::<Outcome>(OUTCOME_BOUND);
     let mount_point = mount_point.to_owned();
-    let thread = std::thread::Builder::new()
-      .name("slates-winfsp".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-winfsp".to_owned()),
+      move || {
         run_mount(
           &mount_point,
           read_only,
@@ -2212,12 +2219,13 @@ impl MountThread {
           open_bound,
           inherited,
         );
-      })
-      .map_err(|_| WinFspError::MountThread)?;
+      },
+    )
+    .map_err(|_| WinFspError::MountThread)?;
     Ok(MountThread {
       commands: Some(commands),
       outcomes,
-      thread: Some(thread),
+      thread: Some(Box::new(thread)),
     })
   }
 

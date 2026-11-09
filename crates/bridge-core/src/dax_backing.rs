@@ -1096,8 +1096,9 @@ pub fn write_back_slice(
 /// the end, a capped call lost a guest's stores past it at an ingest and zeroed its map past it at a refill, on every
 /// machine whose copy slice is longer than the cap
 /// (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`). Bounded by `len`: each call reads
-/// at least a byte or ends the loop.
-fn read_whole(
+/// at least a byte or ends the loop. Also what a cache write-back's stale bytes are compared with (A-248, the FUSE
+/// transports' `judge_writeback` reader).
+pub fn read_whole(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,

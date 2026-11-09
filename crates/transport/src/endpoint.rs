@@ -113,6 +113,8 @@ const HANDSHAKE_TURN_CEILING: usize = 16;
 /// the handshake yields an RTT sample), so this covers a peer that boots many seconds after this node first
 /// dials it — a fleet forms as its nodes come up one after another — while still terminating on a peer that
 /// never answers.
+/// It bounds only waits paced by this end's own timer, so load cannot spend it; a peer's resends are bounded by
+/// [`Endpoint::handshake_deadline`] instead (a count of them ended handshakes with live dialers, 2026-11-08).
 /// Shape: it caps only the failure-and-formation path (a healthy handshake completes in its first few turns
 /// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
 /// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
@@ -182,6 +184,13 @@ pub enum EndpointError {
   Closed,
   /// The authenticated peer exceeded its session reservation, or admission capacity is invalid.
   Admission(crate::demux::SessionRefusal),
+  /// The accepting end abandoned the handshake and said so in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3): its half is gone, so the dialer dials afresh at once rather than waiting out its deadline.
+  PeerClosed,
+  /// The peer no longer holds this session and said so in a stateless reset ending in the token it issued for it
+  /// (RFC 9000 §10.3; `crate::reset`, A-261): it restarted under the same identity. The session is drained: every
+  /// later use refuses the same, and the caller dials afresh at once rather than waiting out its own timers.
+  PeerReset,
   /// This end's handshake flight exceeds the largest flight the fragmenter carries
   /// (`crate::flight::MAX_FLIGHT_BYTES`): a certificate chain beyond a generous bound. Refused here,
   /// typed, before a byte leaves. Below that a flight of any size crosses as fragments each fitting the
@@ -486,6 +495,18 @@ pub struct Endpoint {
   handshake_budgets_spent: u32,
   /// Why the last `establish` ended `NotReady`; `None` before any did, and once one succeeds.
   handshake_stall: Option<HandshakeStall>,
+  /// Closes sent on abandoning a handshake ([`Endpoint::close_abandoned_handshake`]).
+  closes_sent: u64,
+  /// The key this end's stateless reset tokens are made with (`crate::reset`), from its identity; `None` when it could
+  /// not be derived, and then this end issues no token and answers nothing with a reset.
+  reset_key: Option<crate::reset::ResetKey>,
+  /// Whether the peer reset the session ([`EndpointError::PeerReset`]): once set, the session is drained.
+  reset_heard: bool,
+  /// When this end, on its own socket, last answered a packet for another session with a stateless reset: at most one
+  /// per initial probe timeout ([`Endpoint::answer_stray`]).
+  reset_answered_at: Option<u64>,
+  /// Stateless resets this end sent from its own socket.
+  resets_sent: u64,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -568,6 +589,11 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
+      reset_key: identity.reset_key(),
+      reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -616,6 +642,11 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
+      reset_key: identity.reset_key(),
+      reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -666,6 +697,11 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
+      closes_sent: 0,
+      reset_key: on.reset_key(),
+      reset_heard: false,
+      reset_answered_at: None,
+      resets_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -739,6 +775,14 @@ impl Endpoint {
     self
       .conn
       .enable_path_mtu(usize::try_from(peer_params.max_udp_payload).unwrap_or(usize::MAX));
+    // Each end tells a peer that reads it the token its stateless resets of this session will end in (A-261), inside
+    // the session, once. The accepting end's is the one that matters: its address outlives its restart. A dialer's
+    // serves only the rare restart that rebinds its old port.
+    if peer_params.reads_reset_tokens
+      && let Some(key) = &self.reset_key
+    {
+      self.conn.issue_reset_token(key.token(&cid));
+    }
     Ok(cid)
   }
 
@@ -823,10 +867,47 @@ impl Endpoint {
     self.conn.rtt().smoothed_rtt()
   }
 
+  /// Whether the peer reset this session ([`EndpointError::PeerReset`]): it is drained, and its owner dials afresh.
+  pub fn peer_reset(&self) -> bool {
+    self.reset_heard
+  }
+
+  /// Whether the peer has issued this end the token its stateless resets of the session end in (`crate::reset`): held
+  /// once the peer's first packets after the handshake arrive.
+  pub fn holds_reset_token(&self) -> bool {
+    self.conn.peer_reset_token().is_some()
+  }
+
   /// The probe timeout this end would arm to recover a tail loss (RFC 9002 §6.2.1), from the estimated
   /// RTT; before any sample, twice the initial RTT. (Driving a timed receive from it is owed.)
   pub fn pto(&self) -> u64 {
     self.conn.rtt().pto(0)
+  }
+
+  /// How long this session may hear nothing from its peer, while it owes an answer, before its own loss detection
+  /// takes the path for gone: RFC 9002 §7.6.1's persistent-congestion duration, three probe timeouts each floored at
+  /// the initial one
+  /// ([`RttEstimator::persistent_congestion_duration_floored`](crate::rtt::RttEstimator::persistent_congestion_duration_floored)).
+  /// The dialect negotiates no `max_ack_delay` (zero): a peer acknowledges on its next flush.
+  pub fn persistent_congestion_duration(&self) -> u64 {
+    self.conn.rtt().persistent_congestion_duration_floored(0)
+  }
+
+  /// How long the peer has owed this end an answer and given none, now
+  /// ([`Connection::peer_silence`](crate::connection::Connection::peer_silence)); `None` while nothing is owed.
+  pub fn peer_silence_ns(&self) -> Option<u64> {
+    self.conn.peer_silence(now_ns())
+  }
+
+  /// Whether the peer has been silent past its duration: this end sent an ack-eliciting packet, and nothing that opened
+  /// under the session's keys has come back for the longer of `floor_ns` and
+  /// [`persistent_congestion_duration`](Endpoint::persistent_congestion_duration). The one judgement of a dead session
+  /// for every caller that must end an exchange before its deadline (the live lane's watch, the forward lane). A peer
+  /// whose answers a queue holds back is not judged dead: its probe timeout grows with the delay its answers reveal.
+  pub fn peer_silent_past(&self, floor_ns: u64) -> bool {
+    self
+      .peer_silence_ns()
+      .is_some_and(|silence| silence >= floor_ns.max(self.persistent_congestion_duration()))
   }
 
   /// The next packet number the connection will assign — its packet-number cursor, monotonic across
@@ -871,10 +952,55 @@ impl Endpoint {
     self.handshake_stall
   }
 
-  /// Records why this handshake is giving up, and the typed refusal that says so.
+  /// Records why this handshake is giving up, and the typed refusal that says so. An accepting end also tells its peer.
   fn stalled(&mut self, why: HandshakeStall) -> EndpointError {
     self.handshake_stall = Some(why);
+    self.close_abandoned_handshake();
     EndpointError::NotReady
+  }
+
+  /// An accepting end abandoning its handshake tells its dialer, in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3), so the dialer redials within a round trip instead of waiting out a 22 s deadline on state that is gone.
+  /// Only once it holds those keys: before them it has answered nothing, and an unprotected close at the Initial level
+  /// is not sent, since a stranger could forge one and cost the dialer its socket. A dialer sends none: it may yet retry on
+  /// this socket. Within the anti-amplification allowance (RFC 9000 §8.1), which a received flight leaves ample.
+  fn close_abandoned_handshake(&mut self) {
+    if self.quic.is_client() {
+      return;
+    }
+    let Some(keys) = self.levels.keys.as_ref() else {
+      return;
+    };
+    let Ok(close) = crate::flight::seal_close(keys.local.packet.as_ref(), &mut self.levels.numbers)
+    else {
+      return;
+    };
+    if let Some(account) = self.amplification.as_mut()
+      && !account.allow(close.len())
+    {
+      self.amplification_holds = self.amplification_holds.saturating_add(1);
+      return;
+    }
+    if self.send(&close).is_ok() {
+      self.closes_sent = self.closes_sent.saturating_add(1);
+    }
+  }
+
+  /// Whether `datagram`, from this end's peer, is a close sealed under the Handshake keys: the peer abandoned.
+  fn is_peer_close(&self, datagram: &[u8], from: SocketAddrV4) -> bool {
+    from == self.peer
+      && crate::flight::is_sealed_close(datagram)
+      && self
+        .levels
+        .keys
+        .as_ref()
+        .is_some_and(|keys| crate::flight::open_close(datagram, keys.remote.packet.as_ref()))
+  }
+
+  /// Closes this end sent to a dialer on abandoning its handshake: a non-vacuity counter for
+  /// [`Self::close_abandoned_handshake`].
+  pub fn closes_sent(&self) -> u64 {
+    self.closes_sent
   }
 
   /// How many handshake budgets this end has spent without establishing: zero once established, one more
@@ -972,9 +1098,19 @@ impl Endpoint {
     // per retransmit the budget allows.
     let mut partial = 0usize;
     let mut backoff = GRANULARITY_NS;
+    // A peer that keeps resending a flight this end has already answered is bounded by time, not by how often it
+    // resends: its retransmits are load's to spend, and a count of them ended handshakes with a live dialer inside a
+    // second or two (`fleet.accept.stall.repeats`, a 41.9 s formation at load 170, 2026-11-08). This end answers such a
+    // resend at the pace of its own backoff, not once per datagram.
+    let deadline = self.handshake_deadline();
+    let mut resend_after = 0u64;
+    let mut resend_backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => match self.receive_handshake(datagram, from) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
@@ -989,16 +1125,41 @@ impl Endpoint {
             backoff = GRANULARITY_NS;
             continue;
           }
-          // The peer retransmitted a flight this end already consumed (its reply raced this end's):
-          // it is still asking, so resend this end's flight; not re-fed to `read_hs`. Counted, so a
-          // flood cannot loop forever (banned item 8).
+          // The peer retransmitted a flight this end already consumed (its reply raced this end's): it is still asking,
+          // so resend this end's flight at this end's own pace. Not re-fed to `read_hs`. Bounded by the turn's deadline
+          // in time and by the datagram bound in work (banned item 8).
           crate::flight::Reassembly::Repeat => {
-            attempts = attempts.saturating_add(1);
-            if attempts > MAX_HANDSHAKE_RETRANSMITS {
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
+            }
+            let now = now_ns();
+            if now >= deadline {
               return Err(self.stalled(HandshakeStall::Repeats));
             }
-            if !last_flight.is_empty() {
-              self.resend_flight(last_flight)?;
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
+            }
+            continue;
+          }
+          // A later fragment of that same retransmit is as much a sign the peer is asking as its first, which a
+          // constrained path may have dropped: it is answered at the same pace, and bounded with the others.
+          crate::flight::Reassembly::RepeatRest => {
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
+            }
+            let now = now_ns();
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
             }
             continue;
           }
@@ -1059,7 +1220,7 @@ impl Endpoint {
   async fn confirm_as_client(&mut self, last_flight: &Flight) -> Result<(), EndpointError> {
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
@@ -1068,6 +1229,9 @@ impl Endpoint {
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
@@ -1120,7 +1284,7 @@ impl Endpoint {
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
@@ -1169,9 +1333,9 @@ impl Endpoint {
     }
   }
 
-  /// Derived: confirmation permits at most the existing retry count plus the first attempt,
-  /// each no longer than the initial PTO. Traffic cannot renew that absolute budget (AUD-18).
-  fn confirmation_deadline(&self) -> u64 {
+  /// Derived: the absolute deadline of one wait in the handshake, a turn's or the confirmation's: at most the retransmit
+  /// count plus the first attempt, each no longer than the initial PTO, about 22 s. Traffic cannot renew it (AUD-18).
+  fn handshake_deadline(&self) -> u64 {
     slates_rt::futures::now_ns().saturating_add(
       self
         .handshake_probe_ceiling()
@@ -1479,9 +1643,12 @@ impl Endpoint {
   /// [`drive`]: Endpoint::drive
   /// [`settle`]: Endpoint::settle
   async fn receive_and_ingest(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
+    if self.reset_heard {
+      return Err(EndpointError::PeerReset);
+    }
     match self.recv_within(timeout_ns).await? {
-      Some((datagram, _from)) => {
-        self.fold_or_discard(&datagram)?;
+      Some((datagram, from)) => {
+        self.fold_or_discard(&datagram, from)?;
         Ok(true)
       }
       None => Ok(false),
@@ -1495,7 +1662,7 @@ impl Endpoint {
   /// does not open under the keys, is dropped as RFC 9000 §12.2 has it, never fatal to the session. Only
   /// a decoded packet whose frames are malformed (the peer broke the protocol), a closed session, or a
   /// socket refusal end the exchange.
-  fn fold_or_discard(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+  fn fold_or_discard(&mut self, datagram: &[u8], from: SocketAddrV4) -> Result<(), EndpointError> {
     if !is_short_header(datagram) {
       self.discarded = self.discarded.saturating_add(1);
       // At most one answer per probe timeout: repeated raw traffic — a peer's retransmits, or a flood from
@@ -1521,11 +1688,61 @@ impl Endpoint {
     match self.ingest(datagram) {
       Ok(()) => Ok(()),
       Err(EndpointError::Header | EndpointError::Tls(_) | EndpointError::NotReady) => {
+        // A datagram that is not this session's packet may be the peer's stateless reset (RFC 9000 §10.3.1): it is
+        // one only if it ends in the token the peer issued inside the session. One that ends in anything else is
+        // discarded like any other stray.
+        if self
+          .conn
+          .peer_reset_token()
+          .is_some_and(|token| crate::reset::is_reset(datagram, &token))
+        {
+          self.reset_heard = true;
+          return Err(EndpointError::PeerReset);
+        }
         self.discarded = self.discarded.saturating_add(1);
+        self.answer_stray(datagram, from);
         Ok(())
       }
       Err(other) => Err(other),
     }
+  }
+
+  /// Answers a short-header packet that names another session with a stateless reset (RFC 9000 §10.3: any endpoint
+  /// may answer a packet it cannot associate), when this end has its own socket: a process restarted onto the port an
+  /// old session's dialer held is then heard by that session's accepting end within a round trip. On a shared socket
+  /// the demultiplexer decides (it never resets a source with a session there). At most one per initial probe
+  /// timeout, shorter than its trigger; a packet naming this session, or one too short to answer, draws none.
+  fn answer_stray(&mut self, datagram: &[u8], from: SocketAddrV4) {
+    let Link::Own(socket) = &self.link else {
+      return;
+    };
+    let (Some(key), Some(id)) = (&self.reset_key, connection_id_of(datagram)) else {
+      return;
+    };
+    if !is_short_header(datagram) || self.cid == Some(id) {
+      return;
+    }
+    let now = now_ns();
+    if self
+      .reset_answered_at
+      .is_some_and(|at| now.saturating_sub(at) < self.conn.rtt().initial_pto())
+    {
+      return;
+    }
+    let Some(reset) = crate::reset::reset_datagram(&key.token(&id), datagram.len(), |out| {
+      crate::handshake::secure_random(out).is_ok()
+    }) else {
+      return;
+    };
+    self.reset_answered_at = Some(now);
+    if socket.send_to(&reset, from).is_ok() {
+      self.resets_sent = self.resets_sent.saturating_add(1);
+    }
+  }
+
+  /// Stateless resets this end sent from its own socket ([`Endpoint::answer_stray`]).
+  pub fn resets_sent(&self) -> u64 {
+    self.resets_sent
   }
 
   /// Folds one received datagram into the connection: reconstructs its packet number against the persistent
@@ -2292,13 +2509,13 @@ mod tests {
         };
         let raw = crate::flight::fragment(&[2; 10], 0).unwrap().remove(0);
         for _ in 0..50 {
-          client.fold_or_discard(&raw).unwrap();
+          client.fold_or_discard(&raw, client.peer).unwrap();
         }
         let burst = client.fragments_sent();
         slates_rt::futures::sleep(client.handshake_probe_ceiling())
           .await
           .unwrap();
-        client.fold_or_discard(&raw).unwrap();
+        client.fold_or_discard(&raw, client.peer).unwrap();
         let _ = sent.send((burst, client.fragments_sent()));
       })
       .unwrap();

@@ -770,6 +770,84 @@ fn a_stuck_start_is_killed_and_restarted() {
   );
 }
 
+/// The CPU the daemon of an anchor started with `shards` shards has run by the time it answers: what its start cost.
+#[cfg(unix)]
+fn start_cpu_ns(instance: &str, shards: usize) -> u64 {
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    instance,
+    &[],
+    &shards.to_string(),
+  );
+  await_serving(&mut stderr, instance, false);
+  let pid = await_daemon(instance, None, &[]);
+  let spent = slates_machine::process_clock::process_cpu(pid)
+    .map(|reading| reading.spent_ns)
+    .unwrap();
+  drop(anchor);
+  spent
+}
+
+/// A-228, §2.6 boot step 1: a start is judged by the watchdog's rule, one thread at a time, never by the sum of its threads.
+/// Do: measure what one shard adds to a start's CPU (a start of as many shards as the machine runs at once, less a start of
+/// one, over the shards between), then start an anchor with enough shards that their starts sum past three liveness
+/// windows. Expect: the daemon serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's
+/// summed CPU, held it to one window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio,
+/// though no thread came near a window.
+#[cfg(unix)]
+#[test]
+fn a_start_whose_shards_sum_past_a_window_comes_up() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the many-shard start: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let window = slates_server::daemon::LIVENESS_BUDGET_NS;
+  let at_once = std::thread::available_parallelism()
+    .map_or(2, usize::from)
+    .max(2);
+  let one = start_cpu_ns(&format!("cli-sum-one-{}", std::process::id()), 1);
+  let many = start_cpu_ns(&format!("cli-sum-many-{}", std::process::id()), at_once);
+  let per_shard = many.saturating_sub(one) / u64::try_from(at_once - 1).unwrap();
+  assert!(
+    per_shard > 0,
+    "a shard costs its start something: {one} ns, {many} ns"
+  );
+  let shards = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  eprintln!(
+    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {shards} shards sum past three windows"
+  );
+  let instance = format!("cli-sum-{}", std::process::id());
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    &instance,
+    &[],
+    &shards.to_string(),
+  );
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut kills = Vec::new();
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = std::io::BufRead::read_line(&mut stderr, &mut line).unwrap();
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    // Looked for anywhere in a line: the anchor's and the daemon's lines share one pipe and can arrive glued.
+    if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
+      break;
+    }
+    if line.contains(START_KILL_LINE) {
+      kills.push(line.trim_end().to_owned());
+    }
+  }
+  let served = line.contains(&serving_line);
+  drop(anchor);
+  assert!(
+    kills.is_empty() && served,
+    "a start of {shards} shards: served {served}, the anchor's start kills {kills:?}"
+  );
+}
+
 /// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
 
@@ -7654,10 +7732,17 @@ impl MappedThroughAMount {
   /// that leave a map's stores unsynced are.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fn sync_map(&mut self) {
-    // SAFETY: syncs exactly the live map made in `with_pages`.
-    let synced =
-      unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) };
+    let synced = self.try_sync_map();
     assert!(synced.is_ok(), "the map is flushed: {synced:?}");
+  }
+
+  /// Syncs the map, then its file: the first error either reports, as a program sees a refused write-back (A-248) at
+  /// its `msync` or its `fsync`.
+  #[allow(clippy::disallowed_methods)] // the test's own fsync of a file in a slates mount: RAM, not disk
+  fn try_sync_map(&mut self) -> Result<(), rustix::io::Errno> {
+    // SAFETY: syncs exactly the live map made in `with_pages`.
+    unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) }?;
+    rustix::fs::fsync(&self.file)
   }
 
   /// `map.bin` as slates itself holds it, read through the fixture's SDK client: no mount's cache in the way.
@@ -8024,17 +8109,18 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
   );
 }
 
-/// §4.6 cache posture, the mount route's dirty pages
-/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
-/// shared map leaves its page dirty in that mount's cache until the kernel writes it back — which is what a guest's DAX
-/// stores are on the host — and a write another path made meanwhile must not be undone by that write-back. Do: store a
-/// byte through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte
-/// the replacement's, in slates and in the map. Then store again, write other bytes of the same page through a second
-/// mount, sync. Expect both: the store and the second mount's bytes, as one shared page cache would hold them.
+/// §4.6 cache posture, the mount route's dirty pages (A-248, Ada's decision of 2026-11-07: "Refuse, like NFS";
+/// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
+/// shared map leaves its page dirty in that mount's cache until the kernel writes it back, which is what a guest's DAX
+/// stores are on the host, and a write another path made meanwhile must never be undone by that write-back. Since
+/// A-248 a write-back holding any stale byte that differs from the file is refused whole, `EIO`, which the program sees
+/// at its `msync` or `fsync`: never applied around the stale bytes, which was a merge (banned item 11). Do: store a byte
+/// through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte the
+/// replacement's and the sync refused. Then, once the map reads the replacement, store and sync (the control: applied
+/// whole). Then store again, write other bytes of the same page through a second mount, sync. Expect the file the
+/// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
-/// Linux only. On macOS an NFS v3 client cannot be told of the other write, and since A-192 the server refuses the dirty
-/// page's stale write-back: the replacement survives (the test after this one), but the store goes with the refusal,
-/// and keeping both, as the second half here does, would take a byte-level merge, which is banned.
+/// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
@@ -8046,29 +8132,43 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   let length = fixture.length;
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
-  fixture.sync_map();
+  let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
     "the later replacement survives the dirty page's write-back"
+  );
+  assert!(
+    stale_whole.is_err(),
+    "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
   );
   assert!(
     fixture.follows(b'S'),
     "the map reads the replacement within {WAIT_FOR:?}"
   );
   fixture.view()[10] = b'M';
-  let written = 100..200;
-  second.write_at(written.start, &vec![b'R'; written.len()]);
-  fixture.sync_map();
+  let fresh = fixture.try_sync_map();
   let mut expected = vec![b'S'; length];
   expected[10] = b'M';
+  assert!(
+    fresh.is_ok() && fixture.volume_bytes() == expected,
+    "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
+  );
+  fixture.view()[20] = b'N';
+  let written = 100..200;
+  second.write_at(written.start, &vec![b'R'; written.len()]);
+  let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
     fixture.volume_bytes() == expected,
-    "the store and the second mount's later bytes on the same page are both kept"
+    "the second mount's bytes are kept and the stale page's store is not applied around them"
+  );
+  assert!(
+    stale_part.is_err(),
+    "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
     fixture.follows_bytes(&expected),
-    "the map reads both within {WAIT_FOR:?}"
+    "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
 }
 
@@ -8719,7 +8819,8 @@ fn a_takeover_recovers_an_overlay_whose_base_directory_an_outsider_changed() {
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map
 /// and leave it unsynced; truncate the file to one page through a second mount; sync the map. Expect the file still one
-/// page long in slates, its bytes untouched. Linux only, as above.
+/// page long in slates, its bytes untouched, and the sync either clean, where the kernel dropped the cut page with the
+/// truncation, or `EIO`, where it wrote the page back and the write-back was refused (A-248). Linux only, as above.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
@@ -8731,7 +8832,11 @@ fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
   let page = fixture.page;
   fixture.view()[page + 10] = b'M';
   second.truncate(u64::try_from(page).unwrap());
-  fixture.sync_map();
+  let synced = fixture.try_sync_map();
+  assert!(
+    synced.is_ok() || synced == Err(rustix::io::Errno::IO),
+    "the sync is clean or refused EIO: {synced:?}"
+  );
   let held = fixture.volume_bytes();
   assert_eq!(
     held.len(),
@@ -9206,7 +9311,11 @@ fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
 /// [`THREE_WRITER_STEPS`] generated writes as the synced history does, but `msync` the map only at generated sync points.
 /// Expect after every write that the map reads the byte model (a store is its own at once, and the others' changes
 /// reach it as memory alone); and at every sync point, and at the end, that slates' own read and the second mount equal
-/// it too: no store lost, no later write undone. Linux only, as above.
+/// it too. A write by another path into a page holding unsynced stores puts them at risk (A-248), with every dirty page
+/// contiguous with it, which can share its `WRITE`: the map is synced there, its `EIO` allowed; every byte the other
+/// path wrote must be the other path's, every byte of a page at risk its latest value or an older one since the last
+/// settled state, every other byte exact; and the map and the second mount must then read what slates holds, which
+/// becomes the model. No later write is ever undone. Non-vacuous: some write-back was refused. Linux only, as above.
 #[cfg(target_os = "linux")]
 #[test]
 fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
@@ -9216,24 +9325,19 @@ fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
   let mut fixture = MappedThroughAMount::with_pages("mapdirtychaos", 0, THREE_WRITER_PAGES);
   let second = fixture.mount_again();
   let mut model = vec![0u8; fixture.length];
+  let mut settled = StoresAtRisk::new(&model);
   let mut state: u64 = 0x6a09_e667_f3bc_c908;
   let mut syncs = 0u32;
   for step in 0..=THREE_WRITER_STEPS {
     let last = step == THREE_WRITER_STEPS;
     if !last {
       let write = GeneratedWrite::next(&mut state, fixture.length);
-      match &write {
-        GeneratedWrite::Map { offset, bytes } => {
-          let end = offset + bytes.len();
-          fixture.view()[*offset..end].copy_from_slice(bytes);
-        }
-        GeneratedWrite::SecondMount { offset, bytes } => second.write_at(*offset, bytes),
-        GeneratedWrite::Sdk { bytes } => fixture.replace_with(bytes),
-      }
-      write.apply_to(&mut model);
-      assert!(
-        fixture.follows_bytes(&model),
-        "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+      one_generated_write(
+        &mut fixture,
+        &second,
+        step,
+        &write,
+        (&mut model, &mut settled),
       );
     }
     if last || xorshift(&mut state).is_multiple_of(3) {
@@ -9247,12 +9351,160 @@ fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
         second.follows(&model),
         "step {step}: after the sync, the second mount did not come to the model within {WAIT_FOR:?}"
       );
+      settled = StoresAtRisk::new(&model);
     }
   }
   assert!(
     syncs > 1,
     "the history reached sync points between writes, not only at its end"
   );
+  let refused = counter_of(&fixture.instance, "fuse.writeback_conflicts");
+  eprintln!("the map's write-backs refused as conflicts: {refused}");
+  assert!(
+    refused > 0,
+    "non-vacuous: another path wrote into a page holding unsynced stores"
+  );
+}
+
+/// One step of the unsynced history: makes `write`, settles what another path's write put at risk, and holds the map to
+/// the model.
+#[cfg(target_os = "linux")]
+fn one_generated_write(
+  fixture: &mut MappedThroughAMount,
+  second: &SecondMount,
+  step: u32,
+  write: &GeneratedWrite,
+  (model, settled): (&mut Vec<u8>, &mut StoresAtRisk),
+) {
+  let written = make_write(fixture, second, settled, write);
+  write.apply_to(model);
+  if let Some(range) = &written {
+    let at_risk = settled.at_risk(range, fixture.page);
+    if at_risk.is_empty() {
+      settled.written_over(range, model);
+    } else {
+      let what = format!("step {step}, {write:?}");
+      *model = settle_stores_at_risk(fixture, &what, range, &at_risk, model, settled);
+      *settled = StoresAtRisk::new(model);
+    }
+  }
+  assert!(
+    fixture.follows_bytes(model),
+    "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+  );
+}
+
+/// Makes one generated write; the bytes another path wrote, `None` for the map's own stores, which `settled` notes.
+#[cfg(target_os = "linux")]
+fn make_write(
+  fixture: &mut MappedThroughAMount,
+  second: &SecondMount,
+  settled: &mut StoresAtRisk,
+  write: &GeneratedWrite,
+) -> Option<std::ops::Range<usize>> {
+  match write {
+    GeneratedWrite::Map { offset, bytes } => {
+      let end = offset + bytes.len();
+      fixture.view()[*offset..end].copy_from_slice(bytes);
+      settled.stored(*offset, bytes, fixture.page);
+      None
+    }
+    GeneratedWrite::SecondMount { offset, bytes } => {
+      second.write_at(*offset, bytes);
+      Some(*offset..offset + bytes.len())
+    }
+    GeneratedWrite::Sdk { bytes } => {
+      fixture.replace_with(bytes);
+      Some(0..bytes.len())
+    }
+  }
+}
+
+/// Another path wrote `range` over pages holding unsynced stores: syncs the map, its `EIO` allowed, holds what slates
+/// then has to the write-back rule (A-248), and answers it, the model from here on.
+#[cfg(target_os = "linux")]
+fn settle_stores_at_risk(
+  fixture: &mut MappedThroughAMount,
+  what: &str,
+  range: &std::ops::Range<usize>,
+  at_risk: &std::collections::BTreeSet<usize>,
+  model: &[u8],
+  settled: &StoresAtRisk,
+) -> Vec<u8> {
+  let _refusal_is_an_outcome = fixture.try_sync_map();
+  let held = fixture.volume_bytes();
+  for (at, value) in held.iter().enumerate() {
+    let exact = range.contains(&at) || !at_risk.contains(&(at / fixture.page));
+    assert!(
+      *value == model[at] || (!exact && settled.may_hold(at, *value)),
+      "{what}: byte {at} holds {value}, which the write-back rule does not allow (latest {})",
+      model[at]
+    );
+  }
+  held
+}
+
+/// The map's unsynced stores a refused write-back can lose (A-248): each byte's value when its page was last settled and
+/// the stores since, and the dirty pages.
+#[cfg(target_os = "linux")]
+struct StoresAtRisk {
+  settled: Vec<u8>,
+  stores: Vec<Vec<u8>>,
+  dirty: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl StoresAtRisk {
+  /// Nothing unsynced, every byte as `model` has it.
+  fn new(model: &[u8]) -> StoresAtRisk {
+    StoresAtRisk {
+      settled: model.to_vec(),
+      stores: vec![Vec::new(); model.len()],
+      dirty: std::collections::BTreeSet::new(),
+    }
+  }
+
+  /// The map stored `bytes` at `offset`, unsynced.
+  fn stored(&mut self, offset: usize, bytes: &[u8], page: usize) {
+    for (at, value) in (offset..).zip(bytes) {
+      self.stores[at].push(*value);
+      self.dirty.insert(at / page);
+    }
+  }
+
+  /// The dirty pages another path's write of `range` puts at risk: those it touched, and the dirty pages contiguous with
+  /// them, which can share their `WRITE`.
+  fn at_risk(
+    &self,
+    range: &std::ops::Range<usize>,
+    page: usize,
+  ) -> std::collections::BTreeSet<usize> {
+    let last = range.end.saturating_sub(1) / page;
+    let mut at_risk = std::collections::BTreeSet::new();
+    for touched in (range.start / page..=last).filter(|touched| self.dirty.contains(touched)) {
+      let before = (0..touched)
+        .rev()
+        .take_while(|neighbour| self.dirty.contains(neighbour));
+      let after = (touched + 1..).take_while(|neighbour| self.dirty.contains(neighbour));
+      at_risk.insert(touched);
+      at_risk.extend(before);
+      at_risk.extend(after);
+    }
+    at_risk
+  }
+
+  /// Another path's write of `range`, into no dirty page, settled its bytes at `model`'s.
+  fn written_over(&mut self, range: &std::ops::Range<usize>, model: &[u8]) {
+    for at in range.clone() {
+      self.settled[at] = model[at];
+      self.stores[at].clear();
+    }
+  }
+
+  /// Whether byte `at` may hold `value` with its stores lost: its settled value or one of them.
+  fn may_hold(&self, at: usize, value: u8) -> bool {
+    self.settled[at] == value || self.stores[at].contains(&value)
+  }
 }
 
 /// `slates mount ID INNER --subtree /shared` mounts `shared` alone: it lists `g`, serves its bytes, and a write
@@ -11374,9 +11626,12 @@ const DERIVATION_LINES: usize = 512;
 #[test]
 fn a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates() {
   use std::io::{BufRead, BufReader};
-  let instance = "codec-derivation";
+  // The instance names the anchor's rendezvous and segment, so it carries this process's id: under a bare name, a
+  // second copy of the test on the machine found the instance owned and its anchor printed no derivation (1 of 6
+  // copies in 3 concurrent pairs; 2 of 2 alone passed).
+  let instance = format!("codec-derivation-{}", std::process::id());
   let child = slates()
-    .args(["--instance", instance, "anchor", "--shards", SHARDS])
+    .args(["--instance", &instance, "anchor", "--shards", SHARDS])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -12367,11 +12622,70 @@ fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_ke
   );
 }
 
+/// Makes a volume named `name` over a host directory in `scratch`, removes the directory and restarts the daemon in
+/// order (`SIGTERM`, no kernel mount involved), so the successor holds the volume's record but could not rebuild it.
+/// Returns the volume's id and the removed base.
+#[cfg(unix)]
+fn an_unrecovered_volume(instance: &str, scratch: &ScratchDir, name: &str) -> (String, String) {
+  let base = format!("{}/{name}-base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      name,
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("rmdir {base}"));
+  restart_in_order(instance);
+  (id, base)
+}
+
+/// Stops the instance's daemon with `SIGTERM` and waits for its successor.
+#[cfg(unix)]
+fn restart_in_order(instance: &str) {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(instance, Some(stopped), &[]);
+}
+
+/// `slates <verb...>` on the unrecovered volume is refused `NotRecovered`, by kind.
+#[cfg(unix)]
+fn refused_not_recovered(instance: &str, verb: &[&str]) {
+  let (code, out, err) = run(instance, verb);
+  assert_ne!(
+    code, 0,
+    "{verb:?} on a volume recovery could not rebuild: {out}"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "{verb:?} is refused because recovery could not rebuild the volume, by kind: {err}"
+  );
+}
+
 /// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
 /// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
-/// state: the recovery refusal by kind. Do: create a volume over a host directory, remove the directory, and restart the
-/// daemon in order (no kernel mount is involved). Expect: `volume list` still shows the volume, and its `status` is
-/// refused `NotRecovered`, naming the missing base.
+/// state: the recovery refusal by kind. The sweep of 2026-11-08 (GAPS): `volume list` names why on the volume's line,
+/// and the verbs that would change it refuse typed, a share included, though a share touches only the catalog. Do:
+/// create a volume over a host directory, remove the directory, and restart the daemon in order (no kernel mount is
+/// involved). Expect: `volume list` shows the volume with `not_recovered=BaseMissing`; its `status`, a `volume snapshot`
+/// and a `share` are each refused `NotRecovered`, naming the missing base.
 #[cfg(unix)]
 #[test]
 fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
@@ -12386,43 +12700,74 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   let scratch = ScratchDir {
     path: build_output_dir("slates-unrecovered"),
   };
-  let base = format!("{}/base", scratch.path);
-  shell(&format!("mkdir {base}"));
-  let (code, out, err) = run(
-    &instance,
-    &[
-      "volume",
-      "create",
-      "unrecovered",
-      "--bounded",
-      "8MiB",
-      "--base",
-      &base,
-    ],
-  );
-  assert_eq!(code, 0, "{err}");
-  let id = value_of(&out, "id");
-  shell(&format!("rmdir {base}"));
-  let stopped = daemon_pid(&instance).expect("the daemon answers");
-  assert!(
-    Command::new("kill")
-      .args(["-TERM", &stopped.to_string()])
-      .status()
-      .unwrap()
-      .success(),
-    "SIGTERM sent"
-  );
-  await_daemon(&instance, Some(stopped), &[]);
+  let (id, base) = an_unrecovered_volume(&instance, &scratch, "unrecovered");
   let (code, out, err) = run(&instance, &["volume", "list"]);
   assert_eq!(code, 0, "{err}");
   assert!(
-    out.contains("unrecovered"),
-    "the catalog still lists the volume: {out}"
+    out
+      .lines()
+      .any(|line| line.contains(" unrecovered ") && line.ends_with(" not_recovered=BaseMissing")),
+    "the catalog lists the volume, naming why it was not rebuilt: {out}"
   );
   let (code, out, err) = run(&instance, &["status", &id]);
   assert_ne!(code, 0, "the volume was not rebuilt: {out}");
   assert!(
     err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
     "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  refused_not_recovered(&instance, &["volume", "snapshot", &id]);
+  refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
+/// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
+/// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
+/// in order, then `volume destroy` it. Expect: the destroy succeeds; `volume list` no longer names it and its `status`
+/// answers `NotFound`; its name can be given to a new volume; and after a second restart nothing is reported not
+/// rebuilt and the volume is still gone.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_destroyed_and_stays_gone() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's destroy: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-undestroyed-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-undestroyed"),
+  };
+  let (id, _) = an_unrecovered_volume(&instance, &scratch, "undestroyed");
+  let (code, out, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(
+    code, 0,
+    "a volume recovery could not rebuild is destroyed: {out}{err}"
+  );
+  assert_gone(&instance, &id);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "undestroyed", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "the destroyed volume's name is free: {err}");
+  restart_in_order(&instance);
+  assert_gone(&instance, &id);
+}
+
+/// `volume list` names no `undestroyed` volume recovery could not rebuild, and `status` of `id` answers `NotFound`.
+#[cfg(unix)]
+fn assert_gone(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.contains("not_recovered="),
+    "no volume is listed as not rebuilt: {out}"
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_ne!(code, 0, "the destroyed volume has no status: {out}");
+  assert!(
+    err.contains("NotFound"),
+    "the destroyed volume is not found: {err}"
   );
 }

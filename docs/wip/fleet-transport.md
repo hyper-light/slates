@@ -221,6 +221,16 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    probe from the estimated PTO on a *timed* receive (the estimate and the probe mechanism both exist;
    the timer that arms it needs the runtime's timed receive), connection IDs, several frames per packet
    (an MTU budget), and loom on the state machine.
+   **Status (2026-11-08): one judgement of a dead session.** `Endpoint::peer_silent_past(floor)` is the one
+   judgement for every caller that must end an exchange before its deadline (the live lane's watch, the forward
+   lane). It holds once this end has sent an ack-eliciting packet and nothing that opened under the session's keys
+   has come back for max(floor, `Endpoint::persistent_congestion_duration`). That duration is RFC 9002 §7.6.1's
+   three probe timeouts, each floored at the initial 666 ms (§6.2.2), since a sample from a quiet path says nothing
+   of the queue later traffic builds. The clock starts at the first ack-eliciting send after the peer was last heard.
+   Each hearing restarts it while packets are still in flight and clears it when none are, so an idle session is
+   never silent. Path-MTU probes ask nothing: an oversized one is dropped and answered by no one. On the fabric
+   (`crates/transport/tests/exchanges.rs`): a gone peer was judged silent at 2,008 ms against its 1,998 ms duration,
+   and a peer whose answers a shared queue held up to 4.09 s apart was never judged silent and answered.
    **Status (2026-09-13):** connection IDs landed earlier (`4dd4e6e`, one socket per plane). Every
    exchange now rides a **fresh stream id** (RFC 9000 §2.1): the kind in the low `STREAM_KIND_BITS`,
    a per-connection exchange sequence above (`Endpoint::request(kind, ..)`, `abandon_exchange`,

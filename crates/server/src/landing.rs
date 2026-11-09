@@ -1283,7 +1283,8 @@ const BARRIER_THREAD_REFUSED: &str = "landing.barrier_thread_refused";
 #[cfg(unix)]
 struct BarrierThread {
   outcome: std::sync::mpsc::Receiver<Result<(), HostError>>,
-  thread: Option<std::thread::JoinHandle<()>>,
+  /// Joined on the landing's shard, which is marked as waiting on it meanwhile (A-228's transitive wait).
+  thread: Option<slates_rt::registry::WaitedThread<()>>,
 }
 
 #[cfg(unix)]
@@ -1292,16 +1293,17 @@ impl BarrierThread {
   /// no thread can start (the barrier is dropped unrun, its descriptors closed).
   fn start(barrier: Box<dyn Barrier>, waker: std::task::Waker) -> Result<Self, HostError> {
     let (send, outcome) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::Builder::new()
-      .name("slates-land-barrier".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-land-barrier".to_owned()),
+      move || {
         // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
         // nobody is left to tell.
         if send.send(barrier.run()).is_ok() {
           waker.wake();
         }
-      })
-      .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
+      },
+    )
+    .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
     Ok(Self {
       outcome,
       thread: Some(thread),
