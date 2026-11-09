@@ -140,6 +140,14 @@ const EPOCH_UNSUPPORTED: &str = "fuse.epoch_unsupported";
 /// Format: inode invalidations sent in takeover rounds (A-158): the root and every inode a taken-over mount's kernel may
 /// hold older than the volume. The non-vacuity counter of the bytes and attributes half.
 const TAKEOVER_INVALIDATED: &str = "fuse.takeover_invalidated";
+/// Format: inode invalidations sent by revoked mounts before they ended (AUD-29-84): the root and every node their
+/// kernels referenced. The non-vacuity counter of the revoked cache drop.
+const REVOKED_INVALIDATED: &str = "fuse.revoked_invalidated";
+/// Format: requests a revoked mount answered `ENOTCONN` while its kernel's cache was dropped (AUD-29-84).
+const REVOKED_REFUSED: &str = "fuse.revoked_refused";
+/// Format: fenced mounts whose task could not be woken to drop their kernel's cache (the change signal refused): each
+/// drops it at its next request instead. Zero is the healthy reading.
+const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
 /// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
 /// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
 /// shard's other clients (§4.3).
@@ -817,7 +825,11 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   let told_before = mount.serve.told_through();
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
-  if crate::verbs::live_tree_fenced(s, mount.volume) {
+  // A mount whose attachment admits nothing more answers nothing from the volume, so it needs no lease: it refuses
+  // every request while its kernel's cache is dropped, and must go on reading them, since the drop waits for any `READ`
+  // that holds a page (AUD-29-84).
+  let revoked = mount.serve.dropping() || s.attachments.context(mount.registry).is_err();
+  if !revoked && crate::verbs::live_tree_fenced(s, mount.volume) {
     return Turned::Fenced;
   }
   crate::verbs::relieve_deferred(s);
@@ -900,7 +912,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   };
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
-    Ok(Turn::Dropped | Turn::Continued) => Turned::Served,
+    Ok(Turn::Dropped | Turn::Continued | Turn::Refused) => Turned::Served,
     Ok(Turn::Replayed) => {
       let count = s.refusals.entry(REPLAYED).or_insert(0);
       *count = count.saturating_add(1);
@@ -941,6 +953,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(EPOCH_BUMPED, bumped);
   s.count(EPOCH_UNSUPPORTED, unsupported);
   s.count(TAKEOVER_INVALIDATED, invalidated);
+  let (revoked_invalidated, revoked_refused) = mount.serve.take_revoked_counts();
+  s.count(REVOKED_INVALIDATED, revoked_invalidated);
+  s.count(REVOKED_REFUSED, revoked_refused);
   // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
   // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
   // this point moves the generation again and wakes it.
@@ -1418,9 +1433,84 @@ fn ended(s: &mut ShardState, attachment: u64) {
 /// registry attachment the same way (`end_attachment`); a FUSE mount's lives in the mount, which went on serving a revoked
 /// consumer (AUD-29-84 on Linux: `a_revoked_consumers_fuse_mount_reaches_nothing`, a fresh open read the file after the
 /// revocation, 3 of 3 on adacachy2).
+///
+/// The mount's task is woken at once. Before it ends, its kernel drops what it cached of the volume: a page already in
+/// the kernel's cache is read with no request, so a descriptor opened before the revocation went on reading pages the
+/// kernel's readahead had fetched (`slates_bridge_fuse::channel`'s revoked round). A revocation awaits its end with
+/// [`revoked_mounts_ended`].
 pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
-  if let Some(registry) = s.fuse_mounts.get(&attachment).map(|mount| mount.registry) {
-    s.attachments.revoke(registry);
+  let Some(mount) = s.fuse_mounts.get(&attachment) else {
+    return;
+  };
+  s.attachments.revoke(mount.registry);
+  if mount.change.signal().is_err() {
+    // The task still sees the revocation at its next request; only the drop waits for one.
+    s.count(REVOKED_UNWOKEN, 1);
+  }
+}
+
+/// Waits on this shard until none of `mounts` (each a FUSE mount's attachment, with its volume) is served: each was
+/// fenced by [`fence_if_mounted`], had its kernel drop what it cached, and ended. Parked with the volume's writers
+/// (`crate::told`), which a mount's end wakes; dropping the wait leaves nothing parked. Unbounded: the revocation races it
+/// with its bound (`verbs::revoke_everywhere`).
+pub(crate) async fn revoked_mounts_ended(mounts: Vec<(u64, VolumeId)>) {
+  RevokedMountsEnded {
+    mounts,
+    parked: Vec::new(),
+  }
+  .await;
+}
+
+/// The wait of [`revoked_mounts_ended`]: the mounts still served, and where it is parked on each of their volumes.
+struct RevokedMountsEnded {
+  mounts: Vec<(u64, VolumeId)>,
+  parked: Vec<(VolumeId, u64)>,
+}
+
+impl std::future::Future for RevokedMountsEnded {
+  type Output = ();
+
+  fn poll(
+    mut self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<()> {
+    let this = &mut *self;
+    let served = state::with_state_counted(|s| {
+      this
+        .mounts
+        .retain(|(attachment, _)| s.fuse_mounts.contains_key(attachment));
+      for &(_, volume) in &this.mounts {
+        let id = this
+          .parked
+          .iter()
+          .find(|(parked, _)| *parked == volume)
+          .map(|&(_, id)| id);
+        let id = crate::told::park_on(s, volume, id, cx.waker());
+        if !this.parked.contains(&(volume, id)) {
+          this.parked.push((volume, id));
+        }
+      }
+      !this.mounts.is_empty()
+    });
+    // `None`: the shard's state is out of reach (its shutdown), and no mount is left to wait for.
+    if served == Some(true) {
+      std::task::Poll::Pending
+    } else {
+      std::task::Poll::Ready(())
+    }
+  }
+}
+
+impl Drop for RevokedMountsEnded {
+  fn drop(&mut self) {
+    let parked = std::mem::take(&mut self.parked);
+    if !parked.is_empty() {
+      let _ = state::with_state_counted(|s| {
+        for (volume, id) in parked {
+          crate::told::unpark(s, volume, id);
+        }
+      });
+    }
   }
 }
 
