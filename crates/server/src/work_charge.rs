@@ -28,9 +28,14 @@ pub(crate) fn base_footprint(path: &str, base: &slates_merge::increment::Base) -
   let strings = base
     .files
     .iter()
-    .map(|(p, _)| p.len().saturating_add(8))
+    .map(|(p, _)| p.len().saturating_add(std::mem::size_of::<u64>()))
     .chain(base.dirs.iter().map(String::len))
-    .chain(base.modes.iter().map(|(p, _)| p.len().saturating_add(4)))
+    .chain(
+      base
+        .modes
+        .iter()
+        .map(|(p, _)| p.len().saturating_add(std::mem::size_of::<u32>())),
+    )
     .chain(
       base
         .symlinks
