@@ -12329,6 +12329,18 @@ conflict, 122.4 rebase; the second set, all ten runs, is below, and that excursi
   ask batch; on main it runs where its work is. That is the next lever's target: the rebase mapped on the work's shard.
 - The owner's CPU a verdict is 21.0–26.9 µs on W1 against 37.6–50.9 on main, and a rebase 11.9–14.7 against 25.8–27.8.
 
+**Why main's two figures differ: what it drops (2026-11-09).** A diagnostic build of main db9c514e (never committed;
+`tools/drop_site_patch.py`) counted each result `send_back` drops under its sender: a client's reply carried home
+(`send_reply_home`), a cross-shard call's answer, or an acknowledgement scatter's part (`scatter_acknowledge`'s release
+from another shard). Two 3,000-client runs of the same rung: 4,364 and 4,418 dropped, **every one an acknowledgement's
+part**; no verb's reply and no call's answer. The client is answered its acknowledgement at once by its own shard, so
+nothing waits on a part. Its loss leaves that shard's release unsettled, and the client's next requests are refused
+`AcknowledgementOwed` (27,345 and 27,146 those runs) until a later acknowledgement settles it: each refusal is a pause
+and a resend under a new request. That is the whole gap between main's per-attempt and end-to-end figures. No client
+waited out a reply deadline: the longest operation of any kind in main's three 3,000-client runs above took 263.0 ms,
+`resent` (a resend after a reply deadline) was 0, and the oracle found no outcome unknown. So main's end-to-end p99 is
+65.6–84.9 ms accepted and 99.0–127.5 conflicting, not a reply deadline.
+
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
 **What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.

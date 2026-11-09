@@ -66,9 +66,13 @@
 > 42–62 (BENCHMARKS). The owner is the bottleneck, and rebases cost it more than verdicts (`map_rebase` 333 samples
 > against `judge_submission` 226 of 1,121). Owed: the owner's cost per verdict and per rebase.
 >
-> **Open (perf, 2026-11-09): main drops replies at 3,000 clients.** `xshard.reply_dropped` counts 4,074 to 4,439 a run on
-> main 80be552a (a forwarded verb's result carried home past a full channel for one coordinator period); each client
-> waits out its reply deadline and its resend is answered from its record.
+> **Open (perf, 2026-11-09): main drops acknowledgement parts at 3,000 clients.** `xshard.reply_dropped` counts 4,074 to
+> 4,474 a run (main 80be552a and db9c514e): results carried home past a full channel for one coordinator period. A
+> diagnostic build of db9c514e counted every one as an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418);
+> no verb's reply was among them and no client waited out a reply deadline (this entry said so until the diagnostic). A
+> lost part leaves its shard's release unsettled, so the client is refused `AcknowledgementOwed` until a later
+> acknowledgement settles it, 25,868 to 28,995 times a run, each a pause and a resend. Fixed on agents/perf-replies
+> (every result waits for room while its shard lives). BENCHMARKS, "Why main's two figures differ".
 
 > **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
 > shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
