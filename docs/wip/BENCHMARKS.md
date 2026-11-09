@@ -12157,3 +12157,34 @@ each, interleaved, load 19.0 to 22.5. Verdicts a second: main 6,018, 6,739, 6,66
 - The whole cycle's p99 is better at 3,000 clients (231–280 ms against 381–436). At 1,000 clients it is not: 86.8–129.2
   against 77.2–96.0, the medians of the rounds 99.1 against 91.5, though its median and the round to accept are far
   better (Round p99 605–686 against 1,176–1,234).
+
+**Per attempt and end to end (2026-11-09, the supervisor's third measurement).** The harness timed each attempt: a request
+refused `AcknowledgementOwed` and sent again as new started a fresh latency, so main's figures left out the wait of the
+operations whose replies went astray. It now also prints `operation` rows, each logical operation from its first attempt
+to its final answer, refusals for now, pauses and resends included. Main 80be552a against agents/perf-w1 (with the
+`operation` rows), the anchor recipe, interleaved, 5 rounds each, adas-mac-studio.local-2 busy with other agents (8 to 11
+of 32 cores idle), oracle 0 in every run. Per run: main's dropped replies (`xshard.reply_dropped`) and its
+`AcknowledgementOwed` resends (`backpressure`); W1 had 0 of each in every run. Milliseconds, p99, per attempt / end to
+end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
+
+| 3,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 3,636 / 12,912; 4,191 / 27,019; 4,518 / 22,227; 4,245 / 23,967; 4,208 / 25,700 | 0 / 0 in every run |
+| Submit | 54.7/94.6, 50.1/96.6, 56.3/112.3, 53.6/113.4, 45.0/106.6 | 54.9/58.7, 60.3/63.5, 63.2/71.2, 57.1/62.8, 56.8/64.1 |
+| Rebase | 52.3/63.2, 59.6/69.2, 61.1/71.6, 56.0/75.5, 45.5/68.2 | 54.0/54.0, 53.3/53.3, 63.2/63.2, 55.1/55.1, 57.0/57.0 |
+| Edit | 63.0/80.9, 60.6/83.7, 62.6/84.8, 57.9/89.2, 60.0/85.4 | 45.2/45.2, 46.9/46.9, 58.8/58.8, 46.1/46.1, 46.3/46.3 |
+| Cycle | 405.2, 427.6, 447.7, 409.9, 424.8 | 226.4, 240.1, 288.5, 234.6, 239.0 |
+
+| 1,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 0 / 0 in four runs, 0 / 6 in one | 0 / 0 in every run |
+| Submit | 33.6/35.4, 32.3/32.4, 27.9/28.0, 30.3/30.3, 34.9/36.6 | 20.1/61.6, 39.1/39.6, 34.8/35.0, 18.7/39.1, 23.9/24.3 |
+| Rebase | 24.4, 22.5, 38.4, 22.5, 22.9 | 61.7, 39.5, 35.0, 39.2, 27.6 |
+| Cycle | 87.9, 93.6, 106.8, 95.6, 99.5 | 114.2, 106.5, 94.7, 95.4, 116.6 |
+
+- At 3,000 clients main drops about 4,200 replies a run, and the acknowledgements those leave unanswered refuse 12,912 to
+  27,019 requests `AcknowledgementOwed`, each sent again: end to end, main's submit p99 is 94.6–113.4 ms against its
+  45.0–56.3 per attempt. W1 drops none and resends none: 58.7–71.2 ms end to end. Every verb's end-to-end p99 and the
+  cycle's are better on W1.
+- At 1,000 clients main drops none and the two figures agree; W1's submit, rebase and cycle p99 are worse there.
+- Main's drops are fixed on their own branch (agents/perf-replies); the comparison against main with that fix is owed.

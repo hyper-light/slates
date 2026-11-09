@@ -26,7 +26,9 @@
 //! version whose submit was sent before this reply came back. And the green's head bytes of every file the run
 //! touched must equal the version-ordered replay of the accepted submits over the files' version-0 bytes.
 //!
-//! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then `oracle\t<n>\t…` lines;
+//! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each attempt timed alone; then
+//! `operation\t…` in the same columns, each logical operation from its first attempt to its answer, refusals for now
+//! and resends included; then `oracle\t<n>\t…` lines;
 //! a nonzero `oracle_failures` exits 1. Last, `lost\t<counter>\t<count>` for each of the daemon's counters of a lost
 //! reply or ask.
 // Bench harness code: an unwrap here is a failed run.
@@ -176,6 +178,8 @@ struct Agent {
   /// [`Kind::Round`] (cleared at its accept).
   cycle_since: Option<u64>,
   round_since: Option<u64>,
+  /// When the current step's first attempt was sent, kept across a refusal for now and its resend.
+  op_since: Option<u64>,
   /// The pause before this client sends again after a refusal for now (`LeaseUnconfirmed`, `AcknowledgementOwed`, a
   /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
   /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
@@ -188,6 +192,10 @@ struct Tally {
   /// Replies taken: a worker's sign of motion, for its stall dump.
   answered: u64,
   latencies: BTreeMap<Kind, Vec<u64>>,
+  /// Each logical operation's latency from its first attempt to its answer: a request refused for now
+  /// (`AcknowledgementOwed`, `LeaseUnconfirmed`) and sent again as new, or retried under its id, is one operation whose
+  /// wait includes the refusals, the pauses and the resends. `latencies` times each attempt alone.
+  operations: BTreeMap<Kind, Vec<u64>>,
   submits: Vec<SubmitEvent>,
   refusals: BTreeMap<String, u64>,
   starved: u64,
@@ -853,7 +861,9 @@ impl Worker {
     }
     match conn.client.begin(&body) {
       Ok(id) => {
-        agent.inflight = Some((id.word(), ns_since(self.epoch), kind));
+        let now = ns_since(self.epoch);
+        agent.op_since.get_or_insert(now);
+        agent.inflight = Some((id.word(), now, kind));
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -958,7 +968,17 @@ impl Worker {
           refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
         }
       );
+      let refused = matches!(&reply, ReplyBody::Refused { .. });
+      let first = if for_now { None } else { agent.op_since.take() };
       agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
+      if !refused && let Some(first) = first {
+        self
+          .tally
+          .operations
+          .entry(kind)
+          .or_default()
+          .push(now.saturating_sub(first));
+      }
       if agent.step != Step::Done {
         let wait = if for_now {
           agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
@@ -1309,6 +1329,19 @@ fn report(n: usize, tally: &mut Tally) {
       .collect();
     println!(
       "latency\t{n}\t{kind:?}\t{}\t{}\t{}",
+      samples.len(),
+      cuts.join("\t"),
+      samples.last().copied().unwrap_or(0)
+    );
+  }
+  for (kind, samples) in &mut tally.operations {
+    samples.sort_unstable();
+    let cuts: Vec<String> = PERCENTILES
+      .iter()
+      .map(|p| percentile(samples, *p).to_string())
+      .collect();
+    println!(
+      "operation\t{n}\t{kind:?}\t{}\t{}\t{}",
       samples.len(),
       cuts.join("\t"),
       samples.last().copied().unwrap_or(0)
@@ -1687,6 +1720,7 @@ fn spread(
       retry: None,
       cycle_since: None,
       round_since: None,
+      op_since: None,
       pause_ns: 0,
     });
   }
@@ -1789,6 +1823,13 @@ fn level(
     for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
       total
         .latencies
+        .entry(kind)
+        .or_default()
+        .append(&mut samples);
+    }
+    for (kind, mut samples) in std::mem::take(&mut tally.operations) {
+      total
+        .operations
         .entry(kind)
         .or_default()
         .append(&mut samples);
