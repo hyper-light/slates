@@ -100,6 +100,8 @@ pub struct Counters {
   pub wake_unslept: u64,
   /// The online wake estimate, nanoseconds (the step quantum while the shard tracks one).
   pub wake_cost_ns: u64,
+  /// The floor of the online wake estimate, nanoseconds: the idle spin's price (A-223).
+  pub wake_floor_ns: u64,
   /// The idle spin window now, nanoseconds: how long the shard spins after client activity before it parks
   /// (§4.7), as its wake tracking derives it; its configured spin while it tracks no estimate.
   pub idle_window_ns: u64,
@@ -493,11 +495,9 @@ impl ShardContext {
       interests: RefCell::new(Interests::default()),
       waited_for_ns: Cell::new(None),
       scheduler_overrun_ns: Cell::new(0),
-      wake: Cell::new(
-        config
-          .wake_tracking
-          .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
-      ),
+      wake: Cell::new(config.wake_tracking.map(|tracking| {
+        WakeEstimate::with_floor(tracking.prior_ns, tracking.prior_floor_ns, tracking.shift)
+      })),
       idle_ratio: config
         .wake_tracking
         .map_or(1, |tracking| tracking.idle_ratio),
@@ -648,6 +648,7 @@ impl ShardContext {
       .try_borrow()
       .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
+    c.wake_floor_ns = self.wake_floor_ns();
     c.idle_window_ns = self.spin_window_ns();
     c
   }
@@ -1383,17 +1384,30 @@ impl ShardContext {
       .max(1)
   }
 
-  /// The idle spin window now: the online wake estimate times the configured idle ratio while the shard
-  /// tracks one (the 2-competitive spin, §4.3), else the configured spin.
+  /// The idle spin window now: the floor of the online wake estimate times the configured idle ratio while
+  /// the shard tracks one (the 2-competitive spin, §4.3), else the configured spin. The floor, not the mean:
+  /// the mean counts the wait a woken shard spends runnable for a CPU, which costs no CPU and which a
+  /// spinning shard lengthens itself, so a window on the mean fed on its own spinning (A-223).
   fn spin_window_ns(&self) -> u64 {
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
-      estimate.mean_ns().saturating_mul(self.idle_ratio)
+      estimate.floor_ns().max(1).saturating_mul(self.idle_ratio)
     })
   }
 
   /// The online wake estimate now, nanoseconds (the configured step budget when not tracking).
   pub fn wake_cost_ns(&self) -> u64 {
     self.quantum_ns()
+  }
+
+  /// The floor of the online wake estimate now, nanoseconds: what a park costs the shard with its CPU free,
+  /// which its idle windows are priced on (the configured step budget when not tracking, as
+  /// [`ShardContext::wake_cost_ns`]).
+  pub fn wake_floor_ns(&self) -> u64 {
+    self
+      .wake
+      .get()
+      .map_or(self.fixed_quantum_ns, |estimate| estimate.floor_ns())
+      .max(1)
   }
 
   /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park
@@ -1442,6 +1456,7 @@ impl ShardContext {
       inner.counters.wake_cost_ns = mean;
     });
     entry.pulse.record_wake_cost(mean);
+    entry.pulse.record_wake_floor(estimate.floor_ns());
   }
 
   /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it

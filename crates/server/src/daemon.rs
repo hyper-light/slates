@@ -296,6 +296,9 @@ pub struct ShardPulse {
   /// parks it paid (§4.3), which its step quantum and idle windows follow; 0 until its first measured
   /// wake.
   pub wake_cost_ns: u64,
+  /// The floor of the shard's online wake estimate, nanoseconds — what a park costs it with its CPU free,
+  /// which its idle windows are priced on (A-223); 0 until its first measured wake.
+  pub wake_floor_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -1444,6 +1447,7 @@ impl Daemon {
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
+          wake_floor_ns: entry.pulse.wake_floor_ns(),
         })
       })
       .collect()
@@ -4749,8 +4753,9 @@ impl Drop for EndStreams {
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
 /// any client has activity within the window), and idles past it. The window is a multiple of what a
-/// wake costs the shard now — its online wake estimate (§4.3) — so it follows the wakes the shard
-/// actually pays rather than the boot probe's first guess.
+/// wake costs the shard now — the floor of its online wake estimate (§4.3), what a park costs it with its
+/// CPU free — so it follows the wakes the shard actually pays rather than the boot probe's first guess, and
+/// not the wait for a CPU that its own spinning lengthens (A-223).
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
@@ -4764,11 +4769,11 @@ async fn serve_loop() {
   }
   loop {
     let idle_window_ns = derived!(
-      futures::wake_cost_ns()
+      futures::wake_floor_ns()
         .unwrap_or(0)
         .saturating_mul(crate::config::IDLE_WINDOW_RATIO),
-      "the shard's wake estimate × IDLE_WINDOW_RATIO",
-      ["rt.wake_cost_ns", "IDLE_WINDOW_RATIO"]
+      "the floor of the shard's wake estimate × IDLE_WINDOW_RATIO",
+      ["rt.wake_floor_ns", "IDLE_WINDOW_RATIO"]
     )
     .get();
     let (did, within_window) = state::with_state(|s| {

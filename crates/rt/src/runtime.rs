@@ -94,9 +94,12 @@ pub struct ShardCapacity {
 pub struct WakeTracking {
   /// The boot probe's mean wake, nanoseconds: the estimate's seed.
   pub prior_ns: u64,
+  /// The boot probe's floor wake, nanoseconds: the floor's seed, which the idle spin reads until the shard
+  /// has measured a window of its own wakes ([`slates_machine::wake::WakeEstimate::floor_ns`], A-223).
+  pub prior_floor_ns: u64,
   /// The estimate's weighting shift, about `2^shift` wakes ([`slates_machine::wake::WakeLatency::estimate_shift`]).
   pub shift: u32,
-  /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
+  /// The idle spin window as a multiple of the estimate's floor (1 for the runtime's own spin-then-park; the
   /// daemon's idle window sets its ratio).
   pub idle_ratio: u64,
 }
@@ -151,6 +154,7 @@ impl RuntimeConfig {
       spin_ns: d.spin_before_park_ns.get(),
       wake_tracking: Some(WakeTracking {
         prior_ns: d.spin_before_park_ns.get(),
+        prior_floor_ns: d.wake_floor_ns.get(),
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
       }),

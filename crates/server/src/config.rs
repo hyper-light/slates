@@ -855,17 +855,17 @@ impl DaemonConfig {
     // The shard polls for the idle window after its last work before parking (§4.7 "Shards
     // poll rings while any client has activity within the measured idle window"), so a
     // request from an active client, or a forward from another shard, never pays a wake.
+    // The window is priced on the floor of the wake, not its mean: the mean counts time a woken shard waits
+    // runnable for a CPU, which costs none (A-223).
     let idle_window: Derived<u64> = derived!(
-      d.spin_before_park_ns
-        .get()
-        .saturating_mul(IDLE_WINDOW_RATIO),
-      "spin_before_park_ns × IDLE_WINDOW_RATIO",
-      ["wake.mean_ns", "IDLE_WINDOW_RATIO"]
+      d.wake_floor_ns.get().saturating_mul(IDLE_WINDOW_RATIO),
+      "wake_floor_ns × IDLE_WINDOW_RATIO",
+      ["wake.floor_ns", "IDLE_WINDOW_RATIO"]
     );
     derivations.push(note("idle_window_ns", &idle_window));
     runtime.spin_ns = idle_window.get();
-    // A shard's spin follows its online wake estimate at the same multiple (§4.3); `spin_ns` is the boot
-    // value, kept by a runtime that tracks no estimate.
+    // A shard's spin follows the floor of its online wake estimate at the same multiple (§4.3); `spin_ns` is
+    // the boot value, kept by a runtime that tracks no estimate.
     if let Some(tracking) = runtime.wake_tracking.as_mut() {
       tracking.idle_ratio = IDLE_WINDOW_RATIO;
     }

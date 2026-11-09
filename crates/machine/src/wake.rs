@@ -85,6 +85,9 @@ pub struct WakeLatency {
   pub p50_ns: u64,
   /// The p99 of the kept samples: what the inbound ring is sized against at its overflow target.
   pub p99_ns: u64,
+  /// The smallest kept sample: a sleeper's wake with no wait for a CPU in it, what a park costs when the
+  /// waiter's CPU is free. The idle spin is priced on it ([`WakeEstimate::floor_ns`], A-223).
+  pub floor_ns: u64,
   /// The population standard deviation of the kept samples: with the mean, how many wakes an online
   /// estimate needs to reach the probe's precision ([`WakeLatency::estimate_shift`]).
   pub sd_ns: u64,
@@ -151,31 +154,53 @@ impl WakeLatency {
   }
 }
 
-/// An online estimate of the mean wake (§4.1, §4.3, §4.7): an exponentially weighted mean over about
+/// An online estimate of the mean wake (§4.1, §4.3, §4.7), and of its floor: an exponentially weighted mean over about
 /// `2^shift` wakes, seeded with the boot probe's mean and fed each wake the product measures afterwards
 /// (the runtime's kicked parks, a client's woken waits), so a machine whose neighbours change after boot
 /// is tracked rather than frozen at one 250 ms sample. Kept in fixed point — the accumulator is the mean
 /// shifted left by `shift` — so a small correction is never rounded away: an integer mean updated by
 /// `(sample − mean) >> shift` drops every deviation under `2^shift`, keeps the tail's large ones, and
 /// drifts upward.
+///
+/// The floor is the smallest wake in the last one to two windows of `2^shift` wakes: the one being filled and
+/// the one filled before it. A wake measured kick to running counts the time the woken thread waited for a
+/// CPU, which a busy host lengthens and a spinning shard lengthens itself (A-223: 0.2-6.1 ms under two
+/// spinners a CPU). The mean keeps that wait, as the step quantum must; the floor drops it, as the idle spin
+/// must, since waiting for a CPU spends none. A low wake leaves the floor once its window has been
+/// overtaken, so a host that really slowed is followed within two windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeEstimate {
   scaled: u128,
   shift: u32,
   samples: u64,
+  /// The smallest wake in the window being filled (`u64::MAX` while it has none).
+  floor_filling: u64,
+  /// The smallest wake in the window filled before it; the seed's floor until a window has filled.
+  floor_filled: u64,
+  /// Wakes in the window being filled.
+  filling: u64,
 }
 
 impl WakeEstimate {
   /// Format: the largest shift whose accumulator — a `u64` mean shifted left — fits 128 bits.
   pub const MAX_SHIFT: u32 = 63;
 
-  /// An estimate seeded with `prior_ns`, weighting about `2^shift` wakes.
+  /// An estimate seeded with `prior_ns` for its mean and its floor, weighting about `2^shift` wakes.
   pub fn new(prior_ns: u64, shift: u32) -> WakeEstimate {
+    WakeEstimate::with_floor(prior_ns, prior_ns, shift)
+  }
+
+  /// An estimate seeded with a mean and a floor (the boot probe's [`WakeLatency::mean_ns`] and
+  /// [`WakeLatency::floor_ns`]), weighting about `2^shift` wakes.
+  pub fn with_floor(prior_ns: u64, floor_ns: u64, shift: u32) -> WakeEstimate {
     let shift = shift.min(Self::MAX_SHIFT);
     WakeEstimate {
       scaled: u128::from(prior_ns) << shift,
       shift,
       samples: 0,
+      floor_filling: u64::MAX,
+      floor_filled: floor_ns,
+      filling: 0,
     }
   }
 
@@ -186,6 +211,19 @@ impl WakeEstimate {
       .saturating_sub(self.scaled >> self.shift)
       .saturating_add(u128::from(wake_ns));
     self.samples = self.samples.saturating_add(1);
+    self.floor_filling = self.floor_filling.min(wake_ns);
+    self.filling = self.filling.saturating_add(1);
+    if self.filling >= 1u64 << self.shift {
+      self.floor_filled = self.floor_filling;
+      self.floor_filling = u64::MAX;
+      self.filling = 0;
+    }
+  }
+
+  /// The floor: the smallest wake over the last one to two windows of `2^shift` wakes (the seed's floor
+  /// until a window has filled), nanoseconds.
+  pub fn floor_ns(&self) -> u64 {
+    self.floor_filling.min(self.floor_filled)
   }
 
   /// The estimated mean wake, nanoseconds.
@@ -411,6 +449,7 @@ fn summarize(
     mean_upper_ns: pooled.upper,
     p50_ns: sorted.median().unwrap_or(0),
     p99_ns: sorted.percentile(Percentile::P99).unwrap_or(0),
+    floor_ns: kept.iter().copied().min().unwrap_or(0),
     sd_ns: standard_deviation(kept).unwrap_or(0),
     samples: u32::try_from(kept.len()).unwrap_or(u32::MAX),
     same_cpu_samples: tally.same_cpu_samples,
@@ -1089,6 +1128,67 @@ mod tests {
     assert_eq!(tailed.samples(), 400_000);
   }
 
+  /// Shape: the floor tests' weighting shift, a window of thirty-two wakes.
+  const FLOOR_SHIFT: u32 = 5;
+  /// Shape: the floor tests' window, `2^FLOOR_SHIFT` wakes.
+  const FLOOR_WINDOW: u64 = 1 << FLOOR_SHIFT;
+  /// Shape: an unqueued wake, a sleeper woken on a free CPU.
+  const UNQUEUED_NS: u64 = 10_000;
+  /// Shape: a queued wake, one that waited behind spinners for its CPU.
+  const QUEUED_NS: u64 = 2_000_000;
+  /// Shape: a seed between the two.
+  const SEED_NS: u64 = 50_000;
+
+  /// A-223 (i): an estimate that measured nothing reads its seeds, the floor's where one was given.
+  #[test]
+  fn an_estimate_with_no_wakes_reads_its_seeds() {
+    let seeded = WakeEstimate::with_floor(SEED_NS * 2, SEED_NS, FLOOR_SHIFT);
+    assert_eq!(seeded.floor_ns(), SEED_NS);
+    assert_eq!(seeded.mean_ns(), SEED_NS * 2);
+    assert_eq!(WakeEstimate::new(SEED_NS, FLOOR_SHIFT).floor_ns(), SEED_NS);
+  }
+
+  /// A-223 (i), the plan's example: twenty unqueued wakes, then queued ones. The queued tail lifts the mean
+  /// and leaves the floor, until the window after the unqueued wakes' own has filled; then the floor follows
+  /// a host whose every wake now queues.
+  #[test]
+  fn the_floor_drops_a_queued_tail_and_follows_a_host_that_slowed() {
+    let mut estimate = WakeEstimate::with_floor(UNQUEUED_NS, UNQUEUED_NS, FLOOR_SHIFT);
+    for _ in 0..20 {
+      estimate.record(UNQUEUED_NS);
+    }
+    for _ in 20..2 * FLOOR_WINDOW - 1 {
+      estimate.record(QUEUED_NS);
+    }
+    assert!(
+      estimate.mean_ns() > 10 * UNQUEUED_NS,
+      "the queued wakes lift the mean: {estimate:?}"
+    );
+    assert_eq!(
+      estimate.floor_ns(),
+      UNQUEUED_NS,
+      "a queued tail does not raise the floor while the unqueued wakes' window is kept"
+    );
+    estimate.record(QUEUED_NS);
+    assert_eq!(
+      estimate.floor_ns(),
+      QUEUED_NS,
+      "a host whose every wake now queues is followed within two windows"
+    );
+  }
+
+  /// A-223 (i): the seed leaves the floor as a measured wake does, once one window of wakes has filled.
+  #[test]
+  fn the_seed_leaves_the_floor_after_one_window() {
+    let mut seeded = WakeEstimate::with_floor(SEED_NS, SEED_NS, FLOOR_SHIFT);
+    for _ in 0..FLOOR_WINDOW - 1 {
+      seeded.record(QUEUED_NS);
+    }
+    assert_eq!(seeded.floor_ns(), SEED_NS);
+    seeded.record(QUEUED_NS);
+    assert_eq!(seeded.floor_ns(), QUEUED_NS);
+  }
+
   /// The window follows the probe's spread: `(1.96 · cv / 0.05)²` wakes, at least the probe's minimum,
   /// its shift the ceiling of its binary logarithm.
   #[test]
@@ -1099,6 +1199,7 @@ mod tests {
       mean_upper_ns: mean_ns,
       p50_ns: mean_ns,
       p99_ns: mean_ns,
+      floor_ns: mean_ns,
       sd_ns,
       samples: 1,
       same_cpu_samples: 0,

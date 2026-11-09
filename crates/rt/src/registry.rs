@@ -135,6 +135,9 @@ pub struct Pulse {
   /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
   /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
   wake_cost_ns: AtomicU64,
+  /// The floor of the shard's online wake estimate (`ShardContext::wake_floor_ns`), mirrored with it: what
+  /// its idle windows are priced on (A-223).
+  wake_floor_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -159,6 +162,17 @@ impl Pulse {
   /// [`Pulse::record_wake_cost`]).
   pub fn wake_cost_ns(&self) -> u64 {
     self.wake_cost_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors the floor of its online wake estimate after folding a wake into it.
+  pub fn record_wake_floor(&self, wake_floor_ns: u64) {
+    self.wake_floor_ns.store(wake_floor_ns, Ordering::Relaxed);
+  }
+
+  /// The floor of the shard's online wake estimate, nanoseconds; 0 until its first measured wake (see
+  /// [`Pulse::record_wake_floor`]).
+  pub fn wake_floor_ns(&self) -> u64 {
+    self.wake_floor_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.

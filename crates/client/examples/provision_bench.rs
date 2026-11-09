@@ -182,8 +182,9 @@ fn print_growth(key: &str, run: usize, samples: &[u64]) {
 const PARKS_PER_MILLE: u64 = 1000;
 
 /// Each shard's parks (driver waits) over a form, per thousand creates (each followed by its destroy), and
-/// each shard's measured wake cost after it: a shard that parks between a client's requests makes every
-/// request it serves or is forwarded pay that wake, which the percentiles show only as latency.
+/// each shard's measured wake after it, its mean and its floor (the idle window's price, A-223): a shard that
+/// parks between a client's requests makes every request it serves or is forwarded pay that wake, which the
+/// percentiles show only as latency.
 fn print_parks(
   key: &str,
   before: &[slates_server::daemon::ShardPulse],
@@ -200,10 +201,11 @@ fn print_parks(
         .map_or(0, |old| old.waits);
       let parks = pulse.waits.saturating_sub(earlier);
       format!(
-        "shard {}: {} (wake {} ns)",
+        "shard {}: {} (wake {} ns, floor {} ns)",
         pulse.shard,
         parks * PARKS_PER_MILLE / creates,
-        pulse.wake_cost_ns
+        pulse.wake_cost_ns,
+        pulse.wake_floor_ns
       )
     })
     .collect();
