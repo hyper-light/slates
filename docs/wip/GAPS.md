@@ -6,7 +6,11 @@
 > deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full channel; a task refused at
 > admission answered its client once (`AnswerUnstarted`). Each lost its reply, and the client waited out its deadline:
 > 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. Now every one waits for room for as long as the shard it
-> goes to lives (a task of the sending shard carries it); only a shard gone leaves a reply undelivered. Failing first:
+> goes to lives; only a shard gone leaves a reply undelivered. A caller that cannot await (`hand_reply_home`,
+> `AnswerUnstarted`) hands the reply to the client's shard's channel at once and waits on a task of its own shard only
+> when that channel is full: a task for every reply failed main's `a_forward_refused_at_admission_answers_its_client` 3 of
+> 3, since an `AnswerUnstarted` drops because its own shard's arena is full (found on adacachy, 2 of 3 there; fixed
+> 2026-11-09, 3 of 3 pass). Failing first:
 > `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`).
 > Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, and every direct `send_control` of a reply in
 > `crates/server/src`. Siblings reported, not changed (not replies, each counted where lost): a client handed to a shard

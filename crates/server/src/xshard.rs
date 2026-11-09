@@ -565,6 +565,41 @@ mod tests {
     daemon.stop();
   }
 
+  /// A reply handed home by a caller that cannot await waits for room too (§4.3 "backpressure, never a drop";
+  /// [`hand_reply_home`], [`AnswerUnstarted`]). Do: on a shard, register a stand-in slot whose control channel holds one
+  /// message, fill it, and hand a reply home to it with `hand_reply_home`, from the shard's state as its callers do; from
+  /// the test thread, take the filler off the channel. Expect: the hand-off reported no refusal, and the reply's message
+  /// arrives after the filler. Handed to the channel once, as until 2026-11-07, or dropped on a full channel, nothing
+  /// arrives.
+  #[test]
+  // The test thread stands for the client's shard draining later: it must wait off-shard while the reply waits.
+  #[allow(clippy::disallowed_methods)]
+  fn a_reply_handed_home_to_a_full_channel_waits_for_room() {
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver, handed) = crate::daemon::observe_first(&daemon, |_state| {
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let handed = hand_reply_home(home, || {});
+      (registration, receiver, handed)
+    });
+    assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
+    let room = std::time::Duration::from_nanos(REPLY_ROOM_NS.saturating_add(REPLY_PACE_NS));
+    assert!(receiver.recv_timeout(room).is_ok(), "the filler");
+    assert!(
+      receiver.recv_timeout(room).is_ok(),
+      "the reply's message arrived once there was room"
+    );
+    drop(registration);
+    daemon.stop();
+  }
+
   /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
   /// call to that same shard whose future parks past the call's deadline and then reports that it ended. Expect the
   /// call answered `None` at its deadline and the future run to its end anyway, as a call to another shard runs. Until
@@ -808,18 +843,14 @@ impl Drop for AnswerUnstarted {
       state::deliver(client_index, request, reply, true);
       return;
     }
-    // Carried home by a task of this shard that waits for room there, never handed over once (CLAUDE.md §2 items 8
-    // and 9): only this shard's own refusal of the task leaves the client unanswered, counted.
-    let carried = slates_rt::futures::spawn(send_reply_home(home, move || {
+    // Carried home as [`carry_home`] carries a reply: this shard's arena refused the task the guard was in, so the
+    // reply goes to the client's shard's channel needing nothing of it, and only waits on a task here for room there.
+    if carry_home(home, move || {
       state::deliver(client_index, request, reply, true);
-    }));
-    match carried {
-      Ok(task) => {
-        let _ = slates_rt::futures::detach(task);
-      }
-      Err(_) => {
-        let _ = state::with_state_counted(|s| s.count(UNSTARTED_UNANSWERED, 1));
-      }
+    })
+    .is_err()
+    {
+      state::with_state_counted(|s| s.count(UNSTARTED_UNANSWERED, 1));
     }
   }
 }
@@ -904,15 +935,60 @@ pub async fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) 
 /// ([`send_reply_home`]).
 pub(crate) const REPLY_RUN_UNSTARTED: &str = "xshard.reply_run_unstarted";
 
-/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state): a task of this shard carries
-/// `body` home, waiting for room there as [`send_reply_home`] waits. The refusal, for the caller to count, is this
-/// shard's own refusal of that task (its arena full). Until 2026-11-09 `body` was handed to `target`'s channel once and
-/// its refusal returned, so a reply met a full channel and was lost (CLAUDE.md §2 items 8 and 9).
+/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state), as [`carry_home`] carries
+/// it: the refusal is returned for the caller to count. Until 2026-11-09 `body` was handed to `target`'s channel once
+/// and a full channel's refusal returned, so a reply met a full channel and was lost (CLAUDE.md §2 items 8 and 9).
 pub(crate) fn hand_reply_home(
   target: u16,
   body: impl FnOnce() + Send + 'static,
 ) -> Result<(), RtError> {
-  let task = slates_rt::futures::spawn(send_reply_home(target, body))?;
-  let _ = slates_rt::futures::detach(task);
-  Ok(())
+  carry_home(target, body)
+}
+
+/// Carries a reply home to `origin` from a caller that cannot await, waiting for room as [`send_reply_home`] waits,
+/// with the wait's first try made at once: `body` goes to `origin`'s control channel now, which needs nothing of this
+/// shard, and only a full channel puts the wait on a task of this shard. So a reply is not lost to this shard's arena
+/// when the channel has room (an [`AnswerUnstarted`] drops because its shard's arena is full; a task there for every
+/// reply failed `a_forward_refused_at_admission_answers_its_client` 3 of 3), nor to a full channel while this shard can
+/// run the wait. Returned: the refusal when neither could take it, `origin` gone or this shard's arena full with the
+/// channel, for the caller to count; the reply is then dropped here, its guard standing down.
+fn carry_home(origin: u16, body: impl FnOnce() + Send + 'static) -> Result<(), RtError> {
+  let mut guard = RunUnstarted {
+    at: origin,
+    body: Some(Box::new(body)),
+  };
+  let back = SpawnRequest::new(
+    Box::pin(async move {
+      guard.run();
+    }),
+    None,
+  );
+  match registry::send_control_or_return(origin, Control::Spawn(Box::new(back))) {
+    Ok(()) => Ok(()),
+    Err(registry::RefusedControl {
+      error: RtError::ControlFull { .. },
+      message: Some(unsent),
+    }) => discarding_unsent(|| {
+      let waiting = slates_rt::futures::spawn(async move {
+        if !given_room(origin, unsent).await {
+          state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
+        }
+      })?;
+      let _ = slates_rt::futures::detach(waiting);
+      Ok(())
+    }),
+    Err(refused) => discarding_unsent(|| {
+      drop(refused.message);
+      Err(refused.error)
+    }),
+  }
+}
+
+/// Runs `drop_or_hand`, during which a reply guard dropped stands down ([`DISCARDING_UNSENT`]): the caller reports
+/// the refusal.
+fn discarding_unsent<T>(drop_or_hand: impl FnOnce() -> T) -> T {
+  DISCARDING_UNSENT.with(|discarding| discarding.set(true));
+  let result = drop_or_hand();
+  DISCARDING_UNSENT.with(|discarding| discarding.set(false));
+  result
 }
