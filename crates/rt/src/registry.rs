@@ -89,6 +89,9 @@ pub struct Entry {
   /// The shard thread's CPU-clock handle, recorded as it starts (zero until then, and where the platform has none):
   /// what an observer reads to count its budget in the shard's own time ([`shard_cpu`]).
   pub cpu_clock: AtomicU64,
+  /// The CPU-clock handle of a thread the shard is blocked on right now ([`waiting_on`]); zero while it waits on none.
+  /// A shard blocked on a thread that is itself waiting for a CPU is starved, not stuck (A-228's transitive wait).
+  pub waits_on: AtomicU64,
   /// The shard's parking announcement and the kicks it saved: a sender kicks only a parked
   /// shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy"; the
   /// protocol and its loom model live in [`crate::parking`]).
@@ -396,6 +399,7 @@ pub(crate) fn register_slot(
       pair_rings: Vec::new(),
       ring_full_events: AtomicU64::new(0),
       cpu_clock: AtomicU64::new(0),
+      waits_on: AtomicU64::new(0),
       parking: Parking::new(),
       pulse: Pulse::default(),
       exited: AtomicBool::new(false),
@@ -553,6 +557,101 @@ pub fn record_cpu_clock(shard: u16) {
   }
 }
 
+/// A thread a shard may block on, named by its CPU-clock handle ([`calling_thread`]); handed to [`waiting_on`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadHandle(u64);
+
+/// The calling thread's handle, for a thread a shard may block on to publish as it starts; `None` where the platform
+/// reads no thread clock (Miri).
+pub fn calling_thread() -> Option<ThreadHandle> {
+  crate::thread_clock::current().map(ThreadHandle)
+}
+
+/// Marks the calling shard as blocked on `thread` until the guard drops (A-228's transitive wait, §4.14). Every place a
+/// shard thread blocks on another thread of the process holds one: the FUSE notify thread's join
+/// (`slates_bridge_fuse::channel::Notifier`), the landing barrier thread's join (`slates_server::landing`), and the
+/// WinFsp mount thread's join (`slates_bridge_winfsp::host::MountThread`). While it is held, [`shard_run_readings`]
+/// reads a blocked shard as runnable when that thread is runnable: blocked on a thread waiting for a CPU, the shard is
+/// starved, not stuck. A shard whose thread is blocked too is still read blocked, so a deadlock is still found. Off a
+/// shard, or with no handle, the guard does nothing.
+pub fn waiting_on(thread: Option<ThreadHandle>) -> WaitingOn {
+  mark_waiting(thread.map(|ThreadHandle(handle)| handle))
+}
+
+/// Format: the mark of a shard waiting on a thread that has not yet run its first instruction, so has published no
+/// handle ([`WaitedThread::join`]). A thread handle never takes this value: its tag bit is set and its id is a small
+/// integer beneath it (`crate::thread_clock`).
+const STARTING: u64 = u64::MAX;
+
+/// Marks the calling shard's entry with `handle` until the guard drops; off a shard, or with none, nothing.
+fn mark_waiting(handle: Option<u64>) -> WaitingOn {
+  let shard = handle.and_then(|handle| {
+    let shard = current_shard()?;
+    with_entry(shard, |entry| {
+      entry.waits_on.store(handle, Ordering::Release)
+    })?;
+    Some(shard)
+  });
+  WaitingOn { shard }
+}
+
+/// A thread a shard may join, with the handle it publishes as its first act ([`calling_thread`]). [`WaitedThread::join`]
+/// marks the joining shard as waiting on it ([`waiting_on`]). The handle comes over a channel of one, read without
+/// waiting at the join: a thread that has not yet run its first instruction has sent none, and its join is not marked,
+/// as every join was before.
+#[derive(Debug)]
+pub struct WaitedThread<T> {
+  thread: std::thread::JoinHandle<T>,
+  handle: Receiver<Option<ThreadHandle>>,
+}
+
+impl<T> WaitedThread<T> {
+  /// Joins the thread, the calling shard marked as waiting on it meanwhile. A thread that has not yet run its first
+  /// instruction has published no handle; the join first waits for it to, marked as waiting on a thread that is starting
+  /// ([`STARTING`]), which is runnable until it runs: so a join made at once after the spawn is marked too (a test that
+  /// joined at once found the shard unmarked for the whole join).
+  pub fn join(self) -> std::thread::Result<T> {
+    let on = match self.handle.try_recv() {
+      Ok(handle) => handle,
+      Err(std::sync::mpsc::TryRecvError::Empty) => {
+        let _starting = mark_waiting(Some(STARTING));
+        self.handle.recv().ok().flatten()
+      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+    };
+    let _waiting = waiting_on(on);
+    self.thread.join()
+  }
+}
+
+/// Spawns `work` on a thread `builder` describes, which publishes its handle for [`WaitedThread::join`] before it runs.
+pub fn spawn_waited<T: Send + 'static>(
+  builder: std::thread::Builder,
+  work: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<WaitedThread<T>> {
+  let (publish, handle) = sync_channel(1);
+  let thread = builder.spawn(move || {
+    // The receiver lives in the `WaitedThread`; were it gone, the join it serves is gone too.
+    let _ = publish.send(calling_thread());
+    work()
+  })?;
+  Ok(WaitedThread { thread, handle })
+}
+
+/// The mark [`waiting_on`] sets, cleared when it drops.
+#[derive(Debug)]
+pub struct WaitingOn {
+  shard: Option<u16>,
+}
+
+impl Drop for WaitingOn {
+  fn drop(&mut self) {
+    if let Some(shard) = self.shard {
+      let _ = with_entry(shard, |entry| entry.waits_on.store(0, Ordering::Release));
+    }
+  }
+}
+
 /// The calling thread's CPU clock now, or `None` where the platform reads none (Miri): for a caller that judges its own
 /// work by the CPU it spent rather than the wall time it took, which a loaded machine stretches (§4.14's rule for an
 /// observation's budget, applied by `crates/db/tests/snapshot_cadence.rs` to a recovery's cost). Windows charges the
@@ -578,18 +677,66 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
 /// says what each platform reads): `None` for one whose registration no longer holds its slot, whose thread recorded no
 /// clock, or where the platform reads nothing. A batch, since Windows reads the whole system's threads at once. With
 /// [`shard_cpu`] over a window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
+///
+/// A shard blocked on another thread of the process ([`waiting_on`]) reads as that thread does when that thread is
+/// runnable: blocked on a thread waiting for a CPU, it is starved, not stuck (A-228's transitive wait). A shard blocked on
+/// a thread that is itself blocked still reads blocked, so a deadlock is still found. One batch reads both: the shards'
+/// threads and the threads they wait on.
 pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_clock::RunReading>> {
-  let handles: Vec<u64> = holders
+  let marks: Vec<(u64, u64)> = holders
     .iter()
     .map(|holder| {
       with_entry(holder.shard, |entry| {
-        (entry.holder() == *holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+        (entry.holder() == *holder).then(|| {
+          (
+            entry.cpu_clock.load(Ordering::Acquire),
+            entry.waits_on.load(Ordering::Acquire),
+          )
+        })
       })
       .flatten()
-      .unwrap_or(0)
+      .unwrap_or((0, 0))
     })
     .collect();
-  crate::thread_clock::run_readings(&handles)
+  // A thread that is starting is runnable until it runs; it has no handle to read yet.
+  let starting = crate::thread_clock::RunReading {
+    state: crate::thread_clock::RunState::Runnable,
+    waited_ns: None,
+  };
+  let handles: Vec<u64> = marks
+    .iter()
+    .map(|(shard, _)| *shard)
+    .chain(
+      marks
+        .iter()
+        .map(|(_, waited)| if *waited == STARTING { 0 } else { *waited }),
+    )
+    .collect();
+  let mut readings = crate::thread_clock::run_readings(&handles);
+  let read_waited = readings.split_off(marks.len());
+  let waited = read_waited
+    .into_iter()
+    .zip(&marks)
+    .map(|(reading, (_, waited))| {
+      if *waited == STARTING {
+        Some(starting)
+      } else {
+        reading
+      }
+    });
+  readings
+    .into_iter()
+    .zip(waited)
+    .map(|(shard, waited)| match (shard, waited) {
+      (Some(shard), Some(waited))
+        if shard.state == crate::thread_clock::RunState::Blocked
+          && waited.state == crate::thread_clock::RunState::Runnable =>
+      {
+        Some(waited)
+      }
+      (shard, _) => shard,
+    })
+    .collect()
 }
 
 /// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).

@@ -276,6 +276,9 @@ pub struct ShardInner {
   /// Whether each slot is in `timer_waiters`, grown to the highest slot that waited (below the arena's
   /// capacity).
   timer_waiter_queued: Vec<bool>,
+  /// The task the shard runs alone while it lives ([`ShardContext::spawn_alone`]): until its future ends, each step
+  /// polls it and no other task, which stay queued in order. `None` when no task holds the shard.
+  alone: Option<Handle<TaskSlot>>,
 }
 
 impl ShardInner {
@@ -522,6 +525,7 @@ impl ShardContext {
         foreign,
         timer_waiters: std::collections::VecDeque::new(),
         timer_waiter_queued: Vec::new(),
+        alone: None,
       }),
       kept: KeptValues::default(),
     }));
@@ -775,6 +779,33 @@ impl ShardContext {
   /// Admits a local future under `parent`, joinable.
   pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
     self.admit(future, parent, true)
+  }
+
+  /// Admits a local future, joinable, that the shard runs alone until its future ends: each step polls it and no other
+  /// task. Tasks queued before it, spawned or woken meanwhile stay queued in their order and run once it ends, as they
+  /// would behind one long poll. It may yield as often as it likes, and every yield ends a step, so the shard's
+  /// steps, its pulse and its inbox go on (what a watchdog judging steps sees). Refused [`RtError::ShardHeld`] while
+  /// another task holds the shard. A shard held by a task that waits on something other than itself does nothing
+  /// else until that comes.
+  pub fn spawn_alone(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
+    let held = self
+      .with_inner(|inner| live_alone(inner).map(|handle| handle.index()))
+      .ok_or(RtError::NotOnShardThread)?;
+    if let Some(slot) = held {
+      return Err(RtError::ShardHeld { slot });
+    }
+    let id = self.admit(future, None, true)?;
+    self
+      .with_inner(|inner| inner.alone = Some(handle_of(id)))
+      .ok_or(RtError::NotOnShardThread)?;
+    Ok(id)
+  }
+
+  /// Whether a task holds the shard alone now ([`Self::spawn_alone`]).
+  fn held_alone(&self) -> bool {
+    self
+      .with_inner(|inner| live_alone(inner).is_some())
+      .unwrap_or(false)
   }
 
   fn admit(
@@ -1281,7 +1312,7 @@ impl ShardContext {
       self.update_attribution(|tracker| tracker.step_began(|| self.account_now()));
     }
     let mut did_work = false;
-    let (drained, batch) = self
+    let (drained, batch, alone) = self
       .with_inner(|inner| {
         inner.counters.steps = inner.counters.steps.saturating_add(1);
         // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
@@ -1305,15 +1336,26 @@ impl ShardContext {
         work |= self.drain_inbound(inner);
         work |= self.expire_timers(inner);
         work |= self.wake_ready_pollers(inner);
-        (work, inner.config.batch)
+        (work, inner.config.batch, live_alone(inner))
       })
-      .unwrap_or((false, 1));
+      .unwrap_or((false, 1, None));
     did_work |= drained;
-    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`).
-    let ready = self.local.take_ready(batch.max(1));
-    for slot in &ready {
+    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`). A shard a task holds
+    // alone polls that task only, when it is ready ([`Self::spawn_alone`]).
+    let ready = match alone {
+      Some(holder) => self.local.take_slot(holder.index()),
+      None => self.local.take_ready(batch.max(1)),
+    };
+    for (polled, slot) in ready.iter().enumerate() {
       did_work = true;
       self.poll_slot(*slot);
+      // A task this poll ran began to hold the shard alone: the rest of the batch waits for it, in its order.
+      if alone.is_none() && self.held_alone() {
+        self
+          .local
+          .put_back(ready.get(polled.saturating_add(1)..).unwrap_or_default());
+        break;
+      }
     }
     self.local.finish_drain(ready);
     let (exit, next_deadline_ns) = self
@@ -1918,6 +1960,10 @@ fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcom
   let Some(handle) = handle_at(&inner.arena, slot) else {
     return;
   };
+  // A task that held the shard alone lets it go as its future ends, whether it completed or was cancelled.
+  if inner.alone == Some(handle) {
+    inner.alone = None;
+  }
   let (children, first_child) = match inner.arena.get_mut(handle) {
     Ok(task) => {
       task.state = State::Finishing;
@@ -2022,6 +2068,22 @@ fn release_finished(arena: &mut Slab<TaskSlot>) {
       let _ = arena.remove(handle);
     }
   }
+}
+
+/// The task holding the shard alone, if its future has not ended ([`ShardContext::spawn_alone`]). A hold whose task is
+/// gone without passing through [`finish`] (its slot freed or reused) is let go here, so a stale hold never starves the
+/// shard.
+fn live_alone(inner: &mut ShardInner) -> Option<Handle<TaskSlot>> {
+  let holder = inner.alone?;
+  let live = inner
+    .arena
+    .get(holder)
+    .is_ok_and(|task| !matches!(task.state, State::Finishing | State::Done));
+  if !live {
+    inner.alone = None;
+    return None;
+  }
+  Some(holder)
 }
 
 fn cancel_all(arena: &mut Slab<TaskSlot>, local: &LocalQueue) {
