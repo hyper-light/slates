@@ -1,0 +1,200 @@
+## image: ubuntu26 20261101.186.1
+Unable to find image 'rust:1.98.1' locally
+1.98.1: Pulling from library/rust
+42f0cc32f2e3: Pulling fs layer
+ed8a5e9f2f6f: Pulling fs layer
+6eefb2f5d3e9: Pulling fs layer
+38985a14f2b1: Pulling fs layer
+e7272a918094: Pulling fs layer
+42f0cc32f2e3: Download complete
+b9cfe81e8cec: Download complete
+6eefb2f5d3e9: Download complete
+38985a14f2b1: Download complete
+a90298135267: Download complete
+ed8a5e9f2f6f: Download complete
+e7272a918094: Download complete
+6eefb2f5d3e9: Pull complete
+42f0cc32f2e3: Pull complete
+38985a14f2b1: Pull complete
+e7272a918094: Pull complete
+ed8a5e9f2f6f: Pull complete
+Digest: sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+Status: Downloaded newer image for rust:1.98.1
+info: syncing channel updates for 1.98.1-x86_64-unknown-linux-gnu
+info: latest update on 2026-09-03 for version 1.98.1 (48a229cea 2026-09-01)
+info: downloading 2 components
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cc v1.4.5
+  Downloaded cfg-if v1.0.4
+  Downloaded arrayvec v0.7.8
+  Downloaded bitflags v2.13.1
+  Downloaded blake3 v1.8.7
+  Downloaded errno v0.3.14
+  Downloaded pkg-config v0.3.34
+  Downloaded powerfmt v0.2.0
+  Downloaded quote v1.0.47
+  Downloaded proc-macro2 v1.0.107
+  Downloaded rcgen v0.13.2
+  Downloaded once_cell v1.21.4
+  Downloaded num-conv v0.2.2
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded crc32c v0.6.8
+  Downloaded itoa v1.0.18
+  Downloaded rustc_version v0.4.1
+  Downloaded yasna v0.5.2
+  Downloaded cmake v0.1.58
+  Downloaded thiserror-impl v2.0.21
+  Downloaded jobserver v0.1.35
+  Downloaded subtle v2.6.1
+  Downloaded cpufeatures v0.3.1
+  Downloaded lz4_flex v0.11.6
+  Downloaded untrusted v0.9.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded getrandom v0.2.17
+  Downloaded dunce v1.0.5
+  Downloaded time-core v0.1.9
+  Downloaded shlex v2.0.1
+  Downloaded zmij v1.0.23
+  Downloaded unicode-ident v1.0.24
+  Downloaded thiserror v2.0.21
+  Downloaded serde_core v1.0.229
+  Downloaded fs_extra v1.3.0
+  Downloaded zstd v0.13.3
+  Downloaded zeroize v1.9.0
+  Downloaded memmap2 v0.9.11
+  Downloaded getrandom v0.4.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded deranged v0.5.8
+  Downloaded semver v1.0.28
+  Downloaded twox-hash v2.1.4
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded serde_derive v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded rustls-webpki v0.103.15
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_json v1.0.151
+  Downloaded time v0.3.55
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded rustls v0.23.44
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded libc v0.2.189
+  Downloaded ring v0.17.14
+  Downloaded linux-raw-sys v0.12.1
+   Compiling libc v0.2.189
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling pkg-config v0.3.34
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling cfg-if v1.0.4
+   Compiling rustix v1.1.4
+   Compiling zstd-safe v7.3.0
+   Compiling bitflags v2.13.1
+   Compiling serde_core v1.0.229
+   Compiling linux-raw-sys v0.12.1
+   Compiling constant_time_eq v0.4.2
+   Compiling syn v3.0.5
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cpufeatures v0.3.1
+   Compiling arrayvec v0.7.8
+   Compiling cc v1.4.5
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling blake3 v1.8.7
+   Compiling serde_json v1.0.151
+   Compiling twox-hash v2.1.4
+   Compiling serde v1.0.229
+   Compiling lz4_flex v0.11.6
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling memmap2 v0.9.11
+   Compiling cmake v0.1.58
+   Compiling syn v2.0.119
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling aws-lc-sys v0.45.0 (/src/vendor/aws-lc-sys)
+   Compiling aws-lc-rs v1.18.1 (/src/vendor/aws-lc-rs)
+   Compiling zeroize v1.9.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (/src/crates/image)
+   Compiling slates-wire-derive v0.1.0 (/src/crates/wire-derive)
+   Compiling semver v1.0.28
+   Compiling rustc_version v0.4.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling crc32c v0.6.8
+   Compiling thiserror v2.0.21
+   Compiling rustls v0.23.44
+   Compiling getrandom v0.4.3
+   Compiling untrusted v0.9.0
+   Compiling thiserror-impl v2.0.21
+   Compiling once_cell v1.21.4
+   Compiling subtle v2.6.1
+   Compiling hyper-timing v0.1.0 (/src/vendor/hyper-raft/hyper-timing)
+   Compiling hyper-swim v0.1.0 (/src/vendor/hyper-raft/hyper-swim)
+   Compiling time-core v0.1.9
+   Compiling num-conv v0.2.2
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling time v0.3.55
+   Compiling slates-bridge-oci v0.1.0 (/src/crates/bridge-oci)
+   Compiling slates-merge v0.1.0 (/src/crates/merge)
+   Compiling yasna v0.5.2
+   Compiling slates-guest-probe v0.1.0 (/src/crates/guest-probe)
+   Compiling zstd v0.13.3
+   Compiling slates-machine v0.1.0 (/src/crates/machine)
+   Compiling slates-archive v0.1.0 (/src/crates/archive)
+   Compiling slates-mem v0.1.0 (/src/crates/mem)
+   Compiling slates-wire v0.1.0 (/src/crates/wire)
+   Compiling slates-rt v0.1.0 (/src/crates/rt)
+   Compiling slates-anchor v0.1.0 (/src/crates/anchor)
+   Compiling slates-vfs v0.1.0 (/src/crates/vfs)
+   Compiling slates-db v0.1.0 (/src/crates/db)
+   Compiling slates-ipc v0.1.0 (/src/crates/ipc)
+   Compiling slates-base v0.1.0 (/src/crates/base)
+   Compiling slates-bridge-core v0.1.0 (/src/crates/bridge-core)
+   Compiling slates-bridge-fuse v0.1.0 (/src/crates/bridge-fuse)
+   Compiling slates-bridge-virtiofs v0.1.0 (/src/crates/bridge-virtiofs)
+   Compiling slates-bridge-nfs v0.1.0 (/src/crates/bridge-nfs)
+   Compiling slates-land v0.1.0 (/src/crates/land)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/src/target/debug/build/aws-lc-sys-ad4834007445fa2c/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/src/target/debug/build/aws-lc-sys-ad4834007445fa2c/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/src/target/debug/build/aws-lc-sys-ad4834007445fa2c/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/src/target/debug/build/aws-lc-sys-ad4834007445fa2c/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling rustls-webpki v0.103.15
+   Compiling slates-seal v0.1.0 (/src/crates/seal)
+   Compiling hyper-datagram v0.1.0 (/src/vendor/hyper-raft/hyper-datagram)
+   Compiling hyper-seal v0.1.0 (/src/vendor/hyper-raft/hyper-seal)
+   Compiling slates-client v0.1.0 (/src/crates/client)
+   Compiling rcgen v0.13.2
+   Compiling slates-mcp v0.1.0 (/src/crates/mcp)
+   Compiling slates-transport v0.1.0 (/src/crates/transport)
+   Compiling slates-cluster v0.1.0 (/src/crates/cluster)
+   Compiling slates-server v0.1.0 (/src/crates/server)
+   Compiling slates-cli v0.1.0 (/src/crates/cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running tests/cli.rs (target/debug/deps/cli-215ef5075e9cab6d)
+
+running 1 test
+test a_mount_the_helpers_apparmor_profile_refuses_names_the_profile ... SKIP: this host's fusermount3 has no AppArmor profile
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.00s
+
+## policy test exit 0
