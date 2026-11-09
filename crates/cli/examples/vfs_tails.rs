@@ -24,641 +24,656 @@
 // Bench harness code: an unwrap here is a failed run.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-use rustix::fs::{Mode, OFlags};
-use slates_client::{Client, CreateSpec, Deadlines};
-use slates_db::replay::RECOVERY_BUDGET_NS;
-use slates_ipc::protocol::{NamePolicy, SizeClass};
-use slates_machine::{MachineProfile, ProfileOptions};
-use slates_server::daemon::LIVENESS_BUDGET_NS;
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
-
-/// Shape: background spinner threads per core in each sweep step: none, as many as cores, and twice that
-/// (an oversubscribed machine).
-const LOADS_PER_CORE: &[usize] = &[0, 1, 2];
-/// Shape: cores per concurrent caller in the wide step (the narrow step is one caller).
-const CORES_PER_WORKER: usize = 4;
-/// Shape: samples of each operation per caller: enough that p999 is a measured rank (a thousand or more
-/// samples per row at one caller).
-const SAMPLES: usize = 2_000;
-/// Shape: the small file an agent writes or reads (a source file).
-const SMALL_BYTES: usize = 4 << 10;
-/// Shape: the large file (a build artifact).
-const LARGE_BYTES: usize = 1 << 20;
-/// Shape: large-file samples per caller: each moves a mebibyte, so fewer.
-const LARGE_SAMPLES: usize = 200;
-/// Shape: the entries in the listed directory (a source tree's directory).
-const LISTED_ENTRIES: usize = 256;
-/// Derived: the volume's bound: a caller's peak is its listed directory and one large file (256 × 4 KiB +
-/// 1 MiB, about 2 MiB); 64 MiB holds the widest sweep's callers several times over without claiming a shard's
-/// budget the provisioning samples need.
-const VOLUME_BYTES: u64 = 64 << 20;
-/// Shape: the provisioning volume's bound.
-const PROVISION_BYTES: u64 = 1 << 20;
-/// Shape: the L2 assumed when the profile reports none (the largest per-core L2 on the supported targets).
-const FALLBACK_L2_BYTES: u64 = 16 << 20;
-/// Derived: a spinner's sweep is this many times the largest L2, so every pass spills its core's cache.
-const SWEEP_PER_L2: u64 = 2;
-/// Format: the percentiles reported, in parts per thousand.
-const PERCENTILES: &[u64] = &[500, 990, 999];
-/// Format: parts per thousand.
-const PERMILLE: u64 = 1000;
-/// Shape: how long to wait for the daemon's rendezvous to answer.
-const CONNECT_WAIT: Duration = Duration::from_secs(10);
-
-fn ns(elapsed: Duration) -> u64 {
-  u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// The nearest-rank percentile `permille` of sorted `samples`.
-fn rank(samples: &[u64], permille: u64) -> u64 {
-  let count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
-  let position = count.saturating_mul(permille).div_ceil(PERMILLE).max(1);
-  let index = usize::try_from(position.saturating_sub(1)).unwrap_or(usize::MAX);
-  samples.get(index).copied().unwrap_or(0)
-}
-
-fn report(load: usize, workers: usize, op: &str, mut samples: Vec<u64>) {
-  samples.sort_unstable();
-  let ranks: Vec<String> = PERCENTILES
-    .iter()
-    .map(|permille| rank(&samples, *permille).to_string())
-    .collect();
-  println!(
-    "tails\t{load}\t{workers}\t{op}\t{}\t{}\t{}",
-    ranks.join("\t"),
-    samples.last().copied().unwrap_or(0),
-    samples.len()
-  );
-}
-
-fn quick_profile() -> MachineProfile {
-  MachineProfile::measure_patiently(&ProfileOptions {
-    budget_per_probe: Duration::from_millis(5),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
-}
-
-fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
-    match Client::connect(instance, deadlines) {
-      Ok(client) => return client,
-      Err(e) => {
-        assert!(started.elapsed() < CONNECT_WAIT, "connect: {e}");
-        std::hint::spin_loop();
-      }
-    }
-  }
-}
-
-/// A live kernel mount, unmounted and its mount point removed on drop.
-struct Mounted {
-  path: String,
-}
-
-impl Drop for Mounted {
-  fn drop(&mut self) {
-    let _ = Command::new("umount").arg(&self.path).output();
-    let _ = Command::new("rmdir").arg(&self.path).output();
-  }
-}
-
-/// Mounts `volume` with the real `slates mount` against the in-process daemon `instance`.
-fn mount(instance: &str, volume: slates_client::VolumeId) -> Mounted {
-  let exe = std::env::current_exe().unwrap();
-  let examples = exe.parent().unwrap();
-  let path = format!("{}/slates-tails-{}", examples.display(), std::process::id());
-  let made = Command::new("mkdir").args(["-p", &path]).status().unwrap();
-  assert!(made.success(), "mkdir -p {path}");
-  let slates = examples.parent().unwrap().join("slates");
-  let id: String = volume
-    .bytes
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect();
-  let mounted = Command::new(&slates)
-    .args(["mount", &id, &path, "--instance", instance])
-    .output()
-    .unwrap();
-  assert!(
-    mounted.status.success(),
-    "slates mount ({}): {}",
-    slates.display(),
-    String::from_utf8_lossy(&mounted.stderr)
-  );
-  Mounted { path }
-}
-
-/// Background load: `threads` spinners, each sweeping its own `sweep_bytes` buffer a line at a time until
-/// `stop`, so the machine's cores, caches and memory bandwidth are all contended.
-fn spin(stop: &AtomicBool, sweep_bytes: usize, line_bytes: usize) {
-  let mut buffer = vec![0u8; sweep_bytes];
-  let mut value = 0u8;
-  while !stop.load(Ordering::Relaxed) {
-    for line in buffer.chunks_mut(line_bytes) {
-      if let Some(first) = line.first_mut() {
-        *first = first.wrapping_add(value);
-      }
-    }
-    value = value.wrapping_add(1);
-  }
-  std::hint::black_box(&buffer);
-}
-
-/// Times `call` once.
-fn timed(call: impl FnOnce()) -> u64 {
-  let started = Instant::now();
-  call();
-  ns(started.elapsed())
-}
-
-/// One caller's samples of each operation, in its own directory under the mount.
-#[derive(Default)]
-struct Samples {
-  create: Vec<u64>,
-  open_read: Vec<u64>,
-  stat: Vec<u64>,
-  list: Vec<u64>,
-  rename: Vec<u64>,
-  unlink: Vec<u64>,
-  write_large: Vec<u64>,
-}
-
-impl Samples {
-  fn absorb(&mut self, other: Samples) {
-    self.create.extend(other.create);
-    self.open_read.extend(other.open_read);
-    self.stat.extend(other.stat);
-    self.list.extend(other.list);
-    self.rename.extend(other.rename);
-    self.unlink.extend(other.unlink);
-    self.write_large.extend(other.write_large);
-  }
-}
-
-fn create_file(path: &str, bytes: &[u8]) {
-  let fd = rustix::fs::open(
-    path,
-    OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC,
-    Mode::from_raw_mode(0o644),
-  )
-  .unwrap();
-  let mut written = 0;
-  while written < bytes.len() {
-    written += rustix::io::write(&fd, bytes.get(written..).unwrap()).unwrap();
-  }
-}
-
-fn read_file(path: &str, buffer: &mut [u8]) {
-  let fd = rustix::fs::open(path, OFlags::RDONLY, Mode::empty()).unwrap();
-  let mut read = 0;
-  while read < buffer.len() {
-    let got = rustix::io::read(&fd, buffer.get_mut(read..).unwrap()).unwrap();
-    if got == 0 {
-      break;
-    }
-    read += got;
-  }
-}
-
-fn list_dir(path: &str) -> usize {
-  let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
-  let dir = rustix::fs::Dir::read_from(&fd).unwrap();
-  let mut entries = 0;
-  for entry in dir {
-    entry.unwrap();
-    entries += 1;
-  }
-  entries
-}
-
-/// One caller's run: creates, reads, stats, lists, renames, unlinks and large writes, each sampled.
-// The writes, renames and unlinks are through the slates mount, into the RAM volume behind it: never a host
-// path's bytes (R1).
-#[allow(clippy::disallowed_methods)]
-fn caller(root: &str, index: usize) -> Samples {
-  let dir = format!("{root}/w{index}");
-  rustix::fs::mkdir(dir.as_str(), Mode::from_raw_mode(0o755)).unwrap();
-  let listed = format!("{dir}/listed");
-  rustix::fs::mkdir(listed.as_str(), Mode::from_raw_mode(0o755)).unwrap();
-  let small = vec![7u8; SMALL_BYTES];
-  let large = vec![9u8; LARGE_BYTES];
-  let mut buffer = vec![0u8; SMALL_BYTES];
-  for entry in 0..LISTED_ENTRIES {
-    create_file(&format!("{listed}/e{entry}"), &small);
-  }
-  let mut samples = Samples::default();
-  for sample in 0..SAMPLES {
-    let file = format!("{dir}/f{sample}");
-    let moved = format!("{dir}/m{sample}");
-    samples.create.push(timed(|| create_file(&file, &small)));
-    samples
-      .open_read
-      .push(timed(|| read_file(&file, &mut buffer)));
-    samples.stat.push(timed(|| {
-      rustix::fs::stat(file.as_str()).unwrap();
-    }));
-    samples.list.push(timed(|| {
-      assert_eq!(list_dir(&listed), LISTED_ENTRIES + 2);
-    }));
-    samples.rename.push(timed(|| {
-      rustix::fs::rename(file.as_str(), moved.as_str()).unwrap()
-    }));
-    samples
-      .unlink
-      .push(timed(|| rustix::fs::unlink(moved.as_str()).unwrap()));
-  }
-  for sample in 0..LARGE_SAMPLES {
-    let file = format!("{dir}/large{sample}");
-    samples
-      .write_large
-      .push(timed(|| create_file(&file, &large)));
-    rustix::fs::unlink(file.as_str()).unwrap();
-  }
-  samples
-}
-
-fn provision(client: &mut Client, round: usize) -> Vec<u64> {
-  (0..SAMPLES)
-    .map(|sample| {
-      let spec = CreateSpec {
-        name: format!("p{round}-{sample}"),
-        size: SizeClass::Bounded {
-          limit: PROVISION_BYTES,
-        },
-        names: NamePolicy::Exact,
-        require_locked: false,
-        base: None,
-      };
-      let mut id = None;
-      let elapsed = timed(|| id = Some(client.create(&spec).unwrap()));
-      client.destroy(id.unwrap()).unwrap();
-      elapsed
-    })
-    .collect()
-}
-
-/// `VFS_TAILS_FOCUS=<seconds>:<load per core>`: renames one file back and forth for that long under that load
-/// and prints the rate, so a profiler can sample the process during one operation's loop.
-// The renames are through the slates mount, into the RAM volume behind it (R1).
-#[allow(clippy::disallowed_methods)]
-fn focus_loop(
-  daemon: &Daemon,
-  root: &str,
-  focus: &str,
-  cores: usize,
-  sweep_bytes: usize,
-  line_bytes: usize,
-) {
-  let (seconds, per_core) = focus.split_once(':').unwrap();
-  let span = Duration::from_secs(seconds.parse().unwrap());
-  let per_core: usize = per_core.parse().unwrap();
-  let (first, second) = (format!("{root}/focus-a"), format!("{root}/focus-b"));
-  create_file(&first, &[1u8; SMALL_BYTES]);
-  let stop = AtomicBool::new(false);
-  std::thread::scope(|scope| {
-    for _ in 0..per_core.saturating_mul(cores) {
-      scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
-    }
-    println!(
-      "# focus: pid {} renaming for {span:?} at {per_core} spinner(s) per core",
-      std::process::id()
-    );
-    let started = Instant::now();
-    let mut renames = 0u64;
-    let mut samples = Vec::new();
-    while started.elapsed() < span {
-      let (from, to) = if renames.is_multiple_of(2) {
-        (&first, &second)
-      } else {
-        (&second, &first)
-      };
-      samples.push(timed(|| {
-        rustix::fs::rename(from.as_str(), to.as_str()).unwrap()
-      }));
-      renames += 1;
-    }
-    stop.store(true, Ordering::Relaxed);
-    report(per_core, 1, "focus_rename", samples);
-  });
-  let times = daemon.nfs_service_times().unwrap();
-  for (kind, served) in [
-    ("served_local", times.local),
-    ("served_forwarded", times.forwarded),
-    ("served_local_off_cpu", times.local_off_cpu),
-  ] {
-    println!(
-      "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
-      served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
-    );
-  }
-}
-
-/// A raw NFSv3 client over its own loopback connection to the daemon (no kernel NFS client): the instrument that
-/// tells the daemon-and-socket share of a call's time from the kernel client's and the caller's own sleeps.
-struct RawNfs {
-  stream: std::net::TcpStream,
-  root: Vec<u8>,
-  credential: Vec<u8>,
-  xid: u32,
-}
-
-/// Format: ONC RPC and NFSv3 numbers (RFC 5531, RFC 1813).
-const RPC_CALL: u32 = 0;
-/// Format: see [`RPC_CALL`].
-const RPC_VERSION: u32 = 2;
-/// Format: see [`RPC_CALL`].
-const AUTH_SYS: u32 = 1;
-/// Format: see [`RPC_CALL`].
-const NFS_PROGRAM: u32 = 100_003;
-/// Format: see [`RPC_CALL`].
-const NFS_V3: u32 = 3;
-/// Format: see [`RPC_CALL`].
-const NFSPROC3_CREATE: u32 = 8;
-/// Format: see [`RPC_CALL`].
-const NFSPROC3_RENAME: u32 = 14;
-
-impl RawNfs {
-  /// Mounts `export` (a capability path) on the daemon's `port` and keeps one connection open.
-  fn mount(port: u16, export: &str) -> RawNfs {
-    let caller = slates_bridge_nfs::client::Credentials {
-      uid: rustix::process::getuid().as_raw(),
-      gid: rustix::process::getgid().as_raw(),
-      gids: Vec::new(),
-    };
-    let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export, CONNECT_WAIT)
-      .unwrap()
-      .0;
-    let mut credential = slates_bridge_nfs::xdr::XdrWriter::new();
-    credential.u32(0);
-    credential.opaque(b"localhost");
-    credential.u32(caller.uid);
-    credential.u32(caller.gid);
-    credential.u32(0);
-    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_nodelay(true).unwrap();
-    RawNfs {
-      stream,
-      root,
-      credential: credential.into_bytes(),
-      xid: 1,
-    }
-  }
-
-  /// One call of `procedure` with `args`; returns the NFS status word of the reply.
-  fn call(&mut self, procedure: u32, args: &[u8]) -> u32 {
-    use std::io::{Read, Write};
-    self.xid = self.xid.wrapping_add(1);
-    let mut body = slates_bridge_nfs::xdr::XdrWriter::new();
-    for word in [
-      self.xid,
-      RPC_CALL,
-      RPC_VERSION,
-      NFS_PROGRAM,
-      NFS_V3,
-      procedure,
-      AUTH_SYS,
-    ] {
-      body.u32(word);
-    }
-    body.opaque(&self.credential);
-    body.u32(0);
-    body.opaque(&[]);
-    let mut message = body.into_bytes();
-    message.extend_from_slice(args);
-    self
-      .stream
-      .write_all(&slates_bridge_nfs::rpc::write_record(&message))
-      .unwrap();
-    let mut received = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let reply = loop {
-      if let Ok((reply, _)) = slates_bridge_nfs::rpc::read_record(&received) {
-        break reply;
-      }
-      let read = self.stream.read(&mut chunk).unwrap();
-      assert!(read > 0, "the daemon closed the raw connection");
-      received.extend_from_slice(chunk.get(..read).unwrap());
-    };
-    // xid, REPLY, MSG_ACCEPTED, verifier (flavor, empty body), SUCCESS, then the nfsstat3.
-    let mut reader = slates_bridge_nfs::xdr::XdrReader::new(&reply);
-    for _ in 0..3 {
-      reader.u32().unwrap();
-    }
-    reader.u32().unwrap();
-    reader.opaque(usize::MAX).unwrap();
-    assert_eq!(reader.u32().unwrap(), 0, "the call was accepted");
-    reader.u32().unwrap()
-  }
-
-  fn dirop(&self, name: &str) -> Vec<u8> {
-    let mut args = slates_bridge_nfs::xdr::XdrWriter::new();
-    args.opaque(&self.root);
-    args.opaque(name.as_bytes());
-    args.into_bytes()
-  }
-
-  fn create(&mut self, name: &str) {
-    let mut args = self.dirop(name);
-    let mut how = slates_bridge_nfs::xdr::XdrWriter::new();
-    how.u32(0); // UNCHECKED
-    for _ in 0..6 {
-      how.u32(0); // no attribute set
-    }
-    args.extend_from_slice(&how.into_bytes());
-    assert_eq!(self.call(NFSPROC3_CREATE, &args), 0, "CREATE {name}");
-  }
-
-  fn rename(&mut self, from: &str, to: &str) {
-    let mut args = self.dirop(from);
-    args.extend_from_slice(&self.dirop(to));
-    assert_eq!(
-      self.call(NFSPROC3_RENAME, &args),
-      0,
-      "RENAME {from} -> {to}"
-    );
-  }
-}
-
-/// `VFS_TAILS_RAW=<seconds>:<load per core>`: renames over [`RawNfs`] for that long under that load, one RPC per
-/// sample, and prints the caller's histogram beside the daemon's service times.
-fn raw_loop(
-  daemon: &Daemon,
-  client: &mut Client,
-  focus: &str,
-  cores: usize,
-  sweep_bytes: usize,
-  line_bytes: usize,
-) {
-  let (seconds, per_core) = focus.split_once(':').unwrap();
-  let span = Duration::from_secs(seconds.parse().unwrap());
-  let per_core: usize = per_core.parse().unwrap();
-  let volume = client
-    .create(&CreateSpec {
-      name: "raw".to_owned(),
-      size: SizeClass::Bounded {
-        limit: VOLUME_BYTES,
-      },
-      names: NamePolicy::Exact,
-      require_locked: false,
-      base: None,
-    })
-    .unwrap();
-  let attachment = client
-    .attach_mount(volume, slates_ipc::protocol::Intent::Write)
-    .unwrap();
-  let token: String = attachment
-    .token
-    .unwrap()
-    .iter()
-    .map(|b| format!("{b:02x}"))
-    .collect();
-  let export = format!("/raw@{:x}.{token}", attachment.attachment);
-  let mut raw = RawNfs::mount(daemon.nfs_port().unwrap(), &export);
-  raw.create("raw-a");
-  let stop = AtomicBool::new(false);
-  std::thread::scope(|scope| {
-    for _ in 0..per_core.saturating_mul(cores) {
-      scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
-    }
-    let started = Instant::now();
-    let mut renames = 0u64;
-    let mut samples = Vec::new();
-    while started.elapsed() < span {
-      let (from, to) = if renames.is_multiple_of(2) {
-        ("raw-a", "raw-b")
-      } else {
-        ("raw-b", "raw-a")
-      };
-      samples.push(timed(|| raw.rename(from, to)));
-      renames += 1;
-    }
-    stop.store(true, Ordering::Relaxed);
-    report(per_core, 1, "raw_rename_rpc", samples);
-  });
-  let times = daemon.nfs_service_times().unwrap();
-  for (kind, served) in [
-    ("served_local", times.local),
-    ("served_forwarded", times.forwarded),
-    ("served_local_off_cpu", times.local_off_cpu),
-  ] {
-    println!(
-      "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
-      served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
-    );
-  }
-}
-
+#[cfg(unix)]
 fn main() {
-  let cores = std::thread::available_parallelism().map_or(1, usize::from);
-  let profile = quick_profile();
-  let largest_l2 = profile
-    .facts
-    .cores
-    .iter()
-    .map(|core| core.l2_bytes)
-    .max()
-    .filter(|bytes| *bytes > 0)
-    .unwrap_or(FALLBACK_L2_BYTES);
-  let sweep_bytes = usize::try_from(largest_l2.saturating_mul(SWEEP_PER_L2)).unwrap();
-  let line_bytes = usize::try_from(profile.facts.cache_line).unwrap().max(1);
-  let instance = format!("slates-tails-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, None);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: format!("slates-seg-tails-{}", std::process::id()),
-    },
-  )
-  .unwrap();
-  daemon.bootstrap(true).unwrap();
-  let mut client = connect(&instance);
-  let volume = client
-    .create(&CreateSpec {
-      name: "tails".to_owned(),
-      size: SizeClass::Bounded {
-        limit: VOLUME_BYTES,
-      },
-      names: NamePolicy::Exact,
-      require_locked: false,
-      base: None,
-    })
-    .unwrap();
-  let mounted = mount(&instance, volume);
-  // Release builds abort on a panic, so `Mounted`'s drop never runs: the hook unmounts first.
-  let mount_path = mounted.path.clone();
-  let previous = std::panic::take_hook();
-  std::panic::set_hook(Box::new(move |info| {
-    let _ = Command::new("umount").arg(&mount_path).output();
-    let _ = Command::new("rmdir").arg(&mount_path).output();
-    previous(info);
-  }));
-  println!(
-    "# {cores} cores, spinner sweep {sweep_bytes} B, {} shard(s); {}",
-    daemon.shards().len(),
-    std::env::consts::OS
-  );
-  if let Ok(focus) = std::env::var("VFS_TAILS_RAW") {
-    raw_loop(&daemon, &mut client, &focus, cores, sweep_bytes, line_bytes);
-    return;
+  unix::run();
+}
+
+/// The paired arm: Unix only, because it times file calls through a real kernel mount made by `slates mount` (NFS on macOS, FUSE on Linux) with `rustix` file calls; Windows mounts through WinFsp, whose costs the WinFsp benchmark measures.
+#[cfg(not(unix))]
+fn main() {
+  eprintln!("SKIP vfs_tails: Unix only; see the module's doc");
+}
+
+/// Everything the bench does, built where it means something (see the paired `main`).
+#[cfg(unix)]
+mod unix {
+  use std::process::Command;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::time::{Duration, Instant};
+
+  use rustix::fs::{Mode, OFlags};
+  use slates_client::{Client, CreateSpec, Deadlines};
+  use slates_db::replay::RECOVERY_BUDGET_NS;
+  use slates_ipc::protocol::{NamePolicy, SizeClass};
+  use slates_machine::{MachineProfile, ProfileOptions};
+  use slates_server::daemon::LIVENESS_BUDGET_NS;
+  use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+  /// Shape: background spinner threads per core in each sweep step: none, as many as cores, and twice that
+  /// (an oversubscribed machine).
+  const LOADS_PER_CORE: &[usize] = &[0, 1, 2];
+  /// Shape: cores per concurrent caller in the wide step (the narrow step is one caller).
+  const CORES_PER_WORKER: usize = 4;
+  /// Shape: samples of each operation per caller: enough that p999 is a measured rank (a thousand or more
+  /// samples per row at one caller).
+  const SAMPLES: usize = 2_000;
+  /// Shape: the small file an agent writes or reads (a source file).
+  const SMALL_BYTES: usize = 4 << 10;
+  /// Shape: the large file (a build artifact).
+  const LARGE_BYTES: usize = 1 << 20;
+  /// Shape: large-file samples per caller: each moves a mebibyte, so fewer.
+  const LARGE_SAMPLES: usize = 200;
+  /// Shape: the entries in the listed directory (a source tree's directory).
+  const LISTED_ENTRIES: usize = 256;
+  /// Derived: the volume's bound: a caller's peak is its listed directory and one large file (256 × 4 KiB +
+  /// 1 MiB, about 2 MiB); 64 MiB holds the widest sweep's callers several times over without claiming a shard's
+  /// budget the provisioning samples need.
+  const VOLUME_BYTES: u64 = 64 << 20;
+  /// Shape: the provisioning volume's bound.
+  const PROVISION_BYTES: u64 = 1 << 20;
+  /// Shape: the L2 assumed when the profile reports none (the largest per-core L2 on the supported targets).
+  const FALLBACK_L2_BYTES: u64 = 16 << 20;
+  /// Derived: a spinner's sweep is this many times the largest L2, so every pass spills its core's cache.
+  const SWEEP_PER_L2: u64 = 2;
+  /// Format: the percentiles reported, in parts per thousand.
+  const PERCENTILES: &[u64] = &[500, 990, 999];
+  /// Format: parts per thousand.
+  const PERMILLE: u64 = 1000;
+  /// Shape: how long to wait for the daemon's rendezvous to answer.
+  const CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+  fn ns(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
   }
-  if let Ok(focus) = std::env::var("VFS_TAILS_FOCUS") {
-    focus_loop(
-      &daemon,
-      &mounted.path,
-      &focus,
-      cores,
-      sweep_bytes,
-      line_bytes,
+
+  /// The nearest-rank percentile `permille` of sorted `samples`.
+  fn rank(samples: &[u64], permille: u64) -> u64 {
+    let count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
+    let position = count.saturating_mul(permille).div_ceil(PERMILLE).max(1);
+    let index = usize::try_from(position.saturating_sub(1)).unwrap_or(usize::MAX);
+    samples.get(index).copied().unwrap_or(0)
+  }
+
+  fn report(load: usize, workers: usize, op: &str, mut samples: Vec<u64>) {
+    samples.sort_unstable();
+    let ranks: Vec<String> = PERCENTILES
+      .iter()
+      .map(|permille| rank(&samples, *permille).to_string())
+      .collect();
+    println!(
+      "tails\t{load}\t{workers}\t{op}\t{}\t{}\t{}",
+      ranks.join("\t"),
+      samples.last().copied().unwrap_or(0),
+      samples.len()
     );
-    return;
   }
-  let wide = (cores / CORES_PER_WORKER).max(1);
-  let mut round = 0usize;
-  for &per_core in LOADS_PER_CORE {
+
+  fn quick_profile() -> MachineProfile {
+    MachineProfile::measure_patiently(&ProfileOptions {
+      budget_per_probe: Duration::from_millis(5),
+      codecs: false,
+      core_matrix: false,
+    })
+    .expect("the machine profile measures")
+  }
+
+  fn connect(instance: &str) -> Client {
+    let started = Instant::now();
+    loop {
+      let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
+      match Client::connect(instance, deadlines) {
+        Ok(client) => return client,
+        Err(e) => {
+          assert!(started.elapsed() < CONNECT_WAIT, "connect: {e}");
+          std::hint::spin_loop();
+        }
+      }
+    }
+  }
+
+  /// A live kernel mount, unmounted and its mount point removed on drop.
+  struct Mounted {
+    path: String,
+  }
+
+  impl Drop for Mounted {
+    fn drop(&mut self) {
+      let _ = Command::new("umount").arg(&self.path).output();
+      let _ = Command::new("rmdir").arg(&self.path).output();
+    }
+  }
+
+  /// Mounts `volume` with the real `slates mount` against the in-process daemon `instance`.
+  fn mount(instance: &str, volume: slates_client::VolumeId) -> Mounted {
+    let exe = std::env::current_exe().unwrap();
+    let examples = exe.parent().unwrap();
+    let path = format!("{}/slates-tails-{}", examples.display(), std::process::id());
+    let made = Command::new("mkdir").args(["-p", &path]).status().unwrap();
+    assert!(made.success(), "mkdir -p {path}");
+    let slates = examples.parent().unwrap().join("slates");
+    let id: String = volume
+      .bytes
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    let mounted = Command::new(&slates)
+      .args(["mount", &id, &path, "--instance", instance])
+      .output()
+      .unwrap();
+    assert!(
+      mounted.status.success(),
+      "slates mount ({}): {}",
+      slates.display(),
+      String::from_utf8_lossy(&mounted.stderr)
+    );
+    Mounted { path }
+  }
+
+  /// Background load: `threads` spinners, each sweeping its own `sweep_bytes` buffer a line at a time until
+  /// `stop`, so the machine's cores, caches and memory bandwidth are all contended.
+  fn spin(stop: &AtomicBool, sweep_bytes: usize, line_bytes: usize) {
+    let mut buffer = vec![0u8; sweep_bytes];
+    let mut value = 0u8;
+    while !stop.load(Ordering::Relaxed) {
+      for line in buffer.chunks_mut(line_bytes) {
+        if let Some(first) = line.first_mut() {
+          *first = first.wrapping_add(value);
+        }
+      }
+      value = value.wrapping_add(1);
+    }
+    std::hint::black_box(&buffer);
+  }
+
+  /// Times `call` once.
+  fn timed(call: impl FnOnce()) -> u64 {
+    let started = Instant::now();
+    call();
+    ns(started.elapsed())
+  }
+
+  /// One caller's samples of each operation, in its own directory under the mount.
+  #[derive(Default)]
+  struct Samples {
+    create: Vec<u64>,
+    open_read: Vec<u64>,
+    stat: Vec<u64>,
+    list: Vec<u64>,
+    rename: Vec<u64>,
+    unlink: Vec<u64>,
+    write_large: Vec<u64>,
+  }
+
+  impl Samples {
+    fn absorb(&mut self, other: Samples) {
+      self.create.extend(other.create);
+      self.open_read.extend(other.open_read);
+      self.stat.extend(other.stat);
+      self.list.extend(other.list);
+      self.rename.extend(other.rename);
+      self.unlink.extend(other.unlink);
+      self.write_large.extend(other.write_large);
+    }
+  }
+
+  fn create_file(path: &str, bytes: &[u8]) {
+    let fd = rustix::fs::open(
+      path,
+      OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC,
+      Mode::from_raw_mode(0o644),
+    )
+    .unwrap();
+    let mut written = 0;
+    while written < bytes.len() {
+      written += rustix::io::write(&fd, bytes.get(written..).unwrap()).unwrap();
+    }
+  }
+
+  fn read_file(path: &str, buffer: &mut [u8]) {
+    let fd = rustix::fs::open(path, OFlags::RDONLY, Mode::empty()).unwrap();
+    let mut read = 0;
+    while read < buffer.len() {
+      let got = rustix::io::read(&fd, buffer.get_mut(read..).unwrap()).unwrap();
+      if got == 0 {
+        break;
+      }
+      read += got;
+    }
+  }
+
+  fn list_dir(path: &str) -> usize {
+    let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+    let dir = rustix::fs::Dir::read_from(&fd).unwrap();
+    let mut entries = 0;
+    for entry in dir {
+      entry.unwrap();
+      entries += 1;
+    }
+    entries
+  }
+
+  /// One caller's run: creates, reads, stats, lists, renames, unlinks and large writes, each sampled.
+  // The writes, renames and unlinks are through the slates mount, into the RAM volume behind it: never a host
+  // path's bytes (R1).
+  #[allow(clippy::disallowed_methods)]
+  fn caller(root: &str, index: usize) -> Samples {
+    let dir = format!("{root}/w{index}");
+    rustix::fs::mkdir(dir.as_str(), Mode::from_raw_mode(0o755)).unwrap();
+    let listed = format!("{dir}/listed");
+    rustix::fs::mkdir(listed.as_str(), Mode::from_raw_mode(0o755)).unwrap();
+    let small = vec![7u8; SMALL_BYTES];
+    let large = vec![9u8; LARGE_BYTES];
+    let mut buffer = vec![0u8; SMALL_BYTES];
+    for entry in 0..LISTED_ENTRIES {
+      create_file(&format!("{listed}/e{entry}"), &small);
+    }
+    let mut samples = Samples::default();
+    for sample in 0..SAMPLES {
+      let file = format!("{dir}/f{sample}");
+      let moved = format!("{dir}/m{sample}");
+      samples.create.push(timed(|| create_file(&file, &small)));
+      samples
+        .open_read
+        .push(timed(|| read_file(&file, &mut buffer)));
+      samples.stat.push(timed(|| {
+        rustix::fs::stat(file.as_str()).unwrap();
+      }));
+      samples.list.push(timed(|| {
+        assert_eq!(list_dir(&listed), LISTED_ENTRIES + 2);
+      }));
+      samples.rename.push(timed(|| {
+        rustix::fs::rename(file.as_str(), moved.as_str()).unwrap()
+      }));
+      samples
+        .unlink
+        .push(timed(|| rustix::fs::unlink(moved.as_str()).unwrap()));
+    }
+    for sample in 0..LARGE_SAMPLES {
+      let file = format!("{dir}/large{sample}");
+      samples
+        .write_large
+        .push(timed(|| create_file(&file, &large)));
+      rustix::fs::unlink(file.as_str()).unwrap();
+    }
+    samples
+  }
+
+  fn provision(client: &mut Client, round: usize) -> Vec<u64> {
+    (0..SAMPLES)
+      .map(|sample| {
+        let spec = CreateSpec {
+          name: format!("p{round}-{sample}"),
+          size: SizeClass::Bounded {
+            limit: PROVISION_BYTES,
+          },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        };
+        let mut id = None;
+        let elapsed = timed(|| id = Some(client.create(&spec).unwrap()));
+        client.destroy(id.unwrap()).unwrap();
+        elapsed
+      })
+      .collect()
+  }
+
+  /// `VFS_TAILS_FOCUS=<seconds>:<load per core>`: renames one file back and forth for that long under that load
+  /// and prints the rate, so a profiler can sample the process during one operation's loop.
+  // The renames are through the slates mount, into the RAM volume behind it (R1).
+  #[allow(clippy::disallowed_methods)]
+  fn focus_loop(
+    daemon: &Daemon,
+    root: &str,
+    focus: &str,
+    cores: usize,
+    sweep_bytes: usize,
+    line_bytes: usize,
+  ) {
+    let (seconds, per_core) = focus.split_once(':').unwrap();
+    let span = Duration::from_secs(seconds.parse().unwrap());
+    let per_core: usize = per_core.parse().unwrap();
+    let (first, second) = (format!("{root}/focus-a"), format!("{root}/focus-b"));
+    create_file(&first, &[1u8; SMALL_BYTES]);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
       for _ in 0..per_core.saturating_mul(cores) {
         scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
       }
-      report(per_core, 1, "provision", provision(&mut client, round));
-      for workers in [1, wide] {
-        round += 1;
-        let root = format!("{}/r{round}", mounted.path);
-        #[allow(clippy::disallowed_methods)]
-        rustix::fs::mkdir(root.as_str(), Mode::from_raw_mode(0o755)).unwrap();
-        let mut all = Samples::default();
-        std::thread::scope(|callers| {
-          let handles: Vec<_> = (0..workers)
-            .map(|index| {
-              let root = root.as_str();
-              callers.spawn(move || caller(root, index))
-            })
-            .collect();
-          for handle in handles {
-            all.absorb(handle.join().unwrap());
-          }
-        });
-        report(per_core, workers, "create_4k", all.create);
-        report(per_core, workers, "open_read_4k", all.open_read);
-        report(per_core, workers, "stat", all.stat);
-        report(per_core, workers, "list_256", all.list);
-        report(per_core, workers, "rename", all.rename);
-        report(per_core, workers, "unlink", all.unlink);
-        report(per_core, workers, "write_1m", all.write_large);
+      println!(
+        "# focus: pid {} renaming for {span:?} at {per_core} spinner(s) per core",
+        std::process::id()
+      );
+      let started = Instant::now();
+      let mut renames = 0u64;
+      let mut samples = Vec::new();
+      while started.elapsed() < span {
+        let (from, to) = if renames.is_multiple_of(2) {
+          (&first, &second)
+        } else {
+          (&second, &first)
+        };
+        samples.push(timed(|| {
+          rustix::fs::rename(from.as_str(), to.as_str()).unwrap()
+        }));
+        renames += 1;
       }
       stop.store(true, Ordering::Relaxed);
+      report(per_core, 1, "focus_rename", samples);
     });
+    let times = daemon.nfs_service_times().unwrap();
+    for (kind, served) in [
+      ("served_local", times.local),
+      ("served_forwarded", times.forwarded),
+      ("served_local_off_cpu", times.local_off_cpu),
+    ] {
+      println!(
+        "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
+        served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
+      );
+    }
   }
-  drop(mounted);
-  drop(client);
-  drop(daemon);
+
+  /// A raw NFSv3 client over its own loopback connection to the daemon (no kernel NFS client): the instrument that
+  /// tells the daemon-and-socket share of a call's time from the kernel client's and the caller's own sleeps.
+  struct RawNfs {
+    stream: std::net::TcpStream,
+    root: Vec<u8>,
+    credential: Vec<u8>,
+    xid: u32,
+  }
+
+  /// Format: ONC RPC and NFSv3 numbers (RFC 5531, RFC 1813).
+  const RPC_CALL: u32 = 0;
+  /// Format: see [`RPC_CALL`].
+  const RPC_VERSION: u32 = 2;
+  /// Format: see [`RPC_CALL`].
+  const AUTH_SYS: u32 = 1;
+  /// Format: see [`RPC_CALL`].
+  const NFS_PROGRAM: u32 = 100_003;
+  /// Format: see [`RPC_CALL`].
+  const NFS_V3: u32 = 3;
+  /// Format: see [`RPC_CALL`].
+  const NFSPROC3_CREATE: u32 = 8;
+  /// Format: see [`RPC_CALL`].
+  const NFSPROC3_RENAME: u32 = 14;
+
+  impl RawNfs {
+    /// Mounts `export` (a capability path) on the daemon's `port` and keeps one connection open.
+    fn mount(port: u16, export: &str) -> RawNfs {
+      let caller = slates_bridge_nfs::client::Credentials {
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
+        gids: Vec::new(),
+      };
+      let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export, CONNECT_WAIT)
+        .unwrap()
+        .0;
+      let mut credential = slates_bridge_nfs::xdr::XdrWriter::new();
+      credential.u32(0);
+      credential.opaque(b"localhost");
+      credential.u32(caller.uid);
+      credential.u32(caller.gid);
+      credential.u32(0);
+      let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+      stream.set_nodelay(true).unwrap();
+      RawNfs {
+        stream,
+        root,
+        credential: credential.into_bytes(),
+        xid: 1,
+      }
+    }
+
+    /// One call of `procedure` with `args`; returns the NFS status word of the reply.
+    fn call(&mut self, procedure: u32, args: &[u8]) -> u32 {
+      use std::io::{Read, Write};
+      self.xid = self.xid.wrapping_add(1);
+      let mut body = slates_bridge_nfs::xdr::XdrWriter::new();
+      for word in [
+        self.xid,
+        RPC_CALL,
+        RPC_VERSION,
+        NFS_PROGRAM,
+        NFS_V3,
+        procedure,
+        AUTH_SYS,
+      ] {
+        body.u32(word);
+      }
+      body.opaque(&self.credential);
+      body.u32(0);
+      body.opaque(&[]);
+      let mut message = body.into_bytes();
+      message.extend_from_slice(args);
+      self
+        .stream
+        .write_all(&slates_bridge_nfs::rpc::write_record(&message))
+        .unwrap();
+      let mut received = Vec::new();
+      let mut chunk = [0u8; 4096];
+      let reply = loop {
+        if let Ok((reply, _)) = slates_bridge_nfs::rpc::read_record(&received) {
+          break reply;
+        }
+        let read = self.stream.read(&mut chunk).unwrap();
+        assert!(read > 0, "the daemon closed the raw connection");
+        received.extend_from_slice(chunk.get(..read).unwrap());
+      };
+      // xid, REPLY, MSG_ACCEPTED, verifier (flavor, empty body), SUCCESS, then the nfsstat3.
+      let mut reader = slates_bridge_nfs::xdr::XdrReader::new(&reply);
+      for _ in 0..3 {
+        reader.u32().unwrap();
+      }
+      reader.u32().unwrap();
+      reader.opaque(usize::MAX).unwrap();
+      assert_eq!(reader.u32().unwrap(), 0, "the call was accepted");
+      reader.u32().unwrap()
+    }
+
+    fn dirop(&self, name: &str) -> Vec<u8> {
+      let mut args = slates_bridge_nfs::xdr::XdrWriter::new();
+      args.opaque(&self.root);
+      args.opaque(name.as_bytes());
+      args.into_bytes()
+    }
+
+    fn create(&mut self, name: &str) {
+      let mut args = self.dirop(name);
+      let mut how = slates_bridge_nfs::xdr::XdrWriter::new();
+      how.u32(0); // UNCHECKED
+      for _ in 0..6 {
+        how.u32(0); // no attribute set
+      }
+      args.extend_from_slice(&how.into_bytes());
+      assert_eq!(self.call(NFSPROC3_CREATE, &args), 0, "CREATE {name}");
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+      let mut args = self.dirop(from);
+      args.extend_from_slice(&self.dirop(to));
+      assert_eq!(
+        self.call(NFSPROC3_RENAME, &args),
+        0,
+        "RENAME {from} -> {to}"
+      );
+    }
+  }
+
+  /// `VFS_TAILS_RAW=<seconds>:<load per core>`: renames over [`RawNfs`] for that long under that load, one RPC per
+  /// sample, and prints the caller's histogram beside the daemon's service times.
+  fn raw_loop(
+    daemon: &Daemon,
+    client: &mut Client,
+    focus: &str,
+    cores: usize,
+    sweep_bytes: usize,
+    line_bytes: usize,
+  ) {
+    let (seconds, per_core) = focus.split_once(':').unwrap();
+    let span = Duration::from_secs(seconds.parse().unwrap());
+    let per_core: usize = per_core.parse().unwrap();
+    let volume = client
+      .create(&CreateSpec {
+        name: "raw".to_owned(),
+        size: SizeClass::Bounded {
+          limit: VOLUME_BYTES,
+        },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    let attachment = client
+      .attach_mount(volume, slates_ipc::protocol::Intent::Write)
+      .unwrap();
+    let token: String = attachment
+      .token
+      .unwrap()
+      .iter()
+      .map(|b| format!("{b:02x}"))
+      .collect();
+    let export = format!("/raw@{:x}.{token}", attachment.attachment);
+    let mut raw = RawNfs::mount(daemon.nfs_port().unwrap(), &export);
+    raw.create("raw-a");
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      for _ in 0..per_core.saturating_mul(cores) {
+        scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
+      }
+      let started = Instant::now();
+      let mut renames = 0u64;
+      let mut samples = Vec::new();
+      while started.elapsed() < span {
+        let (from, to) = if renames.is_multiple_of(2) {
+          ("raw-a", "raw-b")
+        } else {
+          ("raw-b", "raw-a")
+        };
+        samples.push(timed(|| raw.rename(from, to)));
+        renames += 1;
+      }
+      stop.store(true, Ordering::Relaxed);
+      report(per_core, 1, "raw_rename_rpc", samples);
+    });
+    let times = daemon.nfs_service_times().unwrap();
+    for (kind, served) in [
+      ("served_local", times.local),
+      ("served_forwarded", times.forwarded),
+      ("served_local_off_cpu", times.local_off_cpu),
+    ] {
+      println!(
+        "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
+        served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
+      );
+    }
+  }
+
+  pub(super) fn run() {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let profile = quick_profile();
+    let largest_l2 = profile
+      .facts
+      .cores
+      .iter()
+      .map(|core| core.l2_bytes)
+      .max()
+      .filter(|bytes| *bytes > 0)
+      .unwrap_or(FALLBACK_L2_BYTES);
+    let sweep_bytes = usize::try_from(largest_l2.saturating_mul(SWEEP_PER_L2)).unwrap();
+    let line_bytes = usize::try_from(profile.facts.cache_line).unwrap().max(1);
+    let instance = format!("slates-tails-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, None);
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-tails-{}", std::process::id()),
+      },
+    )
+    .unwrap();
+    daemon.bootstrap(true).unwrap();
+    let mut client = connect(&instance);
+    let volume = client
+      .create(&CreateSpec {
+        name: "tails".to_owned(),
+        size: SizeClass::Bounded {
+          limit: VOLUME_BYTES,
+        },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    let mounted = mount(&instance, volume);
+    // Release builds abort on a panic, so `Mounted`'s drop never runs: the hook unmounts first.
+    let mount_path = mounted.path.clone();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+      let _ = Command::new("umount").arg(&mount_path).output();
+      let _ = Command::new("rmdir").arg(&mount_path).output();
+      previous(info);
+    }));
+    println!(
+      "# {cores} cores, spinner sweep {sweep_bytes} B, {} shard(s); {}",
+      daemon.shards().len(),
+      std::env::consts::OS
+    );
+    if let Ok(focus) = std::env::var("VFS_TAILS_RAW") {
+      raw_loop(&daemon, &mut client, &focus, cores, sweep_bytes, line_bytes);
+      return;
+    }
+    if let Ok(focus) = std::env::var("VFS_TAILS_FOCUS") {
+      focus_loop(
+        &daemon,
+        &mounted.path,
+        &focus,
+        cores,
+        sweep_bytes,
+        line_bytes,
+      );
+      return;
+    }
+    let wide = (cores / CORES_PER_WORKER).max(1);
+    let mut round = 0usize;
+    for &per_core in LOADS_PER_CORE {
+      let stop = AtomicBool::new(false);
+      std::thread::scope(|scope| {
+        for _ in 0..per_core.saturating_mul(cores) {
+          scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
+        }
+        report(per_core, 1, "provision", provision(&mut client, round));
+        for workers in [1, wide] {
+          round += 1;
+          let root = format!("{}/r{round}", mounted.path);
+          #[allow(clippy::disallowed_methods)]
+          rustix::fs::mkdir(root.as_str(), Mode::from_raw_mode(0o755)).unwrap();
+          let mut all = Samples::default();
+          std::thread::scope(|callers| {
+            let handles: Vec<_> = (0..workers)
+              .map(|index| {
+                let root = root.as_str();
+                callers.spawn(move || caller(root, index))
+              })
+              .collect();
+            for handle in handles {
+              all.absorb(handle.join().unwrap());
+            }
+          });
+          report(per_core, workers, "create_4k", all.create);
+          report(per_core, workers, "open_read_4k", all.open_read);
+          report(per_core, workers, "stat", all.stat);
+          report(per_core, workers, "list_256", all.list);
+          report(per_core, workers, "rename", all.rename);
+          report(per_core, workers, "unlink", all.unlink);
+          report(per_core, workers, "write_1m", all.write_large);
+        }
+        stop.store(true, Ordering::Relaxed);
+      });
+    }
+    drop(mounted);
+    drop(client);
+    drop(daemon);
+  }
 }

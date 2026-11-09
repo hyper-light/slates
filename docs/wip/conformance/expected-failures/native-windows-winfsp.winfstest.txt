@@ -2,9 +2,10 @@
 # First review: 2026-11-05, billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (WinFsp v2.1's ext/test),
 # from the per-script outputs of diagnostics run 41989365843 (windows-latest x86_64 and windows-11-arm), whose
 # verdicts were the same case for case: 628 cases, 253 passed, 375 failed; t/base/05.t case 12 has passed since the
-# truncation fix (diagnostics run 42046112993), leaving 374 listed.
-# Each reason names A-209's stated difference the case meets (ATTRIBUTES, SECURITY, CREATION-TIME, REPARSE, SYMLINK,
-# STREAMS) or an open bug with its record and failing test. A case that fails only because an earlier unsupported call
+# truncation fix (diagnostics run 42046112993), leaving 374 listed. t/base/06.t case 5 passes since the drive keeps
+# SetFileTime's creation time (A-259), leaving 373.
+# Each reason names A-209's stated difference the case meets (ATTRIBUTES, SECURITY, REPARSE, SYMLINK, STREAMS) or an
+# open bug with its record and failing test. A case that fails only because an earlier unsupported call
 # failed in the same script carries that call's reason.
 # One case per line. Unlisted failures, listed passes and absent listed cases fail the gate; the list only shrinks.
 # Four bugs the suite found are fixed, each with a failing test first (a move that replaced a taken name, a directory
@@ -20,7 +21,6 @@ t/base/01.t:14  A-209 ATTRIBUTES: the drive keeps no Windows attribute bits; eve
 t/base/01.t:15  A-209 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/04.t:10  A-209 ATTRIBUTES: the target was made FILE_ATTRIBUTE_READONLY (case 3), which the drive does not keep, so the move asked to replace it succeeds where Windows refuses ERROR_ACCESS_DENIED.
 t/base/04.t:12  A-209 ATTRIBUTES, cascade: case 10 already moved the source onto the read-only target the drive did not keep as such, so the source is gone here (ERROR_FILE_NOT_FOUND).
-t/base/06.t:5  A-209 CREATION-TIME: the volume keeps no settable birth time (the bridge's attributes carry none and report the change time), so SetFileTime's creation time is not kept.
 t/base/07.t:2  A-209 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/07.t:4  A-209 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/07.t:6  A-209 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
