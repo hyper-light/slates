@@ -452,14 +452,46 @@ fn recovery_view(instance: &str) -> RecoveryView {
   }
 }
 
-/// Whether the fleet has recovered from its one failure, as `views` show it: every council has committed its voter
-/// change (no joint configuration in flight) and all hold the same voters.
+/// What keeps the fleet from having recovered from its one failure, node by node, as `views` show it (empty once it
+/// has): a voter change still in flight (a joint configuration), voters that differ from the first node's, the node's
+/// own member id not among them (a replacement not yet seated: until the change begins every council already reads no
+/// joint and the same voters), or a retirement kept (the failed node's takeover not yet confirmed by every survivor, so
+/// a later failure's objects would be recovered jointly with its cohort, `RegionalConfiguration::recovery_owners`).
+/// Judged by the council's joint and voter agreement alone, the wait passed before the voter change began
+/// (diag-live-durability-77 and -78, 7 of 22 failed runs) or as it was about to (13 of 22).
+fn unrecovered(views: &[RecoveryView]) -> Vec<String> {
+  let agreed = views.first().map(|first| first.voters.as_str());
+  let mut missing = Vec::new();
+  for view in views {
+    if view.joint != "false" {
+      missing.push(format!(
+        "{}: voter change in flight (joint {})",
+        view.host, view.joint
+      ));
+    }
+    if view.voters == "?" || Some(view.voters.as_str()) != agreed {
+      missing.push(format!("{}: voters {} differ", view.host, view.voters));
+    }
+    if !view
+      .voters
+      .split_whitespace()
+      .any(|voter| voter == view.host)
+    {
+      missing.push(format!("{}: not a voter ({})", view.host, view.voters));
+    }
+    if view.retirements > 0 {
+      missing.push(format!(
+        "{}: {} retirement(s) kept",
+        view.host, view.retirements
+      ));
+    }
+  }
+  missing
+}
+
+/// Whether the fleet has recovered from its one failure: nothing [`unrecovered`].
 fn recovered(views: &[RecoveryView]) -> bool {
-  views.iter().all(|view| {
-    view.joint == "false"
-      && Some(&view.voters) == views.first().map(|first| &first.voters)
-      && view.voters != "?"
-  })
+  unrecovered(views).is_empty()
 }
 
 /// Waits until the fleet has recovered from its one failure ([`recovered`]), within the fleet wait. A flow that has
@@ -469,29 +501,27 @@ fn recovered(views: &[RecoveryView]) -> bool {
 /// needing three. The flows' own waits (`wait_rejoined`, `judge_healed`) look at membership and the log, not the
 /// council. diag-live-durability-66 killed the owner with the change open in 6 of 6 x86 runs, and no survivor could
 /// elect a leader to take it over.
-fn wait_recovered(instances: &[String]) {
-  let mut window = FrozenWindow::new();
+///
+/// Bounded by one fleet wait ([`FLEET_WAIT`], every fleet step's bound in these flows): measured on CI, the voter change
+/// it waits for closed at most 5.26 s after the node was killed (BENCHMARKS "The council's voter change after a
+/// candidate's node is replaced"); the failed node's takeover is confirmed after it, how long after is what the flows
+/// note (the wait's length, returned). Past it, the flow fails naming what is missing on each node ([`unrecovered`]).
+fn wait_recovered(instances: &[String]) -> Duration {
+  let began = Instant::now();
+  let deadline = began + FLEET_WAIT;
   loop {
     let views: Vec<RecoveryView> = instances
       .iter()
       .map(|instance| recovery_view(instance))
       .collect();
-    if recovered(&views) {
-      return;
+    let missing = unrecovered(&views);
+    if missing.is_empty() {
+      return began.elapsed();
     }
-    let seen: Vec<String> = views
-      .iter()
-      .map(|view| {
-        format!(
-          "{}: joint {} voters {} retirements {}",
-          view.host, view.joint, view.voters, view.retirements
-        )
-      })
-      .collect();
     assert!(
-      window.moving(&seen.join("; ")),
-      "the fleet recovered from its failure, or kept changing, within each fleet wait: {}",
-      seen.join("; ")
+      Instant::now() < deadline,
+      "the fleet did not recover from its failure within the fleet wait: {}",
+      missing.join("; ")
     );
     pause();
   }
@@ -536,6 +566,18 @@ fn a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered() {
       view("false", "2 3 4", "3", 0),
     ]),
     "seated, and nothing kept"
+  );
+  assert_eq!(
+    unrecovered(&[
+      view("false", "1 2 3", "4", 0),
+      view("true", "1 2 3", "2", 1),
+    ]),
+    vec![
+      "4: not a voter (1 2 3)".to_owned(),
+      "2: voter change in flight (joint true)".to_owned(),
+      "2: 1 retirement(s) kept".to_owned(),
+    ],
+    "each missing condition is named, node by node"
   );
 }
 
@@ -1662,7 +1704,10 @@ fn a_candidate_killed_mid_stream_catches_up_and_its_copy_serves_a_takeover() {
   verdict.check("NoLoss (owner)", no_loss(&owner, &volume, &outcomes));
   // The owner's whole node lost: the survivors, one of them the succeeded candidate, take the volume over. Only once the
   // council has seated the succeeded candidate: a second failure inside the voter change is past `f`.
-  wait_recovered(&fleet.instances);
+  let waited = wait_recovered(&fleet.instances);
+  verdict.note(format!(
+    "recovered from the candidate's loss after a further {waited:?}"
+  ));
   fleet.kill_node(owner_index);
   let survivors: Vec<&str> = candidates.clone();
   let served = wait_serving(&survivors, &volume, &outcomes);
@@ -2690,7 +2735,10 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
     &samples,
   );
   // The replacement seated before the owner dies: a second failure inside the voter change is past `f`.
-  wait_recovered(&fleet.instances);
+  let waited = wait_recovered(&fleet.instances);
+  verdict.note(format!(
+    "recovered from the candidate's loss after a further {waited:?}"
+  ));
   fleet.kill_node(owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   match wait_serving(&survivors, &volume, &outcomes) {
