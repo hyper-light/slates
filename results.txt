@@ -1,0 +1,48 @@
+runner ubuntu-latest, 4 CPUs, Mon Nov  9 18:55:52 UTC 2026, after 520fc25d, before 8b821c0f, sample 2
+before ../t-before/debug/deps/fleet-10359b5eeeb6ade0
+after ../t-after/debug/deps/fleet-aef428ca1e6973e6
+== pair 1 arm after at 18:55:52, load 3.41 1.95 0.82
+held positions (successor, (b, c)) before the death: [(HostId(4369337403852580316), (Some(2), Some(1))), (HostId(17276817647405874656), (Some(2), Some(1)))]; c's after the takeover {VolumeId { bytes: [141, 14, 12, 87, 244, 231, 78, 178, 0, 0, 0, 0, 0, 0, 0, 6] }: Some(2), VolumeId { bytes: [141, 14, 12, 87, 244, 231, 78, 178, 0, 0, 0, 0, 0, 0, 7, 248] }: Some(2)}; served true; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 16), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.pages_unsent", 1), ("fleet.takeover.unpromised", 14)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 10), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)])]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 4.67s
+
+== pair 1 arm after exit 0, load 3.14 1.92 0.82
+== pair 1 arm before at 18:55:57, load 3.14 1.92 0.82
+== pair 1 arm before exit 124, load 1.66 1.19 0.83
+== pair 2 arm after at 19:05:57, load 1.66 1.19 0.83
+held positions (successor, (b, c)) before the death: [(HostId(12421774218557157523), (Some(2), Some(1))), (HostId(16627722241533891246), (Some(2), Some(1)))]; c's after the takeover {VolumeId { bytes: [18, 78, 176, 87, 37, 225, 128, 130, 0, 0, 0, 0, 0, 0, 0, 6] }: Some(2), VolumeId { bytes: [18, 78, 176, 87, 37, 225, 128, 130, 0, 0, 0, 0, 0, 0, 8, 66] }: Some(2)}; served true; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 8), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 16), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 12)])]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 4.00s
+
+== pair 2 arm after exit 0, load 1.77 1.22 0.84
+== pair 2 arm before at 19:06:01, load 1.77 1.22 0.84
+== pair 2 arm before exit 124, load 1.79 1.15 0.87
+== pair 3 arm after at 19:16:01, load 1.79 1.15 0.87
+held positions (successor, (b, c)) before the death: [(HostId(425165508903905413), (Some(2), Some(1))), (HostId(717881389941212545), (Some(2), Some(1)))]; c's after the takeover {VolumeId { bytes: [253, 170, 226, 247, 237, 195, 208, 83, 0, 0, 0, 0, 0, 0, 0, 6] }: Some(2), VolumeId { bytes: [253, 170, 226, 247, 237, 195, 208, 83, 0, 0, 0, 0, 0, 0, 7, 156] }: Some(2)}; served true; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 14), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 12)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 10), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)])]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 4.64s
+
+== pair 3 arm after exit 0, load 1.79 1.15 0.87
+== pair 3 arm before at 19:16:06, load 1.79 1.15 0.87
+== pair 3 arm before exit 124, load 1.54 1.02 0.84
+== pair 4 arm after at 19:26:06, load 1.54 1.02 0.84
+held positions (successor, (b, c)) before the death: [(HostId(11489598049254660743), (Some(2), Some(1))), (HostId(16130266904977813189), (Some(2), Some(1)))]; c's after the takeover {VolumeId { bytes: [183, 245, 54, 54, 94, 225, 75, 24, 0, 0, 0, 0, 0, 0, 0, 6] }: Some(2), VolumeId { bytes: [183, 245, 54, 54, 94, 225, 75, 24, 0, 0, 0, 0, 0, 0, 15, 195] }: Some(2)}; served true; counters [Ok([("fleet.takeover.adopted", 4), ("fleet.takeover.listed_by_moved_from", 12), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 4), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 8)]), Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 14), ("fleet.takeover.page_unbound", 4), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 8)])]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 3.96s
+
+== pair 4 arm after exit 0, load 1.58 1.04 0.85
+== pair 4 arm before at 19:26:10, load 1.58 1.04 0.85
+== pair 4 arm before exit 124, load 1.85 1.12 0.87
+== pair 5 arm after at 19:36:10, load 1.85 1.12 0.87
+held positions (successor, (b, c)) before the death: [(HostId(4073302760611450668), (Some(2), Some(1))), (HostId(11523943865153289718), (Some(2), Some(1)))]; c's after the takeover {VolumeId { bytes: [40, 165, 15, 188, 190, 133, 35, 217, 0, 0, 0, 0, 0, 0, 0, 6] }: Some(2), VolumeId { bytes: [40, 165, 15, 188, 190, 133, 35, 217, 0, 0, 0, 0, 0, 0, 15, 242] }: Some(2)}; served true; counters [Ok([("fleet.takeover.adopted", 2), ("fleet.takeover.listed_by_moved_from", 10), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 6), ("fleet.takeover.stale_configuration", 2), ("fleet.takeover.unpromised", 4)]), Ok([("fleet.takeover.adopted", 4), ("fleet.takeover.listed_by_moved_from", 30), ("fleet.takeover.page_unbound", 6), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.unpromised", 24)])]
+ok
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 116 filtered out; finished in 4.18s
+
+== pair 5 arm after exit 0, load 1.86 1.13 0.87
+== pair 5 arm before at 19:36:14, load 1.86 1.13 0.87
+== pair 5 arm before exit 124, load 1.64 1.07 0.85
