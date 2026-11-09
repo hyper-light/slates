@@ -13839,6 +13839,30 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
     daemons[successor_index].merge_record_placed(green, 3)
   });
+  if !materialized {
+    // What the successor's takeover of the green was waiting on, so a failure under load says which branch it was
+    // stuck in (1 in 2 of main's fleet suite on adacachy2 spent the whole period budget here, 2026-11-09): the merge
+    // takeover's counters (a catalog not yet adopted or placed, a chain not held, a refused materialization) and the
+    // takeover round's, and each survivor's holder state of the green.
+    for (index, daemon) in daemons.iter().enumerate() {
+      let counters: Vec<(&str, u64)> = daemon
+        .refusals_on_every_shard()
+        .map(|refusals| {
+          refusals
+            .into_iter()
+            .filter(|(name, _)| {
+              name.starts_with("merge.takeover") || name.starts_with("fleet.takeover")
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+      eprintln!(
+        "survivor {index} (successor {}): holder state {:?}; takeover counters {counters:?}",
+        index == successor_index,
+        daemon.merge_holder_state(green)
+      );
+    }
+  }
   let access = daemons[successor_index].volume_access(object);
   for daemon in daemons {
     daemon.stop();

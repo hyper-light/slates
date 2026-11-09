@@ -14893,6 +14893,29 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
+### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
+
+`a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,
+AUD-29-17) failed "the successor materialized the taken-over green at version 3" in 1 of 2 runs of main 1ed67337's fleet
+suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it passed 5 of 5.
+- **Not slow: stuck.** The failing suite took 1,074 s against 671 s. The 403 s more is the wait's period budget, 4,000
+  of the slowest survivor's 100 ms periods (`poll_until`), so the fleet ran on and the takeover never completed: a state
+  it does not leave, not a deadline too short for the work.
+- **The healthy path, measured** (a scratch timeline, not kept): from the owner's stop, the survivors begin the
+  takeover in 1.9-2.1 s (death detection), the successor adopts the green's merge record and its catalog register at
+  sequence 3 about 0.6 s later, and the materialization call is answered in 0.25-1.2 ms. 13 whole-suite runs (up to
+  three copies at once, load 8-27), 6 runs alone under 64 spinners or confined to 4 CPUs, and 8 runs of a variant that
+  stops the owner the moment version 3 commits all materialized, in 1.9-6.0 s. In every run both survivors already held
+  version 3 at the kill.
+- **Suspected, not shown:** a branch of `fleet::materialize_pending_greens` that retries every period and cannot clear:
+  the catalog register not adopted or not placed (`merge.takeover_waits_catalog`), or the successor's own chain short of
+  the adopted version (`merge.takeover_incomplete`; the prefix transfer that would fill it is GAP-A9-7, owed). Unlike the
+  other green-takeover tests, this one does not wait for both holders to recompute version 3 before the owner dies
+  (`holders_before_owner_death`), so a successor that lacked it could never rebuild it. Not added: it would hide a
+  product non-convergence if that is not the cause.
+- **Instrumented:** on failure the test now prints each survivor's `merge.takeover*` and `fleet.takeover*` counters and
+  its holder state of the green, which name the branch the next failure is stuck in.
+
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
 `slates_run_spawns_the_command_as_an_ephemeral_consumer` (`crates/cli/tests/cli.rs`) failed 1 of 10 runs alone under two
