@@ -1,0 +1,95 @@
+name: diag-liveness-a223-baseline
+
+# Diagnostics only, never on main (A-223 window-rule plan, step 2): the baseline under today's x100 rule. Arms: main
+# (80be552a with the bench's CPU rows applied, the bench change alone) and A-223 merged onto it; at 2 shards
+# (PROVISION_BENCH_SHARDS) and the runner's derived count; quiet and with two spinning shell loops per logical CPU;
+# three rounds, the arms alternating. The result lines go to diag-results/liveness-32-<os>, read by git fetch.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  MAIN_SHA: 2e43544847ad8e42f63e33b58076b5b66dcdff10
+  A223_SHA: d0106becdc494c07263ece43892b3c8468670858
+
+jobs:
+  baseline:
+    name: A-223 baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build both arms' bench
+        run: |
+          set +e +o pipefail
+          mkdir -p ../arms
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          for arm in main a223; do
+            case $arm in main) sha=$MAIN_SHA;; a223) sha=$A223_SHA;; esac
+            git worktree add "../src-$arm" "$sha" > /dev/null 2>&1
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench ) > ../build-$arm.log 2>&1 || { echo "== build $arm failed" | tee -a ../results.txt; grep -E '^error|error:|failed' ../build-$arm.log | grep -v aws-lc-sys | tail -30 | cut -c1-300 >> ../results.txt; tail -15 ../build-$arm.log | cut -c1-300 >> ../results.txt; exit 1; }
+            cp "../target-$arm/release/examples/provision_bench$ext" "../arms/bench-$arm$ext"
+            ( cd "../src-$arm" && git log -1 --format="arm $arm %h %s" | cut -c1-100 ) | tee -a ../results.txt
+          done
+      - name: The baseline, three rounds, the arms alternating
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          for cond in quiet busy; do
+            for shards in 2 derived; do
+              for round in 1 2 3; do
+                for arm in main a223; do
+                  pids=""
+                  if [ $cond = busy ]; then
+                    for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                  fi
+                  echo "== $cond shards=$shards round=$round arm=$arm at $(date -u +%H:%M:%S)" | tee -a $R
+                  if [ $shards = derived ]; then unset PROVISION_BENCH_SHARDS; else export PROVISION_BENCH_SHARDS=$shards; fi
+                  timeout 1500 "../arms/bench-$arm$ext" > ../run.log 2>&1; status=$?
+                  unset PROVISION_BENCH_SHARDS
+                  for p in $pids; do kill "$p" 2>/dev/null; done
+                  wait 2>/dev/null
+                  grep -E 'provisioning histogram|_cpu_|spinning_1 parks|parked_1 parks|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|panicked' ../run.log | cut -c1-600 | tee -a $R
+                  echo "== exit $status" | tee -a $R
+                done
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-32-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-32 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
