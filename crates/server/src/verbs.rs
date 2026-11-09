@@ -8490,6 +8490,8 @@ pub(crate) fn end_attachment(
     state.attachments.revoke(mount.registry);
     state.attachments.drain(mount.registry);
   }
+  // What NFSv4 clients held open through it is held no longer: no request is served under it again (A-260).
+  crate::nfs_state::release_attachment(state, record.volume, record.id);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -10927,6 +10929,9 @@ async fn rebuild_records(
       let (snapshots, attachments) = reconcile_lost(state, record);
       rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
       rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+      // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
+      // files no one holds (A-260): the image carries none of these holds.
+      crate::nfs_state::hold_recovered(state, record.id);
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));

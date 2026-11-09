@@ -121,6 +121,10 @@ pub struct Delegations {
   by_inode: BTreeMap<u64, BTreeMap<u64, Other>>,
   /// The inodes whose holders changed since the last [`Delegations::take_changed_inodes`].
   changed_inodes: std::collections::BTreeSet<u64>,
+  /// The delegations granted and ended since the last [`Delegations::take_holdings`] (A-260), once the table holds
+  /// files ([`Delegations::hold_files`]); `None` before, and for a standalone server. Drained after every operation
+  /// with the file state's own, so it holds one operation's at most: a purge's, every delegation of a client.
+  holdings: Option<Vec<super::files::Holding>>,
   /// Every recalled delegation by when its recall began, so the lapse check after each operation reads only the
   /// lapsed ones rather than the whole table (A-80). One entry per recalled delegation.
   recalls: std::collections::BTreeSet<(u64, Other)>,
@@ -148,6 +152,33 @@ impl Delegations {
         recalled_ns: None,
       },
     );
+  }
+
+  /// Queues a holding for every delegation granted or ended from now on (A-260); the ones held already were taken
+  /// with the records they were restored from.
+  pub fn hold_files(&mut self) {
+    self.holdings = Some(Vec::new());
+  }
+
+  /// The delegations granted and ended since the last call (A-260).
+  pub fn take_holdings(&mut self) -> Vec<super::files::Holding> {
+    self
+      .holdings
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default()
+  }
+
+  /// The file of every delegation held, one handle per delegation (A-260).
+  pub fn held_files(&self) -> impl Iterator<Item = Nfsfh3> + '_ {
+    self.table.values().map(|delegation| delegation.fh.clone())
+  }
+
+  /// Queues the holding a newly granted delegation of `fh` takes (A-260).
+  fn took(&mut self, fh: &Nfsfh3) {
+    if let Some(holdings) = self.holdings.as_mut() {
+      holdings.push(super::files::Holding::Took(fh.clone()));
+    }
   }
 
   /// Holds `delegation` as `other`, in every index.
@@ -239,6 +270,7 @@ impl Delegations {
         recalled_ns: None,
       },
     );
+    self.took(fh);
     Some(Stateid { seqid: 1, other })
   }
 
@@ -282,6 +314,7 @@ impl Delegations {
         recalled_ns: None,
       },
     );
+    self.took(fh);
     Some(Stateid { seqid: 1, other })
   }
 
@@ -465,6 +498,9 @@ impl Delegations {
           }
         }
         self.changed_inodes.insert(inode);
+      }
+      if let Some(holdings) = self.holdings.as_mut() {
+        holdings.push(super::files::Holding::Gave(delegation.fh));
       }
     }
   }
