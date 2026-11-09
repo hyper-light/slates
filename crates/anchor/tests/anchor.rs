@@ -25,8 +25,6 @@ use slates_mem::Handoff;
 const CHILD_BEATS: &str = "SLATES_ANCHOR_TEST_BEATS";
 /// Format: the exit code the child leaves with.
 const CHILD_EXIT: &str = "SLATES_ANCHOR_TEST_EXIT";
-/// Format: the environment variable that makes the supervised child mark that it serves before it exits.
-const CHILD_SERVES: &str = "SLATES_ANCHOR_TEST_SERVES";
 /// Shape: how long the parent waits for the child to attach and beat (milliseconds).
 const CHILD_WAIT_MS: u64 = 5_000;
 /// Shape: a poll pause between supervision steps (microseconds); the test harness times the
@@ -232,9 +230,26 @@ fn supervised_child() {
   for n in 1..=beats {
     supervision.beat(n);
   }
-  if std::env::var_os(CHILD_SERVES).is_some() {
-    supervision.mark_serving(beats);
+  std::process::exit(exit);
+}
+
+/// The child [`a_daemon_killed_after_it_served_is_restarted_every_time`] supervises: as [`supervised_child`], and it marks
+/// that it serves before it exits. Its own test name, not an environment variable, makes it serve, so the tests that
+/// run beside it in this process spawn children that do not. Ignored, and run by its parent with `--ignored --exact`.
+#[test]
+#[ignore = "the serving child; run by a_daemon_killed_after_it_served_... with --ignored"]
+fn serving_child() {
+  let Ok(beats) = std::env::var(CHILD_BEATS) else {
+    return;
+  };
+  let beats: u64 = beats.parse().unwrap();
+  let exit: i32 = std::env::var(CHILD_EXIT).unwrap().parse().unwrap();
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  for n in 1..=beats {
+    supervision.beat(n);
   }
+  supervision.mark_serving(beats);
   std::process::exit(exit);
 }
 
@@ -448,7 +463,7 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
-    "supervised_child".to_owned(),
+    "serving_child".to_owned(),
     "--nocapture".to_owned(),
   ];
   let policy = RestartPolicy {
@@ -460,7 +475,6 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   unsafe {
     std::env::set_var(CHILD_BEATS, BEATS.to_string());
     std::env::set_var(CHILD_EXIT, EXIT.to_string());
-    std::env::set_var(CHILD_SERVES, "1");
   }
   let clock = Instant::now();
   supervisor.start(now_ns(clock)).unwrap();
@@ -483,10 +497,6 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
         break;
       }
     }
-  }
-  // SAFETY: as above; no child reads it after this.
-  unsafe {
-    std::env::remove_var(CHILD_SERVES);
   }
   assert_eq!(
     (exits, refused),

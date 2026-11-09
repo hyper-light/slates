@@ -77,10 +77,7 @@ fn segment_words(geometry: &Geometry) -> Words {
           at.saturating_add(SUP_LOG_REFUSALS),
           Width::U64,
         ))
-        .with(WordRun::one(
-          at.saturating_add(SUP_SERVING),
-          Width::U64,
-        ))
+        .with(WordRun::one(at.saturating_add(SUP_SERVING), Width::U64))
         .with(WordRun::one(
           at.saturating_add(SUP_SESSION_PRESENT),
           Width::U64,
