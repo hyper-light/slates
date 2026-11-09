@@ -15481,8 +15481,10 @@ Applied in the same change to:
   - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
     confirmation ahead of the worker's next request.
   - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
-    it, and a request answered without the shard (a security query, from the one fixed descriptor) can come right after a
-    Create. Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    it, and a request answered without the shard can come right after a Create: the host registers no GetSecurity
+    callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without
+    calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and QueryStreamInformation likewise
+    (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
     shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
     replaces.
   - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the

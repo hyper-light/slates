@@ -1245,8 +1245,10 @@ pub(crate) struct Confirming(Receiver<Reply>);
 /// Posts the confirmation that the driver accepted the open `context` names and wakes the mount's task, without waiting
 /// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
 /// the worker's next request (audit step 7, cut (c)). The answer is taken by [`confirmed_open`] before the journal
-/// overwrites the open's settled response; a request no shard call precedes (a security query, answered from the one
-/// fixed descriptor) would otherwise find it unapplied.
+/// overwrites the open's settled response. A request answered without the shard can come next and would otherwise find
+/// it unapplied: the host registers no GetSecurity callback (`ffi.rs`, `get_security: None`), so WinFsp's own
+/// QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`),
+/// and QueryEa and QueryStreamInformation likewise (`fsop.c:1208`, `1478`).
 pub(crate) fn post_confirm(
   requests: &SyncSender<Request>,
   wake: &Waker,

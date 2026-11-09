@@ -53,7 +53,8 @@ const FILES: usize = 3;
 /// Format: FspFsctlTransactReadKind (fsctl.h), a request whose response may name the dead process's buffer.
 const READ_KIND: u32 = 5;
 /// Format: FspFsctlTransactQuerySecurityKind (fsctl.h). The model answers it on the receive worker without the shard, as
-/// the host answers a security query from its one fixed descriptor: a save that no shard call precedes.
+/// WinFsp does for this host, which registers no GetSecurity callback (WinFsp v2.1 `src/dll/fsop.c:1444-1445`): a save
+/// that no shard call precedes.
 const QUERY_SECURITY_KIND: u32 = 19;
 /// Format: Req.Cleanup.UserContext2 and Req.Close.UserContext2 follow the header and the UserContext word (fsctl.h).
 const REQUEST_CONTEXT_AT: usize = HINT_AT + size_of::<u64>() + size_of::<u64>();
