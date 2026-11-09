@@ -5706,6 +5706,10 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
 /// rule's window (a liveness budget, or the session's persistent-congestion duration if longer, about 2 s), the next
 /// return of the session by whichever borrower holds it (every hold is bounded by a derived budget), and the redial.
 const DEAD_SESSION_WATCH: Duration = Duration::from_nanos(8 * LIVENESS_BUDGET_NS);
+/// Shape: [`DEAD_SESSION_WATCH`] as the fleet's own periods, one a heartbeat, so a watch that never holds (the red case)
+/// spends its own periods rather than `poll_until`'s whole convergence budget (about 400 s).
+const DEAD_SESSION_WATCH_PERIODS: u64 =
+  8 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
 /// Shape: how soon after the drop the forward lane's first answer on the replacement must come: the link dials again at
 /// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
 /// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
@@ -5789,19 +5793,24 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
     marked = daemons[1].inject_session_deafness(hosts[0]);
   }
-  // Until the lane has answered on the replacement, charged in the daemons' own periods (`poll_until`).
+  // Until the lane has answered on the replacement, charged in the daemons' own periods (`poll_for_periods`).
   let mut recovered = None;
   let everyone: Vec<&Daemon> = daemons.iter().collect();
-  poll_until(&everyone, DEAD_SESSION_WATCH, || {
-    recovered = daemons[1]
-      .observation(
-        Some(daemons[1].shards()[0]),
-        slates_server::daemon::OBSERVE_BUDGET_NS,
-        |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
-      )?
-      .wait()?;
-    Ok(recovered.is_some())
-  });
+  poll_for_periods(
+    &everyone,
+    DEAD_SESSION_WATCH,
+    DEAD_SESSION_WATCH_PERIODS,
+    || {
+      recovered = daemons[1]
+        .observation(
+          Some(daemons[1].shards()[0]),
+          slates_server::daemon::OBSERVE_BUDGET_NS,
+          |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
+        )?
+        .wait()?;
+      Ok(recovered.is_some())
+    },
+  );
   drop(everyone);
   DEAD_SESSION_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
   let rounds = burst.join().unwrap();
