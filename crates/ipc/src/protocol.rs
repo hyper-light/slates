@@ -1853,6 +1853,9 @@ pub struct VolumeSummary {
   pub overlay: bool,
   /// Whether it is live-shipped (A-200). Appended.
   pub live_shipped: bool,
+  /// Why recovery could not rebuild it after the daemon's restart, when it could not (§4.8): every verb on it but its
+  /// destroy answers [`Refusal::NotRecovered`] with this cause. Appended.
+  pub not_recovered: Option<RecoveryCause>,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
@@ -2026,6 +2029,10 @@ pub struct StatusReport {
   pub mounts_elided: u32,
   /// The volume's journal: its budget, and what its consuming rounds found waiting (§4.5). Appended.
   pub journal: JournalReport,
+  /// Unlinked files kept for a mount that survived a daemon's takeover (U10): its kernel may hold a handle the dead
+  /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
+  /// quota, until that mount ends. Zero outside a takeover. Appended.
+  pub takeover_kept: u32,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
