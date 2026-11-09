@@ -1,0 +1,112 @@
+2e1b1b75 Windows X64; token default owner BUILTIN\Administrators
+=== clippy-land: exit 0
+=== clippy: exit 0
+=== clippy-cli: exit 0
+=== land: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+1 test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.68s
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.22s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+1 test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+2 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+> D:\a\slates\slates\diag-logs\land.log:193:---- a_target_another_user_owns_is_refused stdout ----
+  D:\a\slates\slates\diag-logs\land.log:194:
+> D:\a\slates\slates\diag-logs\land.log:195:thread 'a_target_another_user_owns_is_refused' (1164) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\land.log:196:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'C:\\Windows\\System32').GetOwner([Security.Princ ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\land.log:197:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\land.log:199:---- a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users stdout ----
+  D:\a\slates\slates\diag-logs\land.log:200:
+> D:\a\slates\slates\diag-logs\land.log:201:thread 'a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users' (2132) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\land.log:202:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'D:\\a\\slates\\slates\\target\\tmp\\slates-land-seam ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\land.log:203:
+> D:\a\slates\slates\diag-logs\land.log:211:error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+  D:\a\slates\slates\diag-logs\land.log:212:     Running tests\removal.rs (target\release\deps\removal-0340e4da15d77a2a.exe)
+  D:\a\slates\slates\diag-logs\land.log:213:
+> D:\a\slates\slates\diag-logs\land.log:236:error: 1 target failed:
+  D:\a\slates\slates\diag-logs\land.log:237:    `-p slates-land --test os_seam_windows`
+=== base: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+=== os-again-1: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+1 test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.97s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+> D:\a\slates\slates\diag-logs\os-again-1.log:45:---- a_target_another_user_owns_is_refused stdout ----
+  D:\a\slates\slates\diag-logs\os-again-1.log:46:
+> D:\a\slates\slates\diag-logs\os-again-1.log:47:thread 'a_target_another_user_owns_is_refused' (1224) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-1.log:48:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'C:\\Windows\\System32').GetOwner([Security.Princ ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-1.log:49:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\os-again-1.log:51:---- a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users stdout ----
+  D:\a\slates\slates\diag-logs\os-again-1.log:52:
+> D:\a\slates\slates\diag-logs\os-again-1.log:53:thread 'a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users' (596) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-1.log:54:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'D:\\a\\slates\\slates\\target\\tmp\\slates-land-seam ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-1.log:55:
+> D:\a\slates\slates\diag-logs\os-again-1.log:63:error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+> D:\a\slates\slates\diag-logs\os-again-1.log:64:error: 1 target failed:
+  D:\a\slates\slates\diag-logs\os-again-1.log:65:    `-p slates-land --test os_seam_windows`
+=== os-again-2: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+1 test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.11s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+> D:\a\slates\slates\diag-logs\os-again-2.log:45:---- a_target_another_user_owns_is_refused stdout ----
+  D:\a\slates\slates\diag-logs\os-again-2.log:46:
+> D:\a\slates\slates\diag-logs\os-again-2.log:47:thread 'a_target_another_user_owns_is_refused' (1952) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-2.log:48:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'C:\\Windows\\System32').GetOwner([Security.Princ ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-2.log:49:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\os-again-2.log:51:---- a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users stdout ----
+  D:\a\slates\slates\diag-logs\os-again-2.log:52:
+> D:\a\slates\slates\diag-logs\os-again-2.log:53:thread 'a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users' (5440) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-2.log:54:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'D:\\a\\slates\\slates\\target\\tmp\\slates-land-seam ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-2.log:55:
+> D:\a\slates\slates\diag-logs\os-again-2.log:63:error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+> D:\a\slates\slates\diag-logs\os-again-2.log:64:error: 1 target failed:
+  D:\a\slates\slates\diag-logs\os-again-2.log:65:    `-p slates-land --test os_seam_windows`
+=== os-again-3: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+1 test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.03s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+> D:\a\slates\slates\diag-logs\os-again-3.log:45:---- a_target_another_user_owns_is_refused stdout ----
+  D:\a\slates\slates\diag-logs\os-again-3.log:46:
+> D:\a\slates\slates\diag-logs\os-again-3.log:47:thread 'a_target_another_user_owns_is_refused' (2240) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-3.log:48:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'C:\\Windows\\System32').GetOwner([Security.Princ ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-3.log:49:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\os-again-3.log:51:---- a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users stdout ----
+  D:\a\slates\slates\diag-logs\os-again-3.log:52:
+> D:\a\slates\slates\diag-logs\os-again-3.log:53:thread 'a_tree_bearing_the_tokens_default_owner_is_its_own_though_not_its_users' (2748) panicked at crates\land\tests\os_seam_windows.rs:133:3:
+  D:\a\slates\slates\diag-logs\os-again-3.log:54:powershell: Output { status: ExitStatus(ExitStatus(1)), stdout: "", stderr: "Get-Acl : The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security', but the module could not be \r\nloaded. For more information, run 'Import-Module Microsoft.PowerShell.Security'.\r\nAt line:1 char:2\r\n+ (Get-Acl -LiteralPath 'D:\\a\\slates\\slates\\target\\tmp\\slates-land-seam ...\r\n+  ~~~~~~~\r\n    + CategoryInfo          : ObjectNotFound: (Get-Acl:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CouldNotAutoloadMatchingModule\r\n \r\n" }
+  D:\a\slates\slates\diag-logs\os-again-3.log:55:
+> D:\a\slates\slates\diag-logs\os-again-3.log:63:error: test failed, to rerun pass `-p slates-land --test os_seam_windows`
+> D:\a\slates\slates\diag-logs\os-again-3.log:64:error: 1 target failed:
+  D:\a\slates\slates\diag-logs\os-again-3.log:65:    `-p slates-land --test os_seam_windows`
+=== server-lib: exit 0
+1 test result: ok. 225 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 6.37s
+=== server-verb: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.02s
+=== client-presentation: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+=== client-shards: exit 0
+1 test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.95s
+=== mcp: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+1 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+=== end
