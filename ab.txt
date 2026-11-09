@@ -4800,3 +4800,5 @@ slates daemon: control_shard_capacity = ShardCapacity { tasks: 10593, timers: 10
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
 slates daemon: instance fsb-864-10-cutc serving on 1 shards under the anchor
 ## run 10 of 10 done, 2026-11-09T20:20:22Z
+To https://github.com/hyper-light/slates
+   7733003..97ddf63  97ddf63340d82c9a4b595c31cd9fc565a4eaa47c -> diag-results/winfsp-overlap-42675148419-cutc-x86
