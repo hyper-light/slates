@@ -200,7 +200,7 @@ fn setattr_keeps_the_windows_attribute_bits_for_each_kind() {
   );
 }
 
-/// A-TBD. Do: create a symlink and a file through the bridge, then `setattr` the Win32 word `HIDDEN | DIRECTORY` on
+/// A-275. Do: create a symlink and a file through the bridge, then `setattr` the Win32 word `HIDDEN | DIRECTORY` on
 /// each, as the WinFsp drive marks a link `CreateSymbolicLink` made with `SYMBOLIC_LINK_FLAG_DIRECTORY`. Expect: the
 /// link keeps the directory bit (Windows reports a directory link as `DIRECTORY | REPARSE_POINT`, `t/reparse/03.t`)
 /// and the file drops it, in the reply and in a fresh `getattr`; the link's target is untouched.

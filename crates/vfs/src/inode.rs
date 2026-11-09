@@ -338,7 +338,7 @@ impl XattrTable {
 /// display hint), so it is kept as metadata and leaves the mode alone. The bits keep Windows' own values, so a
 /// WinFsp reply and a Windows landing use them as they are; they fit in the two bytes alignment leaves at the end of
 /// an [`Inode`], so no inode grows (AC-1.5; 168 bytes, `cargo run -p slates-vfs --example tree_heap`). Linux and
-/// macOS carry them in the volume and apply none. A symlink also keeps `FILE_ATTRIBUTE_DIRECTORY` (A-TBD): Windows links
+/// macOS carry them in the volume and apply none. A symlink also keeps `FILE_ATTRIBUTE_DIRECTORY` (A-275): Windows links
 /// come in two kinds, a file link and a directory link (`SYMBOLIC_LINK_FLAG_DIRECTORY`), told apart by that bit alone
 /// and removed by `DeleteFile` and `RemoveDirectory` respectively; a POSIX link has no kind, so the bit is what a
 /// Windows directory link leaves in the volume. A link made on Linux or macOS has none and is a file link on Windows,
@@ -359,7 +359,7 @@ impl WindowsAttributes {
   pub const OFFLINE: u16 = 0x1000;
   /// Format: `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`.
   pub const NOT_CONTENT_INDEXED: u16 = 0x2000;
-  /// Format: `FILE_ATTRIBUTE_DIRECTORY`, kept for a symlink alone: a Windows directory link (A-TBD). A directory's is
+  /// Format: `FILE_ATTRIBUTE_DIRECTORY`, kept for a symlink alone: a Windows directory link (A-275). A directory's is
   /// its kind, never a bit.
   pub const LINK_DIRECTORY: u16 = 0x0010;
   /// Format: every bit kept on any kind, a directory's `READONLY` among them.
@@ -387,7 +387,7 @@ impl WindowsAttributes {
     WindowsAttributes(u16::try_from(bits & u32::from(Self::kept_for(kind))).unwrap_or(0))
   }
 
-  /// The bits as an image or the disk carries them for an object of `kind`. Before A-TBD every kind was masked with
+  /// The bits as an image or the disk carries them for an object of `kind`. Before A-275 every kind was masked with
   /// [`WindowsAttributes::KEPT`] alone, so an older image carries no link's directory bit and reads as it did.
   pub fn from_image(bits: u16, kind: Kind) -> WindowsAttributes {
     WindowsAttributes(bits & (Self::KEPT | (Self::kept_for(kind) & Self::LINK_DIRECTORY)))

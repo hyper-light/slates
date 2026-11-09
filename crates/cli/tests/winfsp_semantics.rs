@@ -15,7 +15,7 @@
 //!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
 //!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
 //!   the end until the size is reached. These two replays pass: alone, the operations do not wedge (an open bug).
-//! - `CreateSymbolicLinkW` must make a link Windows follows and reads back (`t/reparse/02.t` and `03.t`, A-TBD), as
+//! - `CreateSymbolicLinkW` must make a link Windows follows and reads back (`t/reparse/02.t` and `03.t`, A-275), as
 //!   git and npm make links on Windows; the drive answered `ERROR_INVALID_FUNCTION`, since it served no reparse point.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
@@ -631,7 +631,7 @@ fn a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete() {
   std::fs::remove_file(&path).unwrap();
 }
 
-/// A-TBD, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// A-275, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
 /// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
 /// link, a relative directory link and an absolute file link; read through each, read each link back, then remove the
 /// links. Expect: each link is made; reading through it gives its target's bytes; `read_link` gives the target it was
@@ -710,7 +710,7 @@ fn directory_and_early_links_are_followed(drive: &Drive) {
   );
 }
 
-/// A-TBD, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// A-275, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
 /// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
 /// link, an absolute file link, a relative directory link and a link made before its target; read through each, read
 /// each link back, then remove the links. Expect: each link is made; reading through it gives its target's bytes;

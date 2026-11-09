@@ -317,16 +317,16 @@ enum Op<T> {
   Release {
     object: T,
   },
-  /// The link at `path`, read without following it (A-TBD): WinFsp's `GetReparsePointByName`, which its resolver asks
+  /// The link at `path`, read without following it (A-275): WinFsp's `GetReparsePointByName`, which its resolver asks
   /// of each component while it follows a path's links.
   LinkByName {
     path: String,
   },
-  /// The link an open names (`FSCTL_GET_REPARSE_POINT`, A-TBD).
+  /// The link an open names (`FSCTL_GET_REPARSE_POINT`, A-275).
   LinkOf {
     object: T,
   },
-  /// `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer (A-TBD): the empty file or directory an open names at
+  /// `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer (A-275): the empty file or directory an open names at
   /// `path`, which `CreateSymbolicLink` has just made, becomes a volume link to `target`, keeping its attribute bits and,
   /// for a directory, the directory bit that makes it a Windows directory link. A link it names is given the new target.
   MakeLink {
@@ -334,7 +334,7 @@ enum Op<T> {
     path: String,
     target: String,
   },
-  /// `FSCTL_DELETE_REPARSE_POINT` (A-TBD): the link an open names at `path` becomes an empty file, or an empty directory
+  /// `FSCTL_DELETE_REPARSE_POINT` (A-275): the link an open names at `path` becomes an empty file, or an empty directory
   /// for a directory link, as NTFS leaves the object when its reparse point is removed. `symlink_tag` is whether the
   /// caller named a symbolic link's tag.
   UnmakeLink {
@@ -403,7 +403,7 @@ enum Reply {
     info: FileInfo,
   },
   Ok,
-  /// A link's target, or `None` when the object is no link (A-TBD).
+  /// A link's target, or `None` when the object is no link (A-275).
   Link {
     target: Option<String>,
   },
@@ -795,7 +795,7 @@ impl Served {
 fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
   Ok(FileInfo {
     file_attributes: crate::node_attributes(attr)?,
-    // A link's tag (A-TBD): Windows reads it beside `FILE_ATTRIBUTE_REPARSE_POINT` in a listing and an open's
+    // A link's tag (A-275): Windows reads it beside `FILE_ATTRIBUTE_REPARSE_POINT` in a listing and an open's
     // information, and a program tells a symbolic link from another reparse point by it.
     reparse_tag: if attr.kind == Kind::Symlink {
       crate::symlink::IO_REPARSE_TAG_SYMLINK
@@ -1029,7 +1029,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
   })
 }
 
-/// A link's target, or `None` for any other object (A-TBD).
+/// A link's target, or `None` for any other object (A-275).
 fn link_reply(bridge: &mut dyn Bridge, cx: &OpContext, attr: &NodeAttr) -> Result<Reply, VfsError> {
   let target = match attr.kind {
     Kind::Symlink => Some(bridge.readlink(ObjectId::new(attr.ino, attr.generation), cx)?),
@@ -1057,7 +1057,7 @@ fn opened_at<'p>(
   Ok(Ok((name, parent, current)))
 }
 
-/// `FSCTL_SET_REPARSE_POINT` with a symbolic link (A-TBD; [`Op::MakeLink`]). The volume cannot turn a file into a
+/// `FSCTL_SET_REPARSE_POINT` with a symbolic link (A-275; [`Op::MakeLink`]). The volume cannot turn a file into a
 /// link in place, so the empty object is removed and a link made at its name, within this one request: the shard
 /// serves it whole and publishes after it, so no publication, and no crash, can show the name missing. The open
 /// keeps the removed object, as a POSIX open of an unlinked file does; Windows drops what it cached of the name
@@ -1099,7 +1099,7 @@ fn op_make_link(
   object_reply(&link, 0)
 }
 
-/// `FSCTL_DELETE_REPARSE_POINT` (A-TBD; [`Op::UnmakeLink`]): the link becomes an empty file, or an empty directory for
+/// `FSCTL_DELETE_REPARSE_POINT` (A-275; [`Op::UnmakeLink`]): the link becomes an empty file, or an empty directory for
 /// a directory link, with the link's other attribute bits, made at its name within this one request as
 /// [`op_make_link`] makes a link. An object that is no link refuses `STATUS_NOT_A_REPARSE_POINT`, and a delete naming
 /// another tag `STATUS_IO_REPARSE_TAG_MISMATCH`, as WinFsp's `FspFileSystemCanReplaceReparsePoint` answers.
@@ -1582,7 +1582,7 @@ extern "C" fn get_security_by_name(
       // SAFETY: `p_sd_size`/`security_descriptor` follow WinFsp's in/out size protocol.
       unsafe { copy_security_descriptor(handler, security_descriptor, p_sd_size) }
     }
-    // A path through a link (A-TBD): the walk found no object, but a component before the last may be a link, which
+    // A path through a link (A-275): the walk found no object, but a component before the last may be a link, which
     // WinFsp follows when told where it is (memfs's `GetSecurityByName` does the same).
     Reply::Err(status) if plain && !p_file_attributes.is_null() => match ffi::api() {
       Ok(api) => {
@@ -1634,7 +1634,7 @@ unsafe fn reparse_out<'call>(
   }
 }
 
-/// Answers a link-or-not reply into WinFsp's reparse buffer (A-TBD): a link's reparse buffer and its length, success
+/// Answers a link-or-not reply into WinFsp's reparse buffer (A-275): a link's reparse buffer and its length, success
 /// alone when WinFsp asked only whether it is one, and `STATUS_NOT_A_REPARSE_POINT` for another object.
 fn put_link(reply: Reply, out: Option<(&mut [u8], &mut usize)>) -> Ntstatus {
   let target = match reply {
@@ -1660,7 +1660,7 @@ fn put_link(reply: Reply, out: Option<(&mut [u8], &mut usize)>) -> Ntstatus {
   STATUS_SUCCESS.as_i32()
 }
 
-/// WinFsp's `GetReparsePointByName` (A-TBD): the link at `file_name`, read on the shard without following it.
+/// WinFsp's `GetReparsePointByName` (A-275): the link at `file_name`, read on the shard without following it.
 extern "C" fn link_by_name(
   fs: *mut FileSystem,
   _context: Pvoid,
@@ -1681,7 +1681,7 @@ extern "C" fn link_by_name(
   put_link(handler.call(Op::LinkByName { path }), out)
 }
 
-/// `ResolveReparsePoints` (A-TBD): WinFsp's own resolver follows the path's links from `index`, asking
+/// `ResolveReparsePoints` (A-275): WinFsp's own resolver follows the path's links from `index`, asking
 /// [`link_by_name`] of each component, and leaves the path Windows opens instead in `buffer`.
 extern "C" fn resolve_reparse_points(
   fs: *mut FileSystem,
@@ -1712,7 +1712,7 @@ extern "C" fn resolve_reparse_points(
   }
 }
 
-/// `GetReparsePoint` (`FSCTL_GET_REPARSE_POINT`, A-TBD): the link an open names.
+/// `GetReparsePoint` (`FSCTL_GET_REPARSE_POINT`, A-275): the link an open names.
 extern "C" fn get_reparse_point(
   fs: *mut FileSystem,
   context: Pvoid,
@@ -1730,7 +1730,7 @@ extern "C" fn get_reparse_point(
   )
 }
 
-/// The open's name and the reparse buffer a set or a delete hands over, copied out (A-TBD).
+/// The open's name and the reparse buffer a set or a delete hands over, copied out (A-275).
 ///
 /// # Safety
 /// `fs` is our live file system, `file_name` the open's NUL-terminated name and `buffer` null or `size` readable
@@ -1761,7 +1761,7 @@ fn changed(reply: Reply) -> Ntstatus {
   }
 }
 
-/// `SetReparsePoint` (`FSCTL_SET_REPARSE_POINT`, A-TBD): a symbolic link's buffer makes the open's object a link
+/// `SetReparsePoint` (`FSCTL_SET_REPARSE_POINT`, A-275): a symbolic link's buffer makes the open's object a link
 /// ([`Op::MakeLink`]); any other tag is answered as before links were served (`crate::symlink::Refusal::Tag`).
 extern "C" fn set_reparse_point(
   fs: *mut FileSystem,
@@ -1782,7 +1782,7 @@ extern "C" fn set_reparse_point(
   }
 }
 
-/// `DeleteReparsePoint` (`FSCTL_DELETE_REPARSE_POINT`, A-TBD): the open's link becomes an empty object
+/// `DeleteReparsePoint` (`FSCTL_DELETE_REPARSE_POINT`, A-275): the open's link becomes an empty object
 /// ([`Op::UnmakeLink`]).
 extern "C" fn delete_reparse_point(
   fs: *mut FileSystem,
@@ -2395,7 +2395,7 @@ impl Mounted {
       | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
-      // A volume symlink is a Windows symbolic link (A-TBD): WinFsp asks the reparse slots and follows each link it
+      // A volume symlink is a Windows symbolic link (A-275): WinFsp asks the reparse slots and follows each link it
       // meets while opening a path. Access checks on links are left off (`ReparsePointsAccessCheck`), as WinFsp's own
       // memfs leaves them, so no privilege is needed to make one (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
