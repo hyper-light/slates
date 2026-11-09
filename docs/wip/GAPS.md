@@ -924,7 +924,18 @@
 >   does not have the shard runnable (`ShardTime::runnable`, the watchdog's source). Red first:
 >   `an_observation_of_a_starved_shard_is_answered` (`crates/server/tests/liveness.rs`) ended `Deadline` at its
 >   one-window budget 3 of 3 on adacachy2 while the shard's clock stood still 3.0 s; after, answered 6 of 6 (3 at nice 0,
->   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. The anchor's start judgment
+>   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. **The same test failed once on CI's
+>   windows-latest x86_64 after (clients' timing-all-5, 972210ae): fixed 2026-11-09 (bug-sweep).** The clock was read
+>   before the scheduler, so a starved shard released between the two reads ran, parked and read "no progress, not
+>   runnable" (jupiter: 1 of 12 whole-suite runs, its thread `Waiting` on `WrQueue` with its clock unmoved since the wait
+>   began, logged by the give-up's new record). A not-runnable state is now followed by a second read of the clock
+>   (`observe::WindowJudge`), red first in its unit tests; 12 of 12 after on jupiter
+>   (`docs/bugs/2026-11-09-a-starved-shard-released-between-two-reads-was-judged-wedged.md`). **Open, the same order:**
+>   the watchdog (`watchdog::read_runs`, a withheld beat for one look) and the anchor's start judgment
+>   (`anchor::judge_start_of`, which kills a start on one wedged look) read the clock before the scheduler too.
+>   And on jupiter the liveness suite run whole fails 1 to 5 of its beat tests every run, before this change and after
+>   (`a_daemon_beside_two_spinners_a_core_keeps_beating`, `a_wedged_shard_stops_the_beat`, ...), while CI's runners
+>   pass them: not diagnosed. The anchor's start judgment
 >   (`crates/cli/src/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's

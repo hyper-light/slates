@@ -659,6 +659,20 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
   .and_then(crate::thread_clock::read)
 }
 
+/// What the scheduler's own words say of the shard `holder` names now (`crate::thread_clock::run_words`): on Windows its
+/// thread's `ThreadState` and `WaitReason`, or which part of the read failed. For the record of a judgment made on its
+/// run state, never for the judgment itself.
+pub fn shard_run_words(holder: SlotHolder) -> String {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .map_or_else(
+    || "no registration".to_owned(),
+    crate::thread_clock::run_words,
+  )
+}
+
 /// What the scheduler says of each shard `holders` name at this instant, in their order (`crate::thread_clock`'s note
 /// says what each platform reads): `None` for one whose registration no longer holds its slot, whose thread recorded no
 /// clock, or where the platform reads nothing. A batch, since Windows reads the whole system's threads at once. With

@@ -465,11 +465,56 @@ fn process_thread_states_in(snapshot: &[u8], process: u32) -> Option<Vec<u32>> {
   }
 }
 
-/// The `ThreadState` of thread `thread` of process `process` in a snapshot, walking its records with every offset and
-/// count checked against the buffer: a record cut short, or an offset past the end, is `None`. The walk ends, since
-/// each step moves forward by a nonzero offset.
+/// The `ThreadState` of thread `thread` of process `process` in a snapshot ([`thread_record_in`]).
 #[cfg(any(all(windows, not(miri)), test))]
 fn thread_state_in(snapshot: &[u8], process: u32, thread: u32) -> Option<u32> {
+  u32_at(
+    thread_record_in(snapshot, process, thread)?,
+    THREAD_STATE_AT,
+  )
+}
+
+/// Format: where a thread record holds its `WaitReason` (`KWAIT_REASON`), after its `ThreadState`.
+#[cfg(all(windows, not(miri)))]
+const WAIT_REASON_AT: usize = 72;
+
+/// What the scheduler's own words say of thread `handle`, for the record of a judgment made on its state: on Windows the
+/// snapshot's `ThreadState` and `WaitReason`, or which part of the read failed; elsewhere the reading itself.
+#[cfg(all(windows, not(miri)))]
+pub(crate) fn run_words(handle: u64) -> String {
+  if handle & TAG == 0 {
+    return "no thread id".to_owned();
+  }
+  let Ok(thread) = u32::try_from(handle & !TAG) else {
+    return "a thread id past 32 bits".to_owned();
+  };
+  let Some(snapshot) = system_snapshot() else {
+    return "no system snapshot".to_owned();
+  };
+  match thread_record_in(&snapshot, std::process::id(), thread) {
+    None => format!(
+      "thread {thread} not in a snapshot of {} bytes",
+      snapshot.len()
+    ),
+    Some(record) => format!(
+      "thread {thread}: ThreadState {:?}, WaitReason {:?}",
+      u32_at(record, THREAD_STATE_AT),
+      u32_at(record, WAIT_REASON_AT)
+    ),
+  }
+}
+
+/// What the scheduler's own words say of thread `handle` (the Windows reader's note): here the reading itself.
+#[cfg(not(all(windows, not(miri))))]
+pub(crate) fn run_words(handle: u64) -> String {
+  format!("{:?}", run_readings(&[handle]).pop().flatten())
+}
+
+/// The record of thread `thread` of process `process` in a snapshot, walking its records with every offset and count
+/// checked against the buffer: a record cut short, or an offset past the end, is `None`. The walk ends, since each step
+/// moves forward by a nonzero offset.
+#[cfg(any(all(windows, not(miri)), test))]
+fn thread_record_in(snapshot: &[u8], process: u32, thread: u32) -> Option<&[u8]> {
   let mut offset = 0usize;
   loop {
     let record = snapshot.get(offset..)?;
@@ -480,7 +525,7 @@ fn thread_state_in(snapshot: &[u8], process: u32, thread: u32) -> Option<u32> {
         let at = PROCESS_RECORD.checked_add(index.checked_mul(THREAD_RECORD)?)?;
         let held = record.get(at..at.checked_add(THREAD_RECORD)?)?;
         if u32_at(held, THREAD_ID_AT)? == thread {
-          return u32_at(held, THREAD_STATE_AT);
+          return Some(held);
         }
       }
       return None;

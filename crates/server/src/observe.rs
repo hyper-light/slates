@@ -263,11 +263,8 @@ pub struct Admitted<T> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShardTime {
   holder: SlotHolder,
-  budget_ns: u64,
-  /// The CPU time the shard had run when the observation began.
-  began: Option<u64>,
-  /// The shard's progress at the last window's end (first: at the observation's start); it only rises.
-  mark: Option<u64>,
+  /// The budget, the clock at the start and the progress at the last window's end ([`WindowJudge`]).
+  judge: WindowJudge,
 }
 
 impl ShardTime {
@@ -275,9 +272,11 @@ impl ShardTime {
     let began = slates_rt::registry::shard_cpu(holder);
     ShardTime {
       holder,
-      budget_ns,
-      began: began.map(|reading| reading.spent_ns),
-      mark: began.map(|reading| reading.progress),
+      judge: WindowJudge {
+        budget_ns,
+        began: began.map(|reading| reading.spent_ns),
+        mark: began.map(|reading| reading.progress),
+      },
     }
   }
 
@@ -289,36 +288,115 @@ impl ShardTime {
 
   /// The next window's wall length when the shard worked through the window just ended within its budget, or waited for
   /// a CPU through it: the budget it has not yet run. `None` ends the wait: the shard made no progress in the window and
-  /// waited on no CPU, it has run its budget, or its clock cannot be read.
+  /// waited on no CPU, it has run its budget, or its clock cannot be read ([`WindowJudge::judge`]). Each end is logged.
   pub(crate) fn next_window_ns(&mut self) -> Option<u64> {
-    let now = slates_rt::registry::shard_cpu(self.holder)?;
-    let unspent = self
-      .budget_ns
-      .checked_sub(now.spent_ns.checked_sub(self.began?)?)
-      .filter(|unspent| *unspent > 0)?;
+    let holder = self.holder;
+    match self.judge.judge(
+      || slates_rt::registry::shard_cpu(holder),
+      || runnable(holder),
+    ) {
+      Ok(window) => Some(window),
+      Err((why, now)) => {
+        self.gave_up(why, now);
+        None
+      }
+    }
+  }
+
+  /// Logs why a wait judged in the shard's own time gave up on it, with what its clock and the scheduler said: a wait
+  /// given up on a live shard answers its caller that the shard is gone, so each one is kept on the record (2026-11-09:
+  /// an observation of a starved shard was given up on once on CI's windows-latest x86_64, and its log said no more).
+  fn gave_up(&self, why: &str, now: Option<slates_rt::CpuReading>) {
+    slates_machine::log_line!(
+      "slates-server: a wait judged in shard {}'s own time gave up: {why}; budget {} ns, began {:?}, mark {:?}, now {:?}; \
+       the scheduler: {}",
+      self.holder.shard(),
+      self.judge.budget_ns,
+      self.judge.began,
+      self.judge.mark,
+      now,
+      slates_rt::registry::shard_run_words(self.holder)
+    );
+  }
+}
+
+/// A wait judged in a shard's own time between its windows: its budget, the shard's CPU time when it began, and its
+/// progress at the last window's end. Pure over the readers it is handed, so the order of its reads is tested on every
+/// host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowJudge {
+  budget_ns: u64,
+  /// The CPU time the shard had run when the wait began.
+  began: Option<u64>,
+  /// The shard's progress at the last window's end (first: at the wait's start); it only rises.
+  mark: Option<u64>,
+}
+
+impl WindowJudge {
+  /// Judges the window just ended from the shard's clock (`read_clock`) and, when the clock stood still, the scheduler
+  /// (`runnable`): the next window's wall length, the budget the shard has not yet run; or why the wait ends, with the
+  /// clock as it was read.
+  ///
+  /// **The order of the reads.** A clock that stood still with the shard not runnable is a wedged shard, but the two
+  /// cannot be read at one instant. Read clock first and state second, a starved shard released between them runs, ends
+  /// what it was doing and blocks in its idle wait before the state is read: no progress and not runnable, so it was
+  /// given up on as wedged the moment it ran. On jupiter (Windows 11, x86_64) an observation of a starved shard was given
+  /// up on so 1 of 12 runs of the whole liveness suite, its log reading the shard's clock unmoved since the wait began and
+  /// its thread `Waiting` on `WrQueue`, its completion port; CI's windows-latest x86_64 failed the same test once. So a
+  /// state that says not runnable is followed by the clock read again: a thread cannot go from runnable to blocked without
+  /// running, so a clock that moved since says it ran, and only one still unmoved ends the wait.
+  fn judge(
+    &mut self,
+    mut read_clock: impl FnMut() -> Option<slates_rt::CpuReading>,
+    runnable: impl FnOnce() -> bool,
+  ) -> Result<u64, (&'static str, Option<slates_rt::CpuReading>)> {
+    let Some(now) = read_clock() else {
+      return Err(("its CPU clock cannot be read", None));
+    };
+    let Some(unspent) = self
+      .began
+      .and_then(|began| now.spent_ns.checked_sub(began))
+      .and_then(|spent| self.budget_ns.checked_sub(spent))
+      .filter(|unspent| *unspent > 0)
+    else {
+      return Err((
+        "it has run its budget, or its clock reads below its start",
+        Some(now),
+      ));
+    };
     if self.mark.is_none_or(|mark| now.progress <= mark) {
       // No CPU in the window. Starved is not stuck (A-228): a shard the scheduler has runnable, waiting for a CPU, is
       // given the window again; only one that waits on something else, a deadlock or a call that never returns, ends the
       // wait. On adacachy2 an observation of a shard held off its CPU for 3.0 s ended at its one-window deadline 3 of 3
       // before this.
-      return self.runnable().then_some(unspent);
+      if runnable() {
+        return Ok(unspent);
+      }
+      if let Some(again) = read_clock().filter(|again| again.progress > now.progress) {
+        self.mark = Some(again.progress);
+        return Ok(unspent);
+      }
+      return Err((
+        "no CPU in the window, and the scheduler does not have it runnable",
+        Some(now),
+      ));
     }
     self.mark = Some(now.progress);
     // The budget the shard has not yet run, as wall time: an uncontended shard runs at the wall clock's pace and has
     // next to none left; a starved one has most of it.
-    Some(unspent)
+    Ok(unspent)
   }
+}
 
-  /// Whether the scheduler has the shard runnable at this look: on a CPU or waiting for one
-  /// (`slates_rt::registry::shard_run_readings`, the watchdog's source). The state decides on every platform: a thread
-  /// held off its CPU stays runnable, and Linux credits a run-queue wait only once the thread reaches a CPU (A-228's
-  /// notes). No reading (Miri, or a source that cannot be read) says no, as before A-228.
-  fn runnable(&self) -> bool {
-    slates_rt::registry::shard_run_readings(&[self.holder])
-      .pop()
-      .flatten()
-      .is_some_and(|run| run.state == slates_rt::RunState::Runnable)
-  }
+/// Whether the scheduler has the shard `holder` names runnable at this look: on a CPU or waiting for one
+/// (`slates_rt::registry::shard_run_readings`, the watchdog's source). The state decides on every platform: a thread
+/// held off its CPU stays runnable, and Linux credits a run-queue wait only once the thread reaches a CPU (A-228's
+/// notes). No reading (Miri, or a source that cannot be read) says no, as before A-228.
+fn runnable(holder: SlotHolder) -> bool {
+  slates_rt::registry::shard_run_readings(&[holder])
+    .pop()
+    .flatten()
+    .is_some_and(|run| run.state == slates_rt::RunState::Runnable)
 }
 
 /// What one attempt of an observation established: an end (an admitted task, or a final refusal), or
@@ -587,6 +665,89 @@ fn waited_ns(began: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: one window of budget, as the liveness test's observation of a starved shard asks.
+  const BUDGET_NS: u64 = 1_000_000_000;
+  /// Shape: the CPU time and progress of jupiter's starved shard when its observation began (2026-11-09).
+  const AT_START: slates_rt::CpuReading = slates_rt::CpuReading {
+    spent_ns: 31_250_000,
+    progress: 75_583_833,
+  };
+  /// Shape: what the shard ran between the clock's first read and the state's: the rest of its poll, then its park.
+  const RAN_BETWEEN: u64 = 40_000;
+
+  /// A wait at its first window's end, the shard's clock unmoved since it began.
+  fn at_start() -> WindowJudge {
+    WindowJudge {
+      budget_ns: BUDGET_NS,
+      began: Some(AT_START.spent_ns),
+      mark: Some(AT_START.progress),
+    }
+  }
+
+  /// A clock that reads `readings` in turn, then the last again.
+  fn clock(readings: Vec<slates_rt::CpuReading>) -> impl FnMut() -> Option<slates_rt::CpuReading> {
+    let mut readings = readings.into_iter();
+    let mut last = None;
+    move || {
+      if let Some(next) = readings.next() {
+        last = Some(next);
+      }
+      last
+    }
+  }
+
+  /// The race found on jupiter (Windows 11, x86_64; CI's windows-latest x86_64 failed the same way once). Do: judge a
+  /// window whose clock reads unmoved since the wait began, while the scheduler, asked after it, says not runnable, the
+  /// shard having been released, run the rest of its poll and parked in between; the clock read again shows that run.
+  /// Expect another window, the mark moved to the run. Before, the state's answer ended the wait: no progress and not
+  /// runnable, a starved shard given up on as wedged the moment it ran.
+  #[test]
+  fn a_shard_that_ran_between_the_clock_and_the_state_is_not_given_up_on() {
+    let mut judge = at_start();
+    let ran = slates_rt::CpuReading {
+      spent_ns: AT_START.spent_ns,
+      progress: AT_START.progress + RAN_BETWEEN,
+    };
+    let judged = judge.judge(clock(vec![AT_START, ran]), || false);
+    assert_eq!(
+      judged,
+      Ok(BUDGET_NS),
+      "another window, the shard having run"
+    );
+    assert_eq!(judge.mark, Some(ran.progress), "the mark moved to the run");
+  }
+
+  /// A wedged shard is still given up on. Do: judge a window whose clock reads unmoved on both reads, the scheduler
+  /// saying not runnable. Expect the wait to end, saying why, with the clock as read.
+  #[test]
+  fn a_shard_unmoved_on_both_reads_and_not_runnable_is_given_up_on() {
+    let mut judge = at_start();
+    let judged = judge.judge(clock(vec![AT_START, AT_START]), || false);
+    assert_eq!(
+      judged,
+      Err((
+        "no CPU in the window, and the scheduler does not have it runnable",
+        Some(AT_START)
+      ))
+    );
+  }
+
+  /// A starved shard is waited for (A-228). Do: judge a window whose clock reads unmoved, the scheduler saying runnable.
+  /// Expect another window, the clock read once.
+  #[test]
+  fn a_starved_shard_unmoved_but_runnable_gets_another_window() {
+    let mut judge = at_start();
+    let mut reads = 0;
+    let judged = judge.judge(
+      || {
+        reads += 1;
+        Some(AT_START)
+      },
+      || true,
+    );
+    assert_eq!((judged, reads), (Ok(BUDGET_NS), 1));
+  }
 
   /// The reading a poll takes of each refusal: only what can clear is asked again.
   #[test]

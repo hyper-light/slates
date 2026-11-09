@@ -7184,6 +7184,11 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
 > shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
 > gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
+> **2026-11-09, the order of its reads:** the clock was read before the scheduler, so a starved shard released between
+> the two ran, parked, and read "no progress, not runnable", given up on as wedged the moment it ran (jupiter, Windows
+> x86_64: 1 of 12 runs of the liveness suite, its thread `Waiting` on `WrQueue` with its clock unmoved since the wait
+> began; CI's windows-latest x86_64 once). A state that says not runnable is now followed by the clock read again, and
+> only a clock still unmoved ends the wait (`observe::WindowJudge`); 12 of 12 after on jupiter.
 > **2026-11-08, the transitive wait:** a shard blocked joining another thread of the process (the FUSE notify thread,
 > the landing barrier thread, the WinFsp mount thread; `slates_rt::registry::spawn_waited`) is read as that thread while
 > it is runnable, so a shard waiting on a starved thread is starved, not stuck; one waiting on a blocked thread is still
