@@ -12079,3 +12079,21 @@ an ask lost for want of room: `xshard.reply_dropped`, `lease.wait.undelivered`, 
   so the oracle stays 0. W1 drops none.
 - W1's verdict tail is still worse than main's: SubmitAccepted p99 56–72 ms against 42–62, SubmitConflict 74–80
   against 43–63, Rebase 62–71 against 42–64.
+
+**A work composes its own increment (2026-11-09).** The owner composed every remote submit's and rebase's increment,
+about a third of its time in asks. agents/perf-w1 7d6e7d80 composes it on the work's shard from base entries fetched
+with the paths it touched (`Green::path_base`, `Base::for_names`) and sends the increment alone. Main 80be552a, W1
+before it (492ad3c3) and after (7d6e7d80), the anchor recipe, 3,000 clients, interleaved in reversed order on alternate
+rounds, 6 rounds each, adas-mac-studio.local-2, load 3.5 to 24.7, oracle 0 everywhere. `composed` counts the work's
+increments composed on its own shard against those left to the owner. Milliseconds, p50 / p99, the range over the runs:
+
+| Build | Wall (s) | lost | composed | SubmitAccepted | SubmitConflict | Rebase | Edit | ReadHead |
+|---|---|---|---|---|---|---|---|---|
+| main 80be552a | 7.79–8.24 | 4,116–4,374 | — | 28.2–29.8 / 41.3–46.4 | 31.2–33.9 / 42.6–49.3 | 31.2–33.8 / 42.8–49.4 | 30.7–33.0 / 48.3–62.0 | 31.3–33.9 / 42.8–60.3 |
+| W1 492ad3c3 | 4.59–4.78 | 0 | — | 24.3–27.5 / 67.6–75.8 | 35.2–36.0 / 78.6–86.7 | 34.5–35.6 / 64.5–74.9 | 0.5–0.6 / 59.4–66.2 | 11.1–11.4 / 23.4–28.6 |
+| W1 7d6e7d80 | 3.52–3.89 | 0 | 119,500–120,744 / 0 | 18.3–21.1 / 55.2–64.2 | 26.3–28.3 / 59.3–66.6 | 26.2–27.8 / 52.0–62.5 | 0.6–0.7 / 44.0–48.2 | 8.3–8.9 / 15.4–17.6 |
+
+- Every latency and the wall fell against W1 before it. Against main, every p50 and the wall are better (wall 44–48% of
+  main's), and the verdict's p99 is still 10–20 ms worse.
+- Measured on the way, rejected: composing on the work but clearing its entries at a rebase made each resubmit fetch them
+  again first, and SubmitAccepted p99 rose to 84–90 ms (6 rounds, 2026-11-09); the rebase now answers the entries.

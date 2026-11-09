@@ -14225,6 +14225,10 @@ forwarded from another node still places the work on the green's shard.
     work had not changed, so the log's replay is given the base through the same ask of the owner, once the partitions
     are all recovered, and the work is unserved (`Unpublished`) until it has. A work's recovery no longer needs a local
     engine.
+  - *A work composes its own increment.* A first touch's fetch brings the path's base entries (`Green::path_base`),
+    which the work keeps until its base moves; a rebase answers those of its restated journal. A submit or rebase
+    fetches what its journal names that the work lacks, composes by the owner's own function over `Base::for_names`, and
+    sends the increment alone. The owner only judges.
   - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
     region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
     and stalled every run.
