@@ -1,0 +1,660 @@
+leg x86, 4 CPUs, Mon Nov  9 21:55:32 UTC 2026, tree 1f65b968e80175355461cd0ec901931810cb3504
+== release build exit 0
+   r1     Finished `release` profile [optimized] target(s) in 0.10s
+   r1      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-6734 destroyed at 295.109226ms
+   r1 chaos a candidate's store destroyed mid-stream: replacement answering at 487.500263ms
+   r1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.636982646s
+   r1 chaos a candidate's store destroyed mid-stream: 241 writes, 241 acknowledged: p50 1126 us, p99 104130 us, p999 1129149 us, max 1129149 us; 3 over 50ms (sent+took): 0.00s+157ms 0.56s+1129ms 1.79s+104ms
+   r1 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(241), durable: Some(241), owed: false, epoch: Some(1), identity: Some("c102d79bd1be483379cba67d066263a347c2028c9adc298af843257eb25fc7de"), fence: 1, holders: ["7926601410486446859", "8210041284169928672", "14132280324752509845"], moving_to: ["7926601410486446859", "8210041284169928672
+   r1 chaos a candidate's store destroyed mid-stream: 155 samples, 43 heads seen
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-6734 refused the owner: {}
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-6734 refused the owner: {"fleet.live.hold_refused.not_a_member": 8}
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-6734 refused the owner: {}
+   r1 LD-D72 destroyed chaos-replaced-b-6734 successor None replacement_served false
+   r1 LD-D72 counters chaos-replaced-b-6734 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r1 LD-D72 counters chaos-replaced-c-6734 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=8
+   r1   
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 7926601410486446859
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 7926601410486446859 8210041284169928672
+   r1   fleet_peers_probed: 1
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 13
+   r1   anchor: 17288423613152634541
+   r1   fleet_settled_generation: 10
+   r1   fleet_neighbourhood_generation: 10
+   r1   fleet_retirement: host=14132280324752509845 version=7 survivors=[8210041284169928672 8521641927849112013] confirmed=[8210041284169928672] unconfirmed=[]
+   r1   fleet_retirement: host=8521641927849112013 version=10 survivors=[7926601410486446859 8210041284169928672] confirmed=[7926601410486446859] unconfirmed=[14132280324752509845]
+   r1   fleet_peers_in_contact: 1
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 8210041284169928672: lent=false cwnd=130934 srtt_ns=110056 pto_ns=1110056 spurious_losses=0 persistent_collapses=0 consumed=158686 mtu=65496
+   r1   shard 0 refused fleet.link.out_of_contact: 1
+   r1   shard 0 refused fleet.link.stale_return: 1
+   r1   shard 0 refused fleet.live.held: 56
+   r1   shard 0 refused fleet.live.hold_refused: 8
+   r1   shard 0 refused fleet.live.hold_refused.not_a_member: 8
+   r1   shard 0 refused fleet.live.install_taken: 1
+   r1   shard 0 refused fleet.owner_location.direct: 1
+   r1   shard 0 refused fleet.owner_location.forward_unanswered: 1
+   r1   shard 0 refused fleet.owner_location.no_session: 3703
+   r1   shard 0 refused fleet.owner_location.not_owner: 3709
+   r1   shard 0 refused fleet.owner_location.retried: 3670
+   r1   shard 0 refused fleet.owner_location.round: 3709
+   r1   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r1   shard 0 refused fleet.owner_location.session_out: 6
+   r1   shard 0 refused fleet.owner_location.unavailable: 3709
+   r1   shard 0 refused fleet.plane.announce_lends: 4
+   r1   shard 0 refused fleet.plane.announcements_sent: 4
+   r1   shard 0 refused fleet.report.sent: 4
+   r1   shard 0 refused fleet.seal.pair_served: 4
+   r1   shard 0 refused fleet.takeover.page_unbound: 2
+   r1   shard 0 refused fleet.takeover.page_unmatched: 6
+   r1   shard 0 refused fleet.takeover.stale_configuration: 2
+   r1   shard 0 live held 7642f42f0c8571cd0001000000000020 head=241 durable=none owed=false epoch=1 identity=c102d79bd1be483379cba67d066263a347c2028c9adc298af843257eb25fc7de fence=1 holders=none moving_to=none recorded=none
+   r1   anchor_hold_refusals: 0
+   r1   anchor_log_lines_refused: 0
+   r1   fleet_host: 8210041284169928672
+   r1   fleet_host_epoch: 1
+   r1   fleet_members: 7926601410486446859 8210041284169928672
+   r1   fleet_peers_probed: 1
+   r1   fleet_held_records: 2
+   r1   fleet_takeovers_pending: 0
+   r1   fleet_configuration_version: 13
+   r1   anchor: 1289742697809531035
+   r1   fleet_settled_generation: 10
+   r1   fleet_neighbourhood_generation: 10
+   r1   fleet_retirement: host=14132280324752509845 version=7 survivors=[8210041284169928672 8521641927849112013] confirmed=[8210041284169928672] unconfirmed=[]
+   r1   fleet_retirement: host=8521641927849112013 version=10 survivors=[7926601410486446859 8210041284169928672] confirmed=[7926601410486446859] unconfirmed=[14132280324752509845]
+   r1   fleet_peers_in_contact: 1
+   r1   fleet_peers_unmeshed: 0
+   r1   fleet_session 7926601410486446859: lent=false cwnd=130934 srtt_ns=81330 pto_ns=1081330 spurious_losses=0 persistent_collapses=0 consumed=44736 mtu=65496
+   r1   shard 0 refused fleet.link.out_of_contact: 1
+   r1   shard 0 refused fleet.link.peer_reset: 1
+   r1   shard 0 refused fleet.link.stale_return: 1
+   r1   shard 0 refused fleet.live.held: 205
+   r1   shard 0 refused fleet.live.install_taken: 1
+   r1   shard 0 refused fleet.owner_location.declined.departed: 3652
+   r1   shard 0 refused fleet.owner_location.declined.not_owner: 57
+   r1   shard 0 refused fleet.owner_location.owned_unmaterialized: 10
+   r1   shard 0 refused fleet.plane.address_unresolved: 2
+   r1   shard 0 refused fleet.plane.announce_lends: 6
+   r1   shard 0 refused fleet.plane.announcements_sent: 6
+   r1   shard 0 refused fleet.record.refused.configuration_stale: 1
+   r1   shard 0 refused fleet.report.sent: 4
+   r1   shard 0 refused fleet.seal.pair_recipient_unknown: 2
+   r1   shard 0 refused fleet.seal.pair_served: 6
+   r1   shard 0 refused fleet.takeover.lost: 8
+   r1   shard 0 refused fleet.takeover.page_unbound: 10
+   r1   shard 0 refused fleet.takeover.page_unmatched: 3
+   r1   shard 0 live held 7642f42f0c8571cd0001000000000020 head=241 durable=none owed=false epoch=1 identity=c102d79bd1be483379cba67d066263a347c2028c9adc298af843257eb25fc7de fence=1 holders=none moving_to=none recorded=none
+   r1 chaos a candidate's store destroyed mid-stream:
+   r1   candidate node chaos-replaced-b-6734 destroyed at 295.109226ms
+   r1   replacement answering at 487.500263ms
+   r1   the fleet rejoined at 1.636982646s
+   r1   every write acknowledged: held
+   r1   241 writes, 241 acknowledged: p50 1126 us, p99 104130 us, p999 1129149 us, max 1129149 us; 3 over 50ms (sent+took): 0.00s+157ms 0.56s+1129ms 1.79s+104ms
+   r1   converged: true: owner Some(LiveState { holding: false, head: Some(241), durable: Some(241), owed: false, epoch: Some(1), identity: Some("c102d79bd1be483379cba67d066263a347c2028c9adc298af843257eb25fc7de"), fence: 1, holders: ["7926601410486446859", "8210041284169928672", "14132280324752509845"], moving_to: ["7926601410486446859", "8210041284169928672"], recorded: ["7926601410486446859", "8210041
+   r1   Convergence: held
+   r1   155 samples, 43 heads seen
+   r1   Agreement: held
+   r1   NoLoss: held
+   r1   chaos-replaced-a-6734 refused the owner: {}
+   r1   chaos-replaced-b-6734 refused the owner: {"fleet.live.hold_refused.not_a_member": 8}
+   r1   chaos-replaced-c-6734 refused the owner: {}
+   r1   NoLoss (successor): 1 violations
+   r1   NoLoss (copies kept while unserved): held
+   r1 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (6735) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r1 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r1     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r1 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 43.52s
+== run 1 exit 101
+   r2     Finished `release` profile [optimized] target(s) in 0.10s
+   r2      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r2 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7298 destroyed at 203.857026ms
+   r2 chaos a candidate's store destroyed mid-stream: replacement answering at 365.4721ms
+   r2 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.521164406s
+   r2 chaos a candidate's store destroyed mid-stream: 308 writes, 308 acknowledged: p50 517 us, p99 47953 us, p999 1123555 us, max 1123555 us; 3 over 50ms (sent+took): 0.00s+147ms 0.45s+1124ms 1.57s+113ms
+   r2 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(308), durable: Some(308), owed: false, epoch: Some(1), identity: Some("52fdb919545b87f6fb90e57e61d53f400d1611eed8921aab667f745c6ce99e35"), fence: 1, holders: ["12562926519454204979", "13127393316830281503"], moving_to: ["9968911160540890805", "12562926519454204979", "13127393316830281
+   r2 chaos a candidate's store destroyed mid-stream: 149 samples, 29 heads seen
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7298 refused the owner: {}
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7298 refused the owner: {}
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7298 refused the owner: {}
+   r2 LD-D72 destroyed chaos-replaced-a-7298 successor None replacement_served false
+   r2 LD-D72 counters chaos-replaced-a-7298 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r2 LD-D72 counters chaos-replaced-b-7298 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 9968911160540890805
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 9968911160540890805 12562926519454204979
+   r2   fleet_peers_probed: 1
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 17332445822719705732
+   r2   fleet_settled_generation: 5
+   r2   fleet_neighbourhood_generation: 5
+   r2   fleet_retirement: host=13127393316830281503 version=7 survivors=[12562926519454204979 12802241420215008239] confirmed=[12802241420215008239] unconfirmed=[]
+   r2   fleet_peers_in_contact: 1
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 12562926519454204979: lent=false cwnd=130934 srtt_ns=112139 pto_ns=1112139 spurious_losses=0 persistent_collapses=0 consumed=98842 mtu=65496
+   r2   shard 0 refused fleet.accept.replaced: 1
+   r2   shard 0 refused fleet.link.out_of_contact: 1
+   r2   shard 0 refused fleet.link.stale_return: 1
+   r2   shard 0 refused fleet.live.held: 46
+   r2   shard 0 refused fleet.live.install_taken: 2
+   r2   shard 0 refused fleet.owner_location.declined.not_owner: 2245
+   r2   shard 0 refused fleet.owner_location.direct: 1
+   r2   shard 0 refused fleet.owner_location.forward_unanswered: 1
+   r2   shard 0 refused fleet.owner_location.no_session: 2117
+   r2   shard 0 refused fleet.owner_location.not_owner: 2139
+   r2   shard 0 refused fleet.owner_location.retried: 2116
+   r2   shard 0 refused fleet.owner_location.round: 2139
+   r2   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r2   shard 0 refused fleet.owner_location.session_out: 22
+   r2   shard 0 refused fleet.owner_location.unavailable: 2139
+   r2   shard 0 refused fleet.plane.announce_lends: 4
+   r2   shard 0 refused fleet.plane.announcements_sent: 4
+   r2   shard 0 refused fleet.seal.pair_served: 4
+   r2   shard 0 live held b1aab2be14b53bef0001000000000044 head=308 durable=none owed=false epoch=1 identity=52fdb919545b87f6fb90e57e61d53f400d1611eed8921aab667f745c6ce99e35 fence=1 holders=none moving_to=none recorded=none
+   r2   anchor_hold_refusals: 0
+   r2   anchor_log_lines_refused: 0
+   r2   fleet_host: 12562926519454204979
+   r2   fleet_host_epoch: 1
+   r2   fleet_members: 9968911160540890805 12562926519454204979
+   r2   fleet_peers_probed: 1
+   r2   fleet_held_records: 2
+   r2   fleet_takeovers_pending: 0
+   r2   fleet_configuration_version: 10
+   r2   anchor: 11989125042560634972
+   r2   fleet_settled_generation: 7
+   r2   fleet_neighbourhood_generation: 7
+   r2   fleet_retirement: host=13127393316830281503 version=7 survivors=[12562926519454204979 12802241420215008239] confirmed=[12802241420215008239] unconfirmed=[]
+   r2   fleet_peers_in_contact: 1
+   r2   fleet_peers_unmeshed: 0
+   r2   fleet_session 9968911160540890805: lent=false cwnd=130934 srtt_ns=97979 pto_ns=1097979 spurious_losses=0 persistent_collapses=0 consumed=99316 mtu=65496
+   r2   shard 0 refused fleet.link.out_of_contact: 1
+   r2   shard 0 refused fleet.link.peer_reset: 1
+   r2   shard 0 refused fleet.link.stale_return: 1
+   r2   shard 0 refused fleet.live.held: 244
+   r2   shard 0 refused fleet.live.install_taken: 1
+   r2   shard 0 refused fleet.owner_location.declined.not_owner: 2139
+   r2   shard 0 refused fleet.owner_location.no_session: 2219
+   r2   shard 0 refused fleet.owner_location.not_owner: 2245
+   r2   shard 0 refused fleet.owner_location.retried: 2221
+   r2   shard 0 refused fleet.owner_location.round: 2245
+   r2   shard 0 refused fleet.owner_location.session_out: 26
+   r2   shard 0 refused fleet.owner_location.unavailable: 2245
+   r2   shard 0 refused fleet.plane.address_unresolved: 10
+   r2   shard 0 refused fleet.plane.announce_lends: 5
+   r2   shard 0 refused fleet.plane.announcements_sent: 5
+   r2   shard 0 refused fleet.report.sent: 2
+   r2   shard 0 refused fleet.seal.pair_served: 6
+   r2   shard 0 refused fleet.takeover.page_unbound: 4
+   r2   shard 0 refused fleet.takeover.page_unmatched: 2
+   r2   shard 0 refused fleet.takeover.pages_unsent: 473
+   r2   shard 0 live held b1aab2be14b53bef0001000000000044 head=308 durable=none owed=false epoch=1 identity=52fdb919545b87f6fb90e57e61d53f400d1611eed8921aab667f745c6ce99e35 fence=1 holders=none moving_to=none recorded=none
+   r2   
+   r2 chaos a candidate's store destroyed mid-stream:
+   r2   candidate node chaos-replaced-a-7298 destroyed at 203.857026ms
+   r2   replacement answering at 365.4721ms
+   r2   the fleet rejoined at 1.521164406s
+   r2   every write acknowledged: held
+   r2   308 writes, 308 acknowledged: p50 517 us, p99 47953 us, p999 1123555 us, max 1123555 us; 3 over 50ms (sent+took): 0.00s+147ms 0.45s+1124ms 1.57s+113ms
+   r2   converged: true: owner Some(LiveState { holding: false, head: Some(308), durable: Some(308), owed: false, epoch: Some(1), identity: Some("52fdb919545b87f6fb90e57e61d53f400d1611eed8921aab667f745c6ce99e35"), fence: 1, holders: ["12562926519454204979", "13127393316830281503"], moving_to: ["9968911160540890805", "12562926519454204979", "13127393316830281503"], recorded: ["9968911160540890805", "1256
+   r2   Convergence: held
+   r2   149 samples, 29 heads seen
+   r2   Agreement: held
+   r2   NoLoss: held
+   r2   chaos-replaced-c-7298 refused the owner: {}
+   r2   chaos-replaced-a-7298 refused the owner: {}
+   r2   chaos-replaced-b-7298 refused the owner: {}
+   r2   NoLoss (successor): 1 violations
+   r2   NoLoss (copies kept while unserved): held
+   r2 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7299) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r2 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r2     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r2 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 51.69s
+== run 2 exit 101
+   r3     Finished `release` profile [optimized] target(s) in 0.10s
+   r3      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r3 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-7929 destroyed at 194.359613ms
+   r3 chaos a candidate's store destroyed mid-stream: replacement answering at 404.204427ms
+   r3 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.53252452s
+   r3 chaos a candidate's store destroyed mid-stream: 281 writes, 281 acknowledged: p50 812 us, p99 104686 us, p999 929054 us, max 929054 us; 3 over 50ms (sent+took): 0.00s+105ms 0.52s+929ms 1.45s+111ms
+   r3 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(281), durable: Some(281), owed: false, epoch: Some(1), identity: Some("78d791119bfd9e17af97c700a37304ae3ab99b63b73fdf728351633e17767c79"), fence: 1, holders: ["7392009747010547667", "17033550150176782520"], moving_to: [], recorded: ["7392009747010547667", "17033550150176782520"] }); c
+   r3 chaos a candidate's store destroyed mid-stream: 148 samples, 47 heads seen
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7929 refused the owner: {}
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7929 refused the owner: {"fleet.live.hold_refused.not_a_member": 7}
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7929 refused the owner: {}
+   r3 LD-D72 destroyed chaos-replaced-a-7929 successor None replacement_served false
+   r3 LD-D72 counters chaos-replaced-a-7929 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r3 LD-D72 counters chaos-replaced-c-7929 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 17033550150176782520
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 7392009747010547667 17033550150176782520
+   r3   fleet_peers_probed: 1
+   r3   fleet_held_records: 1
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 9
+   r3   anchor: 9514109957262319961
+   r3   fleet_settled_generation: 6
+   r3   fleet_neighbourhood_generation: 6
+   r3   fleet_retirement: host=886441331224778647 version=6 survivors=[7392009747010547667 14873509569700497321] confirmed=[] unconfirmed=[]
+   r3   fleet_peers_in_contact: 1
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 7392009747010547667: lent=false cwnd=130934 srtt_ns=81626 pto_ns=1081626 spurious_losses=0 persistent_collapses=0 consumed=79360 mtu=65496
+   r3   shard 0 refused fleet.link.out_of_contact: 1
+   r3   shard 0 refused fleet.link.stale_return: 1
+   r3   shard 0 refused fleet.live.held: 67
+   r3   shard 0 refused fleet.live.hold_refused: 7
+   r3   shard 0 refused fleet.live.hold_refused.not_a_member: 7
+   r3   shard 0 refused fleet.live.install_taken: 1
+   r3   shard 0 refused fleet.owner_location.declined.not_owner: 1897
+   r3   shard 0 refused fleet.owner_location.direct: 1
+   r3   shard 0 refused fleet.owner_location.forward_unanswered: 6
+   r3   shard 0 refused fleet.owner_location.no_session: 1775
+   r3   shard 0 refused fleet.owner_location.not_owner: 1797
+   r3   shard 0 refused fleet.owner_location.retried: 1778
+   r3   shard 0 refused fleet.owner_location.round: 1797
+   r3   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r3   shard 0 refused fleet.owner_location.session_out: 22
+   r3   shard 0 refused fleet.owner_location.unavailable: 1797
+   r3   shard 0 refused fleet.plane.announce_lends: 4
+   r3   shard 0 refused fleet.plane.announcements_sent: 4
+   r3   shard 0 refused fleet.record.refused.foreign_generation: 6
+   r3   shard 0 refused fleet.report.sent: 4
+   r3   shard 0 refused fleet.seal.pair_served: 4
+   r3   shard 0 live held ce695226815f07a90001000000000019 head=281 durable=none owed=false epoch=1 identity=78d791119bfd9e17af97c700a37304ae3ab99b63b73fdf728351633e17767c79 fence=1 holders=none moving_to=none recorded=none
+   r3   
+   r3   anchor_hold_refusals: 0
+   r3   anchor_log_lines_refused: 0
+   r3   fleet_host: 7392009747010547667
+   r3   fleet_host_epoch: 1
+   r3   fleet_members: 7392009747010547667 17033550150176782520
+   r3   fleet_peers_probed: 1
+   r3   fleet_held_records: 2
+   r3   fleet_takeovers_pending: 0
+   r3   fleet_configuration_version: 8
+   r3   anchor: 12365721518455718087
+   r3   fleet_settled_generation: 5
+   r3   fleet_neighbourhood_generation: 5
+   r3   fleet_retirement: host=886441331224778647 version=6 survivors=[7392009747010547667 14873509569700497321] confirmed=[] unconfirmed=[]
+   r3   fleet_peers_in_contact: 1
+   r3   fleet_peers_unmeshed: 0
+   r3   fleet_session 17033550150176782520: lent=false cwnd=130934 srtt_ns=97449 pto_ns=1097449 spurious_losses=0 persistent_collapses=0 consumed=81317 mtu=65496
+   r3   shard 0 refused fleet.link.out_of_contact: 1
+   r3   shard 0 refused fleet.link.stale_return: 1
+   r3   shard 0 refused fleet.live.held: 237
+   r3   shard 0 refused fleet.live.install_taken: 1
+   r3   shard 0 refused fleet.owner_location.declined.not_owner: 1797
+   r3   shard 0 refused fleet.owner_location.no_session: 1893
+   r3   shard 0 refused fleet.owner_location.not_owner: 1897
+   r3   shard 0 refused fleet.owner_location.retried: 1877
+   r3   shard 0 refused fleet.owner_location.round: 1897
+   r3   shard 0 refused fleet.owner_location.session_out: 4
+   r3   shard 0 refused fleet.owner_location.unavailable: 1897
+   r3   shard 0 refused fleet.plane.address_unresolved: 15
+   r3   shard 0 refused fleet.plane.announce_lends: 5
+   r3   shard 0 refused fleet.plane.announcements_sent: 5
+   r3   shard 0 refused fleet.record.refused.foreign_generation: 2
+   r3   shard 0 refused fleet.report.sent: 5
+   r3   shard 0 refused fleet.seal.pair_served: 6
+   r3   shard 0 refused fleet.takeover.page_unbound: 3
+   r3   shard 0 refused fleet.takeover.page_unmatched: 5
+   r3   shard 0 refused fleet.takeover.pages_unsent: 435
+   r3   shard 0 refused fleet.takeover.round_behind: 1
+   r3   shard 0 refused fleet.takeover.stale_configuration: 3
+   r3   shard 0 live held ce695226815f07a90001000000000019 head=281 durable=none owed=false epoch=1 identity=78d791119bfd9e17af97c700a37304ae3ab99b63b73fdf728351633e17767c79 fence=1 holders=none moving_to=none recorded=none
+   r3 chaos a candidate's store destroyed mid-stream:
+   r3   candidate node chaos-replaced-a-7929 destroyed at 194.359613ms
+   r3   replacement answering at 404.204427ms
+   r3   the fleet rejoined at 1.53252452s
+   r3   every write acknowledged: held
+   r3   281 writes, 281 acknowledged: p50 812 us, p99 104686 us, p999 929054 us, max 929054 us; 3 over 50ms (sent+took): 0.00s+105ms 0.52s+929ms 1.45s+111ms
+   r3   converged: true: owner Some(LiveState { holding: false, head: Some(281), durable: Some(281), owed: false, epoch: Some(1), identity: Some("78d791119bfd9e17af97c700a37304ae3ab99b63b73fdf728351633e17767c79"), fence: 1, holders: ["7392009747010547667", "17033550150176782520"], moving_to: [], recorded: ["7392009747010547667", "17033550150176782520"] }); candidates [Some(LiveState { holding: true, hea
+   r3   Convergence: held
+   r3   148 samples, 47 heads seen
+   r3   Agreement: held
+   r3   NoLoss: held
+   r3   chaos-replaced-b-7929 refused the owner: {}
+   r3   chaos-replaced-a-7929 refused the owner: {"fleet.live.hold_refused.not_a_member": 7}
+   r3   chaos-replaced-c-7929 refused the owner: {}
+   r3   NoLoss (successor): 1 violations
+   r3   NoLoss (copies kept while unserved): held
+   r3 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (7930) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r3 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r3     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r3 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 47.95s
+== run 3 exit 101
+   r4     Finished `release` profile [optimized] target(s) in 0.10s
+   r4      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r4 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-8423 destroyed at 160.585762ms
+   r4 chaos a candidate's store destroyed mid-stream: replacement answering at 314.677962ms
+   r4 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 650.13747ms
+   r4 chaos a candidate's store destroyed mid-stream: 365 writes, 365 acknowledged: p50 523 us, p99 16900 us, p999 1628090 us, max 1628090 us; 3 over 50ms (sent+took): 0.00s+107ms 0.42s+1628ms 2.05s+111ms
+   r4 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(365), durable: Some(365), owed: false, epoch: Some(1), identity: Some("f6b7ee2b20fc10deb9c22a33021741342c1aff30e56d192353a12ae425ed060a"), fence: 1, holders: ["2085768429352167105", "8660880614438155079"], moving_to: ["2085768429352167105", "8660880614438155079", "16701669891504461873
+   r4 chaos a candidate's store destroyed mid-stream: 189 samples, 35 heads seen
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8423 refused the owner: {}
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8423 refused the owner: {}
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8423 refused the owner: {}
+   r4 LD-D72 destroyed chaos-replaced-a-8423 successor None replacement_served false
+   r4 LD-D72 counters chaos-replaced-a-8423 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r4 LD-D72 counters chaos-replaced-c-8423 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 16701669891504461873
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 8660880614438155079 16701669891504461873
+   r4   fleet_peers_probed: 1
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 9
+   r4   anchor: 7880736291409275406
+   r4   fleet_settled_generation: 6
+   r4   fleet_neighbourhood_generation: 6
+   r4   fleet_retirement: host=2085768429352167105 version=6 survivors=[8660880614438155079 13234862957670196374] confirmed=[] unconfirmed=[]
+   r4   fleet_peers_in_contact: 1
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 8660880614438155079: lent=false cwnd=130934 srtt_ns=78708 pto_ns=1078708 spurious_losses=0 persistent_collapses=0 consumed=97545 mtu=65496
+   r4   shard 0 refused fleet.link.out_of_contact: 1
+   r4   shard 0 refused fleet.link.stale_return: 1
+   r4   shard 0 refused fleet.live.held: 61
+   r4   shard 0 refused fleet.live.install_taken: 2
+   r4   shard 0 refused fleet.owner_location.declined.not_owner: 2243
+   r4   shard 0 refused fleet.owner_location.direct: 1
+   r4   shard 0 refused fleet.owner_location.forward_unanswered: 1
+   r4   shard 0 refused fleet.owner_location.no_session: 2107
+   r4   shard 0 refused fleet.owner_location.not_owner: 2128
+   r4   shard 0 refused fleet.owner_location.retried: 2105
+   r4   shard 0 refused fleet.owner_location.round: 2128
+   r4   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r4   shard 0 refused fleet.owner_location.session_out: 21
+   r4   shard 0 refused fleet.owner_location.unavailable: 2128
+   r4   shard 0 refused fleet.plane.announce_lends: 4
+   r4   shard 0 refused fleet.plane.announcements_sent: 4
+   r4   shard 0 refused fleet.report.sent: 3
+   r4   shard 0 refused fleet.seal.pair_served: 4
+   r4   shard 0 live held b7abadbd1ae864960001000000000026 head=365 durable=none owed=false epoch=1 identity=f6b7ee2b20fc10deb9c22a33021741342c1aff30e56d192353a12ae425ed060a fence=1 holders=none moving_to=none recorded=none
+   r4   
+   r4   anchor_hold_refusals: 0
+   r4   anchor_log_lines_refused: 0
+   r4   fleet_host: 8660880614438155079
+   r4   fleet_host_epoch: 1
+   r4   fleet_members: 8660880614438155079 16701669891504461873
+   r4   fleet_peers_probed: 1
+   r4   fleet_held_records: 2
+   r4   fleet_takeovers_pending: 0
+   r4   fleet_configuration_version: 9
+   r4   anchor: 15944414891321770578
+   r4   fleet_settled_generation: 6
+   r4   fleet_neighbourhood_generation: 6
+   r4   fleet_retirement: host=2085768429352167105 version=6 survivors=[8660880614438155079 13234862957670196374] confirmed=[] unconfirmed=[]
+   r4   fleet_peers_in_contact: 1
+   r4   fleet_peers_unmeshed: 0
+   r4   fleet_session 16701669891504461873: lent=false cwnd=130934 srtt_ns=82388 pto_ns=1082388 spurious_losses=0 persistent_collapses=0 consumed=98744 mtu=65496
+   r4   shard 0 refused fleet.link.out_of_contact: 1
+   r4   shard 0 refused fleet.link.stale_return: 1
+   r4   shard 0 refused fleet.live.held: 366
+   r4   shard 0 refused fleet.owner_location.declined.not_owner: 2128
+   r4   shard 0 refused fleet.owner_location.no_session: 2219
+   r4   shard 0 refused fleet.owner_location.not_owner: 2243
+   r4   shard 0 refused fleet.owner_location.retried: 2219
+   r4   shard 0 refused fleet.owner_location.round: 2243
+   r4   shard 0 refused fleet.owner_location.session_out: 24
+   r4   shard 0 refused fleet.owner_location.unavailable: 2243
+   r4   shard 0 refused fleet.plane.address_unresolved: 17
+   r4   shard 0 refused fleet.plane.announce_lends: 5
+   r4   shard 0 refused fleet.plane.announcements_sent: 5
+   r4   shard 0 refused fleet.record.refused.configuration_stale: 1
+   r4   shard 0 refused fleet.report.sent: 2
+   r4   shard 0 refused fleet.seal.pair_served: 6
+   r4   shard 0 refused fleet.takeover.page_unbound: 4
+   r4   shard 0 refused fleet.takeover.page_unmatched: 2
+   r4   shard 0 refused fleet.takeover.pages_unsent: 474
+   r4   shard 0 live held b7abadbd1ae864960001000000000026 head=365 durable=none owed=false epoch=1 identity=f6b7ee2b20fc10deb9c22a33021741342c1aff30e56d192353a12ae425ed060a fence=1 holders=none moving_to=none recorded=none
+   r4 chaos a candidate's store destroyed mid-stream:
+   r4   candidate node chaos-replaced-a-8423 destroyed at 160.585762ms
+   r4   replacement answering at 314.677962ms
+   r4   the fleet rejoined at 650.13747ms
+   r4   every write acknowledged: held
+   r4   365 writes, 365 acknowledged: p50 523 us, p99 16900 us, p999 1628090 us, max 1628090 us; 3 over 50ms (sent+took): 0.00s+107ms 0.42s+1628ms 2.05s+111ms
+   r4   converged: true: owner Some(LiveState { holding: false, head: Some(365), durable: Some(365), owed: false, epoch: Some(1), identity: Some("f6b7ee2b20fc10deb9c22a33021741342c1aff30e56d192353a12ae425ed060a"), fence: 1, holders: ["2085768429352167105", "8660880614438155079"], moving_to: ["2085768429352167105", "8660880614438155079", "16701669891504461873"], recorded: ["2085768429352167105", "8660880
+   r4   Convergence: held
+   r4   189 samples, 35 heads seen
+   r4   Agreement: held
+   r4   NoLoss: held
+   r4   chaos-replaced-b-8423 refused the owner: {}
+   r4   chaos-replaced-a-8423 refused the owner: {}
+   r4   chaos-replaced-c-8423 refused the owner: {}
+   r4   NoLoss (successor): 1 violations
+   r4   NoLoss (copies kept while unserved): held
+   r4 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (8424) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r4 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r4     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r4 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 51.43s
+== run 4 exit 101
+   r5     Finished `release` profile [optimized] target(s) in 0.10s
+   r5      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r5 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-9046 destroyed at 213.790643ms
+   r5 chaos a candidate's store destroyed mid-stream: replacement answering at 479.063731ms
+   r5 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.636965588s
+   r5 chaos a candidate's store destroyed mid-stream: 283 writes, 283 acknowledged: p50 596 us, p99 130967 us, p999 1120853 us, max 1120853 us; 4 over 50ms (sent+took): 0.00s+137ms 0.21s+131ms 0.55s+1121ms 1.67s+116ms
+   r5 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(283), durable: Some(283), owed: false, epoch: Some(1), identity: Some("28dbd2bd72504f4dc6486a96a1ca46e4f0b8ee99bc68e8d9bf71f437e187d3e2"), fence: 1, holders: ["4085159073214582448", "13984575402406157775"], moving_to: ["4085159073214582448", "8821186969420043789", "1398457540240615777
+   r5 chaos a candidate's store destroyed mid-stream: 163 samples, 32 heads seen
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-9046 refused the owner: {}
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-9046 refused the owner: {}
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-9046 refused the owner: {}
+   r5 LD-D72 destroyed chaos-replaced-a-9046 successor None replacement_served false
+   r5 LD-D72 counters chaos-replaced-a-9046 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r5 LD-D72 counters chaos-replaced-b-9046 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 8821186969420043789
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4085159073214582448 8821186969420043789
+   r5   fleet_peers_probed: 1
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 10
+   r5   anchor: 6988589636033239550
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_retirement: host=13984575402406157775 version=7 survivors=[4085159073214582448 11981132789903677734] confirmed=[] unconfirmed=[]
+   r5   fleet_peers_in_contact: 1
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 4085159073214582448: lent=false cwnd=130934 srtt_ns=78624 pto_ns=1078624 spurious_losses=0 persistent_collapses=0 consumed=82709 mtu=65496
+   r5   shard 0 refused fleet.link.out_of_contact: 1
+   r5   shard 0 refused fleet.link.stale_return: 1
+   r5   shard 0 refused fleet.live.held: 45
+   r5   shard 0 refused fleet.live.install_taken: 2
+   r5   shard 0 refused fleet.owner_location.declined.not_owner: 1870
+   r5   shard 0 refused fleet.owner_location.direct: 1
+   r5   shard 0 refused fleet.owner_location.forward_unanswered: 4
+   r5   shard 0 refused fleet.owner_location.no_session: 1749
+   r5   shard 0 refused fleet.owner_location.not_owner: 1769
+   r5   shard 0 refused fleet.owner_location.retried: 1750
+   r5   shard 0 refused fleet.owner_location.round: 1769
+   r5   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r5   shard 0 refused fleet.owner_location.session_out: 20
+   r5   shard 0 refused fleet.owner_location.unavailable: 1769
+   r5   shard 0 refused fleet.plane.announce_lends: 4
+   r5   shard 0 refused fleet.plane.announcements_sent: 4
+   r5   shard 0 refused fleet.report.sent: 2
+   r5   shard 0 refused fleet.seal.pair_no_session: 1
+   r5   shard 0 refused fleet.seal.pair_served: 4
+   r5   shard 0 refused fleet.seal.pair_undelivered: 1
+   r5   shard 0 live held a64588cb2cfe59260001000000000025 head=283 durable=none owed=false epoch=1 identity=28dbd2bd72504f4dc6486a96a1ca46e4f0b8ee99bc68e8d9bf71f437e187d3e2 fence=1 holders=none moving_to=none recorded=none
+   r5   anchor_hold_refusals: 0
+   r5   anchor_log_lines_refused: 0
+   r5   fleet_host: 4085159073214582448
+   r5   fleet_host_epoch: 1
+   r5   fleet_members: 4085159073214582448 8821186969420043789
+   r5   fleet_peers_probed: 1
+   r5   fleet_held_records: 2
+   r5   fleet_takeovers_pending: 0
+   r5   fleet_configuration_version: 10
+   r5   anchor: 8503621037664840878
+   r5   fleet_settled_generation: 7
+   r5   fleet_neighbourhood_generation: 7
+   r5   fleet_retirement: host=13984575402406157775 version=7 survivors=[4085159073214582448 11981132789903677734] confirmed=[] unconfirmed=[]
+   r5   fleet_peers_in_contact: 1
+   r5   fleet_peers_unmeshed: 0
+   r5   fleet_session 8821186969420043789: lent=false cwnd=130934 srtt_ns=82848 pto_ns=1082848 spurious_losses=0 persistent_collapses=0 consumed=82954 mtu=65496
+   r5   shard 0 refused fleet.link.out_of_contact: 1
+   r5   shard 0 refused fleet.link.peer_reset: 1
+   r5   shard 0 refused fleet.link.stale_return: 1
+   r5   shard 0 refused fleet.live.held: 221
+   r5   shard 0 refused fleet.live.install_taken: 1
+   r5   shard 0 refused fleet.owner_location.declined.not_owner: 1769
+   r5   shard 0 refused fleet.owner_location.no_session: 1849
+   r5   shard 0 refused fleet.owner_location.not_owner: 1870
+   r5   shard 0 refused fleet.owner_location.retried: 1850
+   r5   shard 0 refused fleet.owner_location.round: 1870
+   r5   shard 0 refused fleet.owner_location.session_out: 21
+   r5   shard 0 refused fleet.owner_location.unavailable: 1870
+   r5   shard 0 refused fleet.plane.address_unresolved: 10
+   r5   shard 0 refused fleet.plane.announce_lends: 5
+   r5   shard 0 refused fleet.plane.announcements_sent: 5
+   r5   shard 0 refused fleet.record.refused.configuration_stale: 1
+   r5   shard 0 refused fleet.report.sent: 2
+   r5   shard 0 refused fleet.seal.pair_served: 6
+   r5   shard 0 refused fleet.takeover.page_unbound: 5
+   r5   shard 0 refused fleet.takeover.page_unmatched: 3
+   r5   shard 0 refused fleet.takeover.pages_unsent: 417
+   r5   shard 0 live held a64588cb2cfe59260001000000000025 head=283 durable=none owed=false epoch=1 identity=28dbd2bd72504f4dc6486a96a1ca46e4f0b8ee99bc68e8d9bf71f437e187d3e2 fence=1 holders=none moving_to=none recorded=none
+   r5   
+   r5 chaos a candidate's store destroyed mid-stream:
+   r5   candidate node chaos-replaced-a-9046 destroyed at 213.790643ms
+   r5   replacement answering at 479.063731ms
+   r5   the fleet rejoined at 1.636965588s
+   r5   every write acknowledged: held
+   r5   283 writes, 283 acknowledged: p50 596 us, p99 130967 us, p999 1120853 us, max 1120853 us; 4 over 50ms (sent+took): 0.00s+137ms 0.21s+131ms 0.55s+1121ms 1.67s+116ms
+   r5   converged: true: owner Some(LiveState { holding: false, head: Some(283), durable: Some(283), owed: false, epoch: Some(1), identity: Some("28dbd2bd72504f4dc6486a96a1ca46e4f0b8ee99bc68e8d9bf71f437e187d3e2"), fence: 1, holders: ["4085159073214582448", "13984575402406157775"], moving_to: ["4085159073214582448", "8821186969420043789", "13984575402406157775"], recorded: ["4085159073214582448", "882118
+   r5   Convergence: held
+   r5   163 samples, 32 heads seen
+   r5   Agreement: held
+   r5   NoLoss: held
+   r5   chaos-replaced-c-9046 refused the owner: {}
+   r5   chaos-replaced-a-9046 refused the owner: {}
+   r5   chaos-replaced-b-9046 refused the owner: {}
+   r5   NoLoss (successor): 1 violations
+   r5   NoLoss (copies kept while unserved): held
+   r5 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (9047) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r5 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r5     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r5 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 46.01s
+== run 5 exit 101
+   r6     Finished `release` profile [optimized] target(s) in 0.10s
+   r6      Running tests/live_chaos.rs (target/release/deps/live_chaos-d1ed9741d5b7cf39)
+   r6 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-9646 destroyed at 172.844424ms
+   r6 chaos a candidate's store destroyed mid-stream: replacement answering at 345.002383ms
+   r6 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.430179633s
+   r6 chaos a candidate's store destroyed mid-stream: 264 writes, 264 acknowledged: p50 637 us, p99 103166 us, p999 1128804 us, max 1128804 us; 3 over 50ms (sent+took): 0.00s+107ms 0.41s+1129ms 1.54s+103ms
+   r6 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(263), durable: Some(263), owed: false, epoch: Some(1), identity: Some("76c5495b265d3758e23c33b45c4868b7646687b54d5e344fb78d290a977fee0a"), fence: 1, holders: ["5663712601725396514", "7437001972714201207"], moving_to: [], recorded: ["5663712601725396514", "7437001972714201207"] }); can
+   r6 chaos a candidate's store destroyed mid-stream: 133 samples, 31 heads seen
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-9646 refused the owner: {}
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-9646 refused the owner: {}
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-9646 refused the owner: {}
+   r6 LD-D72 destroyed chaos-replaced-a-9646 successor None replacement_served false
+   r6 LD-D72 counters chaos-replaced-a-9646 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r6 LD-D72 counters chaos-replaced-c-9646 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 5663712601725396514
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 5663712601725396514 7437001972714201207
+   r6   fleet_peers_probed: 1
+   r6   fleet_held_records: 1
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 8
+   r6   anchor: 13865362201543148438
+   r6   fleet_settled_generation: 5
+   r6   fleet_neighbourhood_generation: 5
+   r6   fleet_retirement: host=850867832962096099 version=6 survivors=[7437001972714201207 9571771350166811018] confirmed=[] unconfirmed=[]
+   r6   fleet_peers_in_contact: 1
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 7437001972714201207: lent=false cwnd=130934 srtt_ns=91573 pto_ns=1091573 spurious_losses=0 persistent_collapses=0 consumed=93205 mtu=65496
+   r6   shard 0 refused fleet.link.out_of_contact: 1
+   r6   shard 0 refused fleet.link.stale_return: 1
+   r6   shard 0 refused fleet.live.held: 53
+   r6   shard 0 refused fleet.live.install_taken: 1
+   r6   shard 0 refused fleet.owner_location.declined.not_owner: 2283
+   r6   shard 0 refused fleet.owner_location.direct: 1
+   r6   shard 0 refused fleet.owner_location.forward_unanswered: 1
+   r6   shard 0 refused fleet.owner_location.no_session: 2117
+   r6   shard 0 refused fleet.owner_location.not_owner: 2134
+   r6   shard 0 refused fleet.owner_location.retried: 2111
+   r6   shard 0 refused fleet.owner_location.round: 2134
+   r6   shard 0 refused fleet.owner_location.route_dropped.refused: 1
+   r6   shard 0 refused fleet.owner_location.session_out: 17
+   r6   shard 0 refused fleet.owner_location.unavailable: 2134
+   r6   shard 0 refused fleet.plane.announce_lends: 4
+   r6   shard 0 refused fleet.plane.announcements_sent: 4
+   r6   shard 0 refused fleet.record.refused.foreign_generation: 5
+   r6   shard 0 refused fleet.seal.pair_served: 4
+   r6   shard 0 live held 84d5c3545df4318a0001000000000029 head=263 durable=none owed=false epoch=1 identity=76c5495b265d3758e23c33b45c4868b7646687b54d5e344fb78d290a977fee0a fence=1 holders=none moving_to=none recorded=none
+   r6   
+   r6   anchor_hold_refusals: 0
+   r6   anchor_log_lines_refused: 0
+   r6   fleet_host: 7437001972714201207
+   r6   fleet_host_epoch: 1
+   r6   fleet_members: 5663712601725396514 7437001972714201207
+   r6   fleet_peers_probed: 1
+   r6   fleet_held_records: 2
+   r6   fleet_takeovers_pending: 0
+   r6   fleet_configuration_version: 8
+   r6   anchor: 8156189336048299521
+   r6   fleet_settled_generation: 6
+   r6   fleet_neighbourhood_generation: 6
+   r6   fleet_retirement: host=850867832962096099 version=6 survivors=[7437001972714201207 9571771350166811018] confirmed=[] unconfirmed=[]
+   r6   fleet_peers_in_contact: 1
+   r6   fleet_peers_unmeshed: 0
+   r6   fleet_session 5663712601725396514: lent=false cwnd=130934 srtt_ns=98061 pto_ns=1098061 spurious_losses=0 persistent_collapses=0 consumed=97155 mtu=65496
+   r6   shard 0 refused fleet.link.out_of_contact: 1
+   r6   shard 0 refused fleet.link.stale_return: 1
+   r6   shard 0 refused fleet.live.held: 264
+   r6   shard 0 refused fleet.owner_location.declined.not_owner: 2134
+   r6   shard 0 refused fleet.owner_location.no_session: 2281
+   r6   shard 0 refused fleet.owner_location.not_owner: 2283
+   r6   shard 0 refused fleet.owner_location.retried: 2259
+   r6   shard 0 refused fleet.owner_location.round: 2283
+   r6   shard 0 refused fleet.owner_location.session_out: 2
+   r6   shard 0 refused fleet.owner_location.unavailable: 2283
+   r6   shard 0 refused fleet.plane.address_unresolved: 15
+   r6   shard 0 refused fleet.plane.announce_lends: 5
+   r6   shard 0 refused fleet.plane.announcements_sent: 5
+   r6   shard 0 refused fleet.record.refused.foreign_generation: 2
+   r6   shard 0 refused fleet.report.sent: 478
+   r6   shard 0 refused fleet.seal.pair_served: 6
+   r6   shard 0 refused fleet.takeover.page_unbound: 2
+   r6   shard 0 refused fleet.takeover.page_unmatched: 4
+   r6   shard 0 refused fleet.takeover.stale_configuration: 2
+   r6   shard 0 live held 84d5c3545df4318a0001000000000029 head=263 durable=none owed=false epoch=1 identity=76c5495b265d3758e23c33b45c4868b7646687b54d5e344fb78d290a977fee0a fence=1 holders=none moving_to=none recorded=none
+   r6 chaos a candidate's store destroyed mid-stream:
+   r6   candidate node chaos-replaced-a-9646 destroyed at 172.844424ms
+   r6   replacement answering at 345.002383ms
+   r6   the fleet rejoined at 1.430179633s
+   r6   every write acknowledged: held
+   r6   264 writes, 264 acknowledged: p50 637 us, p99 103166 us, p999 1128804 us, max 1128804 us; 3 over 50ms (sent+took): 0.00s+107ms 0.41s+1129ms 1.54s+103ms
+   r6   converged: true: owner Some(LiveState { holding: false, head: Some(263), durable: Some(263), owed: false, epoch: Some(1), identity: Some("76c5495b265d3758e23c33b45c4868b7646687b54d5e344fb78d290a977fee0a"), fence: 1, holders: ["5663712601725396514", "7437001972714201207"], moving_to: [], recorded: ["5663712601725396514", "7437001972714201207"] }); candidates [Some(LiveState { holding: true, head:
+   r6   Convergence: held
+   r6   133 samples, 31 heads seen
+   r6   Agreement: held
+   r6   NoLoss: held
+   r6   chaos-replaced-b-9646 refused the owner: {}
+   r6   chaos-replaced-a-9646 refused the owner: {}
+   r6   chaos-replaced-c-9646 refused the owner: {}
+   r6   NoLoss (successor): 1 violations
+   r6   NoLoss (copies kept while unserved): held
+   r6 thread 'a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover' (9647) panicked at crates/cli/tests/live_chaos.rs:1289:5:
+   r6 chaos a candidate's store destroyed mid-stream: NoLoss (successor): no survivor served the volume within the fleet wait
+   r6     a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover
+   r6 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 51.12s
+== run 6 exit 101
