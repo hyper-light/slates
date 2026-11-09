@@ -906,8 +906,23 @@
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
->   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; classes B (the
->   transport's round-trip estimate) and C+D (A-232, the window itself) are open. Found on
+>   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done. Class B is done
+>   (clients, 2026-11-09): the fleet's four timing tests judge by the daemon's own count or by order, never by a wall
+>   bound. `a_forward_waits_for_the_owners_session_while_it_is_out` holds the session until a forward has met it;
+>   `forwards_to_one_owner_never_wait_behind_each_other` asks that the free shard's read be answered while the hold
+>   stands; `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` counts the hedge round (`fleet.seal.hedged`)
+>   and ends the hold at placement; `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget` asks
+>   that the forward's location never give up before its budget ends (`fleet.owner_location.gave_up` at most
+>   `slo_ended` plus `polls_spent`). At nice 19 beside two spinners a CPU on CI's Linux runners (10 runs, arm64 /
+>   x86_64), main's four passed 7/6, 0/0, 2/1 and 0/0; the rewrites 10/6, 10/10, 8/9, and each is red against the fault
+>   it names. Found with them and fixed: a forward's location budget ran on the wall, so a starved node refused a false
+>   death (now counted in its own polls, `verbs::LOCATION_POLLS`, capped by the failover SLO, so a genuinely stuck
+>   owner's client waits up to the SLO where it was refused after about 1 s); and the seal's hedge compared two clocks
+>   (`docs/bugs/2026-11-08-a-seals-hedge-compared-two-clocks.md`). C+D (A-232, the window itself) are open, and owe one
+>   more wall budget found here: the forward lane gives up a batch whose session makes no progress for `stall_ns` of
+>   wall time (`crates/server/src/forward_lane.rs:296`, `quiet_ns >= stall_ns` on `futures::now_ns()`), so a starved
+>   origin refuses a forward to a live owner its peers know (the false-death test's remaining refusals, about 10-12 s in
+>   at nice 19). Whoever next changes the lane derives that budget as A-232 rules. Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
