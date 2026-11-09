@@ -2132,12 +2132,11 @@ fn a_candidates_copy_survives_its_own_daemons_restart() {
 }
 
 /// The takeover leg of [`a_candidates_copy_survives_its_own_daemons_restart`]: then resume Y, wait until the survivors
-/// see each other, and kill the owner. Expect a survivor to serve every write, from X's restored copy. Ignored: no
-/// takeover begins, since X, which leads the council, never condemns the owner. It was already stopped when X came back,
-/// so X's failure detector holds no entry for it and X keeps it a member (GAPS, "a restarted council leader").
+/// see each other, and kill the owner. Expect a survivor to serve every write, from X's restored copy. The volume is shared
+/// with every node first (A-237), so a survivor serving it is the proof the share reached it. Ignored until 2026-11-08:
+/// no takeover began while X, leading the council, could not condemn an owner already stopped at its restart (fixed by
+/// A-250's f + 1 rule), and then each survivor refused the reads `NotShared` until the test shared the volume.
 #[test]
-#[ignore = "since main's per-host principals, a survivor refuses the taken-over volume's reads NotShared: its owner is the \
-            creator's host (raft-7 A/B, 3 of 3 with and without the incremental held image; reported to the supervisor)"]
 fn a_candidates_restored_copy_serves_its_owners_takeover() {
   restart_flow(true);
 }
@@ -2158,6 +2157,12 @@ fn restart_flow(take_over: bool) {
     .collect();
   let (x, y) = (candidates[0], candidates[1]);
   let id = create_live_volume(&owner, "restarted");
+  // A read through a survivor is its own principal (A-237: a principal carries the host it connects through), so the
+  // volume is shared with each node before any of them must serve it; the catalog register carrying the share ships
+  // to the candidates with the volume's head, and the takeover rebuilds the volume with that access list.
+  if take_over {
+    share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
+  }
   write_files(&owner, &id, 0..1);
   let y_daemon = daemon_pid(&fleet.instances[y]);
   let owner_daemon = daemon_pid(&owner);
