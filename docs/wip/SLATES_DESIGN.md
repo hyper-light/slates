@@ -19819,3 +19819,42 @@ Applied in the same change to:
   - The reset, frame, parameter and connection unit tests.
   - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
     (`crates/server/tests/fleet.rs`).
+
+### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
+
+A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
+line read as settled makes every holder reclaim its copy as stale (`takeover::resolve_held_objects`). The line was read
+as settled from absence: a retirement no longer kept, or a ranked successor neither a member nor a kept retirement. A
+retirement was pruned on its survivors' confirmations, and a survivor confirmed its share even when its round had
+declared an object lost (its settled cohort left with fewer members than its recovery quorum). So a takeover that
+adopted nothing could have every holder delete the copies the current members still held. The store-destroyed takeover
+lost its volume this way: its settled cohort was [owner, A, old B], and the replacement holding the live log was not
+in it.
+
+- **A share confirms only when every object its round learned was adopted** (`takeover::share_done`). A round with a
+  lost object leaves its retirement kept. A pruned retirement therefore means its objects were adopted.
+- **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
+  is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+  retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
+  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
+- **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
+- **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
+  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
+
+Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
+`a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
+`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
+flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
+§4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
+here; a lineage model is owed with (ii).
+
+**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
+the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
+old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
+- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
+- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
+- an installed snapshot (`fold::install` declines it);
+- a learner's fetch and a join (`consensus`).
+A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
+But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
+none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
