@@ -337,6 +337,29 @@ fn primary_green(primary: &str, tree: &str) -> String {
     .to_owned()
 }
 
+/// Shares `volume` through `owner` with this test's account on `node` (A-237): a local account means something only on
+/// its host, so the harness's clients, which reach the green from a client node, are refused `NotShared` until the green
+/// is shared with that node's account (on 1ed67337 the first rung failed so in its setup, 2026-11-09).
+fn share_with_node(owner: &str, volume: &str, node: &str) {
+  let status = eventually(node, &["status"]);
+  let anchor = status
+    .lines()
+    .find_map(|line| line.strip_prefix("anchor: "))
+    .unwrap_or_else(|| panic!("no anchor in {node}'s status: {status}"));
+  let account = rustix::process::getuid().as_raw();
+  ok(
+    owner,
+    &[
+      "share",
+      volume,
+      &format!("uid:{account}@{anchor}"),
+      "--read",
+      "--write",
+      "--admin",
+    ],
+  );
+}
+
 /// One node of the run: its name, its anchor and its instance.
 struct Node {
   name: String,
@@ -499,6 +522,7 @@ fn many_clients_through_client_nodes_against_one_primary_and_two_replicas() {
   eventually(&nodes[0].instance, &["bootstrap", "root"]);
   let green = primary_green(&nodes[0].instance, &tree);
   for node in nodes.iter().skip(SERVERS.len()) {
+    share_with_node(&nodes[0].instance, &green, &node.instance);
     eventually(&node.instance, &["versions", &green]);
   }
   println!("rung\tgreen\t{green}\ttree\t{tree}\tclient_nodes\t{client_nodes}");
