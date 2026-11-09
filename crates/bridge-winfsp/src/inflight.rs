@@ -56,6 +56,13 @@ const CREATE_OPTIONS_AT: usize = HINT_AT + size_of::<u64>();
 /// Format: Create's flag word (`UserMode:1` first) follows the token, `DesiredAccess`, `GrantedAccess`, `ShareAccess`
 /// (four bytes each) and the `Ea` buffer descriptor (four bytes) (`fsctl.h` v2.1).
 const CREATE_FLAGS_AT: usize = CREATE_TOKEN_AT + size_of::<u64>() + 4 * size_of::<u32>();
+/// Format: Create.DesiredAccess follows the token (`fsctl.h` v2.1).
+const CREATE_DESIRED_ACCESS_AT: usize = CREATE_TOKEN_AT + size_of::<u64>();
+/// Format: the access rights a symbolic link's `FSCTL_SET_REPARSE_POINT` needs one of (WinFsp's driver asks for
+/// `FILE_WRITE_DATA`, `FILE_APPEND_DATA` or `FILE_WRITE_ATTRIBUTES`, `src/sys/fsctl.c` v2.1), with the generic and maximum
+/// rights that grant them (`GENERIC_WRITE`, `GENERIC_ALL`, `MAXIMUM_ALLOWED`; `winnt.h`).
+const LINK_SETTING_ACCESS: u32 =
+  0x0000_0002 | 0x0000_0004 | 0x0000_0100 | 0x4000_0000 | 0x1000_0000 | 0x0200_0000;
 /// Format: `UserMode`, bit 0 of Create's flag word: the request came from user mode.
 const CREATE_USER_MODE: u32 = 1;
 /// Format: `FILE_OPEN_REPARSE_POINT` (`ntioapi.h`), the create option that opens a reparse point itself, as
@@ -183,14 +190,17 @@ impl Request<'_> {
     }
     u32::try_from(read_u64(self.bytes, CREATE_TOKEN_AT)? >> u32::BITS).map_err(|_| Refusal::Length)
   }
-  /// Whether a Create opens a reparse point itself, from user mode (A-275): an open a symbolic link may be set through,
-  /// whose caller's privilege the receiver reads. False for every other request.
-  pub fn opens_reparse_point_from_user_mode(&self) -> Result<bool, Refusal> {
+  /// Whether a Create or Open could become a symbolic link (A-275): from user mode, opening a reparse point itself
+  /// (`FILE_OPEN_REPARSE_POINT`, as `CreateSymbolicLinkW` opens what it makes a link) and asking an access a link's set
+  /// needs. Only for such an open does the receiver read the caller's privilege, so an ordinary open costs no token
+  /// query. False for every other request.
+  pub fn could_become_a_link(&self) -> Result<bool, Refusal> {
     if self.kind != CREATE_KIND {
       return Ok(false);
     }
     Ok(
       read_u32(self.bytes, CREATE_OPTIONS_AT)? & FILE_OPEN_REPARSE_POINT != 0
+        && read_u32(self.bytes, CREATE_DESIRED_ACCESS_AT)? & LINK_SETTING_ACCESS != 0
         && read_u32(self.bytes, CREATE_FLAGS_AT)? & CREATE_USER_MODE != 0,
     )
   }
@@ -472,6 +482,71 @@ mod tests {
     assert_eq!(
       request.successful_rename(&response).unwrap(),
       Some((from, to))
+    );
+  }
+
+  /// A Create request with the given options, desired access and flag word, its kernel name `\\link`.
+  fn create_request(options: u32, access: u32, flags: u32) -> Vec<u8> {
+    let mut bytes = vec![0; BATCH_BYTES];
+    let name: Vec<u8> = "\\link\0"
+      .encode_utf16()
+      .flat_map(u16::to_le_bytes)
+      .collect();
+    let length = REQUEST_BASE + name.len();
+    bytes[SIZE_AT..SIZE_AT + size_of::<u16>()]
+      .copy_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+    bytes[KIND_AT..KIND_AT + size_of::<u32>()].copy_from_slice(&CREATE_KIND.to_le_bytes());
+    bytes[HINT_AT..HINT_AT + size_of::<u64>()].copy_from_slice(&0x2000u64.to_le_bytes());
+    bytes[CREATE_OPTIONS_AT..CREATE_OPTIONS_AT + 4].copy_from_slice(&options.to_le_bytes());
+    bytes[CREATE_DESIRED_ACCESS_AT..CREATE_DESIRED_ACCESS_AT + 4]
+      .copy_from_slice(&access.to_le_bytes());
+    bytes[CREATE_FLAGS_AT..CREATE_FLAGS_AT + 4].copy_from_slice(&flags.to_le_bytes());
+    bytes[REQUEST_BASE..length].copy_from_slice(&name);
+    bytes
+  }
+
+  /// A-275 (whose token the receiver reads). Do: ask of Create requests whether they could become a symbolic link: one
+  /// as `CreateSymbolicLinkW` makes it (user mode, `FILE_OPEN_REPARSE_POINT`, `GENERIC_WRITE`), and one each without
+  /// the option, without a write access (`FILE_READ_DATA`), and from kernel mode. Expect only the first: an ordinary open
+  /// costs no token query.
+  #[test]
+  fn only_a_user_mode_write_open_of_a_reparse_point_could_become_a_link() {
+    let could = |options, access, flags| {
+      let bytes = create_request(options, access, flags);
+      let pending = requests(&bytes).unwrap();
+      pending.first().unwrap().could_become_a_link().unwrap()
+    };
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    assert!(could(
+      FILE_OPEN_REPARSE_POINT,
+      GENERIC_WRITE,
+      CREATE_USER_MODE
+    ));
+    assert!(
+      could(FILE_OPEN_REPARSE_POINT, 0x0000_0100, CREATE_USER_MODE),
+      "FILE_WRITE_ATTRIBUTES"
+    );
+    assert!(
+      !could(0, GENERIC_WRITE, CREATE_USER_MODE),
+      "an ordinary open"
+    );
+    assert!(
+      !could(FILE_OPEN_REPARSE_POINT, FILE_READ_DATA, CREATE_USER_MODE),
+      "a read"
+    );
+    assert!(
+      !could(FILE_OPEN_REPARSE_POINT, GENERIC_WRITE, 0),
+      "kernel mode"
+    );
+    let rename = rename_request();
+    assert!(
+      !requests(&rename)
+        .unwrap()
+        .first()
+        .unwrap()
+        .could_become_a_link()
+        .unwrap()
     );
   }
 

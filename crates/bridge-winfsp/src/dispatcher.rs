@@ -73,13 +73,13 @@ pub(crate) fn may_link(context: u64) -> bool {
 /// 36, `wdm.h`), each a `LUID_AND_ATTRIBUTES` of three words, after the count's one word.
 const PRIVILEGE_WORDS: usize = 1 + 36 * 3;
 
-/// Whether `request` is a user-mode Create that opens a reparse point itself (how `CreateSymbolicLinkW` opens the object
-/// it makes a link) for a caller whose token holds `SeCreateSymbolicLinkPrivilege` (A-275). A token the query refuses
+/// Whether `request` is a Create or Open that could become a symbolic link (`Request::could_become_a_link`) for a caller
+/// whose token holds `SeCreateSymbolicLinkPrivilege` (A-275). A token the query refuses
 /// holds nothing, so such a caller is judged as one without the privilege.
 fn creator_may_link(request: &Request<'_>) -> Result<bool, WinFspError> {
   use windows_sys::Win32::Security::{GetTokenInformation, TokenPrivileges};
   if !request
-    .opens_reparse_point_from_user_mode()
+    .could_become_a_link()
     .map_err(WinFspError::Capture)?
   {
     return Ok(false);
