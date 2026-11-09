@@ -3501,6 +3501,11 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       0
     },
+    diag_contacts: if is_control_shard(state) {
+      crate::fleet::diag_contacts(state)
+    } else {
+      Vec::new()
+    },
   }
 }
 

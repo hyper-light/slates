@@ -1398,6 +1398,8 @@ pub struct FleetReport {
   pub peers_in_contact: u32,
   /// Of `peers_in_contact`, those with no formed probe session yet: the mesh is up at zero. Appended.
   pub peers_unmeshed: u32,
+  /// DIAG (never for main): each other member's direct-contact reason and this node's membership belief about it.
+  pub diag_contacts: Vec<String>,
 }
 
 impl RequestBody {

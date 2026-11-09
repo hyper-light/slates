@@ -2607,6 +2607,9 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     "fleet_peers_in_contact: {}\nfleet_peers_unmeshed: {}\n",
     report.fleet.peers_in_contact, report.fleet.peers_unmeshed
   ));
+  for contact in &report.fleet.diag_contacts {
+    out.push_str(&format!("fleet_contact: {contact}\n"));
+  }
   for session in &report.fleet.sessions {
     out.push_str(&format!(
       "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",
