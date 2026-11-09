@@ -16306,7 +16306,10 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   - Measured on the runner by `a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused` (`ERROR_PRIVILEGE_NOT_HELD`,
     no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
     `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag` and
-    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`: PENDING-PRIVILEGE. The NTFS control (the same token and
+    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`, on the final build (diagnostics run 42720006662), with
+    Developer Mode on and then off: `CreateSymbolicLinkW` without the privilege and without the flag, 1314 and 1314;
+    with the flag, made and 1314; with the privilege, made; a raw set with the privilege held but disabled, made (the
+    deviation (a)) and 1314; enabled before its open, made and made. The NTFS control (the same token and
     flags on the runner's own disk, Developer Mode off and on) gave the same four answers as the drive. The daemon holds no privilege (R10).
 - **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
   its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
@@ -16336,7 +16339,8 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
 - **What winfstest says** (diagnostics run 42695804063, windows-latest, 733 cases): the links let 105 cases run that
   never ran. With the 3 listed cases they unlocked (02.t:1, 03.t:1, streams/04.t:9), 78 pass and 30 are listed, none a
   defect: 02.t 39 of 41 (15 and 16, SYMLINK-DATA), 03.t 26 of 26, streams/04.t 13 of its cases 9 to 49 (28 listed
-  STREAMS, each through a `name:stream` path). The list goes from 355 to 382, recorded from PENDING-RECORD.
+  STREAMS, each through a `name:stream` path). The list goes from 355 to 382, recorded from diagnostics run 42720006662 on the final build (733 cases, 382
+  expected, 0 unexpected, 0 listed-now-passing).
 - **Proven** by `symbolic_links_made_through_the_drive_are_followed_and_read_back` and
   the three privilege tests and `a_link_relative_to_the_drives_root_follows_its_directory_when_moved`
   (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows
