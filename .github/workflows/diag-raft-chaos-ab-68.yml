@@ -84,4 +84,4 @@ jobs:
           cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
           git add results.txt
           git commit -qm "diag-raft-chaos-ab-68 results ${{ matrix.sample }}"
-          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-68-${{ matrix.sample }}"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-raft-chaos-ab-68b-${{ matrix.sample }}"
