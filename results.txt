@@ -1,2 +1,9 @@
 tested 2e1220459e62388886f516558d8531691ed7d697 on ubuntu-latest
 build exit 0
+wheel exit 0
+python exit 1
+Connecting to an instance with no daemon raises SlatesError carrying the typed refusal — the ... ok
+The extension loads and exposes the Client class, the SlatesError exception, and a version. ... ok
+slates.SlatesError: Stalled { after_ns: 10000000000 }
+Ran 6 tests in 50.920s
+FAILED (errors=1)
