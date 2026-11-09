@@ -61,15 +61,16 @@ lost or wrongly answered: the forwards were refused and retried.
     `a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one` is the test of the stall itself.
   - **Hardened for load (2026-11-09).** The test failed at load 46–48 (main's parked runs) and at 170–232 (the
     supervisor's Mac gate) with no reset to see: b's session to a had been lent, replaced or judged dead first, so no
-    packet reached the new process on it. The test now reads the precondition from b's own state at the moment a comes
-    back. b held its session to the old a until the new a met it: still the same session, or a reset already counted
-    (read as the same session alone, it raced the reset itself, and diag-69 judged 1 of 16 runs vacuous whose four
-    restarts all reset and reached):
-    - the same session to a, by connection id, held or lent (`Daemon::fleet_record_session_id`);
-    - neither `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since before the stop.
+    packet reached the new process on it. The test now judges each restart by its outcome: it counts when a reset
+    reached b before b's liveness judged a dead. The restarted a resets only a 1-RTT packet naming a session it never
+    knew (`slates_transport::demux`, "Stateless reset"), so a reset on b's link to a shows b still held a session from
+    the old process when the new one met it. Readings of b's slot at an instant raced the reset or b's replacement of
+    the slot (diag-69 and diag-71 judged 1 of 16 and 1 of 24 runs vacuous whose every restart reset and reached), so
+    none is taken.
 
-    A run without it is recorded and a restarted again, at most `RESET_ATTEMPTS` (4) times. It fails only if the
-    precondition never held, or if, where it held, any of these is missing:
+    An attempt with no reset is made again, at most `RESET_ATTEMPTS` (4) times, a bound derived from the measured
+    misses (1 of 97 attempts). The test fails only if no attempt counted, or if, where one did, any of these is
+    missing:
     - a reset sent by the restarted a;
     - one counted by b while its reads waited;
     - b's liveness not having judged a dead first;

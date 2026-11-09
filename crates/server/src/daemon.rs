@@ -3101,22 +3101,6 @@ impl Daemon {
     })
   }
 
-  /// Test support: the connection id of this node's record session to `peer` (§4.8, `ShardState::record_sessions`),
-  /// held in its slot or lent on a borrow; `None` with no link or no session. A test compares two reads to tell the same
-  /// session from a replacement (A-261's process test). The typed refusal when the control shard could not be observed.
-  pub fn fleet_record_session_id(
-    &self,
-    peer: slates_db::HostId,
-  ) -> Result<Option<slates_transport::endpoint::ConnectionId>, ObserveError> {
-    self.observe(self.shards.first().copied(), move |s| {
-      let link = s.record_sessions.get_mut(&peer)?;
-      match link.endpoint.as_mut() {
-        Some(endpoint) => endpoint.connection_id().ok(),
-        None => link.borrowed,
-      }
-    })
-  }
-
   /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
   /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
   /// discovery exchange, which this cannot tell apart ([`Daemon::fleet_pending_discovery`] names a pending exchange).

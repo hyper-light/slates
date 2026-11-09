@@ -17357,18 +17357,27 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
 /// holds at a load that stretches every wait.
 const RESET_REACH_BOUND: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
 
-/// Shape: restarts the test makes before it gives up on b still holding its session to the old a when a comes back. Under
-/// extreme load b's liveness can judge a dead while it is down, and then there is no session to reset: that run is not
-/// the reset case, so it is recorded and the restart made again.
+/// Shape: restarts the test makes before it gives up on an attempt that counts (a reset reached b before b's liveness
+/// judged a dead; [`ResetAttempt::counted`]).
+/// Derived: an attempt with no reset is not the reset case and is made again, so the test fails on bad luck only if
+/// every attempt misses. Measured misses, 2026-11-09: 1 of 97 attempts drew no reset since the precondition was read
+/// from b's own state (diag-63, 64, 69 and 71 on CI at two spinners a core and at one busy CPU: 1 of 81; the Studio,
+/// unloaded: 0 of 16). Its one-sided 95% upper bound is 4.9% (exact binomial, 1 of 97), so four attempts all miss with
+/// probability at most 0.049^4 ≈ 6e-6 a run, and three would leave 1.2e-4. The test's first form, one attempt a run,
+/// drew no reset in 3 of 4 runs at Mac load 46 to 232 (b's session lent, replaced or judged dead first, GAPS A-261):
+/// a regime past this bound, where the test fails and says so rather than pass on nothing.
 const RESET_ATTEMPTS: usize = 4;
 
 /// What one restart of a showed from b.
 #[derive(Debug)]
 struct ResetAttempt {
-  /// Whether b held its session to the old a until the new a met it, read once the new a has started: the same connection
-  /// id as before the stop (held or lent, not replaced), or a reset already counted on b; and neither
-  /// `fleet.link.invalid.believed_dead` nor `fleet.link.out_of_contact` moved since.
-  held: bool,
+  /// Whether the attempt is the reset case: b counted a reset (`fleet.link.peer_reset`) before its liveness judged a
+  /// dead. The restarted a resets only a 1-RTT packet whose connection id names no session it has, from a source with
+  /// no session there (`slates_transport::demux`, "Stateless reset"; RFC 9000 §10.3). That id is the one both ends
+  /// derived from a completed handshake, so the session it names finished its handshake with a process other than the
+  /// new a: on b's link to a, the old a. A reset counted on b therefore shows that b still held a session from the old
+  /// process when the new one met it, whatever b's slot showed at any instant.
+  counted: bool,
   /// Resets the restarted a's demultiplexers sent over the attempt (to b's old session, and to c's).
   sent_by_a: u64,
   /// `fleet.link.peer_reset` counted on b over the attempt.
@@ -17381,11 +17390,10 @@ struct ResetAttempt {
   reset_seen: Option<Duration>,
 }
 
-/// b's counters the precondition and the verdict read: believed dead, out of contact, reset.
-fn link_counters(b: &Daemon) -> (u64, u64, u64) {
+/// b's counters the verdict reads: believed dead, reset.
+fn link_counters(b: &Daemon) -> (u64, u64) {
   (
     refusal_count(b, "fleet.link.invalid.believed_dead").unwrap(),
-    refusal_count(b, "fleet.link.out_of_contact").unwrap(),
     refusal_count(b, "fleet.link.peer_reset").unwrap(),
   )
 }
@@ -17398,30 +17406,19 @@ fn restart_and_reach(
   probe: &mut Client,
   read: &RequestBody,
 ) -> ResetAttempt {
-  let a_host = daemons[0].member_identity().unwrap();
   let before = link_counters(&daemons[1]);
-  let session_before = daemons[1].fleet_record_session_id(a_host).unwrap();
   daemons.remove(0).stop();
   daemons.insert(0, restart());
   let restarted = Instant::now();
-  let (dead, out, resets_by_now) = link_counters(&daemons[1]);
-  let session_after = daemons[1].fleet_record_session_id(a_host).unwrap();
-  // b held its session to the old a until the new a answered it: still the same session now, or already reset. A reset
-  // is sent only for a session the new process never knew, which on b's link to a is one b held to the old a, so a
-  // reset counted by now says the session lasted until the new a met it. Read as the same session alone, the
-  // precondition raced the reset itself: under one busy CPU the new a's start was slow enough for b's own traffic to
-  // draw the reset first, and a run whose four restarts all reset and reached was judged vacuous (diag-69, 1 of 16).
-  // Read at the stop instead, it never held: b's link to a changed as the old a's port closed (0 of 12 on a Mac).
-  let held = session_before.is_some()
-    && (session_after == session_before || resets_by_now > before.2)
-    && dead == before.0
-    && out == before.1;
+  // The attempt is judged by its outcome, not by a reading of b's slot at an instant: every such reading raced either
+  // the reset or b's own replacement of the slot (diag-69 and 71 judged 1 of 16 and 1 of 24 runs vacuous whose every
+  // restart reset and reached; read at the stop it never held, 0 of 12 on a Mac).
   let mut reset_seen = None;
   let mut judged_first = false;
   let reached = loop {
     let reply = probe.call(read);
-    let (dead_now, _, resets_now) = link_counters(&daemons[1]);
-    if reset_seen.is_none() && resets_now > before.2 {
+    let (dead_now, resets_now) = link_counters(&daemons[1]);
+    if reset_seen.is_none() && resets_now > before.1 {
       reset_seen = Some(restarted.elapsed());
       judged_first = dead_now > before.0;
     }
@@ -17443,9 +17440,9 @@ fn restart_and_reach(
     .map(|counters| counters.iter().map(|counter| counter.resets_sent).sum())
     .unwrap_or(0);
   ResetAttempt {
-    held,
+    counted: reset_seen.is_some() && !judged_first,
     sent_by_a,
-    resets: link_counters(&daemons[1]).2 - before.2,
+    resets: link_counters(&daemons[1]).1 - before.1,
     judged_first,
     reached,
     reset_seen,
@@ -17460,15 +17457,13 @@ fn restart_and_reach(
 /// Do: three nodes; a volume owned by a, read through b; restart a with its identity on its ports; read through b until
 /// a answers.
 ///
-/// The precondition is read from b's own state once the new a has started: b held its session to the old a until the
-/// new a met it, so it is the same session by connection id, held or lent, or a reset was already counted on b, which
-/// the new a sends only for a session it never knew; and b's liveness has not judged a dead. A reset that lands during
-/// the new a's start counts, and must still show as the cause below. Under load b can lose it first: at load 170–232
-/// its liveness judged a dead while it was down (`believed_dead` 1, `out_of_contact` 1); at load 46–48 its session was
-/// lent or replaced first (main's parked runs, GAPS). Such a run is not the reset case: it is recorded, and a is
-/// restarted again, at most [`RESET_ATTEMPTS`] times.
+/// An attempt counts when a reset reached b before b's liveness judged a dead ([`ResetAttempt::counted`]). The new a
+/// resets only a 1-RTT packet naming a session it never knew (`slates_transport::demux`, "Stateless reset"), so such a
+/// reset shows b still held a session from the old process when the new one met it. An attempt with none is not the
+/// reset case (under load b's session can be lent, replaced or judged dead first) and a is restarted again, at most
+/// [`RESET_ATTEMPTS`] times, a bound derived at the constant.
 ///
-/// Expect: the precondition held in some attempt, and in each attempt where it held:
+/// Expect: some attempt counted, and in each that did:
 /// - the restarted a sent a reset (its demultiplexers' `resets_sent`) and b counted one (`fleet.link.peer_reset`);
 /// - b's liveness had not judged a dead before it, so the reset moved the link;
 /// - a read through b reached the restarted a within [`RESET_REACH_BOUND`].
@@ -17563,9 +17558,9 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
       &mut probe,
       &read,
     );
-    let held = attempt.held;
+    let counted = attempt.counted;
     attempts.push(attempt);
-    if held {
+    if counted {
       break;
     }
   }
@@ -17578,10 +17573,10 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   for daemon in daemons {
     daemon.stop();
   }
-  let held = attempts.iter().filter(|attempt| attempt.held).count();
+  let counted = attempts.iter().filter(|attempt| attempt.counted).count();
   eprintln!(
-    "{} restarts, the precondition held in {held} (the reset path ran there); each: {attempts:?}; b's forward and link \
-     counters {counters:?}",
+    "{} restarts, {counted} counted (a reset reached b before its liveness judged a dead); each: {attempts:?}; b's \
+     forward and link counters {counters:?}",
     attempts.len()
   );
   assert!(
@@ -17589,11 +17584,11 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
     "b routed the volume to a before the restart: {last:?}"
   );
   assert!(
-    held >= 1,
-    "b still held its session to the old a when a came back in none of {} restarts: {attempts:?}",
+    counted >= 1,
+    "no reset reached b before its liveness judged a dead in {} restarts: {attempts:?}",
     attempts.len()
   );
-  for attempt in attempts.iter().filter(|attempt| attempt.held) {
+  for attempt in attempts.iter().filter(|attempt| attempt.counted) {
     assert!(
       attempt.sent_by_a >= 1 && attempt.resets >= 1 && attempt.reset_seen.is_some(),
       "the restarted a sent a reset and b's session to the old a was reset while its reads waited: {attempt:?}; \

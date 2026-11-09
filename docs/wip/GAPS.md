@@ -9221,25 +9221,33 @@ new process. In simulation the session ended one round trip after its first pack
     loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
     bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
     here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
-  - **The process test holds its own precondition (2026-11-09; parked `#[ignore]` by the supervisor on landing, un-ignored
-    in the same change).** It had failed 2 of 3 on a Mac at load 46 to 48 and the stack gate's one at load 232. Each
+  - **The process test judges each restart by its outcome (2026-11-09; parked `#[ignore]` by the supervisor on landing,
+    un-ignored in the same change).** It had failed 2 of 3 on a Mac at load 46 to 48 and the stack gate's one at load 232. Each
     read 0 resets: b's session had been lent, replaced or judged dead before any packet reached the new process on it,
     so no reset was owed. The product behaved; the test did not hold its precondition.
-    - `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` now reads the precondition from b's own
-      state once the new a has started: b held its session to the old a until the new a met it, so it is the same
-      session by connection id (`Daemon::fleet_record_session_id`, held or lent, not replaced) or a reset was already
-      counted on b (the new a resets only a session it never knew); and neither `fleet.link.invalid.believed_dead` nor
-      `fleet.link.out_of_contact` moved. Read as the same session alone, it raced the reset: under one busy CPU b's own
-      traffic drew the reset during the new a's start, and diag-69 (9644ec2b) judged 1 of 16 runs vacuous whose four
-      restarts all reset and reached in 214–375 ms. Read at the stop, it never held (0 of 12 on a Mac): b's link to a
-      changed as the old a's port closed.
-    - A run without it is recorded and a restarted again, at most `RESET_ATTEMPTS` (4) times.
-    - Where it held, the test requires:
+    - `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` judges each restart by its outcome
+      (the supervisor's shape B, 2026-11-09). An attempt counts when a reset reached b before b's liveness judged a
+      dead. The restarted a resets only a 1-RTT packet whose connection id names no session it has, from a source with
+      no session there (`slates_transport::demux`, "Stateless reset"; RFC 9000 §10.3). That id is the one both ends
+      derived from a completed handshake, so the session it names finished its handshake with a process other than the
+      new a, on b's link to a the old one. A reset counted on b therefore shows b still held a session from the old
+      process when the new one met it. Every reading of b's slot at an instant raced something, so none is taken:
+      - read after the restart as the same session, it raced the reset (diag-69 on 9644ec2b: 1 of 16 runs judged
+        vacuous whose four restarts all reset and reached in 214–375 ms);
+      - read after the restart as the same session or a reset already counted, it raced b's own replacement of its
+        slot (diag-71 on f676b41d: 1 of 24, four restarts that reset and reached in 178–410 ms);
+      - read between the stop and the restart, it never held (0 of 12 on a Mac): b's link to a changed as the old a's
+        port closed.
+    - An attempt with no reset is made again, at most `RESET_ATTEMPTS` (4) times, derived at the constant: 1 of 97
+      attempts drew none since the precondition was read from b's state (CI at two spinners a core and at one busy
+      CPU, 1 of 81; the Studio, 0 of 16), a one-sided 95% bound of 4.9%, so four all miss at most 6e-6 a run. The first
+      form drew none in 3 of 4 runs at Mac load 46–232: a regime past the bound, where the test fails and says so.
+    - Where an attempt counted, the test requires:
       - a reset sent by the restarted a (its demultiplexers' `resets_sent`);
       - one counted by b, seen while its reads waited;
       - b's liveness not having judged a dead first;
       - a read reaching the new a within ten liveness budgets.
-    - It prints how many runs held the precondition, the count of runs in which the reset path ran.
+    - It prints how many restarts it made and how many counted.
     - A reset met first by a discovery page now counts `fleet.link.peer_reset` too (`fleet::refresh_discovery`); it
       dropped the link uncounted before.
 
