@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "suite": "winfstest",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "Microsoft Windows [Version 10.0.26100.33674]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33674]",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-09",
+  "command": "cd <drive>\\conformance-<pid>\\winfstest && <the transcribed scripts, each call `winfstest.exe ARGS`>",
+  "bound": "every script at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (20 scripts), 300s a call",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 20,
+      "cases": 733,
+      "passed": 351,
+      "failed": 382,
+      "needs_root": 0,
+      "todo": 0,
+      "expected_failures": 382,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt",
+    "blake3": "38b5e58eed712eccc957f2d66c63b0bcc9407030a04c125d1fd85b921a80b061",
+    "entries": 382
+  },
+  "duration_ms": 65382,
+  "notes": [
+    "winfstest: billziss-gh/secfs.test@6ac65cd winfstest/winfstest.c (BSD-3-Clause), sha256 7a1ddf128b02a38145a1f3230fed5a64ffda6dc64c096b8a67da89be17632c94, with winerror.i at the same commit, built `cl /nologo /MT /W2 winfstest.c advapi32.lib /Fe:winfstest.exe /link /subsystem:console` (source unchanged)",
+    "382 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "the scripts: a Rust transcription of winfstest's 20 scripts at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (each upstream file's sha256 in xtask/src/conformance/winfstest/scripts.rs), held to them by a golden of their calls and cases",
+    "run in E:\\conformance-4928\\winfstest on the drive, each call one winfstest.exe process, 300s a call",
+    "failures by shape (12 of 213 shapes; names folded to N, inode numbers to <inode>): 100 × testeval(\":strm%s:$DATA\" % i in s); 6 × testeval(r[0][\"FileIndex\"] == s[0][\"FileIndex\"]); 4 × expect \"CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0\" 0 - got ERROR_INVALID_NAME; 4 × expect \"GetFileInformation 00000012:foo\" 0 - got ERROR_INVALID_NAME; 4 × expect \"GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION\" 0 - got ERROR_INVALID_NAME; 4 × expect \"SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F\" 0 - got ERROR_INVALID_FUNCTION; 4 × expect \"SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F\" 0 - got ERROR_INVALID_FUNCTION; 4 × testeval(\"::$DATA\" in s); 4 × testeval(\":bar:$DATA\" in s); 4 × testeval(\":foo:$DATA\" in s); 3 × expect \"CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0\" 0 - got ERROR_INVALID_NAME; 3 × expect \"CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0\" 0 - got ERROR_INVALID_NAME"
+  ]
+}
