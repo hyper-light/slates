@@ -233,6 +233,26 @@ fn supervised_child() {
   std::process::exit(exit);
 }
 
+/// The child [`a_daemon_killed_after_it_served_is_restarted_every_time`] supervises: as [`supervised_child`], and it marks
+/// that it serves before it exits. Its own test name, not an environment variable, makes it serve, so the tests that
+/// run beside it in this process spawn children that do not. Ignored, and run by its parent with `--ignored --exact`.
+#[test]
+#[ignore = "the serving child; run by a_daemon_killed_after_it_served_... with --ignored"]
+fn serving_child() {
+  let Ok(beats) = std::env::var(CHILD_BEATS) else {
+    return;
+  };
+  let beats: u64 = beats.parse().unwrap();
+  let exit: i32 = std::env::var(CHILD_EXIT).unwrap().parse().unwrap();
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  for n in 1..=beats {
+    supervision.beat(n);
+  }
+  supervision.mark_serving(beats);
+  std::process::exit(exit);
+}
+
 /// The NFS-listener-inheritance child (§4.6): it verifies it inherited the anchor's held listener
 /// descriptor across the spawn — reads [`CHILD_NFS_PORT`] (its role signal) and `ENV_NFS_LISTENER`,
 /// and exits 0 if that descriptor is a bound listening socket at the expected port, 1 otherwise.
@@ -421,6 +441,68 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
     "the child's heartbeats were seen through the segment"
   );
   assert_crash_loop_recorded(&supervisor);
+}
+
+/// §2.6 step 1, the restart bound's rule ("a daemon that has failed more times inside the recovery budget than that
+/// budget holds daemon starts is not recovering"): a daemon that finished its start and served before it exited was
+/// recovering, so its exit is not counted. Do: supervise a child that beats, marks that it serves, and exits, under a
+/// window that holds every exit of the test and a bound of three; drive it through twice the bound's exits. Expect each
+/// one restarted, never a crash loop, never a back-off. On main 80be552a every exit counted, so a daemon killed while
+/// serving was judged a crash loop at the fourth kill: `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`
+/// was backed off 16 s at kill 20 on both Windows runners, every earlier successor having served.
+#[test]
+fn a_daemon_killed_after_it_served_is_restarted_every_time() {
+  /// Shape: the bound the window holds, and twice it, the exits driven.
+  const BOUND: u32 = 3;
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-served"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "serving_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: BOUND,
+  };
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
+  // SAFETY: the test sets the child's environment before it spawns any child; the variables are read by the child only.
+  unsafe {
+    std::env::set_var(CHILD_BEATS, BEATS.to_string());
+    std::env::set_var(CHILD_EXIT, EXIT.to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  let mut exits = 0u32;
+  let mut refused = None;
+  while exits < BOUND * 2 && clock.elapsed() < deadline * (BOUND * 2) {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } => {
+        assert_eq!(exit_code, Some(EXIT));
+        exits += 1;
+      }
+      other => {
+        refused = Some(format!("{other:?}"));
+        break;
+      }
+    }
+  }
+  assert_eq!(
+    (exits, refused),
+    (BOUND * 2, None),
+    "a daemon that served is restarted at every exit, past the bound of {BOUND}"
+  );
 }
 
 /// A-119, supervision never gives up: do supervise a child that beats and exits at once, under a short window that

@@ -55,10 +55,10 @@ pub use slates_ipc::protocol::{
   Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
   HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
   KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
-  LearnerReport, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal,
-  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
-  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
-  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  LearnerReport, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy,
+  RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport,
+  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
+  SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
