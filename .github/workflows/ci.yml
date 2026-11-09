@@ -1598,6 +1598,19 @@ jobs:
       # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
       - name: The kernel's TLS record layer and NFS client (for the export leg)
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      # kind's nodes are privileged containers whose processes all run as the host's root, so the six nodes share root's
+      # inotify instances. Ubuntu 26.04's runner image (ubuntu26 20261101.186.1) leaves fs.inotify.max_user_instances at the
+      # kernel's 128, where 24.04's image (ubuntu24 20261101.360.1) set 1280. At 128, kube-proxy exited 1 and crash-looped on
+      # 4 of 5 workers, so a pod there could not reach the cluster's DNS and the fleet never formed (`peers_probed=0`,
+      # diag-release-13 and -14). Derived: kind's documented limits for this failure (kind's Known Issues, "Pod errors due
+      # to too many open files"), raised only, never lowered; with them 6 of 6 kube-proxies ran with 0 restarts on 26.04
+      # (diag-release-14).
+      - name: Room for the nodes' inotify instances (kind's known issue; 26.04's image keeps the kernel's 128)
+        run: |
+          set -euo pipefail
+          at_least() { now=$(sysctl -n "$1"); if [ "$now" -lt "$2" ]; then sudo sysctl -w "$1=$2"; else echo "$1 = $now"; fi; }
+          at_least fs.inotify.max_user_instances 512
+          at_least fs.inotify.max_user_watches 524288
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
       # The DAX matrix's Kubernetes socket-route cell (docs/wip/virtiofs.md §8; `xtask/src/kind_direct.rs`): a process in
