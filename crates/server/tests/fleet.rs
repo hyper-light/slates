@@ -242,16 +242,24 @@ impl WaitTrace {
 
   /// Closes the trace with the wait's `verdict` and the daemons' state at its end.
   fn end(&self, kind: &str, verdict: &str, daemons: &[&Daemon], advances: &[u64]) {
+    let line = format!(
+      "{kind} end {} verdict={verdict} wall={:.3}s advances={advances:?} unavailable={} last_unavailable={:?} {}",
+      site_of(self.site),
+      self.began.elapsed().as_secs_f64(),
+      self.unavailable,
+      self.last_unavailable,
+      describe(daemons)
+    );
     if trace::enabled() {
-      trace::record(format_args!(
-        "{kind} end {} verdict={verdict} wall={:.3}s advances={advances:?} unavailable={} \
-         last_unavailable={:?} {}",
-        site_of(self.site),
-        self.began.elapsed().as_secs_f64(),
-        self.unavailable,
-        self.last_unavailable,
-        describe(daemons)
-      ));
+      trace::record(format_args!("{line}"));
+    }
+    // A wait that gave up says so at once, on the process's own error stream, which libtest does not capture: the
+    // captured output is printed only in the failure summary, and a fleet step cut at its time limit never prints one
+    // (main's Windows arm64 lane, run 42609672766: a 409 s wait in `a_learner_fetches_the_councils_committed_
+    // configuration_over_the_transport` that nothing named).
+    if verdict != "held" {
+      use std::io::Write as _;
+      let _ = writeln!(std::io::stderr(), "fleet wait gave up: {line}");
     }
   }
 }
