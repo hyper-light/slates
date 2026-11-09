@@ -17568,6 +17568,7 @@ fn yield_for(pause: Duration) {
 /// work's catalog is withheld, the owner counting the wait (`merge.record.awaits_work_catalog`, non-vacuous), and,
 /// once lifted, the record placed and the submit answered version 1.
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn a_versions_merge_record_waits_for_its_works_catalog_record() {
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];
@@ -17677,5 +17678,203 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
     })),
     "the submit was answered its version once its record committed"
+  );
+}
+
+/// What `client` is answered under `word` within `within`, polled as [`answer_within`] polls: `None` when nothing came.
+fn answer_in(
+  client: &mut slates_client::Client,
+  word: u64,
+  within: Duration,
+) -> Option<Result<ReplyBody, String>> {
+  let began = Instant::now();
+  while began.elapsed() < within {
+    match client.poll_reply_word(word) {
+      Ok(Some(reply)) => return Some(Ok(reply)),
+      Ok(None) => std::thread::yield_now(),
+      Err(error) => return Some(Err(format!("{error:?}"))),
+    }
+  }
+  None
+}
+
+/// A-255, the forged id (§4.9 RIFL: a completion record answers only the client that made the request): through the
+/// takeover route the green's successor answers a resend by its key, so a key copied into another session must reach
+/// nothing. Do: three nodes at `f = 1`; on a, a green and a work shared with the fleet; through b, an edit and the
+/// submit from a library client (the victim), answered version 1; a dies and the survivor rendezvous ranks first takes
+/// the green over. Then a second client of b sends the submit under the victim's own word, and another under the
+/// victim's next, unused word, and a client of c sends it under the victim's word. Expect: b refuses both of its
+/// forgers `BadRequest` at its door (A-SEAT's `refuse_foreign_request`, counted `client.foreign_request`), so neither
+/// meets the victim's completion nor plants one under its key; c's client is never answered the victim's version; the victim's next
+/// request, at the sequence a forger took, is served as its own (a `Versions` answered the head, not a forger's
+/// refusal); the victim's resend is answered version 1; and the green holds the one version.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_takeover() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "forged-green", &daemons);
+  drop(owner_client);
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let edited = routed.then(|| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    })
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut victim = common::client::connect(daemons[1].instance());
+  let word = victim.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut victim, *word));
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  // Survivors' indices once a is removed: b is 0, c is 1.
+  let victim_word = *word.as_ref().expect("the victim's submit was sent");
+  let next_word = RequestId {
+    sequence: RequestId::from_word(victim_word).sequence.wrapping_add(1),
+    ..RequestId::from_word(victim_word)
+  }
+  .word();
+  let mut forger_b = common::client::connect(daemons[0].instance());
+  let mut forger_c = common::client::connect(daemons[1].instance());
+  let sent: Vec<_> = [
+    forger_b.begin_again(victim_word, &submit),
+    forger_b.begin_again(next_word, &submit),
+    forger_c.begin_again(victim_word, &submit),
+  ]
+  .into_iter()
+  .collect();
+  let forged_answers = [
+    answer_in(&mut forger_b, victim_word, RESEND_RETRY_FOR),
+    answer_in(&mut forger_b, next_word, RESEND_RETRY_FOR),
+    answer_in(&mut forger_c, victim_word, RESEND_RETRY_FOR),
+  ];
+  let own_next = victim
+    .begin(&RequestBody::Versions { green })
+    .map(|id| id.word());
+  let own_answer = own_next
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut victim, *word));
+  let again = {
+    let began = Instant::now();
+    loop {
+      match resent_answer(&mut victim, victim_word, &submit) {
+        Some(Ok(ReplyBody::Refused {
+          refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. },
+        }))
+        | Some(Err(_))
+        | None
+          if began.elapsed() < RESEND_RETRY_FOR =>
+        {
+          yield_for(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
+        }
+        other => break other,
+      }
+    }
+  };
+  let forged_counted = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("client.foreign_request").copied().unwrap_or(0));
+  let mut reader = Client::connect(daemons[successor_index].instance());
+  let head = head_once_its_lease_confirms(&mut reader, green, &daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert!(
+    matches!(edited, Some(ReplyBody::Edited)),
+    "the edit: {edited:?}"
+  );
+  assert!(
+    matches!(
+      first,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the victim's submit was answered version 1: {first:?}"
+  );
+  assert!(
+    caught_up,
+    "both holders held version 1 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 1"
+  );
+  assert!(
+    sent.iter().all(|sent| matches!(sent, Ok(true))),
+    "every forged word was sent: {sent:?}"
+  );
+  let [copied_on_b, next_on_b, copied_on_c] = forged_answers;
+  for (which, answer) in [
+    ("the victim's word", &copied_on_b),
+    ("its next word", &next_on_b),
+  ] {
+    assert!(
+      matches!(answer, Some(Err(refusal)) if refusal.contains("BadRequest")),
+      "the forger on b under {which} is refused BadRequest at its door, never answered a completion: {answer:?}"
+    );
+  }
+  // c allocates its client ids on its own, so its client may hold the victim's id as its own; a key under c's origin is
+  // another request, which the successor never answers with the victim's version.
+  assert!(
+    !matches!(copied_on_c, Some(Ok(ReplyBody::Submitted { .. }))),
+    "a client of c is never answered the victim's version: {copied_on_c:?}"
+  );
+  assert!(
+    forged_counted.as_ref().is_ok_and(|count| *count >= 2),
+    "b refused the forged words at its door: {forged_counted:?}"
+  );
+  assert_eq!(
+    own_answer,
+    Some(Ok(ReplyBody::Versions { head: 1 })),
+    "the victim's next request, at the sequence a forger took, is served as its own"
+  );
+  assert_eq!(
+    again,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the victim's own resend is answered its version"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
   );
 }

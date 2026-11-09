@@ -100,6 +100,10 @@ pub struct MergeShardState {
   pub nudged: bool,
   /// On the control shard: the coordinator's waker while it waits for its next period, woken by a nudge.
   pub nudge_waker: Option<std::task::Waker>,
+  /// On an owner shard: the works created here whose catalog register is not yet committed (A-255). The record plane
+  /// ships each at once, so a submit soon after the work's creation finds its route committed rather than waiting for
+  /// it ([`next_merge_work`]). A work leaves once its catalog is committed or it has no record; bounded by the works.
+  pub works_owing_catalog: std::collections::BTreeSet<DbVolumeId>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -1571,8 +1575,10 @@ const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
 /// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key);
 /// a decoder refuses any other.
 const RECORD_VERSION: u32 = 1;
+/// Format: a merge record's magic and its version are each a little-endian `u32`.
+const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
-const RECORD_FRAME_BYTES: usize = 4 + 4;
+const RECORD_FRAME_BYTES: usize = 2 * RECORD_WORD_BYTES;
 /// Counted where a merge record of another format version was refused (a peer of another build).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const RECORD_VERSION_REFUSED: &str = "merge.record.version_refused";
@@ -1672,13 +1678,13 @@ impl MergeRecordValue {
     let body = crate::catalog::untagged(crate::catalog::MERGE_CLASS, bytes)
       .ok_or(RecordRefused::OtherClass)?;
     let (magic, rest) = body
-      .split_first_chunk::<4>()
+      .split_first_chunk::<RECORD_WORD_BYTES>()
       .ok_or(RecordRefused::Malformed)?;
     if u32::from_le_bytes(*magic) != RECORD_MAGIC {
       return Err(RecordRefused::Malformed);
     }
     let (version, mut input) = rest
-      .split_first_chunk::<4>()
+      .split_first_chunk::<RECORD_WORD_BYTES>()
       .ok_or(RecordRefused::Malformed)?;
     let found = u32::from_le_bytes(*version);
     if found != RECORD_VERSION {
@@ -2337,6 +2343,33 @@ pub(crate) enum MergeWork {
     /// The quorum.
     quorum: Quorum,
   },
+  /// Ship a submitting work's catalog register, which a version's record waits for (A-255), now rather than at the
+  /// coordinator's next period.
+  ShipWorkCatalog(crate::fleet::OwedCatalog),
+}
+
+/// Ships the catalog register of each work created on this shard whose catalog is not yet committed (A-255), noting
+/// each in `catalogs_owed` so a version waiting for the same catalog does not ship it twice in a pass; forgets each work
+/// whose catalog is committed or which has no record any more.
+fn ship_new_works_catalogs(
+  state: &mut ShardState,
+  local: HostId,
+  catalogs_owed: &mut std::collections::BTreeSet<DbVolumeId>,
+  work: &mut Vec<MergeWork>,
+) {
+  let owing = std::mem::take(&mut state.merge.works_owing_catalog);
+  for submitting in owing {
+    if crate::fleet::catalog_committed(state, submitting, local) {
+      continue;
+    }
+    let Some(catalog) = crate::fleet::owed_work_catalog(state, submitting, local) else {
+      continue;
+    };
+    state.merge.works_owing_catalog.insert(submitting);
+    if catalogs_owed.insert(submitting) {
+      work.push(MergeWork::ShipWorkCatalog(catalog));
+    }
+  }
 }
 
 /// The merge work this shard's greens owe this period (§4.16): each candidate's first missing
@@ -2355,6 +2388,8 @@ pub(crate) fn next_merge_work(
   let config = state.fleet.configuration().clone();
   let page = archive_page(state);
   let mut work = Vec::new();
+  let mut catalogs_owed = std::collections::BTreeSet::new();
+  ship_new_works_catalogs(state, local, &mut catalogs_owed, &mut work);
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
     // The green's catalog register first (AUD-29-17): a successor that adopted a merge record and no catalog could
@@ -2386,11 +2421,17 @@ pub(crate) fn next_merge_work(
       // The submitting work's catalog record before the record that carries its completion (A-255): a successor
       // answers a resend only through the work's catalog, which names the green, so no holder takes the completion
       // before the route is committed. A destroyed work's catalog owes nothing.
-      if pending
+      if let Some(submitting) = pending
         .work
-        .is_some_and(|work| !crate::fleet::catalog_committed(state, work, local))
+        .filter(|submitting| !crate::fleet::catalog_committed(state, *submitting, local))
       {
         state.count(RECORD_AWAITS_WORK_CATALOG, 1);
+        // Shipped in this pass, once however many of its versions wait: its commit nudges the next pass.
+        if catalogs_owed.insert(submitting)
+          && let Some(catalog) = crate::fleet::owed_work_catalog(state, submitting, local)
+        {
+          work.push(MergeWork::ShipWorkCatalog(catalog));
+        }
         continue;
       }
       let green = DbVolumeId { bytes: object.0 };
@@ -2490,6 +2531,14 @@ pub(crate) async fn run_merge_period(
           (budget, period),
         )
         .await
+      }
+      MergeWork::ShipWorkCatalog(catalog) => {
+        let dispatch =
+          crate::fleet::ship_owed_catalog(origin, owner_acceptor, local, &catalog, budget).await;
+        // The catalog's placement is recorded on its owner shard ahead of the next pass's question there, which
+        // this wakes, so the version that waited for it ships at once.
+        let _ = crate::state::with_state(nudge_record_plane);
+        dispatch
       }
     };
     if let Some(dispatch) = dispatch {
@@ -3429,11 +3478,12 @@ mod tests {
       let shipments = |state: &mut ShardState| {
         next_merge_work(state, local, 0)
           .into_iter()
-          .map(
-            |MergeWork::Ship {
-               version, targets, ..
-             }| (version, targets),
-          )
+          .filter_map(|item| match item {
+            MergeWork::Ship {
+              version, targets, ..
+            } => Some((version, targets)),
+            MergeWork::ShipWorkCatalog(_) => None,
+          })
           .collect::<Vec<_>>()
       };
       let before = shipments(state);

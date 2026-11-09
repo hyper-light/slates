@@ -2283,6 +2283,37 @@ fn owed_catalog(
   (owed, ready)
 }
 
+/// A catalog register this owner still owes some candidate, for the merge plane to ship on demand (A-255): a version's
+/// merge record waits for its submitting work's catalog ([`catalog_committed`]), and catalogs otherwise ship on the
+/// coordinator's period, so a submit made right after its work was created waited out a whole period (median 109.2 ms
+/// against 1.24 ms, twenty submits each, an idle Mac Studio, 2026-11-09).
+pub(crate) struct OwedCatalog(Head);
+
+/// The catalog register work `work` still owes some candidate, read on its owner shard; `None` when every candidate
+/// holds its current version or the work has no record here.
+pub(crate) fn owed_work_catalog(
+  state: &ShardState,
+  work: DbVolumeId,
+  local: HostId,
+) -> Option<OwedCatalog> {
+  let record = state.db.partition().volume(work)?;
+  owed_catalog(state, state.fleet.configuration(), record, local)
+    .0
+    .map(OwedCatalog)
+}
+
+/// Ships an owed catalog register as the period's head shipment does ([`ship_head`]): to every candidate still missing
+/// it, committed at `f + 1`, its placement recorded on its owner shard.
+pub(crate) async fn ship_owed_catalog(
+  origin: u16,
+  owner_acceptor: &mut Acceptor,
+  local: HostId,
+  catalog: &OwedCatalog,
+  budget: CommitBudget,
+) -> Option<Dispatch> {
+  ship_head(origin, owner_acceptor, local, &catalog.0, budget).await
+}
+
 /// Whether the merge volume `id`'s catalog register is committed, so a merge record that depends on it may ship (see
 /// [`owed_catalog`]):
 /// - a green's (AUD-29-17): a successor materializes a green only with its adopted catalog, so a merge record that

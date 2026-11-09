@@ -6006,6 +6006,10 @@ fn create_work(
       charged,
     },
   );
+  // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
+  // version's merge record waits for it (A-255): shipped by the record plane now, not at the coordinator's period.
+  state.merge.works_owing_catalog.insert(id);
+  crate::merge_service::nudge_record_plane(state);
   ReplyBody::WorkCreated {
     id: to_wire_volume(id),
     base,

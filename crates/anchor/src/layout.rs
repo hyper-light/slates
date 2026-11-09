@@ -5,11 +5,9 @@
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
-/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
-/// (A-237), 6 a green's chain entries record what each version changed (A-257), 7 a chain entry and a merge record carry
-/// the completion key of the submit that made the version (A-255). An older segment is refused, never read under
-/// semantics it was not written with.
+/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide origin, 4 pool
+/// owner words (A-98), 5 host-scoped principals (A-237), 6 chain entries record each version's changes (A-257), 7 they
+/// and merge records carry the submit's completion key (A-255). An older segment is refused, never misread.
 pub const LAYOUT_VERSION: u32 = 7;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;

@@ -90,13 +90,11 @@ fn recovered(
   for bytes in &durable.chain {
     let entry = chain_entry::decode(bytes).unwrap();
     let version = green.apply_recorded(&entry.increment, &entry.applied);
-    if let Some(key) = entry.completion {
-      assert_eq!(
-        key,
-        completion_of(version),
-        "version {version}'s completion key, as its entry recorded it (A-255)"
-      );
-    }
+    assert_eq!(
+      entry.completion,
+      completion_for(version),
+      "version {version}'s completion key, as its entry recorded it, present or absent (A-255)"
+    );
     assert_eq!(
       identities.get(&version).copied(),
       Some(green.head_identity()),
@@ -292,7 +290,7 @@ impl History {
         .is_multiple_of(3)
         .then(|| self.live.head_identity());
       // A request made most versions (A-255): its completion key rides the entry, and recovery reads it back.
-      let completion = (!self.next_id.is_multiple_of(5)).then(|| completion_of(*version));
+      let completion = completion_for(*version);
       self.durable.chain.push(chain_entry::encode(
         &increment.encode(),
         &increment,
@@ -636,7 +634,7 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
       &increment.encode(),
       &increment,
       &applied.unwrap(),
-      Some(completion_of(version)),
+      completion_for(version),
       None,
     ));
     accepted.push((increment, version));
@@ -666,6 +664,13 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
   );
   let mut twin = recovered(&origin_rows, &durable, &identities);
   assert_same(&mut live, &mut twin, durable.held, &accepted, &[]);
+}
+
+/// The completion key a generated version carries in its entry: none for every fifth version (one no request made, as
+/// a green's version 0 or a merge with no submit), else [`completion_of`]; a function of the version alone, so the
+/// replay holds both markers to what was written (liveness's review of A-255).
+fn completion_for(version: u64) -> Option<chain_entry::Completion> {
+  (!version.is_multiple_of(5)).then(|| completion_of(version))
 }
 
 /// The completion key a test's version `version` was made under: distinct per version, every field used.
