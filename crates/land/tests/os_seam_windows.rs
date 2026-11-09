@@ -124,9 +124,12 @@ fn a_directory_this_process_makes_is_a_target_it_owns() {
 const TOKEN_SIDS: &str =
   "$i = [Security.Principal.WindowsIdentity]::GetCurrent(); $i.User.Value; $i.Owner.Value";
 
-/// Runs `script` in PowerShell, which inherits this process's token, and returns its output's lines.
+/// Runs `script` in Windows PowerShell, which inherits this process's token, and returns its output's lines. Its module
+/// path is its own: under pwsh 7, as CI's steps run, the inherited `PSModulePath` names pwsh 7's modules, which
+/// Windows PowerShell cannot load (`Get-Acl` was refused on both runners, 2026-11-09). The scripts name .NET alone.
 fn powershell(script: &str) -> Vec<String> {
   let out = std::process::Command::new("powershell")
+    .env_remove("PSModulePath")
     .args(["-NoProfile", "-NonInteractive", "-Command", script])
     .output()
     .unwrap();
@@ -150,7 +153,7 @@ fn token_sids() -> (String, String) {
 /// The SID that owns `path`, as Windows reports it.
 fn owner_sid(path: &Path) -> String {
   let script = format!(
-    "(Get-Acl -LiteralPath '{}').GetOwner([Security.Principal.SecurityIdentifier]).Value",
+    "[IO.Directory]::GetAccessControl('{}', 'Owner').GetOwner([Security.Principal.SecurityIdentifier]).Value",
     path.display()
   );
   powershell(&script).concat()
