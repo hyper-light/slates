@@ -1211,7 +1211,7 @@ fn walked(green: &Green, version: u64, per_page: usize) -> Vec<String> {
 
 /// §4.16 `changed_since` (A-264). Do: on a green, submit increments that change content, a symlink, a mode, an xattr,
 /// a hard link and a directory, at different versions, and change one file again; then ask what changed since each
-/// version, whole and walked in pages of two entries. Expect: exactly `changed_between(v, head)` each time, every
+/// version, whole and walked in pages of two entries. Expect: exactly what the model walking the histories names (`changed_between_by_histories`), and `changed_between(v, head)` the same, each time, every
 /// dimension's path included and the file changed twice answered once. Before 2026-11-08 `changed_since` read the
 /// content index alone and answered only the files whose content changed.
 #[test]
@@ -1231,7 +1231,12 @@ fn changed_since_reports_every_dimension_as_changed_between_does() {
   green.submit(&Build::new().overwrite("a", 0, b"A").at(7, 6));
   let head = green.head();
   for version in 0..=head {
-    let expected = green.changed_between(version, head);
+    let expected = green.changed_between_by_histories(version, head);
+    assert_eq!(
+      green.changed_between(version, head),
+      expected,
+      "changed between {version} and the head"
+    );
     assert_eq!(
       green.changed_since(version),
       expected,
@@ -1257,8 +1262,9 @@ fn changed_since_reports_every_dimension_as_changed_between_does() {
 /// §4.16 `changed_since` (A-264). Do: on a green, submit eight versions, each after the first changing a file of its own
 /// and one shared file; read what changed since each version, then fold the history below version 5 and read again from 5 on. Expect:
 /// a read costs the entries of the span alone (since version 7, two entries, however many versions came before), and
-/// after the fold every read answers as `changed_between` does, below the floor too, the superseded entries below it
-/// gone, and the index's running total equals its recount before and after.
+/// after the fold every read answers as the model walking the histories does, below the floor too, the superseded entries below it
+/// gone (a path keeps its last change below the floor, as a folded history keeps its value in effect there), and the
+/// index's running total equals its recount before and after.
 #[test]
 fn changed_since_reads_the_span_alone_and_folds_with_the_histories() {
   let mut green = Green::new();
@@ -1284,19 +1290,19 @@ fn changed_since_reads_the_span_alone_and_folds_with_the_histories() {
   green.fold_history_before(5);
   assert_eq!(
     green.changes_after(0, None).count(),
-    before - 4,
-    "the fold dropped the shared file's four superseded entries below version 5, and kept every last change"
+    before - 3,
+    "the fold dropped the shared file's entries at versions 1 to 3, keeping its last below the floor (4) and every other"
   );
   assert_walks_match_from(&green);
 }
 
-/// Every walk to the head answers as `changed_between` does, and the index's running total is its recount.
+/// Every walk to the head answers as the model walking the histories does, and the index's running total is its recount.
 fn assert_walks_match_from(green: &Green) {
   let head = green.head();
   for version in 0..=head {
     assert_eq!(
       walked(green, version, 3),
-      green.changed_between(version, head)
+      green.changed_between_by_histories(version, head)
     );
   }
   assert_eq!(green.changes_recounted(), green.changes_bytes());

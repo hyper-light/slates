@@ -1615,6 +1615,7 @@ dependencies = [
  "blake3",
  "proptest",
  "shuttle",
+ "slates-merge",
  "slates-test-seeds",
 ]
 
