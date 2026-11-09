@@ -1,0 +1,2 @@
+Developer Mode 0, NTFS, a token with no privilege: no flag: error 1314; flag 0x2: error 1314
+Developer Mode 1, NTFS, a token with no privilege: no flag: error 1314; flag 0x2: made
