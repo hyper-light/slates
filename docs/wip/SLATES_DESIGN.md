@@ -19908,10 +19908,11 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
     byte. The layout without the field is refused as truncated, never read as "moved from none".
-  - **The image (owed, after raft-7).** conformance-14 (A-262) and then raft-7 (A-270) land first, each with its own
-    image and delta versions. Then the held image's register piece is this encoding, at the image and delta versions
-    after raft-7's, and an image or delta of another version is refused typed (`VfsError::RecoveryVersion`). A missing field is never read as none: that would be the compatibility shim §2.7
-    forbids. Until then a warm restart forgets an earlier move, as main does today.
+  - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
+    an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
+    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7), and raft-7 (A-270) takes the
+    numbers after. An image or delta of another version is refused by its version. A missing field is never read as
+    none: that would be the compatibility shim §2.7 forbids.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.
