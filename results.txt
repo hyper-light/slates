@@ -1,0 +1,434 @@
+leg store-arm, 4 CPUs, Mon Nov  9 22:55:42 UTC 2026, tree 3ca0ec78de097e51b67bd58f37e846cb8835e954
+== release build exit 0
+   r1     Finished `release` profile [optimized] target(s) in 0.09s
+   r1      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r1 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-6091 destroyed at 194.805675ms
+   r1 chaos a candidate's store destroyed mid-stream: replacement answering at 343.958504ms
+   r1 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.595810406s
+   r1 chaos a candidate's store destroyed mid-stream: 174 writes, 174 acknowledged: p50 1818 us, p99 118186 us, p999 1146017 us, max 1146017 us; 3 over 50ms (sent+took): 0.00s+118ms 0.42s+1146ms 1.67s+109ms
+   r1 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(174), durable: Some(174), owed: false, epoch: Some(1), identity: Some("69a1b1286f66fbe0fc8b4140ec9854ef003b99568d8466bff3ad0ddb101582f0"), fence: 1, holders: ["1137509802481322772", "3343143391408167769"], moving_to: [], recorded: ["1137509802481322772", "3343143391408167769"] }); can
+   r1 chaos a candidate's store destroyed mid-stream: 160 samples, 45 heads seen
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-6091 refused the owner: {}
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-6091 refused the owner: {}
+   r1 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-6091 refused the owner: {}
+   r1 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 352.808826ms
+   r1 LD-D72 destroyed chaos-replaced-b-6091 successor Some(("chaos-replaced-b-6091", 2.013709627s)) replacement_served true
+   r1 LD-D72 counters chaos-replaced-b-6091 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r1 LD-D72 counters chaos-replaced-c-6091 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r1 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-b-6091 after 2.013709627s
+   r1 chaos a candidate's store destroyed mid-stream:
+   r1   candidate node chaos-replaced-b-6091 destroyed at 194.805675ms
+   r1   replacement answering at 343.958504ms
+   r1   the fleet rejoined at 1.595810406s
+   r1   every write acknowledged: held
+   r1   174 writes, 174 acknowledged: p50 1818 us, p99 118186 us, p999 1146017 us, max 1146017 us; 3 over 50ms (sent+took): 0.00s+118ms 0.42s+1146ms 1.67s+109ms
+   r1   converged: true: owner Some(LiveState { holding: false, head: Some(174), durable: Some(174), owed: false, epoch: Some(1), identity: Some("69a1b1286f66fbe0fc8b4140ec9854ef003b99568d8466bff3ad0ddb101582f0"), fence: 1, holders: ["1137509802481322772", "3343143391408167769"], moving_to: [], recorded: ["1137509802481322772", "3343143391408167769"] }); candidates [Some(LiveState { holding: true, head:
+   r1   Convergence: held
+   r1   160 samples, 45 heads seen
+   r1   Agreement: held
+   r1   NoLoss: held
+   r1   chaos-replaced-a-6091 refused the owner: {}
+   r1   chaos-replaced-b-6091 refused the owner: {}
+   r1   chaos-replaced-c-6091 refused the owner: {}
+   r1   recovered from the candidate's loss after a further 352.808826ms
+   r1   taken over by chaos-replaced-b-6091 after 2.013709627s
+   r1   NoLoss (successor): held
+   r1   StaleNeverCommits (fences): held
+   r1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 5.52s
+== run 1 exit 0
+   r2     Finished `release` profile [optimized] target(s) in 0.09s
+   r2      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r2 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-6709 destroyed at 275.421049ms
+   r2 chaos a candidate's store destroyed mid-stream: replacement answering at 510.818779ms
+   r2 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.765016532s
+   r2 chaos a candidate's store destroyed mid-stream: 553 writes, 553 acknowledged: p50 1875 us, p99 13134 us, p999 210266 us, max 210266 us; 3 over 50ms (sent+took): 0.00s+168ms 0.57s+210ms 0.78s+113ms
+   r2 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(553), durable: Some(553), owed: false, epoch: Some(1), identity: Some("f020f6ac4670de226f76d2b448d2584152ec0b90295a7a85a1c595bb4c5784ce"), fence: 1, holders: ["3386158247653609654", "8147290285965534731"], moving_to: [], recorded: ["3386158247653609654", "8147290285965534731"] }); can
+   r2 chaos a candidate's store destroyed mid-stream: 179 samples, 113 heads seen
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-6709 refused the owner: {}
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-6709 refused the owner: {}
+   r2 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-6709 refused the owner: {}
+   r2 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 537.565532ms
+   r2 LD-D72 destroyed chaos-replaced-a-6709 successor Some(("chaos-replaced-a-6709", 2.01131722s)) replacement_served true
+   r2 LD-D72 counters chaos-replaced-a-6709 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r2 LD-D72 counters chaos-replaced-b-6709 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r2 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-a-6709 after 2.01131722s
+   r2 chaos a candidate's store destroyed mid-stream:
+   r2   candidate node chaos-replaced-a-6709 destroyed at 275.421049ms
+   r2   replacement answering at 510.818779ms
+   r2   the fleet rejoined at 1.765016532s
+   r2   every write acknowledged: held
+   r2   553 writes, 553 acknowledged: p50 1875 us, p99 13134 us, p999 210266 us, max 210266 us; 3 over 50ms (sent+took): 0.00s+168ms 0.57s+210ms 0.78s+113ms
+   r2   converged: true: owner Some(LiveState { holding: false, head: Some(553), durable: Some(553), owed: false, epoch: Some(1), identity: Some("f020f6ac4670de226f76d2b448d2584152ec0b90295a7a85a1c595bb4c5784ce"), fence: 1, holders: ["3386158247653609654", "8147290285965534731"], moving_to: [], recorded: ["3386158247653609654", "8147290285965534731"] }); candidates [Some(LiveState { holding: true, head:
+   r2   Convergence: held
+   r2   179 samples, 113 heads seen
+   r2   Agreement: held
+   r2   NoLoss: held
+   r2   chaos-replaced-c-6709 refused the owner: {}
+   r2   chaos-replaced-a-6709 refused the owner: {}
+   r2   chaos-replaced-b-6709 refused the owner: {}
+   r2   recovered from the candidate's loss after a further 537.565532ms
+   r2   taken over by chaos-replaced-a-6709 after 2.01131722s
+   r2   NoLoss (successor): held
+   r2   StaleNeverCommits (fences): held
+   r2 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.50s
+== run 2 exit 0
+   r3     Finished `release` profile [optimized] target(s) in 0.09s
+   r3      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r3 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-7372 destroyed at 166.316965ms
+   r3 chaos a candidate's store destroyed mid-stream: replacement answering at 341.957774ms
+   r3 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.512010578s
+   r3 chaos a candidate's store destroyed mid-stream: 302 writes, 302 acknowledged: p50 526 us, p99 65093 us, p999 1128446 us, max 1128446 us; 4 over 50ms (sent+took): 0.00s+125ms 0.17s+65ms 0.44s+1128ms 1.56s+134ms
+   r3 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(302), durable: Some(302), owed: false, epoch: Some(1), identity: Some("858e95093bbeea33445ac6e62e6f0b1856d4f9896559d31acde50fa23317d381"), fence: 1, holders: ["1271257446756525002", "11875207275020469213", "16290517643260272769"], moving_to: ["1271257446756525002", "162905176432602727
+   r3 chaos a candidate's store destroyed mid-stream: 155 samples, 37 heads seen
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-7372 refused the owner: {}
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-7372 refused the owner: {}
+   r3 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-7372 refused the owner: {}
+   r3 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 395.319701ms
+   r3 LD-D72 destroyed chaos-replaced-b-7372 successor Some(("chaos-replaced-b-7372", 2.003645974s)) replacement_served true
+   r3 LD-D72 counters chaos-replaced-b-7372 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r3 LD-D72 counters chaos-replaced-c-7372 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r3 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-b-7372 after 2.003645974s
+   r3 chaos a candidate's store destroyed mid-stream:
+   r3   candidate node chaos-replaced-b-7372 destroyed at 166.316965ms
+   r3   replacement answering at 341.957774ms
+   r3   the fleet rejoined at 1.512010578s
+   r3   every write acknowledged: held
+   r3   302 writes, 302 acknowledged: p50 526 us, p99 65093 us, p999 1128446 us, max 1128446 us; 4 over 50ms (sent+took): 0.00s+125ms 0.17s+65ms 0.44s+1128ms 1.56s+134ms
+   r3   converged: true: owner Some(LiveState { holding: false, head: Some(302), durable: Some(302), owed: false, epoch: Some(1), identity: Some("858e95093bbeea33445ac6e62e6f0b1856d4f9896559d31acde50fa23317d381"), fence: 1, holders: ["1271257446756525002", "11875207275020469213", "16290517643260272769"], moving_to: ["1271257446756525002", "16290517643260272769"], recorded: ["1271257446756525002", "16290
+   r3   Convergence: held
+   r3   155 samples, 37 heads seen
+   r3   Agreement: held
+   r3   NoLoss: held
+   r3   chaos-replaced-a-7372 refused the owner: {}
+   r3   chaos-replaced-b-7372 refused the owner: {}
+   r3   chaos-replaced-c-7372 refused the owner: {}
+   r3   recovered from the candidate's loss after a further 395.319701ms
+   r3   taken over by chaos-replaced-b-7372 after 2.003645974s
+   r3   NoLoss (successor): held
+   r3   StaleNeverCommits (fences): held
+   r3 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.23s
+== run 3 exit 0
+   r4     Finished `release` profile [optimized] target(s) in 0.08s
+   r4      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r4 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-8033 destroyed at 169.131613ms
+   r4 chaos a candidate's store destroyed mid-stream: replacement answering at 293.938768ms
+   r4 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.41739603s
+   r4 chaos a candidate's store destroyed mid-stream: 311 writes, 311 acknowledged: p50 506 us, p99 8321 us, p999 1129047 us, max 1129047 us; 2 over 50ms (sent+took): 0.00s+118ms 0.32s+1129ms
+   r4 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(311), durable: Some(311), owed: false, epoch: Some(1), identity: Some("53cef5d3777606dd86fac3eb1debe79aa129c10f334c5b88d74d3597d5e1299f"), fence: 1, holders: ["1854380684710212764", "6421689158404716731"], moving_to: ["1854380684710212764", "6421689158404716731", "11482636171848842892
+   r4 chaos a candidate's store destroyed mid-stream: 129 samples, 25 heads seen
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8033 refused the owner: {}
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8033 refused the owner: {}
+   r4 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8033 refused the owner: {}
+   r4 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 556.526865ms
+   r4 LD-D72 destroyed chaos-replaced-a-8033 successor Some(("chaos-replaced-b-8033", 2.255187513s)) replacement_served false
+   r4 LD-D72 counters chaos-replaced-a-8033 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r4 LD-D72 counters chaos-replaced-b-8033 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r4 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-b-8033 after 2.255187513s
+   r4 chaos a candidate's store destroyed mid-stream:
+   r4   candidate node chaos-replaced-a-8033 destroyed at 169.131613ms
+   r4   replacement answering at 293.938768ms
+   r4   the fleet rejoined at 1.41739603s
+   r4   every write acknowledged: held
+   r4   311 writes, 311 acknowledged: p50 506 us, p99 8321 us, p999 1129047 us, max 1129047 us; 2 over 50ms (sent+took): 0.00s+118ms 0.32s+1129ms
+   r4   converged: true: owner Some(LiveState { holding: false, head: Some(311), durable: Some(311), owed: false, epoch: Some(1), identity: Some("53cef5d3777606dd86fac3eb1debe79aa129c10f334c5b88d74d3597d5e1299f"), fence: 1, holders: ["1854380684710212764", "6421689158404716731"], moving_to: ["1854380684710212764", "6421689158404716731", "11482636171848842892"], recorded: ["1854380684710212764", "6421689
+   r4   Convergence: held
+   r4   129 samples, 25 heads seen
+   r4   Agreement: held
+   r4   NoLoss: held
+   r4   chaos-replaced-c-8033 refused the owner: {}
+   r4   chaos-replaced-a-8033 refused the owner: {}
+   r4   chaos-replaced-b-8033 refused the owner: {}
+   r4   recovered from the candidate's loss after a further 556.526865ms
+   r4   taken over by chaos-replaced-b-8033 after 2.255187513s
+   r4   NoLoss (successor): held
+   r4   StaleNeverCommits (fences): held
+   r4 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.32s
+== run 4 exit 0
+   r5     Finished `release` profile [optimized] target(s) in 0.09s
+   r5      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r5 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-8695 destroyed at 199.855647ms
+   r5 chaos a candidate's store destroyed mid-stream: replacement answering at 356.568728ms
+   r5 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.728046248s
+   r5 chaos a candidate's store destroyed mid-stream: 309 writes, 309 acknowledged: p50 2487 us, p99 17607 us, p999 623711 us, max 623711 us; 2 over 50ms (sent+took): 0.00s+112ms 0.41s+624ms
+   r5 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(309), durable: Some(309), owed: false, epoch: Some(1), identity: Some("9d028963bcdf3c6a9fdf3bb2519cd96a9b6f491ab1ace5bde6cd75366e635207"), fence: 1, holders: ["6493285781992585995", "11988370032903344260", "12350510307578705812"], moving_to: ["6493285781992585995", "123505103075787058
+   r5 chaos a candidate's store destroyed mid-stream: 194 samples, 105 heads seen
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-8695 refused the owner: {}
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-8695 refused the owner: {}
+   r5 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-8695 refused the owner: {}
+   r5 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 561.334426ms
+   r5 LD-D72 destroyed chaos-replaced-a-8695 successor Some(("chaos-replaced-a-8695", 2.006716403s)) replacement_served true
+   r5 LD-D72 counters chaos-replaced-a-8695 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r5 LD-D72 counters chaos-replaced-b-8695 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r5 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-a-8695 after 2.006716403s
+   r5 chaos a candidate's store destroyed mid-stream:
+   r5   candidate node chaos-replaced-a-8695 destroyed at 199.855647ms
+   r5   replacement answering at 356.568728ms
+   r5   the fleet rejoined at 1.728046248s
+   r5   every write acknowledged: held
+   r5   309 writes, 309 acknowledged: p50 2487 us, p99 17607 us, p999 623711 us, max 623711 us; 2 over 50ms (sent+took): 0.00s+112ms 0.41s+624ms
+   r5   converged: true: owner Some(LiveState { holding: false, head: Some(309), durable: Some(309), owed: false, epoch: Some(1), identity: Some("9d028963bcdf3c6a9fdf3bb2519cd96a9b6f491ab1ace5bde6cd75366e635207"), fence: 1, holders: ["6493285781992585995", "11988370032903344260", "12350510307578705812"], moving_to: ["6493285781992585995", "12350510307578705812"], recorded: ["6493285781992585995", "12350
+   r5   Convergence: held
+   r5   194 samples, 105 heads seen
+   r5   Agreement: held
+   r5   NoLoss: held
+   r5   chaos-replaced-c-8695 refused the owner: {}
+   r5   chaos-replaced-a-8695 refused the owner: {}
+   r5   chaos-replaced-b-8695 refused the owner: {}
+   r5   recovered from the candidate's loss after a further 561.334426ms
+   r5   taken over by chaos-replaced-a-8695 after 2.006716403s
+   r5   NoLoss (successor): held
+   r5   StaleNeverCommits (fences): held
+   r5 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 5.71s
+== run 5 exit 0
+   r6     Finished `release` profile [optimized] target(s) in 0.08s
+   r6      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r6 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-9313 destroyed at 464.20923ms
+   r6 chaos a candidate's store destroyed mid-stream: replacement answering at 666.449221ms
+   r6 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 939.97065ms
+   r6 chaos a candidate's store destroyed mid-stream: 182 writes, 182 acknowledged: p50 3008 us, p99 199180 us, p999 1544531 us, max 1544531 us; 3 over 50ms (sent+took): 0.00s+199ms 0.69s+1545ms 2.33s+104ms
+   r6 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(182), durable: Some(182), owed: false, epoch: Some(1), identity: Some("115cfe563c03fda2b820e20fbbe7a5354bd68a792331f6bed98940b8fc481dfc"), fence: 1, holders: ["9312638425340354081", "13328538053944845990"], moving_to: [], recorded: ["9312638425340354081", "13328538053944845990"] }); c
+   r6 chaos a candidate's store destroyed mid-stream: 215 samples, 63 heads seen
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-9313 refused the owner: {}
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-9313 refused the owner: {}
+   r6 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-9313 refused the owner: {}
+   r6 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 326.977101ms
+   r6 LD-D72 destroyed chaos-replaced-a-9313 successor Some(("chaos-replaced-a-9313", 2.005833434s)) replacement_served true
+   r6 LD-D72 counters chaos-replaced-a-9313 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r6 LD-D72 counters chaos-replaced-c-9313 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r6 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-a-9313 after 2.005833434s
+   r6 chaos a candidate's store destroyed mid-stream:
+   r6   candidate node chaos-replaced-a-9313 destroyed at 464.20923ms
+   r6   replacement answering at 666.449221ms
+   r6   the fleet rejoined at 939.97065ms
+   r6   every write acknowledged: held
+   r6   182 writes, 182 acknowledged: p50 3008 us, p99 199180 us, p999 1544531 us, max 1544531 us; 3 over 50ms (sent+took): 0.00s+199ms 0.69s+1545ms 2.33s+104ms
+   r6   converged: true: owner Some(LiveState { holding: false, head: Some(182), durable: Some(182), owed: false, epoch: Some(1), identity: Some("115cfe563c03fda2b820e20fbbe7a5354bd68a792331f6bed98940b8fc481dfc"), fence: 1, holders: ["9312638425340354081", "13328538053944845990"], moving_to: [], recorded: ["9312638425340354081", "13328538053944845990"] }); candidates [Some(LiveState { holding: true, hea
+   r6   Convergence: held
+   r6   215 samples, 63 heads seen
+   r6   Agreement: held
+   r6   NoLoss: held
+   r6   chaos-replaced-b-9313 refused the owner: {}
+   r6   chaos-replaced-a-9313 refused the owner: {}
+   r6   chaos-replaced-c-9313 refused the owner: {}
+   r6   recovered from the candidate's loss after a further 326.977101ms
+   r6   taken over by chaos-replaced-a-9313 after 2.005833434s
+   r6   NoLoss (successor): held
+   r6   StaleNeverCommits (fences): held
+   r6 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.14s
+== run 6 exit 0
+   r7     Finished `release` profile [optimized] target(s) in 0.09s
+   r7      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r7 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-9960 destroyed at 208.917316ms
+   r7 chaos a candidate's store destroyed mid-stream: replacement answering at 331.405712ms
+   r7 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.410921288s
+   r7 chaos a candidate's store destroyed mid-stream: 314 writes, 314 acknowledged: p50 581 us, p99 9100 us, p999 1639210 us, max 1639210 us; 3 over 50ms (sent+took): 0.00s+137ms 0.44s+1639ms 2.08s+103ms
+   r7 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(315), durable: Some(315), owed: false, epoch: Some(1), identity: Some("b1adc6532b20364a8f877963ade44c94d2fd1bd4eff2f8781548bbac247e9bc3"), fence: 1, holders: ["15142213261918767490", "17191267648917236630"], moving_to: [], recorded: ["15142213261918767490", "17191267648917236630"] });
+   r7 chaos a candidate's store destroyed mid-stream: 192 samples, 34 heads seen
+   r7 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-9960 refused the owner: {}
+   r7 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-9960 refused the owner: {}
+   r7 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-9960 refused the owner: {}
+   r7 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 379.850255ms
+   r7 LD-D72 destroyed chaos-replaced-a-9960 successor Some(("chaos-replaced-a-9960", 2.201157253s)) replacement_served true
+   r7 LD-D72 counters chaos-replaced-a-9960 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r7 LD-D72 counters chaos-replaced-c-9960 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r7 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-a-9960 after 2.201157253s
+   r7 chaos a candidate's store destroyed mid-stream:
+   r7   candidate node chaos-replaced-a-9960 destroyed at 208.917316ms
+   r7   replacement answering at 331.405712ms
+   r7   the fleet rejoined at 1.410921288s
+   r7   every write acknowledged: held
+   r7   314 writes, 314 acknowledged: p50 581 us, p99 9100 us, p999 1639210 us, max 1639210 us; 3 over 50ms (sent+took): 0.00s+137ms 0.44s+1639ms 2.08s+103ms
+   r7   converged: true: owner Some(LiveState { holding: false, head: Some(315), durable: Some(315), owed: false, epoch: Some(1), identity: Some("b1adc6532b20364a8f877963ade44c94d2fd1bd4eff2f8781548bbac247e9bc3"), fence: 1, holders: ["15142213261918767490", "17191267648917236630"], moving_to: [], recorded: ["15142213261918767490", "17191267648917236630"] }); candidates [Some(LiveState { holding: true, h
+   r7   Convergence: held
+   r7   192 samples, 34 heads seen
+   r7   Agreement: held
+   r7   NoLoss: held
+   r7   chaos-replaced-b-9960 refused the owner: {}
+   r7   chaos-replaced-a-9960 refused the owner: {}
+   r7   chaos-replaced-c-9960 refused the owner: {}
+   r7   recovered from the candidate's loss after a further 379.850255ms
+   r7   taken over by chaos-replaced-a-9960 after 2.201157253s
+   r7   NoLoss (successor): held
+   r7   StaleNeverCommits (fences): held
+   r7 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.36s
+== run 7 exit 0
+   r8     Finished `release` profile [optimized] target(s) in 0.09s
+   r8      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r8 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-10742 destroyed at 219.94571ms
+   r8 chaos a candidate's store destroyed mid-stream: replacement answering at 349.483339ms
+   r8 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.540878737s
+   r8 chaos a candidate's store destroyed mid-stream: 203 writes, 203 acknowledged: p50 1164 us, p99 102540 us, p999 1122134 us, max 1122134 us; 3 over 50ms (sent+took): 0.00s+114ms 0.42s+1122ms 1.66s+103ms
+   r8 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(203), durable: Some(203), owed: false, epoch: Some(1), identity: Some("dd2cdb73c30aea916bde5824cb35f2dc04653be1bb2546aebd758d42f87fd6e9"), fence: 1, holders: ["417837629774830361", "652853405566697641", "13489716438982476617"], moving_to: [], recorded: ["417837629774830361", "65285340
+   r8 chaos a candidate's store destroyed mid-stream: 155 samples, 44 heads seen
+   r8 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-10742 refused the owner: {}
+   r8 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-10742 refused the owner: {}
+   r8 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-10742 refused the owner: {}
+   r8 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 471.789642ms
+   r8 LD-D72 destroyed chaos-replaced-b-10742 successor Some(("chaos-replaced-b-10742", 2.039206293s)) replacement_served true
+   r8 LD-D72 counters chaos-replaced-b-10742 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r8 LD-D72 counters chaos-replaced-c-10742 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r8 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-b-10742 after 2.039206293s
+   r8 chaos a candidate's store destroyed mid-stream:
+   r8   candidate node chaos-replaced-b-10742 destroyed at 219.94571ms
+   r8   replacement answering at 349.483339ms
+   r8   the fleet rejoined at 1.540878737s
+   r8   every write acknowledged: held
+   r8   203 writes, 203 acknowledged: p50 1164 us, p99 102540 us, p999 1122134 us, max 1122134 us; 3 over 50ms (sent+took): 0.00s+114ms 0.42s+1122ms 1.66s+103ms
+   r8   converged: true: owner Some(LiveState { holding: false, head: Some(203), durable: Some(203), owed: false, epoch: Some(1), identity: Some("dd2cdb73c30aea916bde5824cb35f2dc04653be1bb2546aebd758d42f87fd6e9"), fence: 1, holders: ["417837629774830361", "652853405566697641", "13489716438982476617"], moving_to: [], recorded: ["417837629774830361", "652853405566697641", "13489716438982476617"] }); candi
+   r8   Convergence: held
+   r8   155 samples, 44 heads seen
+   r8   Agreement: held
+   r8   NoLoss: held
+   r8   chaos-replaced-a-10742 refused the owner: {}
+   r8   chaos-replaced-b-10742 refused the owner: {}
+   r8   chaos-replaced-c-10742 refused the owner: {}
+   r8   recovered from the candidate's loss after a further 471.789642ms
+   r8   taken over by chaos-replaced-b-10742 after 2.039206293s
+   r8   NoLoss (successor): held
+   r8   StaleNeverCommits (fences): held
+   r8 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.39s
+== run 8 exit 0
+   r9     Finished `release` profile [optimized] target(s) in 0.09s
+   r9      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r9 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-11436 destroyed at 328.481202ms
+   r9 chaos a candidate's store destroyed mid-stream: replacement answering at 495.252872ms
+   r9 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.550763892s
+   r9 chaos a candidate's store destroyed mid-stream: 231 writes, 231 acknowledged: p50 1101 us, p99 103089 us, p999 1054768 us, max 1054768 us; 3 over 50ms (sent+took): 0.00s+195ms 0.50s+1055ms 1.56s+103ms
+   r9 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(230), durable: Some(230), owed: false, epoch: Some(1), identity: Some("a10753411bc64621edd5a4505eaae47b2387e86419d273edecd16298f06548cd"), fence: 1, holders: ["2765188368144945446", "14420504260817543047"], moving_to: [], recorded: ["2765188368144945446", "14420504260817543047"] }); c
+   r9 chaos a candidate's store destroyed mid-stream: 131 samples, 29 heads seen
+   r9 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-11436 refused the owner: {}
+   r9 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-11436 refused the owner: {}
+   r9 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-11436 refused the owner: {}
+   r9 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 459.86917ms
+   r9 LD-D72 destroyed chaos-replaced-a-11436 successor Some(("chaos-replaced-c-11436", 2.496542229s)) replacement_served false
+   r9 LD-D72 counters chaos-replaced-a-11436 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r9 LD-D72 counters chaos-replaced-c-11436 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r9 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-c-11436 after 2.496542229s
+   r9 chaos a candidate's store destroyed mid-stream:
+   r9   candidate node chaos-replaced-a-11436 destroyed at 328.481202ms
+   r9   replacement answering at 495.252872ms
+   r9   the fleet rejoined at 1.550763892s
+   r9   every write acknowledged: held
+   r9   231 writes, 231 acknowledged: p50 1101 us, p99 103089 us, p999 1054768 us, max 1054768 us; 3 over 50ms (sent+took): 0.00s+195ms 0.50s+1055ms 1.56s+103ms
+   r9   converged: true: owner Some(LiveState { holding: false, head: Some(230), durable: Some(230), owed: false, epoch: Some(1), identity: Some("a10753411bc64621edd5a4505eaae47b2387e86419d273edecd16298f06548cd"), fence: 1, holders: ["2765188368144945446", "14420504260817543047"], moving_to: [], recorded: ["2765188368144945446", "14420504260817543047"] }); candidates [Some(LiveState { holding: true, hea
+   r9   Convergence: held
+   r9   131 samples, 29 heads seen
+   r9   Agreement: held
+   r9   NoLoss: held
+   r9   chaos-replaced-b-11436 refused the owner: {}
+   r9   chaos-replaced-a-11436 refused the owner: {}
+   r9   chaos-replaced-c-11436 refused the owner: {}
+   r9   recovered from the candidate's loss after a further 459.86917ms
+   r9   taken over by chaos-replaced-c-11436 after 2.496542229s
+   r9   NoLoss (successor): held
+   r9   StaleNeverCommits (fences): held
+   r9 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.08s
+== run 9 exit 0
+   r10     Finished `release` profile [optimized] target(s) in 0.08s
+   r10      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r10 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-12019 destroyed at 186.56236ms
+   r10 chaos a candidate's store destroyed mid-stream: replacement answering at 305.618992ms
+   r10 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 586.700748ms
+   r10 chaos a candidate's store destroyed mid-stream: 263 writes, 263 acknowledged: p50 633 us, p99 102776 us, p999 1826908 us, max 1826908 us; 3 over 50ms (sent+took): 0.00s+121ms 0.44s+1827ms 2.27s+103ms
+   r10 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(264), durable: Some(264), owed: false, epoch: Some(1), identity: Some("79c08b4d202c0b3c7cdd82bc82ab27039ba006cc4b0a0afaa0921bd9bd558a1b"), fence: 1, holders: ["11928763411587240921", "16638122880707809811"], moving_to: [], recorded: ["11928763411587240921", "16638122880707809811"] });
+   r10 chaos a candidate's store destroyed mid-stream: 207 samples, 31 heads seen
+   r10 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-12019 refused the owner: {}
+   r10 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-12019 refused the owner: {"fleet.live.hold_refused.not_a_member": 12}
+   r10 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-12019 refused the owner: {}
+   r10 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 384.005318ms
+   r10 LD-D72 destroyed chaos-replaced-a-12019 successor Some(("chaos-replaced-a-12019", 3.00544392s)) replacement_served true
+   r10 LD-D72 counters chaos-replaced-a-12019 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r10 LD-D72 counters chaos-replaced-c-12019 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r10 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-a-12019 after 3.00544392s
+   r10 chaos a candidate's store destroyed mid-stream:
+   r10   candidate node chaos-replaced-a-12019 destroyed at 186.56236ms
+   r10   replacement answering at 305.618992ms
+   r10   the fleet rejoined at 586.700748ms
+   r10   every write acknowledged: held
+   r10   263 writes, 263 acknowledged: p50 633 us, p99 102776 us, p999 1826908 us, max 1826908 us; 3 over 50ms (sent+took): 0.00s+121ms 0.44s+1827ms 2.27s+103ms
+   r10   converged: true: owner Some(LiveState { holding: false, head: Some(264), durable: Some(264), owed: false, epoch: Some(1), identity: Some("79c08b4d202c0b3c7cdd82bc82ab27039ba006cc4b0a0afaa0921bd9bd558a1b"), fence: 1, holders: ["11928763411587240921", "16638122880707809811"], moving_to: [], recorded: ["11928763411587240921", "16638122880707809811"] }); candidates [Some(LiveState { holding: true, h
+   r10   Convergence: held
+   r10   207 samples, 31 heads seen
+   r10   Agreement: held
+   r10   NoLoss: held
+   r10   chaos-replaced-b-12019 refused the owner: {}
+   r10   chaos-replaced-a-12019 refused the owner: {"fleet.live.hold_refused.not_a_member": 12}
+   r10   chaos-replaced-c-12019 refused the owner: {}
+   r10   recovered from the candidate's loss after a further 384.005318ms
+   r10   taken over by chaos-replaced-a-12019 after 3.00544392s
+   r10   NoLoss (successor): held
+   r10   StaleNeverCommits (fences): held
+   r10 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.88s
+== run 10 exit 0
+   r11     Finished `release` profile [optimized] target(s) in 0.09s
+   r11      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r11 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-a-12695 destroyed at 180.155471ms
+   r11 chaos a candidate's store destroyed mid-stream: replacement answering at 477.135103ms
+   r11 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.729513218s
+   r11 chaos a candidate's store destroyed mid-stream: 553 writes, 553 acknowledged: p50 1571 us, p99 13337 us, p999 212179 us, max 212179 us; 4 over 50ms (sent+took): 0.00s+107ms 0.18s+144ms 0.52s+212ms 0.73s+115ms
+   r11 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(553), durable: Some(553), owed: false, epoch: Some(1), identity: Some("824367a4d249013959e57d7fd15a064cded5bee2a0032ac5dbf93ac5bd543d59"), fence: 1, holders: ["6512366194724861655", "18281627341988719705"], moving_to: [], recorded: ["6512366194724861655", "18281627341988719705"] }); c
+   r11 chaos a candidate's store destroyed mid-stream: 182 samples, 122 heads seen
+   r11 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-12695 refused the owner: {}
+   r11 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-12695 refused the owner: {}
+   r11 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-12695 refused the owner: {}
+   r11 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 551.774224ms
+   r11 LD-D72 destroyed chaos-replaced-a-12695 successor Some(("chaos-replaced-b-12695", 2.258318999s)) replacement_served false
+   r11 LD-D72 counters chaos-replaced-a-12695 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r11 LD-D72 counters chaos-replaced-b-12695 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r11 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-b-12695 after 2.258318999s
+   r11 chaos a candidate's store destroyed mid-stream:
+   r11   candidate node chaos-replaced-a-12695 destroyed at 180.155471ms
+   r11   replacement answering at 477.135103ms
+   r11   the fleet rejoined at 1.729513218s
+   r11   every write acknowledged: held
+   r11   553 writes, 553 acknowledged: p50 1571 us, p99 13337 us, p999 212179 us, max 212179 us; 4 over 50ms (sent+took): 0.00s+107ms 0.18s+144ms 0.52s+212ms 0.73s+115ms
+   r11   converged: true: owner Some(LiveState { holding: false, head: Some(553), durable: Some(553), owed: false, epoch: Some(1), identity: Some("824367a4d249013959e57d7fd15a064cded5bee2a0032ac5dbf93ac5bd543d59"), fence: 1, holders: ["6512366194724861655", "18281627341988719705"], moving_to: [], recorded: ["6512366194724861655", "18281627341988719705"] }); candidates [Some(LiveState { holding: true, hea
+   r11   Convergence: held
+   r11   182 samples, 122 heads seen
+   r11   Agreement: held
+   r11   NoLoss: held
+   r11   chaos-replaced-c-12695 refused the owner: {}
+   r11   chaos-replaced-a-12695 refused the owner: {}
+   r11   chaos-replaced-b-12695 refused the owner: {}
+   r11   recovered from the candidate's loss after a further 551.774224ms
+   r11   taken over by chaos-replaced-b-12695 after 2.258318999s
+   r11   NoLoss (successor): held
+   r11   StaleNeverCommits (fences): held
+   r11 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 5.84s
+== run 11 exit 0
+   r12     Finished `release` profile [optimized] target(s) in 0.09s
+   r12      Running tests/live_chaos.rs (target/release/deps/live_chaos-ffd1da26695bfb6b)
+   r12 chaos a candidate's store destroyed mid-stream: candidate node chaos-replaced-b-13282 destroyed at 189.667915ms
+   r12 chaos a candidate's store destroyed mid-stream: replacement answering at 307.391301ms
+   r12 chaos a candidate's store destroyed mid-stream: the fleet rejoined at 1.4686748s
+   r12 chaos a candidate's store destroyed mid-stream: 245 writes, 245 acknowledged: p50 737 us, p99 12731 us, p999 1133218 us, max 1133218 us; 2 over 50ms (sent+took): 0.00s+124ms 0.32s+1133ms
+   r12 chaos a candidate's store destroyed mid-stream: converged: true: owner Some(LiveState { holding: false, head: Some(245), durable: Some(245), owed: false, epoch: Some(1), identity: Some("d43f751b75afcf503a887be2a4a9d50fd48baad7fc0166b3b14737e43ed0b8ed"), fence: 1, holders: ["9833712403867197201", "14274928421003803245"], moving_to: ["1952059196836188301", "9833712403867197201", "1427492842100380324
+   r12 chaos a candidate's store destroyed mid-stream: 130 samples, 33 heads seen
+   r12 chaos a candidate's store destroyed mid-stream: chaos-replaced-a-13282 refused the owner: {}
+   r12 chaos a candidate's store destroyed mid-stream: chaos-replaced-b-13282 refused the owner: {}
+   r12 chaos a candidate's store destroyed mid-stream: chaos-replaced-c-13282 refused the owner: {}
+   r12 chaos a candidate's store destroyed mid-stream: recovered from the candidate's loss after a further 635.962132ms
+   r12 LD-D72 destroyed chaos-replaced-b-13282 successor Some(("chaos-replaced-c-13282", 2.169387222s)) replacement_served false
+   r12 LD-D72 counters chaos-replaced-b-13282 replacement true takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r12 LD-D72 counters chaos-replaced-c-13282 replacement false takeover_waits_key=0 takeover_key_arrived=0 takeover_no_key_exhausted=0 no_key=0 reclaimed=0 lost=0
+   r12 chaos a candidate's store destroyed mid-stream: taken over by chaos-replaced-c-13282 after 2.169387222s
+   r12 chaos a candidate's store destroyed mid-stream:
+   r12   candidate node chaos-replaced-b-13282 destroyed at 189.667915ms
+   r12   replacement answering at 307.391301ms
+   r12   the fleet rejoined at 1.4686748s
+   r12   every write acknowledged: held
+   r12   245 writes, 245 acknowledged: p50 737 us, p99 12731 us, p999 1133218 us, max 1133218 us; 2 over 50ms (sent+took): 0.00s+124ms 0.32s+1133ms
+   r12   converged: true: owner Some(LiveState { holding: false, head: Some(245), durable: Some(245), owed: false, epoch: Some(1), identity: Some("d43f751b75afcf503a887be2a4a9d50fd48baad7fc0166b3b14737e43ed0b8ed"), fence: 1, holders: ["9833712403867197201", "14274928421003803245"], moving_to: ["1952059196836188301", "9833712403867197201", "14274928421003803245"], recorded: ["1952059196836188301", "983371
+   r12   Convergence: held
+   r12   130 samples, 33 heads seen
+   r12   Agreement: held
+   r12   NoLoss: held
+   r12   chaos-replaced-a-13282 refused the owner: {}
+   r12   chaos-replaced-b-13282 refused the owner: {}
+   r12   chaos-replaced-c-13282 refused the owner: {}
+   r12   recovered from the candidate's loss after a further 635.962132ms
+   r12   taken over by chaos-replaced-c-13282 after 2.169387222s
+   r12   NoLoss (successor): held
+   r12   StaleNeverCommits (fences): held
+   r12 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 6.32s
+== run 12 exit 0
