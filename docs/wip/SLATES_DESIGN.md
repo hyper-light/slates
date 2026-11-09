@@ -14551,8 +14551,10 @@ Status: built 2026-11-06.
   is left. So a boot's give-back of memories the journal did not write (18 GB a shard on adas-macbook-pro-2, 12 to 43
   ms in one poll before) holds the shard one quantum a step. The oracle gives back generated shares from the top
   (`JournalStep::GiveBack { quarters }`). The test of the shard held is
-  `a_boot_give_back_holds_its_shard_no_longer_than_its_noise_floor`: a probe's longest wait through the boot's
-  give-back against its own quiet floor, skipping loudly on a host too loaded to judge.
+  `a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step`: each step's CPU on the shard thread's own clock, which load
+  does not inflate. Until 2026-11-08 it also held a probe's longest wait against a quiet floor, which on a loaded host
+  measured the host (10.4 ms against 2.2 ms at load 65), and waited for the bytes given back to stand still, where it
+  now waits on the journal having nothing left to give back.
 - The sibling of the same shape, sliced the same day: the Linux FUSE write log (A-63) gave back its whole record
   area once per emptying (`WriteLog::purge`), whatever its records had reached. It now gives back only as far as
   records reached since its last give-back (the whole area once, for a log opened over a predecessor's object), a slice
