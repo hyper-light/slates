@@ -216,6 +216,8 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
           tally.barriered.push(dispatched.opcode.unwrap());
         }
         if refused {
+          // Diagnostic (2026-11-09, the race under load): which request's barrier took the refusal.
+          eprintln!("owner_turn: refused the barrier of {:?}", dispatched.opcode);
           tally.refused += 1;
           let given_back = reclaim_dispatched(
             &mut state,
