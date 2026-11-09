@@ -4,8 +4,12 @@
 > CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then dropped the result
 > (`xshard.reply_dropped`), and `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship, the merge plane's
 > deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full channel; a task refused at
-> admission answered its client once (`AnswerUnstarted`). Each lost its reply, and the client waited out its deadline:
-> 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. Now every one waits for room for as long as the shard it
+> admission answered its client once (`AnswerUnstarted`). Each lost what it carried: 4,074 to 4,518 a run of the
+> 3,000-client rung on main 80be552a. A diagnostic build of main db9c514e (2026-11-09) counted every one an
+> acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418 in two runs), not a verb's reply: no client waited out
+> a reply deadline (this entry said each did until then). A lost part leaves its shard's release unsettled, and the
+> client is refused `AcknowledgementOwed` until a later acknowledgement settles it, about 27,000 times a run, each a
+> pause and a resend. Now every one waits for room for as long as the shard it
 > goes to lives; only a shard gone leaves a reply undelivered. A caller that cannot await (`hand_reply_home`,
 > `AnswerUnstarted`) hands the reply to the client's shard's channel at once and waits on a task of its own shard only
 > when that channel is full: a task for every reply failed main's `a_forward_refused_at_admission_answers_its_client` 3 of

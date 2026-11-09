@@ -186,9 +186,10 @@ impl<T: 'static> Future for CrossShardCall<T> {
 /// lives (§4.3: backpressure, never a drop). A full channel drains as the origin turns. Only an origin gone (its client
 /// with it) leaves the result undelivered, counted on this shard (`xshard.reply_dropped`). Bounded by what waits: one
 /// result a request in flight, which the clients' credit bounds. Before 2026-10-07 every refusal dropped the reply at
-/// once and unseen; until 2026-11-09 one still refused after a coordinator period was dropped, and its client waited out
-/// its whole reply deadline (about 4,300 a run of the 3,000-client rung on main 80be552a;
-/// `crates/server/tests/reply_room.rs`).
+/// once and unseen; until 2026-11-09 one still refused after a coordinator period was dropped: about 4,300 a run of the
+/// 3,000-client rung on main, every one an acknowledgement scatter's part, whose loss refused its client
+/// `AcknowledgementOwed` until a later acknowledgement settled the release (`crates/server/tests/reply_room.rs` shows the
+/// same loss of a forwarded verb's answer).
 pub async fn send_back(origin: u16, back: SpawnRequest) {
   if !given_room(origin, Control::Spawn(Box::new(back))).await {
     state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
