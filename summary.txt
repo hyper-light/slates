@@ -1,0 +1,86 @@
+image: ubuntu24 20261101.360.1; kernel 7.0.0-1017-azure
+export=success direct=success all=success
+=== export: 625 lines
+597:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+621:ERROR: failed to delete cluster "slates-export": failed to delete nodes: command "docker rm -f -v slates-export-control-plane slates-export-worker" failed with error: exit status 1
+624:Error response from daemon: cannot remove container "/slates-export-worker": could not kill: tried to kill container, but did not receive an exit event
+kind export: a pod's read-only map through kubelet's RPC-with-TLS mount followed another path's change after a stat and a read, 4.3 s after the change
+kind export: slates-export-worker's NFS mounts (kubelet's own; field 6 is the per-mount flags):
+1241 493 0:237 / /var/lib/kubelet/pods/7a3b4676-fe74-425f-98af-f7d477d5f489/volumes/kubernetes.io~nfs/slates-export rw,nosuid,nodev,relatime shared:459 - nfs4 10.96.200.20:/published@1.74dd1458435f2f59a128366fdd70afe2 rw,vers=4.2,rsize=262144,wsize=262144,namlen=255,hard,fatal_neterrors=ENETDOWN:ENETUNREACH,proto=tcp,port=7000,timeo=600,retrans=2,sec=sys,xprtsec=mtls,clientaddr=172.18.0.3,local_lock=none,addr=10.96.200.20
+
+kind export: the holder pod's view: 1375 1367 0:237 / /data rw,relatime - nfs4 10.96.200.20:/published@1.74dd1458435f2f59a128366fdd70afe2 rw,vers=4.2,rsize=262144,wsize=262144,namlen=255,hard,fatal_neterrors=ENETDOWN:ENETUNREACH,proto=tcp,port=7000,timeo=600,retrans=2,sec=sys,xprtsec=mtls,clientaddr=172.18.0.3,local_lock=none,addr=10.96.200.20
+
+kind export: a planted setuid-root binary ran as 0 without allowPrivilegeEscalation: false and as 65534 with it
+kind export: kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote
+kind: $ kind delete cluster --name slates-export
+Deleting cluster "slates-export" ...
+ERROR: failed to delete cluster "slates-export": failed to delete nodes: command "docker rm -f -v slates-export-control-plane slates-export-worker" failed with error: exit status 1
+
+Command Output: slates-export-control-plane
+Error response from daemon: cannot remove container "/slates-export-worker": could not kill: tried to kill container, but did not receive an exit event
+kind export: kind: `kind delete cluster --name slates-export` exited 1
+=== direct: 228 lines
+161:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+205:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+219:kind direct: the restricted namespace refuses a hostPath pod: Error from server (Forbidden): error when creating "STDIN": pods "direct-restricted-hostpath" is forbidden: violates PodSecurity "restricted:latest": restricted volume types (volume "rendezvous" uses restricted volume type "hostPath")
+kind direct: direct-own-write: direct-write: wrote 4194304
+kind direct: pod direct-own-map-write at 10.244.1.6, pod 0 at 10.244.1.4, ended Succeeded
+kind direct: direct-own-map-write: direct-map-write: differing=37 synced=37 released=0 whole=true
+kind direct: own pod direct-map-write: differing=37 synced=37 released=0 whole=true
+kind direct: a pod with a network namespace of its own wrote a file in place through a writable direct map, reaching the daemon at the rendezvous's socket file
+kind direct: the restricted namespace refuses a hostPath pod: Error from server (Forbidden): error when creating "STDIN": pods "direct-restricted-hostpath" is forbidden: violates PodSecurity "restricted:latest": restricted volume types (volume "rendezvous" uses restricted volume type "hostPath")
+kind direct: pod direct-restricted-write at 10.244.1.7, pod 0 at 10.244.1.4, ended Succeeded
+kind direct: direct-restricted-write: direct-write: wrote 4194304
+kind direct: pod direct-restricted-map-write at 10.244.1.8, pod 0 at 10.244.1.4, ended Succeeded
+kind direct: direct-restricted-map-write: direct-map-write: differing=37 synced=37 released=0 whole=true
+kind direct: restricted pod direct-map-write: differing=37 synced=37 released=0 whole=true
+kind direct: a pod in a namespace enforcing the restricted profile wrote a file in place through a writable direct map, the rendezvous directory mounted through a claim
+kind: $ kind delete cluster --name slates-direct
+Deleting cluster "slates-direct" ...
+Deleted nodes: ["slates-direct-control-plane" "slates-direct-worker"]
+=== all: 416 lines
+170:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+180:kind:   slates-0: host=3088483204149821630 f=1 members=[3088483204149821630, 5723907127204799819, 12905895745974433238] peers_probed=2 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=0 version=2 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+181:kind:   slates-1: host=5723907127204799819 f=1 members=[3088483204149821630, 5723907127204799819, 12905895745974433238] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+182:kind:   slates-2: host=12905895745974433238 f=1 members=[3088483204149821630, 5723907127204799819, 12905895745974433238] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+190:kind:   slates-0: host=3088483204149821630 f=1 members=[676865196715109973, 3088483204149821630, 12905895745974433238] peers_probed=2 leads=true base=10 span=10 tail_ns=1335624 spread_ns=1000000 samples=366 term=1 priority_ns=257310±1000000 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=41 version=12 configuration_members=3 voters=3 joint=false settled=8/8 retirements=0
+191:kind:   slates-1: host=676865196715109973 f=1 members=[676865196715109973, 3088483204149821630, 12905895745974433238] peers_probed=2 leads=false base=10 span=10 tail_ns=1466305 spread_ns=1151360 samples=167 term=1 priority_ns=206000±1000000 rank=0 lease=true pre_elections=0 elections=0 resolve_refused=0 version=12 configuration_members=3 voters=3 joint=false settled=8/8 retirements=0
+192:kind:   slates-2: host=12905895745974433238 f=1 members=[676865196715109973, 3088483204149821630, 12905895745974433238] peers_probed=2 leads=false base=10 span=10 tail_ns=1222921 spread_ns=1000000 samples=234 term=1 priority_ns=155787±1000000 rank=0 lease=true pre_elections=0 elections=0 resolve_refused=41 version=12 configuration_members=3 voters=3 joint=false settled=8/8 retirements=0
+214:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+224:kind:   slates-0: host=14538001105859442715 f=2 members=[2612176425929382661, 3067599132918294212, 4660009536735252084, 14538001105859442715, 15703314800678573078] peers_probed=4 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=114 version=4 configuration_members=5 voters=1 joint=false settled=4/4 retirements=0
+225:kind:   slates-1: host=15703314800678573078 f=2 members=[2612176425929382661, 3067599132918294212, 4660009536735252084, 14538001105859442715, 15703314800678573078] peers_probed=4 leads=false base=10 span=10 tail_ns=1190964 spread_ns=1000000 samples=59 term=1 priority_ns=0±0 rank=0 lease=true pre_elections=0 elections=0 resolve_refused=115 version=6 configuration_members=5 voters=1 joint=false settled=4/4 retirements=0
+226:kind:   slates-2: host=3067599132918294212 f=2 members=[2612176425929382661, 3067599132918294212, 4660009536735252084, 14538001105859442715, 15703314800678573078] peers_probed=4 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=146 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+227:kind:   slates-3: host=2612176425929382661 f=2 members=[2612176425929382661, 3067599132918294212, 4660009536735252084, 14538001105859442715, 15703314800678573078] peers_probed=4 leads=false base=10 span=10 tail_ns=1181532 spread_ns=1000000 samples=49 term=1 priority_ns=0±0 rank=0 lease=true pre_elections=0 elections=0 resolve_refused=0 version=6 configuration_members=5 voters=1 joint=false settled=4/4 retirements=0
+228:kind:   slates-4: host=4660009536735252084 f=2 members=[2612176425929382661, 3067599132918294212, 4660009536735252084, 14538001105859442715, 15703314800678573078] peers_probed=4 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=158 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+249:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+259:kind:   slates-0: host=4493525536013225903 f=1 members=[149732456896793887, 4493525536013225903, 18012238997724353358] peers_probed=2 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=0 version=2 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+260:kind:   slates-1: host=18012238997724353358 f=1 members=[149732456896793887, 4493525536013225903, 18012238997724353358] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+261:kind:   slates-2: host=149732456896793887 f=1 members=[149732456896793887, 4493525536013225903, 18012238997724353358] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+282:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+292:kind:   slates-0: host=3000391387972434278 f=1 members=[3000391387972434278, 4546078237292707765, 17696115878226109310] peers_probed=2 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=0 version=2 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+293:kind:   slates-1: host=4546078237292707765 f=1 members=[3000391387972434278, 4546078237292707765, 17696115878226109310] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=3 voters=1 joint=false settled=1/2 retirements=0
+294:kind:   slates-2: host=17696115878226109310 f=1 members=[3000391387972434278, 4546078237292707765, 17696115878226109310] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+319:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+329:kind:   slates-0: host=9875268744065065891 f=1 members=[3298151176248634514, 5702614280095123353, 9875268744065065891] peers_probed=2 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=0 version=2 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+330:kind:   slates-1: host=3298151176248634514 f=1 members=[3298151176248634514, 5702614280095123353, 9875268744065065891] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+331:kind:   slates-2: host=5702614280095123353 f=1 members=[3298151176248634514, 5702614280095123353, 9875268744065065891] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+356:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+366:kind:   slates-0: host=1443300308030747833 f=1 members=[1443300308030747833, 2934585342723321756, 11618594869781796521] peers_probed=2 leads=true base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=1 resolve_refused=0 version=2 configuration_members=3 voters=1 joint=false settled=2/2 retirements=0
+367:kind:   slates-1: host=11618594869781796521 f=1 members=[1443300308030747833, 2934585342723321756, 11618594869781796521] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=0 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=0 configuration_members=0 voters=0 joint=false settled=0/0 retirements=0
+368:kind:   slates-2: host=2934585342723321756 f=1 members=[1443300308030747833, 2934585342723321756, 11618594869781796521] peers_probed=2 leads=false base=10 span=10 tail_ns=0 spread_ns=0 samples=0 term=1 priority_ns=0±0 rank=0 lease=false pre_elections=0 elections=0 resolve_refused=0 version=3 configuration_members=3 voters=1 joint=false settled=1/2 retirements=0
+393:reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+kind:   wan: 18 samples over 186 s, leader changes 0, leader 3000391387972434278 ;
+    slates-0: tail 194.4 ms spread 37.6 ms → base 20 (expected ⌈10 × tail / 100 ms⌉ = 20) span 10 samples 4897 leads true
+    slates-1: tail 212.8 ms spread 53.6 ms → base 22 (expected ⌈10 × tail / 100 ms⌉ = 22) span 10 samples 3630 leads false
+    slates-2: tail 139.3 ms spread 58.5 ms → base 14 (expected ⌈10 × tail / 100 ms⌉ = 14) span 10 samples 3726 leads false
+kind:   wan-loss: 18 samples over 186 s, leader changes 0, leader 9875268744065065891 ;
+    slates-0: tail 214.0 ms spread 60.6 ms → base 22 (expected ⌈10 × tail / 100 ms⌉ = 22) span 10 samples 4769 leads true
+    slates-1: tail 224.9 ms spread 60.7 ms → base 23 (expected ⌈10 × tail / 100 ms⌉ = 23) span 10 samples 3547 leads false
+    slates-2: tail 141.3 ms spread 57.2 ms → base 15 (expected ⌈10 × tail / 100 ms⌉ = 15) span 10 samples 3642 leads false
+kind:   ceiling: 18 samples over 186 s, leader changes 0, leader 1443300308030747833 ;
+    slates-0: tail 701.2 ms spread 1.0 ms → base 71 (expected ⌈10 × tail / 100 ms⌉ = 71) span 10 samples 3918 leads true
+    slates-1: tail 701.1 ms spread 1.0 ms → base 71 (expected ⌈10 × tail / 100 ms⌉ = 71) span 10 samples 3499 leads false
+    slates-2: tail 351.1 ms spread 1.0 ms → base 36 (expected ⌈10 × tail / 100 ms⌉ = 36) span 10 samples 3530 leads false
+kind: $ kind delete cluster --name slates-lane
+Deleting cluster "slates-lane" ...
+Deleted nodes: ["slates-lane-worker" "slates-lane-worker4" "slates-lane-worker2" "slates-lane-worker5" "slates-lane-control-plane" "slates-lane-worker3"]
