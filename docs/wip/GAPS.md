@@ -9007,6 +9007,24 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
 
+### 2026-11-08: a restarted node's peers kept their sessions to its old process (A-261, stateless reset)
+
+**Fixed in the transport.** On loadtest-scale's primary-kill rung, the client node forwarded into its record session
+to the restarted primary for 25 to 135 s. The new process dropped every packet for the old session
+(`unknown_id`). With A-261 it answers the first such packet with a stateless reset (RFC 9000 §10.3). The reset ends in
+the token the old process issued for the session inside the encrypted session, from a key that only the node's
+identity derives. The client node ends the session `PeerReset`, drops the link (`fleet.link.peer_reset`) and dials the
+new process. In simulation the session ended one round trip after its first packet (10.0 ms against 10 ms). Record:
+`docs/bugs/2026-11-08-a-restarted-node-left-its-peers-sessions-to-it-in-place.md`.
+- **Still open:**
+  - An accepting session whose dialer restarted onto another port is not reset, since nothing answers at the old
+    port. It ends on its own timers, as before. A restart that rebinds the old port does reset it: a dialer's own
+    socket answers strays too.
+  - A peer restarted under another identity, a lost reset, a silent peer and an older build all fall to
+    loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
+    bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
+    here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
+
 ### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
 
 - **Found** by the supervisor beside 518a1e82 (the same predicate in status). `Daemon::fleet_meshed` judged the mesh
