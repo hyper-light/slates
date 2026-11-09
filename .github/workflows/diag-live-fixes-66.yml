@@ -1,0 +1,55 @@
+name: DIAG live-fixes the healer restores the named holders and republishes, red arm (not for main)
+
+on:
+  push:
+    branches: [diag-live-fixes-66]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  arm:
+    name: Healer red on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The tests
+        shell: bash
+        run: |
+          R=../results.txt
+          echo "red on ${{ matrix.os }}, $(getconf _NPROCESSORS_ONLN) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          for run in 1 2 3; do
+            for t in a_heal_leaves_the_head_naming_holders_that_hold_the_content a_heal_republishes_the_head_once_a_named_holder_has_left a_holder_that_lost_placed_content_is_repaired_by_the_healer; do
+              status=0
+              perl -e 'alarm shift; exec @ARGV' 1500 cargo test --locked -p slates-server --test fleet -- --nocapture --exact $t > ../run.log 2>&1 || status=$?
+              echo "== run $run $t exit $status" | tee -a $R
+              grep -E -A3 'panicked|^test result|fleet wait gave up' ../run.log | cut -c1-2500 >> $R || true
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-66 ${{ matrix.os }} results"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-live-fixes-66-${{ matrix.os }}"
