@@ -1,0 +1,97 @@
+---
+name: DIAG slabs -- the live-guest lane with the workspace at /mnt/src, on the 26.04
+  image (not for main)
+'on':
+  push:
+    branches:
+    - diag-slabs-[0-9]*
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  live-guest:
+    name: live guest over vhost-user (QEMU), the workspace at /mnt/src
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@v4
+    - name: Open KVM to the job
+      run: |
+        if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+        ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+    - name: Build the guest image
+      run: docker build -t slates-guest ci/guest
+    - name: The virtio-fs suite with the live guest
+      shell: bash
+      run: |
+        set -o pipefail
+        # `seccomp=unconfined` was needed partly to let io_uring through Docker's default profile; that
+        # reason left with A-136 (2026-10-18, Linux runs on epoll). It is kept because QEMU in this lane
+        # may still need it — whoever owns this lane should test dropping it, which would be a strict
+        # hardening of the CI container.
+        docker run --rm --security-opt seccomp=unconfined \
+          $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+          -v "$PWD":/src -w /src slates-guest sh -c \
+          'SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+           SLATES_GUEST_KERNEL=/guest/vmlinuz SLATES_GUEST_INITRD=/guest/initrd.gz \
+           cargo test -p slates-server --test virtiofs -- --nocapture' 2>&1 | tee live-guest.log
+        # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
+        if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
+        grep -q "guest workload git: Identical" live-guest.log
+        grep -q "guest suite fsx: ok" live-guest.log
+        grep -q "guest suite fsstress: ok" live-guest.log
+        grep -q "guest suite pjdfstest: ok" live-guest.log
+      continue-on-error: true
+    - name: slates' own device with DAX in QEMU
+      shell: bash
+      run: |
+        set -o pipefail
+        docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+          --device /dev/fuse --cap-add SYS_ADMIN \
+          $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+          -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
+          'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+             --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+           SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+           SLATES_GUEST_KERNEL=/guest/vmlinuz \
+           SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
+           cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+        # The image provides the whole environment, so a skip is a vacuous pass and fails.
+        if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+        grep -q "guest over slates' own device in qemu: QEMU emulator version 11" guest-vhost.log
+      continue-on-error: true
+    - name: The image form in QEMU
+      shell: bash
+      run: |
+        set -o pipefail
+        docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+          --device /dev/fuse --cap-add SYS_ADMIN \
+          $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+          -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
+          'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+           SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+           SLATES_GUEST_KERNEL=/guest/vmlinuz \
+           SLATES_GUEST_MODULES="/lib/modules/$(ls /lib/modules | head -1)" \
+           SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
+           cargo test -p slates-cli --test guest_image -- --nocapture --test-threads=1' 2>&1 | tee guest-image.log
+        if grep -q "SKIP" guest-image.log; then echo "an image test was skipped"; exit 1; fi
+        grep -q "test result: ok. 7 passed" guest-image.log
+      continue-on-error: true
+    - name: Publish
+      if: always()
+      shell: bash
+      run: |
+        {
+          echo "## image: ${ImageOS:-?} ${ImageVersion:-?}"
+          for f in live-guest.log guest-vhost.log guest-image.log; do
+            echo "## $f"; [ -f "$f" ] && grep -E "^test result|panicked|SKIP|QEMU emulator version|Permission denied|guest suite|guest workload" "$f" | head -40
+          done
+        } > own.txt 2>&1
+        export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+        blob=$(git hash-object -w own.txt); tree=$(printf "100644 blob %s\town.txt\n" "$blob" | git mktree)
+        commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)")
+        git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
