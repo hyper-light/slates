@@ -1,0 +1,37 @@
+# t/reparse/01.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 33bc9c9160d188aa3329dd71a97425c6316f153d447952150d0e60568f8efd47
+ok 1 - expect "CreateDirectory 0000000d 0" 0
+ok 2 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x10) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x100000000002f FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 3 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F" 0 - got ERROR_INVALID_FUNCTION
+not ok 4 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x410) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x100000000002f FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 5 - expect "GetReparsePoint 0000000d" 0 - got ERROR(4390)
+not ok 6 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F" 0 - got ERROR_INVALID_FUNCTION
+not ok 7 - expect "GetReparsePoint 0000000d" 0 - got ERROR(4390)
+not ok 8 - expect "SetReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F" ERROR(4394) - got ERROR_INVALID_FUNCTION
+not ok 9 - expect "SetReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F" ERROR(4391) - got ERROR_INVALID_FUNCTION
+ok 10 - expect "RemoveDirectory 0000000d" 0
+ok 11 - expect "CreateDirectory 0000000d 0" 0
+ok 12 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x10) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x1000000000030 FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 13 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F" 0 - got ERROR_INVALID_FUNCTION
+not ok 14 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x410) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x1000000000030 FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 15 - expect "DeleteReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}" ERROR(4394) - got ERROR(4390)
+not ok 16 - expect "DeleteReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52}" ERROR(4391) - got ERROR(4390)
+not ok 17 - expect "DeleteReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}" 0 - got ERROR(4390)
+ok 18 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x10) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x1000000000030 FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 19 - expect "RemoveDirectory 0000000d" 0
+ok 20 - expect "CreateDirectory 0000000d 0" 0
+ok 21 - expect "CreateFile 0000000d\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 22 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x10) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x1000000000031 FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 23 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F" ERROR_DIR_NOT_EMPTY - got ERROR_INVALID_FUNCTION
+ok 24 - expect "DeleteFile 0000000d\1" 0
+not ok 25 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F" 0 - got ERROR_INVALID_FUNCTION
+not ok 26 - expect "GetFileInformation 0000000d" (r[0]["FileAttributes"] == 0x410) - result [CreationTime="2026-11-09T22:45:16Z" FileAttributes=0x10 FileIndex=0x1000000000031 FileSize=0x0 LastAccessTime="2026-11-09T22:45:16Z" LastWriteTime="2026-11-09T22:45:16Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+not ok 27 - expect "GetReparsePoint 0000000d" 0 - got ERROR(4390)
+not ok 28 - expect "CreateFile 0000000d\2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" ERROR_CANT_ACCESS_FILE - got 0
+not ok 29 - expect "RemoveDirectory 0000000d" 0 - got ERROR_DIR_NOT_EMPTY
+not ok 30 - expect "CreateDirectory 0000000d 0" 0 - got ERROR_ALREADY_EXISTS
+not ok 31 - expect "SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F" 0 - got ERROR_INVALID_FUNCTION
+ok 32 - expect "CreateDirectory 0000000d 0" ERROR_ALREADY_EXISTS
+ok 33 - expect "CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" ERROR_ACCESS_DENIED
+ok 34 - expect "CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0" ERROR_ACCESS_DENIED
+not ok 35 - expect "RemoveDirectory 0000000d" 0 - got ERROR_DIR_NOT_EMPTY
+1..35

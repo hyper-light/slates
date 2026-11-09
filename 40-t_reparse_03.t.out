@@ -1,0 +1,28 @@
+# t/reparse/03.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 2a0b63a4f052f6bda94598e7f2b6b06cfc73dff6d3d18b8b6505b917b7e1ab53
+ok 1 - expect "CreateSymbolicLink 00000010 00000011 SYMBOLIC_LINK_FLAG_DIRECTORY" 0
+ok 2 - expect "GetFileInformation 00000010" (r[0]["FileAttributes"] == 0x410) - result [CreationTime="2026-11-09T22:45:17Z" FileAttributes=0x410 FileIndex=0x1000000000041 FileSize=0x8 LastAccessTime="2026-11-09T22:45:17Z" LastWriteTime="2026-11-09T22:45:17Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 3 - expect "GetReparsePoint 00000010" (r[0]["ReparseTag"] == "IO_REPARSE_TAG_SYMLINK" and r[0]["SubstituteName"] == dstname and r[0]["PrintName"] == dstname and r[0]["Flags"] == 1) - result [Flags=0x1 PrintName="00000011" ReparseTag="IO_REPARSE_TAG_SYMLINK" SubstituteName="00000011"]
+ok 4 - testeval(not safeopen(os.path.join(srcname, "1")))
+ok 5 - expect "CreateDirectory 00000011 0" 0
+ok 6 - expect "CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 7 - testeval(safeopen(os.path.join(srcname, "1")))
+ok 8 - expect "DeleteFile 00000011\1" 0
+ok 9 - expect "RemoveDirectory 00000011" 0
+ok 10 - testeval(not safeopen(os.path.join(srcname, "1")))
+ok 11 - expect "CreateDirectory 00000010 0" ERROR_ALREADY_EXISTS
+ok 12 - expect "CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" ERROR_ACCESS_DENIED
+ok 13 - expect "RemoveDirectory 00000010" 0
+ok 14 - expect "CreateSymbolicLink 00000010 E:\conformance-6660\winfstest\00000011 SYMBOLIC_LINK_FLAG_DIRECTORY" 0
+ok 15 - expect "GetFileInformation 00000010" (r[0]["FileAttributes"] == 0x410) - result [CreationTime="2026-11-09T22:45:17Z" FileAttributes=0x410 FileIndex=0x1000000000045 FileSize=0x26 LastAccessTime="2026-11-09T22:45:17Z" LastWriteTime="2026-11-09T22:45:17Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 16 - expect "GetReparsePoint 00000010" (r[0]["ReparseTag"] == "IO_REPARSE_TAG_SYMLINK" and r[0]["SubstituteName"] == "\\??\\" + (dstpath if "\\" != dstpath[:1] else "UNC" + dstpath[1:]) and r[0]["PrintName"] == (dstpath if "\\" != dstpath[:1] else dstpath[1:]) and r[0]["Flags"] == 0) - result [Flags=0x0 PrintName="E:\\conformance-6660\\winfstest\\00000011" ReparseTag="IO_REPARSE_TAG_SYMLINK" SubstituteName="\\??\\E:\\conformance-6660\\winfstest\\00000011"]
+ok 17 - testeval(not safeopen(os.path.join(srcname, "1")))
+ok 18 - expect "CreateDirectory 00000011 0" 0
+ok 19 - expect "CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 20 - testeval(safeopen(os.path.join(srcname, "1")))
+ok 21 - expect "DeleteFile 00000011\1" 0
+ok 22 - expect "RemoveDirectory 00000011" 0
+ok 23 - testeval(not safeopen(os.path.join(srcname, "1")))
+ok 24 - expect "CreateDirectory 00000010 0" ERROR_ALREADY_EXISTS
+ok 25 - expect "CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" ERROR_ACCESS_DENIED
+ok 26 - expect "RemoveDirectory 00000010" 0
+1..26

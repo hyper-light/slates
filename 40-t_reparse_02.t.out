@@ -1,0 +1,43 @@
+# t/reparse/02.t at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf, sha256 a7e72c5e4b3be1c2a003168425435b8bb6ccccef1e0c71b2a8fe6914d970c3a5
+ok 1 - expect "CreateSymbolicLink 0000000e 0000000f 0" 0
+ok 2 - expect "GetFileInformation 0000000e" (r[0]["FileAttributes"] == 0x420) - result [CreationTime="2026-11-09T22:45:17Z" FileAttributes=0x420 FileIndex=0x1000000000035 FileSize=0x8 LastAccessTime="2026-11-09T22:45:17Z" LastWriteTime="2026-11-09T22:45:17Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 3 - expect "GetReparsePoint 0000000e" (r[0]["ReparseTag"] == "IO_REPARSE_TAG_SYMLINK" and r[0]["SubstituteName"] == dstname and r[0]["PrintName"] == dstname and r[0]["Flags"] == 1) - result [Flags=0x1 PrintName="0000000f" ReparseTag="IO_REPARSE_TAG_SYMLINK" SubstituteName="0000000f"]
+ok 4 - testeval(not safeopen(srcname))
+ok 5 - expect "CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 6 - testeval(safeopen(srcname))
+ok 7 - expect "DeleteFile 0000000f" 0
+ok 8 - expect "CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 9 - testeval(safeopen(srcname))
+ok 10 - testeval(safeopen(dstname))
+ok 11 - expect "DeleteFile 0000000f" 0
+ok 12 - testeval(not safeopen(srcname))
+ok 13 - expect "DeleteFile 0000000e" 0
+ok 14 - expect "CreateSymbolicLink 0000000e 0000000f 0" 0
+not ok 15 - expect "WriteFile 0000000e 0 41 42 43 44 45" 0 - got ERROR_INVALID_PARAMETER
+not ok 16 - expect "ReadFile 0000000e 0 10" 0 - got ERROR_INVALID_PARAMETER
+ok 17 - expect "GetFileInformation 0000000e" (r[0]["FileAttributes"] == 0x420) - result [CreationTime="2026-11-09T22:45:17Z" FileAttributes=0x420 FileIndex=0x1000000000039 FileSize=0x8 LastAccessTime="2026-11-09T22:45:17Z" LastWriteTime="2026-11-09T22:45:17Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 18 - expect "GetReparsePoint 0000000e" (r[0]["ReparseTag"] == "IO_REPARSE_TAG_SYMLINK" and r[0]["SubstituteName"] == dstname and r[0]["PrintName"] == dstname and r[0]["Flags"] == 1) - result [Flags=0x1 PrintName="0000000f" ReparseTag="IO_REPARSE_TAG_SYMLINK" SubstituteName="0000000f"]
+ok 19 - testeval(not safeopen(srcname))
+ok 20 - expect "CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 21 - testeval(safeopen(srcname))
+ok 22 - expect "DeleteFile 0000000f" 0
+ok 23 - expect "CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 24 - testeval(safeopen(srcname))
+ok 25 - testeval(safeopen(dstname))
+ok 26 - expect "DeleteFile 0000000f" 0
+ok 27 - testeval(not safeopen(srcname))
+ok 28 - expect "DeleteFile 0000000e" 0
+ok 29 - expect "CreateSymbolicLink 0000000e E:\conformance-6660\winfstest\0000000f 0" 0
+ok 30 - expect "GetFileInformation 0000000e" (r[0]["FileAttributes"] == 0x420) - result [CreationTime="2026-11-09T22:45:17Z" FileAttributes=0x420 FileIndex=0x100000000003d FileSize=0x26 LastAccessTime="2026-11-09T22:45:17Z" LastWriteTime="2026-11-09T22:45:17Z" NumberOfLinks=0x1 VolumeSerialNumber=0x0]
+ok 31 - expect "GetReparsePoint 0000000e" (r[0]["ReparseTag"] == "IO_REPARSE_TAG_SYMLINK" and r[0]["SubstituteName"] == "\\??\\" + (dstpath if "\\" != dstpath[:1] else "UNC" + dstpath[1:]) and r[0]["PrintName"] == (dstpath if "\\" != dstpath[:1] else dstpath[1:]) and r[0]["Flags"] == 0) - result [Flags=0x0 PrintName="E:\\conformance-6660\\winfstest\\0000000f" ReparseTag="IO_REPARSE_TAG_SYMLINK" SubstituteName="\\??\\E:\\conformance-6660\\winfstest\\0000000f"]
+ok 32 - testeval(not safeopen(srcname))
+ok 33 - expect "CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 34 - testeval(safeopen(srcname))
+ok 35 - expect "DeleteFile 0000000f" 0
+ok 36 - expect "CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0" 0
+ok 37 - testeval(safeopen(srcname))
+ok 38 - testeval(safeopen(dstname))
+ok 39 - expect "DeleteFile 0000000f" 0
+ok 40 - testeval(not safeopen(srcname))
+ok 41 - expect "DeleteFile 0000000e" 0
+1..41
