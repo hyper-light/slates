@@ -1,0 +1,28 @@
+## image: ubuntu26 20261101.186.1
+## live-guest.log
+guest suite fsx: ok
+guest suite fsstress: ok (2000 operations logged)
+guest workload git: Identical
+guest workload cargo: Identical
+guest workload npm: Identical
+guest workload python: Identical
+guest workload rg: Identical
+guest workload rsync: Identical
+guest workload sqlite: Identical
+guest workload editor: Identical
+guest workload watcher: Identical
+guest suite pjdfstest: 238 files, 8798 cases; 1798 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent
+guest suite pjdfstest: ok
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 418.12s
+## guest-vhost.log
+test a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the_guest_synced ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_daemon_killed_under_a_guests_write_is_taken_over_with_the_write_whole_and_told ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_guest_holds_every_change_of_a_session_file_over_generated_histories_through_slates_own_device ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_guest_killed_while_its_writes_reply_waits_leaves_the_write_whole_and_its_device_ended ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_change_as_its_writer_is_answered ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_guests_stores_reach_the_session_when_it_syncs_or_closes_and_never_past_the_files_end ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_guests_write_through_slates_own_device_is_answered_once_every_fuse_mount_of_its_volume_was_told ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devices_end ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.20s
+## guest-image.log
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.13s
