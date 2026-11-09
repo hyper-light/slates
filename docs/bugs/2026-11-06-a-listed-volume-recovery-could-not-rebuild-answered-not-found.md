@@ -26,4 +26,5 @@ nothing of it.
 
 **Siblings found, not fixed here.** `destroy` goes through `find` too, so such a volume cannot be destroyed: it answered
 `NotFound` before and answers `NotRecovered` now. The catalog record stays until a later change lets a destroy remove a
-record with no live slot (GAPS).
+record with no live slot (GAPS). **Fixed 2026-11-08:**
+`2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.

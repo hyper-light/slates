@@ -2713,6 +2713,28 @@ impl Daemon {
     Ok(returned)
   }
 
+  /// Test support: the bytes of dead recovery memory every shard has still to give back (A-226): what the give-back's
+  /// own record says is left, so a test waits on the give-back's completion rather than on how long it usually takes.
+  pub fn recovery_left_to_give_back(&self) -> Result<u64, ObserveError> {
+    let mut left = 0u64;
+    for shard in self.shards.iter().copied() {
+      let bytes = self.observe(Some(shard), |s| {
+        let (slots_start, slots_end) = s.content_range;
+        let (log_start, log_end) = s.delta_range;
+        s.journal
+          .dead_ranges(
+            slots_end.saturating_sub(slots_start),
+            log_end.saturating_sub(log_start),
+          )
+          .map_or(0, |dead| {
+            dead.stale_slot.1.saturating_add(dead.log_past_tail.1)
+          })
+      })?;
+      left = left.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+    Ok(left)
+  }
+
   /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's reap tick does
   /// (`return_dead_recovery`, A-226), timing each step on the shard thread's own CPU clock, which a loaded host does
   /// not inflate: the bytes given back, the steps, the CPU each step held its shard, and the step quantum the shard
