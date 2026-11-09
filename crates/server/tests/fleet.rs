@@ -17878,3 +17878,146 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
     "the green holds the one version"
   );
 }
+
+/// A-255, the location round's answer end to end (§4.8 Lookup): a resend reaches the green through the work's
+/// catalog, and an origin that holds no copy of that catalog learns the work's green from the peers that do
+/// (`owner_location::locate_work_of`, `Reply::work_of`). Do: five nodes at `f = 1`; d refuses every register record
+/// from the others, so it never holds the work's catalog however the record is placed or re-placed; on a, a green and a
+/// work shared with the fleet; through d, an edit and the submit from a library client, answered version 1; once another
+/// node holds version 1 and another the work's catalog (one survivor of each is what a takeover at `f = 1` needs),
+/// a dies; d's client resends under its id. Expect: the resend
+/// answered version 1; d holding no copy of the catalog throughout (the round was the only route) and counting the
+/// round's naming of the green (`fleet.owner_location.work_of_named`, non-vacuous); the green holding the one version.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let others: Vec<HostId> = hosts
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != 3)
+    .map(|(_, host)| *host)
+    .collect();
+  let deafened = daemons[3].inject_record_refusal(&others);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "located-work", &daemons);
+  drop(owner_client);
+  let mut client = Client::connect(daemons[3].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  if routed {
+    edit_work(&mut client, work, 0, "hello");
+  }
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut resender = common::client::connect(daemons[3].instance());
+  let word = resender.begin(&submit).map(|id| id.word());
+  let first = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut resender, *word));
+  let catalog = ObjectId(work.bytes).catalog();
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let ready = poll_until(&everyone, PLACEMENT_DEADLINE, || {
+    let versions = daemons[1..]
+      .iter()
+      .map(|holder| holder.merge_holder_state(green).map(|state| state.version))
+      .collect::<Result<Vec<_>, _>>()?;
+    let records = daemons[1..]
+      .iter()
+      .map(|holder| holder.fleet_held_record(catalog))
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(versions.iter().any(|version| *version == Some(1)) && records.iter().any(Option::is_some))
+  });
+  drop(everyone);
+  daemons.remove(0).stop();
+  // Survivors once a is removed: b 0, c 1, d 2, e 3.
+  let again = word.as_ref().ok().and_then(|word| {
+    let began = Instant::now();
+    loop {
+      match resent_answer(&mut resender, *word, &submit) {
+        Some(Ok(ReplyBody::Refused {
+          refusal: Refusal::OwnerUnreachable { .. } | Refusal::Overloaded { .. },
+        }))
+        | Some(Err(_))
+        | None
+          if began.elapsed() < PLACEMENT_DEADLINE =>
+        {
+          yield_for(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
+        }
+        other => break other,
+      }
+    }
+  });
+  let held_by_d = daemons[2].fleet_held_record(catalog);
+  let named = daemons[2].refusals_on_every_shard().map(|counts| {
+    counts
+      .get("fleet.owner_location.work_of_named")
+      .copied()
+      .unwrap_or(0)
+  });
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut head = None;
+  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    head = daemons
+      .iter()
+      .map(|daemon| Client::connect(daemon.instance()).call(&RequestBody::Versions { green }))
+      .find(|reply| matches!(reply, ReplyBody::Versions { .. }));
+    Ok(head.is_some())
+  });
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(deafened.is_ok(), "d's refusal was installed: {deafened:?}");
+  assert!(routed, "d routed the work to its owner: {last:?}");
+  assert!(
+    matches!(
+      first,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the submit through d was answered version 1: {first:?}"
+  );
+  assert!(
+    ready,
+    "another node held version 1 and another the work's catalog before a died (d, when a candidate, refuses)"
+  );
+  assert_eq!(
+    again,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "d's resend is answered its version through the green the location round named"
+  );
+  assert!(
+    matches!(held_by_d, Ok(None)),
+    "d held no copy of the work's catalog, so the round was its only route: {held_by_d:?}"
+  );
+  assert!(
+    named.as_ref().is_ok_and(|named| *named > 0),
+    "d's location round named the work's green: {named:?}"
+  );
+  assert_eq!(
+    head,
+    Some(ReplyBody::Versions { head: 1 }),
+    "the green holds the one version"
+  );
+}
