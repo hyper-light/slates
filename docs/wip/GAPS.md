@@ -158,6 +158,15 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
+> waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
+> whose answers a queue held back 1.1 to 2.0 s apart. The transport now makes the one judgement,
+> `Endpoint::peer_silent_past(floor)`: an answer owed and nothing authenticated back for max(floor, three probe
+> timeouts each at least the initial one; RFC 9002 §7.6.1, §6.2.2). A gone peer is judged at 2,008 ms against its
+> 1,998 ms duration. A peer behind a queue, its answers up to 4.09 s apart, is never judged silent. An idle session
+> owes nothing and is never silent. On loopback a stopped peer is judged about 2 s into its silence, not 1 s
+> (fleet-transport §5 status; tests in `crates/transport/tests/exchanges.rs`).
+
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
 > on the fabric port of its descriptor's number, where nothing arrives. `crates/cluster/tests/live.rs` bound its
@@ -388,7 +397,7 @@
 >   removed, with these fixes: no such stall; each first `no_catalog` refusal was followed by holding.
 
 > **A volume recovery could not rebuild (2026-11-06): its status names why, and Windows unmount passes over it
-> (fixed); destroying it (open).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
+> (fixed); destroying it (fixed 2026-11-08).** Such a volume stays in the catalog and in `volume list`, but every verb on it answered
 > `NotFound`. It now answers `Refusal::NotRecovered { cause }`, a closed `RecoveryCause` kept from recovery
 > (`docs/bugs/2026-11-06-a-listed-volume-recovery-could-not-rebuild-answered-not-found.md`). Windows `slates unmount`
 > asked each volume's status and stopped at the first refusal, so one such volume blocked every drive; it now asks every
@@ -398,9 +407,23 @@
 > tests 6, the CLI flow 86) and red with it removed (diag-slabs-26, run 42319805390: "refused: NotFound"). On Windows,
 > on both runners, the unmount test green (diag-slabs-24, run 42319805783: the WinFsp suite 16), red with the old loop
 > (diag-slabs-25, run 42319805958: the drive was found first and the unrecovered volume never named), and red with the
-> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound"). Open:
-> - **Destroying such a volume.** `destroy` goes through the same lookup, so it is refused `NotRecovered` (before, `NotFound`)
->   and the catalog record stays: a destroy must be able to remove a record with no live slot.
+> status fix removed (diag-slabs-26, run 42319805581: "refused: NotFound").
+> - **Destroying such a volume: fixed 2026-11-08 (slabs).** `destroy` was refused `NotRecovered` too, so the record, its
+>   snapshots' records and its name stayed for good (banned item 8). It now removes a record with no live slot in one
+>   step: the volume's attachments end, then `Destroying`, the lease's release and `VolumeDestroyed`, and its name alias,
+>   its origin pin and its live shipping are given back, with nothing materialized. The sweep: `volume list` names the
+>   cause (`not_recovered=<kind>`; JSON `"not_recovered"`), and `share`, which read only the catalog and went through,
+>   is refused `NotRecovered` with every catalog-only lookup (`find_record`). Proven on macOS: the destroy test red
+>   before (`refused: NotRecovered`) and green after, the volume still gone after a second restart; the sweep test red
+>   at the list line before and at the share with `find_record`'s check taken out. On Linux at b7dc93c9 (merged with
+>   main 92dcd16c; diag-slabs-40, run 42506866309): workspace clippy, the whole server suite and both tests green, the
+>   CLI flow 94 of 95, its one failure the fleet formation test (`three_daemon_processes_deploy_a_fleet_…`, untouched
+>   here); both red with the destroy path and `find_record`'s check taken out (diag-slabs-41, run 42506866717). On both
+>   Windows runners (run 42506866249) the WinFsp suite 16 of 17, its one failure A-254's second-daemon test (owned by
+>   conformance). Record: `docs/bugs/2026-11-08-a-volume-recovery-could-not-rebuild-could-not-be-destroyed.md`.
+> - **Open, found here:** on Linux a kept FUSE mount of such a volume is let go but never unmounted (the stale-mount
+>   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
+>   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
