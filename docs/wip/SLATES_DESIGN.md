@@ -4924,6 +4924,8 @@ A regional learner fetches from every member of its region it holds a session to
 list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
 to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
 adoption only moves forward.
+A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
+voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
