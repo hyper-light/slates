@@ -462,7 +462,9 @@ slates vhost-user ID --dax-window 8MiB -- qemu-system-x86_64 -machine q35,memory
   -device vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40 ...
 ```
 
-and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
+and the guest mounts `mount -t virtiofs slates /mnt -o dax=always,nosuid,nodev` (`--tag` names another tag): keep
+`nosuid` and `nodev`, as every mount of a volume carries them (A-94), since other writers share the volume and a root
+writer (the guest's own, or an NFS client asserting uid 0) can plant a setuid-root program in it. No socket file exists
 anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
 that end alone. QEMU's vhost-user-fs-pci has no DAX window, so use the generic device for DAX; QEMU before 11.1 offers
 no window on either.

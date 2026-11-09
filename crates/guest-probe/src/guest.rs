@@ -518,7 +518,9 @@ fn option<'c>(cmdline: &'c str, key: &str) -> Option<&'c str> {
     .find_map(|word| word.strip_prefix(key))
 }
 
-/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names.
+/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names, `nosuid` and `nodev`, as
+/// every mount of a volume is (A-94): a volume has other writers, and a guest's root or an NFS client asserting uid 0
+/// can plant a setuid-root program in it.
 fn mount_tag(cmdline: &str) -> Result<(), String> {
   let tag = option(cmdline, TAG_KEY).unwrap_or(DEFAULT_TAG);
   let data = dax_option(cmdline)?;
@@ -526,7 +528,7 @@ fn mount_tag(cmdline: &str) -> Result<(), String> {
     tag,
     MOUNT_POINT,
     "virtiofs",
-    MountFlags::empty(),
+    MountFlags::NOSUID | MountFlags::NODEV,
     data.as_deref(),
   )
   .map_err(|e| format!("mount virtiofs tag {tag} at {MOUNT_POINT}: {e}"))
