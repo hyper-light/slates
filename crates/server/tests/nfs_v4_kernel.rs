@@ -119,7 +119,7 @@ fn daemon_with_volume(tag: &str, name: &str) -> Daemon {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{tag}"),
+      name: common::fixture_object("slates-seg", tag),
     },
   )
   .unwrap();

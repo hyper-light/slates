@@ -337,7 +337,7 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
   if owner != rustix::process::geteuid().as_raw() {
     return refuse(format!("belongs to uid {owner}, not the daemon's user"));
   }
-  if let Principal::Uid { uid } = principal
+  if let Principal::Uid { uid, .. } = principal
     && *uid != owner
   {
     return refuse(format!(
@@ -447,16 +447,9 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
   let Some(route) = route else {
     return;
   };
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      state::deliver(route.client_index, route.request, reply, true);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(
-    route.shard,
-    slates_rt::control::Control::Spawn(Box::new(delivery)),
-  )
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    state::deliver(route.client_index, route.request, reply, true);
+  })
   .is_err()
   {
     s.count(REPLY_UNDELIVERED, 1);
@@ -516,6 +509,8 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
   // The mount's change signal (§4.6 cache posture), made before anything is held or recorded, so a refusal leaves
   // nothing behind.
   let mut serve_state = ServeState::new();
+  // Each `FORGET` is logged beside the writes (`log_forgets`), for a successor to give back.
+  serve_state.logs_forgets();
   let Some(change) = change_signal(&mut serve_state) else {
     return refuse(s, &mount_point, Refusal::Overloaded { shard: s.shard });
   };
@@ -925,6 +920,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
+  log_forgets(s, attachment, mount.serve.take_forgotten());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let kept_back = mount.serve.take_writeback_bytes_kept_back();
@@ -1223,6 +1219,39 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
   }
 }
 
+/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write.
+const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
+
+/// Logs the lookups this turn's `FORGET`s gave back through `attachment` in the shard's write log (GAPS, A-154's
+/// sibling): a `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
+/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
+/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
+/// which would report every taken-over file as having lost writes.
+fn log_forgets(s: &mut ShardState, attachment: u64, forgotten: Vec<(u64, u64)>) {
+  for (inode, count) in forgotten {
+    let forgotten = crate::write_log::Forgotten {
+      attachment,
+      inode,
+      count,
+    };
+    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+      (Some(log), Some(object)) => log.append_forget(object, forgotten),
+      _ => return,
+    };
+    let logged = match appended {
+      Ok(()) => true,
+      Err(crate::write_log::Refused::Full) => {
+        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
+      }
+      Err(crate::write_log::Refused::Unwritten) => false,
+    };
+    if !logged {
+      s.count(FORGET_UNLOGGED, 1);
+    }
+  }
+}
+
 /// Sends the anchor this mount's session once its `INIT` has been answered (A-61), so a restarted daemon can
 /// serve the device without the negotiation the kernel will not repeat.
 fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount) {
@@ -1317,6 +1346,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     return end(s);
   }
   let mut serve_state = ServeState::restored(session, s.recovered_replies.remove(&attachment));
+  serve_state.logs_forgets();
   let Some(change) = change_signal(&mut serve_state) else {
     s.attachments.revoke(registry);
     s.attachments.drain(registry);

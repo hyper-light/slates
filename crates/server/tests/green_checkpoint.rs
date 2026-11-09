@@ -82,7 +82,7 @@ fn a_green_whose_readers_keep_up_holds_versions_past_its_chain_cap() {
     &profile,
     config(&profile, &instance),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-cap-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-cap"),
     },
   )
   .unwrap();
@@ -194,6 +194,59 @@ const IDENTITY_KEPT_BYTES: usize = 40;
 /// files' worth between them, with the same again for the increments' framing.
 const UNFOLDED_EDITS: usize = 4;
 
+/// W3, §4.8 recovery. Do: under a played anchor, from a green at version 0, make two works; submit one, accepted as version
+/// 1, so its base rises to 1, then the other, accepted as version 2 over base 0 (they touch different files), so its base
+/// rises to 2 and the reachable floor to 1. Restart over the same anchor. Expect: the recovered green's head is version 2
+/// and both files read their bytes. A chain checkpointed at the floor alone restored the green at version 1 and replayed
+/// version 2, whose recorded base 0 is below the restored history: refused `BaseUnavailable` at replay, and the whole green
+/// fenced, every acknowledged version unreadable.
+#[test]
+fn a_checkpoint_leaves_every_later_entry_a_base_recovery_can_replay() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-below-{}", std::process::id());
+  let config = config(&profile, &instance);
+  let anchor = common::anchor::held_anchor(
+    &format!("chain-below-{}", std::process::id()),
+    &profile,
+    &config,
+  );
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-green", false).unwrap();
+  let (first_work, _) = client.create_work(green, "first-work").unwrap();
+  let (second_work, _) = client.create_work(green, "second-work").unwrap();
+  client
+    .edit(first_work, "first", 0, 0, &bytes_of(1))
+    .unwrap();
+  client
+    .edit(second_work, "second", 0, 0, &bytes_of(2))
+    .unwrap();
+  assert_eq!(client.submit(first_work).unwrap(), Submitted::Accepted(1));
+  assert_eq!(client.submit(second_work).unwrap(), Submitted::Accepted(2));
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let recovered_head = client.versions(green);
+  let first_bytes = client.read(green, "first", ReadAt::Head);
+  let second_bytes = client.read(green, "second", ReadAt::Head);
+  drop(client);
+  second.stop();
+  assert_eq!(
+    recovered_head.ok(),
+    Some(2),
+    "the recovered head is version 2"
+  );
+  assert_eq!(first_bytes.ok(), Some(bytes_of(1)), "version 1's file");
+  assert_eq!(second_bytes.ok(), Some(bytes_of(2)), "version 2's file");
+}
+
 /// W3, §4.8. Do: on a one-shard daemon with its derived caps, submit 40 versions as above and read the bytes the
 /// partition's snapshot encodes to; submit 160 more and read it again. Expect: it grew by less than four edits' bytes
 /// plus what a checkpoint keeps of each accepted increment (40 bytes): the chain past the checkpoint stays under the
@@ -207,7 +260,7 @@ fn a_partitions_snapshot_holds_what_its_green_is_not_what_it_has_been() {
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-flat-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-flat"),
     },
   )
   .unwrap();
@@ -288,7 +341,7 @@ fn held_cap_daemon(instance: &str) -> Daemon {
     &profile,
     config,
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-chain-held-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "chain-held"),
     },
   )
   .unwrap();
@@ -334,4 +387,64 @@ fn a_chain_held_by_a_reader_is_refused_typed_at_its_cap_and_folds_once_released(
     matches!(after, Ok(Submitted::Accepted(version)) if version == head + 1),
     "once the floor is released the refused version is accepted next: {after:?}"
   );
+}
+
+/// W3, A-257, §4.8 recovery. Do: under a played anchor with the chain capped at 256 KiB, two works take turns writing their
+/// own file, 8 KiB a version, 200 versions, each based on its own last version, so every entry's base trails it; restart.
+/// Expect: all accepted (the cap holds about 32 such increments, so the chain really folded with bases behind its head), and
+/// the recovered green holds every last write. A checkpoint held at or below every retained entry's base would never fold
+/// here; recovery re-deciding each entry would fence the green.
+#[test]
+fn two_clients_taking_turns_keep_folding_and_recover_whole() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-turns-{}", std::process::id());
+  let config = config(&profile, &instance);
+  let anchor = common::anchor::held_anchor(
+    &format!("chain-turns-{}", std::process::id()),
+    &profile,
+    &config,
+  );
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-green", false).unwrap();
+  let works = [
+    client.create_work(green, "turn-0").unwrap().0,
+    client.create_work(green, "turn-1").unwrap().0,
+  ];
+  let names = ["turn-file-0", "turn-file-1"];
+  let mut last: [Option<Vec<u8>>; 2] = [None, None];
+  for n in 1..=VERSIONS {
+    let who = usize::try_from(n % 2).unwrap();
+    let delete = last[who].as_ref().map_or(0, |_| EDIT_BYTES as u64);
+    client
+      .edit(works[who], names[who], 0, delete, &bytes_of(n))
+      .unwrap();
+    assert_eq!(
+      client.submit(works[who]).unwrap(),
+      Submitted::Accepted(n),
+      "version {n} accepted though its base trails the head"
+    );
+    last[who] = Some(bytes_of(n));
+  }
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let head = client.versions(green);
+  let files: Vec<_> = names
+    .iter()
+    .map(|name| client.read(green, name, ReadAt::Head))
+    .collect();
+  drop(client);
+  second.stop();
+  assert_eq!(head.ok(), Some(VERSIONS), "the recovered head");
+  for (index, read) in files.into_iter().enumerate() {
+    assert_eq!(read.ok(), last[index], "{}'s last write", names[index]);
+  }
 }

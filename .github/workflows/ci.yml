@@ -19,6 +19,23 @@ env:
   # asset, and matched the file downloaded on 2026-11-04. Raising it is a review of the receiver's layout.
   WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
   WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  # How a pinned tool's download is retried (the WinFsp installer, kind, kubectl). Shape, from the outage that turned main
+  # red in run 42471186455 on 2026-11-08: GitHub's release downloads answered 504 and 503 from at least 10:23:21 to
+  # 10:41:08 UTC (17 min 47 s, one Windows job after another), each failed try taking 12-51 s. Twenty retries 60 s
+  # apart cover 20 minutes of it. One try is bounded by twice the slowest failed try seen (120 s), since a successful
+  # download of these few megabytes takes seconds. A step's own bound is above the whole: 21 tries of up to 120 s
+  # with 60 s between them is 63 minutes at worst, but the outage it answers is 20, so `timeout-minutes` is 45.
+  DOWNLOAD_RETRIES: "20"
+  DOWNLOAD_RETRY_SECONDS: "60"
+  DOWNLOAD_TRY_SECONDS: "120"
+  # kind and kubectl, pinned, each with the SHA-256 its release publishes (kind-linux-amd64.sha256sum, kubectl.sha256; read
+  # 2026-11-08). They are installed by a step of this workflow, not helm/kind-action, whose installer runs curl without
+  # --fail: a 504 wrote an error page over the checksum file and the step failed with "no properly formatted checksum
+  # lines found" (run 42471186455, job 128702055861).
+  KIND_URL: https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_URL: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+  KUBECTL_SHA256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
 
 jobs:
   gates:
@@ -446,9 +463,15 @@ jobs:
       # `winfsp-x64.dll` at run time, by name on the loader's path (the `bin/` added below) or under the install
       # directory the MSI records in the registry, as WinFsp's own `FspLoad` does.
       - name: Install WinFsp
+        id: winfsp
+        timeout-minutes: 45
         run: |
           $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
-          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          try {
+            Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "WinFsp's installer could not be downloaded from $env:WINFSP_MSI_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message)). The job stops here: the steps after this one need WinFsp."
+          }
           $found = (Get-FileHash $msi -Algorithm SHA256).Hash
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
@@ -479,13 +502,13 @@ jobs:
       # end the script — only the last line decides the step, which would mask this).
       #
       # The binary is what this lane was widened for: its Windows signal handling was compiled by nothing
-      # until 2026-10-20. Its *other* targets are Unix by nature — the bin's own `cfg(test)` modules and the
-      # `vfs_tails` example use inherited descriptors, `slates-bridge-nfs` and `slates-bridge-oci` — and
-      # `--all-targets` pulled them in here, where they cannot compile. They are not left unlinted: the
-      # ubuntu and macOS gates lint the whole workspace with `--all-targets`, which is where a Unix-only
-      # target belongs. Narrowing keeps this lane about the Windows artifact.
-      - name: Clippy the shipped Windows binary
-        run: cargo clippy -p slates-cli -- -D warnings
+      # until 2026-10-20. All its targets are linted here, examples included: a target that is Unix by nature gates
+      # itself with a stated reason (a test module `cfg(all(test, unix))`; an example a paired `main` whose Windows arm
+      # says why, as `journal_bench` does), so it still compiles. Until 2026-11-08 this step linted the binary alone, and
+      # three `slates-cli` examples that did not compile for Windows went unseen (`nfs_writeback_ab`, from e2eac8db,
+      # `nfs_large_write` and `vfs_tails`); `slates-land`'s `land_bench` joined the crate list above for the same reason.
+      - name: Clippy the shipped Windows binary and every other slates-cli target
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The binary's one Windows test target, the WinFsp mount through the command, linted on its own for the same
       # reason: the rest of its targets are Unix by nature.
       - name: Clippy the WinFsp CLI tests (native Windows)
@@ -534,7 +557,7 @@ jobs:
       # (nothing kept), then with an administrator's `LocalDumps` full dumps, a machine setting made on this throwaway
       # runner with the OS's own registry provider (every mapping kept, and the daemon reports the setting).
       - name: Test that a crash under WER's defaults keeps nothing (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           SLATES_WER_SCAN_DEFAULT_REPORT: "1"
@@ -550,47 +573,47 @@ jobs:
           New-ItemProperty -Force -Path $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
           "SLATES_WER_DUMP_DIR=$dumps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Test that an administrator's full dump carries every mapping, and is reported (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test dump_exclusion -- --exact an_administrators_local_full_dump_carries_every_mapping --nocapture
       - name: Test the Win32 shared memory (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-mem
       - name: Test the rings and the Event wake (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test rings
       - name: Test the Win32 rendezvous (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test rendezvous
       - name: Test the consumer-capability delivery (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
       # A-198: acknowledged holds and explicit inheritance across real supervised processes; no WinFsp required.
       - name: Test the Windows anchor hold and supervisor
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         run: cargo test -p slates-anchor -- --test-threads=1
       # A Shards stream's end handed to a program by `spawn_with` (§4.6, A-181): the program writes through the handle its
       # arguments name; a child started afterwards inherits nothing of it, against an inheritable copy's contrast; the
       # launcher's copy stands until it lets the program go, and its kill-on-close job ends a program it drops.
       - name: Test the stream hand-off to a program (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test stream_spawn
       # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
       # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
       - name: Test the IOCP driver's kick and no-op (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: 'cargo test -p slates-rt --lib driver::'
       # The Windows base host's containment (AUD-29-62): handle-relative opens over a real NTFS directory in
       # the build output, with the root, an intermediate and a final component swapped for junctions and
       # links between the host's calls; nothing outside the base is ever read.
       - name: Test the base host's contained access (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-base
       # Landing on Windows (§4.15, A-185): the writer over NTFS handles, the oracle, a real kill mid-landing on NTFS
@@ -617,21 +640,21 @@ jobs:
         timeout-minutes: 15
         run: cargo test -p slates-mcp -- --test-threads=1
       - name: Test the AFD readiness over loopback UDP (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test udp
       # A Windows named pipe's end on the IOCP driver (§4.3, A-179), the Shards route's stream on Windows: a task reads
       # and writes one by completions, a write to a reader that waits blocks and resumes, a gone peer ends the stream,
       # an end dropped with a read in the kernel leaves the next one whole, and a disconnect wakes its reader.
       - name: Test the IOCP driver's pipe ends (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
       # TCP on the AFD reactor (`docs/wip/platforms.md` gap 1): a request and a framed reply, a listener handed over by
       # its socket, a refused connect, the peer's close in Windows' own record of the connection, a peeked request left
       # queued, the receive low-water mark refused typed, and a listener's port no other socket can bind.
       - name: Test TCP on the AFD reactor (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test tcp
       # The NFS server on Windows (A-183), the network export's: honest clients write and read back their files while
@@ -642,11 +665,11 @@ jobs:
       # its deadline on jupiter, as the client suite's did; the write-back suite's seven at once had a create refused
       # BudgetExceeded behind a 24 s poll there.
       - name: Test the NFS server, its write-back judgment and the network export (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
       - name: Test a shard's lateness after a park (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test overrun
       # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
@@ -654,16 +677,16 @@ jobs:
       # shard answered past the wall budget, a wedged one ended in one budget
       # (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
       - name: Test the shard CPU clock (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: 'cargo test -p slates-rt --lib thread_clock::'
       - name: Test the observation budget in the shard's own time (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
       # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
       - name: Test a deleted file's memory going back to the OS (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
       # The daemon's own unit tests, which no Windows lane ran until 2026-11-06. Two landing tests failed on both runners
@@ -674,6 +697,22 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --lib -- --test-threads=1
+      # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
+      # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
+      # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
+      # ICMP-reset report turned off, or a send to a closed port fails the next receive and 3 of 4 fleet starts never
+      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). One test at a time, as the other daemon suites.
+      # Measured on the runners (diagnostics run 42340483175, 2026-11-07): 85 passed, 3 ignored, in 418 s on x86_64 and 365 s
+      # on arm64; the bound is about three times that.
+      - name: Test the fleet over real UDP sessions, one test at a time (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 20
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: cargo test -p slates-server --test fleet -- --test-threads=1
       # The client binary whole on Windows, and the async driver: an in-process `slates-server` daemon found through the
       # Win32 rendezvous bootstrap object, driven over the rings through the whole lifecycle; the same-kernel direct map
       # by handle duplication (§4.6, A-175: zero copy asserted, the hostile holder's escalations refused, the neighbour's
@@ -683,7 +722,7 @@ jobs:
       # daemons at once in one process (GAPS: at 32 test threads 14 of 20 failed, 12 of them `Stalled`, and one
       # daemon's shard held a single poll 1277 ms; none fail one at a time).
       - name: Test the client binary and the async driver, one test at a time (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
       # The Shards form (§4.6, A-161, A-179) by the handle route: an in-process daemon duplicates the client end of the
@@ -694,7 +733,7 @@ jobs:
       # attachment's write and has its backing let go at the end; an untouched base file's section is refilled with the
       # host's edit. One test at a time, as the client binary's other daemon-per-test suites run here.
       - name: Test the Shards form over the handle route (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test shards -- --test-threads=1
       # The WinFsp mount through the command (§4.6 "Windows"; G-mount step 2): a real anchor and daemon, `slates
@@ -707,13 +746,13 @@ jobs:
       # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
       # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
       - name: Test WinFsp request recovery and ledger oracles
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: The WinFsp mount through the CLI (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
@@ -725,7 +764,7 @@ jobs:
       # command holds its copy and gone once the program exits; a killed command taking its program and the
       # attachment along through its job; the refusals. Gated by `SLATES_TEST_CLI=1`.
       - name: The Shards hand-off through the CLI (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
@@ -734,7 +773,7 @@ jobs:
       # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
       # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
       - name: The anchor's start judgment through the CLI (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           SLATES_TEST_CLI: "1"
@@ -742,7 +781,7 @@ jobs:
       # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
       # Gated by `SLATES_TEST_CLI=1`.
       - name: The held rendezvous through the CLI (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           SLATES_TEST_CLI: "1"
@@ -752,21 +791,21 @@ jobs:
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
       # judged against its reviewed list (docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt).
       - name: Clippy the conformance harness (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         run: cargo clippy -p xtask --all-targets -- -D warnings
       - name: Win32 semantics through the WinFsp drive (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture
       - name: fsx over the WinFsp drive (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: winfstest over the WinFsp drive, against the reviewed list (native Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native Windows)
@@ -954,9 +993,10 @@ jobs:
         run: >-
           cargo clippy -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-anchor
           -p slates-bridge-winfsp -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
-      - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
+      # Every slates-cli target, examples included, as on x86_64 (windows-lint says why).
+      - name: Clippy the shipped binary and every other slates-cli target natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards --test start_judgment --test held_rendezvous --test winfsp --test winfsp_semantics -- -D warnings
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
@@ -997,6 +1037,22 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --lib -- --test-threads=1
+      # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
+      # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
+      # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
+      # ICMP-reset report turned off, or a send to a closed port fails the next receive and 3 of 4 fleet starts never
+      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). One test at a time, as the other daemon suites.
+      # Measured on the runners (diagnostics run 42340483175, 2026-11-07): 85 passed, 3 ignored, in 418 s on x86_64 and 365 s
+      # on arm64; the bound is about three times that.
+      - name: Test the fleet over real UDP sessions, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: cargo test -p slates-server --test fleet -- --test-threads=1
       - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -1030,10 +1086,16 @@ jobs:
       # change, and a mapped view's outcome is asserted as measured (A-177). First run on this image in diagnostics run
       # 40570394717 (2026-10-27): the cached read followed in 20.9 ms, the mapped view stayed stale for 10 s.
       - name: Install WinFsp (native arm64 Windows)
+        id: winfsp
         if: ${{ !cancelled() }}
+        timeout-minutes: 45
         run: |
           $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
-          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          try {
+            Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "WinFsp's installer could not be downloaded from $env:WINFSP_MSI_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message)). The job stops here: the steps after this one need WinFsp."
+          }
           $found = (Get-FileHash $msi -Algorithm SHA256).Hash
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
@@ -1042,13 +1104,13 @@ jobs:
       # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
       # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
       - name: Test WinFsp request recovery and ledger oracles
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: The WinFsp mount through the CLI (native arm64 Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
@@ -1059,21 +1121,21 @@ jobs:
       # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
       # judged against its reviewed list (docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt).
       - name: Clippy the conformance harness (native arm64 Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         run: cargo clippy -p xtask --all-targets -- -D warnings
       - name: Win32 semantics through the WinFsp drive (native arm64 Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture
       - name: fsx over the WinFsp drive (native arm64 Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: winfstest over the WinFsp drive, against the reviewed list (native arm64 Windows)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native arm64 Windows)
@@ -1201,13 +1263,13 @@ jobs:
       # AC-0.7 / T-0.3: every loom model in the workspace — the one-producer ring, the two contending
       # producers, the lapping producer, the handle core (a handle crossing threads against its slot's
       # reuse), the runtime's kick-if-parked protocol and the client/daemon doorbell protocol
-      # (`slates-ipc` `doorbell.rs`, 2026-09-28) — under the bounds `slates_mem::loom_bounds`
+      # (`slates-ipc` `doorbell.rs`, 2026-09-28), and the WinFsp purge slot's publish racing a Create (A-249) — under the bounds `slates_mem::loom_bounds`
       # carries in code (a preemption bound of 2 and a 224-branch cap, each Derived: there), so this
       # lane sets no environment variable and explores exactly what a laptop run explores. The models
       # print the interleavings they explored (`--nocapture`), so the log carries the numbers
       # `docs/wip/concurrency.md` records.
       - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
-        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom -- --nocapture
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc -p slates-bridge-winfsp --lib --release loom -- --nocapture
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -1242,9 +1304,15 @@ jobs:
       # QUIC-over-UDP not NFS-over-TCP). Clippy and test the Windows-buildable crates — the same set the
       # `windows-lint` job covers, plus the WinFsp mount host, whose live mount needs WinFsp installed.
       - name: Install WinFsp
+        id: winfsp
+        timeout-minutes: 45
         run: |
           $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
-          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          try {
+            Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "WinFsp's installer could not be downloaded from $env:WINFSP_MSI_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message)). The job stops here: the steps after this one need WinFsp."
+          }
           $found = (Get-FileHash $msi -Algorithm SHA256).Hash
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
@@ -1257,13 +1325,13 @@ jobs:
       # end the script — only the last line decides the step, which would mask this).
       #
       # The binary is what this lane was widened for: its Windows signal handling was compiled by nothing
-      # until 2026-10-20. Its *other* targets are Unix by nature — the bin's own `cfg(test)` modules and the
-      # `vfs_tails` example use inherited descriptors, `slates-bridge-nfs` and `slates-bridge-oci` — and
-      # `--all-targets` pulled them in here, where they cannot compile. They are not left unlinted: the
-      # ubuntu and macOS gates lint the whole workspace with `--all-targets`, which is where a Unix-only
-      # target belongs. Narrowing keeps this lane about the Windows artifact.
-      - name: Clippy the shipped Windows binary
-        run: cargo clippy -p slates-cli -- -D warnings
+      # until 2026-10-20. All its targets are linted here, examples included: a target that is Unix by nature gates
+      # itself with a stated reason (a test module `cfg(all(test, unix))`; an example a paired `main` whose Windows arm
+      # says why, as `journal_bench` does), so it still compiles. Until 2026-11-08 this step linted the binary alone, and
+      # three `slates-cli` examples that did not compile for Windows went unseen (`nfs_writeback_ab`, from e2eac8db,
+      # `nfs_large_write` and `vfs_tails`); `slates-land`'s `land_bench` joined the crate list above for the same reason.
+      - name: Clippy the shipped Windows binary and every other slates-cli target
+        run: cargo clippy -p slates-cli --all-targets -- -D warnings
       # The Win32 paths a native runner exercises, including the **full daemon lifecycle end to end**
       # (an in-process daemon a client reaches through the Win32 rendezvous, driving the whole verb set)
       # — no longer owed now that the rendezvous is proven; the cross-process anchor-restart path stays
@@ -1271,80 +1339,80 @@ jobs:
       # One step per binary, each limited and run even after an earlier failure: see the same note on
       # the native Windows job (a hung binary is named by its step and cut with its log kept).
       - name: Test the Win32 shared memory (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-mem
       - name: Test the rings and the Event wake (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test rings
       - name: Test the Win32 rendezvous (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test rendezvous
       - name: Test the consumer-capability delivery (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
       # A-198: acknowledged holds and explicit inheritance across real supervised processes; no WinFsp required.
       - name: Test the Windows anchor hold and supervisor
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         run: cargo test -p slates-anchor -- --test-threads=1
       - name: Test the stream hand-off to a program (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test stream_spawn
       # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
       # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
       - name: Test the IOCP driver's kick and no-op (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: 'cargo test -p slates-rt --lib driver::'
       - name: Test the AFD readiness over loopback UDP (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test udp
       - name: Test the IOCP driver's pipe ends (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
       - name: Test TCP on the AFD reactor (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test tcp
       - name: Test the NFS server, its write-back judgment and the network export (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
       - name: Test a shard's lateness after a park (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test overrun
       - name: Test the client binary and the async driver, one test at a time (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
       - name: Test the Shards form over the handle route (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test shards -- --test-threads=1
       # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
       # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
       - name: Test WinFsp request recovery and ledger oracles
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: Test the WinFsp mount through the CLI (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
       - name: The Shards hand-off through the CLI (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 20
         env:
           SLATES_TEST_CLI: "1"
@@ -1353,7 +1421,7 @@ jobs:
       # starved.md): a successor suspended all but a sixty-fourth of every heartbeat is waited for, not killed; one
       # suspended for good is killed and replaced. Gated by `SLATES_TEST_CLI=1`.
       - name: The anchor's start judgment through the CLI (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           SLATES_TEST_CLI: "1"
@@ -1361,7 +1429,7 @@ jobs:
       # A-114: a client connecting as its daemon dies is answered by the next one (the anchor holds the rendezvous).
       # Gated by `SLATES_TEST_CLI=1`.
       - name: The held rendezvous through the CLI (Windows, every push to main)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         env:
           SLATES_TEST_CLI: "1"
@@ -1528,8 +1596,8 @@ jobs:
   # (the configuration group's membership change), and the WAN profiles through a lane-only NET_ADMIN init
   # container running `tc netem` (80 ms ± 20 ms; the same with 1 % loss; the 350 ms handshake ceiling), each
   # pod's derived council timing checked against ⌈10 × tail / 100 ms⌉ and the leader's stability over a
-  # three-minute window. kind, kubectl and helm are installed by their actions, pinned to the versions the
-  # lane was validated with on 2026-09-14 — non-Rust tooling admitted for this lane by the charter that
+  # three-minute window. kind and kubectl are installed by a pinned, retried download of this workflow, and helm by its
+  # action, at the versions the lane was validated with on 2026-09-14 — non-Rust tooling admitted for this lane by the charter that
   # commissioned it, as the conformance lane's suites are. A full run is tens of minutes (a cold release
   # build in Docker on the runner, six node containers, three shaped windows), so it runs on the push
   # cadence like the other long lanes; the chart's own gates run in `gates` on every pull request.
@@ -1546,10 +1614,26 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v4.3.0
-      - uses: helm/kind-action@v1
-        with:
-          version: v0.33.0
-          install_only: true
+      # Pinned and retried as WinFsp is (the `env` block says why this is not helm/kind-action). A failure stops the job here:
+      # the steps below run the lane, and on the runner image's own kind a lane would pass or fail on tools it did not pin.
+      - name: Install kind and kubectl
+        id: kind_tools
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/kind-tools"
+          mkdir -p "$bin"
+          fetch() {
+            curl --fail --silent --show-error --location --retry "$DOWNLOAD_RETRIES" --retry-delay "$DOWNLOAD_RETRY_SECONDS" \
+              --retry-all-errors --max-time "$DOWNLOAD_TRY_SECONDS" --output "$2" "$1" \
+              || { echo "::error::could not download $1 after $DOWNLOAD_RETRIES retries; the KIND lane needs it, so the job stops here"; exit 1; }
+          }
+          fetch "$KIND_URL" "$bin/kind"
+          echo "$KIND_SHA256  $bin/kind" | sha256sum -c -
+          fetch "$KUBECTL_URL" "$bin/kubectl"
+          echo "$KUBECTL_SHA256  $bin/kubectl" | sha256sum -c -
+          chmod +x "$bin/kind" "$bin/kubectl"
+          echo "$bin" >> "$GITHUB_PATH"
       - name: The chart's gates (helm lint; the golden render)
         run: cargo test -p xtask --test helm_chart
       # AUD-29-75's kernel leg (§4.6 "Kubernetes publication without privilege"; Ada authorized its tooling on
@@ -1566,8 +1650,8 @@ jobs:
       # own. Its first run found a daemon refusing every client it cannot see by pid
       # (docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md).
       - name: The direct leg (a pod's process maps a file by the direct map)
-        if: success() || failure()
+        if: ${{ (success() || failure()) && steps.kind_tools.outcome == 'success' }}
         run: cargo xtask kind direct
       - name: The lane, end to end (the cluster is deleted at the end whatever happens)
-        if: success() || failure()
+        if: ${{ (success() || failure()) && steps.kind_tools.outcome == 'success' }}
         run: cargo xtask kind all

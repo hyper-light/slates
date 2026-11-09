@@ -188,6 +188,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   signal::install().map_err(Failure::Failed)?;
   let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
+  // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
+  // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
+  // so a refused start that had created one left the live anchor's next daemon nothing to attach. The client rendezvous
+  // is then held the same way as the segment (A-114): a client that connects while a daemon restarts waits for the next
+  // one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
+  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&options.instance)
+    .map_err(|e| failed("rendezvous", e))?;
   // The anchor-owned content object that holds each shard's recovery image (§4.8): one shard's
   // reserve times the partitions, lazily backed so its unused tail costs no RAM. The anchor holds
   // it across daemon restarts and hands it off, so an agent's writes survive a restart (BUG-11).
@@ -265,10 +272,6 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
     slates_machine::log_line!("slates anchor: descriptor limit raised from {was} to {now}");
   }
-  // The client rendezvous is held the same way (A-114): a client that connects while a daemon restarts waits for the
-  // next one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
-  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&options.instance)
-    .map_err(|e| failed("rendezvous", e))?;
   supervisor.hold_environment(
     slates_ipc::rendezvous::ENV_RENDEZVOUS,
     rendezvous.adoption().env_value().to_owned(),
@@ -339,19 +342,25 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
   }
 }
 
-/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`), judged by the watchdog's
-/// rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
+/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`): its progress and its busiest
+/// thread's CPU, judged by the watchdog's rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
 /// its one step, so it is alive while its CPU progresses and has run less than a window of it. With no reading (no
 /// process clock, or the process already gone) the wall window stands alone, as for a shard with no thread clock.
 fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+  // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
+  // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
+  // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
+  // read nothing is judged spinning, and the progress alone judges a start wedged.
   let cpu = supervisor
     .child_pid()
     .and_then(slates_machine::process_clock::process_cpu)
-    .map(|reading| (reading.spent_ns, reading.progress));
+    .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
   let look = Look {
     steps: 0,
     parked: false,
     cpu,
+    // The anchor judges a whole process by its CPU time; a scheduler reading is of one thread (GAPS, A-228's siblings).
+    run: None,
     now_ns: now,
   };
   let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
@@ -362,14 +371,15 @@ fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Ver
 /// What a start's verdict says when it is to be killed: `None` while it is alive.
 fn start_stuck(verdict: Verdict) -> Option<String> {
   match verdict {
-    Verdict::Alive => None,
+    // A start has no scheduler reading, so it is never found starved; were it, it would not be stuck.
+    Verdict::Alive | Verdict::Starved { .. } => None,
     Verdict::Wedged { for_ns } => Some(format!(
       "made no progress for {} ms (the {} ms liveness window)",
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
     Verdict::Spinning { cpu_ns } => Some(format!(
-      "ran {} ms of CPU without beating (the {} ms liveness window)",
+      "ran {} ms of CPU on one thread without beating (the {} ms liveness window)",
       cpu_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
@@ -398,17 +408,16 @@ fn observe(
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
   // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
   slates_machine::log_line!(
-    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or runs \
-     that much CPU without its first beat, in its own CPU time ({})",
+    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or one of \
+     its threads runs that much CPU without its first beat, in its own CPU time ({})",
     LIVENESS_BUDGET_NS / NS_PER_MS,
-    if supervisor
+    match supervisor
       .child_pid()
       .and_then(slates_machine::process_clock::process_cpu)
-      .is_some()
     {
-      "read from the OS"
-    } else {
-      "none read here: the wall window stands alone"
+      Some(cpu) if cpu.busiest_thread_ns.is_some() => "read from the OS, each thread's",
+      Some(_) => "read from the OS; its threads not, so nothing is judged spinning",
+      None => "none read here: the wall window stands alone",
     }
   );
   let mut kill_sent = false;

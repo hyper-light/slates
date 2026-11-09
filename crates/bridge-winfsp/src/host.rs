@@ -93,6 +93,8 @@ pub enum WinFspError {
   Capture(crate::inflight::Refusal),
   /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
   UnsupportedDll(crate::dll_version::UnsupportedVersion),
+  /// The purge-intent slot refused (`crate::purge_intents`).
+  Intent(crate::purge_slot::Refusal),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -100,6 +102,13 @@ pub enum WinFspError {
     /// Its original system error code.
     code: Option<i32>,
   },
+}
+
+impl From<crate::inflight::Refusal> for WinFspError {
+  /// A journal refusal ends the receive worker as a capture refusal (`crate::inflight::settle`).
+  fn from(refusal: crate::inflight::Refusal) -> Self {
+    Self::Capture(refusal)
+  }
 }
 
 impl std::fmt::Display for WinFspError {
@@ -114,6 +123,7 @@ impl std::fmt::Display for WinFspError {
       Self::MountThread => write!(f, "the mount thread could not run"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
+      Self::Intent(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
       Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
@@ -269,13 +279,14 @@ enum Op<T> {
     object: T,
     new_size: u64,
   },
-  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
-  /// time (A-209, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
+  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification, change or
+  /// birth time (A-209 and A-259, `t/base/06.t`).
   SetTimes {
     object: T,
     atime: Option<i64>,
     mtime: Option<i64>,
     ctime: Option<i64>,
+    btime: Option<i64>,
   },
   /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
   /// deletion. A directory with any child refuses (A-209, `t/base/03.t`): the delete itself runs in Cleanup, which
@@ -634,11 +645,13 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       atime,
       mtime,
       ctime,
+      btime,
     } => Op::SetTimes {
       object: ledger.get(object)?,
       atime,
       mtime,
       ctime,
+      btime,
     },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
@@ -710,7 +723,7 @@ fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
     reparse_tag: 0,
     allocation_size: attr.size,
     file_size: attr.size,
-    creation_time: filetime_from_unix_ns(attr.ctime),
+    creation_time: filetime_from_unix_ns(attr.btime),
     last_access_time: filetime_from_unix_ns(attr.atime),
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
@@ -867,6 +880,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       atime,
       mtime,
       ctime,
+      btime,
     } => op_set_times(
       bridge,
       cx,
@@ -875,6 +889,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
         atime,
         mtime,
         ctime,
+        btime,
         ..SetAttr::default()
       },
     )?,
@@ -1036,14 +1051,18 @@ fn op_set_times(
 /// first, and one child, which is enough to refuse.
 const DOTS_AND_ONE_CHILD: usize = 3;
 
-/// Whether `object` may be deleted: a directory refuses `NotEmpty` (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child,
-/// read from the first few entries of its listing; any other object may.
+/// Whether `object` may be deleted: refused before Windows marks it for deletion when the attachment may not change the
+/// volume (`ReadOnly`, `STATUS_MEDIA_WRITE_PROTECTED`: the delete itself happens at the cleanup, which has no reply, so
+/// a refusal there was silent and `DeleteFile` reported success); a directory refuses `NotEmpty`
+/// (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child, read from the first few entries of its listing; any other
+/// object may.
 fn op_can_delete(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,
   fh: u64,
 ) -> Result<Reply, VfsError> {
+  bridge.authorize_change(cx)?;
   if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
     return Ok(Reply::Ok);
   }
@@ -1589,14 +1608,14 @@ extern "C" fn set_basic_info(
   fs: *mut FileSystem,
   context: Pvoid,
   _file_attributes: u32,
-  _creation_time: u64,
+  creation_time: u64,
   last_access_time: u64,
   last_write_time: u64,
   change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // The access, write and change times are applied (A-209); the attribute bits and the creation time are not kept by
-  // the volume (A-209's stated differences), and the object's live info is returned so the caller sees what it holds.
+  // The creation, access, write and change times are applied (A-209, A-259); the attribute bits are not kept by the
+  // volume (A-209's stated difference), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1605,6 +1624,7 @@ extern "C" fn set_basic_info(
     atime: crate::unix_ns_from_filetime(last_access_time),
     mtime: crate::unix_ns_from_filetime(last_write_time),
     ctime: crate::unix_ns_from_filetime(change_time),
+    btime: crate::unix_ns_from_filetime(creation_time),
   }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.
@@ -1841,7 +1861,7 @@ impl Mounted {
     wake: Waker,
     inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
     purge_intents: crate::purge_intents::Sender,
-    private_opens: &mut crate::purge_intents::Intents,
+    private_opens: &crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
     let drive: [u16; 2] = mount_point
       .encode_utf16()
@@ -2040,7 +2060,7 @@ impl Mounted {
       };
       self
         .purge_intents
-        .publish(Some(crate::purge_intents::Intent {
+        .publish(Some(&crate::purge_intents::Intent {
           purge: purge.clone(),
           client,
         }))?;
@@ -2275,8 +2295,8 @@ fn run_mount(
     wake.wake_by_ref();
   };
   let confirmations = requests.clone();
-  // Shape: the preceding purge's End and the next purge's Begin can be queued before a fresh kernel Create arrives.
-  let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
+  // The purge-intent slot: the mount thread publishes into it, and the receive worker reads it.
+  let (purge_intents, private_opens) = match crate::purge_intents::channel() {
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
@@ -2316,14 +2336,8 @@ fn run_mount(
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
     let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
-    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume(&mut scratch)
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
+    let saved_open = crate::inflight::settle::saved_open(&mut captured, &mut scratch)
+      .map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;
@@ -2334,7 +2348,7 @@ fn run_mount(
       wake.clone(),
       inherited,
       purge_intents,
-      &mut private_opens,
+      &private_opens,
     )?;
     let value = ledger
       .memory()

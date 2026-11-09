@@ -69,6 +69,9 @@ pub struct NodeAttr {
   pub mtime: i64,
   /// The change time.
   pub ctime: i64,
+  /// The birth time: when the object was made, unless a host whose API sets a creation time set another (WinFsp's
+  /// `SetFileTime`, A-259).
+  pub btime: i64,
   /// The change counter: it moves on every change to the object and never repeats, whatever the
   /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
   pub change: u64,
@@ -133,6 +136,9 @@ pub struct SetAttr {
   /// and FSKit carry no such field and leave it `None`, and the change time then advances to the
   /// volume's clock as for any attribute change.
   pub ctime: Option<i64>,
+  /// A new birth time (nanoseconds since the Unix epoch), if set: only a host whose API sets a creation time asks for
+  /// it (WinFsp's `SetFileTime`, A-259); POSIX has no call that sets one, so FUSE, NFS and FSKit leave it `None`.
+  pub btime: Option<i64>,
 }
 
 /// The `renameat2` flags a rename carries. The operation layer preserves them and an
@@ -311,11 +317,17 @@ pub trait Bridge {
   /// Whether an effect a client keeps across a restart waits for the volume's next publication
   /// ([`slates_vfs::volume::Volume::awaits_publication`]): a transport's reply then waits for the owner's barrier (D-18).
   fn awaits_publication(&self) -> bool;
+  /// Whether `cx` may change this volume at all (`ReadOnly` for an attachment that may read but not write or a
+  /// snapshot's view, `NotPermitted` for one with no rights or of another volume), asked before a transport grants
+  /// something that becomes a change later: WinFsp's `CanDelete`, whose delete happens at the cleanup that has no reply.
+  fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError>;
   /// Look `name` up in directory `parent` under `cx`; the child's attributes.
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
   /// The attributes of `object` under `cx`.
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError>;
-  /// Open `object` under `cx`; the file handle.
+  /// Open `object` under `cx`; the file handle. `flags` are the open's flags as the FUSE protocol carries them (Linux
+  /// `O_*`), or `O_RDONLY` (0) from a transport without them; an open for writing (a write access mode, or `O_TRUNC`)
+  /// is a change, refused `ReadOnly` before any handle on an attachment that may not write.
   fn open(&mut self, object: ObjectId, cx: &OpContext, flags: u32) -> Result<u64, VfsError>;
   /// Read `size` bytes at `offset` from `object` into `out`, under the authenticated `cx`. The
   /// object is addressed by identity (§4.6), not an open handle; `cx` carries the view and the

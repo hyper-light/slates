@@ -113,6 +113,8 @@ const HANDSHAKE_TURN_CEILING: usize = 16;
 /// the handshake yields an RTT sample), so this covers a peer that boots many seconds after this node first
 /// dials it — a fleet forms as its nodes come up one after another — while still terminating on a peer that
 /// never answers.
+/// It bounds only waits paced by this end's own timer, so load cannot spend it; a peer's resends are bounded by
+/// [`Endpoint::handshake_deadline`] instead (a count of them ended handshakes with live dialers, 2026-11-08).
 /// Shape: it caps only the failure-and-formation path (a healthy handshake completes in its first few turns
 /// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
 /// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
@@ -136,6 +138,27 @@ const MAX_PARTIAL_FRAGMENTS_PER_TURN: usize =
 /// Shape: a small tail-loss tolerance — on any path a client answers a live confirmation within one
 /// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
 const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
+
+/// Why a handshake's `establish` gave up with [`EndpointError::NotReady`]: which of its bounds it reached (banned item 8:
+/// every wait in it is bounded). The kinds are what a caller counts, so a handshake that keeps failing says which bound
+/// is spending it: a peer that stays silent, or one that keeps asking and never gets further.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandshakeStall {
+  /// The peer's next flight never came, through every retransmit this end is allowed.
+  Silence,
+  /// The peer kept resending a flight this end had already taken, past the retransmit bound, without moving on.
+  Repeats,
+  /// Datagrams that never made a whole flight (fragments that stayed incomplete, or strays), past their bound.
+  Fragments,
+  /// The handshake took more turns than a TLS handshake's flights can.
+  TurnCeiling,
+  /// The two ends' last confirmation did not land within its absolute deadline.
+  ConfirmDeadline,
+  /// Confirmation retransmits ran out with the peer silent.
+  ConfirmSilence,
+  /// Confirmation met more invalid datagrams than its bound allows.
+  ConfirmGarbage,
+}
 
 /// A refusal on the endpoint.
 #[derive(Debug)]
@@ -161,6 +184,9 @@ pub enum EndpointError {
   Closed,
   /// The authenticated peer exceeded its session reservation, or admission capacity is invalid.
   Admission(crate::demux::SessionRefusal),
+  /// The accepting end abandoned the handshake and said so in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3): its half is gone, so the dialer dials afresh at once rather than waiting out its deadline.
+  PeerClosed,
   /// This end's handshake flight exceeds the largest flight the fragmenter carries
   /// (`crate::flight::MAX_FLIGHT_BYTES`): a certificate chain beyond a generous bound. Refused here,
   /// typed, before a byte leaves. Below that a flight of any size crosses as fragments each fitting the
@@ -463,6 +489,10 @@ pub struct Endpoint {
   /// Handshake budgets spent without establishing (`establish` calls that ended `NotReady`); reset to zero
   /// on establishment.
   handshake_budgets_spent: u32,
+  /// Why the last `establish` ended `NotReady`; `None` before any did, and once one succeeds.
+  handshake_stall: Option<HandshakeStall>,
+  /// Closes sent on abandoning a handshake ([`Endpoint::close_abandoned_handshake`]).
+  closes_sent: u64,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -544,6 +574,8 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -591,6 +623,8 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -640,6 +674,8 @@ impl Endpoint {
       fragments_sent: 0,
       hs_sent: 0,
       handshake_budgets_spent: 0,
+      handshake_stall: None,
+      closes_sent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -827,7 +863,10 @@ impl Endpoint {
     let mut last_flight = std::mem::take(&mut self.pending_flight);
     let outcome = self.establish_turns(&mut last_flight).await;
     match &outcome {
-      Ok(()) => self.handshake_budgets_spent = 0,
+      Ok(()) => {
+        self.handshake_budgets_spent = 0;
+        self.handshake_stall = None;
+      }
       Err(EndpointError::NotReady) => {
         self.pending_flight = last_flight;
         self.handshake_budgets_spent = self.handshake_budgets_spent.saturating_add(1);
@@ -835,6 +874,62 @@ impl Endpoint {
       Err(_) => {}
     }
     outcome
+  }
+
+  /// Why the last `establish` ended `NotReady`, for a caller to count: `None` before any did, and once one succeeds.
+  pub fn handshake_stall(&self) -> Option<HandshakeStall> {
+    self.handshake_stall
+  }
+
+  /// Records why this handshake is giving up, and the typed refusal that says so. An accepting end also tells its peer.
+  fn stalled(&mut self, why: HandshakeStall) -> EndpointError {
+    self.handshake_stall = Some(why);
+    self.close_abandoned_handshake();
+    EndpointError::NotReady
+  }
+
+  /// An accepting end abandoning its handshake tells its dialer, in a close sealed under the Handshake keys (RFC 9000
+  /// §10.2.3), so the dialer redials within a round trip instead of waiting out a 22 s deadline on state that is gone.
+  /// Only once it holds those keys: before them it has answered nothing, and an unprotected close at the Initial level
+  /// is not sent, since a stranger could forge one and cost the dialer its socket. A dialer sends none: it may yet retry on
+  /// this socket. Within the anti-amplification allowance (RFC 9000 §8.1), which a received flight leaves ample.
+  fn close_abandoned_handshake(&mut self) {
+    if self.quic.is_client() {
+      return;
+    }
+    let Some(keys) = self.levels.keys.as_ref() else {
+      return;
+    };
+    let Ok(close) = crate::flight::seal_close(keys.local.packet.as_ref(), &mut self.levels.numbers)
+    else {
+      return;
+    };
+    if let Some(account) = self.amplification.as_mut()
+      && !account.allow(close.len())
+    {
+      self.amplification_holds = self.amplification_holds.saturating_add(1);
+      return;
+    }
+    if self.send(&close).is_ok() {
+      self.closes_sent = self.closes_sent.saturating_add(1);
+    }
+  }
+
+  /// Whether `datagram`, from this end's peer, is a close sealed under the Handshake keys: the peer abandoned.
+  fn is_peer_close(&self, datagram: &[u8], from: SocketAddrV4) -> bool {
+    from == self.peer
+      && crate::flight::is_sealed_close(datagram)
+      && self
+        .levels
+        .keys
+        .as_ref()
+        .is_some_and(|keys| crate::flight::open_close(datagram, keys.remote.packet.as_ref()))
+  }
+
+  /// Closes this end sent to a dialer on abandoning its handshake: a non-vacuity counter for
+  /// [`Self::close_abandoned_handshake`].
+  pub fn closes_sent(&self) -> u64 {
+    self.closes_sent
   }
 
   /// How many handshake budgets this end has spent without establishing: zero once established, one more
@@ -912,7 +1007,7 @@ impl Endpoint {
       // rather than being fed to `read_hs` a second time.
       self.quic.read_hs(&received)?;
     }
-    Err(EndpointError::NotReady)
+    Err(self.stalled(HandshakeStall::TurnCeiling))
   }
 
   /// One turn's receive: the peer's next whole flight, rebuilt from its fragments, retransmitting this
@@ -932,9 +1027,19 @@ impl Endpoint {
     // per retransmit the budget allows.
     let mut partial = 0usize;
     let mut backoff = GRANULARITY_NS;
+    // A peer that keeps resending a flight this end has already answered is bounded by time, not by how often it
+    // resends: its retransmits are load's to spend, and a count of them ended handshakes with a live dialer inside a
+    // second or two (`fleet.accept.stall.repeats`, a 41.9 s formation at load 170, 2026-11-08). This end answers such a
+    // resend at the pace of its own backoff, not once per datagram.
+    let deadline = self.handshake_deadline();
+    let mut resend_after = 0u64;
+    let mut resend_backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => match self.receive_handshake(datagram, from) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
@@ -944,21 +1049,46 @@ impl Endpoint {
           crate::flight::Reassembly::Pending => {
             partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-              return Err(EndpointError::NotReady);
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
             backoff = GRANULARITY_NS;
             continue;
           }
-          // The peer retransmitted a flight this end already consumed (its reply raced this end's):
-          // it is still asking, so resend this end's flight; not re-fed to `read_hs`. Counted, so a
-          // flood cannot loop forever (banned item 8).
+          // The peer retransmitted a flight this end already consumed (its reply raced this end's): it is still asking,
+          // so resend this end's flight at this end's own pace. Not re-fed to `read_hs`. Bounded by the turn's deadline
+          // in time and by the datagram bound in work (banned item 8).
           crate::flight::Reassembly::Repeat => {
-            attempts = attempts.saturating_add(1);
-            if attempts > MAX_HANDSHAKE_RETRANSMITS {
-              return Err(EndpointError::NotReady);
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
-            if !last_flight.is_empty() {
-              self.resend_flight(last_flight)?;
+            let now = now_ns();
+            if now >= deadline {
+              return Err(self.stalled(HandshakeStall::Repeats));
+            }
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
+            }
+            continue;
+          }
+          // A later fragment of that same retransmit is as much a sign the peer is asking as its first, which a
+          // constrained path may have dropped: it is answered at the same pace, and bounded with the others.
+          crate::flight::Reassembly::RepeatRest => {
+            partial = partial.saturating_add(1);
+            if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+              return Err(self.stalled(HandshakeStall::Fragments));
+            }
+            let now = now_ns();
+            if now >= resend_after {
+              if !last_flight.is_empty() {
+                self.resend_flight(last_flight)?;
+              }
+              resend_after = now.saturating_add(resend_backoff.min(self.handshake_probe_ceiling()));
+              resend_backoff = resend_backoff.saturating_mul(2);
             }
             continue;
           }
@@ -968,7 +1098,7 @@ impl Endpoint {
             self.discarded = self.discarded.saturating_add(1);
             partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-              return Err(EndpointError::NotReady);
+              return Err(self.stalled(HandshakeStall::Fragments));
             }
             continue;
           }
@@ -976,7 +1106,7 @@ impl Endpoint {
         None => {
           attempts = attempts.saturating_add(1);
           if attempts > MAX_HANDSHAKE_RETRANSMITS {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::Silence));
           }
           backoff = backoff.saturating_mul(2);
           // A server the demultiplexer opened has no flight until it has read the client's first, so it
@@ -1019,15 +1149,18 @@ impl Endpoint {
   async fn confirm_as_client(&mut self, last_flight: &Flight) -> Result<(), EndpointError> {
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
       if remaining == 0 {
-        return Err(EndpointError::NotReady);
+        return Err(self.stalled(HandshakeStall::ConfirmDeadline));
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
+        Some((datagram, from)) if self.is_peer_close(&datagram, from) => {
+          return Err(EndpointError::PeerClosed);
+        }
         Some((datagram, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
@@ -1037,7 +1170,7 @@ impl Endpoint {
           invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmGarbage));
           }
           if from != self.peer {
             continue;
@@ -1050,7 +1183,7 @@ impl Endpoint {
         None => {
           retransmits = retransmits.saturating_add(1);
           if retransmits > MAX_HANDSHAKE_RETRANSMITS {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmSilence));
           }
           backoff = backoff.saturating_mul(2);
           self.resend_flight(last_flight)?;
@@ -1080,12 +1213,12 @@ impl Endpoint {
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
-    let deadline = self.confirmation_deadline();
+    let deadline = self.handshake_deadline();
     let mut invalid = 0usize;
     loop {
       let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
       if remaining == 0 {
-        return Err(EndpointError::NotReady);
+        return Err(self.stalled(HandshakeStall::ConfirmDeadline));
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(period).await? {
@@ -1100,7 +1233,7 @@ impl Endpoint {
           invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
-            return Err(EndpointError::NotReady);
+            return Err(self.stalled(HandshakeStall::ConfirmGarbage));
           }
           if from != self.peer {
             continue;
@@ -1129,9 +1262,9 @@ impl Endpoint {
     }
   }
 
-  /// Derived: confirmation permits at most the existing retry count plus the first attempt,
-  /// each no longer than the initial PTO. Traffic cannot renew that absolute budget (AUD-18).
-  fn confirmation_deadline(&self) -> u64 {
+  /// Derived: the absolute deadline of one wait in the handshake, a turn's or the confirmation's: at most the retransmit
+  /// count plus the first attempt, each no longer than the initial PTO, about 22 s. Traffic cannot renew it (AUD-18).
+  fn handshake_deadline(&self) -> u64 {
     slates_rt::futures::now_ns().saturating_add(
       self
         .handshake_probe_ceiling()
@@ -1642,6 +1775,14 @@ impl Endpoint {
     self.by_stream.remove(&stream);
     self.conn.close_recv(stream);
     Some(exchange.reply)
+  }
+
+  /// The bytes of exchange `id`'s reply read so far (`None` for an unknown exchange): how far that one reply has
+  /// come, for a caller that must tell an exchange still arriving from one that is silent while the session carries
+  /// other exchanges' bytes (the forward lane's stall budget, 2026-11-07).
+  pub fn reply_bytes_read(&mut self, id: u64) -> Option<usize> {
+    self.drain();
+    self.exchanges.get(&id).map(|exchange| exchange.reply.len())
   }
 
   /// Abandons exchange `id`: a bound one's request stops sending (`ResetStream`) and its reply is refused

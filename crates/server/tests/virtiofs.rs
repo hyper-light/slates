@@ -48,6 +48,8 @@ const DEADLINE_NS: u64 = 5_000_000_000;
 const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Format: `EPERM`.
 const EPERM: i32 = 1;
+/// Format: Linux `EROFS`, a read-only file system's answer to any change: a snapshot device's.
+const EROFS: i32 = 30;
 /// The bytes the guest writes and the host reads back.
 const PAYLOAD: &[u8] = b"written by a guest through virtqueues, read back by the host over NFS\n";
 
@@ -116,7 +118,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -151,7 +153,10 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
   let (outcome, errors) = run_guest(
     &daemon,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     |kick_write, call_read| {
       Box::pin(async move {
         let created = round_trip(
@@ -252,6 +257,7 @@ fn a_guest_whose_consumer_has_no_rights_is_refused_every_effect() {
     panic!("the volume was not created");
   };
   let foreign = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
     uid: my_uid().wrapping_add(1),
   };
   let (outcome, error) = run_guest(&daemon, id, foreign, |kick_write, call_read| {
@@ -298,7 +304,10 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   let (outcome, errors) = run_guest(
     &first,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     |kick_write, call_read| {
       Box::pin(async move {
         let created = round_trip(
@@ -393,7 +402,11 @@ fn a_consumers_revocation_stops_its_guest_device() {
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: true,
@@ -407,7 +420,11 @@ fn a_consumers_revocation_stops_its_guest_device() {
   let guest = common::guest::start_guest(
     &daemon,
     id,
-    Principal::Consumer { account, consumer },
+    Principal::Consumer {
+      host: slates_db::HostId(common::this_host()),
+      account,
+      consumer,
+    },
     slates_server::virtiofs::GuestView::default(),
     move |kick_write, call_read| {
       Box::pin(async move {
@@ -565,7 +582,7 @@ async fn snapshot_guest_script(
 /// scoped device look up `g` and `private` at its root and GETATTR `private`'s inode directly; through the
 /// snapshot device look up `f` and CREATE a file; ask for a subtree of a snapshot. Expect: the scoped device
 /// finds `g` and answers `ENOENT` for `private` both ways; the snapshot device sees `f` at the snapshot's six
-/// bytes, not the head's seven, and refuses the CREATE (`EPERM`); a subtree of a snapshot is refused typed with
+/// bytes, not the head's seven, and refuses the CREATE (`EROFS`, a read-only file system's); a subtree of a snapshot is refused typed with
 /// nothing admitted. Before 2026-10-01 a guest device presented only the volume's head, whole.
 #[test]
 fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
@@ -575,7 +592,10 @@ fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
     panic!("the volume was not created");
   };
   let (snapshot, private) = shared_private_and_a_snapshot(&daemon, &mut client, id, "viewed");
-  let me = Principal::Uid { uid: my_uid() };
+  let me = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
+    uid: my_uid(),
+  };
   let subtree = slates_server::virtiofs::GuestView {
     subtree: Some("/shared".to_owned()),
     snapshot: None,
@@ -615,7 +635,7 @@ fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
 }
 
 /// A guest device presenting `snapshot` of volume `id` finds `f` at the snapshot's six bytes, not the head's
-/// seven, and its CREATE is refused `EPERM`.
+/// seven, and its CREATE is refused `EROFS`.
 fn assert_the_snapshot_device_is_read_only(
   daemon: &Daemon,
   id: slates_ipc::protocol::VolumeId,
@@ -639,7 +659,10 @@ fn assert_the_snapshot_device_is_read_only(
     (0, 6),
     "the snapshot's `before`, not the head"
   );
-  assert_eq!(created, -EPERM, "a snapshot device writes nothing");
+  assert_eq!(
+    created, -EROFS,
+    "a snapshot device writes nothing, as a read-only file system"
+  );
 }
 
 /// The vhost-user front end the tests below speak (`common/vhost_front_end.rs`). Linux only.
@@ -975,7 +998,7 @@ mod vhost_form {
       &profile,
       config,
       SegmentSource::Create {
-        name: format!("slates-seg-{tag}"),
+        name: common::fixture_object("slates-seg", tag),
       },
     )
     .unwrap();
@@ -1776,7 +1799,11 @@ mod vhost_form {
     owner
       .share(
         volume,
-        slates_client::Principal::Consumer { account, consumer },
+        slates_client::Principal::Consumer {
+          host: common::this_host(),
+          account,
+          consumer,
+        },
         slates_client::Rights {
           read: true,
           write: false,
@@ -2589,7 +2616,10 @@ fn a_guest_device_is_recorded_its_snapshot_view_advances_and_its_detach_ends_it(
   let guest = common::guest::start_guest(
     &daemon,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     slates_server::virtiofs::GuestView {
       subtree: None,
       snapshot: Some(first),
@@ -2647,7 +2677,10 @@ fn a_dead_daemons_guest_record_is_ended_by_recovery() {
   let guest = common::guest::start_guest(
     &first,
     id,
-    Principal::Uid { uid: my_uid() },
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
     slates_server::virtiofs::GuestView::default(),
     move |kick_write, _call_read| {
       Box::pin(async move {
@@ -2818,7 +2851,10 @@ fn a_volume_destroyed_under_its_guest_devices_ends_them_cleanly() {
     let guest = common::guest::start_guest(
       &daemon,
       id,
-      Principal::Uid { uid: my_uid() },
+      Principal::Uid {
+        host: slates_db::HostId(common::this_host()),
+        uid: my_uid(),
+      },
       slates_server::virtiofs::GuestView {
         subtree: None,
         snapshot,

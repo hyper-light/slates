@@ -1186,6 +1186,10 @@ pub struct HostPromise {
   pub next: Option<ObjectId>,
   /// The highest fence above the epoch on an object this holder could not promise, if any.
   pub fenced: Option<HostEpoch>,
+  /// How many objects this page's range holds a copy of that this holder could not promise for any other reason: such
+  /// a page is no answer for what it leaves out, so the asker does not count it as complete. Listing nothing means
+  /// holding nothing only when this is zero.
+  pub unpromised: u32,
 }
 
 /// Format: the fixed width of one [`HostPromise`] entry before its value: the object (16 bytes), the record's
@@ -1193,9 +1197,10 @@ pub struct HostPromise {
 pub const HOST_PROMISE_ENTRY_BYTES: usize = OBJECT_BYTES + 2 * size_of::<u64>() + size_of::<u32>();
 
 /// Format: the widest [`HostPromise`] header: holder, departed, epoch, generation (u64 LE each), the next
-/// page's presence byte and object, the fence's presence byte and epoch, and the entry count (u32 LE).
+/// page's presence byte and object, the fence's presence byte and epoch, the unpromised count and the entry count
+/// (u32 LE each).
 pub const HOST_PROMISE_HEADER_BYTES: usize =
-  4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
+  4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + 2 * size_of::<u32>();
 
 impl HostPromise {
   /// Whether this answers `prepare`: the same retired host, epoch and generation, so an answer to another
@@ -1228,6 +1233,7 @@ impl HostPromise {
         out.extend_from_slice(&fence.0.to_le_bytes());
       }
     }
+    out.extend_from_slice(&self.unpromised.to_le_bytes());
     let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for (object, accepted) in &self.entries {
@@ -1256,6 +1262,7 @@ impl HostPromise {
       FIELD_PRESENT => Some(HostEpoch(reader.word()?)),
       _ => return Err(RegisterError::MalformedRecord),
     };
+    let unpromised = reader.half()?;
     let count = usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
     if count > reader.remaining() / HOST_PROMISE_ENTRY_BYTES {
       return Err(RegisterError::MalformedRecord);
@@ -1286,6 +1293,7 @@ impl HostPromise {
       entries,
       next,
       fenced,
+      unpromised,
     })
   }
 }
@@ -1524,6 +1532,15 @@ impl Acceptor {
       .range((object, 0)..=(object, u64::MAX))
       .next_back()
       .map(|(&(_, sequence), (_, value))| (sequence, value.as_slice()))
+  }
+
+  /// The value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup, where
+  /// [`Acceptor::values`] walks every position the object holds.
+  pub fn value_at(&self, object: ObjectId, sequence: u64) -> Option<&[u8]> {
+    self
+      .accepted
+      .get(&(object, sequence))
+      .map(|(_, value)| value.as_slice())
   }
 
   /// Every accepted value of `object`, in sequence order (a ledger's whole history).
@@ -4455,6 +4472,7 @@ mod tests {
       ],
       next: Some(ObjectId::new(HostId(1), 8)),
       fenced: Some(HostEpoch(6)),
+      unpromised: 3,
     }
   }
 
@@ -4544,9 +4562,10 @@ mod tests {
       HostPrepare::decode(&flag),
       Err(RegisterError::MalformedRecord)
     );
-    // The entry count sits after the header words, the next page (presence byte and object) and the fence
-    // (presence byte and epoch); claim every count there is.
-    let count_at = 4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>();
+    // The entry count sits after the header words, the next page (presence byte and object), the fence (presence byte
+    // and epoch) and the unpromised count; claim every count there is.
+    let count_at =
+      4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
     let mut lying = answer.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
