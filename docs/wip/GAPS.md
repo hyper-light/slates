@@ -438,7 +438,11 @@
 > runs of clients' recipe at 183-292 runnable processes and in loadtest-scale's memrung beside the same spinners; stuck
 > starts killed at 1,001-1,294 ms on this Mac, both Linux and both Windows CI runners; the restart, handoff and start
 > suites green on all four. Open:
-> - a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat;
+> - ~~a shard's recovery is one poll, which past a window of CPU stops the watchdog's beat~~ **closed 2026-11-07**: the
+>   shard's start runs alone (`slates_rt::futures::spawn_alone`) and its recovery yields between units, its yields held to
+>   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
+>   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
+>   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
 > - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
@@ -1055,11 +1059,20 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. Recovery in one poll and the client's reconnect
->   budget stay open here. Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
->   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`). Slicing the
->   recovery is liveness's next goal.
+>   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
+> - **2026-11-07, recovery in one poll closed:** a shard's start runs alone and its recovery yields between units (each
+>   record, a green's held origin a directory listing or file a unit, its chain an entry a unit, each logged write),
+>   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
+>   (with A-257's whole replay, state A under load on main 80be552a: unsliced 198 spinning lines and 203 restarts for 5
+>   kills, no restart whole; sliced 0 lines, every restart read back whole; the first CPU figures here measured fenced
+>   replays and are withdrawn, the comparison owed); the records' sort computes each key once (it recomputed the lineage depth,
+>   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
+>   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
+>   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over
+>   its origin (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`).
 
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; fixed
 > 2026-11-07, `agents/winfsp-overlap-21`; Windows CI owed).** WinFsp's transact never goes pending: the control dispatch
@@ -9048,6 +9061,25 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   relay-retirement test. Both are intermittent, are owed root causes, and are not tolerated.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
+
+### 2026-11-08: a restarted node's peers kept their sessions to its old process (A-261, stateless reset)
+
+**Fixed in the transport.** On loadtest-scale's primary-kill rung, the client node forwarded into its record session
+to the restarted primary for 25 to 135 s. The new process dropped every packet for the old session
+(`unknown_id`). With A-261 it answers the first such packet with a stateless reset (RFC 9000 §10.3). The reset ends in
+the token the old process issued for the session inside the encrypted session, from a key that only the node's
+identity derives. The client node ends the session `PeerReset`, drops the link (`fleet.link.peer_reset`) and dials the
+new process. In simulation the session ended one round trip after its first packet (10.0 ms against 10 ms). Record:
+`docs/bugs/2026-11-08-a-restarted-node-left-its-peers-sessions-to-it-in-place.md`.
+- **Still open:**
+  - An accepting session whose dialer restarted onto another port is not reset, since nothing answers at the old
+    port. It ends on its own timers, as before. A restart that rebinds the old port does reset it: a dialer's own
+    socket answers strays too.
+  - A peer restarted under another identity, a lost reset, a silent peer and an older build all fall to
+    loadtest-scale's borrower check. That check is transport-only: at each turn, a session that failed, or one with
+    bytes in flight and no authenticated packet for a liveness budget, is judged dead. The membership offers no signal
+    here: the restarted primary rejoined with the same member id at incarnation 0, and every peer kept it `Alive`.
+  - **The process test is parked `#[ignore]` (2026-11-09, the supervisor, landing it).** `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process` passed 15 of 15 a side on three CI runners (diag-61), but on a Mac at load 46 to 48 it failed 2 of 3 runs, and at load 232 the stack gate's one. Each failure read 0 resets while b's first read reached the restarted a in 207 to 263 ms: b's forward found its session lent (`fleet.forward.session_out`) or the link already judged the old a dead, so no packet reached the new process on the old session and no reset was owed. The product behaved; the test does not hold its precondition. Owed (raft-chaos): assert b still holds its session to the old a when a restarts, retry within a bound when it does not, and count the runs in which the reset path ran, then un-ignore it.
 
 ### 2026-11-07: a bootstrapped node with no probe session counted itself meshed (fixed)
 
