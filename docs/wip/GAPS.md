@@ -15540,6 +15540,13 @@ runs on the box at load average 74 to 93, and never alone.
   4,194,304 for 0. The server's end of a mount now sweeps its attachment's references (§4.6, "A FUSE mount's end gives
   back its lookups"). Test: `the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end`
   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-09-an-unmounted-fuse-mounts-lookups-stayed-counted.md`.
+  Since main's B10 fences a FUSE mount whose record ended (`fence_if_mounted` revokes its registry attachment), the
+  sweep takes the attachment's owner as the registry records it, live or revoked, until it is drained
+  (`Attachments::owner`; a drained attachment answers none). Tests: `an_attachments_owner_answers_while_live_or_revoked_and_none_once_drained`
+  (`crates/bridge-core/tests/authority.rs`) and `a_revoked_mounts_references_are_given_back_once_and_only_its_own`
+  (`crates/server/tests/fuse_mount.rs`, Linux): a revoked consumer's lookup of a file the account holds open and
+  unlinked is given back at its mount's end and none of the account's with it. On adacachy2 green in 0.35 s; with the
+  sweep call taken out, 1,048,576 bytes stayed counted for 0.
 - **Open, a test race (slabs, low priority; found 2026-11-09):**
   `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
   asserts a `mkdir` through the mount answers `EIO` once the stand-in server refuses its barrier; once, the `mkdir`

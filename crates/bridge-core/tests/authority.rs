@@ -59,6 +59,47 @@ fn a_context_is_built_from_the_record_and_a_revoked_attachment_is_refused() {
 }
 
 /// A takeover raises the owner epoch; an attachment admitted under the old epoch is fenced.
+/// The owner a teardown sweeps an ending attachment's references under (the server's FUSE mount end, 2026-11-09):
+/// answered for a live attachment and for a revoked one, whose references are still its own though it admits no
+/// request, and for no drained one, so a sweep after the drain finds no owner and gives nothing back twice. Do: attach;
+/// read the owner; revoke; read it again; drain; read it again. Expect the context's owner, the same owner, then none.
+#[test]
+fn an_attachments_owner_answers_while_live_or_revoked_and_none_once_drained() {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [2; 16] },
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      },
+      Rights {
+        read: true,
+        write: false,
+      },
+    )
+    .unwrap();
+  let live = attachments.context(id).unwrap().owner;
+  assert_eq!(
+    attachments.owner(id),
+    Some(live),
+    "a live attachment's owner is its context's"
+  );
+  attachments.revoke(id);
+  assert_eq!(
+    attachments.owner(id),
+    Some(live),
+    "a revoked attachment's references are still its own"
+  );
+  attachments.drain(id);
+  assert_eq!(
+    attachments.owner(id),
+    None,
+    "a drained attachment has no owner"
+  );
+}
+
 #[test]
 fn a_takeover_fences_attachments_under_the_old_epoch() {
   let mut attachments = Attachments::new();

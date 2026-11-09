@@ -426,6 +426,110 @@ fn a_revoked_consumers_fuse_mount_reaches_nothing() {
   );
 }
 
+/// Shape: the file the exactly-once test's two mounts hold: 1 MiB, plainly apart from the volume's own bytes.
+const HELD_BYTES: usize = 1 << 20;
+
+/// The references a revoked consumer's FUSE mount held are given back once, at its end, and only its own (2026-11-09:
+/// the end-of-mount sweep; a revoked attachment admits no context, so the sweep takes its owner as the registry records
+/// it until it is drained). Do: the account mounts a volume and writes `f`; a consumer's workload mounts it for reading
+/// and looks `f` up; the account opens `f`, keeps it open, and unlinks it; the consumer is revoked, which ends its mount.
+/// Expect `f` still counted and readable through the account's open file, since the consumer's sweep gave back none of
+/// the account's references; then, the account's file closed, the volume's referenced bytes back where they were before
+/// `f`, since the consumer's lookup went with its mount. Before the sweep the consumer's lookup stayed counted until the
+/// next restart, and the bytes never came back.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mounts: RAM, not disk
+fn a_revoked_mounts_references_are_given_back_once_and_only_its_own() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-once-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fuse-once"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = rustix::process::getuid().as_raw();
+  let mut owner = connect(&instance);
+  let mut workload = connect(&instance);
+  let (consumer, capability) = owner
+    .enroll(account, slates_server::landing::enroll_proof(&secret, account))
+    .unwrap();
+  workload.attest(consumer, &capability).unwrap();
+  let volume = owner.create(&scratch("fuse-once")).unwrap();
+  let owners = target_dir();
+  let owners_mount = owner.attach_fuse(volume, Intent::Write, &owners.path).unwrap();
+  let before = owner.status(volume).unwrap().referenced_bytes;
+  let file = format!("{}/f", owners.path);
+  std::fs::write(&file, vec![0x5Au8; HELD_BYTES]).unwrap();
+  owner
+    .share(
+      volume,
+      slates_client::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
+      slates_ipc::protocol::Rights {
+        read: true,
+        write: false,
+        admin: false,
+      },
+    )
+    .unwrap();
+  let consumers = target_dir();
+  workload.attach_fuse(volume, Intent::Read, &consumers.path).unwrap();
+  let looked_up = std::fs::metadata(format!("{}/f", consumers.path)).map(|m| m.len());
+  let held = std::fs::File::open(&file).unwrap();
+  std::fs::remove_file(&file).unwrap();
+  owner
+    .revoke(consumer, slates_server::landing::revoke_proof(&secret, consumer))
+    .unwrap();
+  let after_revocation = owner.status(volume).unwrap().referenced_bytes;
+  let still_read = {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    (&held).read_to_end(&mut bytes).map(|_| bytes.len())
+  };
+  drop(held);
+  let deadline = Instant::now() + HELPER_WAIT_FOR_RELEASE;
+  let mut at_end = owner.status(volume).unwrap().referenced_bytes;
+  while at_end > before && Instant::now() < deadline {
+    std::thread::sleep(Duration::from_millis(20));
+    at_end = owner.status(volume).unwrap().referenced_bytes;
+  }
+  owner.detach(owners_mount.attachment).unwrap();
+  let _ = Command::new("fusermount3").args(["-u", "-z", &consumers.path]).status();
+  daemon.stop();
+  let held_bytes = u64::try_from(HELD_BYTES).unwrap();
+  assert_eq!(looked_up.ok(), Some(held_bytes), "the consumer's mount looked f up");
+  assert!(
+    after_revocation >= before + held_bytes,
+    "the consumer's sweep gave back none of the account's references: f still counted ({after_revocation} for at \
+     least {})",
+    before + held_bytes
+  );
+  assert_eq!(still_read.ok(), Some(HELD_BYTES), "f reads through the account's open file");
+  assert_eq!(
+    at_end, before,
+    "with the account's file closed, the revoked consumer's lookup is gone too, so f's bytes are freed"
+  );
+}
+
+/// Shape: how long the exactly-once test waits for the account's closed file to be released and reclaimed: the
+/// kernel sends `RELEASE` in the background after `close` returns.
+const HELPER_WAIT_FOR_RELEASE: Duration = Duration::from_secs(10);
+
 /// Shape: the file the revoked consumer's descriptor reads: far past what one read and its readahead bring in.
 const REVOKED_FILE_BYTES: usize = 1 << 20;
 /// Shape: what the consumer reads before the revocation, a page, and where it reads after: the next page, which the
