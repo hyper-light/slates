@@ -1,0 +1,60 @@
+name: DIAG live-fixes the healer's republish and bound (A-276) on Linux and Windows, x5 (not for main)
+
+# Diagnostics branch of live-fixes; never merged. agents/live-fixes-1 at 24869c87 (the healer, A-276, with main at
+# 1c49c33f merged): the three tests that are red on the old code, five runs each, each run's wall time recorded.
+
+on:
+  push:
+    branches: [diag-live-fixes-71]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  arm:
+    name: Healer on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The tests
+        shell: bash
+        run: |
+          R=../results.txt
+          echo "24869c87 on ${{ matrix.os }}, $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo $NUMBER_OF_PROCESSORS) CPUs, $(date -u), head $(git rev-parse HEAD)" > $R
+          for run in 1 2 3 4 5; do
+            for t in a_heal_republishes_the_head_once_a_named_holder_has_left a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later; do
+              status=0
+              began=$SECONDS
+              perl -e 'alarm shift; exec @ARGV' 1500 cargo test --locked -p slates-server --test fleet -- --nocapture --exact $t > ../run.log 2>&1 || status=$?
+              echo "== run $run $t exit $status $((SECONDS - began)) s" | tee -a $R
+              grep -E -A3 'panicked|^test result|fleet wait gave up' ../run.log | cut -c1-2500 >> $R || true
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "diag-live-fixes"
+          git config user.email "diag-live-fixes@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-fixes-71 ${{ matrix.os }} results"
+          git push -q origin "HEAD:refs/heads/diag-results/diag-live-fixes-71-${{ matrix.os }}"
