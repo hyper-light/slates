@@ -1,0 +1,977 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded arrayvec v0.7.8
+  Downloaded autocfg v1.5.1
+  Downloaded bit-vec v0.8.0
+  Downloaded dunce v1.0.5
+  Downloaded bitflags v2.13.1
+  Downloaded fastrand v2.5.0
+  Downloaded rand_chacha v0.9.0
+  Downloaded tempfile v3.27.0
+  Downloaded syn v2.0.119
+  Downloaded serde_json v1.0.151
+  Downloaded errno v0.3.14
+  Downloaded quick-error v1.2.3
+  Downloaded rusty-fork v0.3.1
+  Downloaded once_cell v1.21.4
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded subtle v2.6.1
+  Downloaded getrandom v0.4.3
+  Downloaded thiserror-impl v2.0.21
+  Downloaded tinyvec v1.13.2
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded fnv v1.0.7
+  Downloaded powerfmt v0.2.0
+  Downloaded time-core v0.1.9
+  Downloaded wait-timeout v0.2.1
+  Downloaded pkg-config v0.3.34
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded zmij v1.0.23
+  Downloaded rand_xorshift v0.4.0
+  Downloaded zeroize v1.9.0
+  Downloaded memmap2 v0.9.11
+  Downloaded cpufeatures v0.3.1
+  Downloaded crc32c v0.6.8
+  Downloaded itoa v1.0.18
+  Downloaded cfg-if v1.0.4
+  Downloaded fs_extra v1.3.0
+  Downloaded getrandom v0.2.17
+  Downloaded untrusted v0.9.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded serde_core v1.0.229
+  Downloaded rustc_version v0.4.1
+  Downloaded unarray v0.1.4
+  Downloaded cmake v0.1.58
+  Downloaded deranged v0.5.8
+  Downloaded quote v1.0.47
+  Downloaded shlex v2.0.1
+  Downloaded jobserver v0.1.35
+  Downloaded num-conv v0.2.2
+  Downloaded rand_core v0.9.5
+  Downloaded rcgen v0.13.2
+  Downloaded semver v1.0.28
+  Downloaded thiserror v2.0.21
+  Downloaded twox-hash v2.1.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded yasna v0.5.2
+  Downloaded serde_derive v1.0.229
+  Downloaded proc-macro2 v1.0.107
+  Downloaded getrandom v0.3.4
+  Downloaded memchr v2.8.3
+  Downloaded num-traits v0.2.19
+  Downloaded serde v1.0.229
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded rand v0.9.5
+  Downloaded cc v1.4.5
+  Downloaded lz4_flex v0.11.6
+  Downloaded rustls-webpki v0.103.15
+  Downloaded proptest v1.11.0
+  Downloaded blake3 v1.8.7
+  Downloaded time v0.3.55
+  Downloaded zerocopy v0.8.56
+  Downloaded rustls v0.23.44
+  Downloaded syn v3.0.5
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded libc v0.2.189
+  Downloaded ring v0.17.14
+  Downloaded linux-raw-sys v0.12.1
+   Compiling libc v0.2.189
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling pkg-config v0.3.34
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.13.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.5
+   Compiling cpufeatures v0.3.1
+   Compiling zmij v1.0.23
+   Compiling constant_time_eq v0.4.2
+   Compiling jobserver v0.1.35
+   Compiling arrayvec v0.7.8
+   Compiling cc v1.4.5
+   Compiling blake3 v1.8.7
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling serde_derive v1.0.229
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+   Compiling memmap2 v0.9.11
+   Compiling cmake v0.1.58
+   Compiling syn v2.0.119
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling zstd-safe v7.3.0
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling zeroize v1.9.0
+   Compiling twox-hash v2.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling getrandom v0.4.3
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling unicode-normalization v0.1.25
+   Compiling getrandom v0.3.4
+   Compiling slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+   Compiling once_cell v1.21.4
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling semver v1.0.28
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling rustc_version v0.4.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling zerocopy v0.8.56
+   Compiling rand_core v0.9.5
+   Compiling crc32c v0.6.8
+   Compiling untrusted v0.9.0
+   Compiling autocfg v1.5.1
+   Compiling rustls v0.23.44
+   Compiling thiserror v2.0.21
+   Compiling num-traits v0.2.19
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling thiserror-impl v2.0.21
+   Compiling subtle v2.6.1
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.27.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling deranged v0.5.8
+   Compiling num-conv v0.2.2
+   Compiling powerfmt v0.2.0
+   Compiling hyper-timing v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-timing)
+   Compiling time-core v0.1.9
+   Compiling fnv v1.0.7
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling time v0.3.55
+   Compiling hyper-swim v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-swim)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling yasna v0.5.2
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling slates-merge v0.1.0 (/home/runner/work/slates/slates/crates/merge)
+   Compiling proptest v1.11.0
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+   Compiling slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling rustls-webpki v0.103.15
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+   Compiling hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling rcgen v0.13.2
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 08s
+     Running tests/nfs_read_only_kernel.rs (target/debug/deps/nfs_read_only_kernel-9844751c0f9d9256)
+
+running 1 test
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 2191 µs
+test a_read_only_attachment_refuses_an_open_for_writing_through_the_kernels_nfs_clients ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+## nfs read-only exit 0
+ Downloading crates ...
+  Downloaded heck v0.5.0
+  Downloaded pyo3-macros v0.22.6
+  Downloaded toml_write v0.1.2
+  Downloaded derive_more-impl v2.1.1
+  Downloaded regex v1.13.1
+  Downloaded toml_datetime v0.6.11
+  Downloaded equivalent v1.0.2
+  Downloaded napi-sys v2.4.0
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded target-lexicon v0.12.16
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded trybuild v1.0.120
+  Downloaded derive_more v2.1.1
+  Downloaded iai-callgrind-macros v0.6.1
+  Downloaded indoc v2.0.7
+  Downloaded napi v2.16.17
+  Downloaded target-triple v1.0.1
+  Downloaded winnow v1.0.4
+  Downloaded convert_case v0.6.0
+  Downloaded pyo3-macros-backend v0.22.6
+  Downloaded napi-build v2.4.1
+  Downloaded indexmap v2.14.2
+  Downloaded iai-callgrind v0.16.1
+  Downloaded rustversion v1.0.23
+  Downloaded toml v1.1.5+spec-1.1.0
+  Downloaded unindent v0.2.4
+  Downloaded aho-corasick v1.1.5
+  Downloaded pyo3-ffi v0.22.6
+  Downloaded iai-callgrind-runner v0.16.1
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded memoffset v0.9.1
+  Downloaded pyo3 v0.22.6
+  Downloaded bincode v1.3.3
+  Downloaded hashbrown v0.17.1
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded termcolor v1.4.1
+  Downloaded napi-derive-backend v1.0.75
+  Downloaded ctor v0.2.9
+  Downloaded napi-derive v2.16.13
+  Downloaded toml v0.8.23
+  Downloaded winnow v0.7.15
+  Downloaded pyo3-build-config v0.22.6
+  Downloaded regex-automata v0.4.18
+  Downloaded toml_edit v0.22.27
+  Downloaded serde_spanned v0.6.9
+  Downloaded glob v0.3.4
+  Downloaded serde_spanned v1.1.1
+    Checking cfg-if v1.0.4
+   Compiling libc v0.2.189
+   Compiling rustix v1.1.4
+    Checking bitflags v2.13.1
+    Checking linux-raw-sys v0.12.1
+    Checking cpufeatures v0.3.1
+    Checking constant_time_eq v0.4.2
+    Checking arrayvec v0.7.8
+   Compiling serde_core v1.0.229
+   Compiling jobserver v0.1.35
+    Checking twox-hash v2.1.4
+    Checking lz4_flex v0.11.6
+   Compiling cc v1.4.5
+    Checking zmij v1.0.23
+    Checking memchr v2.8.3
+    Checking itoa v1.0.18
+    Checking memmap2 v0.9.11
+   Compiling syn v2.0.119
+    Checking serde v1.0.229
+   Compiling blake3 v1.8.7
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+    Checking serde_json v1.0.151
+    Checking once_cell v1.21.4
+    Checking getrandom v0.4.3
+    Checking getrandom v0.3.4
+    Checking rand_core v0.9.5
+    Checking zerocopy v0.8.56
+    Checking fastrand v2.5.0
+    Checking tempfile v3.27.0
+    Checking wait-timeout v0.2.1
+    Checking quick-error v1.2.3
+    Checking fnv v1.0.7
+    Checking bit-vec v0.8.0
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+    Checking bit-set v0.8.0
+    Checking rusty-fork v0.3.1
+    Checking num-traits v0.2.19
+    Checking rand v0.9.5
+    Checking rand_xorshift v0.4.0
+    Checking regex-syntax v0.8.11
+    Checking unarray v0.1.4
+    Checking slates-image v0.1.0 (/home/runner/work/slates/slates/crates/image)
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.13.2
+    Checking unicode-normalization v0.1.25
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+   Compiling cmake v0.1.58
+    Checking zeroize v1.9.0
+    Checking thiserror v2.0.21
+    Checking rustls-pki-types v1.15.1
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+    Checking proptest v1.11.0
+    Checking untrusted v0.9.0
+    Checking subtle v2.6.1
+    Checking crc32c v0.6.8
+    Checking hyper-timing v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-timing)
+    Checking hyper-swim v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-swim)
+    Checking deranged v0.5.8
+    Checking slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+    Checking time-core v0.1.9
+    Checking powerfmt v0.2.0
+    Checking num-conv v0.2.2
+    Checking slates-merge v0.1.0 (/home/runner/work/slates/slates/crates/merge)
+    Checking time v0.3.55
+    Checking yasna v0.5.2
+    Checking slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling derive_more-impl v2.1.1
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling iai-callgrind-runner v0.16.1
+   Compiling proc-macro-error2 v2.0.1
+   Compiling derive_more v2.1.1
+   Compiling iai-callgrind v0.16.1
+   Compiling iai-callgrind-macros v0.6.1
+    Checking bincode v1.3.3
+    Checking slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+    Checking slates-guest-probe v0.1.0 (/home/runner/work/slates/slates/crates/guest-probe)
+   Compiling target-lexicon v0.12.16
+    Checking winnow v1.0.4
+   Compiling pyo3-build-config v0.22.6
+    Checking hashbrown v0.17.1
+   Compiling target-triple v1.0.1
+    Checking equivalent v1.0.2
+    Checking indexmap v2.14.2
+    Checking toml_parser v1.1.3+spec-1.1.0
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v1.1.1
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking toml_writer v1.1.2+spec-1.1.0
+    Checking winnow v0.7.15
+    Checking toml_write v0.1.2
+    Checking toml v1.1.5+spec-1.1.0
+   Compiling pyo3-macros-backend v0.22.6
+   Compiling pyo3-ffi v0.22.6
+   Compiling aho-corasick v1.1.5
+    Checking toml_edit v0.22.27
+   Compiling zstd-safe v7.3.0
+    Checking zstd v0.13.3
+    Checking slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+    Checking slates-archive v0.1.0 (/home/runner/work/slates/slates/crates/archive)
+    Checking slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+    Checking slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+    Checking glob v0.3.4
+    Checking termcolor v1.4.1
+    Checking trybuild v1.0.120
+    Checking slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+    Checking slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+    Checking slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+    Checking slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+    Checking slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling regex-automata v0.4.18
+    Checking toml v0.8.23
+   Compiling memoffset v0.9.1
+   Compiling unicode-segmentation v1.13.3
+    Checking slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+    Checking slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+    Checking slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+    Checking slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+    Checking slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+    Checking slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+    Checking unicode-ident v1.0.24
+   Compiling heck v0.5.0
+    Checking proc-macro2 v1.0.107
+   Compiling regex v1.13.1
+   Compiling convert_case v0.6.0
+   Compiling pyo3 v0.22.6
+   Compiling napi-build v2.4.1
+   Compiling napi-derive-backend v1.0.75
+   Compiling slates-sdk-node v0.1.0 (/home/runner/work/slates/slates/crates/sdk-node)
+    Checking quote v1.0.47
+   Compiling ctor v0.2.9
+    Checking napi-sys v2.4.0
+   Compiling indoc v2.0.7
+   Compiling slates-sdk-python v0.1.0 (/home/runner/work/slates/slates/crates/sdk-python)
+    Checking unindent v0.2.4
+    Checking napi v2.16.17
+   Compiling napi-derive v2.16.13
+   Compiling pyo3-macros v0.22.6
+    Checking slates-bridge-fskit v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fskit)
+    Checking slates-bridge-winfsp v0.1.0 (/home/runner/work/slates/slates/crates/bridge-winfsp)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-42c31b829b6af06e/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling rustls v0.23.44
+    Checking hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+    Checking rustls-webpki v0.103.15
+    Checking hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+    Checking rcgen v0.13.2
+    Checking slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+    Checking slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+    Checking slates-mcp v0.1.0 (/home/runner/work/slates/slates/crates/mcp)
+    Checking xtask v0.1.0 (/home/runner/work/slates/slates/xtask)
+    Checking slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+    Checking slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+    Checking slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Checking slates-cli v0.1.0 (/home/runner/work/slates/slates/crates/cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 06s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+## workspace clippy exit 0
+   Compiling syn v3.0.5
+   Compiling serde_derive v1.0.229
+   Compiling serde v1.0.229
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.44s
+     Running unittests src/lib.rs (target/debug/deps/slates_bridge_nfs-49d0638299394af0)
+
+running 27 tests
+test multi::tests::a_malformed_mount_capability_is_refused_not_a_panic ... ok
+test rpc::tests::a_colossal_auth_sys_gid_count_is_refused_before_allocating ... ok
+test rpc_tls::tests::malformed_messages_are_refused_typed ... ok
+test rpc_tls::tests::only_a_null_call_with_an_empty_auth_tls_credential_is_a_probe ... ok
+test rpc_tls::tests::the_starttls_and_bad_credential_replies_are_the_rfcs_bytes ... ok
+test v4::lock::tests::a_conflict_needs_an_overlap_and_a_writer ... ok
+test v4::lock::tests::a_range_is_refused_when_empty_or_past_the_largest_offset ... ok
+test multi::tests::a_well_formed_capability_round_trips ... ok
+test v4::replay::tests::a_bulk_read_is_served_again_never_answered ... ok
+test v4::replay::tests::a_call_is_refused_at_the_bound_unless_its_slot_frees_the_room ... ok
+test v4::replay::tests::a_later_compound_replaces_its_slots_record ... ok
+test v4::replay::tests::a_malformed_record_is_refused ... ok
+test v4::replay::tests::a_purge_drops_records_and_owes_their_removal ... ok
+test v4::replay::tests::a_recorded_call_is_answered_only_for_its_own_compound_and_key ... ok
+test v4::replay::tests::a_records_counted_bytes_are_its_encodings ... ok
+test v4::replay::tests::a_restore_keeps_the_later_or_longer_copy ... ok
+test v4::replay::tests::a_restored_record_answers_until_it_is_replaced ... ok
+test v4::replay::tests::a_writes_digest_leaves_out_its_data ... ok
+test v4::replay::tests::only_a_record_with_a_change_rides_a_publication ... ok
+test v4::replay::tests::only_a_restored_record_reports_a_divergence ... ok
+test v4::v3call::tests::a_read_result_that_does_not_end_with_its_data_is_malformed ... ok
+test v4::v3call::tests::the_read_tail_is_read4resok_byte_for_byte ... ok
+test xdr::tests::a_hostile_opaque_length_is_refused_before_reading ... ok
+test xdr::tests::a_well_formed_opaque_reads_and_bad_utf8_is_refused ... ok
+test multi::tests::any_string_parses_to_an_option_never_a_panic ... ok
+test rpc::tests::any_auth_sys_credential_parses_to_a_bounded_identity_or_none ... ok
+test v4::lock::tests::locks_and_unlocks_match_the_byte_model ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/async_loopback.rs (target/debug/deps/async_loopback-6a16763ae20e1521)
+
+running 2 tests
+test queued_calls_yield_between_replies ... ok
+test a_client_mounts_and_reads_a_file_over_the_async_server ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/attr_floor.rs (target/debug/deps/attr_floor-b7d517d13e5d02c9)
+
+running 1 test
+test no_object_encodes_below_the_floor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/auth.rs (target/debug/deps/auth-9476d3994625ca12)
+
+running 4 tests
+test a_credential_with_too_many_groups_is_refused ... ok
+test an_auth_sys_credential_carries_the_groups ... ok
+test an_auth_sys_credential_names_the_mounting_user ... ok
+test an_auth_none_credential_names_no_user ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client.rs (target/debug/deps/client-8b41e6005377e4a3)
+
+running 3 tests
+test the_mount_arguments_describe_their_own_length ... ok
+test the_servers_parser_reads_the_clis_mount_call ... ok
+test a_servers_mount_reply_parses_to_its_handle_and_a_truncated_one_is_refused ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/handle.rs (target/debug/deps/handle-2bbaf7f347414d02)
+
+running 8 tests
+test a_handle_is_golden ... ok
+test a_handle_round_trips_within_the_size_cap ... ok
+test a_reused_inode_with_a_new_generation_is_a_different_handle ... ok
+test a_wrong_length_handle_is_refused ... ok
+test an_unknown_version_handle_is_refused ... ok
+test the_same_object_under_another_capability_is_a_different_handle ... ok
+test any_bytes_decode_without_a_panic_and_a_decoded_handle_is_canonical ... ok
+test a_handle_of_any_fields_round_trips_within_the_cap ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/loopback.rs (target/debug/deps/loopback-80769ef9a5cdfef6)
+
+running 1 test
+test a_client_mounts_and_reads_a_file_over_a_real_socket ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/mount.rs (target/debug/deps/mount-bf19d02744f2932f)
+
+running 4 tests
+test a_failed_mount_reply_is_only_the_status ... ok
+test a_portmap_mapping_round_trips_and_getport_is_the_bare_port ... ok
+test a_successful_mount_reply_carries_the_handle_and_auth_flavors ... ok
+test a_mount_path_round_trips_and_caps_length ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/multi.rs (target/debug/deps/multi-87a4af38f0987771)
+
+running 2 tests
+test a_client_mounts_the_root_and_browses_the_volumes ... ok
+test one_server_routes_requests_to_the_volume_each_handle_names ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/nfs.rs (target/debug/deps/nfs-e845adf4d0731e53)
+
+running 6 tests
+test an_unknown_file_type_is_refused ... ok
+test fattr3_round_trips ... ok
+test file_handle_round_trips_and_caps_size ... ok
+test post_op_attr_round_trips ... ok
+test status_and_time_are_golden ... ok
+test the_front_end_dialect_carries_the_change_counter_and_nfsv3_is_unchanged ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/procedures.rs (target/debug/deps/procedures-3da519cbd3a1c346)
+
+running 50 tests
+test a_commit_of_the_host_root_is_a_no_op ... ok
+test a_create_over_the_export_makes_a_file ... ok
+test a_commit_over_the_export_reports_the_write_stable ... ok
+test a_foreign_or_malformed_handle_is_refused ... ok
+test a_directory_without_search_permission_refuses_lookup ... ok
+test a_handle_survives_copy_on_write_of_its_object ... ok
+test a_handle_to_a_reclaimed_inode_is_stale ... ok
+test a_directory_it_does_not_own_is_renamed_over_the_callers_directory_in_its_own_sticky_directory ... ok
+test a_link_over_the_export_makes_a_second_name ... ok
+test a_missing_name_is_noent ... ok
+test a_readlink_returns_the_target_and_refuses_a_non_symlink ... ok
+test a_mkdir_over_the_export_makes_a_directory ... ok
+test a_readdir_continuation_after_the_directory_changes_is_bad_cookie ... ok
+test a_remove_over_the_export_unlinks_the_name ... ok
+test a_rmdir_over_the_export_removes_the_directory ... ok
+test a_rename_over_the_export_moves_the_entry ... ok
+test a_setattr_over_the_export_chmods ... ok
+test a_setattr_guard_mismatch_is_not_sync ... ok
+test a_stale_generation_handle_is_refused ... ok
+test a_setattr_to_a_colossal_size_is_a_sparse_hole_that_charges_no_quota ... ok
+test a_symlink_over_the_export_makes_a_link ... ok
+test a_write_count_that_lies_or_overruns_the_request_never_reads_out_of_bounds ... ok
+test a_write_then_read_round_trips_over_the_export ... ok
+test a_setattr_sets_client_and_server_times ... ok
+test access_answers_the_callers_class ... ok
+test a_write_through_a_read_only_export_is_refused ... ok
+test access_reflects_the_mode_not_the_request ... ok
+test create_and_mkdir_need_write_permission_on_the_directory ... ok
+test device_mknod_is_refused_badtype ... ok
+test an_exclusive_create_keeps_its_verifier_and_a_retry_finds_its_own_file ... ok
+test every_procedure_refuses_hostile_input_without_panicking ... ok
+test guarded_and_unchecked_create_differ_on_an_existing_name ... ok
+test chmod_needs_ownership_and_chown_is_restricted ... ok
+test mount_lookup_and_getattr_walk_the_export ... ok
+test pathconf_reflects_a_case_folding_volume ... ok
+test hostile_names_never_reach_outside_the_export_or_leave_an_entry ... ok
+test pathconf_reports_the_volume_limits ... ok
+test mknod_creates_fifo_and_socket_names_with_their_real_types ... ok
+test read_and_write_honour_the_mode_with_the_owner_override ... ok
+test readdir_lists_entries_and_paginates ... ok
+test readdir_needs_read_permission_on_the_directory ... ok
+test remove_needs_a_writable_directory_and_honours_the_sticky_bit ... ok
+test rename_refuses_reserved_and_malformed_names ... ok
+test rename_checks_both_directories_and_the_sticky_source ... ok
+test readdirplus_lists_entries_with_attributes_and_handles ... ok
+test rmdir_refuses_dot_entries_and_preserves_the_directory ... ok
+test the_callers_directory_replaces_one_it_does_not_own_in_its_own_sticky_directory ... ok
+test the_post_mount_queries_answer_over_the_root ... ok
+test truncated_mknod_has_no_namespace_effect ... ok
+test a_listing_asked_for_four_gibibytes_is_capped_at_the_transfer_ceiling ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/v4.rs (target/debug/deps/v4-f8d6bd0fa0cf1a96)
+
+running 38 tests
+test a_lapsed_client_makes_room_and_its_opens_go_with_it ... ok
+test a_conflicting_share_is_denied ... ok
+test a_client_opens_writes_reads_closes_and_lists_a_file ... ok
+test a_lock_conflicts_with_another_owner_and_holds_its_open ... ok
+test a_lock_does_not_carry_another_users_open_access ... ok
+test a_lock_is_refused_outside_its_rules ... ok
+test a_retried_request_gets_the_kept_reply_and_is_not_run_again ... ok
+test a_reopen_by_the_same_owner_shares_one_state_id_and_close_releases_it ... ok
+test a_state_id_serves_only_its_own_file ... ok
+test a_state_ids_access_mode_and_other_opens_denials_govern_io ... ok
+test a_v4_2_operation_is_illegal_in_a_v4_1_compound ... ok
+test access_grants_the_extended_attribute_bits_by_the_file_permissions ... ok
+test allocate_and_deallocate_are_refused_notsupp_over_nfs ... ok
+test an_exclusive_create_is_retried_after_a_restart_onto_its_own_file ... ok
+test an_nfsv4_client_never_reaches_an_appledouble_view ... ok
+test an_open_of_an_existing_file_checks_the_callers_permission ... ok
+test a_directory_listed_in_pages_returns_every_name_once_and_refuses_a_stale_resume ... ok
+test a_readdir_page_of_small_entries_fills_the_clients_maxcount ... ok
+test an_unchecked_open_of_an_existing_file_truncates_it_and_keeps_its_mode ... ok
+test change_moves_on_every_write_under_a_frozen_clock ... ok
+test create_and_remove_answer_atomic_change_info_under_a_frozen_clock ... ok
+test hostile_compounds_are_refused_with_a_status ... ok
+test lookupp_names_the_parent_and_is_noent_at_the_root ... ok
+test extended_attributes_are_set_read_listed_and_removed ... ok
+test outside_a_session_only_the_session_operations_are_served ... ok
+test read_plus_returns_data_and_whole_holes_in_order ... ok
+test secinfo_backchannel_ctl_and_set_ssv_are_served ... ok
+test secinfo_consumes_the_current_file_handle ... ok
+test seek_finds_the_holes_and_the_data_of_a_sparse_file ... ok
+test the_sessions_negotiated_sizes_bound_requests_and_replies ... ok
+test the_supported_attributes_follow_the_minor_version ... ok
+test the_write_only_times_are_supported_settable_and_never_read ... ok
+test times_past_2106_and_before_1970_round_trip ... ok
+test two_users_sharing_an_open_owner_do_not_pool_their_access ... ok
+test verify_and_nverify_compare_the_objects_attributes ... ok
+test copy_moves_the_bytes_server_side_and_refuses_bad_ranges ... ok
+test no_interleaving_of_shared_open_owners_lends_one_users_write_to_another ... ok
+test a_session_outlives_its_connection_and_other_versions_are_mismatched ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/v4_delegation.rs (target/debug/deps/v4_delegation-733c236110e3c765)
+
+running 16 tests
+test a_change_through_another_mount_recalls_the_delegation ... ok
+test a_conflicting_change_recalls_once_and_waits_until_the_return ... ok
+test a_delegation_survives_a_restart_through_its_record ... ok
+test a_delegations_state_id_serves_its_holders_reads_only ... ok
+test a_read_by_another_client_does_not_recall_a_read_delegation ... ok
+test a_recalled_file_is_not_delegated_again_within_the_quiet_period ... ok
+test a_read_only_open_is_delegated_unless_another_client_writes_the_file ... ok
+test a_write_delegations_holder_is_not_given_it_again_as_a_read_one ... ok
+test an_open_that_writes_or_denies_reads_recalls_a_read_delegation ... ok
+test an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_file ... ok
+test an_unreturned_delegation_is_revoked_after_a_lease ... ok
+test another_clients_getattr_recalls_a_write_delegation ... ok
+test any_open_by_another_client_recalls_a_write_delegation ... ok
+test locks_past_the_bound_are_delayed_not_admitted ... ok
+test opens_past_the_bound_are_refused_without_starving_the_owner ... ok
+test the_gate_updated_by_changed_inodes_equals_a_whole_rebuild ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/v4_session.rs (target/debug/deps/v4_session-cda5d3b27ac762a3)
+
+running 15 tests
+test a_client_id_is_confirmed_by_its_first_session_and_the_channel_is_negotiated_down ... ok
+test a_departed_session_keeps_its_reply_cache_and_its_home_remembers_it ... ok
+test a_client_dropped_at_home_leaves_a_drop_for_each_guest ... ok
+test a_drop_owes_its_purge_in_the_same_journal_and_its_settlement_is_journaled ... ok
+test a_guest_asks_for_a_renewal_note_at_most_twice_a_lease_and_keeps_its_client_alive ... ok
+test a_reply_past_the_cache_size_is_not_kept ... ok
+test a_reply_the_client_did_not_ask_to_keep_is_not_kept ... ok
+test a_rebooted_client_replaces_its_record_and_another_principal_cannot_take_it ... ok
+test a_restored_table_owes_the_purges_its_records_owed ... ok
+test a_retry_of_a_request_still_being_served_is_delayed ... ok
+test a_session_with_a_request_in_flight_does_not_depart ... ok
+test a_slot_runs_each_request_once_and_answers_its_retry_from_the_cache ... ok
+test a_retried_create_session_returns_its_grant ... ok
+test destruction_reclaim_and_the_lease ... ok
+test the_tables_refuse_at_their_bounds ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire.rs (target/debug/deps/wire-e1bcf7d0eeda2187)
+
+running 16 tests
+test rpc_empty_fragments_cannot_extend_a_record_without_limit ... ok
+test rpc_fragment_budget_survives_tcp_read_boundaries ... ok
+test rpc_oversized_record_is_refused ... ok
+test rpc_parses_a_call_header ... ok
+test rpc_partial_record_is_incomplete ... ok
+test rpc_prog_mismatch_reply_carries_the_range ... ok
+test rpc_record_round_trips ... ok
+test rpc_refuses_a_non_call ... ok
+test rpc_success_reply_is_a_golden_vector ... ok
+test xdr_opaque_is_length_prefixed_and_padded ... ok
+test xdr_refuses_hostile_and_truncated_input ... ok
+test xdr_scalars_round_trip ... ok
+test xdr_string_round_trips_and_rejects_non_utf8 ... ok
+test rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries ... ok
+test a_reply_framed_in_place_is_the_reply_framed ... ok
+test a_reply_built_as_a_record_is_the_reply_framed ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+   Doc-tests slates_bridge_nfs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## nfs bridge exit 0
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.72s
+     Running tests/nfs_mount.rs (target/debug/deps/nfs_mount-e3378c22d720c110)
+
+running 40 tests
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1671 µs
+slates-server: shard 0 initialized in 3941 µs
+slates-server: shard 1 initialized in 5647 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1106 µs
+slates-server: shard 1 initialized in 3000 µs
+slates-server: shard 1 initialized in 4645 µs
+slates-server: shard 0 initialized in 3451 µs
+test a_bound_export_serves_its_identity_and_shows_any_other_caller_only_attributes ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1569 µs
+slates-server: shard 0 initialized in 2139 µs
+test a_back_channel_being_probed_is_not_reported_down_and_is_probed_once ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1281 µs
+slates-server: shard 0 initialized in 2411 µs
+test a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_name ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1649 µs
+test a_back_channel_is_probed_on_its_connection_and_recorded_up_or_down ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1194 µs
+slates-server: shard 0 initialized in 1766 µs
+test a_consumer_private_volume_is_served_over_nfs_only_through_its_attachment_capability ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1013 µs
+slates-server: shard 0 initialized in 1662 µs
+test a_back_channel_that_stopped_answering_is_reported_and_repaired_by_a_rebind ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1012 µs
+slates-server: shard 0 initialized in 2087 µs
+test a_host_mount_binds_its_mount_point_and_the_status_reports_it ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1340 µs
+slates-server: bytes budget refuse-all (first occurrence): requested=1048576 config[reserve_per_shard=5586782890 shards=1 max_inodes=2424818 max_chunks=1363960 metadata_class=5586782890] bytes[capacity=4294967296 committed=1048576 retained=0 headroom=2621440 replicated=0] versions[capacity=2424818 committed=454 retained=0 headroom=1] held[stages=0 charged=0]
+test a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 987 µs
+slates-server: shard 0 initialized in 1817 µs
+test a_granted_landing_of_a_delegated_file_waits_for_the_return_and_lands ... ok
+test a_connection_alternating_between_volumes_on_two_shards_serves_both ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1053 µs
+slates-server: shard 0 initialized in 1662 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1648 µs
+slates-server: shard 1 initialized in 1634 µs
+test a_plain_open_is_not_pushed_a_write_delegation ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1431 µs
+test a_plain_volume_lists_what_its_mount_wrote ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1488 µs
+slates-server: shard 0 initialized in 1580 µs
+test a_granted_landing_waits_out_an_unreturned_delegation_and_lands ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 969 µs
+slates-server: shard 0 initialized in 1540 µs
+test a_probe_answered_delay_is_retried_on_the_same_slot_sequence ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1187 µs
+slates-server: shard 0 initialized in 1798 µs
+test a_session_is_granted_one_clients_in_flight_bound_and_can_use_it ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1711 µs
+test a_mount_preserves_each_requests_unix_owner_across_shards ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1472 µs
+test a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 942 µs
+slates-server: shard 0 initialized in 1456 µs
+test a_mounts_connection_moves_to_its_volumes_owner_and_is_served_there ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1258 µs
+slates-server: shard 0 initialized in 1806 µs
+test a_stranger_to_a_bound_export_cannot_write_through_its_identitys_delegation ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1100 µs
+slates-server: shard 0 initialized in 1726 µs
+test a_write_delegation_on_a_fully_writable_file_survives_a_chmod_and_serves_a_truncate ... ok
+test a_write_delegation_does_not_lend_its_holders_permission_to_another_users_truncate ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 806 µs
+slates-server: shard 0 initialized in 1813 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 884 µs
+slates-server: shard 0 initialized in 1558 µs
+test a_write_delegation_does_not_truncate_a_file_its_holder_no_longer_owns ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1444 µs
+test an_nfs_handle_of_a_base_file_an_outsider_replaced_never_reads_the_new_file ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1020 µs
+slates-server: shard 0 initialized in 1655 µs
+test a_session_moves_to_its_volumes_shard_and_its_compounds_run_there ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1090 µs
+slates-server: shard 0 initialized in 1549 µs
+test a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 2314 µs
+slates-server: shard 0 initialized in 2970 µs
+test an_nfsv4_client_reaches_a_volume_on_another_shard_through_its_capability ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1622 µs
+slates-server: shard 0 initialized in 1952 µs
+test a_write_from_another_client_recalls_the_read_delegation_first ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 890 µs
+slates-server: shard 0 initialized in 1530 µs
+test an_nfsv4_scoped_browse_lists_a_volume_on_another_shard_with_its_own_fsid ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 859 µs
+slates-server: shard 0 initialized in 1374 µs
+test an_nfsv3_write_to_a_delegated_file_is_held_until_the_delegation_returns ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 952 µs
+slates-server: shard 0 initialized in 1573 µs
+test an_nfsv3_write_held_on_an_unreturned_delegation_proceeds_after_its_revocation ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1070 µs
+slates-server: shard 0 initialized in 1619 µs
+test another_clients_getattr_of_a_write_delegated_file_recalls_it ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1450 µs
+test locks_and_shares_meet_across_two_mounts_of_one_file ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1585 µs
+test status_counts_the_nfs_calls_each_procedure_served ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 913 µs
+slates-server: shard 0 initialized in 1374 µs
+test the_daemon_serves_a_provisioned_volume_over_nfs ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test the_daemon_serves_a_volume_on_another_shard_over_nfs ... slates-server: shard 1 initialized in 1112 µs
+slates-server: shard 0 initialized in 2402 µs
+ok
+slates-server: shard 1 initialized in 1051 µs
+slates-server: shard 0 initialized in 1969 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1950 µs
+slates-server: shard 0 initialized in 2630 µs
+test two_fresh_daemons_name_different_servers_and_mint_different_client_ids ... ok
+test an_open_denying_reads_recalls_a_read_delegation ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1109 µs
+slates-server: shard 0 initialized in 1704 µs
+test the_host_root_listing_gathers_volumes_from_every_shard ... ok
+test two_nfsv4_clients_meet_one_lock_table_at_the_files_owner ... ok
+test recalls_asked_together_reach_the_one_slot_in_turn ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.04s
+
+     Running tests/nfs_v4_kernel.rs (target/debug/deps/nfs_v4_kernel-163a2cbde2430a06)
+
+running 1 test
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 2303 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1653 µs
+test the_linux_kernel_nfsv4_client_mounts_and_works_a_volume ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/nfs_writeback.rs (target/debug/deps/nfs_writeback-70af8c5e2427ce26)
+
+running 7 tests
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 3659 µs
+slates-server: shard 0 initialized in 3565 µs
+slates-server: shard 0 initialized in 3817 µs
+slates-server: shard 1 initialized in 4084 µs
+slates-server: shard 1 initialized in 918 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 4039 µs
+NFS-AB sdk-replace: write-back answered 5, store landed false, stale bytes kept false, length 16384
+NFS-AB sdk-replace counters: conflicts 1
+NFS-AB cut: write-back answered 5, length after 0 (the cut left 0)
+test a_stale_page_never_puts_its_old_bytes_back_over_the_sdks_write ... ok
+test a_stale_page_never_brings_back_bytes_another_path_cut ... ok
+NFS-AB two-shards wb-shard-a: write-back answered 5, store landed false, stale bytes kept false, length 16384
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1620 µs
+slates-server: shard 0 initialized in 1835 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 902 µs
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1651 µs
+NFS-AB two-shards wb-shard-b: write-back answered 5, store landed false, stale bytes kept false, length 16384
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 1085 µs
+slates-server: shard 0 initialized in 1631 µs
+NFS-AB two-clients: write-back answered 5, store landed false, stale bytes kept false, length 16384
+test one_clients_stale_page_never_undoes_another_clients_write ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 0 initialized in 1697 µs
+NFS-AB hostile: writes answered [(18446744073709551614, 10006), (18446744073709551615, 10006), (0, 0), (17179869180, 0)], a read past the end Ok([])
+test hostile_writes_are_answered_and_the_export_goes_on ... ok
+NFS-AB two-shards wb-shard-c: write-back answered 5, store landed false, stale bytes kept false, length 16384
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates-server: shard 1 initialized in 969 µs
+slates-server: shard 0 initialized in 1519 µs
+NFS-AB two-shards wb-shard-d: write-back answered 5, store landed false, stale bytes kept false, length 16384
+test a_stale_page_is_caught_on_a_volume_of_either_shard ... ok
+NFS-AB fair alone: answered 0, store landed true
+NFS-AB fair beside: answered 0, store landed true
+NFS-AB fair again: answered 0, store landed true
+NFS-AB fair blind: answered 0, store landed true
+NFS-AB fair same: answered 0, store landed true
+test write_backs_no_other_path_overtook_are_applied ... ok
+NFS-AB ends: 1 sent to another shard for 33 connections; live tasks 7 before, 7 after
+test a_connections_end_reaches_only_the_shards_its_reads_and_writes_did ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+
+## server nfs exit 0
