@@ -6802,6 +6802,48 @@ fn a_learner_learns_configurations_that_leave_the_membership_alone() {
   );
 }
 
+/// §4.14 status paging, the fleet harness's client: a report spanning pages is read whole even when an acknowledgement
+/// falls due during it. Do shape one daemon's ring so its report spans several pages (as
+/// `status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors` in `tests/daemon.rs` does), advance this
+/// file's `Client` until its acknowledgement falls due on the second page, and read the status. Expect the whole report.
+/// Found on main's Windows arm64 lane (run 42528348387): the harness acknowledged between pages, which cancels the
+/// channel's capture, so `share_with_fleet` read `Refused` and every fleet test that shares a volume could fail there.
+#[test]
+fn the_harness_reads_a_paged_status_whole_across_an_acknowledgement() {
+  let profile = common::machine_profile();
+  let instance = format!("fleet-status-pages-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  // Shape: eight slots' bulk with short reply chunks, so the report pages (the daemon tests' shape).
+  config.region.bulk_bytes = config.region.bulk_bytes / u64::from(config.region.slots) * 8;
+  config.region.slots = u32::try_from(config.region.bulk_bytes / (2 * 128)).unwrap();
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut client = Client::connect(&instance);
+  let every = u32::try_from(client.end.region().cmd().slots() / 2)
+    .unwrap()
+    .max(1);
+  // One request short of an acknowledgement: the report's first page goes out without one, its second falls due.
+  while client.sequence.saturating_sub(client.acknowledged) + 1 < every {
+    assert!(matches!(
+      client.call(&RequestBody::List),
+      ReplyBody::Listed { .. }
+    ));
+  }
+  let reply = client.call(&RequestBody::DaemonStatus);
+  daemon.stop();
+  assert!(
+    matches!(reply, ReplyBody::DaemonStatus { .. }),
+    "a paged status reads whole though an acknowledgement fell due during it: {reply:?}"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
@@ -7637,9 +7679,15 @@ impl Client {
 
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
     if matches!(body, RequestBody::DaemonStatus) {
+      // Acknowledged once before the first page, as `slates_client` does, and never between pages: any request but the
+      // next page cancels the channel's capture (`status_on_channel`), so an acknowledgement that fell due mid-report
+      // left the report refused (main's Windows arm64 lane, run 42528348387: `share_with_fleet` got `Refused` after
+      // `DaemonStatus`, `Acknowledge`, `DaemonStatusNext`).
+      self.acknowledge_if_due();
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
       return slates_ipc::status::collect::<IpcError>(capacity, |request| {
-        Ok(self.call_once(request))
+        self.sequence += 1;
+        Ok(self.send_at(self.sequence, request))
       })
       .unwrap();
     }
