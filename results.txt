@@ -1,0 +1,60 @@
+f593c2dc Windows X64; token default owner BUILTIN\Administrators
+=== clippy-land: exit 0
+=== clippy: exit 0
+=== clippy-cli: exit 0
+=== land: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.63s
+1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+1 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+2 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+=== base: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+1 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.00s
+=== os-again-1: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.65s
+1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+=== os-again-2: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.68s
+1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+=== os-again-3: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.75s
+1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+=== server-lib: exit 0
+1 test result: ok. 229 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 6.37s
+=== server-verb: exit 101
+1 error: 1 target failed:
+1 error: test failed, to rerun pass `-p slates-server --test snapshot_landing`
+1 test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.76s
+> D:\a\slates\slates\diag-logs\server-verb.log:57:---- a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it stdout ----
+  D:\a\slates\slates\diag-logs\server-verb.log:58:
+> D:\a\slates\slates\diag-logs\server-verb.log:59:thread 'a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it' (3396) panicked at crates\server\tests\snapshot_landing.rs:56:14:
+  D:\a\slates\slates\diag-logs\server-verb.log:60:the granted landing: Err(Refused(LandingConflict { entries: ["/f"] }))
+  D:\a\slates\slates\diag-logs\server-verb.log:61:note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+> D:\a\slates\slates\diag-logs\server-verb.log:69:error: test failed, to rerun pass `-p slates-server --test snapshot_landing`
+> D:\a\slates\slates\diag-logs\server-verb.log:70:error: 1 target failed:
+  D:\a\slates\slates\diag-logs\server-verb.log:71:    `-p slates-server --test snapshot_landing`
+=== client-presentation: exit 0
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s
+=== client-shards: exit 0
+1 test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.95s
+=== mcp: exit 0
+1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+1 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+=== end
