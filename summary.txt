@@ -1,0 +1,452 @@
+image: ubuntu24 20261101.360.1; kernel 7.0.0-1017-azure; Ubuntu 24.04.5 LTS
+$ docker version --format docker {{.Server.Version}} containerd {{range .Server.Components}}{{.Name}}={{.Version}} {{end}}
+docker 28.0.4 containerd Engine=28.0.4 containerd=v2.4.2 runc=1.5.2 docker-init=0.19.0 
+$ docker info
+Client: Docker Engine - Community
+ Version:    28.0.4
+ Context:    default
+ Debug Mode: false
+ Plugins:
+  buildx: Docker Buildx (Docker Inc.)
+    Version:  v0.38.1
+    Path:     /usr/libexec/docker/cli-plugins/docker-buildx
+  compose: Docker Compose (Docker Inc.)
+    Version:  v2.38.2
+    Path:     /usr/libexec/docker/cli-plugins/docker-compose
+
+Server:
+ Containers: 0
+  Running: 0
+  Paused: 0
+  Stopped: 0
+ Images: 6
+ Server Version: 28.0.4
+ Storage Driver: overlay2
+  Backing Filesystem: extfs
+  Supports d_type: true
+  Using metacopy: false
+  Native Overlay Diff: false
+  userxattr: false
+ Logging Driver: json-file
+ Cgroup Driver: systemd
+ Cgroup Version: 2
+ Plugins:
+  Volume: local
+  Network: bridge host ipvlan macvlan null overlay
+  Log: awslogs fluentd gcplogs gelf journald json-file local splunk syslog
+ Swarm: inactive
+ Runtimes: io.containerd.runc.v2 runc
+ Default Runtime: runc
+ Init Binary: docker-init
+ containerd version: b7a25261e029d68978bbf290df0a62fc819b3c51
+ runc version: v1.5.2-0-g29dd3dc2
+ init version: de40ad0
+ Security Options:
+  apparmor
+  seccomp
+   Profile: builtin
+  cgroupns
+ Kernel Version: 7.0.0-1017-azure
+ Operating System: Ubuntu 24.04.5 LTS
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 4
+ Total Memory: 15.61GiB
+ Name: runnervm7aw5e
+ ID: aeba5083-36f4-4ab3-a6cd-5185eccc7a63
+ Docker Root Dir: /var/lib/docker
+ Debug Mode: false
+ Username: githubactions
+ Experimental: false
+ Insecure Registries:
+  ::1/128
+  127.0.0.0/8
+ Live Restore Enabled: false
+$ sudo sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables
+net.ipv4.ip_forward = 1
+sysctl: cannot stat /proc/sys/net/bridge/bridge-nf-call-iptables: No such file or directory
+sysctl: cannot stat /proc/sys/net/bridge/bridge-nf-call-ip6tables: No such file or directory
+$ lsmod
+Module                  Size  Used by
+cls_bpf                24576  2
+sch_ingress            20480  1
+xt_MASQUERADE          16384  1
+bridge                421888  0
+xt_set                 20480  0
+ip_set                 61440  1 xt_set
+nft_chain_nat          12288  5
+nf_nat                 61440  2 nft_chain_nat,xt_MASQUERADE
+xt_addrtype            12288  4
+xfrm_user              65536  1
+xfrm_algo              16384  1 xfrm_user
+tls                   163840  0
+qrtr                   53248  2
+overlay               225280  0
+cfg80211             1515520  0
+8021q                  49152  0
+garp                   24576  1 8021q
+mrp                    24576  1 8021q
+stp                    12288  2 bridge,garp
+llc                    16384  3 bridge,stp,garp
+xt_owner               12288  1
+xt_tcpudp              16384  0
+xt_conntrack           12288  2
+nf_conntrack          196608  3 xt_conntrack,nf_nat,xt_MASQUERADE
+nf_defrag_ipv6         24576  1 nf_conntrack
+nf_defrag_ipv4         12288  1 nf_conntrack
+nft_compat             20480  8
+nf_tables             389120  95 nft_compat,nft_chain_nat
+binfmt_misc            24576  1
+nls_iso8859_1          12288  1
+intel_rapl_msr         20480  0
+intel_rapl_common      57344  1 intel_rapl_msr
+intel_uncore_frequency_common    20480  0
+isst_if_common         28672  0
+skx_edac_common        24576  0
+mana_ib                86016  0
+ib_uverbs             204800  1 mana_ib
+ib_core               544768  2 mana_ib,ib_uverbs
+kvm_intel             540672  0
+$ sudo aa-status
+apparmor module is loaded.
+123 profiles are loaded.
+28 profiles are in enforce mode.
+   /usr/bin/man
+   /usr/lib/snapd/snap-confine
+   /usr/sbin/chronyd
+   /usr/sbin/haveged
+   /usr/sbin/mysqld
+   docker-default
+   lsb_release
+   man_filter
+   man_groff
+   nvidia_modprobe
+   nvidia_modprobe//kmod
+   passt
+$ iptables -V
+iptables v1.8.10 (nf_tables)
+$ sudo nft list ruleset
+# Warning: table ip security is managed by iptables-nft, do not touch!
+table ip security {
+	chain OUTPUT {
+		type filter hook output priority 150; policy accept;
+		ip daddr 168.63.129.16 tcp dport 53 counter packets 0 bytes 0 accept
+		ip daddr 168.63.129.16 ip protocol tcp skuid 0 counter packets 204 bytes 124430 accept
+		ip daddr 168.63.129.16 ip protocol tcp ct state invalid,new counter packets 0 bytes 0 drop
+	}
+}
+# Warning: table ip nat is managed by iptables-nft, do not touch!
+table ip nat {
+	chain DOCKER {
+		iifname "docker0" counter packets 0 bytes 0 return
+	}
+
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		fib daddr type local counter packets 0 bytes 0 jump DOCKER
+	}
+
+	chain OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr != 127.0.0.0/8 fib daddr type local counter packets 0 bytes 0 jump DOCKER
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 172.17.0.0/16 oifname != "docker0" counter packets 0 bytes 0 masquerade
+	}
+}
+# Warning: table ip filter is managed by iptables-nft, do not touch!
+table ip filter {
+	chain DOCKER {
+		iifname != "docker0" oifname "docker0" counter packets 0 bytes 0 drop
+	}
+
+	chain DOCKER-FORWARD {
+		counter packets 0 bytes 0 jump DOCKER-CT
+		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-1
+		counter packets 0 bytes 0 jump DOCKER-BRIDGE
+		iifname "docker0" counter packets 0 bytes 0 accept
+	}
+
+	chain DOCKER-BRIDGE {
+		oifname "docker0" counter packets 0 bytes 0 jump DOCKER
+	}
+
+	chain DOCKER-CT {
+		oifname "docker0" ct state related,established counter packets 0 bytes 0 accept
+	}
+
+	chain DOCKER-ISOLATION-STAGE-1 {
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-2
+	}
+
+	chain DOCKER-ISOLATION-STAGE-2 {
+		oifname "docker0" counter packets 0 bytes 0 drop
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+		counter packets 0 bytes 0 jump DOCKER-USER
+		counter packets 0 bytes 0 jump DOCKER-FORWARD
+	}
+
+	chain DOCKER-USER {
+		counter packets 0 bytes 0 return
+	}
+}
+# Warning: table ip6 nat is managed by iptables-nft, do not touch!
+table ip6 nat {
+	chain DOCKER {
+	}
+
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		fib daddr type local counter packets 0 bytes 0 jump DOCKER
+	}
+
+	chain OUTPUT {
+$ kind create cluster --name probe --config /home/runner/work/_temp/kind.yaml --wait 180s
+Creating cluster "probe" ...
+ • Ensuring node image (kindest/node:v1.37.0) 🖼️  ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️
+ • Preparing nodes 📦 📦 📦   ...
+ ✓ Preparing nodes 📦 📦 📦 
+ • Writing configuration 📜  ...
+ ✓ Writing configuration 📜
+ • Starting control-plane 🕹️  ...
+ ✓ Starting control-plane 🕹️
+ • Installing CNI 🔌  ...
+ ✓ Installing CNI 🔌
+ • Installing StorageClass 💾  ...
+ ✓ Installing StorageClass 💾
+ • Joining worker nodes 🚜  ...
+ ✓ Joining worker nodes 🚜
+ • Waiting ≤ 3m0s for control-plane = Ready ⏳  ...
+ ✓ Waiting ≤ 3m0s for control-plane = Ready ⏳
+ • Ready after 6s 💚
+Set kubectl context to "kind-probe"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-probe
+
+Not sure what to do next? 😅  Check out https://kind.sigs.k8s.io/docs/user/quick-start/
+$ kubectl get nodes -o wide
+NAME                  STATUS     ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION             CONTAINER-RUNTIME
+probe-control-plane   Ready      control-plane   21s   v1.37.0   172.18.0.4    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-1017-azure (amd64)   containerd://2.3.4
+probe-worker          NotReady   <none>          7s    v1.37.0   172.18.0.3    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-1017-azure (amd64)   containerd://2.3.4
+probe-worker2         NotReady   <none>          7s    v1.37.0   172.18.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-1017-azure (amd64)   containerd://2.3.4
+$ docker exec probe-worker sh -c iptables -V; ls -l /usr/sbin/iptables; uname -r
+iptables v1.8.11 (nf_tables)
+lrwxrwxrwx 1 root root 26 Nov 20  2024 /usr/sbin/iptables -> /etc/alternatives/iptables
+7.0.0-1017-azure
+$ docker exec probe-worker2 sh -c iptables -V; ls -l /usr/sbin/iptables; uname -r
+iptables v1.8.11 (nf_tables)
+lrwxrwxrwx 1 root root 26 Nov 20  2024 /usr/sbin/iptables -> /etc/alternatives/iptables
+7.0.0-1017-azure
+$ docker exec probe-worker sh -c iptables-save | head -60
+# Generated by iptables-save v1.8.11 (nf_tables) on Mon Nov  9 22:35:01 2026
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:KUBE-IPTABLES-HINT - [0:0]
+:KUBE-KUBELET-CANARY - [0:0]
+:KUBE-PROXY-CANARY - [0:0]
+COMMIT
+# Completed on Mon Nov  9 22:35:01 2026
+# Generated by iptables-save v1.8.11 (nf_tables) on Mon Nov  9 22:35:01 2026
+*filter
+:INPUT ACCEPT [264:206534]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [296:51776]
+:KUBE-EXTERNAL-SERVICES - [0:0]
+:KUBE-FIREWALL - [0:0]
+:KUBE-FORWARD - [0:0]
+:KUBE-KUBELET-CANARY - [0:0]
+:KUBE-NODEPORTS - [0:0]
+:KUBE-PROXY-CANARY - [0:0]
+:KUBE-PROXY-FIREWALL - [0:0]
+:KUBE-SERVICES - [0:0]
+-A INPUT -m conntrack --ctstate NEW -m comment --comment "kubernetes load balancer firewall" -j KUBE-PROXY-FIREWALL
+-A INPUT -m comment --comment "kubernetes health check service ports" -j KUBE-NODEPORTS
+-A INPUT -m conntrack --ctstate NEW -m comment --comment "kubernetes externally-visible service portals" -j KUBE-EXTERNAL-SERVICES
+-A INPUT -j KUBE-FIREWALL
+-A FORWARD -m conntrack --ctstate NEW -m comment --comment "kubernetes load balancer firewall" -j KUBE-PROXY-FIREWALL
+-A FORWARD -m comment --comment "kubernetes forwarding rules" -j KUBE-FORWARD
+-A FORWARD -m conntrack --ctstate NEW -m comment --comment "kubernetes service portals" -j KUBE-SERVICES
+-A FORWARD -m conntrack --ctstate NEW -m comment --comment "kubernetes externally-visible service portals" -j KUBE-EXTERNAL-SERVICES
+-A OUTPUT -m conntrack --ctstate NEW -m comment --comment "kubernetes load balancer firewall" -j KUBE-PROXY-FIREWALL
+-A OUTPUT -m conntrack --ctstate NEW -m comment --comment "kubernetes service portals" -j KUBE-SERVICES
+-A OUTPUT -j KUBE-FIREWALL
+-A KUBE-FIREWALL ! -s 127.0.0.0/8 -d 127.0.0.0/8 -m comment --comment "block incoming localnet connections" -m conntrack ! --ctstate RELATED,ESTABLISHED,DNAT -j DROP
+-A KUBE-FORWARD -m conntrack --ctstate INVALID -m nfacct --nfacct-name  ct_state_invalid_dropped_pkts -j DROP
+-A KUBE-FORWARD -m comment --comment "kubernetes forwarding rules" -m mark --mark 0x4000/0x4000 -j ACCEPT
+-A KUBE-FORWARD -m comment --comment "kubernetes forwarding conntrack rule" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A KUBE-SERVICES -d 10.96.0.10/32 -p udp -m comment --comment "kube-system/kube-dns:dns has no endpoints" -m udp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+-A KUBE-SERVICES -d 10.96.0.10/32 -p tcp -m comment --comment "kube-system/kube-dns:dns-tcp has no endpoints" -m tcp --dport 53 -j REJECT --reject-with icmp-port-unreachable
+-A KUBE-SERVICES -d 10.96.0.10/32 -p tcp -m comment --comment "kube-system/kube-dns:metrics has no endpoints" -m tcp --dport 9153 -j REJECT --reject-with icmp-port-unreachable
+COMMIT
+# Completed on Mon Nov  9 22:35:01 2026
+# Generated by iptables-save v1.8.11 (nf_tables) on Mon Nov  9 22:35:01 2026
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [18:1080]
+:POSTROUTING ACCEPT [44:3056]
+:DOCKER_OUTPUT - [0:0]
+:DOCKER_POSTROUTING - [0:0]
+:KIND-MASQ-AGENT - [0:0]
+:KUBE-KUBELET-CANARY - [0:0]
+:KUBE-MARK-MASQ - [0:0]
+:KUBE-NODEPORTS - [0:0]
+:KUBE-POSTROUTING - [0:0]
+:KUBE-PROXY-CANARY - [0:0]
+:KUBE-SEP-KC2ZJE2J2ZFCZOW4 - [0:0]
+$ docker exec probe-worker sh -c nft list ruleset 2>&1 | head -40
+# Warning: table ip nat is managed by iptables-nft, do not touch!
+table ip nat {
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		 counter packets 0 bytes 0 jump KUBE-SERVICES
+		ip daddr 172.18.0.1 counter packets 0 bytes 0 jump DOCKER_OUTPUT
+	}
+
+	chain INPUT {
+		type nat hook input priority srcnat; policy accept;
+	}
+
+	chain OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+		 counter packets 8 bytes 544 jump KUBE-SERVICES
+		ip daddr 172.18.0.1 counter packets 26 bytes 1976 jump DOCKER_OUTPUT
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		 counter packets 1 bytes 60 jump KUBE-POSTROUTING
+		ip daddr 172.18.0.1 counter packets 0 bytes 0 jump DOCKER_POSTROUTING
+		fib daddr type != local  counter packets 0 bytes 0 jump KIND-MASQ-AGENT
+	}
+
+	chain DOCKER_OUTPUT {
+		ip daddr 172.18.0.1 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:46059
+		ip daddr 172.18.0.1 udp dport 53 counter packets 26 bytes 1976 dnat to 127.0.0.11:42944
+	}
+
+	chain DOCKER_POSTROUTING {
+		ip saddr 127.0.0.11 tcp sport 46059 counter packets 0 bytes 0 snat to 172.18.0.1:53
+		ip saddr 127.0.0.11 udp sport 42944 counter packets 0 bytes 0 snat to 172.18.0.1:53
+	}
+
+	chain KUBE-KUBELET-CANARY {
+	}
+
+	chain KUBE-PROXY-CANARY {
+	}
+listener IPs udp=10.244.2.3 tcp=10.244.2.2
+--- logs send-cross (Succeeded)
+$ kubectl logs send-cross
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.96.0.1
+
+sent
+--- logs send-same (Succeeded)
+$ kubectl logs send-same
+sent
+--- logs listen-a (Running)
+$ kubectl logs listen-a
+--- logs listen-t (Succeeded)
+$ kubectl logs listen-t
+tcp-cross
+
+done
+$ kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=15
+I1109 22:34:50.700503       1 proxier.go:231] "Setting route_localnet=1 to allow node-ports on localhost; to change this either disable iptables.localhostNodePorts (--iptables-localhost-nodeports) or set nodePortAddresses (--nodeport-addresses) to filter loopback addresses" ipFamily="IPv4"
+I1109 22:34:50.705858       1 server.go:530] "Version info" version="v1.37.0"
+I1109 22:34:50.705895       1 server.go:532] "Golang settings" GOGC="" GOMAXPROCS="" GOTRACEBACK=""
+I1109 22:34:50.707718       1 config.go:200] "Starting service config controller"
+I1109 22:34:50.709516       1 shared_informer.go:503] "Waiting for caches to sync" controller="service config"
+I1109 22:34:50.709982       1 config.go:309] "Starting node config controller"
+I1109 22:34:50.711032       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 22:34:50.711132       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 22:34:50.707924       1 config.go:106] "Starting endpoint slice config controller"
+I1109 22:34:50.711536       1 shared_informer.go:503] "Waiting for caches to sync" controller="endpoint slice config"
+I1109 22:34:50.707949       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 22:34:50.714184       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 22:34:50.809775       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 22:34:50.812812       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+I1109 22:34:50.814895       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+I1109 22:34:56.337650       1 proxier.go:231] "Setting route_localnet=1 to allow node-ports on localhost; to change this either disable iptables.localhostNodePorts (--iptables-localhost-nodeports) or set nodePortAddresses (--nodeport-addresses) to filter loopback addresses" ipFamily="IPv4"
+I1109 22:34:56.338052       1 server.go:530] "Version info" version="v1.37.0"
+I1109 22:34:56.338175       1 server.go:532] "Golang settings" GOGC="" GOMAXPROCS="" GOTRACEBACK=""
+I1109 22:34:56.340047       1 config.go:200] "Starting service config controller"
+I1109 22:34:56.340974       1 shared_informer.go:503] "Waiting for caches to sync" controller="service config"
+I1109 22:34:56.341159       1 config.go:403] "Starting serviceCIDR config controller"
+I1109 22:34:56.341176       1 shared_informer.go:503] "Waiting for caches to sync" controller="serviceCIDR config"
+I1109 22:34:56.341061       1 config.go:106] "Starting endpoint slice config controller"
+I1109 22:34:56.341594       1 shared_informer.go:503] "Waiting for caches to sync" controller="endpoint slice config"
+I1109 22:34:56.342087       1 config.go:309] "Starting node config controller"
+I1109 22:34:56.342481       1 shared_informer.go:503] "Waiting for caches to sync" controller="node config"
+I1109 22:34:56.342897       1 shared_informer.go:510] "Caches are synced" controller="node config"
+I1109 22:34:56.442155       1 shared_informer.go:510] "Caches are synced" controller="endpoint slice config"
+I1109 22:34:56.442185       1 shared_informer.go:510] "Caches are synced" controller="service config"
+I1109 22:34:56.442316       1 shared_informer.go:510] "Caches are synced" controller="serviceCIDR config"
+$ kubectl -n kube-system logs -l app=kindnet --tail=15
+I1109 22:34:57.950394       1 controller.go:465] "Syncing nftables rules" logger="nftables-sync" elapsed="3.745348ms"
+I1109 22:35:07.445908       1 main.go:320] Handling node with IPs: map[172.18.0.4:{}]
+I1109 22:35:07.445995       1 main.go:347] Node probe-control-plane has CIDR [10.244.0.0/24] 
+I1109 22:35:07.446204       1 routes.go:62] Adding route {Ifindex: 0 Dst: 10.244.0.0/24 Src: <nil> Gw: 172.18.0.4 Flags: [] Table: 0 Realm: 0} 
+I1109 22:35:07.446271       1 main.go:320] Handling node with IPs: map[172.18.0.3:{}]
+I1109 22:35:07.446328       1 main.go:347] Node probe-worker has CIDR [10.244.2.0/24] 
+I1109 22:35:07.446407       1 routes.go:62] Adding route {Ifindex: 0 Dst: 10.244.2.0/24 Src: <nil> Gw: 172.18.0.3 Flags: [] Table: 0 Realm: 0} 
+I1109 22:35:07.446453       1 main.go:320] Handling node with IPs: map[172.18.0.2:{}]
+I1109 22:35:07.446478       1 main.go:324] handling current node
+I1109 22:35:17.447975       1 main.go:320] Handling node with IPs: map[172.18.0.4:{}]
+I1109 22:35:17.448004       1 main.go:347] Node probe-control-plane has CIDR [10.244.0.0/24] 
+I1109 22:35:17.448180       1 main.go:320] Handling node with IPs: map[172.18.0.3:{}]
+I1109 22:35:17.448189       1 main.go:347] Node probe-worker has CIDR [10.244.2.0/24] 
+I1109 22:35:17.448237       1 main.go:320] Handling node with IPs: map[172.18.0.2:{}]
+I1109 22:35:17.448242       1 main.go:324] handling current node
+I1109 22:35:00.770633       1 main.go:320] Handling node with IPs: map[172.18.0.3:{}]
+I1109 22:35:00.770648       1 main.go:347] Node probe-worker has CIDR [10.244.2.0/24] 
+I1109 22:35:00.770680       1 routes.go:62] Adding route {Ifindex: 0 Dst: 10.244.2.0/24 Src: <nil> Gw: 172.18.0.3 Flags: [] Table: 0 Realm: 0} 
+I1109 22:35:10.768019       1 main.go:320] Handling node with IPs: map[172.18.0.2:{}]
+I1109 22:35:10.768049       1 main.go:347] Node probe-worker2 has CIDR [10.244.1.0/24] 
+I1109 22:35:10.768243       1 main.go:320] Handling node with IPs: map[172.18.0.3:{}]
+I1109 22:35:10.768252       1 main.go:347] Node probe-worker has CIDR [10.244.2.0/24] 
+I1109 22:35:10.768291       1 main.go:320] Handling node with IPs: map[172.18.0.4:{}]
+I1109 22:35:10.768312       1 main.go:324] handling current node
+I1109 22:35:20.768424       1 main.go:320] Handling node with IPs: map[172.18.0.4:{}]
+I1109 22:35:20.768449       1 main.go:324] handling current node
+I1109 22:35:20.768461       1 main.go:320] Handling node with IPs: map[172.18.0.2:{}]
+I1109 22:35:20.768465       1 main.go:347] Node probe-worker2 has CIDR [10.244.1.0/24] 
+I1109 22:35:20.768666       1 main.go:320] Handling node with IPs: map[172.18.0.3:{}]
+I1109 22:35:20.768674       1 main.go:347] Node probe-worker has CIDR [10.244.2.0/24] 
+$ sudo dmesg -T
+[Mon Nov  9 22:33:57 2026] Linux version 7.0.0-1017-azure (buildd@lcy02-amd64-066) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #17~24.04.1-Ubuntu SMP PREEMPT Thu Sep 24 18:46:57 UTC 2026 (Ubuntu 7.0.0-1017.17~24.04.1-azure 7.0.14)
+[Mon Nov  9 22:33:57 2026] Command line: BOOT_IMAGE=/vmlinuz-7.0.0-1017-azure root=PARTUUID=6a568bb8-39a2-40cc-a70f-9d67aaad1bc2 ro console=tty1 console=ttyS0 earlyprintk=ttyS0 nvme_core.io_timeout=240 rootflags=nobarrier,data=writeback,journal_async_commit,commit=30 panic=-1
+[Mon Nov  9 22:33:57 2026] KERNEL supported cpus:
+[Mon Nov  9 22:33:57 2026]   Intel GenuineIntel
+[Mon Nov  9 22:33:57 2026]   AMD AuthenticAMD
+[Mon Nov  9 22:33:57 2026]   Hygon HygonGenuine
+[Mon Nov  9 22:33:57 2026]   Centaur CentaurHauls
+[Mon Nov  9 22:33:57 2026]   zhaoxin   Shanghai  
+[Mon Nov  9 22:33:57 2026] BIOS-provided physical RAM map:
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff]  System RAM
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [gap 0x00000000000a0000-0x00000000000bffff]
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x00000000000c0000-0x00000000000fffff]  device reserved
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x0000000000100000-0x00000000044fdfff]  System RAM
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x00000000044fe000-0x00000000048fdfff]  device reserved
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x00000000048fe000-0x000000003ff1efff]  System RAM
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x000000003ff1f000-0x000000003ffc8fff]  device reserved
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x000000003ffc9000-0x000000003fffafff]  ACPI data
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x000000003fffb000-0x000000003fffefff]  ACPI NVS
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [mem 0x000000003ffff000-0x000000003fffffff]  System RAM
+[Mon Nov  9 22:33:57 2026] BIOS-e820: [gap 0x0000000040000000-0x00000000ffffffff]
