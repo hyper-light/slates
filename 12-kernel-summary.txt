@@ -1,0 +1,20 @@
+thread 'the_linux_kernel_nfsv4_client_mounts_and_works_a_volume' (6813) panicked at crates/server/tests/nfs_v4_kernel.rs:803:5:
+the char device is refused EPERM, not an internal errno: mknod: /home/runner/work/slates/slates/target/tmp/nfs4-1-6812/char: Unknown error 527
+test the_linux_kernel_nfsv4_client_mounts_and_works_a_volume ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+exit 101
+test nfsv4_opens_and_locks_survive_a_daemon_restart ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+exit 0
+test a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it ... FAILED
+test a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first ... FAILED
+thread 'a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it' (7738) panicked at crates/bridge-nfs/tests/procedures.rs:1865:5:
+assertion `left == right` failed: a block device is refused EPERM
+  left: 10007
+ right: 1
+thread 'a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first' (7739) panicked at crates/bridge-nfs/tests/procedures.rs:1895:5:
+assertion `left == right` failed: a taken name is EEXIST before the device's EPERM
+  left: 10007
+ right: 17
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s
+exit 101

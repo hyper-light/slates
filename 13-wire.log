@@ -1,0 +1,45 @@
+   Compiling syn v3.0.5
+   Compiling serde_derive v1.0.229
+   Compiling serde v1.0.229
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.90s
+     Running tests/procedures.rs (target/debug/deps/procedures-3da519cbd3a1c346)
+
+running 2 tests
+test a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it ... FAILED
+test a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first ... FAILED
+
+failures:
+
+---- a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it stdout ----
+
+thread 'a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it' (7738) panicked at crates/bridge-nfs/tests/procedures.rs:1865:5:
+assertion `left == right` failed: a block device is refused EPERM
+  left: 10007
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first stdout ----
+
+thread 'a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first' (7739) panicked at crates/bridge-nfs/tests/procedures.rs:1895:5:
+assertion `left == right` failed: a taken name is EEXIST before the device's EPERM
+  left: 10007
+ right: 17
+
+
+failures:
+    a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it
+    a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p slates-bridge-nfs --test procedures`
+exit 101
