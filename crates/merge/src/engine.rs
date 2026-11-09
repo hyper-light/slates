@@ -1483,6 +1483,33 @@ impl Green {
     base
   }
 
+  /// The entries one path contributes to a restricted base at `version` ([`Green::base_for`]): every dimension's entry
+  /// at `path`, and the hard links whose link or target it is. What a work's shard fetches with a path it touches, so
+  /// that [`Base::for_names`](crate::increment::Base::for_names) assembles its increment's base without the green
+  /// (A-247).
+  pub fn path_base(&self, version: u64, path: &str) -> crate::increment::Base {
+    let mut base = crate::increment::Base::of_files(Vec::new());
+    let at_head = version >= self.head();
+    if at_head {
+      self.head_entries(path, &mut base);
+      for (link, target) in &self.hardlinks {
+        if link == path || target == path {
+          base.hardlinks.push((link.clone(), target.clone()));
+        }
+      }
+    } else {
+      self.entries_at(path, version, &mut base);
+      for (link, history) in &self.hardlink_history {
+        if let Some(target) = history_at(history, version)
+          && (link == path || target == path)
+        {
+          base.hardlinks.push((link.clone(), target));
+        }
+      }
+    }
+    base
+  }
+
   /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
   fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
     if let Some(bytes) = self.content.get(path) {
