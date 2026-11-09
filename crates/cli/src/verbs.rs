@@ -31,6 +31,18 @@ fn failure_of(e: ClientError, instance: &str) -> Failure {
        or, on a fleet node, wait for it to import the groups."
       ))
     }
+    // A mount the host's mount helper policy refused: the profile's own files say what to do (GAPS, 2026-11-09).
+    ClientError::Refused(slates_ipc::protocol::Refusal::MountRefusedByHelperPolicy {
+      helper,
+      profile,
+      policy_file,
+      local_override,
+    }) => Failure::Refused(format!(
+      "MountRefusedByHelperPolicy {{ helper: {helper:?}, profile: {profile:?}, policy_file: {policy_file:?}, \
+       local_override: {local_override:?} }}: the AppArmor profile {profile} attached to {helper} refused a FUSE mount \
+       at this point. Mount under a directory {policy_file} allows (docs/cli.md lists them for the systems measured), or \
+       have an administrator allow the point in {local_override} and reload the profile."
+    )),
     ClientError::Refused(refusal) => Failure::Refused(format!("{refusal:?}")),
     // Both are "no daemon" to the caller (exit 3), but the cause is kept: a rendezvous that is not
     // there, a claim the daemon never answered, or a daemon that stopped answering are different

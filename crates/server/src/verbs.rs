@@ -3826,6 +3826,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::MountRefusedByHelperPolicy { .. } => "mount_refused_by_helper_policy",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",

@@ -140,6 +140,10 @@ pub enum MountError {
   /// The helper refused `allow_other`: the host's `/etc/fuse.conf` does not grant `user_allow_other`, an
   /// operator's setting (§4.6). Read from the helper's own refusal, never from the file (R1).
   AllowOtherNotGranted,
+  /// The kernel refused the helper's mount (`Permission denied`), and the helper is confined by an AppArmor profile
+  /// (GAPS, decided 2026-11-09): the profile's policy refused this mount point. Diagnosed after the refusal, never
+  /// predicted ([`crate::helper_policy`]).
+  RefusedByHelperPolicy(crate::helper_policy::HelperPolicy),
 }
 
 impl std::fmt::Display for MountError {
@@ -148,6 +152,11 @@ impl std::fmt::Display for MountError {
       Self::Socketpair { code } => write!(f, "socketpair refused (code {code:?})"),
       Self::AllowOtherNotGranted => f.write_str(
         "the mount helper refused allow_other: the host does not grant user_allow_other in /etc/fuse.conf",
+      ),
+      Self::RefusedByHelperPolicy(policy) => write!(
+        f,
+        "the mount helper {}'s AppArmor profile {} refused this mount point ({}; an administrator may allow it in {})",
+        policy.helper, policy.profile, policy.policy_file, policy.local_override
       ),
       Self::Spawn { code } => write!(
         f,
@@ -175,6 +184,28 @@ impl std::fmt::Display for MountError {
 }
 
 impl std::error::Error for MountError {}
+
+/// The AppArmor profile that refused the helper's mount, when the helper handed back no device and said the kernel
+/// refused it ([`crate::helper_policy::PERMISSION_DENIED`]) and the profile can be named; `None` otherwise.
+#[cfg(target_os = "linux")]
+fn refusing_policy(
+  message: &str,
+  handed_a_device: bool,
+) -> Option<crate::helper_policy::HelperPolicy> {
+  if handed_a_device || !message.contains(crate::helper_policy::PERMISSION_DENIED) {
+    return None;
+  }
+  crate::helper_policy::diagnose(FUSERMOUNT)
+}
+
+/// No other platform mounts through `fusermount3`, so no helper policy is diagnosed there.
+#[cfg(not(target_os = "linux"))]
+fn refusing_policy(
+  _message: &str,
+  _handed_a_device: bool,
+) -> Option<crate::helper_policy::HelperPolicy> {
+  None
+}
 
 /// A mount: the channel over the mounted connection and the mount point, so `unmount` can tear
 /// it down with the same helper.
@@ -521,6 +552,8 @@ impl PendingHandshake {
           let message = self.helper_message();
           if message.contains(ALLOW_OTHER_REFUSAL) {
             Err(MountError::AllowOtherNotGranted)
+          } else if let Some(policy) = refusing_policy(&message, device.is_some()) {
+            Err(MountError::RefusedByHelperPolicy(policy))
           } else if device.is_some() {
             Err(MountError::Helper {
               exit: HelperExit::of(status),
