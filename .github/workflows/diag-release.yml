@@ -1,0 +1,54 @@
+# DIAG, not for main: main's KIND lane (its `all` leg, kept) on ubuntu-latest (26.04), then the pods' restarts, events,
+# previous logs and the kernel's AppArmor denials, published to a diag-results branch.
+name: DIAG KIND on ubuntu-26.04, with the cluster kept for a look (not for main)
+'on':
+  push:
+    branches:
+    - diag-release-13
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  DOWNLOAD_RETRIES: '20'
+  DOWNLOAD_RETRY_SECONDS: '60'
+  DOWNLOAD_TRY_SECONDS: '120'
+  KIND_URL: https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_URL: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+  KUBECTL_SHA256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
+jobs:
+  kind:
+    name: KIND fleet lane (chart, formation, takeover, scale, WAN profiles)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.98.1
+    - uses: Swatinem/rust-cache@v2
+    - uses: azure/setup-helm@v4
+      with:
+        version: v4.3.0
+    - name: Install kind and kubectl
+      id: kind_tools
+      timeout-minutes: 45
+      run: "set -euo pipefail\nbin=\"$RUNNER_TEMP/kind-tools\"\nmkdir -p \"$bin\"\nfetch() {\n  curl --fail --silent --show-error --location --retry \"$DOWNLOAD_RETRIES\" --retry-delay \"$DOWNLOAD_RETRY_SECONDS\" \\\n    --retry-all-errors --max-time \"$DOWNLOAD_TRY_SECONDS\" --output \"$2\" \"$1\" \\\n    || { echo \"::error::could not download $1 after $DOWNLOAD_RETRIES retries; the KIND lane needs it, so the job stops here\"; exit 1; }\n}\nfetch \"$KIND_URL\" \"$bin/kind\"\necho \"$KIND_SHA256  $bin/kind\" | sha256sum -c -\nfetch \"$KUBECTL_URL\" \"$bin/kubectl\"\necho \"$KUBECTL_SHA256  $bin/kubectl\" | sha256sum -c -\nchmod +x \"$bin/kind\" \"$bin/kubectl\"\necho \"$bin\" >> \"$GITHUB_PATH\"\n"
+    - name: The chart's gates (helm lint; the golden render)
+      run: cargo test -p xtask --test helm_chart
+    - name: The lane, end to end (the cluster is deleted at the end whatever happens)
+      if: ${{ steps.kind_tools.outcome == 'success' }}
+      run: 'set -o pipefail
+
+        cargo xtask kind all --keep 2>&1 | tee "$RUNNER_TEMP/kind-all.log"'
+      id: all
+      shell: bash
+    - name: Capture the failure, then publish
+      if: always()
+      shell: bash
+      run: "set +e +o pipefail\nout=\"$RUNNER_TEMP/summary.txt\"; : > \"$out\"\nsay() { echo \"$@\" >> \"$out\"; }\nrun() { say \"\\$ $*\"; \"$@\" 2>&1 | head -${N:-40} >> \"$out\"; }\nsay \"image: $ImageOS $ImageVersion; kernel $(uname -r); all=${{ steps.all.outcome }}\"\nN=12 run sh -c 'grep -n -E \"peers_probed|configuration_version|ConsensusRecoveryUnavailable|error|Error|failed\" \"$RUNNER_TEMP/kind-all.log\" | head -40'\nN=40 run kubectl --context kind-slates-lane get pods -A -o wide\nfor p in slates-0 slates-1 slates-2; do\n  N=30 run sh -c \"kubectl --context kind-slates-lane -n slates describe pod $p | sed -n '/Containers:/,\\$p' | grep -E 'State|Reason|Exit Code|Restart Count|Last State|Started|Finished|Warning|Normal|Killing|BackOff|OOM|Signal' \"\n  N=30 run kubectl --context kind-slates-lane -n slates logs $p --previous --tail=25\n  N=30 run kubectl --context kind-slates-lane -n slates logs $p --tail=25\n  N=40 run kubectl --context kind-slates-lane -n slates exec $p -- /slates\
+        \ status\ndone\nN=40 run sh -c 'sudo dmesg -T | grep -i -E \"apparmor|denied|audit\" | tail -40'\nN=30 run sh -c 'sudo journalctl -k --no-pager | grep -i -E \"apparmor=\\\"DENIED\\\"\" | tail -30'\nfor n in $(kind get nodes --name slates-lane); do N=6 run docker inspect $n --format '{{.Name}} privileged={{.HostConfig.Privileged}} apparmor={{.AppArmorProfile}} security={{.HostConfig.SecurityOpt}}'; done\nN=20 run sh -c 'sudo aa-status | grep -i -E \"profiles|docker|runc|containerd|crun|unprivileged|kind\" '\nN=30 run kubectl --context kind-slates-lane -n slates get events --sort-by=.lastTimestamp\nkind delete cluster --name slates-lane >/dev/null 2>&1\ngit config user.name diag-release; git config user.email diag-release@users.noreply.github.com\nblob=$(git hash-object -w \"$out\"); tree=$(printf \"100644 blob %s\\tsummary.txt\\n\" \"$blob\" | git mktree)\nc=$(echo \"results of run ${{ github.run_id }}\" | git commit-tree \"$tree\")\ngit push origin \"$c:refs/heads/diag-results/release-13-kind-2604\"\
+        \n"
+    permissions:
+      contents: write
