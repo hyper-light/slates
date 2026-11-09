@@ -12097,3 +12097,22 @@ increments composed on its own shard against those left to the owner. Millisecon
   main's), and the verdict's p99 is still 10–20 ms worse.
 - Measured on the way, rejected: composing on the work but clearing its entries at a rebase made each resubmit fetch them
   again first, and SubmitAccepted p99 rose to 84–90 ms (6 rounds, 2026-11-09); the rebase now answers the entries.
+
+**Where the verdict's tail waits, measured (2026-11-09).** An instrumented build of W1 8cf40742 (in-process daemon,
+3,000 clients, 2 runs, adas-mac-studio.local-2 at load 22 to 26; the instrumentation roughly doubles the latencies, so
+the shares are the finding). The owner (partition 19) ran 12,058 and 12,942 batches a run, of 28 to 32 asks at the
+median and 32 at most, one batch a step: step wall p50 283–311 µs, p99 1.9–2.6 ms, max 10.4–22 ms; step CPU p50
+278–299 µs, p99 818–824 µs. An ask's own CPU: a verdict p50 29–32 µs, p99 101–122; a rebase p50 17–19, p99 42–53. The
+slowest 1% of verdict asks, mean per asking shard: 86–99 ms waiting in their shard's outbox for its last batch to come
+back, 23–50 ms in transit and queued behind the owner's other work, 0.13–0.23 ms behind the other asks of their batch,
+0.02–0.05 ms in their own verdict, 0.5–26 ms coming back. A long step holding the verdicts in it is not the tail; the
+owner being busy (step CPU about its wall at the median) and a shard's backlog draining 32 asks a round trip is.
+
+**Measured and rejected the same day: a whole outbox a message, answered in slices of the step budget.** One message
+carried everything a shard had waiting; the owner answered it a slice at a time, as many asks as the step budget held
+at its measured cost of an ask, yielding between slices, each slice's answers sent home as it finished. The step budget
+here (about 4.5 µs) is below one ask's cost (about 20 to 30 µs), so every slice was one ask and every answer its own
+message. Main 80be552a, W1 8cf40742 and this, the anchor recipe, 3,000 clients, interleaved, 6 rounds each, load 12 to
+30 (other agents' builds), oracle 0 in every run. SubmitAccepted p99, every round, ms: main 118.4, 50.7, 51.6, 72.2,
+49.4, 40.5; W1 77.2, 71.0, 55.0, 59.0, 53.8, 55.5; this 130.7, 493.0, 95.4, 194.6, 75.3, 76.3. Wall: main 7.79–12.62 s,
+W1 3.59–5.40, this 4.66–8.45. Kept as `w4-sliced-batches.patch` in perf's scratch; not landed.
