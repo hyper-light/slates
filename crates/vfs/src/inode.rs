@@ -164,6 +164,10 @@ pub struct Fingerprint {
   /// the device and inode number it tells a file from one that took its number since (A-151, [`FileTag`]). A host
   /// reports the same value for a file whether it lists it or opens it.
   pub birth_ns: i64,
+  /// The Windows attribute bits the disk holds for the entry, those [`WindowsAttributes::kept`] keeps for its kind
+  /// (A-262): an untouched base entry reports them through the WinFsp drive as the disk holds them. Zero on every host but
+  /// Windows, which holds none.
+  pub windows: u16,
 }
 
 impl Fingerprint {
@@ -327,6 +331,67 @@ impl XattrTable {
   }
 }
 
+/// The Windows attribute bits a volume keeps beside POSIX's mode (A-262): `FILE_ATTRIBUTE_HIDDEN`, `SYSTEM`,
+/// `ARCHIVE`, `OFFLINE` and `NOT_CONTENT_INDEXED` on any object, and `READONLY` on a directory alone. A file's
+/// read-only state is not a bit here: it is the mode's write bits, the one permission model (A-209), as WSL's DrvFs
+/// and Samba's `map readonly` map it. A directory's `READONLY` gives no permission on Windows (Explorer reads it as a
+/// display hint), so it is kept as metadata and leaves the mode alone. The bits keep Windows' own values, so a
+/// WinFsp reply and a Windows landing use them as they are; they fit in the two bytes alignment leaves at the end of
+/// an [`Inode`], so no inode grows (AC-1.5; 168 bytes, `cargo run -p slates-vfs --example tree_heap`). Linux and
+/// macOS carry them in the volume and apply none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowsAttributes(u16);
+
+impl WindowsAttributes {
+  /// Format: `FILE_ATTRIBUTE_READONLY`, kept for a directory alone (a file's is its mode).
+  pub const READONLY: u16 = 0x0001;
+  /// Format: `FILE_ATTRIBUTE_HIDDEN`.
+  pub const HIDDEN: u16 = 0x0002;
+  /// Format: `FILE_ATTRIBUTE_SYSTEM`.
+  pub const SYSTEM: u16 = 0x0004;
+  /// Format: `FILE_ATTRIBUTE_ARCHIVE`.
+  pub const ARCHIVE: u16 = 0x0020;
+  /// Format: `FILE_ATTRIBUTE_OFFLINE`.
+  pub const OFFLINE: u16 = 0x1000;
+  /// Format: `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`.
+  pub const NOT_CONTENT_INDEXED: u16 = 0x2000;
+  /// Format: every bit kept, a directory's `READONLY` among them.
+  pub const KEPT: u16 = Self::READONLY
+    | Self::HIDDEN
+    | Self::SYSTEM
+    | Self::ARCHIVE
+    | Self::OFFLINE
+    | Self::NOT_CONTENT_INDEXED;
+
+  /// The bits of `bits` (a Win32 attribute word) this volume keeps for an object of `kind`: a file's `READONLY` is its
+  /// mode, never a bit, and every bit outside [`WindowsAttributes::KEPT`] (the directory bit, a reparse point's, the
+  /// ones the drive derives) is dropped.
+  pub fn kept(bits: u32, kind: Kind) -> WindowsAttributes {
+    let kept = u32::from(Self::KEPT)
+      & if kind == Kind::Dir {
+        u32::MAX
+      } else {
+        !u32::from(Self::READONLY)
+      };
+    WindowsAttributes(u16::try_from(bits & kept).unwrap_or(0))
+  }
+
+  /// The bits as an image carries them.
+  pub fn from_image(bits: u16) -> WindowsAttributes {
+    WindowsAttributes(bits & Self::KEPT)
+  }
+
+  /// The bits, at Windows' own values.
+  pub fn bits(self) -> u16 {
+    self.0
+  }
+
+  /// A new file's bits: `ARCHIVE`, as NTFS and WinFsp's memfs mark every file they make, so a backup knows it is new.
+  pub const fn new_file() -> WindowsAttributes {
+    WindowsAttributes(Self::ARCHIVE)
+  }
+}
+
 /// An inode version.
 #[derive(Clone, Debug)]
 pub struct Inode {
@@ -362,6 +427,9 @@ pub struct Inode {
   /// its owner or when the attribute is removed or replaced. Kept as a non-zero word (an inode number is never zero:
   /// a volume's counter starts at 2), so `None` costs no tag: 8 bytes in every inode, not 16 ([`Inode::attribute_of`]).
   attribute_owner: Option<std::num::NonZeroU64>,
+  /// The Windows attribute bits kept beside the mode (A-262); none for an object no Windows caller set them on,
+  /// `ARCHIVE` for a file the volume made.
+  pub windows: WindowsAttributes,
 }
 
 /// A file's place in the namespace: the parent directory's inode number and the hash of the
@@ -422,6 +490,7 @@ impl Inode {
       multi: false,
       xattrs: None,
       attribute_owner: None,
+      windows: WindowsAttributes(0),
     }
   }
 
@@ -442,7 +511,7 @@ impl Inode {
   }
 
   /// Takes attributes observed on the host beneath an overlay (an outsider's edit, §4.5): the size,
-  /// the mode and owner when the observation carries them, and the host's times. The change counter
+  /// the mode, owner and Windows attribute bits (A-262) when the observation carries them, and the host's times. The change counter
   /// moves when any of them differs from what the volume held, so a client caching by the counter
   /// sees the edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
   /// Whether anything differed: the caller tells the file's Shards backings (Shards part 3, step 4).
@@ -450,13 +519,19 @@ impl Inode {
   pub(crate) fn adopt_observed(
     &mut self,
     size: u64,
-    mode_and_owner: Option<(u32, u32, u32)>,
+    metadata: Option<(u32, u32, u32, u16)>,
     mtime: i64,
     ctime: i64,
   ) -> bool {
     let changed = self.attrs.size != size
-      || mode_and_owner.is_some_and(|(mode, uid, gid)| {
-        (mode, uid, gid) != (self.attrs.mode, self.attrs.uid, self.attrs.gid)
+      || metadata.is_some_and(|(mode, uid, gid, windows)| {
+        (mode, uid, gid, WindowsAttributes::from_image(windows))
+          != (
+            self.attrs.mode,
+            self.attrs.uid,
+            self.attrs.gid,
+            self.windows,
+          )
       })
       || self.attrs.mtime != mtime
       || self.attrs.ctime != ctime;
@@ -464,10 +539,11 @@ impl Inode {
       return false;
     }
     self.attrs.size = size;
-    if let Some((mode, uid, gid)) = mode_and_owner {
+    if let Some((mode, uid, gid, windows)) = metadata {
       self.attrs.mode = mode;
       self.attrs.uid = uid;
       self.attrs.gid = gid;
+      self.windows = WindowsAttributes::from_image(windows);
     }
     self.attrs.mtime = mtime;
     self.stamp_change(ctime);
