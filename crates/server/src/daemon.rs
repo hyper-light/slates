@@ -2622,6 +2622,20 @@ impl Daemon {
     }
   }
 
+  /// Test support: takes the snapshot of `green`'s owner partition now, as a log that fills does (§4.8): recovery then
+  /// reads the partition from the snapshot, not the log entries before it, so a test proves what the snapshot carries (a
+  /// submit's durable wait, A-252) across a restart. Whether the snapshot was taken; the typed refusal when it could not
+  /// be observed.
+  pub fn snapshot_green_partition(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<bool, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db.snapshot(&mut s.segment).is_ok()
+    })
+  }
+
   /// Test support: runs every shard's publication now, as a transport's barrier does after a mutation (a FUSE `close`,
   /// an NFS procedure): the recovery image then names the content written so far. A test proves what a freed block that
   /// an image names still owes (A-99: its plaintext scrubbed at the commit that releases it) without driving a kernel
