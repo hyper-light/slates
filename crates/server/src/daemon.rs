@@ -3110,6 +3110,15 @@ impl Daemon {
     })
   }
 
+  /// What the liveness watchdog has done (A-228): its looks, and those that withheld the beat for a stuck shard. `None`
+  /// once the daemon has stopped it.
+  pub fn watchdog_turns(&self) -> Option<(u64, u64)> {
+    self
+      .watchdog
+      .as_ref()
+      .map(|watchdog| watchdog.turns().read())
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards

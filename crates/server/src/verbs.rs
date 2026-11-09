@@ -8450,6 +8450,16 @@ pub(crate) fn end_attachment(
   };
   state.db.mutate(&mut state.segment, &removal, now)?;
   crate::merge_service::forget_attachment(state, record.id);
+  // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
+  if let Some(&handle) = state.by_id.get(&record.volume)
+    && let Ok(slot) = state.volumes.get_mut(handle)
+    && slot
+      .volume
+      .end_takeover_holder(&mut state.store, record.id)
+      .is_err()
+  {
+    state.count(TAKEOVER_KEPT_UNRELEASED, 1);
+  }
   // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
   // sweeps the device's references through its view and only then closes it (AUD-29-68).
   #[cfg(unix)]
@@ -8963,6 +8973,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   };
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
+  let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
   let (drifted, watcher) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
       Ok(s) => (
@@ -9008,6 +9019,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts,
       mounts_elided,
       journal,
+      takeover_kept,
     }),
   }
 }
@@ -12394,13 +12406,22 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
     return 0;
   };
   let partition = state.db.partition();
+  // The FUSE mounts of this volume whose records survived: the anchor held their devices, so their kernels may hold
+  // handles the dead daemon issued after its last publication (U10).
+  let held_mounts: Vec<u64> = partition
+    .attachments_of(record.id)
+    .into_iter()
+    .filter(|attachment| attachment.form.fuse_mount_point().is_some())
+    .map(|attachment| attachment.id)
+    .collect();
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return 0;
   };
-  match slot
-    .volume
-    .settle_recovered_references(&mut state.store, |id| partition.attachment(id).is_some())
-  {
+  match slot.volume.settle_recovered_references(
+    &mut state.store,
+    |id| partition.attachment(id).is_some(),
+    &held_mounts,
+  ) {
     Ok((_, reclaimed)) => reclaimed,
     Err(_) => {
       state.count(REFERENCES_UNSETTLED, 1);
@@ -12408,6 +12429,10 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
     }
   }
 }
+
+/// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
+/// its next restart. Zero is the healthy reading.
+const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 #[cfg(target_os = "linux")]
