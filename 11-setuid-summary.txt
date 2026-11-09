@@ -1,0 +1,7 @@
+test a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest ... guest over slates' own device in qemu: QEMU emulator version 11.1.2 (Debian 1:11.1.2+ds-3~bpo13+4)
+thread 'a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest' (7371) panicked at crates/cli/tests/vm/mod.rs:219:5:
+assertion `left == right` failed: slates mount c6266b3e01eb20870001000000000012 /src/target/tmp/slates-guest-mount-7370-0: slates: refused: TargetUnavailable { reason: "the FUSE mount at /src/target/tmp/slates-guest-mount-7370-0 was refused: the mount helper returned no device descriptor (HelperExit { code: Some(1), signal: None }): fusermount3: mount failed: Permission denied" }
+  left: 1
+ right: 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.48s
+exit 101
