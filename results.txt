@@ -1,0 +1,106 @@
+runner ubuntu-latest, 4 CPUs, 8 spinners, 10 runs each, tests under [nice -n 19], commit 75021869
+a_forward_waits_for_the_owners_session_while_it_is_out run 1 exit 0 load 11.04
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 2 exit 0 load 12.32
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 3 exit 0 load 12.75
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 4 exit 0 load 13.08
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 5 exit 0 load 12.67
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 6 exit 0 load 12.94
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 7 exit 0 load 12.63
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 8 exit 0 load 12.75
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 9 exit 0 load 13.04
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+a_forward_waits_for_the_owners_session_while_it_is_out run 10 exit 0 load 12.97
+test a_forward_waits_for_the_owners_session_while_it_is_out has been running for over 60 seconds
+== a_forward_waits_for_the_owners_session_while_it_is_out passed 10 failed 0
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 1 exit 0 load 12.82
+FALSE-DEATH outages: [(true, true, 6.13003966s, 0), (true, false, 12.122980783s, 1), (true, true, 9.245449674s, 0), (true, false, 11.086277257s, 1), (true, false, 11.698973349s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 2 exit 0 load 12.64
+FALSE-DEATH outages: [(true, true, 3.015737924s, 0), (true, true, 6.240339972s, 0), (true, false, 13.238175622s, 1), (true, true, 9.843406298s, 0), (true, false, 11.509989191s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 3 exit 0 load 13.27
+FALSE-DEATH outages: [(true, true, 12.787869569s, 0), (true, true, 7.54291485s, 0), (true, true, 7.815114991s, 0), (true, true, 9.925048741s, 0), (true, true, 9.444045864s, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 4 exit 0 load 13.24
+FALSE-DEATH outages: [(true, true, 4.943069022s, 0), (true, true, 11.539084216s, 0), (true, true, 12.886774776s, 0), (true, true, 11.997332971s, 0), (true, false, 10.424093316s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 5 exit 0 load 12.79
+FALSE-DEATH outages: [(true, true, 5.955398306s, 0), (true, true, 5.758074693s, 0), (true, true, 10.70487018s, 0), (true, true, 4.975739263s, 0), (true, false, 10.406972916s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 6 exit 0 load 13.23
+FALSE-DEATH outages: [(true, false, 11.03797272s, 1), (true, true, 8.988928736s, 0), (true, true, 3.897720873s, 0), (true, true, 11.051037541s, 0), (true, true, 8.468798141s, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 7 exit 0 load 12.57
+FALSE-DEATH outages: [(true, true, 4.609241174s, 0), (true, true, 4.771663719s, 0), (true, true, 4.870561287s, 0), (true, true, 5.975322896s, 0), (true, false, 14.418966657s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 8 exit 0 load 13.19
+FALSE-DEATH outages: [(true, true, 8.689035486s, 0), (true, true, 6.019058428s, 0), (true, true, 9.496056834s, 0), (true, true, 8.827574906s, 0), (true, false, 13.64138256s, 1)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 9 exit 0 load 12.90
+FALSE-DEATH outages: [(true, true, 13.52068555s, 0), (true, true, 7.456062999s, 0), (true, true, 9.338776384s, 0), (true, true, 7.230815098s, 0), (true, true, 8.032531073s, 0)]
+a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget run 10 exit 0 load 13.55
+FALSE-DEATH outages: [(true, false, 11.706089955s, 1), (true, true, 10.844058859s, 0), (true, false, 12.34997879s, 1), (true, true, 6.115245683s, 0), (true, true, 11.950053568s, 0)]
+== a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget passed 10 failed 0
+forwards_to_one_owner_never_wait_behind_each_other run 1 exit 0 load 12.69
+the forward of a read on a free shard took [152.799502ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 152.799502ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 62, "fleet.accept.replaced": 1, "fleet.discovery.pages": 63, "fleet.fan.sent": 3, "fleet.fan.unchanged": 56, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.session_out": 1, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.lent_to.link": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+forwards_to_one_owner_never_wait_behind_each_other run 2 exit 0 load 13.05
+the forward of a read on a free shard took [705.02612ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 705.02612ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 54, "fleet.accept.replaced": 1, "fleet.discovery.pages": 59, "fleet.fan.sent": 3, "fleet.fan.unchanged": 34, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.session_out": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 2, "fleet.lent_to.link": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.seal.member_anchors_unsent": 1})
+forwards_to_one_owner_never_wait_behind_each_other run 3 exit 0 load 12.77
+the forward of a read on a free shard took [250.410791ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 250.410791ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 3, "content.purged_bytes": 698290176, "content.ticks.idle": 45, "fleet.accept.replaced": 2, "fleet.discovery.deadline": 1, "fleet.discovery.pages": 51, "fleet.fan.sent": 3, "fleet.fan.unchanged": 35, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 5, "fleet.plane.announcements_sent": 5})
+forwards_to_one_owner_never_wait_behind_each_other run 4 exit 0 load 13.00
+the forward of a read on a free shard took [207.565124ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 207.565124ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 60, "fleet.discovery.pages": 62, "fleet.fan.sent": 3, "fleet.fan.unchanged": 68, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.link.stale_return": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.seal.member_anchors_unsent": 1})
+forwards_to_one_owner_never_wait_behind_each_other run 5 exit 0 load 12.59
+the forward of a read on a free shard took [636.599205ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 636.599205ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 50, "fleet.discovery.pages": 53, "fleet.fan.sent": 3, "fleet.fan.unchanged": 51, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.session_out": 1, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 4, "fleet.lent_to.link": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.seal.member_anchors_unsent": 3})
+forwards_to_one_owner_never_wait_behind_each_other run 6 exit 0 load 13.11
+the forward of a read on a free shard took [349.940913ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 349.940913ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 49, "fleet.discovery.deadline": 2, "fleet.discovery.pages": 50, "fleet.fan.sent": 3, "fleet.fan.unchanged": 25, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 2, "fleet.learner.fetches": 1, "fleet.link.stale_return": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 9, "fleet.plane.announcements_sent": 9, "fleet.plane.epoch_unanswered": 6})
+forwards_to_one_owner_never_wait_behind_each_other run 7 exit 0 load 13.13
+the forward of a read on a free shard took [114.41847ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 114.41847ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 48, "fleet.accept.replaced": 2, "fleet.discovery.deadline": 1, "fleet.discovery.pages": 49, "fleet.fan.sent": 3, "fleet.fan.unchanged": 22, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 5, "fleet.plane.announcements_sent": 5, "fleet.seal.member_anchors_unsent": 1})
+forwards_to_one_owner_never_wait_behind_each_other run 8 exit 0 load 13.14
+the forward of a read on a free shard took [431.036726ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 431.036726ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 45, "fleet.accept.replaced": 2, "fleet.discovery.deadline": 1, "fleet.discovery.pages": 49, "fleet.fan.sent": 3, "fleet.fan.unchanged": 33, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 5, "fleet.plane.announcements_sent": 5})
+forwards_to_one_owner_never_wait_behind_each_other run 9 exit 0 load 13.79
+the forward of a read on a free shard took [334.094239ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 334.094239ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 2, "content.purged_bytes": 698294272, "content.ticks.idle": 54, "fleet.accept.replaced": 1, "fleet.discovery.pages": 56, "fleet.fan.sent": 3, "fleet.fan.unchanged": 43, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.taken_for_another": 1, "fleet.learner.fetches": 3, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.seal.member_anchors_unsent": 2})
+forwards_to_one_owner_never_wait_behind_each_other run 10 exit 0 load 13.10
+the forward of a read on a free shard took [510.612723ms] a round, while another forward to its owner waited on a 5s hold: [ForwardRound { served: true, during_hold: true, fast_took: 510.612723ms }]; b's fleet counters Ok({"content.give_back.left_for_next_tick": 1, "content.purged_bytes": 698294272, "content.ticks.idle": 48, "fleet.accept.replaced": 1, "fleet.discovery.deadline": 1, "fleet.discovery.invalidated": 1, "fleet.discovery.pages": 50, "fleet.fan.sent": 3, "fleet.fan.unchanged": 24, "fleet.forward.batch_done": 4, "fleet.forward.begun": 4, "fleet.forward.client.control_started": 4, "fleet.forward.client.delivered_home": 2, "fleet.forward.client.resolved": 4, "fleet.forward.client.to_control": 2, "fleet.forward.session_out": 1, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 4, "fleet.learner.fetches": 2, "fleet.lent_to.link": 1, "fleet.link.invalid.member_changed": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4, "fleet.plane.epoch_unanswered": 1})
+== forwards_to_one_owner_never_wait_behind_each_other passed 10 failed 0
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 1 exit 0 load 13.29
+hedge: measured before the hold Ok((1, Some(1525512318))) (readings, p95 ns); hedged while held true; second seal placed after 4.86004536s, held Ok(4923360821) ns; readings after Ok((2, Some(714328625)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 2 exit 0 load 12.89
+hedge: measured before the hold Ok((1, Some(726414058))) (readings, p95 ns); hedged while held true; second seal placed after 2.917070828s, held Ok(2996454464) ns; readings after Ok((3, Some(726099589)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 3 exit 0 load 13.11
+hedge: measured before the hold Ok((1, Some(1147867210))) (readings, p95 ns); hedged while held true; second seal placed after 4.418211757s, held Ok(4848328688) ns; readings after Ok((3, Some(730734791)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 4 exit 0 load 13.48
+hedge: measured before the hold Ok((1, Some(15203504))) (readings, p95 ns); hedged while held true; second seal placed after 8.661068186s, held Ok(8976384472) ns; readings after Ok((2, Some(12101651)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 5 exit 0 load 12.37
+hedge: measured before the hold Ok((2, Some(277936797))) (readings, p95 ns); hedged while held true; second seal placed after 4.414051072s, held Ok(4736984387) ns; readings after Ok((3, Some(293542315)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 6 exit 0 load 13.33
+hedge: measured before the hold Ok((2, Some(14259059))) (readings, p95 ns); hedged while held true; second seal placed after 3.622039042s, held Ok(3678326201) ns; readings after Ok((4, Some(613947849)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 7 exit 0 load 12.79
+hedge: measured before the hold Ok((2, Some(969151740))) (readings, p95 ns); hedged while held true; second seal placed after 4.444070284s, held Ok(4586810715) ns; readings after Ok((4, Some(969151740)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 8 exit 0 load 13.55
+hedge: measured before the hold Ok((1, Some(1985211148))) (readings, p95 ns); hedged while held true; second seal placed after 3.598061919s, held Ok(3640259896) ns; readings after Ok((3, Some(706477249)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 9 exit 0 load 14.07
+hedge: measured before the hold Ok((2, Some(878160157))) (readings, p95 ns); hedged while held true; second seal placed after 5.322052856s, held Ok(5675403468) ns; readings after Ok((4, Some(878160157)))
+a_slow_first_round_candidate_is_hedged_after_the_measured_p95 run 10 exit 0 load 14.28
+hedge: measured before the hold Ok((1, Some(716240748))) (readings, p95 ns); hedged while held true; second seal placed after 5.235194362s, held Ok(5358225445) ns; readings after Ok((2, Some(420253934)))
+== a_slow_first_round_candidate_is_hedged_after_the_measured_p95 passed 10 failed 0
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 1 exit 0 load 14.56
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 2 exit 0 load 15.13
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 3 exit 0 load 15.09
+slates daemon: the control shard's beat task ran 889 ms after its last turn (a near miss against a test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 4 exit 0 load 15.22
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 5 exit 0 load 14.70
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 6 exit 0 load 14.41
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 7 exit 0 load 14.06
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 8 exit 0 load 14.87
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 9 exit 0 load 14.86
+slates daemon: the control shard's beat task ran test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+a_forward_answered_within_its_bounds_is_never_reported_stalled run 10 exit 0 load 14.11
+test a_forward_answered_within_its_bounds_is_never_reported_stalled has been running for over 60 seconds
+== a_forward_answered_within_its_bounds_is_never_reported_stalled passed 10 failed 0
