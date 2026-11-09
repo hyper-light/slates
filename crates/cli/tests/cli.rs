@@ -12308,9 +12308,11 @@ fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open(
     code, 1,
     "a landing target on the daemon's own mount is refused: {err} {out}"
   );
+  // The refusal itself, not a reason that names it: the writer's `OwnMount` reported as `TargetUnavailable` names
+  // "OwnMount" in its reason too, and its Windows twin passed that looser check under exactly that break (2026-11-07).
   assert!(
-    err.contains("OwnMount"),
-    "refused as the daemon's own mount: {err}"
+    err.contains("LandingTarget") && !err.contains("TargetUnavailable"),
+    "refused as the daemon's own mount, a landing target: {err}"
   );
   assert_eq!(
     std::fs::read_dir(&target).unwrap().count(),
