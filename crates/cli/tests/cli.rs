@@ -12760,11 +12760,70 @@ fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_ke
   );
 }
 
+/// Makes a volume named `name` over a host directory in `scratch`, removes the directory and restarts the daemon in
+/// order (`SIGTERM`, no kernel mount involved), so the successor holds the volume's record but could not rebuild it.
+/// Returns the volume's id and the removed base.
+#[cfg(unix)]
+fn an_unrecovered_volume(instance: &str, scratch: &ScratchDir, name: &str) -> (String, String) {
+  let base = format!("{}/{name}-base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      name,
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("rmdir {base}"));
+  restart_in_order(instance);
+  (id, base)
+}
+
+/// Stops the instance's daemon with `SIGTERM` and waits for its successor.
+#[cfg(unix)]
+fn restart_in_order(instance: &str) {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(instance, Some(stopped), &[]);
+}
+
+/// `slates <verb...>` on the unrecovered volume is refused `NotRecovered`, by kind.
+#[cfg(unix)]
+fn refused_not_recovered(instance: &str, verb: &[&str]) {
+  let (code, out, err) = run(instance, verb);
+  assert_ne!(
+    code, 0,
+    "{verb:?} on a volume recovery could not rebuild: {out}"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "{verb:?} is refused because recovery could not rebuild the volume, by kind: {err}"
+  );
+}
+
 /// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
 /// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
-/// state: the recovery refusal by kind. Do: create a volume over a host directory, remove the directory, and restart the
-/// daemon in order (no kernel mount is involved). Expect: `volume list` still shows the volume, and its `status` is
-/// refused `NotRecovered`, naming the missing base.
+/// state: the recovery refusal by kind. The sweep of 2026-11-08 (GAPS): `volume list` names why on the volume's line,
+/// and the verbs that would change it refuse typed, a share included, though a share touches only the catalog. Do:
+/// create a volume over a host directory, remove the directory, and restart the daemon in order (no kernel mount is
+/// involved). Expect: `volume list` shows the volume with `not_recovered=BaseMissing`; its `status`, a `volume snapshot`
+/// and a `share` are each refused `NotRecovered`, naming the missing base.
 #[cfg(unix)]
 #[test]
 fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
@@ -12779,43 +12838,74 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   let scratch = ScratchDir {
     path: build_output_dir("slates-unrecovered"),
   };
-  let base = format!("{}/base", scratch.path);
-  shell(&format!("mkdir {base}"));
-  let (code, out, err) = run(
-    &instance,
-    &[
-      "volume",
-      "create",
-      "unrecovered",
-      "--bounded",
-      "8MiB",
-      "--base",
-      &base,
-    ],
-  );
-  assert_eq!(code, 0, "{err}");
-  let id = value_of(&out, "id");
-  shell(&format!("rmdir {base}"));
-  let stopped = daemon_pid(&instance).expect("the daemon answers");
-  assert!(
-    Command::new("kill")
-      .args(["-TERM", &stopped.to_string()])
-      .status()
-      .unwrap()
-      .success(),
-    "SIGTERM sent"
-  );
-  await_daemon(&instance, Some(stopped), &[]);
+  let (id, base) = an_unrecovered_volume(&instance, &scratch, "unrecovered");
   let (code, out, err) = run(&instance, &["volume", "list"]);
   assert_eq!(code, 0, "{err}");
   assert!(
-    out.contains("unrecovered"),
-    "the catalog still lists the volume: {out}"
+    out
+      .lines()
+      .any(|line| line.contains(" unrecovered ") && line.ends_with(" not_recovered=BaseMissing")),
+    "the catalog lists the volume, naming why it was not rebuilt: {out}"
   );
   let (code, out, err) = run(&instance, &["status", &id]);
   assert_ne!(code, 0, "the volume was not rebuilt: {out}");
   assert!(
     err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
     "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  refused_not_recovered(&instance, &["volume", "snapshot", &id]);
+  refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
+/// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
+/// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
+/// in order, then `volume destroy` it. Expect: the destroy succeeds; `volume list` no longer names it and its `status`
+/// answers `NotFound`; its name can be given to a new volume; and after a second restart nothing is reported not
+/// rebuilt and the volume is still gone.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_destroyed_and_stays_gone() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's destroy: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-undestroyed-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-undestroyed"),
+  };
+  let (id, _) = an_unrecovered_volume(&instance, &scratch, "undestroyed");
+  let (code, out, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(
+    code, 0,
+    "a volume recovery could not rebuild is destroyed: {out}{err}"
+  );
+  assert_gone(&instance, &id);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "undestroyed", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "the destroyed volume's name is free: {err}");
+  restart_in_order(&instance);
+  assert_gone(&instance, &id);
+}
+
+/// `volume list` names no `undestroyed` volume recovery could not rebuild, and `status` of `id` answers `NotFound`.
+#[cfg(unix)]
+fn assert_gone(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.contains("not_recovered="),
+    "no volume is listed as not rebuilt: {out}"
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_ne!(code, 0, "the destroyed volume has no status: {out}");
+  assert!(
+    err.contains("NotFound"),
+    "the destroyed volume is not found: {err}"
   );
 }
