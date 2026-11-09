@@ -28,6 +28,11 @@
 > 0 with its bytes until its last close, also across a daemon restart, and its 64 KiB come back at the close or at its
 > client's lease lapse. Still owed: NFSv3 has no open, so its clients' silly renames stay (NFS-OPEN on the NFSv3 lists).
 
+> **A chained async call stalled after its first step: fixed (2026-11-09, found by CI's diag list-3).** The async
+> driver reported a call ready once until it was finished, so a chained call (a listing's next page, a large edit's next
+> put) was never reported again and both SDKs' async listings past one page failed `Stalled`. `Driver::continued`
+> re-arms the call; both SDKs call it (`docs/bugs/2026-11-09-a-chained-async-call-stalled-after-its-first-step.md`).
+
 > **A volume listing outgrew one reply: fixed (found by liveness, fixed 2026-11-08, A-263, §4.4 `list`, §4.3).** `slates volume
 > list` was refused "reply too large for the bulk area" from 100 volumes on a two-shard daemon, so an operator could not
 > list what a server holds. `List { after }` is now answered a page at a time, `Listed { volumes, next }`: volumes in id

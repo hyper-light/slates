@@ -938,6 +938,13 @@ impl Client {
     Ok(())
   }
 
+  /// Keeps a call whose poll answered nothing yet because it took a chained step: its next reply is reported.
+  #[napi]
+  pub fn continued(&mut self, ticket: String) -> Result<()> {
+    self.driver.continued(parse_word(&ticket)?);
+    Ok(())
+  }
+
   /// Releases a call its caller no longer awaits.
   #[napi]
   pub fn cancel(&mut self, ticket: String) -> Result<()> {

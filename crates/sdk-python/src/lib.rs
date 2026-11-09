@@ -1606,7 +1606,11 @@ fn settle_one(slf: &Bound<'_, AsyncClient>, event: Event) -> PyResult<()> {
         decode_pending(py, &mut this.inner, word, decode)
       };
       match decoded {
-        Ok(None) => return Ok(()),
+        // A chained call took a step: its next reply is reported again.
+        Ok(None) => {
+          slf.borrow_mut().driver.continued(ticket);
+          return Ok(());
+        }
         Ok(Some(value)) => (ticket, Ok(value)),
         Err(error) => (ticket, Err(error)),
       }

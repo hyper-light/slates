@@ -480,3 +480,73 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
   assert!(driver.is_idle());
   daemon.stop();
 }
+
+/// Shape: the volumes the chained-listing test lists: about three pages of summaries at these names, so the listing is
+/// a chain of page requests under the call's one word.
+const CHAINED_VOLUMES: usize = 250;
+
+/// §4.4 `list` (A-263), the async path both SDKs drive. Do: create 250 volumes, then list them through the driver as
+/// an SDK does: on each `Ready`, poll the call's word; a page that is not the last answers `None` while the client
+/// sends the next page under the same word; settle the call when the poll answers the listing. Expect: the listing,
+/// every volume once, well within the reply deadline. Before 2026-11-09 the driver reported a call `Ready` once until
+/// it was finished, so the second page's reply was never reported and the call failed `Stalled` at the deadline (both
+/// SDKs' async suites on CI, diag list-3, `Stalled { after_ns: 10000000000 }`).
+#[test]
+fn a_chained_call_is_reported_at_each_step_until_it_ends() {
+  let instance = format!("cl-driver-chain-{}", std::process::id());
+  let anchor = Anchor::new(&instance);
+  let daemon = anchor.start();
+  let mut ticker = Ticker::default();
+  let mut client = connect_from_the_loop(&instance, &mut ticker);
+  let mut made = std::collections::BTreeSet::new();
+  for n in 0..CHAINED_VOLUMES {
+    made.insert(
+      client
+        .create(&slates_client::CreateSpec {
+          name: format!("chained-{n:04}"),
+          size: slates_client::SizeClass::Bounded { limit: 1 << 20 },
+          names: slates_client::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        })
+        .unwrap(),
+    );
+  }
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let started = Instant::now();
+  let listed = 'call: loop {
+    let mut events = driver.pump(&mut client);
+    events.extend(driver.tick(&mut client));
+    for event in events {
+      match event {
+        Event::Ready { word, .. } => {
+          if let Some(volumes) = client.list_poll(word).unwrap() {
+            driver.finish(ticket);
+            break 'call volumes;
+          }
+          driver.continued(ticket);
+        }
+        Event::Failed { error, .. } => panic!(
+          "the chained listing failed after {:?}: {error}",
+          started.elapsed()
+        ),
+      }
+    }
+    std::hint::spin_loop();
+  };
+  let ids: std::collections::BTreeSet<_> = listed.iter().map(|v| v.id).collect();
+  assert_eq!(
+    (ids.len(), listed.len()),
+    (made.len(), made.len()),
+    "every volume once"
+  );
+  assert_eq!(ids, made);
+  assert!(driver.is_idle());
+  daemon.stop();
+}
