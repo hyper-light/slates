@@ -2169,7 +2169,16 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
 > held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
-> so none serves a request after the acknowledgement.
+> so none serves a request after the acknowledgement. **2026-11-09:** on Linux the ended FUSE mount's own registry
+> attachment is revoked too (`fuse::fence_if_mounted`); before, it was not, and a revoked consumer's FUSE mount read on
+> (`docs/bugs/2026-11-09-a-revoked-consumers-linux-fuse-mount-went-on-serving.md`). The same day the fenced mount's
+> kernel cache was closed as well: a page the kernel holds is read with no request, so a descriptor opened before the
+> revocation read a page its readahead had fetched and the process never asked for. The fence now wakes the mount,
+> which tells its kernel to drop the root and every node it references (`FUSE_NOTIFY_INVAL_INODE` of all data, sliced
+> under the shard's budget, written on the notify thread) while it answers every request `ENOTCONN`, and ends only once
+> the last slice is written; the revocation is acknowledged after the mount has ended, bounded by the told wait (§4.6,
+> `told::TOLD_WAIT_NS`) and counted past it (`fuse.revoked_overdue`). The cost is one message per node the kernel
+> references, at most the volume's inode allowance.
 
 > **Amendment (2026-10-17): invalidations are delivered off the answering thread, not before each request.**
 > "Before each request" was not merely an ordering preference — it deadlocked the mount, and could not be kept.
@@ -4966,6 +4975,12 @@ and cannot replace an initialized group. Separate group genesis identities never
 state. Both regional and root groups follow this rule, as does N=1.
 An initialized learner keeps a fetched read view separate from its Raft fold, so catching up
 cannot apply a takeover or home change twice. The view is dropped when replay reaches its version.
+A regional learner fetches from every member of its region it holds a session to, not from the voters alone: its voter
+list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
+to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
+adoption only moves forward.
+A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
+voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -20018,6 +20033,45 @@ Applied in the same change to:
   - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
     (`crates/server/tests/fleet.rs`).
 
+### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
+
+A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
+line read as settled makes every holder reclaim its copy as stale (`takeover::resolve_held_objects`). The line was read
+as settled from absence: a retirement no longer kept, or a ranked successor neither a member nor a kept retirement. A
+retirement was pruned on its survivors' confirmations, and a survivor confirmed its share even when its round had
+declared an object lost (its settled cohort left with fewer members than its recovery quorum). So a takeover that
+adopted nothing could have every holder delete the copies the current members still held. The store-destroyed takeover
+lost its volume this way: its settled cohort was [owner, A, old B], and the replacement holding the live log was not
+in it.
+
+- **A share confirms only when every object its round learned was adopted** (`takeover::share_done`). A round with a
+  lost object leaves its retirement kept. A pruned retirement therefore means its objects were adopted.
+- **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
+  is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
+  retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
+  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
+- **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
+- **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
+  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
+
+Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
+`a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
+`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
+flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
+§4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
+here; a lineage model is owed with (ii).
+
+**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
+the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
+old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
+- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
+- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
+- an installed snapshot (`fold::install` declines it);
+- a learner's fetch and a join (`consensus`).
+A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
+But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
+none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
+
 ### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
 
 A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
@@ -20130,42 +20184,3 @@ Applied in the same change to:
   `promise_local_copies`, `initial_epoch`, `answer_own_copies_by_name`, and the module doc's account of the empty
   promise.
 - Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.
-
-### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
-
-A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
-line read as settled makes every holder reclaim its copy as stale (`takeover::resolve_held_objects`). The line was read
-as settled from absence: a retirement no longer kept, or a ranked successor neither a member nor a kept retirement. A
-retirement was pruned on its survivors' confirmations, and a survivor confirmed its share even when its round had
-declared an object lost (its settled cohort left with fewer members than its recovery quorum). So a takeover that
-adopted nothing could have every holder delete the copies the current members still held. The store-destroyed takeover
-lost its volume this way: its settled cohort was [owner, A, old B], and the replacement holding the live log was not
-in it.
-
-- **A share confirms only when every object its round learned was adopted** (`takeover::share_done`). A round with a
-  lost object leaves its retirement kept. A pruned retirement therefore means its objects were adopted.
-- **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
-  is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
-  retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
-  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
-- **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
-- **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
-  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
-
-Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
-`a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
-`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
-flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
-§4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
-here; a lineage model is owed with (ii).
-
-**The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
-the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
-old build has bytes left over (`LengthMismatch`). Every caller refuses rather than defaults:
-- a retained council's base and view at restart (`retention::restore`: "invalid retained council base");
-- a saved snapshot (`fold::for_saved`: `InvalidSnapshot`);
-- an installed snapshot (`fold::install` declines it);
-- a learner's fetch and a join (`consensus`).
-A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
-But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
-none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.

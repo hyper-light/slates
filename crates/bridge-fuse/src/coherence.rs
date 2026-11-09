@@ -823,6 +823,20 @@ impl KernelHolds {
     )
   }
 
+  /// The nodes the kernel references above `after` (every one for `None`), in node order: what a revoked mount's round
+  /// walks a slice at a time (AUD-29-84). A node the kernel forgets between slices needs nothing, and one it looks up
+  /// meanwhile is refused its pages by the revoked mount, so a set that changes between slices loses nothing.
+  pub fn nodes_after(&self, after: Option<u64>) -> impl Iterator<Item = u64> + '_ {
+    let from = match after {
+      Some(after) => std::ops::Bound::Excluded(after),
+      None => std::ops::Bound::Unbounded,
+    };
+    self
+      .lookups
+      .range((from, std::ops::Bound::Unbounded))
+      .map(|(&node, _)| node)
+  }
+
   /// What an `Everything` invalidates ([`KernelHolds::everything`]), taking the names away as it goes: once the round
   /// is written the kernel has dropped or expired each, and a later use is a new lookup that names it again. The nodes
   /// stay, since an invalidation takes no lookup away. Taken when the round is built, not when it returns: a lookup
