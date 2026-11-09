@@ -73,6 +73,28 @@ pub const STATUS_IO_REPARSE_TAG_MISMATCH: Ntstatus = Ntstatus(0xC000_0277);
 /// Format: `STATUS_BUFFER_TOO_SMALL` (`0xC000_0023`): the caller's buffer cannot hold the link's reparse buffer.
 pub const STATUS_BUFFER_TOO_SMALL: Ntstatus = Ntstatus(0xC000_0023);
 
+/// Format: `STATUS_PRIVILEGE_NOT_HELD` (`0xC000_0061`, Win32 `ERROR_PRIVILEGE_NOT_HELD`): NTFS's answer to a symbolic link
+/// set by a caller without `SeCreateSymbolicLinkPrivilege`, outside Developer Mode (A-275).
+pub const STATUS_PRIVILEGE_NOT_HELD: Ntstatus = Ntstatus(0xC000_0061);
+/// Format: a `TOKEN_PRIVILEGES` (`winnt.h`): its `PrivilegeCount` (four bytes), then that many `LUID_AND_ATTRIBUTES`, each
+/// a `LUID` (`LowPart`, four bytes; `HighPart`, four) and its `Attributes` (four).
+const PRIVILEGE_ENTRY: usize = 3 * size_of::<u32>();
+
+/// Whether a token's privileges (`GetTokenInformation(TokenPrivileges)`'s bytes) hold the privilege `luid` names, enabled
+/// or not: a holder may enable it, as `CreateSymbolicLinkW` does for an administrator, whose token holds
+/// `SeCreateSymbolicLinkPrivilege` disabled (A-275). A short or malformed buffer holds nothing.
+pub fn holds_privilege(token_privileges: &[u8], luid: u32) -> bool {
+  let Some((count, entries)) = token_privileges.split_first_chunk::<{ size_of::<u32>() }>() else {
+    return false;
+  };
+  let count = usize::try_from(u32::from_le_bytes(*count)).unwrap_or(0);
+  let (entries, _) = entries.as_chunks::<PRIVILEGE_ENTRY>();
+  entries.iter().take(count).any(|entry| {
+    let (luid_parts, _) = entry.as_chunks::<{ size_of::<u32>() }>();
+    matches!(luid_parts, [low, high, _] if u32::from_le_bytes(*low) == luid && u32::from_le_bytes(*high) == 0)
+  })
+}
+
 /// Why a link could not be mapped between the volume and Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -442,6 +464,45 @@ mod tests {
       Err(Refusal::Malformed),
       "an unpaired surrogate"
     );
+  }
+
+  /// A `TOKEN_PRIVILEGES` holding `privileges` (each a LUID's low part and its attributes), as Windows lays it out.
+  fn token_privileges(privileges: &[(u32, u32)]) -> Vec<u8> {
+    let mut bytes = u32::try_from(privileges.len())
+      .unwrap()
+      .to_le_bytes()
+      .to_vec();
+    for (low, attributes) in privileges {
+      bytes.extend_from_slice(&low.to_le_bytes());
+      bytes.extend_from_slice(&0u32.to_le_bytes());
+      bytes.extend_from_slice(&attributes.to_le_bytes());
+    }
+    bytes
+  }
+
+  /// A-275 (who may make a link). Do: ask whether tokens hold `SeCreateSymbolicLinkPrivilege` (LUID 35): one holding it
+  /// enabled, one holding it disabled (an administrator's, before `CreateSymbolicLinkW` enables it), one without it,
+  /// one claiming more entries than it carries, and a truncated one. Expect: held, held, not, not, not.
+  #[test]
+  fn a_token_holds_the_link_privilege_enabled_or_not() {
+    const LINK: u32 = 35;
+    assert!(holds_privilege(
+      &token_privileges(&[(23, 3), (LINK, 2)]),
+      LINK
+    ));
+    assert!(holds_privilege(&token_privileges(&[(LINK, 0)]), LINK));
+    assert!(!holds_privilege(
+      &token_privileges(&[(23, 3), (19, 0)]),
+      LINK
+    ));
+    let mut overclaimed = token_privileges(&[(23, 3)]);
+    overclaimed[..4].copy_from_slice(&9u32.to_le_bytes());
+    assert!(!holds_privilege(&overclaimed, LINK));
+    assert!(!holds_privilege(
+      &token_privileges(&[(LINK, 2)])[..10],
+      LINK
+    ));
+    assert!(!holds_privilege(&[], LINK));
   }
 
   #[test]

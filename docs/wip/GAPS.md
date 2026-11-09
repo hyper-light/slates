@@ -5,7 +5,9 @@
 > as a reparse point Windows could not follow. Now a volume symlink is the Windows symbolic link: WinFsp's resolver
 > follows it, a relative target is stored with `/` and shown with `\`, a directory link keeps its type in the inode's
 > Windows bits (image 27, delta 10, an older reader refusing them), and making one asks for
-> `SeCreateSymbolicLinkPrivilege` as NTFS does, unless Developer Mode's unprivileged create applies. winfstest's
+> `SeCreateSymbolicLinkPrivilege` as NTFS does, unless Developer Mode is on (judged by the drive from the opener's token,
+> since WinFsp's own check refuses Developer Mode; under it the drive allows a caller who did not pass the unprivileged
+> flag, which never reaches a file system). winfstest's
 > `t/reparse/02.t`, `03.t` and `t/streams/04.t` run to their ends: 78 cases newly pass, and three script-level entries
 > become 30 case-level ones, each with its reason (355 to 382 entries; finer grain, no case that passed before fails).
 > Stated differences: a link holds no data stream; a link POSIX made is a file link; a link relative to the drive's root

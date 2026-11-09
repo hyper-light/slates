@@ -1730,6 +1730,14 @@ extern "C" fn get_reparse_point(
   )
 }
 
+/// NTFS's rule for setting or removing a symbolic link (A-275): the opener's token held `SeCreateSymbolicLinkPrivilege`
+/// (read at its Create, `crate::dispatcher::may_link`), or Developer Mode is on. WinFsp never passes the caller's
+/// `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file system, so under Developer Mode a caller who did not pass it
+/// is allowed where NTFS refuses it: A-275's stated deviation.
+fn may_set_a_link(object: u64) -> bool {
+  crate::dispatcher::may_link(object) || ffi::developer_mode()
+}
+
 /// The open's name and the reparse buffer a set or a delete hands over, copied out (A-275).
 ///
 /// # Safety
@@ -1772,9 +1780,13 @@ extern "C" fn set_reparse_point(
 ) -> Ntstatus {
   // SAFETY: our file system, the open's name and the request's `size` bytes, owned by WinFsp for this call.
   let (handler, path, data) = unsafe { reparse_request(fs, file_name, buffer, size) };
+  let object = context_key(context);
+  if !may_set_a_link(object) {
+    return crate::symlink::STATUS_PRIVILEGE_NOT_HELD.as_i32();
+  }
   match crate::symlink::target(&data, &path) {
     Ok(target) => changed(handler.call(Op::MakeLink {
-      object: context_key(context),
+      object,
       path,
       target,
     })),
@@ -1793,8 +1805,12 @@ extern "C" fn delete_reparse_point(
 ) -> Ntstatus {
   // SAFETY: our file system, the open's name and the request's `size` bytes, owned by WinFsp for this call.
   let (handler, path, data) = unsafe { reparse_request(fs, file_name, buffer, size) };
+  let object = context_key(context);
+  if !may_set_a_link(object) {
+    return crate::symlink::STATUS_PRIVILEGE_NOT_HELD.as_i32();
+  }
   changed(handler.call(Op::UnmakeLink {
-    object: context_key(context),
+    object,
     path,
     symlink_tag: crate::symlink::tag(&data) == Some(crate::symlink::IO_REPARSE_TAG_SYMLINK),
   }))
@@ -1846,6 +1862,7 @@ fn finish_open(
   let Ok(context) = usize::try_from(context) else {
     return crate::status_invalid_parameter();
   };
+  crate::dispatcher::opened(u64::try_from(context).unwrap_or(0));
   // SAFETY: WinFsp owns these writable output parameters. The context is an opaque integer, never dereferenced.
   unsafe {
     *p_context = std::ptr::without_provenance_mut(context);
@@ -1958,6 +1975,7 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
   if context.is_null() {
     return;
   }
+  crate::dispatcher::closed(context_key(context));
   report_terminal_reply(
     "close",
     handler.call(Op::Release {
@@ -2396,10 +2414,11 @@ impl Mounted {
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
       // A volume symlink is a Windows symbolic link (A-275): WinFsp asks the reparse slots and follows each link it
-      // meets while opening a path. Making one asks for `SeCreateSymbolicLinkPrivilege`, as NTFS does: WinFsp's driver
-      // checks the caller's token (`ReparsePointsAccessCheck`); the daemon itself holds no privilege (R10).
+      // meets while opening a path. Making one asks for `SeCreateSymbolicLinkPrivilege` unless Developer Mode is on, as
+      // on NTFS; the drive judges it from the opener's token (`crate::dispatcher::may_link`), since WinFsp's own check
+      // (`ReparsePointsAccessCheck`) refuses Developer Mode's unprivileged create (diagnostics run 42712321599). The
+      // daemon itself holds no privilege (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
-      | ffi::VOLUME_FLAG_REPARSE_POINTS_ACCESS_CHECK
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed

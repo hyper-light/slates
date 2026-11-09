@@ -42,6 +42,85 @@ thread_local! {
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
   /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
   static REPLAYING: Cell<bool> = const { Cell::new(false) };
+  /// A-275: whether the current Create opens a reparse point from user mode for a caller whose token holds
+  /// `SeCreateSymbolicLinkPrivilege`, read from the request's token while WinFsp keeps it live.
+  static CREATOR_MAY_LINK: Cell<bool> = const { Cell::new(false) };
+  /// A-275: the opens made so, by context, until their Close. Every member is a live open of the ledger, so the ledger's
+  /// bound is this set's; a symbolic link set through any other open is judged by Developer Mode alone.
+  static OPENS_THAT_MAY_LINK: RefCell<std::collections::BTreeSet<u64>> =
+    const { RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Records an open just made (`context`) as one whose caller holds `SeCreateSymbolicLinkPrivilege`, when the current
+/// Create's token held it (A-275).
+pub(crate) fn opened(context: u64) {
+  if CREATOR_MAY_LINK.get() {
+    OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| opens.insert(context));
+  }
+}
+
+/// Forgets a closed open's privilege (A-275).
+pub(crate) fn closed(context: u64) {
+  OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| opens.remove(&context));
+}
+
+/// Whether the open `context` was made by a caller holding `SeCreateSymbolicLinkPrivilege` (A-275).
+pub(crate) fn may_link(context: u64) -> bool {
+  OPENS_THAT_MAY_LINK.with_borrow(|opens| opens.contains(&context))
+}
+
+/// Format: the most entries a token's privileges hold, one per well-known privilege (`SE_MAX_WELL_KNOWN_PRIVILEGE`,
+/// 36, `wdm.h`), each a `LUID_AND_ATTRIBUTES` of three words, after the count's one word.
+const PRIVILEGE_WORDS: usize = 1 + 36 * 3;
+
+/// Whether `request` is a user-mode Create that opens a reparse point itself (how `CreateSymbolicLinkW` opens the object
+/// it makes a link) for a caller whose token holds `SeCreateSymbolicLinkPrivilege` (A-275). A token the query refuses
+/// holds nothing, so such a caller is judged as one without the privilege.
+fn creator_may_link(request: &Request<'_>) -> Result<bool, WinFspError> {
+  use windows_sys::Win32::Security::{GetTokenInformation, TokenPrivileges};
+  if !request
+    .opens_reparse_point_from_user_mode()
+    .map_err(WinFspError::Capture)?
+  {
+    return Ok(false);
+  }
+  let value = usize::try_from(request.access_token().map_err(WinFspError::Capture)?)
+    .map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  if value == 0 {
+    return Ok(false);
+  }
+  let mut words = [0u32; PRIVILEGE_WORDS];
+  let mut returned = 0u32;
+  let length =
+    u32::try_from(size_of_val(&words)).map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  // SAFETY: this fresh Create's token handle was opened into this receiver's process by WinFsp, which keeps it live
+  // until the request is answered (as `PrivateOpens::authenticate` reads it); `words` is live, aligned storage of exactly
+  // `length` bytes, and `returned` a live word.
+  let queried = unsafe {
+    GetTokenInformation(
+      value as *mut _,
+      TokenPrivileges,
+      words.as_mut_ptr().cast(),
+      length,
+      &mut returned,
+    )
+  };
+  if queried == 0 {
+    slates_machine::log_line!(
+      "slates-winfsp: a link-making open's token refused its privileges' query"
+    );
+    return Ok(false);
+  }
+  let bytes: Vec<u8> = words
+    .iter()
+    .flat_map(|word| word.to_ne_bytes())
+    .take(usize::try_from(returned).unwrap_or(0))
+    .collect();
+  Ok(crate::symlink::holds_privilege(
+    &bytes,
+    u32::try_from(windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE)
+      .unwrap_or(0),
+  ))
 }
 
 /// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
@@ -422,6 +501,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
+  CREATOR_MAY_LINK.set(creator_may_link(request)?);
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
   // throughout the synchronous call.
@@ -440,6 +520,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(None);
   CURRENT_HINT.set(0);
+  CREATOR_MAY_LINK.set(false);
   inflight::finish_response(response, status).map_err(WinFspError::Capture)
 }
 

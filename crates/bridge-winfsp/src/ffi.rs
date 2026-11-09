@@ -89,10 +89,6 @@ pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
 /// Format: `ReparsePoints` — bit 4: the file system serves reparse points, so WinFsp calls the reparse slots and
 /// follows a symbolic link it finds while opening a path (A-275; `fsctl.h` v2.1, `FSP_FSCTL_VOLUME_PARAMS_V0_FIELD_DEFN`).
 pub(crate) const VOLUME_FLAG_REPARSE_POINTS: u32 = 1 << 4;
-/// Format: `ReparsePointsAccessCheck` — bit 5: WinFsp's driver refuses a symbolic link's `FSCTL_SET_REPARSE_POINT` from
-/// a user-mode caller whose token lacks `SeCreateSymbolicLinkPrivilege` (`STATUS_PRIVILEGE_NOT_HELD`; `src/sys/fsctl.c`
-/// v2.1, 231-240), as NTFS does (A-275).
-pub(crate) const VOLUME_FLAG_REPARSE_POINTS_ACCESS_CHECK: u32 = 1 << 5;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
@@ -452,6 +448,35 @@ fn load_library() -> Option<windows_sys::Win32::Foundation::HMODULE> {
   // SAFETY: as above, for the full path.
   let module = unsafe { LoadLibraryW(by_path.as_ptr()) };
   (!module.is_null()).then_some(module)
+}
+
+/// Format: the registry key and value Developer Mode sets (`AllowDevelopmentWithoutDevLicense`, 1 when on), which
+/// `CreateSymbolicLinkW`'s `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` requires (Microsoft Learn, CreateSymbolicLinkW).
+const DEVELOPER_MODE_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock";
+/// Format: see [`DEVELOPER_MODE_KEY`].
+const DEVELOPER_MODE_VALUE: &str = "AllowDevelopmentWithoutDevLicense";
+
+/// Whether Developer Mode is on (A-275), read at each symbolic link set, which is rare: a link may be made without
+/// `SeCreateSymbolicLinkPrivilege` while it is. An unreadable value is off.
+pub(crate) fn developer_mode() -> bool {
+  use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+  let key = wide(DEVELOPER_MODE_KEY);
+  let value = wide(DEVELOPER_MODE_VALUE);
+  let mut word = 0u32;
+  let mut bytes = u32::try_from(size_of::<u32>()).unwrap_or(0);
+  // SAFETY: `key` and `value` are NUL-terminated; `word` holds `bytes` bytes, the most the call writes.
+  let status = unsafe {
+    RegGetValueW(
+      HKEY_LOCAL_MACHINE,
+      key.as_ptr(),
+      value.as_ptr(),
+      RRF_RT_REG_DWORD,
+      std::ptr::null_mut(),
+      std::ptr::from_mut(&mut word).cast(),
+      &mut bytes,
+    )
+  };
+  status == 0 && word == 1
 }
 
 /// The install directory WinFsp's installer recorded (with its trailing separator), or `None`.

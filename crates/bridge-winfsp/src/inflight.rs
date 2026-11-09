@@ -50,6 +50,17 @@ const KIND_AT: usize = SIZE_AT + size_of::<u16>();
 const HINT_AT: usize = KIND_AT + size_of::<u32>();
 /// Format: the request union follows the common header; Create.AccessToken is 24 bytes into that union.
 const CREATE_TOKEN_AT: usize = HINT_AT + size_of::<u64>() + 24;
+/// Format: Create.CreateOptions opens the request union (`fsctl.h` v2.1: the disposition in its high 8 bits, the options
+/// in its low 24).
+const CREATE_OPTIONS_AT: usize = HINT_AT + size_of::<u64>();
+/// Format: Create's flag word (`UserMode:1` first) follows the token, `DesiredAccess`, `GrantedAccess`, `ShareAccess`
+/// (four bytes each) and the `Ea` buffer descriptor (four bytes) (`fsctl.h` v2.1).
+const CREATE_FLAGS_AT: usize = CREATE_TOKEN_AT + size_of::<u64>() + 4 * size_of::<u32>();
+/// Format: `UserMode`, bit 0 of Create's flag word: the request came from user mode.
+const CREATE_USER_MODE: u32 = 1;
+/// Format: `FILE_OPEN_REPARSE_POINT` (`ntioapi.h`), the create option that opens a reparse point itself, as
+/// `CreateSymbolicLinkW` opens the object it makes a link.
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// Format: IoStatus.Information precedes IoStatus.Status after the response's common header.
 const STATUS_AT: usize = HINT_AT + size_of::<u64>() + size_of::<u32>();
 /// Format: Create.Opened.UserContext2 follows the common 24-byte header and its UserContext word.
@@ -172,6 +183,18 @@ impl Request<'_> {
     }
     u32::try_from(read_u64(self.bytes, CREATE_TOKEN_AT)? >> u32::BITS).map_err(|_| Refusal::Length)
   }
+  /// Whether a Create opens a reparse point itself, from user mode (A-275): an open a symbolic link may be set through,
+  /// whose caller's privilege the receiver reads. False for every other request.
+  pub fn opens_reparse_point_from_user_mode(&self) -> Result<bool, Refusal> {
+    if self.kind != CREATE_KIND {
+      return Ok(false);
+    }
+    Ok(
+      read_u32(self.bytes, CREATE_OPTIONS_AT)? & FILE_OPEN_REPARSE_POINT != 0
+        && read_u32(self.bytes, CREATE_FLAGS_AT)? & CREATE_USER_MODE != 0,
+    )
+  }
+
   /// The borrowed Create token's process-local handle, valid only in the current receiver's fresh request.
   pub fn access_token(&self) -> Result<u32, Refusal> {
     if self.kind != CREATE_KIND {

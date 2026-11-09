@@ -14428,6 +14428,8 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     POSIX link brings, each stated in A-275: a link holds no data stream of its own (SYMLINK-DATA); a link POSIX made is
     a file link, whatever its target; and a link relative to the drive's root (`\x\y`) is kept relative to its own
     directory, so moved, it reaches what that path names from its new directory, where NTFS keeps it naming `\x\y`.
+    And who may make one is NTFS's rule judged by the drive, with one deviation: under Developer Mode it allows a
+    caller who did not pass `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, since that flag never reaches a file system.
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
 - **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
@@ -16266,21 +16268,41 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   a drive path; neither reaches what Linux meant, and Windows cannot name such a file in any case. Samba sends a
   relative target's `/` unchanged (`read_symlink_reparse`, `source3/smbd/files.c` 859-922); slates converts, since its
   drive is followed by WinFsp's resolver, which splits at `\` alone.
-- **3. Privilege: NTFS's rule.** Making a link asks for `SeCreateSymbolicLinkPrivilege`, unless Developer Mode's
-  unprivileged create applies (`CreateSymbolicLinkW` with `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Git for
-  Windows passes, `adjust_symlink_flags`; Microsoft Learn, CreateSymbolicLinkW). The user-mode drive never sees the
-  caller's token on an `FSCTL_SET_REPARSE_POINT`; WinFsp's driver does, and checks the privilege when the volume sets
-  `ReparsePointsAccessCheck` (`SeSinglePrivilegeCheck`, `src/sys/fsctl.c` 231-240, v2.1), refusing
-  `STATUS_PRIVILEGE_NOT_HELD` (`ERROR_PRIVILEGE_NOT_HELD`), NTFS's answer. The drive sets it (memfs, airfs and WinFsp's
-  FUSE layer leave it off, which would make the drive looser than NTFS). Measured on the runner
-  (`a_link_is_refused_to_a_caller_without_the_symlink_privilege`, `a_link_is_made_by_a_caller_holding_the_symlink_privilege`,
-  `a_link_is_made_without_the_privilege_under_developer_mode`): PENDING-PRIVILEGE. The daemon holds no privilege (R10).
+- **3. Privilege: NTFS's rule.** Making or removing a symbolic link asks for `SeCreateSymbolicLinkPrivilege`, unless
+  Developer Mode is on (Microsoft Learn, CreateSymbolicLinkW, `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Git
+  for Windows passes, `adjust_symlink_flags`). WinFsp's own check (`ReparsePointsAccessCheck`, `SeSinglePrivilegeCheck`
+  in `src/sys/fsctl.c` 231-240, v2.1) was measured refusing Developer Mode's unprivileged create: a token with no
+  privilege, the flag passed and Developer Mode on (`AllowDevelopmentWithoutDevLicense` 1), answered
+  `ERROR_PRIVILEGE_NOT_HELD` (diagnostics run 42712321599). memfs, airfs and WinFsp's FUSE layer leave the check off, which
+  would make the drive looser than NTFS. So the drive judges it:
+  - WinFsp passes the caller's token only on a Create (`Req.Create.AccessToken`; no FSCTL carries one). For a user-mode
+    Create that opens a reparse point itself (`FILE_OPEN_REPARSE_POINT`, as `CreateSymbolicLinkW` opens the object it
+    makes a link), the receiver reads the token's privileges while WinFsp keeps it live, and keeps the open as one that
+    may make a link if the token holds the privilege (`crate::dispatcher::may_link`; a set bounded by the open ledger's,
+    each member removed at its Close).
+  - A symbolic link's set or delete is allowed if its open was kept so, or if Developer Mode is on, read from the registry
+    at the set. Otherwise it answers `STATUS_PRIVILEGE_NOT_HELD`, which Windows reports as `ERROR_PRIVILEGE_NOT_HELD`,
+    NTFS's answer.
+  - Stated deviations from NTFS. (a) WinFsp never passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file
+    system, so under Developer Mode the drive allows a caller who did not pass it, where NTFS refuses it. (b) A token that
+    holds the privilege disabled is allowed, as its holder could enable it, where NTFS asks that it be enabled at the
+    set. (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT`, or through one a successor restored after
+    a takeover (which kept no token), is judged as one without the privilege: allowed under Developer Mode alone.
+  - Measured on the runner by `a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode` (`ERROR_PRIVILEGE_NOT_HELD`,
+    no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
+    `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag`: PENDING-PRIVILEGE. An NTFS control (the same token
+    and flag on the runner's own disk, Developer Mode on and off): PENDING-NTFS. The daemon holds no privilege (R10).
 - **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
   its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
   relative link (prefixed with the volume's name) and an absolute one alike (`src/sys/create.c` 893-996, v2.1), so the
   I/O manager reopens the new name under the caller's token and is never handed an `IO_REPARSE_TAG_SYMLINK` to evaluate.
   The drive is a local disk file system (`FILE_DEVICE_DISK_FILE_SYSTEM` without `FILE_REMOTE_DEVICE`,
-  `src/sys/volume.c`). Measured on the runner: PENDING-EVALUATION.
+  `src/sys/volume.c`); Windows reports it a "Fixed Drive" (`fsutil fsinfo drivetype`). Measured on the runner (diagnostics
+  run 42712321599): the evaluation classes are L2L and L2R enabled, R2L and R2R disabled; a drive link to
+  `\\localhost\C$\Windows\win.ini` is followed. With `fsutil behavior set SymlinkEvaluation L2R:0` (which `fsutil behavior
+  query` then reports DISABLED) the drive link was still followed, but so was the same link on the runner's NTFS, so the
+  setting did not take effect on the running system and the run cannot tell the drive from NTFS there; the reason the
+  drive would not apply it either is WinFsp's rewrite, read in its source above.
 - **The stored form's cost, and the format bump.** The directory bit lives in the inode's existing `u16`: no inode,
   wire, archive or layout change. But an earlier reader would drop the bit without a word and show a directory link as
   a file link, so the image (version 27) and the delta (version 10) are bumped, and a reader of another version refuses
@@ -16303,7 +16325,7 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   the three privilege tests and `a_link_relative_to_the_drives_root_follows_its_directory_when_moved`
   (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows
   runner; the first red on main, `ERROR_INVALID_FUNCTION` at the first `CreateSymbolicLinkW`, and red with the four
-  reparse callbacks removed: PENDING-RED), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
+  reparse callbacks removed, `Incorrect function.` at the first `CreateSymbolicLinkW`, diagnostics run 42712321599), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
   (`crates/bridge-core/tests/volume_bridge.rs`; on main the reply read 2 where 18 was set),
   `windows_attributes_survive_an_image_and_a_rebuild` (`crates/vfs/tests/recover.rs`; with the old image mask the
   rebuilt volume read 2, not 18), the version-refusal tests, the buffer's ten tests in `crates/bridge-winfsp/src/symlink.rs`

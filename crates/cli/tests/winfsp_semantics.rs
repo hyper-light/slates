@@ -865,28 +865,40 @@ fn developer_mode() -> bool {
   output.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("0x1"))
 }
 
-/// A-275 (who may make a link, NTFS's rule). Do: on the drive, as a caller whose token holds no privilege (a standard
-/// user without `SeCreateSymbolicLinkPrivilege`), make a file link with no flag. Expect `ERROR_PRIVILEGE_NOT_HELD`, as
-/// NTFS answers, and no link. Before A-275 set `ReparsePointsAccessCheck`, the drive made it.
+/// A-275 (who may make a link, NTFS's rule judged by the drive). Do: on the drive, as a caller whose token holds no
+/// privilege (a standard user without `SeCreateSymbolicLinkPrivilege`), make a file link with no flag. Expect, outside
+/// Developer Mode, `ERROR_PRIVILEGE_NOT_HELD`, as NTFS answers, and no link; under Developer Mode the link, A-275's
+/// stated deviation (the flag NTFS asks for there never reaches a file system, so the drive cannot ask for it).
 #[test]
-fn a_link_is_refused_to_a_caller_without_the_symlink_privilege() {
+fn a_link_by_a_caller_without_the_privilege_is_refused_outside_developer_mode() {
   if !live_mount_runs() {
     return;
   }
+  let developer = developer_mode();
   let drive = Drive::mount("refused");
   std::fs::write(drive.path("target.txt"), b"the target").unwrap();
   let made =
     without_privileges(|| create_symbolic_link(&drive.path("refused-link"), "target.txt", 0));
-  eprintln!("A-275 an unprivileged CreateSymbolicLinkW on the drive, no flag: {made:?}");
-  assert_eq!(
-    made,
-    Err(ERROR_PRIVILEGE_NOT_HELD),
-    "refused as NTFS refuses"
+  eprintln!(
+    "A-275 an unprivileged CreateSymbolicLinkW on the drive, no flag, Developer Mode {developer}: {made:?}"
   );
-  assert!(
-    std::fs::symlink_metadata(drive.path("refused-link")).is_err(),
-    "no link is left"
-  );
+  if developer {
+    assert_eq!(
+      made,
+      Ok(()),
+      "under Developer Mode the drive allows it (A-275's stated deviation)"
+    );
+  } else {
+    assert_eq!(
+      made,
+      Err(ERROR_PRIVILEGE_NOT_HELD),
+      "refused as NTFS refuses"
+    );
+    assert!(
+      std::fs::symlink_metadata(drive.path("refused-link")).is_err(),
+      "no link is left"
+    );
+  }
 }
 
 /// A-275 (who may make a link, NTFS's rule). Do: on the drive, as the test's own caller (an administrator, whose token
@@ -907,20 +919,18 @@ fn a_link_is_made_by_a_caller_holding_the_symlink_privilege() {
   );
 }
 
-/// A-275 (who may make a link, NTFS's rule). Do: with Developer Mode on, as a caller whose token holds no privilege, make
-/// a file link with `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, as Git for Windows passes it
-/// (`compat/mingw.c`, `adjust_symlink_flags`). Expect it made and followed, as on NTFS. Skips loudly where Developer
-/// Mode is off (CI's diagnostics run turns it on for this test).
+/// A-275 (who may make a link, NTFS's rule). Do: as a caller whose token holds no privilege, make a file link with
+/// `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, as Git for Windows passes it (`compat/mingw.c`,
+/// `adjust_symlink_flags`). Expect, under Developer Mode, the link made and followed, as on NTFS; outside it,
+/// `ERROR_PRIVILEGE_NOT_HELD`, as on NTFS. WinFsp's own check refused this under Developer Mode (diagnostics run
+/// 42712321599), which is why the drive judges it.
 #[test]
-fn a_link_is_made_without_the_privilege_under_developer_mode() {
+fn a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag() {
   use windows_sys::Win32::Storage::FileSystem::SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
   if !live_mount_runs() {
     return;
   }
-  if !developer_mode() {
-    eprintln!("SKIP: Developer Mode is off, so an unprivileged create is refused on NTFS too");
-    return;
-  }
+  let developer = developer_mode();
   let drive = Drive::mount("developer");
   std::fs::write(drive.path("target.txt"), b"the target").unwrap();
   let made = without_privileges(|| {
@@ -930,21 +940,80 @@ fn a_link_is_made_without_the_privilege_under_developer_mode() {
       SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
     )
   });
-  eprintln!("A-275 an unprivileged CreateSymbolicLinkW under Developer Mode: {made:?}");
-  assert_eq!(
-    made,
-    Ok(()),
-    "Developer Mode's unprivileged create is allowed, as on NTFS"
+  eprintln!(
+    "A-275 an unprivileged CreateSymbolicLinkW with the flag, Developer Mode {developer}: {made:?}"
   );
-  assert_eq!(
-    std::fs::read(drive.path("developer-link")).unwrap(),
-    b"the target"
-  );
+  if developer {
+    assert_eq!(
+      made,
+      Ok(()),
+      "Developer Mode's unprivileged create is allowed, as on NTFS"
+    );
+    assert_eq!(
+      std::fs::read(drive.path("developer-link")).unwrap(),
+      b"the target"
+    );
+  } else {
+    assert_eq!(
+      made,
+      Err(ERROR_PRIVILEGE_NOT_HELD),
+      "outside Developer Mode, refused as on NTFS"
+    );
+  }
 }
 
 /// Format: `FSCTL_SET_REPARSE_POINT` (winioctl.h): `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED,
 /// FILE_SPECIAL_ACCESS)`.
 const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+
+/// Enables `SeCreateSymbolicLinkPrivilege` in this process's token, as a program that sets a link's reparse buffer
+/// through `FSCTL_SET_REPARSE_POINT` itself must on NTFS: an administrator's token holds it disabled, and
+/// `CreateSymbolicLinkW` enables it for its own call.
+fn enable_link_privilege() {
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+  use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    SE_CREATE_SYMBOLIC_LINK_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
+  };
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+  let mut token: HANDLE = std::ptr::null_mut();
+  let mut luid = LUID::default();
+  // SAFETY: each call writes only the out-parameter it is given; the token handle opened here is closed below.
+  unsafe {
+    assert_ne!(
+      OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut token
+      ),
+      0
+    );
+    assert_ne!(
+      LookupPrivilegeValueW(std::ptr::null(), SE_CREATE_SYMBOLIC_LINK_NAME, &mut luid),
+      0
+    );
+    let enabled = TOKEN_PRIVILEGES {
+      PrivilegeCount: 1,
+      Privileges: [LUID_AND_ATTRIBUTES {
+        Luid: luid,
+        Attributes: SE_PRIVILEGE_ENABLED,
+      }],
+    };
+    assert_ne!(
+      AdjustTokenPrivileges(
+        token,
+        0,
+        &enabled,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut()
+      ),
+      0
+    );
+    CloseHandle(token);
+  }
+}
 
 /// Makes `path` a symbolic link relative to the drive's root (`rooted`, as `\x\y`) through `FSCTL_SET_REPARSE_POINT`, as
 /// a program that writes the reparse buffer itself does: `CreateSymbolicLinkW` turns a rooted target into an absolute
@@ -973,6 +1042,7 @@ fn set_root_relative_link(path: &str, rooted: &str) {
     .open(path)
     .unwrap();
   let mut returned = 0u32;
+  enable_link_privilege();
   // SAFETY: the handle is the open file's; the input is the live buffer of its stated length, and there is no output.
   let set = unsafe {
     windows_sys::Win32::System::IO::DeviceIoControl(
