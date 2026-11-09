@@ -11996,3 +11996,47 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
+
+## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
+
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+
+**Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
+
+**Command.** `cargo build --release --locked -p slates-client --example provision_bench`, run with no arguments and with `PROVISION_BENCH_SHARDS=2`. Diagnostics runs [diag-liveness-31](https://github.com/hyper-light/slates/actions/runs/42648540654) (windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-latest) and diag-liveness-32 (windows-11-arm), results pushed to `diag-results/liveness-31-<os>` and `liveness-32-windows-11-arm`. Main is 80be552a with this bench applied (2e435448). The A-223 arm is A-223 merged onto 80be552a (d0106bec). Each runner has 4 CPUs (macos-latest 3). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU. Three rounds per cell, the arms alternating. A paced cell has 9 runs (3 rounds of 3), a rest cell 3, a p99 cell 9 (3 rounds of the bench's 3 runs). Ranges are the lowest to the highest run.
+
+**Main, two shards, one client paced at 1 ms:**
+
+| runner | at rest, quiet | paced, quiet | paced, loaded | single-client p99, quiet |
+|---|---|---|---|---|
+| Windows x86_64 (windows-latest) | 0–5 | 34–71 | 742–754 | 40.3 µs–80.1 µs |
+| Windows arm64 (windows-11-arm) | 5–15 | 31–104 | 100–269 | 30.1 µs–70.0 µs |
+| Linux x86_64 (ubuntu-latest) | 1–3 | 1464–2024 | 936–1102 | 17.4 µs–22.4 µs |
+| Linux arm64 (ubuntu-24.04-arm) | 1–2 | 1773–2022 | 859–1111 | 22.3 µs–24.4 µs |
+| macOS arm64 (macos-latest) | 1 | 132–466 | 77–480 | 242.4 µs–1.1 ms |
+
+**Main at each runner's derived shard count:**
+
+| runner | shards | at rest, quiet | paced, quiet | paced, loaded |
+|---|---|---|---|---|
+| Windows x86_64 | 1 | 0–15 | 12–39 | 11–30 |
+| Windows arm64 | 3 | 0–5 | 88–176 | 104–1342 |
+| Linux x86_64 | 1 | 0–1 | 609–692 | 622–863 |
+| Linux arm64 | 3 | 1–2 | 1709–2545 | 1148–1420 |
+| macOS arm64 | 2 | 1 | 180–394 | 127–288 |
+
+**A-223 beside it, two shards:** the paced cost, quiet then loaded, main → A-223.
+
+| runner | paced, quiet | paced, loaded |
+|---|---|---|
+| Windows x86_64 | 34–71 → 191–493 | 742–754 → 756–778 |
+| Windows arm64 | 31–104 → 230–404 | 100–269 → 728–745 |
+| Linux x86_64 | 1464–2024 → 1466–2026 | 936–1102 → 971–1031 |
+| Linux arm64 | 1773–2022 → 1727–2022 | 859–1111 → 848–1206 |
+| macOS arm64 | 132–466 → 117–356 | 77–480 → 118–194 |
+
+**What it means.**
+- **Linux pays on main, and A-223 does not change it.** At two shards a 1 ms-paced client costs Linux x86_64 1,464 to 2,024 thousandths of a core and Linux arm64 1,773 to 2,022, against 0 to 3 at rest. The boot probe's wake was 5.9 to 7.3 µs, so the boot window (0.59 to 0.73 ms) is shorter than the pause. In the paced form, though, the owner shard (shard 1) parked 0 times per 1,000 creates in every round on both runners. Its live estimate had risen to 34 to 70 µs, making its window 3.4 to 7.0 ms. The other shard parked 0 to 819 times per 1,000 (`provision.parked_1 parks per 1000 creates`). The estimate feeding on its own spinning is the window rule's item (i).
+- **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
+- **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
+- **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
