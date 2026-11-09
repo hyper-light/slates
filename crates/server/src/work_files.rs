@@ -42,6 +42,8 @@ pub struct FetchedBase {
   pub page: Option<FetchedPage>,
   /// Every file of the base with its length, when asked for.
   pub sizes: Option<Vec<(String, u64)>>,
+  /// The base entries of the files asked for (`Green::path_base`), which the work keeps to compose its increment.
+  pub entries: BTreeMap<String, slates_merge::increment::Base>,
 }
 
 /// What a work changed since its base: per path, the file's bytes, or `None` for a file of the base it removed.

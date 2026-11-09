@@ -37,6 +37,10 @@ const WORKS: usize = 24;
 const FILE_BYTES: usize = 1024;
 /// Shape: the slot one work overwrites in a shared file.
 const SLOT_BYTES: usize = 8;
+/// Format: the counters of a work's increment composed on its own shard, and of one left to the green's owner.
+const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
+/// Format: see [`COMPOSED_ON_WORK`].
+const COMPOSED_BY_OWNER: &str = "merge.work.composed_by_owner";
 /// Format: the counter a work's shard moves for each verb it asked the green's owner to serve.
 const ASKED_THE_OWNER: &str = "merge.work.asked_owner";
 
@@ -161,18 +165,18 @@ fn a_greens_works_spread_over_shards_answer_as_they_do_on_one() {
     let (daemon, instance) = daemon(shards, tag);
     let mut client = connect(&instance);
     let said = history(&mut client);
-    let asked = daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get(ASKED_THE_OWNER)
-      .copied()
-      .unwrap_or(0);
+    let counts = daemon.refusals_on_every_shard().unwrap();
+    let asked = counts.get(ASKED_THE_OWNER).copied().unwrap_or(0);
+    let composed = (
+      counts.get(COMPOSED_ON_WORK).copied().unwrap_or(0),
+      counts.get(COMPOSED_BY_OWNER).copied().unwrap_or(0),
+    );
     drop(client);
     daemon.stop();
-    (said, asked)
+    (said, asked, composed)
   };
-  let (on_one, asked_on_one) = run(ONE_SHARD, "one");
-  let (on_many, asked_on_many) = run(MANY_SHARDS, "many");
+  let (on_one, asked_on_one, _) = run(ONE_SHARD, "one");
+  let (on_many, asked_on_many, (on_work, by_owner)) = run(MANY_SHARDS, "many");
   for (at, (one, many)) in on_one.iter().zip(&on_many).enumerate() {
     assert_eq!(one, many, "step {at} differs between one shard and many");
   }
@@ -181,6 +185,10 @@ fn a_greens_works_spread_over_shards_answer_as_they_do_on_one() {
   assert!(
     asked_on_many > 0,
     "the many-shard run is not vacuous: its works' shards asked the green's owner"
+  );
+  assert!(
+    on_work > 0 && by_owner == 0,
+    "every remote increment was composed on its work's shard: {on_work} there, {by_owner} left to the owner"
   );
 }
 

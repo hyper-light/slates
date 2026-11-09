@@ -5990,6 +5990,7 @@ fn create_work(
       files: crate::work_files::WorkFiles::default(),
       revision: 0,
       charged,
+      entries: std::collections::BTreeMap::new(),
     },
   );
   ReplyBody::WorkCreated {
@@ -6586,7 +6587,6 @@ fn build_increment(
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
-  let work_id = sealed.work;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
@@ -6598,10 +6598,40 @@ fn build_increment(
       green: to_wire_volume(green_id),
       version: base_version,
     })?;
+  // A work off this shard composed its own (A-247): the owner only judges it.
+  if let Some(composed) = &sealed.composed {
+    return Ok((green_id, composed.clone()));
+  }
   // Only the base entries the journal names (`Green::base_for`): the deriver reads nothing else, and the
   // whole base cloned every path's name on every submit.
   let base = engine.base_for(base_version, &sealed.journal);
-  let (doc, plan) = match slates_merge::increment::compose_volume_planned(&base, &sealed.journal) {
+  let files_base = crate::work_files::Base {
+    green: Some(engine),
+    fetched: None,
+    version: base_version,
+  };
+  let inc = compose_increment(
+    (sealed.work, base_version),
+    &base,
+    (&sealed.files, files_base),
+    &sealed.journal,
+    evidence,
+  )?;
+  Ok((green_id, inc))
+}
+
+/// Composes a work's increment over `base`, the restricted base of its journal at `base_version` (§4.16): the ops
+/// document, the post-state assembled from the work's files over `files_base`, and the identity. The owner's shard and
+/// a work's own shard (A-247, from the entries it fetched, `Base::for_names`) compose by this one function, so the
+/// increment is the same byte for byte wherever it is composed.
+pub(crate) fn compose_increment(
+  (work_id, base_version): (DbVolumeId, u64),
+  base: &slates_merge::increment::Base,
+  (files, files_base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+  evidence: Vec<[u8; 32]>,
+) -> Result<slates_merge::engine::Increment, Refusal> {
+  let (doc, plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
     Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
@@ -6609,18 +6639,7 @@ fn build_increment(
       });
     }
   };
-  let post_state = assemble_post_state(
-    (&doc, &plan),
-    (
-      &sealed.files,
-      crate::work_files::Base {
-        green: Some(engine),
-        fetched: None,
-        version: base_version,
-      },
-    ),
-    &sealed.journal,
-  );
+  let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
   // retry of this work's increment. Without them, a second work's identical edit from the same base was
@@ -6634,16 +6653,13 @@ fn build_increment(
   hasher.update(&doc.encode());
   hasher.update(&post_state);
   let id = *hasher.finalize().as_bytes();
-  Ok((
-    green_id,
-    slates_merge::engine::Increment {
-      id,
-      base: base_version,
-      doc,
-      post_state,
-      evidence,
-    },
-  ))
+  Ok(slates_merge::engine::Increment {
+    id,
+    base: base_version,
+    doc,
+    post_state,
+    evidence,
+  })
 }
 
 /// The conflict windows of a merge outcome, as the wire's [`MergeWindow`](slates_ipc::protocol::MergeWindow)s.
@@ -6671,6 +6687,7 @@ fn take_sealed(state: &mut ShardState, work: DbVolumeId) -> Option<crate::work_h
     base_version: w.base_version,
     journal: std::mem::take(&mut w.journal),
     files: std::mem::take(&mut w.files),
+    composed: None,
   })
 }
 
@@ -7040,6 +7057,8 @@ fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64
   w.base_version = version;
   w.journal.clear();
   w.files.clear();
+  // The entries were the old base's (A-247).
+  w.entries.clear();
   w.revision = w.revision.wrapping_add(1);
   // The recount of what it now keeps: nothing, so the charge only falls and cannot be refused.
   let kept = crate::work_charge::footprint(&w.files, &w.journal);
@@ -7166,6 +7185,7 @@ fn settle_rebase(
     w.files = changed;
     w.base_version = version;
     w.journal = journal;
+    w.entries.clear();
     w.revision = w.revision.wrapping_add(1);
   }
   // The work's base rose, so the reachable floor may have: the owner's floor moves, folds the green's histories to it
@@ -7232,6 +7252,10 @@ pub(crate) fn owner_files(
       .content_ref_at(path, version)
       .map(std::borrow::Cow::into_owned);
     fetched.files.insert(path.clone(), file);
+    // With the path's base entries, so the work composes its increment itself (A-247).
+    fetched
+      .entries
+      .insert(path.clone(), engine.path_base(version, path));
   }
   fetched
 }
@@ -11582,6 +11606,7 @@ fn install_rebuilt_work(
       files,
       revision: 0,
       charged,
+      entries: std::collections::BTreeMap::new(),
     },
   );
 }

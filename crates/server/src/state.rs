@@ -986,6 +986,10 @@ pub struct WorkState {
   /// The bytes this work is charged against the shard's budget: its content's and journal's footprint
   /// (`crate::work_charge`), released when it shrinks, resets or is destroyed.
   pub charged: u64,
+  /// The base entries of the paths the work fetched (A-247), each as `Green::path_base` gave it at the work's base
+  /// version, so the work composes its increment off its green's shard (`Base::for_names`). Cleared with the base;
+  /// charged with the work.
+  pub entries: std::collections::BTreeMap<String, slates_merge::increment::Base>,
 }
 
 /// A reply waiting to be written into a client's ring.

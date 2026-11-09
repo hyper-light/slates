@@ -62,6 +62,13 @@ pub(crate) const PENDING_SETTLED_FIRST: &str = "merge.work.pending_settled_first
 const PENDING_STUCK: &str = "merge.work.pending_stuck";
 /// Format: a pending submit whose request could not be decoded; the work's verbs then run as though it had none.
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
+/// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
+pub(crate) const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
+/// Format: a work's increment left to its green's owner to compose: its journal names a base it could not assemble, or
+/// does not compose (the owner then refuses it, typed).
+const COMPOSED_BY_OWNER: &str = "merge.work.composed_by_owner";
+/// Format: base entries a work fetched and could not keep, its charge refused; the verb is refused `BudgetExceeded`.
+const ENTRIES_REFUSED: &str = "merge.work.entries_refused";
 /// Format: a verb refused because the shard's parked verbs are at their bound.
 const PARK_FULL: &str = "merge.work.park_full";
 /// Format: an ask of the green's owner unanswered within its deadline; the verb answers `Overloaded` and is retried.
@@ -82,6 +89,9 @@ pub(crate) struct SealedWork {
   pub(crate) journal: Vec<VolumeOp>,
   /// The files it changed.
   pub(crate) files: WorkFiles,
+  /// The increment composed from them on the work's shard, when it was (A-247): the owner then only judges it, and the
+  /// journal and files are not sent.
+  pub(crate) composed: Option<slates_merge::engine::Increment>,
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
@@ -279,13 +289,29 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
     }
     | RequestBody::Status { .. } => (!fetched).then_some(Need::Sizes),
     RequestBody::Declare { op, .. } => declare_need(fetched, op),
-    RequestBody::Submit { evidence, .. } => home.verdict.is_none().then(|| Need::Verdict {
-      evidence: evidence.clone(),
-      sealed: seal(state, work),
-    }),
-    RequestBody::Rebase { .. } => home.rebased.is_none().then(|| Need::Rebase {
-      sealed: seal(state, work),
-    }),
+    RequestBody::Submit { evidence, .. } => {
+      if home.verdict.is_some() {
+        return None;
+      }
+      let sealed = seal(state, work);
+      Some(
+        base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
+          evidence: evidence.clone(),
+          sealed: composed(state, sealed, evidence.clone()),
+        }),
+      )
+    }
+    RequestBody::Rebase { .. } => {
+      if home.rebased.is_some() {
+        return None;
+      }
+      let sealed = seal(state, work);
+      Some(
+        base_missing(state, &sealed).unwrap_or_else(|| Need::Rebase {
+          sealed: composed(state, sealed, Vec::new()),
+        }),
+      )
+    }
     RequestBody::EditSubmit {
       path,
       at,
@@ -300,9 +326,11 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       if home.verdict.is_some() {
         return None;
       }
-      sealed_with_edit(state, work, (path, *at, *delete_len, insert)).map(|sealed| Need::Verdict {
-        evidence: evidence.clone(),
-        sealed,
+      sealed_with_edit(state, work, (path, *at, *delete_len, insert)).map(|sealed| {
+        base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
+          evidence: evidence.clone(),
+          sealed: composed(state, sealed, evidence.clone()),
+        })
       })
     }
     _ => None,
@@ -338,6 +366,65 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
   }
 }
 
+/// The paths a sealed work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
+/// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of. `None` when it has
+/// all it needs, and after this verb's fetch.
+fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
+  if state.work_home.fetched.is_some() {
+    return None;
+  }
+  let w = state.works.get(&sealed.work)?;
+  let named: std::collections::BTreeSet<&str> = sealed
+    .journal
+    .iter()
+    .flat_map(VolumeOp::names)
+    .flatten()
+    .collect();
+  let missing: Vec<String> = named
+    .into_iter()
+    .filter(|path| !w.entries.contains_key(*path) || !sealed.files.holds(path))
+    .map(str::to_owned)
+    .collect();
+  (!missing.is_empty()).then_some(Need::Files(missing))
+}
+
+/// `sealed` with its increment composed on this shard, from the entries the work fetched and its files (over the bytes
+/// this verb fetched, for a file it does not hold), and its journal and files left behind: the owner only judges it.
+/// Composed by the function the owner composes by (`verbs::compose_increment`), so the increment is the same.
+fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>) -> SealedWork {
+  let Some(w) = state.works.get(&sealed.work) else {
+    return sealed;
+  };
+  let named: std::collections::BTreeSet<&str> = sealed
+    .journal
+    .iter()
+    .flat_map(VolumeOp::names)
+    .flatten()
+    .collect();
+  let Some(base) = slates_merge::increment::Base::for_names(&named, &w.entries) else {
+    return sealed;
+  };
+  let files_base = Base {
+    green: None,
+    fetched: state.work_home.fetched.as_ref(),
+    version: sealed.base_version,
+  };
+  let Ok(inc) = crate::verbs::compose_increment(
+    (sealed.work, sealed.base_version),
+    &base,
+    (&sealed.files, files_base),
+    &sealed.journal,
+    evidence,
+  ) else {
+    // A journal that does not compose is the owner's to refuse, typed, as it always was.
+    return sealed;
+  };
+  sealed.composed = Some(inc);
+  sealed.journal = Vec::new();
+  sealed.files = WorkFiles::default();
+  sealed
+}
+
 /// A copy of the work as it now stands, for the owner. A copy, not a move: an ask can go unanswered, and the work must
 /// still be whole when it does.
 fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
@@ -348,6 +435,7 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     base_version: w.map_or(0, |w| w.base_version),
     journal: w.map(|w| w.journal.clone()).unwrap_or_default(),
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
+    composed: None,
   }
 }
 
@@ -737,6 +825,16 @@ fn start_ask(
   let Some(need) = need else {
     return true;
   };
+  if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = &need {
+    state.count(
+      if sealed.composed.is_some() {
+        COMPOSED_ON_WORK
+      } else {
+        COMPOSED_BY_OWNER
+      },
+      1,
+    );
+  }
   let green = match &need {
     Need::Verdict { sealed, .. } | Need::Rebase { sealed } => sealed.green,
     Need::Admit { green, .. } => *green,
@@ -1089,13 +1187,14 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     {
       state.work_home.settling.push(verb_key);
     }
+    let refused = keep_entries(state, work, fetched.as_ref());
     let home = &mut state.work_home;
     home.fetched = fetched;
     home.verdict = verdict;
     home.rebased = rebased;
     home.admitted = admitted;
     home.resuming = Some(work);
-    crate::lease_wait::run_resumed(state, verb, None, None);
+    crate::lease_wait::run_resumed(state, verb, refused, None);
     let home = &mut state.work_home;
     home.resuming = None;
     home.fetched = None;
@@ -1103,6 +1202,37 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.rebased = None;
     home.admitted = None;
   }
+}
+
+/// Keeps the base entries a verb fetched with the work (A-247), charged as the work's: the refusal its verb answers when
+/// the budget cannot hold them.
+fn keep_entries(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  fetched: Option<&FetchedBase>,
+) -> Option<ReplyBody> {
+  let fetched = fetched?;
+  let new: Vec<(String, slates_merge::increment::Base)> = {
+    let w = state.works.get(&work)?;
+    fetched
+      .entries
+      .iter()
+      .filter(|(path, _)| !w.entries.contains_key(*path))
+      .map(|(path, base)| (path.clone(), base.clone()))
+      .collect()
+  };
+  let bytes: u64 = new
+    .iter()
+    .map(|(path, base)| crate::work_charge::base_footprint(path, base))
+    .fold(0, u64::saturating_add);
+  if let Err(available) = crate::work_charge::grow(state, work, bytes) {
+    state.count(ENTRIES_REFUSED, 1);
+    return Some(crate::verbs::refused(Refusal::BudgetExceeded { available }));
+  }
+  if let Some(w) = state.works.get_mut(&work) {
+    w.entries.extend(new);
+  }
+  None
 }
 
 /// Tells the green's owner, once the verb's transaction has committed, that `work` now holds version `base`

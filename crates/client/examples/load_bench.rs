@@ -1881,6 +1881,19 @@ fn report_losses(client: &mut Client) {
       .sum();
     println!("lost\t{name}\t{count}");
   }
+  for name in [
+    "merge.work.composed_on_work",
+    "merge.work.composed_by_owner",
+  ] {
+    let count: u64 = report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|refusal| refusal.kind == name)
+      .map(|refusal| refusal.count)
+      .sum();
+    println!("counter\t{name}\t{count}");
+  }
 }
 
 fn main() {

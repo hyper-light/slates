@@ -23,6 +23,40 @@ pub(crate) fn file_footprint(path: &str, bytes: usize) -> u64 {
   u64::try_from(path.len().saturating_add(bytes)).unwrap_or(u64::MAX)
 }
 
+/// The footprint of one path's base entries a work keeps (A-247): the path and every name, target and value they hold.
+pub(crate) fn base_footprint(path: &str, base: &slates_merge::increment::Base) -> u64 {
+  let strings = base
+    .files
+    .iter()
+    .map(|(p, _)| p.len().saturating_add(8))
+    .chain(base.dirs.iter().map(String::len))
+    .chain(base.modes.iter().map(|(p, _)| p.len().saturating_add(4)))
+    .chain(
+      base
+        .symlinks
+        .iter()
+        .map(|(p, t)| p.len().saturating_add(t.len())),
+    )
+    .chain(
+      base
+        .xattrs
+        .iter()
+        .map(|(p, n, v)| p.len().saturating_add(n.len()).saturating_add(v.len())),
+    )
+    .chain(
+      base
+        .hardlinks
+        .iter()
+        .map(|(p, t)| p.len().saturating_add(t.len())),
+    )
+    .chain(base.specials.iter().map(|(p, _)| {
+      p.len()
+        .saturating_add(std::mem::size_of::<slates_merge::special::SpecialNode>())
+    }))
+    .fold(path.len(), usize::saturating_add);
+  u64::try_from(strings).unwrap_or(u64::MAX)
+}
+
 /// The footprint of journal operations: each one's size and heap.
 pub(crate) fn journal_footprint(journal: &[VolumeOp]) -> u64 {
   journal
