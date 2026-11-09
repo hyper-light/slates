@@ -1,0 +1,132 @@
+# DIAG, not for main: a plain kind cluster's pod network, UDP and TCP across and within nodes and DNS, on ubuntu-24.04
+# against ubuntu-latest (26.04), with what each image runs (docker, nftables, iptables in the node, AppArmor, sysctls).
+name: DIAG kind pod network, 24.04 against 26.04 (not for main)
+'on':
+  push:
+    branches:
+    - diag-release-11
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  DOWNLOAD_RETRIES: '20'
+  DOWNLOAD_RETRY_SECONDS: '60'
+  DOWNLOAD_TRY_SECONDS: '120'
+  KIND_URL: https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_URL: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+  KUBECTL_SHA256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
+jobs:
+  probe:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-24.04
+          label: '2404'
+        - runner: ubuntu-latest
+          label: latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install kind and kubectl
+      id: kind_tools
+      timeout-minutes: 45
+      run: "set -euo pipefail\nbin=\"$RUNNER_TEMP/kind-tools\"\nmkdir -p \"$bin\"\nfetch() {\n  curl --fail --silent --show-error --location --retry \"$DOWNLOAD_RETRIES\" --retry-delay \"$DOWNLOAD_RETRY_SECONDS\" \\\n    --retry-all-errors --max-time \"$DOWNLOAD_TRY_SECONDS\" --output \"$2\" \"$1\" \\\n    || { echo \"::error::could not download $1 after $DOWNLOAD_RETRIES retries; the KIND lane needs it, so the job stops here\"; exit 1; }\n}\nfetch \"$KIND_URL\" \"$bin/kind\"\necho \"$KIND_SHA256  $bin/kind\" | sha256sum -c -\nfetch \"$KUBECTL_URL\" \"$bin/kubectl\"\necho \"$KUBECTL_SHA256  $bin/kubectl\" | sha256sum -c -\nchmod +x \"$bin/kind\" \"$bin/kubectl\"\necho \"$bin\" >> \"$GITHUB_PATH\"\n"
+    - name: Probe the kind pod network
+      shell: bash
+      run: 'set -u
+
+        out="$RUNNER_TEMP/summary.txt"; : > "$out"
+
+        say() { echo "$@" | tee -a "$out"; }
+
+        run() { say "\$ $*"; "$@" 2>&1 | head -${N:-40} | tee -a "$out"; }
+
+        say "image: $ImageOS $ImageVersion; kernel $(uname -r); $(. /etc/os-release; echo $PRETTY_NAME)"
+
+        run docker version --format ''docker {{.Server.Version}} containerd {{range .Server.Components}}{{.Name}}={{.Version}} {{end}}''
+
+        N=60 run docker info
+
+        run sudo sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables
+
+        run lsmod
+
+        N=15 run sudo aa-status
+
+        run iptables -V
+
+        N=80 run sudo nft list ruleset
+
+        cat > "$RUNNER_TEMP/kind.yaml" <<''K''
+
+        kind: Cluster
+
+        apiVersion: kind.x-k8s.io/v1alpha4
+
+        nodes:
+
+        - role: control-plane
+
+        - role: worker
+
+        - role: worker
+
+        K
+
+        N=30 run kind create cluster --name probe --config "$RUNNER_TEMP/kind.yaml" --wait 180s
+
+        N=20 run kubectl get nodes -o wide
+
+        for n in probe-worker probe-worker2; do N=8 run docker exec $n sh -c ''iptables -V; ls -l /usr/sbin/iptables; uname -r''; done
+
+        N=60 run docker exec probe-worker sh -c ''iptables-save | head -60''
+
+        N=40 run docker exec probe-worker sh -c ''nft list ruleset 2>&1 | head -40''
+
+        pod() { kubectl run "$1" --image=busybox:1.36 --restart=Never --overrides="{\"spec\":{\"nodeName\":\"$2\"}}" -- sh -c "$3" >/dev/null; }
+
+        pod listen-a probe-worker ''nc -lu -p 7000 -w 60 | head -c 64; echo; echo done''
+
+        pod listen-t probe-worker ''nc -l -p 7001 -w 60 | head -c 64; echo; echo done''
+
+        kubectl wait --for=condition=Ready pod/listen-a pod/listen-t --timeout=120s >/dev/null 2>&1
+
+        ipa=$(kubectl get pod listen-a -o jsonpath=''{.status.podIP}''); ipt=$(kubectl get pod listen-t -o jsonpath=''{.status.podIP}'')
+
+        say "listener IPs udp=$ipa tcp=$ipt"
+
+        pod send-cross probe-worker2 "for i in 1 2 3 4 5; do echo udp-cross-node-\$i | nc -u -w1 $ipa 7000; sleep 1; done; echo tcp-cross | nc -w3 $ipt 7001; nslookup kubernetes.default.svc.cluster.local; echo sent"
+
+        pod send-same probe-worker "for i in 1 2 3; do echo udp-same-node-\$i | nc -u -w1 $ipa 7000; sleep 1; done; echo sent"
+
+        kubectl wait --for=jsonpath=''{.status.phase}''=Succeeded pod/send-cross pod/send-same --timeout=120s >/dev/null 2>&1
+
+        sleep 5
+
+        for p in send-cross send-same listen-a listen-t; do say "--- logs $p ($(kubectl get pod $p -o jsonpath=''{.status.phase}''))"; N=20 run kubectl logs $p; done
+
+        N=30 run kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=15
+
+        N=30 run kubectl -n kube-system logs -l app=kindnet --tail=15
+
+        N=20 run sudo dmesg -T
+
+        '
+    - name: Publish
+      if: always()
+      shell: bash
+      run: 'git config user.name diag-release; git config user.email diag-release@users.noreply.github.com
+
+        blob=$(git hash-object -w "$RUNNER_TEMP/summary.txt"); tree=$(printf "100644 blob %s\tsummary.txt\n" "$blob" | git mktree)
+
+        c=$(echo "results of run ${{ github.run_id }} on ${{ matrix.runner }}" | git commit-tree "$tree")
+
+        git push origin "$c:refs/heads/diag-results/release-11-${{ matrix.label }}"
+
+        '
