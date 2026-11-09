@@ -502,6 +502,20 @@
 >   unmount is skipped for it), so it answers `ENOTCONN` until someone unmounts it (from reading the code, not yet run);
 >   and the Python and Node SDKs' listings carry neither `live_shipped` nor `not_recovered`.
 
+> **Ubuntu 26.04 confines `fusermount3`, so a Linux `slates mount` reaches only some directories (found 2026-11-09,
+> slabs; a product limit, recorded for users in `docs/cli.md`).** Main's live-guest lane failed at its first `slates mount`
+> on the ubuntu-26.04 runner image, 8 of 8 in `guest_vhost` (runs 42669607818, 42678193238, 42688024228; it passed on
+> 24.04, run 42651321466): "fusermount3: mount failed: Permission denied". Measured (diag-slabs-51, run 42695696906):
+> the image ships `/etc/apparmor.d/fusermount3` in enforce mode, attached to `/usr/bin/fusermount3`, whose mount and
+> umount rules allow FUSE file systems only under `@{HOME}/**`, `/mnt/**`, `/run/user/@{uid}/**`, `/media/**`, `/tmp/**`
+> and `/cvmfs/**`. The kernel applies it to the container's own `fusermount3` too, under `apparmor=unconfined`
+> (`apparmor="DENIED" operation="umount" profile="fusermount3" name="/src/target/tmp/c/"`, while `/tmp` and `/mnt` passed),
+> and the lane's mount points were in `/src/target/tmp`. The host FUSE lanes pass because the checkout is under the
+> runner's home. **The lane:** the two FUSE steps bind the workspace at `/mnt/src`, so the rig's build-output mount
+> points (A-50) lie under `/mnt`. **For users:** on such a host `slates mount` and `slates unmount` work only under
+> those directories unless an administrator extends `/etc/apparmor.d/local/fusermount3`. Owed: the lane's run at
+> this change (no CI run of it yet).
+
 > **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): built on Linux, Windows and
 > macOS.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused typed
 > (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount this
