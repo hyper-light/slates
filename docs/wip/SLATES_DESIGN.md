@@ -16718,6 +16718,13 @@ backslashes), `crates/server/src/landing.rs` (no Unix gate; the delegation recal
   `crates/land/tests/os_seam_windows.rs` calls each verb directly on a name that exists and on a real junction, since
   with an entry's open following junctions, or a temporary's create overwriting, the landing suites still passed.
   arm64 Windows runs what x86_64 runs. Not held by any test: a flush reaching the device, which would take a power cut.
+- **A-227 on the Windows writer, ported onto `4811191a`, 2026-11-09**
+  (`docs/bugs/2026-11-09-the-windows-writer-walked-its-own-drive-before-a-227-looked.md`): the writer's walk
+  (`slates_base::walk_dir`) opened each component of its target from the drive's root, and A-227's drive check ran only
+  afterwards, in `OsHost::open_root`. Now `walk_dir` runs the base's own check (`check_root_volume`: the drive named by
+  `QueryDosDeviceW`, never the volume) before any open, and the writer answers `TargetRefusal::OwnMount`, which the
+  server reports as `Refusal::OwnMount` for a `LandingTarget`, as on Unix. Held by
+  `a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open` (`crates/cli/tests/winfsp.rs`).
 
 ### A-181 — `slates shards` on Windows starts its command holding the stream end as a named handle, and waits for it (accepted 2026-10-26)
 Applied in the same change to: §4.6 (the Shards form's Windows status), GAPS, `crates/ipc` (`win_spawn.rs`, new: the

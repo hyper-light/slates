@@ -466,8 +466,7 @@ jobs:
       # had never been compiled for Windows — which is where §4.6's DAX suite lives, with its paired `#[cfg]`
       # arms and its `huge_page_bytes` probe that answers `None` off Linux. Cross-linted clean against
       # `x86_64-pc-windows-gnu` before being added here. **`slates-mcp` joined on 2026-10-26** with its HTTP edge on Windows
-      # (A-183); its test runs here once landing does, since `slates.land.materialize` answers `Unsupported` on Windows
-      # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
+      # (A-183); its test runs here since landing does (A-185), as "Test the MCP server". **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
       # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
@@ -612,6 +611,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test presentation -- --test-threads=1
+      # The MCP server over a real daemon: its materialize plans a landing and never writes without a grant (R10).
+      - name: Test the MCP server (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp -- --test-threads=1
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -968,6 +972,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test presentation -- --test-threads=1
+      - name: Test the MCP server (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp -- --test-threads=1
       # A-205: as on x86_64, the pages of a deleted file leave the working set.
       - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
         if: ${{ !cancelled() }}

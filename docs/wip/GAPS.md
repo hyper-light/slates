@@ -14195,7 +14195,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   gives a renamed file the creation time of the name's last holder (the move check sets the birth time aside on Windows);
   an elevated token owned nothing it made (`docs/bugs/2026-11-06-an-elevated-token-owned-nothing-it-made.md`). **Owed:**
   a symbolic link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one); a reflink
-  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS). A flush reaching the device is held by no test, as on Unix.
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS). A flush reaching the device is held by no test, as on Unix. A-227 holds on
+  Windows too: a landing target on the daemon's own drive is refused `OwnMount` before the writer's walk opens anything
+  (2026-11-09). CI's Windows lanes run `slates-mcp`'s test, which waited on landing there.
+- **Reported, not changed (2026-11-09):**
+  - `crates/cli/src/dumps.rs`'s unit test calls `rustix::process`, configured out on Windows, so
+    `cargo clippy -p slates-cli --tests` cannot build there; CI names the binary and its test targets only.
+  - `a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open` (`crates/cli/tests/cli.rs`, Unix)
+    checks only that the error names `OwnMount`, which a `TargetUnavailable` whose reason names the host's refusal also
+    does; its Windows twin checks for `LandingTarget` and no `TargetUnavailable`.
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
