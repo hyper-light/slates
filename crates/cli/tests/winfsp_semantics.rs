@@ -576,3 +576,55 @@ fn a_file_shrunk_then_extended_by_zero_writes_reaches_the_size() {
     "the extension reads as zeros"
   );
 }
+
+/// A-262, `t/base/01.t` and `07.t`. Do: create a file on the drive with `FILE_ATTRIBUTE_HIDDEN`, read its attributes,
+/// mark it read-only (`SetFileAttributes` through `set_permissions`), try to delete it, clear its read-only state and
+/// delete it. Expect: the file reports `HIDDEN | ARCHIVE` (kept, and archived as NTFS marks a new file), then
+/// `READONLY` beside them; its delete is refused `ERROR_ACCESS_DENIED` while read-only; once cleared it deletes. Before,
+/// every file reported `NORMAL` and a read-only file deleted.
+#[test]
+fn a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete() {
+  use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+  /// Format: `FILE_ATTRIBUTE_READONLY`, `HIDDEN`, `ARCHIVE` and `NORMAL`.
+  const READONLY: u32 = 0x1;
+  const HIDDEN: u32 = 0x2;
+  const ARCHIVE: u32 = 0x20;
+  const NORMAL: u32 = 0x80;
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("attributes");
+  let path = drive.path("kept.txt");
+  drop(
+    std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .attributes(HIDDEN)
+      .open(&path)
+      .unwrap(),
+  );
+  let attributes = || std::fs::metadata(&path).unwrap().file_attributes();
+  assert_eq!(
+    attributes() & (READONLY | HIDDEN | ARCHIVE | NORMAL),
+    HIDDEN | ARCHIVE,
+    "a file created hidden is kept hidden, and archived"
+  );
+  let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+  permissions.set_readonly(true);
+  std::fs::set_permissions(&path, permissions.clone()).unwrap();
+  assert_eq!(
+    attributes() & (READONLY | HIDDEN | ARCHIVE),
+    READONLY | HIDDEN | ARCHIVE,
+    "read-only beside the kept bits"
+  );
+  assert_eq!(
+    std::fs::remove_file(&path).unwrap_err().raw_os_error(),
+    Some(ERROR_ACCESS_DENIED),
+    "a read-only file refuses its delete"
+  );
+  // On Windows this clears `FILE_ATTRIBUTE_READONLY` alone; the lint's world-writable mode is Unix's.
+  #[allow(clippy::permissions_set_readonly_false)]
+  permissions.set_readonly(false);
+  std::fs::set_permissions(&path, permissions).unwrap();
+  std::fs::remove_file(&path).unwrap();
+}

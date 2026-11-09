@@ -1779,3 +1779,66 @@ fn a_session_grant_covers_the_next_landing() {
     .count();
   assert_eq!(finished, 2);
 }
+
+/// Sets the Windows attribute bits `bits` (a Win32 word) on the file at `path` through the overlay, as the WinFsp
+/// drive's `SetFileAttributes` does (A-262).
+fn set_windows_bits(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+  bits: u32,
+) {
+  let (dir, name) = split(path);
+  let d = common::dir_of(vol, host, store, dir);
+  let mut o = vol.with_host(host);
+  let no = o.lookup(store, d, name).unwrap().inode;
+  o.set_windows_attributes(
+    store,
+    no,
+    slates_vfs::inode::WindowsAttributes::kept(bits, slates_vfs::inode::Kind::File),
+  )
+  .unwrap();
+}
+
+/// A-262, stage 1 (no landing applies the bits yet). Do: run §4.15's worked example twice over the same base, the second
+/// time with Windows attribute bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the
+/// work never otherwise touched. Expect: both landings are `Done` with nothing refused, and they leave the same disk,
+/// byte for byte and kind for kind: a landing carries the bits nowhere and fails on none of them.
+#[test]
+fn a_landing_ignores_windows_attribute_bits_without_error() {
+  let land = |with_bits: bool| {
+    let mut host = SimHost::new();
+    example_base(&mut host, 16);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    example_edits(&mut vol, &mut host, &mut store);
+    if with_bits {
+      for path in ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"] {
+        set_windows_bits(&mut vol, &mut host, &mut store, path, 0x2 | 0x4);
+      }
+    }
+    let target = root_target(&mut host);
+    let mut session = Session::new();
+    let mut setup = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    };
+    let report = setup.land(example_request(1)).unwrap();
+    assert_eq!(report.state, LandingState::Done, "{report:?}");
+    (disk(&host), report.written)
+  };
+  let (with_bits, written_with_bits) = land(true);
+  let (without, written_without) = land(false);
+  assert_eq!(
+    with_bits, without,
+    "the bits change nothing a landing writes, and refuse nothing"
+  );
+  assert_eq!(
+    written_with_bits, written_without,
+    "nor how many entries it writes ({written_without})"
+  );
+}
