@@ -1135,3 +1135,48 @@ fn generated_histories_answer_the_same_on_one_shard_and_on_many() {
   one_daemon.stop();
   many_daemon.stop();
 }
+
+/// A-247, the generated oracle's first find (2026-11-09): do, in a work off its green's shard, rename one base file over
+/// another, rebase, edit-and-submit an empty edit of a third, then submit two other works; on one shard and on eight.
+/// Expect: the same answers and the same green, as the oracle demands of every history.
+#[test]
+fn a_rename_rebased_then_submitted_off_the_owner_merges_as_on_it() {
+  let (one_daemon, one_instance) = daemon(ONE_SHARD, "rename-one");
+  let (many_daemon, many_instance) = daemon(MANY_SHARDS, "rename-many");
+  let history = [
+    Step::Rename {
+      slot: 3,
+      from: 1,
+      to: 3,
+    },
+    Step::Rebase { slot: 3 },
+    Step::EditAndSubmit {
+      slot: 3,
+      file: 2,
+      at: 5,
+      delete_len: 0,
+      bytes: Vec::new(),
+    },
+    Step::Submit { slot: 2 },
+    Step::Submit { slot: 1 },
+  ];
+  let mut said = Vec::new();
+  for (instance, tag) in [(&one_instance, "one"), (&many_instance, "many")] {
+    let mut side = Side {
+      client: connect(instance),
+      green: VolumeId::default(),
+      works: Vec::new(),
+    };
+    side.begin(&format!("rename-{tag}"));
+    let mut answers: Vec<String> = history
+      .iter()
+      .enumerate()
+      .map(|(at, step)| side.run(step, &format!("rename-{tag}-{at}")))
+      .collect();
+    answers.extend(side.head());
+    said.push(answers);
+  }
+  one_daemon.stop();
+  many_daemon.stop();
+  assert_eq!(said[0], said[1]);
+}
