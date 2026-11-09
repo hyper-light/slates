@@ -949,6 +949,20 @@
 > list and the analyzer are under `~/.cache/slates-agents-scratch/fixtures/rungs11-a228/` on adacachy
 > (`r3k-clean-a228.log`, `.samples`, `.units`, `analyze.py`).
 
+> **A capped unit on adacachy can be frozen: check before reading a stall as the product's (2026-11-09, fixtures).** A-228
+> step 5's two 3,000-client clean rungs on main `1ed67337` (`CPUWeight=1`, `capped3.sh` unit, 100 ms sampler) ran into
+> their 1,800 s bound having done 236 and 191 of 3,000 agents, and are recorded invalid (BENCHMARKS, "A-228 step 5"). In
+> about 98% of the samples every shard thread of all four daemons was in `do_freezer_trap`, a cgroup freezer's; the unit
+> used 127 s and 124 s of CPU over about 1,800 s at `cpu.pressure` about 0, and the run-queue wait per timeslice (0.11
+> ms) matched a healthy rung's (0.10 ms). What looked like the product's fault was the freezer's: a council RTT tail of
+> 46 s, a root RTT tail of 70 s, a session `pto` of 54 s on loopback, 18,645 `lease.refused.unconfirmed` on the primary
+> (855 on `rungs8/r3k-clean2`) and a replica whose status did not answer. Its own and every ancestor's `cgroup.freeze`
+> read 0 whenever looked at, so a measurement on adacachy reads the threads' `wchan` (or samples `cgroup.events`) through
+> the run before charging a stall to slates. Whether kiln's headroom pacing should freeze `app.slice` units is Ada's call.
+> The 0 wedged, starved, spinning and lapsed lines of both runs say nothing about A-228: a frozen fleet freezes its
+> watchdog too. Files: `~/.cache/slates-agents-scratch/fixtures/rungs12-a228/` on adacachy (`.log`, `.samples`, `.mon`,
+> `.stall`, `starve.py`, `wake.py`).
+
 > **A starved shard was judged wedged (found 2026-11-07 by fixtures, fixed 2026-11-08, A-228).** A shard held off its CPU
 > shows no CPU progress, as a blocked one does, so the watchdog withheld the beat and the anchor killed a live daemon. The
 > watchdog now asks the scheduler; a shard waiting for a CPU is `Starved` and goes on beating (§4.14 status). Linux reads

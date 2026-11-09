@@ -12257,3 +12257,22 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
+
+Recorded so no one reads them as a result. The command, per run: `bash rungs12-a228/run.sh` (and `run2.sh`) on adacachy
+(AMD Ryzen 9 9950X3D2, 32 CPUs, Linux 7.2.9-2-cachyos): a release build of main `1ed67337` with the harness's share fix
+(`agents/fixtures-load-scale-share`), then `load_scale.rs` at 3,000 clients, one client node, `--hot-files 2400
+--reply-patience 60 --per-connection 32 --think-us 0`, Linux v7.4-rc1 `kernel/`, in a `systemd-run --user` unit at
+`CPUWeight=1`, `Nice=19`, `CPUQuota=800%`, a quarter of available memory, with a 100 ms sampler of every shard thread's
+`/proc` state, `wchan` and `schedstat` outside the unit.
+
+| Run | Load 1 m min/median/max | Agents done at the 1,800 s bound | Unit CPU | Samples in `do_freezer_trap` | Run-queue wait / timeslice | Wedged / starved / spinning / lapsed |
+|---|---|---|---|---|---|---|
+| `r3k-clean` | 38.4 / 94.5 / 195.4 | 236 of 3,000 | 127 s | about 98% | 0.11 ms | 0 / 0 / 0 / 0 |
+| `r3k-clean-2` | 22.6 / 46.4 / 151.6 | 191 of 3,000 | 124 s | about 98% | 0.12 ms | 0 / 0 / 0 / 0 |
+
+Invalid: a cgroup freezer held the fleet, not the scheduler (GAPS, "A capped unit on adacachy can be frozen"). Neither
+reached its oracle, so neither has latencies. The healthy reference for the wait per timeslice is `rungs9/ab-clean-2`, 0.10
+ms. Step 5 is closed without a third run: A-228 stands on its own red and green evidence.
+
