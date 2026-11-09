@@ -1,0 +1,62 @@
+name: "DIAG slabs -- why fusermount3 refuses the live-guest lane's mount on the 26.04 runner image (not for main)"
+
+# Main's live-guest vhost-user job fails at its first `slates mount` on the ubuntu-26.04 runner image ("fusermount3:
+# mount failed: Permission denied") inside a container run with seccomp and AppArmor unconfined, SYS_ADMIN and
+# /dev/fuse. This measures where fusermount3 may mount, on the host as the runner's user and in the same container
+# setup as root, with the host's AppArmor state and kernel log beside each attempt. bindfs is the FUSE file system:
+# it mounts through fusermount3 as `slates mount` does. Output goes to a results branch named after the diag branch.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    name: fusermount3 on the runner image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set +e
+          try() { local where=$1; shift; echo "### $where: $*"; "$@" 2>&1; echo "### exit $?"; sudo dmesg 2>/dev/null | grep -i apparmor | tail -4; }
+          {
+            echo "## image: ${ImageOS:-?} ${ImageVersion:-?}"; grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release; uname -r
+            echo "## fusermount3"; ls -l /usr/bin/fusermount3; fusermount3 -V
+            echo "## aa-status"; sudo aa-status 2>&1 | head -60
+            echo "## profiles naming fusermount"; grep -rl fusermount /etc/apparmor.d 2>/dev/null
+            for f in $(grep -rl fusermount /etc/apparmor.d 2>/dev/null); do echo "#### $f"; cat "$f"; done
+            echo "## fuse.conf"; cat /etc/fuse.conf 2>&1 | grep -v '^#'
+            sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq bindfs >/dev/null 2>&1; echo "bindfs: $(command -v bindfs)"
+            echo "## host, as $(id -un)"
+            mkdir -p /tmp/x "$GITHUB_WORKSPACE/target/tmp/x"; sudo mkdir -p /srv/x; sudo chown "$(id -u):$(id -g)" /srv/x
+            for point in /tmp/x /srv/x "$GITHUB_WORKSPACE/target/tmp/x"; do
+              try "host $point" bindfs /etc "$point"
+              mountpoint -q "$point" && echo "mounted at $point" && fusermount3 -u "$point"
+            done
+            echo "## container (rust:1.98.1, the live-guest image's base), as root, with the lane's options"
+            docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+              --device /dev/fuse --cap-add SYS_ADMIN -v "$PWD":/src -w /src rust:1.98.1 sh -c '
+                apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq fuse3 bindfs >/dev/null 2>&1
+                cat /proc/self/attr/current 2>/dev/null; echo
+                for point in /src/target/tmp/c /tmp/c /mnt/c; do
+                  mkdir -p $point; echo "### container $point"; bindfs /etc $point 2>&1; echo "### exit $?"
+                  mountpoint -q $point && echo "mounted at $point" && fusermount3 -u $point
+                done' 2>&1
+            echo "## kernel log after the container"; sudo dmesg 2>/dev/null | grep -i apparmor | tail -12
+          } 2>&1 | tee own.txt
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w own.txt)
+          tree=$(printf '100644 blob %s\town.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+          exit 0
