@@ -619,6 +619,13 @@
 >   (`snapshot_cadence.rs`, red on CI run 42385009677;
 >   `docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`). The local 10k rung went from
 >   2,197 to 3,128 clients done in 900 s. Still owed: the snapshot is encoded whole on the committing shard's turn.
+>   **Its longest-tail test's approach (2026-11-09):** it predicted the next record from the last one, and a record
+>   preempted mid-commit measured 1 to 8 ms of a 10 ms budget on the loaded Mac, so the snapshot came first three times
+>   (main failed 3 of 6 at load 69 to 112 under two spinners a CPU). It now predicts from the largest record it has seen,
+>   an early snapshot's lower bound included: 6 of 6 at load 116 to 143, though at 135 and above the approach stopped
+>   after one record (`docs/bugs/2026-11-09-the-cadence-tests-approach-predicted-the-next-record-from-the-last.md`).
+>   Open, raft's: the trigger times replay work on the wall, so preemption counts as work; the thread's CPU time would
+>   remove the spikes from the trigger and the test alike.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
