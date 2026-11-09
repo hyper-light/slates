@@ -1,0 +1,57 @@
+name: "DIAG slabs -- owner_turn's refused barrier under repetition, which request takes the refusal (not for main)"
+
+# Runs crates/bridge-fuse/tests/owner_turn.rs, instrumented to name the request whose barrier it refused, 200 times
+# alone and 200 times beside CPU load on ubuntu-latest, and publishes each failure's diagnostic lines.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  race:
+    name: owner_turn repeated on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Repeat
+        shell: bash
+        timeout-minutes: 75
+        run: |
+          set +e
+          {
+            echo "## image: ${ImageOS:-?} ${ImageVersion:-?}"; uname -r; nproc
+            bin=$(cargo test --locked -p slates-bridge-fuse --test owner_turn --no-run --message-format=json 2>/dev/null | grep -o '"executable":"[^"]*owner_turn[^"]*"' | tail -1 | cut -d'"' -f4)
+            echo "binary: $bin"
+            for phase in alone loaded; do
+              busy=""
+              if [ "$phase" = loaded ]; then for i in $(seq "$(nproc)"); do ( while :; do :; done ) & busy="$busy $!"; done; fi
+              fails=0
+              for run in $(seq 200); do
+                out=$("$bin" --nocapture 2>&1)
+                if ! echo "$out" | grep -q "test result: ok"; then
+                  fails=$((fails+1)); echo "### $phase run $run failed"; echo "$out" | grep -E "owner_turn: refused|panicked|the refused barrier|SKIP" | head -6
+                elif [ "$run" -le 2 ]; then echo "### $phase run $run passed:"; echo "$out" | grep -E "owner_turn: refused|SKIP" | head -3; fi
+              done
+              [ -n "$busy" ] && kill $busy
+              echo "## $phase: $fails of 200 failed"
+            done
+          } 2>&1 | tee own.txt
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w own.txt); tree=$(printf '100644 blob %s\town.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+          exit 0
