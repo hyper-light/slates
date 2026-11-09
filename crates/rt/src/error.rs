@@ -19,6 +19,11 @@ pub enum RtError {
     /// The generation the id carried.
     generation: u32,
   },
+  /// A task asked to hold its shard alone while another task does (`ShardContext::spawn_alone`).
+  ShardHeld {
+    /// The slot of the task holding the shard.
+    slot: u32,
+  },
   /// The process has registered every shard id it may.
   TooManyShards {
     /// The bound.
@@ -91,6 +96,9 @@ impl fmt::Display for RtError {
       Self::TooManyTasks { capacity } => write!(f, "too many tasks: the arena holds {capacity}"),
       Self::StaleTask { slot, generation } => {
         write!(f, "stale task: slot {slot} generation {generation}")
+      }
+      Self::ShardHeld { slot } => {
+        write!(f, "the shard is held alone by the task in slot {slot}")
       }
       Self::TooManyShards { max } => write!(f, "too many shards: at most {max} per process"),
       Self::DriverRefused { call, code } => write!(f, "the OS refused {call} (code {code:?})"),
@@ -173,7 +181,8 @@ impl RtError {
       | Self::KeptInUse { .. }
       | Self::RingClaimed { .. }
       | Self::WorkerFailed { .. }
-      | Self::InterestsExhausted { .. } => ReceiveRefusal::SocketGone,
+      | Self::InterestsExhausted { .. }
+      | Self::ShardHeld { .. } => ReceiveRefusal::SocketGone,
     }
   }
 

@@ -1734,7 +1734,7 @@ fn a_surviving_attachments_references_are_restored_and_every_other_holders_relea
   )
   .unwrap();
   let settled = recovered
-    .settle_recovered_references(&mut fresh, |id| id == 42)
+    .settle_recovered_references(&mut fresh, |id| id == 42, &[])
     .unwrap();
   assert_eq!(
     settled,

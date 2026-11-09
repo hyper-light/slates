@@ -61,6 +61,10 @@ use crate::verbs::{
 /// rest of the daemon is a single line there and a single line at init.
 #[derive(Default)]
 pub struct MergeShardState {
+  /// On the control shard: the coordinator periods run so far (`crate::fleet`'s coordinator counts one a period). On
+  /// an owner shard: the period of the record plane's latest pass over it, which a version enqueued here is stamped
+  /// with (`PendingMergeRecord::first_period`).
+  pub coordinator_period: u64,
   /// The version each green attachment pins, by attachment id (§4.16 "Attachments and versions").
   pub attachments: BTreeMap<u64, PinnedAttachment>,
   /// The merge records this owner shard still owes its candidate holders, by green then version
@@ -653,20 +657,71 @@ pub(crate) fn walk_held_origin(
   state: &ShardState,
   held: &slates_db::partition::OriginRef,
 ) -> Result<Origin, Refusal> {
-  let handle = state
-    .by_id
-    .get(&held.volume)
-    .copied()
-    .ok_or(Refusal::NotFound)?;
-  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
-  let snapshot = core_snapshot(SnapshotId {
-    value: held.snapshot.value,
-  });
-  let origin = walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))?;
-  if origin_identity(&origin) != held.identity {
-    return Err(Refusal::ContentUnavailable);
+  let mut walk = HeldWalk::begin(state, held)?;
+  while !walk.step(state)? {}
+  walk.finish()
+}
+
+/// [`walk_held_origin`] a unit at a time ([`OriginWalk::unit`]: a directory's listing or a file's read), so a
+/// recovery can end its slice between two (§2.6 boot step 2, `crate::recovery_slices`). Holds no borrow of the state
+/// between steps: each step finds the base volume again.
+pub(crate) struct HeldWalk {
+  /// The base volume walked.
+  volume: DbVolumeId,
+  /// The identity the green recorded for its origin, which the finished walk must reproduce.
+  identity: [u8; 32],
+  /// The walk so far.
+  walk: OriginWalk,
+  /// The walked origin, once the last unit is done.
+  walked: Option<Origin>,
+}
+
+impl HeldWalk {
+  /// The walk of `held`'s base snapshot, not yet begun: `NotFound` when the base volume is not here.
+  pub(crate) fn begin(
+    state: &ShardState,
+    held: &slates_db::partition::OriginRef,
+  ) -> Result<HeldWalk, Refusal> {
+    held_base(state, held.volume)?;
+    let snapshot = core_snapshot(SnapshotId {
+      value: held.snapshot.value,
+    });
+    Ok(HeldWalk {
+      volume: held.volume,
+      identity: held.identity,
+      walk: OriginWalk::new(snapshot),
+      walked: None,
+    })
   }
-  Ok(origin)
+
+  /// One unit of the walk; true once the whole snapshot is walked.
+  pub(crate) fn step(&mut self, state: &ShardState) -> Result<bool, Refusal> {
+    if self.walked.is_some() {
+      return Ok(true);
+    }
+    let slot = held_base(state, self.volume)?;
+    self.walked = self
+      .walk
+      .unit(&slot.volume, &state.store)
+      .map_err(|e| refusal_of_vfs(&e))?;
+    Ok(self.walked.is_some())
+  }
+
+  /// The walked origin: `ContentUnavailable` when it is not the one the green was created from, `NotFound` when the
+  /// walk was not stepped to its end.
+  pub(crate) fn finish(self) -> Result<Origin, Refusal> {
+    let origin = self.walked.ok_or(Refusal::NotFound)?;
+    if origin_identity(&origin) != self.identity {
+      return Err(Refusal::ContentUnavailable);
+    }
+    Ok(origin)
+  }
+}
+
+/// The base volume a held origin is walked from, on this shard: `NotFound` when it is not here.
+fn held_base(state: &ShardState, volume: DbVolumeId) -> Result<&crate::state::VolumeSlot, Refusal> {
+  let handle = state.by_id.get(&volume).copied().ok_or(Refusal::NotFound)?;
+  state.volumes.get(handle).map_err(|_| Refusal::NotFound)
 }
 
 /// Walks a complete snapshot into an [`Origin`]: every file with its bytes, every directory, every
@@ -1404,6 +1459,8 @@ pub(crate) fn status_merge_volume(
       mounts_elided: 0,
       // A green or a work volume keeps no op log (its history is the merge engine's), so it has no journal to report.
       journal: slates_ipc::protocol::JournalReport::default(),
+      // A merge volume serves no FUSE mount of its own, so nothing is kept for one (U10).
+      takeover_kept: 0,
     }),
   })
 }
@@ -1466,6 +1523,12 @@ pub(crate) const INPUTS_UNPLACED: &str = "merge.inputs_unplaced";
 /// Counted on a holder for each merge record that arrived with the inputs it names (§4.16 "Commit" in one exchange a
 /// version): the non-vacuity counter for inputs placed inside the record that references them.
 pub(crate) const INPUTS_CARRIED: &str = "merge.inputs_carried";
+/// Counted on the owner for each version placed at the quorum in the same coordinator period it was enqueued in
+/// (§4.16 "Commit", A-235): its submit's answer did not wait for the coordinator's period.
+pub(crate) const PLACED_WITHIN_PERIOD: &str = "merge.placed_within_period";
+/// Counted on the owner for each version placed at the quorum only after one or more coordinator periods began since
+/// it was enqueued: the answer waited for the period (every version before A-235, which left it to the next period).
+pub(crate) const PLACED_AFTER_PERIODS: &str = "merge.placed_after_periods";
 /// Counted on a holder that refused a content put under an injected fault (a test's placement
 /// refusal), so a record's wait is shown to be the refusal's doing.
 /// Format: a refusal name in the daemon's status report.
@@ -1665,6 +1728,11 @@ pub struct PendingMergeRecord {
   pub inputs: Placement,
   /// The record's placement so far (the owner's own hold is counted by the commit).
   pub record: Placement,
+  /// The coordinator period the version was enqueued in (the period of the record plane's latest pass over its owner
+  /// shard), or of its first pass when nothing had passed yet: what [`PLACED_WITHIN_PERIOD`] and
+  /// [`PLACED_AFTER_PERIODS`] are judged from when the version places. Stamped at the enqueue, so a version the
+  /// record plane leaves for its next period counts as having waited for it.
+  pub first_period: Option<u64>,
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -1923,6 +1991,8 @@ fn enqueue_record_with(
   let identity = identity_of(state);
   let inputs_identity = inputs_of(state, green, version)
     .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
+  // The coordinator period this version is enqueued in: the record plane's latest pass over this shard (A-235).
+  let stamped = (state.merge.coordinator_period > 0).then_some(state.merge.coordinator_period);
   state.merge.pending.entry(object).or_default().insert(
     version,
     PendingMergeRecord {
@@ -1943,6 +2013,7 @@ fn enqueue_record_with(
         mirror_acked: None,
         ..shape
       },
+      first_period: stamped,
     },
   );
   nudge_record_plane(state);
@@ -2121,7 +2192,15 @@ pub(crate) enum MergeWork {
 /// version, grouped by version so one dispatch can still reach a quorum. Each candidate appears in
 /// at most one dispatch per green; input placement precedes that version's record. A lagging holder
 /// cannot hold another holder at its own old position (AUD-13).
-pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<MergeWork> {
+/// Runs in coordinator period `period`: each version this pass works is stamped with the period it was first worked in,
+/// which its placement is judged against ([`PLACED_WITHIN_PERIOD`]).
+pub(crate) fn next_merge_work(
+  state: &mut ShardState,
+  local: HostId,
+  period: u64,
+) -> Vec<MergeWork> {
+  // The period a version enqueued on this shard from now on is stamped with.
+  state.merge.coordinator_period = period;
   let config = state.fleet.configuration().clone();
   let page = archive_page(state);
   let mut work = Vec::new();
@@ -2138,6 +2217,11 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
     };
     pending_green.retarget(&placement);
     let selected = pending_green.next(local);
+    for version in selected.keys() {
+      if let Some(pending) = pending_green.records.get_mut(version) {
+        pending.first_period.get_or_insert(period);
+      }
+    }
     for (version, targets) in selected {
       let Some(pending) = state
         .merge
@@ -2211,10 +2295,12 @@ pub(crate) async fn run_merge_period(
   owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
+  // The coordinator period this pass runs in, read on the control shard, where the coordinator counts them.
+  let period = crate::state::with_state(|s| s.merge.coordinator_period).unwrap_or(0);
   let work = call_within(
     origin,
     shard,
-    move |s| next_merge_work(s, local),
+    move |s| next_merge_work(s, local, period),
     crate::daemon::HEARTBEAT_NS,
   )
   .await
@@ -2240,7 +2326,7 @@ pub(crate) async fn run_merge_period(
           targets,
           shape,
           quorum,
-          budget,
+          (budget, period),
         )
         .await
       }
@@ -2266,7 +2352,7 @@ async fn ship_record(
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,
-  budget: CommitBudget,
+  (budget, period): (CommitBudget, u64),
 ) -> Option<Dispatch> {
   let holders = take_sessions("fleet.lent_to.ship_record", |host| targets.contains(&host));
   if holders.is_empty() {
@@ -2304,7 +2390,7 @@ async fn ship_record(
     Err(_) => return Some(dispatch),
   };
   crate::xshard::run_on_counted(origin, shard, move |s| {
-    record_merge_acks(s, local, object, version, placement, quorum);
+    record_merge_acks_in(s, local, object, version, placement, quorum, period);
   });
   Some(dispatch)
 }
@@ -2344,6 +2430,38 @@ pub(crate) fn greens_placed_on_current_cohort(state: &ShardState) -> bool {
 /// Merges a round's acknowledgements into the version's pending record (never overwriting them: each
 /// holder's acceptance is durable there), marks the version placed once the quorum holds, and drops
 /// the entry once every remote candidate acknowledged it.
+/// [`record_merge_acks`] for acknowledgements gathered in coordinator period `period`: a version they newly place is
+/// counted [`PLACED_WITHIN_PERIOD`] when it was enqueued in that same period, else
+/// [`PLACED_AFTER_PERIODS`] (§4.16 "Commit", A-235: an answer that waited for the coordinator's period).
+fn record_merge_acks_in(
+  state: &mut ShardState,
+  local: HostId,
+  object: ObjectId,
+  version: u64,
+  placement: Placement,
+  quorum: Quorum,
+  period: u64,
+) {
+  let before = state
+    .merge
+    .pending
+    .get(&object)
+    .and_then(|pending_green| pending_green.records.get(&version))
+    .map(|pending| (pending.record.placed(quorum), pending.first_period));
+  record_merge_acks(state, local, object, version, placement, quorum);
+  if let Some((false, first)) = before
+    && placed_version(state, object).is_some_and(|placed| placed >= version)
+  {
+    let waited = period.saturating_sub(first.unwrap_or(period));
+    let counter = if waited == 0 {
+      PLACED_WITHIN_PERIOD
+    } else {
+      PLACED_AFTER_PERIODS
+    };
+    state.count(counter, 1);
+  }
+}
+
 fn record_merge_acks(
   state: &mut ShardState,
   local: HostId,
@@ -3020,6 +3138,7 @@ mod tests {
         mirror_acked: None,
         joint: Vec::new(),
       },
+      first_period: None,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -3114,6 +3233,7 @@ mod tests {
               mirror_acked: None,
               joint: Vec::new(),
             },
+            first_period: None,
           },
         );
       }
@@ -3132,7 +3252,7 @@ mod tests {
         quorum,
       );
       let shipments = |state: &mut ShardState| {
-        next_merge_work(state, local)
+        next_merge_work(state, local, 0)
           .into_iter()
           .map(
             |MergeWork::Ship {

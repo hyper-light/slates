@@ -250,9 +250,10 @@ pub struct Admitted<T> {
 /// An observation's budget counted in the observed shard's own time (§4.14, A-65): the shard's CPU clock when the
 /// observation began, and at the last window's end. At a wall deadline the observation goes on — for the part of the
 /// budget the shard has not yet run, as wall time — only while the shard is working: it ran on the CPU during the
-/// window just ended. A starved shard, runnable but given little CPU, keeps consuming some and is answered; a wedged
-/// one, which consumes none, ends the observation at the end of the first whole window it spends without CPU (one
-/// window if it was wedged when the observation began, two if it wedged partway through the first); a busy one that never answers ends it once it has run
+/// window just ended, or was waiting for one (A-228). A starved shard, runnable but given little CPU, keeps consuming
+/// some, or stands still in the run queue, and is answered; a wedged one, which consumes none and waits on no CPU, ends
+/// the observation at the end of the first whole window it spends so (one window if it was wedged when the observation
+/// began, two if it wedged partway through the first); a busy one that never answers ends it once it has run
 /// the budget, which an uncontended shard does at the wall clock's pace. A reading at or below the mark (a thread id the
 /// OS reused once the shard's thread had ended, which reads lower) ends it too. Under Miri, which has no thread
 /// clock, the wall budget stands alone.
@@ -286,9 +287,9 @@ impl ShardTime {
     Instant::now().checked_add(Duration::from_nanos(self.next_window_ns()?))
   }
 
-  /// The next window's wall length when the shard worked through the window just ended within its budget: the budget
-  /// it has not yet run. `None` ends the wait: the shard made no progress in the window, it has run its budget, or its
-  /// clock cannot be read.
+  /// The next window's wall length when the shard worked through the window just ended within its budget, or waited for
+  /// a CPU through it: the budget it has not yet run. `None` ends the wait: the shard made no progress in the window and
+  /// waited on no CPU, it has run its budget, or its clock cannot be read.
   pub(crate) fn next_window_ns(&mut self) -> Option<u64> {
     let now = slates_rt::registry::shard_cpu(self.holder)?;
     let unspent = self
@@ -296,12 +297,27 @@ impl ShardTime {
       .checked_sub(now.spent_ns.checked_sub(self.began?)?)
       .filter(|unspent| *unspent > 0)?;
     if self.mark.is_none_or(|mark| now.progress <= mark) {
-      return None;
+      // No CPU in the window. Starved is not stuck (A-228): a shard the scheduler has runnable, waiting for a CPU, is
+      // given the window again; only one that waits on something else, a deadlock or a call that never returns, ends the
+      // wait. On adacachy2 an observation of a shard held off its CPU for 3.0 s ended at its one-window deadline 3 of 3
+      // before this.
+      return self.runnable().then_some(unspent);
     }
     self.mark = Some(now.progress);
     // The budget the shard has not yet run, as wall time: an uncontended shard runs at the wall clock's pace and has
     // next to none left; a starved one has most of it.
     Some(unspent)
+  }
+
+  /// Whether the scheduler has the shard runnable at this look: on a CPU or waiting for one
+  /// (`slates_rt::registry::shard_run_readings`, the watchdog's source). The state decides on every platform: a thread
+  /// held off its CPU stays runnable, and Linux credits a run-queue wait only once the thread reaches a CPU (A-228's
+  /// notes). No reading (Miri, or a source that cannot be read) says no, as before A-228.
+  fn runnable(&self) -> bool {
+    slates_rt::registry::shard_run_readings(&[self.holder])
+      .pop()
+      .flatten()
+      .is_some_and(|run| run.state == slates_rt::RunState::Runnable)
   }
 }
 
