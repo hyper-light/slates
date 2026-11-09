@@ -8759,6 +8759,74 @@ fn the_lookups_an_unmounted_fuse_mount_held_are_given_back_at_its_end() {
   drop(anchor);
 }
 
+/// Format: Linux `ENOTCONN`, what a FUSE mount whose daemon side is gone answers.
+#[cfg(target_os = "linux")]
+const ENOTCONN: i32 = 107;
+
+/// Bug (GAPS, 2026-11-09; the unrecovered destroy's sibling, corrected): a FUSE mount the predecessor kept, of a volume
+/// its successor cannot rebuild, must be what A-102 makes every dead mount: left in place, answering `ENOTCONN` until its
+/// user unmounts it, and counted (`fuse.dead_mount_left`) with its record ended. Recovery skipped all of that for a
+/// volume it could not rebuild (`verbs::reconcile_lost` runs only for a rebuilt one), so the mount went uncounted and its
+/// attachment's record stayed. Do: an overlay over a host directory, FUSE-mounted; remove the directory and kill the
+/// daemon with its mount kept; wait for the successor. Expect the volume refused `NotRecovered`, the mount still in the
+/// kernel's table (A-102), a `stat` through it answering `ENOTCONN`, and one dead mount counted. Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_kept_fuse_mount_of_a_volume_recovery_could_not_rebuild_is_left_dead_and_counted() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-unrecoveredmount-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-unrecoveredmount"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "deadmount",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  shell(&format!("rmdir {base}"));
+  restart_keeping_mounts(&instance);
+  let (code, _, err) = run(&instance, &["status", &id]);
+  assert_ne!(
+    code, 0,
+    "recovery could not rebuild the volume whose base is gone"
+  );
+  assert!(err.contains("NotRecovered"), "{err}");
+  assert!(
+    is_mounted(&mount.path),
+    "A-102: the dead mount is left in place"
+  );
+  #[allow(clippy::disallowed_methods)] // a stat through the dead slates mount
+  let stat = std::fs::metadata(&mount.path)
+    .err()
+    .and_then(|e| e.raw_os_error());
+  assert_eq!(stat, Some(ENOTCONN), "the dead mount answers ENOTCONN");
+  assert_eq!(
+    counter_of(&instance, "fuse.dead_mount_left"),
+    1,
+    "the dead mount is counted, as a rebuilt volume's is"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// Writes [`LOOKED_UP_FILES`] files through the mount at `writer` and looks each up through the mount at `looker`.
 #[cfg(target_os = "linux")]
 fn write_and_look_up(writer: &str, looker: &str) {
