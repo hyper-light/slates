@@ -2886,24 +2886,21 @@ impl Daemon {
     })
   }
 
-  /// Test support: makes this node's record session to `peer`, as it stands now, drop everything it receives from now on:
-  /// a session whose peer is gone without a word (a restarted process that kept its member id, a reset that was lost).
-  /// Marked by its connection id, so the session the link dials to replace it is healthy. Delivered like
-  /// [`Self::inject_serve_delay`]; `Ok` once marked, else the typed refusal.
-  pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<bool, ObserveError> {
+  /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
+  /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
+  pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
-      let Some(link) = s.record_sessions.get_mut(&peer) else {
-        return false;
-      };
-      let id = match link.endpoint.as_mut() {
-        Some(endpoint) => {
-          endpoint.set_deaf();
-          endpoint.connection_id().ok()
-        }
-        None => link.borrowed,
-      };
-      s.injected_deaf_session = id.map(|id| (peer, id));
-      id.is_some()
+      s.injected_discovery_hold = peer;
+    })
+  }
+
+  /// Test support: makes this node's record session to `peer` drop everything it receives from the forward lane's next
+  /// borrow of it: a session whose peer is gone without a word (a restarted process that kept its member id, a reset
+  /// that was lost). Once, so the session the link dials to replace it is healthy. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_deaf_session = Some(peer);
     })
   }
 
@@ -3831,6 +3828,9 @@ fn init_shard(
     injected_serve_delay_ns: None,
     injected_forward_silence: None,
     injected_deaf_session: None,
+    injected_discovery_hold: None,
+    dead_session_dropped_at: std::collections::BTreeMap::new(),
+    dead_session_recovered_ns: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,

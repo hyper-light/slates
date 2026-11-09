@@ -4701,7 +4701,9 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       discovery_wait = HEARTBEAT_NS;
       discovery_due = 0;
     }
-    if !absent && futures::now_ns() >= discovery_due {
+    let discovery_held =
+      state::with_state(|s| s.injected_discovery_hold == Some(peer_host)).unwrap_or(false);
+    if !absent && !discovery_held && futures::now_ns() >= discovery_due {
       let before = discovery_cursor.settled();
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
       discovery_wait = next_discovery_wait(before, discovery_cursor.settled(), discovery_wait);
@@ -7804,12 +7806,6 @@ pub(crate) fn take_sessions(
       {
         // The borrow is tagged with the session's own identity, so only this session returns to the slot.
         link.borrowed = endpoint.connection_id().ok();
-        if s
-          .injected_deaf_session
-          .is_some_and(|(deaf, id)| deaf == *host && link.borrowed == Some(id))
-        {
-          endpoint.set_deaf();
-        }
         link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }
@@ -7819,27 +7815,9 @@ pub(crate) fn take_sessions(
   .unwrap_or_default()
 }
 
-/// Drops a borrowed session its borrower judged dead (`forward_lane::judged_dead`) instead of returning it: the link's
-/// entry goes with it, so the link task dials the peer again at its next pace, as for any session it gives up. Only the
-/// entry the session left is removed; one the link re-established meanwhile stays. Counted.
-pub(crate) fn drop_dead_session(host: HostId, mut endpoint: Endpoint) {
-  let dropped = endpoint.connection_id().ok();
-  state::with_state(|s| {
-    let ours = s
-      .record_sessions
-      .get(&host)
-      .is_some_and(|link| link.endpoint.is_none() && link.borrowed == dropped);
-    if ours {
-      s.record_sessions.remove(&host);
-      s.count(LINK_DEAD_DROPPED, 1);
-    } else {
-      s.count(LINK_STALE_RETURN, 1);
-    }
-  });
-}
-
-/// The status count of a record link dropped because a borrower judged its session dead.
-const LINK_DEAD_DROPPED: &str = "fleet.link.dead_dropped";
+/// The status count of a record session dropped on its return because its peer was silent past the rule
+/// ([`return_sessions`]), for the link to dial again.
+const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
@@ -7847,11 +7825,30 @@ const LINK_DEAD_DROPPED: &str = "fleet.link.dead_dropped";
 /// removed by its link task), a slot the link task re-established since (holding a newer session, or
 /// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
 /// never installed over a newer session.
+///
+/// A session whose peer is gone without a word is dropped here too, and its entry with it, so the link task dials the
+/// peer again at its next pace: the transport's one rule (`Endpoint::peer_silent_past`, shared with the install watch),
+/// an ack-eliciting packet unanswered for a liveness budget or the session's persistent-congestion duration, whichever is
+/// longer. Judged at the one place every borrower hands the session back, since whichever of them holds it the session
+/// is never in its slot for the link to look at: on the f = 1 primary-kill rung the restarted primary kept its member id,
+/// and with a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward
+/// lane's own check never got a turn (2026-11-08/09). A stateless reset (A-261) ends such a session sooner; this covers a
+/// reset lost and a peer that is silent. A starved node can judge a live peer dead: that costs a session replaced, and
+/// the forwards on it are answered unanswered and sent again under their own ids, never run twice. Counted.
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
+        Some(link)
+          if link.endpoint.is_none()
+            && link.borrowed == returned
+            && endpoint.peer_silent_past(crate::daemon::LIVENESS_BUDGET_NS) =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_SESSION_JUDGED_DEAD, 1);
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
+        }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);

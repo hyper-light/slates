@@ -5702,10 +5702,14 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
   }
 }
 
-/// Shape: how long after b's session to a goes deaf a read through b may take to be served on a new one: one liveness
-/// budget for the lane to judge the session dead (data in flight and nothing back), one for the link to dial a again
-/// and the read to be sent on the new session.
-const DEAD_SESSION_BOUND: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
+/// Shape: how long a test waits, in the daemons' own time, for b to drop a deaf session and answer on a new one: the
+/// rule's window (a liveness budget, or the session's persistent-congestion duration if longer, about 2 s), the next
+/// return of the session by whichever borrower holds it (every hold is bounded by a derived budget), and the redial.
+const DEAD_SESSION_WATCH: Duration = Duration::from_nanos(8 * LIVENESS_BUDGET_NS);
+/// Shape: how soon after the drop the forward lane's first answer on the replacement must come: the link dials again at
+/// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
+/// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
+const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon::HEARTBEAT_NS;
 /// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
 /// returns it and the link never finds it in its slot, as the rung's thousand clients did. Measured 2026-11-08: at 32
 /// the link's own discovery refresh found the deaf session in its slot and replaced it, and the read was served in
@@ -5716,13 +5720,15 @@ static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
 /// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
-/// so the client node's record session to it looked valid, and its forward lane, borrowing the session turn after turn,
-/// kept forwarding into a session the new process had no state for; every request through the client node waited 25 to
-/// 135 s. The condition is injected here rather than hoped for from the load: b's session to a drops everything it
-/// receives (`Daemon::inject_session_deafness`, cut at the session's receive path, so the lane's own judgment runs).
-/// Do: three nodes; a volume on a read through b; a burst of reads through b kept going; b's session to a made deaf;
-/// one read through b. Expect: it is served by a, on a new session, within [`DEAD_SESSION_BOUND`]. Before: the lane
-/// kept the deaf session and the read waited out its forwarders' give-ups.
+/// so the client node's record session to it looked valid, and borrowers kept forwarding into a session the new process
+/// had no state for; every request through the client node waited 25 to 135 s. The condition is injected here rather
+/// than hoped for from the load: b's session to a drops everything it receives (`Daemon::inject_session_deafness`, cut at
+/// the session's receive path, so the product's own judgment runs). Do: three nodes; a volume on a read through b; a
+/// burst of reads through b kept going (256 clients, so the session is never in its slot); b's session to a made deaf.
+/// Expect: b judges the session silent where a borrower returns it (`fleet::return_sessions`), drops it, and the forward
+/// lane's first answer on the replacement comes within a liveness budget of the drop. Before: no borrower judged it,
+/// the lane forwarded into it, and every forward through b gave up until its failover bound. (A read through b served
+/// within that bound behind the resends' backlog is a separate finding, tested with its fix.)
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
@@ -5770,46 +5776,63 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   while Instant::now() < busy_until {
     std::thread::yield_now();
   }
-  // Marked once the control shard answers with the session found (busy with the burst, an observation can miss it).
-  let mut marked = Ok(false);
+  // The link's own discovery refresh, which can take the session from its slot when a page falls due, is held, so the
+  // rescue tested is the one at the return of a borrow, which every borrower's bounded hold reaches.
+  let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  let holding = Instant::now();
+  while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
+    held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  }
+  // Installed once the control shard answers (busy with the burst, an observation can miss its budget).
+  let mut marked = daemons[1].inject_session_deafness(hosts[0]);
   let marking = Instant::now();
-  while marked != Ok(true) && marking.elapsed() < DEAD_SESSION_BOUND {
+  while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
     marked = daemons[1].inject_session_deafness(hosts[0]);
   }
-  let deafened = Instant::now();
-  let reply = probe.call(&read);
-  let served_after = deafened.elapsed();
+  // Until the lane has answered on the replacement, charged in the daemons' own periods (`poll_until`).
+  let mut recovered = None;
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  poll_until(&everyone, DEAD_SESSION_WATCH, || {
+    recovered = daemons[1]
+      .observation(
+        Some(daemons[1].shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
+      )?
+      .wait()?;
+    Ok(recovered.is_some())
+  });
+  drop(everyone);
   DEAD_SESSION_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
   let rounds = burst.join().unwrap();
   let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
     .into_iter()
-    .filter(|(name, _)| {
-      name.contains("judged_dead") || name.contains("dead_dropped") || name.contains("given_up")
-    })
+    .filter(|(name, _)| name.contains("judged_dead") || name.contains("given_up"))
     .collect();
   drop(owner);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "after b's session to a went deaf, a read through b was answered in {served_after:?}: {}; burst rounds {rounds}; \
-     b's counters {counters:?}",
-    match &reply {
-      ReplyBody::Status { .. } => "served".to_owned(),
-      other => format!("{other:?}"),
-    }
+    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; burst rounds {rounds}; b's \
+     counters {counters:?}",
+    recovered.map(Duration::from_nanos)
   );
   assert!(routed, "b routed the volume to a: {last:?}");
-  assert_eq!(marked, Ok(true), "b's session to a was marked deaf");
+  assert_eq!(held, Ok(()), "b's discovery to a was held");
+  assert_eq!(marked, Ok(()), "the deafness was installed on b");
   assert!(rounds > 0, "the burst kept b's lane busy");
+  let recovered = recovered.unwrap_or_else(|| {
+    panic!(
+      "b never answered on a replacement within the watch ({DEAD_SESSION_WATCH:?} of the daemons' periods) of the \
+       session going deaf: no borrower judged it silent (counters {counters:?})"
+    )
+  });
   assert!(
-    matches!(reply, ReplyBody::Status { .. }),
-    "the read through b was served by a on a new session: {reply:?}"
-  );
-  assert!(
-    served_after <= DEAD_SESSION_BOUND,
-    "the read through b was served {served_after:?} after the session went deaf, past {DEAD_SESSION_BOUND:?}: b's \
-     lane kept the session that hears nothing"
+    recovered <= DEAD_SESSION_RECOVERY_NS,
+    "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
+    Duration::from_nanos(recovered),
+    Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
   );
 }
 

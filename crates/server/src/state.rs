@@ -810,9 +810,18 @@ pub struct ShardState {
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
   pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
-  /// Test support (never reachable from the wire): the record session to this peer, by its connection id, that drops
-  /// everything it receives once seen (`Daemon::inject_session_deafness`). `None` in production.
-  pub injected_deaf_session: Option<(slates_db::HostId, slates_transport::endpoint::ConnectionId)>,
+  /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
+  /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
+  pub injected_deaf_session: Option<slates_db::HostId>,
+  /// Test support (never reachable from the wire): a peer whose record link pages no discovery while set, so a test can
+  /// hold the one rescue that does not depend on a borrower (`Daemon::inject_discovery_hold`). `None` in production.
+  pub injected_discovery_hold: Option<slates_db::HostId>,
+  /// When each peer's record session was last dropped as silent (`fleet::return_sessions`), until the forward lane's
+  /// first reply on its replacement logs the gap. One entry a peer, so bounded by the roster.
+  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, u64>,
+  /// How long after the last silent session's drop the forward lane's first reply on its replacement came (logged too):
+  /// what a test or an operator reads to see the lane back on a live session. `None` until it has happened.
+  pub dead_session_recovered_ns: Option<u64>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,

@@ -47,9 +47,6 @@ use crate::state;
 
 /// The status count of a forward refused because its lane held [`lane_bound`] forwards already.
 const LANE_FULL: &str = "fleet.forward.lane_full";
-/// The status count of a session a forward lane's borrower judged dead ([`judged_dead`]) and dropped for the link to
-/// replace: a peer gone or restarted without the session, or, on a starved node, a live peer judged so.
-const SESSION_JUDGED_DEAD: &str = "fleet.forward.session_judged_dead";
 /// The status count of a forward answered unanswered because its session was replaced while it was open.
 const SESSION_REPLACED: &str = "fleet.forward.session_replaced";
 /// The status count of a forward begun on the session (the non-vacuity count of the multiplexed path).
@@ -496,11 +493,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
     return Turn::SessionOut;
   };
   let session = endpoint.connection_id().ok();
-  if judged_dead(&endpoint, awaiting_replies(peer, session)) {
-    answer_dead(peer);
-    crate::fleet::drop_dead_session(peer, endpoint);
-    return Turn::Failed;
-  }
+  apply_injected_deafness(peer, &mut endpoint);
   let mut any_reply = settle(peer, &mut endpoint, session);
   let consumed = endpoint.bytes_consumed();
   let driven = futures::within(left_ns, drive_or_queued(peer, &mut endpoint)).await;
@@ -514,55 +507,6 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
     Ok(Some(Err(_))) | Err(_) => Turn::Failed,
     Ok(Some(Ok(()))) | Ok(None) => Turn::Driven { any_reply },
   }
-}
-
-/// Whether the borrowed session's peer is gone: forwards open on it awaiting their replies (`awaiting`) and no
-/// authenticated packet back for a liveness budget. A live peer acknowledges within its probe timeout, far inside a
-/// budget. Judged on the lane's own open forwards, not the transport's bytes in flight: a session whose peer is gone
-/// declares its packets lost at each probe timeout, and its bytes in flight read zero between sends (measured with the
-/// deaf session of `a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`: the check never fired). Read by the borrower itself at each turn
-/// from the session it holds, since a session lent turn after turn is never in its slot for the link to look at: on
-/// the f = 1 primary-kill rung the restarted primary kept its member id, so nothing in the membership told its new
-/// process from the old, and the client node forwarded into the old session 25 to 135 s (2026-11-08). A restarted peer
-/// that answers with a stateless reset (A-261) ends the session sooner, as a failed drive; this covers a reset lost and
-/// a peer that is silent. A starved node can judge a live peer dead: that costs a session replaced and the forwards
-/// sent again under their own ids, never run twice, and each judgement is counted ([`SESSION_JUDGED_DEAD`]).
-fn judged_dead(endpoint: &Endpoint, awaiting: bool) -> bool {
-  awaiting
-    && endpoint.last_received_ns().is_some_and(|last| {
-      futures::now_ns().saturating_sub(last) >= crate::daemon::LIVENESS_BUDGET_NS
-    })
-}
-
-/// Whether `peer`'s lane has forwards open on `session`, awaiting their replies.
-fn awaiting_replies(peer: HostId, session: Option<ConnectionId>) -> bool {
-  state::with_state(|s| {
-    s.forward_lanes
-      .lanes
-      .get(&peer)
-      .is_some_and(|lane| lane.open_on == session && !lane.open.is_empty())
-  })
-  .unwrap_or(false)
-}
-
-/// Answers unanswered every forward open on `peer`'s lane, its session judged dead ([`judged_dead`]): each forwarder
-/// is woken and its caller sends it again under its own id, on the session the link dials next.
-fn answer_dead(peer: HostId) {
-  let _ = state::with_state(|s| {
-    s.count(SESSION_JUDGED_DEAD, 1);
-    let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) else {
-      return;
-    };
-    let mut forwarders = Vec::new();
-    for ticket in std::mem::take(&mut lane.open).into_values() {
-      if let Some(entry) = lane.tickets.get_mut(&ticket) {
-        entry.stage = Stage::Done(None);
-        forwarders.push(entry.forwarder);
-      }
-    }
-    lane.open_on = None;
-    let _ = wake_answered(lane, &forwarders);
-  });
 }
 
 /// Drives `endpoint` one turn, or returns as soon as a forward is queued on `peer`'s lane (the turn is cancel-safe:
@@ -605,6 +549,16 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
     let replaced = answer_open(lane, endpoint, session, &mut answered);
     let begun = session.map_or(0, |on| begin_queued(lane, endpoint, on, &mut answered));
     let woken = wake_answered(lane, &answered.forwarders);
+    if answered.any_reply
+      && let Some(dropped) = s.dead_session_dropped_at.remove(&peer)
+    {
+      let recovered = futures::now_ns().saturating_sub(dropped);
+      s.dead_session_recovered_ns = Some(recovered);
+      slates_machine::log_line!(
+        "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped",
+        recovered / 1_000_000
+      );
+    }
     Some((answered.any_reply, replaced, begun, woken))
   })
   .flatten();
@@ -671,6 +625,22 @@ fn answer_open(
     }
   }
   replaced
+}
+
+/// Test support: makes `endpoint` deaf if a deafness is injected for `peer`, once, so the session the link dials to
+/// replace it is healthy (`Daemon::inject_session_deafness`). In the lane's own borrow, so the session is deaf in the
+/// lane's hands whichever turn takes it. Nothing is injected in production.
+fn apply_injected_deafness(peer: HostId, endpoint: &mut Endpoint) {
+  let injected = state::with_state(|s| {
+    let hit = s.injected_deaf_session == Some(peer);
+    if hit {
+      s.injected_deaf_session = None;
+    }
+    hit
+  });
+  if injected == Some(true) {
+    endpoint.set_deaf();
+  }
 }
 
 /// Begins queued forwards on session `on`, in order, while its stream credit admits them (a refusal past the credit,
