@@ -28,6 +28,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    branches: ["diag-release-9"] # DIAG only: the release dry run on one push; publishing jobs are tag-only
   workflow_dispatch:
 
 permissions:
@@ -209,3 +210,24 @@ jobs:
             gathered/dist/slates-* gathered/dist/SHA256SUMS
           gh release view "${GITHUB_REF_NAME}" --json name,isDraft,isPrerelease,assets \
             --jq '{name, isDraft, isPrerelease, assets: [.assets[] | {name, size}]}'
+
+  # DIAG only: every job's result, published to a branch so the run is read with git, not the API.
+  diag-results:
+    name: DIAG results
+    if: always()
+    needs: [guard, build, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the results
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" > "$RUNNER_TEMP/summary.json"
+          git config user.name diag-release; git config user.email diag-release@users.noreply.github.com
+          blob=$(git hash-object -w "$RUNNER_TEMP/summary.json"); tree=$(printf "100644 blob %s\tsummary.json\n" "$blob" | git mktree)
+          c=$(echo "results of run ${{ github.run_id }} (release)" | git commit-tree "$tree")
+          git push origin "$c:refs/heads/diag-results/release-9-release"
