@@ -1,0 +1,43 @@
+## image: ubuntu26 20261101.186.1
+7.0.0-1019-azure
+## the caller's own label: unconfined
+## host, as runner
+fusermount3 version: 3.18.2
+uid 1001 euid 1001: helper 2198 exited code 0, unreaped
+  /proc/2198/attr/apparmor/current: 'fusermount3 (enforce)'
+  /proc/2198/attr/current: 'fusermount3 (enforce)'
+  reaped
+## host, as root
+fusermount3 version: 3.18.2
+uid 0 euid 0: helper 2202 exited code 0, unreaped
+  /proc/2202/attr/apparmor/current: 'fusermount3 (enforce)'
+  /proc/2202/attr/current: 'fusermount3 (enforce)'
+  reaped
+## container (rust:1.98.1, the lane's options), as root
+Unable to find image 'rust:1.98.1' locally
+1.98.1: Pulling from library/rust
+38985a14f2b1: Pulling fs layer
+6eefb2f5d3e9: Pulling fs layer
+ed8a5e9f2f6f: Pulling fs layer
+e7272a918094: Pulling fs layer
+42f0cc32f2e3: Pulling fs layer
+b9cfe81e8cec: Download complete
+42f0cc32f2e3: Download complete
+a90298135267: Download complete
+38985a14f2b1: Download complete
+6eefb2f5d3e9: Download complete
+6eefb2f5d3e9: Pull complete
+ed8a5e9f2f6f: Download complete
+e7272a918094: Download complete
+42f0cc32f2e3: Pull complete
+38985a14f2b1: Pull complete
+e7272a918094: Pull complete
+ed8a5e9f2f6f: Pull complete
+Digest: sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+Status: Downloaded newer image for rust:1.98.1
+the container process: unconfined
+fusermount3 version: 3.17.2
+uid 0 euid 0: helper 92 exited code 0, unreaped
+  /proc/92/attr/apparmor/current: 'fusermount3 (enforce)'
+  /proc/92/attr/current: 'fusermount3 (enforce)'
+  reaped
