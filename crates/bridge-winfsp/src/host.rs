@@ -1147,28 +1147,60 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let Some(answer) = post(requests, op) else {
+    return Reply::Err(crate::status_unsuccessful());
+  };
+  wake.wake_by_ref();
+  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
+}
+
+/// Puts `op` on the mount's channel and answers where its reply will come, or `None` when the mount is gone. Nothing
+/// wakes the mount's task: the caller does, or a later request's wake carries it there (FIFO).
+fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> {
   let (reply, answer) = sync_channel(1);
-  if requests
+  requests
     .send(Request {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
       replayed: crate::dispatcher::replaying(),
     })
-    .is_err()
-  {
-    return Reply::Err(crate::status_unsuccessful());
-  }
-  wake.wake_by_ref();
-  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
+    .ok()
+    .map(|()| answer)
 }
 
-pub(crate) fn confirm_open(
+/// A posted confirmation's answer, still to be taken ([`confirmed_open`]).
+pub(crate) struct Confirming(Receiver<Reply>);
+
+/// Posts the confirmation that the driver accepted the open `context` names and wakes the mount's task, without waiting
+/// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
+/// the worker's next request (audit step 7, cut (c)). The answer is taken by [`confirmed_open`] before the journal
+/// overwrites the open's settled response; a request no shard call precedes (a security query, answered from the one
+/// fixed descriptor) would otherwise find it unapplied.
+pub(crate) fn post_confirm(
   requests: &SyncSender<Request>,
   wake: &Waker,
   context: u64,
-) -> Result<(), WinFspError> {
-  match call_on(requests, wake, Op::Confirm { context }) {
+) -> Result<Confirming, WinFspError> {
+  let confirming = post(requests, Op::Confirm { context })
+    .map(Confirming)
+    .ok_or(WinFspError::MountThread)?;
+  wake.wake_by_ref();
+  Ok(confirming)
+}
+
+/// Takes a posted confirmation's answer, waking the mount's task first when it has not been applied yet.
+pub(crate) fn confirmed_open(confirming: &Confirming, wake: &Waker) -> Result<(), WinFspError> {
+  let Confirming(answer) = confirming;
+  let reply = match answer.try_recv() {
+    Ok(reply) => reply,
+    Err(TryRecvError::Empty) => {
+      wake.wake_by_ref();
+      crate::reply::await_reply(answer).map_err(|_| WinFspError::MountThread)?
+    }
+    Err(TryRecvError::Disconnected) => return Err(WinFspError::MountThread),
+  };
+  match reply {
     Reply::Ok => Ok(()),
     Reply::Err(status) => Err(WinFspError::Api {
       call: "confirm handed open",
@@ -2337,9 +2369,8 @@ fn run_mount(
       .memory()
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
-    let saved_open = crate::inflight::settle::saved_open(&mut captured, &mut scratch)
-      .map_err(WinFspError::Capture)?;
+    let saved_open =
+      crate::inflight::settle::saved_open(&mut captured).map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;

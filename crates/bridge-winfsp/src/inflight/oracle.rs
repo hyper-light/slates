@@ -12,7 +12,8 @@
 //! - every request delivered is answered exactly once, and only with the response made for it or a cancellation;
 //! - a file the driver opened stays open until its Close completes, whatever the Close answered, and the ledger holds a
 //!   live context for exactly the files the driver holds open: none lost, none leaked;
-//! - when the driver is quiet, the journal holds no unsettled batch and the ledger no unconfirmed open.
+//! - when the driver is quiet, the journal holds no unsettled batch, and the ledger no unconfirmed open but one the
+//!   journal's saved response vouches for (a confirmation the shard had not yet applied: cut (c) of audit step 7).
 //!
 //! Recording is the only test hook in production code: the journal tells [`journal_stored`] of each store.
 //!
@@ -51,6 +52,9 @@ const BOUND: usize = 8;
 const FILES: usize = 3;
 /// Format: FspFsctlTransactReadKind (fsctl.h), a request whose response may name the dead process's buffer.
 const READ_KIND: u32 = 5;
+/// Format: FspFsctlTransactQuerySecurityKind (fsctl.h). The model answers it on the receive worker without the shard, as
+/// the host answers a security query from its one fixed descriptor: a save that no shard call precedes.
+const QUERY_SECURITY_KIND: u32 = 19;
 /// Format: Req.Cleanup.UserContext2 and Req.Close.UserContext2 follow the header and the UserContext word (fsctl.h).
 const REQUEST_CONTEXT_AT: usize = HINT_AT + size_of::<u64>() + size_of::<u64>();
 /// Shape: where the model writes a request's serial, inside the request union and before its file name descriptor; the
@@ -64,8 +68,8 @@ const HINT_STRIDE: u64 = 0x100;
 const STATUS_DISK_FULL: u32 = 0xC000_007F;
 /// Format: STATUS_INVALID_HANDLE (ntstatus.h), the model shard's answer to a context the ledger refuses.
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-/// Shape: each file's requests in the workload: its Create, a Read, its Cleanup and its Close.
-const REQUESTS_PER_FILE: usize = 4;
+/// Shape: each file's requests in the workload: its Create, a security query, a Read, its Cleanup and its Close.
+const REQUESTS_PER_FILE: usize = 5;
 /// Format: the receive buffer follows the journal's eight-byte phase word (`super::capture`).
 const RECEIVE_AT: usize = size_of::<u64>();
 /// Format: IoStatus.Information, which the model's shard sets to the request's serial so the driver can tell which
@@ -270,8 +274,9 @@ impl Driver {
             .violations
             .push(format!("file {} opened twice", irp.file));
         }
-        self.issue(READ_KIND, irp.file, context);
+        self.issue(QUERY_SECURITY_KIND, irp.file, context);
       }
+      QUERY_SECURITY_KIND => self.issue(READ_KIND, irp.file, irp.context),
       READ_KIND => self.issue(CLEANUP_KIND, irp.file, irp.context),
       CLEANUP_KIND => self.issue(CLOSE_KIND, irp.file, irp.context),
       CLOSE_KIND => {
@@ -287,10 +292,25 @@ impl Driver {
 }
 
 /// The edges the protocol runs over here: the modelled driver, and a modelled owner shard over the real ledger whose
-/// rules are host.rs's (`record_open_reply`, `confirm_reply`, `finish_context_effects`).
+/// rules are host.rs's (`record_open_reply`, `confirm_reply`, `finish_context_effects`). A posted confirmation waits on the
+/// shard's FIFO channel. The worker wakes the shard as it posts, so the shard normally applies it at once, while the
+/// worker goes on; `lags` holds it instead until the latest moment the protocol allows (the next request the shard serves,
+/// or the worker's own check before it saves), so the crash oracle sees the order a slow shard makes.
 struct Model<'a> {
   driver: &'a mut Driver,
   ledger: &'a mut Ledger<HeldMemory>,
+  posted: Option<u64>,
+  lags: bool,
+}
+
+impl Model<'_> {
+  /// The shard takes the confirmation posted ahead of whatever it serves next.
+  fn apply_posted(&mut self) -> Result<(), String> {
+    match self.posted.take() {
+      Some(context) => self.ledger.confirmed(context).map_err(text),
+      None => Ok(()),
+    }
+  }
 }
 
 impl Edges for Model<'_> {
@@ -318,6 +338,17 @@ impl Edges for Model<'_> {
     response: &mut [u8],
     replaying: bool,
   ) -> Result<usize, String> {
+    if request.kind() == QUERY_SECURITY_KIND {
+      let serial = u32::from_le_bytes(
+        request.bytes()[SERIAL_AT..SERIAL_AT + 4]
+          .try_into()
+          .unwrap(),
+      );
+      response[..RESPONSE_BASE].copy_from_slice(&request.cancelled_response().map_err(text)?);
+      response[INFORMATION_AT..INFORMATION_AT + 4].copy_from_slice(&serial.to_le_bytes());
+      return super::finish_response(response, 0).map_err(text);
+    }
+    self.apply_posted()?;
     let bytes = request.bytes();
     let serial = u32::from_le_bytes(bytes[SERIAL_AT..SERIAL_AT + 4].try_into().unwrap());
     let context = u64::from_le_bytes(
@@ -364,10 +395,23 @@ impl Edges for Model<'_> {
     super::finish_response(response, status).map_err(text)
   }
 
-  fn confirm_open(&mut self, context: u64) -> Result<(), String> {
-    // The worker waits here for the shard to apply the confirmation: a round on its path.
-    self.driver.held_on_confirm += 1;
-    self.ledger.confirmed(context).map_err(text)
+  fn post_confirm(&mut self, context: u64) -> Result<(), String> {
+    if self.posted.replace(context).is_some() {
+      return Err("a second confirmation was posted before the first was taken".to_owned());
+    }
+    if self.lags {
+      return Ok(());
+    }
+    // Woken as it is posted, the shard applies it while the worker acknowledges and goes on.
+    self.apply_posted()
+  }
+
+  fn confirmed(&mut self) -> Result<(), String> {
+    // A confirmation still posted here is one the worker must wait for the shard to apply: a round on its path.
+    if self.posted.is_some() {
+      self.driver.held_on_confirm += 1;
+    }
+    self.apply_posted()
   }
 
   fn rename_open_names(&mut self, _from: &str, _to: &str) -> Result<(), String> {
@@ -465,7 +509,12 @@ fn is_delivery(events: &[Event], at: usize) -> bool {
 
 /// One daemon's life over `held`: recover the ledger (or create it), settle the one unconfirmed open against the journal,
 /// settle the journal's kept batch, then receive and serve until the driver is quiet. Records into `events` when given.
-fn life(held: &mut Held, fresh: bool, events: Option<&mut Vec<Event>>) -> Result<(), String> {
+fn life(
+  held: &mut Held,
+  fresh: bool,
+  lags: bool,
+  events: Option<&mut Vec<Event>>,
+) -> Result<(), String> {
   let memory = HeldMemory {
     bytes: std::mem::take(&mut held.ledger),
   };
@@ -477,7 +526,7 @@ fn life(held: &mut Held, fresh: bool, events: Option<&mut Vec<Event>>) -> Result
       events: Vec::new(),
     }));
   }
-  let outcome = serve(held, memory, fresh);
+  let outcome = serve(held, memory, fresh, lags);
   let recorded = RECORDING.take();
   if let (Some(events), Some(recorded)) = (events, recorded) {
     *events = recorded.events;
@@ -485,21 +534,21 @@ fn life(held: &mut Held, fresh: bool, events: Option<&mut Vec<Event>>) -> Result
   outcome
 }
 
-fn serve(held: &mut Held, memory: HeldMemory, fresh: bool) -> Result<(), String> {
+fn serve(held: &mut Held, memory: HeldMemory, fresh: bool, lags: bool) -> Result<(), String> {
   let mut ledger = if fresh {
     Ledger::create(memory, BOUND).map_err(text)?
   } else {
     Ledger::recover(memory, BOUND).map_err(text)?
   };
-  let outcome = serve_with(held, &mut ledger);
+  let outcome = serve_with(held, &mut ledger, lags);
   held.ledger = ledger.into_memory().bytes;
   outcome
 }
 
-fn serve_with(held: &mut Held, ledger: &mut Ledger<HeldMemory>) -> Result<(), String> {
+fn serve_with(held: &mut Held, ledger: &mut Ledger<HeldMemory>, lags: bool) -> Result<(), String> {
   let mut scratch = Scratch::new().map_err(text)?;
   let mut copy = held.journal.clone();
-  let saved_open = settle::saved_open(&mut copy, &mut scratch).map_err(text)?;
+  let saved_open = settle::saved_open(&mut copy).map_err(text)?;
   ledger.settle_pending(saved_open).map_err(text)?;
   // Once the one unconfirmed open is settled, every file the driver holds open must have a live context, but one whose
   // Close the dead daemon had taken: it may have retired the open (or torn the retiring frame, which quarantines it)
@@ -524,6 +573,8 @@ fn serve_with(held: &mut Held, ledger: &mut Ledger<HeldMemory>) -> Result<(), St
   let mut model = Model {
     driver: &mut held.driver,
     ledger,
+    posted: None,
+    lags,
   };
   settle::recover(
     Capture::new(&mut held.journal).map_err(text)?,
@@ -553,13 +604,16 @@ fn check(held: &mut Held, scenario: &str) {
     driver.violations
   );
   assert!(driver.quiet(), "{scenario}: the driver still has requests");
-  let ledger = Ledger::recover(
+  let mut ledger = Ledger::recover(
     HeldMemory {
       bytes: held.ledger.clone(),
     },
     BOUND,
   )
   .unwrap();
+  // An open whose confirmation the shard had not applied is kept only on the journal's word, as a successor keeps it.
+  let saved_open = settle::saved_open(&mut held.journal.clone()).unwrap();
+  ledger.settle_pending(saved_open).unwrap();
   let live: BTreeSet<u64> = ledger.live().map(|(context, _)| context).collect();
   let open: BTreeSet<u64> = driver.held.values().copied().collect();
   assert_eq!(
@@ -568,7 +622,7 @@ fn check(held: &mut Held, scenario: &str) {
   );
   assert!(
     ledger.has_room(),
-    "{scenario}: the ledger kept an unconfirmed open"
+    "{scenario}: the ledger kept an unconfirmed open the journal does not vouch for"
   );
   // A receive that found the driver quiet leaves the journal receiving over an empty buffer, which a successor settles
   // as nothing; any request left in it is unsettled.
@@ -602,11 +656,21 @@ fn fresh() -> Held {
 /// and no unsettled batch left.
 #[test]
 fn a_crash_after_any_store_to_held_memory_loses_no_open_and_answers_every_request_once() {
+  for lags in [false, true] {
+    crash_everywhere(lags);
+  }
+}
+
+/// The crash oracle over one timing of the shard's confirmations (see [`Model`]).
+fn crash_everywhere(lags: bool) {
   let start = fresh();
   let mut reference = start.clone();
   let mut events = Vec::new();
-  life(&mut reference, true, Some(&mut events)).unwrap();
-  check(&mut reference, "the reference");
+  life(&mut reference, true, lags, Some(&mut events)).unwrap();
+  check(
+    &mut reference,
+    &format!("the reference (shard lags {lags})"),
+  );
   assert!(
     reference.driver.answered.len() >= FILES * REQUESTS_PER_FILE,
     "the reference answered {} requests",
@@ -626,19 +690,21 @@ fn a_crash_after_any_store_to_held_memory_loses_no_open_and_answers_every_reques
     let mut crashed = after_creation.crashed(tail, at, torn);
     let before_recovery = crashed.clone();
     let mut recovery = Vec::new();
-    life(&mut crashed, false, Some(&mut recovery))
-      .unwrap_or_else(|error| panic!("crash at {at} (torn {torn}): recovery refused: {error}"));
-    check(&mut crashed, &format!("crash at {at} (torn {torn})"));
+    life(&mut crashed, false, lags, Some(&mut recovery)).unwrap_or_else(|error| {
+      panic!("shard lags {lags}, crash at {at} (torn {torn}): recovery refused: {error}")
+    });
+    check(
+      &mut crashed,
+      &format!("shard lags {lags}, crash at {at} (torn {torn})"),
+    );
     scenarios += 1;
     for (again, torn_again) in crash_points(&recovery) {
       let mut twice = before_recovery.crashed(&recovery, again, torn_again);
-      life(&mut twice, false, None).unwrap_or_else(|error| {
-        panic!("crash at {at} (torn {torn}), then at {again} (torn {torn_again}): {error}")
-      });
-      check(
-        &mut twice,
-        &format!("crash at {at} (torn {torn}), then at {again} (torn {torn_again})"),
+      let scenario = format!(
+        "shard lags {lags}, crash at {at} (torn {torn}), then at {again} (torn {torn_again})"
       );
+      life(&mut twice, false, lags, None).unwrap_or_else(|error| panic!("{scenario}: {error}"));
+      check(&mut twice, &scenario);
       scenarios += 1;
     }
   }
@@ -652,7 +718,7 @@ fn a_crash_after_any_store_to_held_memory_loses_no_open_and_answers_every_reques
 #[test]
 fn an_opens_confirmation_does_not_hold_the_receive_worker() {
   let mut held = fresh();
-  life(&mut held, true, None).unwrap();
+  life(&mut held, true, false, None).unwrap();
   check(&mut held, "the workload");
   assert_eq!(
     held.driver.held_on_confirm, 0,

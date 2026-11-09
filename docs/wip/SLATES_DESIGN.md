@@ -15417,6 +15417,39 @@ Applied in the same change to:
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
 
+### A-262 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp`:
+  - `inflight/capture.rs`: a third saved-response state, SETTLED, which the acknowledgement writes; `begin` leaves the
+    saved response and refuses a published one; `Capture::saved_open` reads a published or settled response whatever the
+    phase. A settled response is never replayed.
+  - `inflight/settle.rs`: `Edges::post_confirm` after the send and `Edges::confirmed` before the next save, in place of
+    the confirmation's round; `saved_open` reads the journal whatever its phase.
+  - `host.rs`: `post_confirm` (the Confirm put on the mount's channel, the mount's task woken, no wait) and
+    `confirmed_open`; `dispatcher.rs` holds the one outstanding answer.
+  - `opens.rs`: the docs of `confirmed` and `settle_pending`.
+- The tests: `an_opens_confirmation_does_not_hold_the_receive_worker` (first: 3 of 3 opens held the worker), and the
+  crash oracle with a security query answered without the shard after each Create and the shard's confirmations both
+  prompt and lagging to the protocol's latest moment.
+- **What was there.** After sending a successful Create's response the worker waited for the shard to confirm the open:
+  a round on every open, 9.9 µs at the mean on arm64 quiet and 139.6 µs loaded (diag-winfsp-overlap-50, run
+  42506936806). The confirmation had to be applied before the acknowledgement, because the next receive cleared the
+  saved response, and recovery keeps an unconfirmed open only on the journal's word.
+- **The rule.**
+  - A pending open always has its successful response in the journal, published or settled.
+  - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
+    confirmation ahead of the worker's next request.
+  - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
+    posted confirmation's answer, waiting only if the shard has not yet applied it (a request answered without the shard,
+    such as a security query, can come next).
+  - Recovery reads a settled response only for the open it may have issued, never to replay it: its request was
+    answered.
+- **Checked.** The crash oracle, at every store and torn inside each, twice over. Put in by hand, each of these is
+  caught: no check before the save, recovery that ignores a settled response, and `begin` clearing the saved response.
+- **Measured.** Owed to its A/B against a do-nothing arm.
+
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
 Applied in the same change to:
