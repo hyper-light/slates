@@ -15189,6 +15189,13 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   **Decided and built 2026-11-07 (U10, the supervisor's option 2; narrowed 2026-11-09: never kept for a mount whose
   `FORGET` said it holds nothing, since a handle holds a lookup):** such a file is kept, charged to the volume's quota
   and counted (`takeover_kept`), until the surviving mount ends (A-152's note of that date).
+  **Open (2026-11-09): the release at a real mount's end has no real-mount test.** The kept files are released when the
+  last surviving mount ends: through `sweep_attachment` (held by `crates/bridge-core/tests/takeover_release.rs`'s
+  `kept_until_the_mount_ends`) and, for an ordinary Linux mount, which gets no `FUSE_DESTROY`, through
+  `Volume::end_takeover_holder` from the server's `end_attachment`. That second path has only the old real-mount
+  release test as evidence, which a mount's own `FORGET` now settles before the mount ends (2d8eee97). A test needs a file
+  kept with no `FORGET` to come: unlinked through the successor while a handle no image counted is open, then the mount
+  unmounted while the handle is held (a lazy unmount) and `referenced_bytes` read back to its level before the file.
 - **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
   left its open in the image, and nothing ever gave it back.
 
