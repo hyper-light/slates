@@ -12115,3 +12115,81 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## The idle window's rule, measured: main, x100, and three rules against it (A-223; R9; CI; 2026-11-09)
+
+**What was asked.** A-223 measures a real Windows wake, which made the idle window (the shard's wake estimate × `IDLE_WINDOW_RATIO`, 100) span a 1 ms pause and feed on its own spinning's queueing. The same rule already spun through a 1 ms pause on main on Linux (the window rule's baseline, above). The supervisor asked for a rule priced on something load cannot grow, judged by (a) the paced client's CPU, (b) quiet single-client p99, (c) loaded single-client p99 and (d) parks in the paced form above 0.
+
+**Measured and rejected: the floor of confirmed wakes** (605ec524, 2389b0d9, diag-liveness-33). The window priced on the smallest confirmed wake over the last one to two windows of 2^shift wakes. Under two spinners a logical CPU at 2 shards the floor itself queued: largest shard floor 33.8 ms on windows-latest, 17.3 ms on windows-11-arm, 0.90 ms on ubuntu-latest and 0.33 ms on ubuntu-24.04-arm, against at most 15 µs quiet.
+
+**Measured and rejected: option 1, the floor less the thread's run-queue time (Linux only).** The floor sample was each wake less the thread's `run_delay` across the wait (`/proc/thread-self/schedstat`). On fedora-2 (32 CPUs, 64 spinners, load 68) at 2 shards every shard floor read 0-1.75 µs, nearly all 0. Owner parks rose to 1,639-2,318 per 1,000 single-client creates, the loaded single-client p99 was 2.5-3.1 ms, and paced CPU was 238-243 thousandths of a core. A Linux wake's kick-to-running time is run-queue time, so subtracting it removes the wake itself. Windows reports no such time.
+
+**The comparison** (diag-liveness-35). Command: `provision_bench` with `PROVISION_BENCH_SHARDS=2`, built from main 1c49c33f and from the branch at 843cc514 with a diagnostic selector (`SLATES_DIAG_WINDOW_RULE`, f4f48b1b), on every CI runner. Arms: main; x100 (the window on the live mean × 100, A-223 alone); option 2, W = max(F, the boot probe's smallest confirmed wake), where F = 50 µs is R9's provisioning floor (AC-2.1, T-2.6); option 3, the live floor × 100 capped at 4F (the 4 is a bare factor, not derived). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU, with the daemon booting beside them. Three rounds, the arms alternating, 24 runs per runner.
+
+### windows-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 45: 29, 33, 39, 42, 45, 45, 46, 53, 69 | med 749: 706, 740, 742, 743, 749, 751, 752, 755, 759 | med 79.7: 46.8, 49.1, 50.0, 51.9, 79.7, 80.7, 86.7, 88.7, 216.6 | med 129.1: 51.0, 87.3, 94.1, 97.1, 129.1, 65.1ms, 73.2ms, 86.8ms, 89.4ms | 1169, 1440, 1588, 1628, 1830, 1896 | 28, 36, 38, 51, 58, 62 |
+| x100 (mean) | med 232: 177, 180, 203, 223, 232, 241, 242, 250, 254 | med 775: 766, 769, 773, 774, 775, 776, 777, 779, 782 | med 35.9: 31.4, 33.2, 33.7, 35.6, 35.9, 36.1, 37.7, 39.3, 39.9 | med 127.1: 81.9, 86.8, 105.8, 106.4, 127.1, 133.3, 140.4, 43.5ms, 74.7ms | 1039, 1149, 1153, 1312, 1396, 1419 | 2, 2, 4, 4, 8, 10 |
+| option 2 | med 45: 20, 31, 39, 40, 45, 48, 49, 50, 67 | med None: - | med 41.2: 39.5, 40.3, 40.5, 40.6, 41.2, 42.6, 42.6, 43.0, 43.3 | med 98.8ms: 96.9ms, 97.2ms, 98.2ms, 98.8ms, 98.8ms, 98.8ms, 99.4ms, 100.2ms, 100.5ms | 1351, 1380, 1526, 1796, 1798, 1830 | - |
+| option 3 | med 64: 37, 50, 61, 63, 64, 67, 69, 69, 69 | med 12: 10, 12, 15 | med 38.0: 31.3, 33.4, 34.9, 35.6, 38.0, 38.4, 38.6, 38.9, 39.0 | med 97.1ms: 92.8ms, 93.1ms, 94.8ms, 96.5ms, 97.1ms, 97.6ms, 100.8ms, 137.1ms, 163.9ms | 1160, 1161, 1200, 1427, 1430, 1485 | 1890, 2314 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 3.1, 6.4, 6.4 µs; loaded 10.1, 10.1, 10.1 µs
+All rules-binary boots: quiet floor 3.1, 6.4, 6.4, 6.4, 6.4, 6.4, 6.5, 6.5, 6.5 µs (N=9); loaded floor 10.0, 10.0, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1 µs (N=9)
+Problems: ['== exit 124', '== exit 124', '== exit 124', '== exit 124', '== exit 124']
+
+### windows-11-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 37: 29, 29, 31, 35, 37, 38, 41, 44, 50 | med 702: 162, 176, 181, 666, 702, 707, 725, 733, 737 | med 30.2: 27.9, 27.9, 29.5, 29.9, 30.2, 30.3, 34.8, 36.7, 40.7 | med 36.0ms: 44.8, 83.6, 129.0, 10.8ms, 36.0ms, 41.3ms, 48.3ms, 49.2ms, 51.9ms | 1172, 1266, 1412, 1570, 1612, 1882 | 4, 6, 8, 10, 1301, 1473 |
+| x100 (mean) | med 274: 225, 256, 260, 274, 274, 280, 284, 290, 435 | med 736: 693, 716, 718, 730, 736, 740, 741, 741, 756 | med 31.2: 25.7, 29.2, 29.5, 30.5, 31.2, 32.2, 33.7, 35.5, 76.1 | med 125.2: 72.6, 85.7, 91.5, 93.8, 125.2, 126.0, 131.2, 25.8ms, 36.9ms | 1163, 1170, 1180, 1386, 1387, 1393 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 39: 33, 33, 35, 35, 39, 44, 48, 54, 56 | med 11: 8, 10, 10, 11, 11, 12, 12, 12, 13 | med 42.6: 25.0, 29.9, 31.6, 31.7, 42.6, 42.9, 43.6, 93.8, 161.7 | med 48.2ms: 47.8ms, 48.0ms, 48.1ms, 48.1ms, 48.2ms, 48.2ms, 52.2ms, 54.7ms, 56.2ms | 1782, 1800, 1810, 1973, 1976, 2010 | 1863, 1864, 1864, 2221, 2226, 2231 |
+| option 3 | med 54: 40, 46, 50, 50, 54, 54, 58, 62, 68 | med 17: 12, 12, 13, 17, 17, 17, 18, 18, 22 | med 30.0: 27.5, 27.5, 27.9, 29.4, 30.0, 30.5, 33.5, 34.4, 36.2 | med 48.3ms: 47.9ms, 48.0ms, 48.0ms, 48.1ms, 48.3ms, 48.4ms, 48.6ms, 50.8ms, 66.8ms | 1186, 1190, 1251, 1398, 1408, 1421 | 1849, 1849, 1858, 2206, 2212, 2213 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.8, 6.4, 7.1 µs; loaded 4.9, 5.1, 5.1 µs
+All rules-binary boots: quiet floor 5.4, 5.6, 5.7, 5.8, 5.8, 5.8, 6.0, 6.4, 7.1 µs (N=9); loaded floor 4.7, 4.9, 4.9, 5.0, 5.1, 5.1, 5.1, 5.2, 5.2 µs (N=9)
+
+### ubuntu-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 1502: 1451, 1462, 1467, 1481, 1502, 1512, 1552, 1908, 1980 | med 980: 905, 938, 945, 978, 980, 1011, 1029, 1043, 1051 | med 19.3: 17.8, 18.1, 18.7, 19.0, 19.3, 19.3, 19.3, 19.6, 19.6 | med 8.0ms: 7.0ms, 7.1ms, 8.0ms, 8.0ms, 8.0ms, 8.1ms, 9.1ms, 9.9ms, 10.0ms | 0, 0, 182, 709, 717, 784 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1619: 1467, 1468, 1475, 1482, 1619, 1884, 2023, 2024, 2025 | med 943: 858, 900, 933, 934, 943, 956, 958, 1020, 1029 | med 18.3: 16.4, 17.2, 17.5, 18.1, 18.3, 18.4, 19.2, 20.0, 20.4 | med 8.5ms: 6.9ms, 7.0ms, 7.4ms, 8.2ms, 8.5ms, 9.9ms, 9.9ms, 9.9ms, 9.9ms | 0, 0, 0, 177, 673, 802 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 162: 155, 157, 160, 161, 162, 162, 163, 168, 170 | med 343: 299, 302, 315, 331, 343, 379, 421, 430, 434 | med 19.0: 17.1, 17.5, 17.6, 18.8, 19.0, 19.2, 19.4, 19.6, 20.1 | med 4.0ms: 2.9ms, 3.2ms, 3.9ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms | 754, 765, 888, 891, 911, 1013 | 1537, 1553, 1644, 2120, 2175, 2200 |
+| option 3 | med 361: 356, 358, 359, 361, 361, 361, 366, 369, 369 | med 447: 420, 420, 426, 439, 447, 451, 452, 452, 469 | med 19.5: 17.2, 18.4, 18.7, 19.1, 19.5, 19.7, 19.9, 24.0, 36.0 | med 4.0ms: 3.6ms, 3.7ms, 3.7ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 5.0ms, 5.0ms | 740, 788, 878, 882, 936, 988 | 1652, 1740, 1812, 2145, 2194, 2420 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.9, 6.2, 6.2 µs; loaded 21.7, 50.1, 258.8 µs
+All rules-binary boots: quiet floor 5.9, 5.9, 5.9, 6.0, 6.0, 6.0, 6.2, 6.2, 6.2 µs (N=9); loaded floor 6.8, 21.7, 42.8, 48.8, 50.1, 67.3, 73.0, 74.5, 258.8 µs (N=9)
+
+### ubuntu-24.04-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 2017: 1626, 1637, 1732, 2001, 2017, 2021, 2022, 2022, 2023 | med 950: 859, 864, 918, 928, 950, 952, 966, 972, 1002 | med 23.3: 23.1, 23.1, 23.1, 23.1, 23.3, 23.7, 23.7, 23.9, 24.0 | med 9.8ms: 7.9ms, 9.0ms, 9.1ms, 9.8ms, 9.8ms, 9.9ms, 10.0ms, 10.0ms, 10.0ms | 0, 0, 0, 16, 172, 362 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1610: 1584, 1590, 1608, 1609, 1610, 1707, 2005, 2020, 2022 | med 965: 813, 907, 940, 941, 965, 989, 1028, 1042, 1058 | med 23.4: 22.9, 23.3, 23.3, 23.3, 23.4, 23.9, 24.4, 25.1, 26.0 | med 8.0ms: 6.9ms, 6.9ms, 7.0ms, 7.7ms, 8.0ms, 8.9ms, 9.9ms, 9.9ms, 12.1ms | 0, 0, 12, 315, 341, 398 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 198: 193, 194, 194, 195, 198, 198, 202, 203, 224 | med 318: 289, 289, 295, 306, 318, 360, 440, 516, 524 | med 24.1: 23.1, 23.5, 23.9, 23.9, 24.1, 24.3, 24.9, 24.9, 25.2 | med 4.0ms: 2.9ms, 3.0ms, 3.1ms, 3.1ms, 4.0ms, 4.0ms, 6.2ms, 6.4ms, 6.7ms | 808, 908, 909, 947, 1018, 1044 | 1606, 1836, 1843, 1848, 2344, 2535 |
+| option 3 | med 396: 383, 391, 394, 395, 396, 398, 399, 405, 408 | med 406: 362, 388, 394, 401, 406, 410, 414, 446, 452 | med 24.0: 22.9, 23.4, 23.6, 23.9, 24.0, 24.1, 24.3, 25.2, 26.0 | med 3.7ms: 3.6ms, 3.7ms, 3.7ms, 3.7ms, 3.7ms, 4.0ms, 4.6ms, 5.0ms, 5.8ms | 844, 844, 863, 952, 984, 988 | 1560, 1652, 1822, 1994, 2030, 2250 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 6.3, 6.5, 6.6 µs; loaded 12.0, 19.3, 346.0 µs
+All rules-binary boots: quiet floor 5.4, 6.3, 6.4, 6.4, 6.4, 6.4, 6.5, 6.6, 6.6 µs (N=9); loaded floor 8.2, 12.0, 19.3, 43.9, 45.3, 70.6, 87.4, 323.8, 346.0 µs (N=9)
+
+### macos-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 304: 105, 121, 129, 275, 304, 310, 317, 332, 333 | med 172: 64, 68, 72, 148, 172, 176, 353, 397, 510 | med 350.8: 273.7, 281.4, 287.6, 292.9, 350.8, 355.4, 584.4, 608.3, 690.3 | med 3.9ms: 3.2ms, 3.3ms, 3.7ms, 3.9ms, 3.9ms, 3.9ms, 4.0ms, 4.1ms, 4.1ms | 459, 587, 589, 665, 1158, 1230 | 0, 30, 639, 860, 1093, 1212 |
+| x100 (mean) | med 328: 153, 210, 293, 309, 328, 337, 337, 348, 384 | med 132: 82, 90, 108, 131, 132, 133, 501, 503, 536 | med 298.5: 242.7, 262.0, 269.8, 273.5, 298.5, 299.1, 312.3, 350.8, 589.8 | med 3.8ms: 3.4ms, 3.4ms, 3.7ms, 3.7ms, 3.8ms, 3.9ms, 3.9ms, 3.9ms, 4.1ms | 490, 628, 707, 712, 722, 769 | 0, 90, 804, 884, 1000, 1147 |
+| option 2 | med 95: 85, 88, 90, 92, 95, 96, 98, 106, 112 | med 84: 60, 71, 73, 74, 84, 88, 94, 98, 99 | med 273.7: 242.2, 245.4, 246.7, 266.9, 273.7, 274.0, 284.8, 299.5, 527.8 | med 3.7ms: 3.0ms, 3.5ms, 3.5ms, 3.6ms, 3.7ms, 3.8ms, 3.8ms, 3.8ms, 3.9ms | 1390, 1400, 1498, 1640, 1658, 1756 | 1301, 1318, 1338, 1690, 1736, 1775 |
+| option 3 | med 97: 75, 83, 92, 95, 97, 104, 104, 109, 123 | med 81: 36, 48, 68, 75, 81, 82, 85, 95, 96 | med 282.1: 260.3, 268.1, 273.2, 282.0, 282.1, 302.5, 517.9, 569.5, 709.0 | med 3.8ms: 2.2ms, 2.6ms, 3.5ms, 3.6ms, 3.8ms, 3.8ms, 3.9ms, 4.0ms, 4.0ms | 1343, 1404, 1453, 1552, 1583, 1656 | 1146, 1251, 1426, 1456, 1646, 1670 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 0.9, 1.0, 1.0 µs; loaded 0.7, 0.8, 0.8 µs
+All rules-binary boots: quiet floor 0.9, 0.9, 1.0, 1.0, 1.0, 1.3, 1.3, 2.3, 2.8 µs (N=9); loaded floor 0.7, 0.7, 0.8, 0.8, 0.8, 1.0, 1.0, 1.2, 1.2 µs (N=9)
+
+**What it shows.**
+- **Linux and macOS: option 2 meets (a)-(d).** Paced CPU quiet fell from main's 1,451-2,023 to 155-224 thousandths of a core on Linux. Quiet p99 stays within main's spread. Loaded p99 halved (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64). The owner parks under the paced form while loaded (1,537-2,535 per 1,000), where main's never does.
+- **Option 3 is measured and rejected.** It is no better than option 2 on any criterion, and its paced CPU on Linux is about twice option 2's (356-408 against 155-224 quiet).
+- **The loaded boot inflates option 2's input.** A Linux daemon booted beside two spinners a CPU read the probe's smallest wake at 6.8-259 µs (x86_64) and 8.2-346 µs (arm64), past F in 5 of 9 boots on each runner, against 5.4-6.6 µs quiet. So the boot minimum cannot be trusted under load, and option 2 becomes W = F alone. Windows' loaded boots read 4.7-10.1 µs and macOS's 0.7-2.8 µs.
+- **Windows: option 2 fails (c).** A shard parked under two spinners a CPU pays a wake of 50-100 ms on every request. On windows-latest the loaded single-client p99 was 97-100 ms in all nine runs, against x100's median 127 µs and main's 129 µs. Every loaded option 2 run, and two of three loaded option 3 runs, ran past the bench's 1,500 s limit before the paced form. On windows-11-arm the loaded p99 was 47.8-56.2 ms, against x100's median 125 µs. Windows' paced CPU was already low on main (29-69 quiet), and option 2 keeps it there (20-67 quiet), so a short window buys little on Windows and costs its loaded tail. This repeats A-218's Windows finding.
+- **The rule for Windows is the supervisor's decision** (A-223 plan, 2026-11-09). The choices are W = F on Linux and macOS with x100 kept on Windows, W = F everywhere, or a Windows window measured first.
