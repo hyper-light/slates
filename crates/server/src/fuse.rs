@@ -1412,6 +1412,18 @@ fn ended(s: &mut ShardState, attachment: u64) {
   }
 }
 
+/// Fences the FUSE mount of `attachment` if the shard serves one, its record ended (a consumer's revocation, an
+/// expiry, a detach): its registry attachment is revoked, so its next request is refused and the turn ends the mount,
+/// which the kernel then answers `ENOTCONN` until its user unmounts it (A-102). A host mount's record end revokes its
+/// registry attachment the same way (`end_attachment`); a FUSE mount's lives in the mount, which went on serving a revoked
+/// consumer (AUD-29-84 on Linux: `a_revoked_consumers_fuse_mount_reaches_nothing`, a fresh open read the file after the
+/// revocation, 3 of 3 on adacachy2).
+pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
+  if let Some(registry) = s.fuse_mounts.get(&attachment).map(|mount| mount.registry) {
+    s.attachments.revoke(registry);
+  }
+}
+
 /// Unmounts the FUSE mount of `attachment` if the shard serves one (a `detach`, the volume's destroy): the
 /// kernel's disconnect then ends the serve task, which ends what remains.
 pub(crate) fn unmount_if_mounted(s: &ShardState, attachment: u64) {

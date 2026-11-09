@@ -331,6 +331,101 @@ fn left_dead_until_its_user_unmounts(point: &str, what: &str) {
   );
 }
 
+/// AUD-29-84 on Linux (§4.13 "every later effect", A-28): a consumer's revocation must fence its FUSE mount, as it
+/// fences its NFS mount on macOS (`a_revoked_consumers_mount_capability_reaches_nothing`). Do: the account creates a
+/// volume, mounts it, writes `f` there and shares the volume with an enrolled consumer; a workload bound to the consumer
+/// mounts it for reading at its own point and reads `f`; the human revokes the consumer; then `f` is opened afresh through the
+/// consumer's mount, and through the account's. Expect: the consumer's read served before; after, its fresh open
+/// refused (a fresh open asks the daemon, where a descriptor held from before could be answered from the kernel's
+/// cache); the account's mount still reads. The revocation ends the consumer's attachments before it is acknowledged.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mounts: RAM, not disk
+fn a_revoked_consumers_fuse_mount_reaches_nothing() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-revoke-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fuse-revoke"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = rustix::process::getuid().as_raw();
+  let mut owner = connect(&instance);
+  let mut workload = connect(&instance);
+  let (consumer, capability) = owner
+    .enroll(
+      account,
+      slates_server::landing::enroll_proof(&secret, account),
+    )
+    .unwrap();
+  workload.attest(consumer, &capability).unwrap();
+  let volume = owner.create(&scratch("fuse-revoked")).unwrap();
+  let owners = target_dir();
+  let owners_mount = owner
+    .attach_fuse(volume, Intent::Write, &owners.path)
+    .unwrap();
+  std::fs::write(format!("{}/f", owners.path), b"shared bytes").unwrap();
+  owner
+    .share(
+      volume,
+      slates_client::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
+      slates_ipc::protocol::Rights {
+        read: true,
+        write: true,
+        admin: false,
+      },
+    )
+    .unwrap();
+  let consumers = target_dir();
+  // For reading: the account's mount holds the volume's write lease.
+  workload
+    .attach_fuse(volume, Intent::Read, &consumers.path)
+    .unwrap();
+  let before = std::fs::read(format!("{}/f", consumers.path));
+  owner
+    .revoke(
+      consumer,
+      slates_server::landing::revoke_proof(&secret, consumer),
+    )
+    .unwrap();
+  let after = std::fs::read(format!("{}/f", consumers.path));
+  let owners_read = std::fs::read(format!("{}/f", owners.path));
+  owner.detach(owners_mount.attachment).unwrap();
+  let _ = Command::new("fusermount3")
+    .args(["-u", "-z", &consumers.path])
+    .status();
+  daemon.stop();
+  assert_eq!(
+    before.as_deref().ok(),
+    Some(&b"shared bytes"[..]),
+    "the consumer's mount read before the revocation: {before:?}"
+  );
+  assert!(
+    after.is_err(),
+    "the revoked consumer's mount reaches nothing: a fresh open read {after:?}"
+  );
+  assert_eq!(
+    owners_read.as_deref().ok(),
+    Some(&b"shared bytes"[..]),
+    "the account's own mount is not revoked with the consumer: {owners_read:?}"
+  );
+}
+
 /// AUD-29-64 (the daemon serves Linux FUSE). Do: start a daemon, create a volume, and attach it with the
 /// FUSE form at a fresh directory; work through the kernel; read the mount table; detach; attach again and
 /// unmount from the kernel's side (`fusermount3 -u`); ask for a mount over a regular file; attach again and

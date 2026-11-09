@@ -8481,6 +8481,10 @@ pub(crate) fn end_attachment(
     #[cfg(target_os = "linux")]
     crate::fuse::unmount_if_mounted(state, record.id);
   }
+  // However it ends, a FUSE mount of the attachment serves nothing more: its registry attachment is revoked, as a host
+  // mount's is below, so a revoked consumer's mount reaches nothing (AUD-29-84).
+  #[cfg(target_os = "linux")]
+  crate::fuse::fence_if_mounted(state, record.id);
   // A WinFsp mount ends with its attachment, however it ends: a drive letter has no directory beneath it for a later
   // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
   #[cfg(windows)]
