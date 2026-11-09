@@ -1,6 +1,7 @@
 //! Measurement (not a gate): what `changed_since` costs on a large green with a long history, read from the change
-//! index (`Green::changes_after`), against `Green::changed_between(v, head)`, the per-path histories' walk of every path,
-//! at a dense span and at sparse ones, on a tree and on several copies of it (`SLATES_TREE_COPIES`), §4.16. Skips loudly without the tree; run in release:
+//! index (`Green::changes_after`), against the per-path histories' walk of every path (`changed_between_by_histories`,
+//! the tests' model), at a dense span and at sparse ones, on a tree and on several copies of it (`SLATES_TREE_COPIES`),
+//! §4.16. Skips loudly without the tree; run in release:
 //! `SLATES_KERNEL_TREE=<linux-v7.4-rc1> cargo test --release -p slates-merge --test changed_since_cost -- --ignored --nocapture`.
 // Test harness code: an unwrap here is a failed run.
 #![allow(
@@ -124,13 +125,18 @@ fn changed_since_over_every_dimension_against_the_content_index() {
   eprintln!("history of {SUBMITS} submits in {:?}", built.elapsed());
   let head = green.head();
   for version in [0, head / 2, head.saturating_sub(10), head.saturating_sub(1)] {
-    let expected = green.changed_between(version, head);
+    let expected = green.changed_between_by_histories(version, head);
+    assert_eq!(
+      green.changed_between(version, head),
+      expected,
+      "changed_between reads the index exactly"
+    );
     assert_eq!(
       green.changed_since(version),
       expected,
       "the change index answers changed_between(v, head) exactly"
     );
-    let (whole_ns, whole_len) = best(|| green.changed_between(version, head).len());
+    let (whole_ns, whole_len) = best(|| green.changed_between_by_histories(version, head).len());
     let (merged_ns, merged_len) = best(|| green.changed_since(version).len());
     let (paged_ns, pages) = best(|| {
       let mut cursor = None;
@@ -149,7 +155,7 @@ fn changed_since_over_every_dimension_against_the_content_index() {
       pages
     });
     eprintln!(
-      "since version {version} of {head}: changed_between {whole_ns} ns ({whole_len} paths) | change index {merged_ns} \
+      "since version {version} of {head}: the histories walk {whole_ns} ns ({whole_len} paths) | change index {merged_ns} \
        ns ({merged_len}) | paged walk {paged_ns} ns ({pages} pages of {PAGE_PATHS}, {} ns a page)",
       paged_ns / pages.max(1) as u128
     );

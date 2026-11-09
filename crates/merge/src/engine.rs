@@ -503,12 +503,14 @@ pub struct Green {
   /// changed the special it names, the rule [`Green::changed_between`] applies. Each entry carries whether its version
   /// is the last its path changed at (cleared on the earlier entry when a later version records the path again), and
   /// its place in its version's list as recorded, so a walk's cursor holds when a fold drops entries. Below the fold
-  /// floor only each path's last change is kept: what changed since a version there is the paths whose last change is
-  /// after it, which a fold and a restore from a checkpoint both keep.
+  /// floor each path keeps only its last change before the floor, as the folded histories keep each key's value in
+  /// effect at the floor, and a restore from a checkpoint indexes the same.
   changes: BTreeMap<u64, Vec<ChangeEntry>>,
   /// The last version in `changes` each path changed at: a path changed at several versions of a span is answered once,
   /// at the last of them. One entry a path ever changed, as the histories keep a key a path.
   latest_change: BTreeMap<String, u64>,
+  /// Each path's last change below the fold floor, whose entry the change index keeps there ([`Green::fold_history_before`]).
+  below_floor_last: BTreeMap<String, u64>,
   /// The hard links naming each target, the reverse of `hardlinks`: the links a special's change changes.
   links_to: BTreeMap<String, BTreeSet<String>>,
   /// The bytes `changes` and `latest_change` hold, a running total counted in [`Green::history_bytes`], so the index
@@ -612,9 +614,10 @@ fn history_at<T: Clone>(history: &[(u64, Option<T>)], version: u64) -> Option<T>
     .and_then(|(_, value)| value.clone())
 }
 
-/// Whether a per-version history has an entry at a version in `(from, to]`. Histories are in version order, so this is
-/// a seek to the first entry past `from`, never a scan of the path's whole history (a file many clients edit has an
-/// entry a version until the fold).
+/// Whether a per-version history has an entry at a version in `(from, to]` (the model's, `test-model`). Histories are in
+/// version order, so this is a seek to the first entry past `from`, never a scan of the path's whole history (a file
+/// many clients edit has an entry a version until the fold).
+#[cfg(feature = "test-model")]
 fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
   history
     .get(history.partition_point(|(version, _)| *version <= from))
@@ -643,6 +646,10 @@ fn relink(
       .insert(alias.to_owned());
   }
 }
+
+/// Format: what the change index holds for each path a restore indexes: its entry in its version, its last change
+/// (`latest_change`) and its last change below the floor (`below_floor_last`).
+const RESTORED_INDEX_ENTRIES: usize = 3;
 
 /// Notes in `last` that `path` changed at `version`, when that is after the origin and later than what it holds.
 fn note_last(last: &mut BTreeMap<String, u64>, path: &str, version: Option<u64>) {
@@ -696,7 +703,8 @@ pub struct ChangeAt<'a> {
   pub last: bool,
 }
 
-/// The paths of a per-path history that changed at a version in `(from, to]`.
+/// The paths of a per-path history that changed at a version in `(from, to]` (the model's, `test-model`).
+#[cfg(feature = "test-model")]
 fn paths_changed_in<T>(
   histories: &BTreeMap<String, Vec<(u64, T)>>,
   from: u64,
@@ -1334,10 +1342,27 @@ impl Green {
 
   /// The paths any dimension of which changed at a version in `(from, to]` (§4.16 "`advance` …
   /// invalidates exactly the paths the manifest diff between the two versions names"): what an
-  /// attachment moving from `from` to `to` must invalidate. Read off the per-dimension histories,
-  /// which hold every version a path changed at — not the last-changed index alone, which would
-  /// miss a path changed inside the span and again after it. Sorted, each path once.
+  /// attachment moving from `from` to `to` must invalidate, read from the change index in the span's own entries, so
+  /// it costs the changes in the span and never the green's tree (A-264). Every version a path changed at is an entry
+  /// at or above the fold floor, so a path changed inside the span and again after it is named; below the floor each
+  /// path keeps its last change before the floor, as the folded histories do. Sorted, each path once.
   pub fn changed_between(&self, from: u64, to: u64) -> Vec<String> {
+    if from >= to {
+      return Vec::new();
+    }
+    let changed: BTreeSet<&str> = self
+      .changes
+      .range(from.saturating_add(1)..=to)
+      .flat_map(|(_, entries)| entries.iter().map(|entry| entry.path.as_str()))
+      .collect();
+    changed.into_iter().map(str::to_owned).collect()
+  }
+
+  /// The model of [`Green::changed_between`], for tests only (the `test-model` feature): the paths any dimension of
+  /// which changed at a version in `(from, to]`, read off the per-dimension histories, a walk of every path. Product
+  /// code reads the change index; this second computation stays out of it, as the oracle the index is checked against.
+  #[cfg(feature = "test-model")]
+  pub fn changed_between_by_histories(&self, from: u64, to: u64) -> Vec<String> {
     let mut changed: BTreeSet<String> = BTreeSet::new();
     changed.extend(paths_changed_in(&self.content_history, from, to));
     changed.extend(paths_changed_in(&self.special_history, from, to));
@@ -2923,10 +2948,12 @@ impl Green {
     for (path, version) in &last {
       by_version.entry(*version).or_default().insert(path.clone());
     }
+    // Every key restored is at or below the checkpoint, the restored green's floor: its last change is the one below it.
     self.changes_bytes = last
       .keys()
-      .map(|path| change_bytes(path).saturating_mul(2))
+      .map(|path| change_bytes(path).saturating_mul(RESTORED_INDEX_ENTRIES))
       .sum();
+    self.below_floor_last = last.clone();
     self.changes = by_version
       .into_iter()
       .map(|(version, paths)| (version, numbered(paths)))
@@ -2934,21 +2961,44 @@ impl Green {
     self.latest_change = last;
   }
 
-  /// Folds the change index below `floor`, as the histories fold (each key's value in effect at the floor kept): every
-  /// entry below the floor a later version superseded goes, and each path's last change stays, so what changed since a
-  /// version below the floor is still answered, as the folded histories answer it. A version emptied goes too.
-  fn fold_changes_before(&mut self, floor: u64) {
-    let mut released = 0usize;
-    for entries in self.changes.range_mut(..floor).map(|(_, entries)| entries) {
-      entries.retain(|entry| {
-        if !entry.last {
-          released = released.saturating_add(change_bytes(&entry.path));
+  /// Folds the change index below `floor` (from `previous`, the floor before), as the histories fold, each key keeping
+  /// its value in effect at the floor: of a path's entries below the floor only its last stays, the others go, so a span
+  /// that starts below the floor and ends at or above it is answered as the folded histories answer it. A version
+  /// emptied goes too; an entry keeps its place in its version, so a walk's cursor holds. The cost of the entries the
+  /// floor passes.
+  fn fold_changes_before(&mut self, previous: u64, floor: u64) {
+    let passed: Vec<u64> = self
+      .changes
+      .range(previous..floor)
+      .map(|(version, _)| *version)
+      .collect();
+    for version in passed {
+      let paths: Vec<String> = self
+        .changes
+        .get(&version)
+        .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect())
+        .unwrap_or_default();
+      for path in paths {
+        match self.below_floor_last.insert(path.clone(), version) {
+          None => self.changes_bytes = self.changes_bytes.saturating_add(change_bytes(&path)),
+          Some(earlier) => self.drop_change_entry(earlier, &path),
         }
-        entry.last
-      });
+      }
     }
-    self.changes.retain(|_, entries| !entries.is_empty());
-    self.changes_bytes = self.changes_bytes.saturating_sub(released);
+  }
+
+  /// Drops `path`'s entry at `version` from the change index, and the version when it is left empty.
+  fn drop_change_entry(&mut self, version: u64, path: &str) {
+    let Some(entries) = self.changes.get_mut(&version) else {
+      return;
+    };
+    if let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(path)) {
+      entries.remove(at);
+      self.changes_bytes = self.changes_bytes.saturating_sub(change_bytes(path));
+    }
+    if entries.is_empty() {
+      self.changes.remove(&version);
+    }
   }
 
   /// The bytes the change index holds (`changes`, `latest_change`), a running total: charged with the histories'
@@ -2965,6 +3015,7 @@ impl Green {
       .flatten()
       .map(|entry| &entry.path)
       .chain(self.latest_change.keys())
+      .chain(self.below_floor_last.keys())
       .map(|path| change_bytes(path))
       .sum()
   }
@@ -3413,9 +3464,10 @@ impl Green {
     if self.identity_version < floor {
       self.fold_identity();
     }
+    let previous = self.folded_below;
     self.folded_below = floor;
     let before = self.history_bytes().saturating_add(self.changes_bytes);
-    self.fold_changes_before(floor);
+    self.fold_changes_before(previous, floor);
     self.fold_content_before(floor);
     self.fold_specials_before(floor);
     for history in self.mode_history.values_mut() {

@@ -20111,6 +20111,14 @@ chain), GAPS, `docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`
   `UnknownBase`.
 - **Seeks:** `history_touches`, `history_at` and `present_at` scanned a path's whole history; histories are in version
   order, so each is one `partition_point`.
+- **One computation (2026-11-09):** `changed_between`, what `advance` invalidates by, walked every path's histories
+  beside the index `changed_since` read: two computations of what changed between versions, free to drift. It reads the
+  index's entries in the span; below the fold floor the index keeps each path's last change before the floor, as the
+  folded histories keep each key's value in effect there. The history walk is the tests' model
+  (`changed_between_by_histories`, the `test-model` feature, never in the shipped crate); the checkpoint proptest
+  compares `changed_between` and `changed_since` with it at every version and over every span ending at or above the
+  floor, in a green folded or not and its restoration. Red: four mutations of the index (the span's end excluded, a
+  superseded entry left last, a special's links not recorded, the fold keeping only last changes) each fail it.
 - **Cost, measured:** a page of 150 entries from the change index costs 0.25 to 1.7 µs at every span, on the kernel tree (97,229 paths) and on ten copies of it (972,290), where the path-keyed walk cost 17 to 33 µs a page at the dense spans and 0.6 to 1.4 ms at the sparse ones, and ten times the tree 90 to 236 µs and 10 to 22 ms (2,000 submits; release; this Mac at load 37 to 41; the two alternated ABBA; 2026-11-09). The index answers `changed_between(v, head)` at every version measured.
 - **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
   an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.

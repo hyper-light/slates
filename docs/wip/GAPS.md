@@ -52,8 +52,9 @@
 >   never the tree. It reports every dimension (`changed_between(v, head)`), where it read the content index alone. One
 >   path always fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the
 >   longest an edit carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one
->   page when it lands. **Open:** `changed_between` itself, which `advance` invalidates by, still walks every path's
->   histories (now by seeks, but every path); it can read the same index
+>   page when it lands. `changed_between`, which `advance` invalidates by, reads the same index (one
+>   computation in product code); the history walk is the tests' model (`test-model`), checked against at every
+>   version, below the checkpoint, across folds and after a restore
 >   (`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`).
 > - **Still open, the same one-reply shape**, by their code and not reproduced: `audit`, `grants`, a status's `drifted`
 >   list, and the conflict and invalidation lists of `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs

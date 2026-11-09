@@ -106,3 +106,20 @@ above; this Mac at load 37 to 41, the walk and the index alternated ABBA, best o
 The walk's page grew with the tree; the index's does not, at any span. A first cut of the index looked each entry's path
 up in the last-change map as it walked (55 to 130 µs a page at the dense spans, slower than the walk there); each entry
 now carries whether it is its path's last, cleared on the earlier entry when a later version records the path.
+
+**And one computation** (the supervisor's review, 2026-11-09). With the index, product code held two computations of
+what changed between versions: `changed_since` read the index, and `changed_between`, what `advance` invalidates an
+attachment by, still walked every path's histories. Two can drift. `changed_between` now reads the index's entries in
+its span. Below the fold floor the index keeps each path's last change before the floor (`below_floor_last`), as the
+folded histories keep each key's value in effect there, so a span starting below the floor and ending at or above it is
+answered as before. The walk moved to the tests as the model: `changed_between_by_histories`, built only under the
+merge crate's `test-model` feature, which the crate's own tests enable. The checkpoint proptest
+(`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`) compares `changed_between` and `changed_since`
+with it at every version and over every span ending at or above the floor, in a green folded or not and in its
+restoration.
+
+Red, by mutation of the index, each caught by that proptest with a minimal case:
+- the span's last version excluded: `changed_between(0, 1): [], the model ["a"]`;
+- a superseded entry left `last`: `changed_since(0): ["a", "a", "a", "b", "d/y", "d/y", "dd"]`, the model's each once;
+- a special's hard links not recorded: `changed_since(1): ["a"], the model ["a", "b"]`;
+- the fold keeping only each path's last change overall: `changed_between(2, 4): ["dd"], the model ["d/y", "dd"]`.
