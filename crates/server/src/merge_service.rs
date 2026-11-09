@@ -1555,6 +1555,24 @@ const INPUTS_ENTRY_NAME: &str = "inputs";
 /// the corrupted byte can never equal the original whatever its value.
 const CORRUPTION_MASK: u8 = 0xff;
 
+/// Counted each pass a version's record waits for its submitting work's catalog record to commit (A-255).
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_catalog";
+/// Format: a merge record's magic, "GMRC" little-endian, after the register's class byte: an unversioned record an
+/// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
+const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
+/// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key);
+/// a decoder refuses any other.
+const RECORD_VERSION: u32 = 1;
+/// Format: the magic and version before a merge record's value.
+const RECORD_FRAME_BYTES: usize = 4 + 4;
+/// Counted where a merge record of another format version was refused (a peer of another build).
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const RECORD_VERSION_REFUSED: &str = "merge.record.version_refused";
+/// Counted where a merge record's bytes were not its magic, version and one value.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const RECORD_MALFORMED: &str = "merge.record.malformed";
+
 /// A merge record's value (§4.16 `MergeRecord`): what the holders recompute against. The
 /// increment's bytes are never here (AC-6.5: an increment is a constant-size descriptor); they are
 /// the placed inputs the `inputs` identity names. Encoded by the daemon's canonical codec, so two
@@ -1629,16 +1647,79 @@ impl SubmitCompletion {
 }
 
 impl MergeRecordValue {
-  /// The value's canonical bytes, behind the merge register's class byte (`crate::catalog::MERGE_CLASS`).
+  /// The value's canonical bytes, behind the merge register's class byte (`crate::catalog::MERGE_CLASS`): the format's
+  /// magic and version, then the value.
   pub fn to_record_bytes(&self) -> Vec<u8> {
-    crate::catalog::tagged(crate::catalog::MERGE_CLASS, self.to_bytes())
+    let body = self.to_bytes();
+    let mut framed = Vec::with_capacity(RECORD_FRAME_BYTES.saturating_add(body.len()));
+    framed.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+    framed.extend_from_slice(&RECORD_VERSION.to_le_bytes());
+    framed.extend(body);
+    crate::catalog::tagged(crate::catalog::MERGE_CLASS, framed)
   }
 
-  /// Parses a record's value; `None` for another register class or for bytes that are not exactly one value.
+  /// Parses a record's value, refusing typed: another register class, another format version (a record a build of
+  /// another layout wrote, refused whole and never decoded by a second path, CLAUDE.md §2.7), or bytes that are not
+  /// exactly one value.
+  pub fn decode_record(bytes: &[u8]) -> Result<MergeRecordValue, RecordRefused> {
+    let body = crate::catalog::untagged(crate::catalog::MERGE_CLASS, bytes)
+      .ok_or(RecordRefused::OtherClass)?;
+    let (magic, rest) = body
+      .split_first_chunk::<4>()
+      .ok_or(RecordRefused::Malformed)?;
+    if u32::from_le_bytes(*magic) != RECORD_MAGIC {
+      return Err(RecordRefused::Malformed);
+    }
+    let (version, mut input) = rest
+      .split_first_chunk::<4>()
+      .ok_or(RecordRefused::Malformed)?;
+    let found = u32::from_le_bytes(*version);
+    if found != RECORD_VERSION {
+      return Err(RecordRefused::Version {
+        found,
+        expected: RECORD_VERSION,
+      });
+    }
+    let value =
+      <MergeRecordValue as Wire>::decode(&mut input).map_err(|_| RecordRefused::Malformed)?;
+    if input.is_empty() {
+      Ok(value)
+    } else {
+      Err(RecordRefused::Malformed)
+    }
+  }
+
+  /// [`Self::decode_record`] for a caller that only asks whether bytes are a merge record of this format: `None` for any
+  /// refusal, a record of another version included.
   pub fn from_record_bytes(bytes: &[u8]) -> Option<MergeRecordValue> {
-    let mut input = crate::catalog::untagged(crate::catalog::MERGE_CLASS, bytes)?;
-    let value = <MergeRecordValue as Wire>::decode(&mut input).ok()?;
-    if input.is_empty() { Some(value) } else { None }
+    Self::decode_record(bytes).ok()
+  }
+}
+
+/// Why bytes are not a merge record of this build's format ([`MergeRecordValue::decode_record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordRefused {
+  /// A register value of another class (a head, a catalog, a tombstone).
+  OtherClass,
+  /// A merge record of another format version.
+  Version {
+    /// The version the bytes carry.
+    found: u32,
+    /// This build's version.
+    expected: u32,
+  },
+  /// A merge record's class whose bytes are not its magic, its version and exactly one value.
+  Malformed,
+}
+
+impl RecordRefused {
+  /// The counter a holder or successor records a refused record under; `None` for another class, which is no refusal.
+  pub(crate) fn counter(self) -> Option<&'static str> {
+    match self {
+      Self::OtherClass => None,
+      Self::Version { .. } => Some(RECORD_VERSION_REFUSED),
+      Self::Malformed => Some(RECORD_MALFORMED),
+    }
   }
 }
 
@@ -1779,6 +1860,11 @@ pub struct PendingMergeRecord {
   /// [`PLACED_AFTER_PERIODS`] are judged from when the version places. Stamped at the enqueue, so a version the
   /// record plane leaves for its next period counts as having waited for it.
   pub first_period: Option<u64>,
+  /// The work whose submit made the version, while its owner holds it in memory (A-255): the record is not shipped
+  /// before that work's catalog record is committed at its quorum, so a holder never holds a submit's completion
+  /// without the route a resend reaches it by. `None` for a version no submit made (a green's version 0) and for a
+  /// record rebuilt at a restart, whose work's catalog was owed before the crash and is still owed by this owner.
+  pub work: Option<DbVolumeId>,
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -1794,6 +1880,9 @@ pub struct MergeFault {
   /// accepted; the owner counts no acknowledgement), so a version whose inputs placed still cannot
   /// commit at the quorum (AUD-11).
   pub refuse_records: bool,
+  /// Withhold the acknowledgement of every work's catalog record while set (A-255), so a submitting work's catalog
+  /// stays uncommitted and the version's merge record must wait for it.
+  pub refuse_work_catalogs: bool,
 }
 
 /// What a holder holds of a green's replica, for a test to observe.
@@ -1909,13 +1998,14 @@ pub(crate) fn enqueue_record(
   increment: [u8; 32],
   base: u64,
   evidence: Vec<[u8; 32]>,
-  completion: Option<SubmitCompletion>,
+  (completion, work): (Option<SubmitCompletion>, Option<DbVolumeId>),
 ) {
   enqueue_record_with(
     state,
     green,
     version,
     (increment, base, evidence, completion),
+    work,
     |state| {
       state
         .greens
@@ -1967,6 +2057,7 @@ pub(crate) fn enqueue_recovered_record(
     green,
     version,
     (increment, base, evidence, completion),
+    None,
     move |_| identity,
   );
 }
@@ -1978,6 +2069,7 @@ fn enqueue_record_with(
   green: DbVolumeId,
   version: u64,
   (increment, base, evidence, completion): ([u8; 32], u64, Vec<[u8; 32]>, Option<SubmitCompletion>),
+  work: Option<DbVolumeId>,
   identity_of: impl FnOnce(&mut ShardState) -> [u8; 32],
 ) {
   let object = ObjectId(green.bytes);
@@ -2065,6 +2157,7 @@ fn enqueue_record_with(
         ..shape
       },
       first_period: stamped,
+      work,
     },
   );
   nudge_record_plane(state);
@@ -2259,7 +2352,7 @@ pub(crate) fn next_merge_work(
   for object in objects {
     // The green's catalog register first (AUD-29-17): a successor that adopted a merge record and no catalog could
     // not say who may use the green, so no record ships before the catalog's current version is committed.
-    if !crate::fleet::green_catalog_committed(state, DbVolumeId { bytes: object.0 }, local) {
+    if !crate::fleet::catalog_committed(state, DbVolumeId { bytes: object.0 }, local) {
       continue;
     }
     let placement = config.place(object);
@@ -2283,6 +2376,16 @@ pub(crate) fn next_merge_work(
       else {
         continue;
       };
+      // The submitting work's catalog record before the record that carries its completion (A-255): a successor
+      // answers a resend only through the work's catalog, which names the green, so no holder takes the completion
+      // before the route is committed. A destroyed work's catalog owes nothing.
+      if pending
+        .work
+        .is_some_and(|work| !crate::fleet::catalog_committed(state, work, local))
+      {
+        state.count(RECORD_AWAITS_WORK_CATALOG, 1);
+        continue;
+      }
       let green = DbVolumeId { bytes: object.0 };
       let inputs = if carries_inputs(&pending, &targets) {
         let Some(bytes) = inputs_of(state, green, version) else {
@@ -2847,9 +2950,12 @@ pub(crate) fn accept_merge_record(
     state.count(RECORD_WITHHELD, 1);
     return Vec::new();
   }
-  let Some(value) = MergeRecordValue::from_record_bytes(&record.value) else {
-    state.count(INPUTS_UNDECODABLE, 1);
-    return Vec::new();
+  let value = match MergeRecordValue::decode_record(&record.value) {
+    Ok(value) => value,
+    Err(refused) => {
+      state.count(refused.counter().unwrap_or(INPUTS_UNDECODABLE), 1);
+      return Vec::new();
+    }
   };
   if record.sequence != value.version {
     state.count(OUT_OF_ORDER, 1);
@@ -3198,6 +3304,7 @@ mod tests {
         joint: Vec::new(),
       },
       first_period: None,
+      work: None,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -3294,6 +3401,7 @@ mod tests {
               joint: Vec::new(),
             },
             first_period: None,
+            work: None,
           },
         );
       }
@@ -3411,6 +3519,43 @@ mod tests {
     let mut padded = bytes;
     padded.push(0);
     assert!(MergeRecordValue::from_record_bytes(&padded).is_none());
+  }
+
+  /// A-255, hostile input: a merge record of another format version is refused typed with the version it carries, and
+  /// an unversioned record an earlier layout wrote (the value right after the class byte) and a foreign magic are refused
+  /// malformed. None is decoded by a second path.
+  #[test]
+  fn a_merge_record_of_another_format_is_refused_typed() {
+    let bytes = value().to_record_bytes();
+    let mut other_version = bytes.clone();
+    if let Some(version) = other_version.get_mut(5..9) {
+      version.copy_from_slice(&RECORD_VERSION.saturating_add(1).to_le_bytes());
+    }
+    assert_eq!(
+      MergeRecordValue::decode_record(&other_version),
+      Err(RecordRefused::Version {
+        found: RECORD_VERSION.saturating_add(1),
+        expected: RECORD_VERSION,
+      })
+    );
+    let unversioned = crate::catalog::tagged(crate::catalog::MERGE_CLASS, value().to_bytes());
+    assert_eq!(
+      MergeRecordValue::decode_record(&unversioned),
+      Err(RecordRefused::Malformed)
+    );
+    let mut foreign_magic = bytes;
+    if let Some(magic) = foreign_magic.get_mut(1) {
+      *magic ^= 0xff;
+    }
+    assert_eq!(
+      MergeRecordValue::decode_record(&foreign_magic),
+      Err(RecordRefused::Malformed)
+    );
+    let head_class = crate::catalog::tagged(crate::catalog::MERGE_CLASS ^ 0xff, value().to_bytes());
+    assert_eq!(
+      MergeRecordValue::decode_record(&head_class),
+      Err(RecordRefused::OtherClass)
+    );
   }
 
   /// The inputs archive's identity is a function of the bytes alone: the same bytes name one

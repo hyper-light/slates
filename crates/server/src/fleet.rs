@@ -1818,7 +1818,11 @@ pub(crate) fn accept_held_record(
   record: &Record,
 ) -> Vec<u8> {
   // A test's injected refusal: this holder behaves as one that never received the owner's records.
-  if state.record_refused_from.contains(&peer_host) {
+  if state.record_refused_from.contains(&peer_host)
+    || (state.merge.fault.refuse_work_catalogs
+      && crate::catalog::CatalogValue::from_record_bytes(&record.value)
+        .is_some_and(|catalog| catalog.work_of.is_some()))
+  {
     state.count(RECORD_REFUSED_BY_FAULT, 1);
     return Vec::new();
   }
@@ -2206,7 +2210,7 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
 
 /// The catalog registers of this shard's merge volumes, which have no store slot, as this owner still owes them.
 /// - A green's (AUD-29-17): its access list is what a successor admits by, and the merge plane ships no record of the
-///   green before the register's current version is committed (`green_catalog_committed`).
+///   green before the register's current version is committed (`catalog_committed`).
 /// - A work's (A-255): a work's head is never placed, so its catalog is the only record of it a successor holds, and
 ///   it names the work's green. A resend that names the work reaches the work's successor, which sends it on to the
 ///   green's owner, where the submit's completion is (in its merge record).
@@ -2279,11 +2283,16 @@ fn owed_catalog(
   (owed, ready)
 }
 
-/// Whether the green `id`'s catalog register is ready for its merge records to ship (AUD-29-17; see [`owed_catalog`]):
-/// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
-/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
-/// stands for both registers (AUD-29-43). Read on the green's owner shard.
-pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
+/// Whether the merge volume `id`'s catalog register is committed, so a merge record that depends on it may ship (see
+/// [`owed_catalog`]):
+/// - a green's (AUD-29-17): a successor materializes a green only with its adopted catalog, so a merge record that
+///   could be adopted without one would leave the green unserved;
+/// - a submitting work's (A-255): the work's catalog names its green, the only route a resend of the submit has to the
+///   completion the record carries.
+///
+/// A volume with no record here owes no catalog: a destroyed volume's tombstone stands for both registers (AUD-29-43).
+/// Read on the green's owner shard, which holds its works too.
+pub(crate) fn catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
   state
     .db
     .partition()

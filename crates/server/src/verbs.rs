@@ -5721,7 +5721,7 @@ fn found_green(
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(id, engine);
   // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
-  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), None);
+  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), (None, None));
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -6757,7 +6757,7 @@ fn submit(
         inc.id,
         inc.base,
         inc.evidence,
-        completion,
+        (completion, Some(work_id)),
       );
       // The work's base moved to the version, so the reachable floor may have risen: fold the histories
       // to it and true the retention charge up to what the commit retained (the secured surplus credited).

@@ -1035,12 +1035,20 @@ fn record_adoption(
       .insert(object, tombstone.tombstone_sequence(record.sequence));
   } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
     state.pending_materializations.insert(object, head);
-  } else if let Some(merge) =
-    crate::merge_service::MergeRecordValue::from_record_bytes(&record.value)
-  {
-    // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
-    // and held inputs on the shard its id routes to (AUD-14).
-    state.pending_green_materializations.insert(object, merge);
+  } else {
+    match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
+      // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
+      // and held inputs on the shard its id routes to (AUD-14).
+      Ok(merge) => {
+        state.pending_green_materializations.insert(object, merge);
+      }
+      // A merge record of another format: adopted as bytes, never materialized from, and counted.
+      Err(refused) => {
+        if let Some(counter) = refused.counter() {
+          state.count(counter, 1);
+        }
+      }
+    }
   }
   let count = state.refusals.entry(TAKEOVER_ADOPTED).or_insert(0);
   *count = count.saturating_add(1);

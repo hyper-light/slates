@@ -10995,6 +10995,7 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
     refuse_content_puts: false,
     corrupt_next_inputs: false,
     refuse_records: true,
+    refuse_work_catalogs: false,
   });
   let mut client = common::client::connect(daemon_b.instance());
   let edited = client.edit(work, "f", 0, 0, b"hello");
@@ -11120,6 +11121,7 @@ fn a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound(
     refuse_content_puts: false,
     corrupt_next_inputs: false,
     refuse_records: true,
+    refuse_work_catalogs: false,
   });
   let mut client = common::client::connect(daemon_b.instance());
   let edited = client.edit(work, "f", 0, 0, b"hello");
@@ -11284,6 +11286,7 @@ fn a_merge_record_is_issued_only_once_its_inputs_are_placed() {
     refuse_content_puts: true,
     corrupt_next_inputs: false,
     refuse_records: false,
+    refuse_work_catalogs: false,
   });
   assert!(installed.is_ok(), "the fault installs on B: {installed:?}");
   let mut client = Client::connect(&instance_a);
@@ -11444,6 +11447,7 @@ fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
     refuse_content_puts: false,
     corrupt_next_inputs: true,
     refuse_records: false,
+    refuse_work_catalogs: false,
   });
   assert!(installed.is_ok(), "the fault installs on B: {installed:?}");
   let mut client = Client::connect(&instance_a);
@@ -12550,6 +12554,7 @@ fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
       refuse_content_puts: true,
       corrupt_next_inputs: false,
       refuse_records: false,
+      refuse_work_catalogs: false,
     })
     .expect("the inputs fault installs on B");
   let mut client = Client::connect(&instance_a);
@@ -13106,6 +13111,7 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
     refuse_content_puts: false,
     corrupt_next_inputs: false,
     refuse_records: true,
+    refuse_work_catalogs: false,
   };
   let faulted: Vec<_> = daemons[1..]
     .iter()
@@ -13388,6 +13394,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     refuse_content_puts: false,
     corrupt_next_inputs: false,
     refuse_records: true,
+    refuse_work_catalogs: false,
   };
   let faulted: Vec<_> = daemons[1..]
     .iter()
@@ -13600,6 +13607,7 @@ fn observe_commit_gate(
       refuse_content_puts: false,
       corrupt_next_inputs: false,
       refuse_records: true,
+      refuse_work_catalogs: false,
     })
     .expect("the record fault installs on B");
   let held_on_records = holds_for(RECORD_HOLD_WINDOW, || {
@@ -17387,7 +17395,7 @@ fn a_greens_successor_is_found_by_a_survivor_after_its_owner_died() {
     if matches!(reply, ReplyBody::Versions { .. }) || began.elapsed() >= PLACEMENT_DEADLINE {
       break reply;
     }
-    std::thread::sleep(Duration::from_millis(100));
+    yield_for(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
   };
   let took = began.elapsed();
   let counters = |daemon: &Daemon| -> Vec<(String, u64)> {
@@ -17397,9 +17405,14 @@ fn a_greens_successor_is_found_by_a_survivor_after_its_owner_died() {
         counters
           .into_iter()
           .filter(|(name, _)| {
-            ["fleet.owner_location.", "fleet.takeover.", "fleet.materialize", "fleet.forward."]
-              .iter()
-              .any(|prefix| name.starts_with(prefix))
+            [
+              "fleet.owner_location.",
+              "fleet.takeover.",
+              "fleet.materialize",
+              "fleet.forward.",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
           })
           .map(|(name, count)| (name.to_owned(), count))
           .collect()
@@ -17411,9 +17424,18 @@ fn a_greens_successor_is_found_by_a_survivor_after_its_owner_died() {
   for daemon in daemons {
     daemon.stop();
   }
-  assert!(matches!(edited, ReplyBody::Edited), "the edit was declared: {edited:?}");
   assert!(
-    matches!(submitted, ReplyBody::Submitted { version: Some(1), .. }),
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
     "the submit was accepted as version 1: {submitted:?}"
   );
   assert_eq!(placed_before, Ok(true), "version 1 committed at the quorum");
@@ -17490,7 +17512,7 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
         | None
           if began.elapsed() < RESEND_RETRY_FOR =>
         {
-          std::thread::sleep(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
+          yield_for(Duration::from_nanos(LIVENESS_BUDGET_NS / 10));
         }
         other => break other,
       }
@@ -17502,10 +17524,19 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
     daemon.stop();
   }
   assert!(routed, "b routed the work to its owner: {last:?}");
-  assert!(matches!(edited, Some(ReplyBody::Edited)), "the edit: {edited:?}");
+  assert!(
+    matches!(edited, Some(ReplyBody::Edited)),
+    "the edit: {edited:?}"
+  );
   assert!(word.is_ok(), "the submit was sent: {word:?}");
-  assert!(caught_up, "both holders held version 1 before the owner died");
-  assert!(materialized, "the successor took the green over at version 1");
+  assert!(
+    caught_up,
+    "both holders held version 1 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 1"
+  );
   assert_eq!(
     again,
     Some(Ok(ReplyBody::Submitted {
@@ -17514,5 +17545,137 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
-  assert_eq!(head, ReplyBody::Versions { head: 1 }, "the green holds the one version");
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
+  );
+}
+
+/// Yields the test thread for `pause`, as the resend loops here wait between tries (`std::thread::sleep` is disallowed).
+fn yield_for(pause: Duration) {
+  let resume = Instant::now() + pause;
+  while Instant::now() < resume {
+    std::thread::yield_now();
+  }
+}
+
+/// A-255, the merge-record gate: a version's merge record, which carries its submit's completion, is shipped only once
+/// the submitting work's catalog record is committed at its quorum, since that catalog is the only route a resend has
+/// to the completion after a takeover. Do: three nodes at `f = 1`; on a, a green whose version 0 is placed; both holders
+/// withhold every work's catalog record; on a, a work, one edit and a submit, its answer not read; watch over four
+/// liveness budgets of the fleet's periods; then lift the fault. Expect: version 1's record never placed while the
+/// work's catalog is withheld, the owner counting the wait (`merge.record.awaits_work_catalog`, non-vacuous), and,
+/// once lifted, the record placed and the submit answered version 1.
+#[test]
+fn a_versions_merge_record_waits_for_its_works_catalog_record() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "gated-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 0)
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_work_catalogs: true,
+    ..Default::default()
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "gated-work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let mut submitter = common::client::connect(daemons[0].instance());
+  let word = submitter
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .map(|id| id.word());
+  let placed_while_withheld =
+    poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
+      daemons[0].merge_record_placed(green, 1)
+    });
+  let waits = daemons[0].refusals_on_every_shard().map(|counts| {
+    counts
+      .get("merge.record.awaits_work_catalog")
+      .copied()
+      .unwrap_or(0)
+  });
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  let placed_after = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut submitter, *word));
+  drop(fleet);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    origin_placed,
+    "the green's version 0 was placed before the fault"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' faults were installed and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(
+    !placed_while_withheld,
+    "version 1's merge record was not placed while its work's catalog record was withheld"
+  );
+  assert!(
+    waits.as_ref().is_ok_and(|waits| *waits > 0),
+    "the owner counted the record waiting for the work's catalog: {waits:?}"
+  );
+  assert!(
+    placed_after,
+    "version 1's record was placed once the work's catalog could commit"
+  );
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit was answered its version once its record committed"
+  );
 }
