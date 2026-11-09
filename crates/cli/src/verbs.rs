@@ -2618,6 +2618,9 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     "fleet_peers_in_contact: {}\nfleet_peers_unmeshed: {}\n",
     report.fleet.peers_in_contact, report.fleet.peers_unmeshed
   ));
+  for contact in &report.fleet.diag_contacts {
+    out.push_str(&format!("fleet_contact: {contact}\n"));
+  }
   // A learner's configuration fetches: the council version it holds, the version after its last fetch, how many members
   // that fetch asked and how long ago, `never` before any. A node held at an old version says here whether it asked.
   let learner = &report.fleet.learner;

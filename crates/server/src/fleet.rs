@@ -4521,6 +4521,25 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
 /// formation failure's report shows for each peer, so a pair that never meshes says which side dropped the other and
 /// why (2026-10-09: a pair formed no probe session in either direction for 4,000 periods under load, one side counting
 /// itself meshed without the other).
+/// DIAG (never for main): for each other member, its direct-contact reason and this node's membership belief about it.
+pub(crate) fn diag_contacts(state: &ShardState) -> Vec<String> {
+  let host = state.fleet.host();
+  state
+    .fleet
+    .members()
+    .iter()
+    .filter(|&&peer| peer != host)
+    .map(|&peer| {
+      format!(
+        "{} {} believed={:?}",
+        peer.0,
+        direct_contact_reason(state, peer),
+        state.fleet.membership().state(peer)
+      )
+    })
+    .collect()
+}
+
 pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String {
   format!("{:?}", direct_contact(state, peer))
 }
