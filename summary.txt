@@ -1,0 +1,1 @@
+image: ubuntu26 20261101.186.1; kernel 7.0.0-1019-azure; inotify 512/524288; job=success; all=success
