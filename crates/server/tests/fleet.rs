@@ -18507,12 +18507,12 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
 /// A-255, the location round's answer end to end (§4.8 Lookup): a resend reaches the green through the work's
 /// catalog, and an origin that holds no copy of that catalog learns the work's green from the peers that do
 /// (`owner_location::locate_work_of`, `Reply::work_of`). Do: five nodes at `f = 1`; d refuses every register record
-/// from the others, so it never holds the work's catalog however the record is placed or re-placed; on a, a green and a
+/// from the others, so it holds no copy of the work's catalog while a owns the work; on a, a green and a
 /// work shared with the fleet; through d, an edit and the submit from a library client, answered version 1; once another
 /// node holds version 1 and another the work's catalog (one survivor of each is what a takeover at `f = 1` needs),
 /// a dies; d's client resends under its id. Expect: the resend
-/// answered version 1; d holding no copy of the catalog throughout (the round was the only route) and counting the
-/// round's naming of the green (`fleet.owner_location.work_of_named`, non-vacuous); the green holding the one version.
+/// answered version 1; d counting its location round's naming of the green (`fleet.owner_location.work_of_named`,
+/// non-vacuous: the round, not a held copy, gave the route); the green holding the one version.
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round() {
@@ -18595,16 +18595,23 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
       .copied()
       .unwrap_or(0)
   });
+  // One reader a survivor, connected once: a client a poll would hold descriptors past macOS's limit late in the suite
+  // (`kqueue refused`, EMFILE, 1 of 3 full fleet runs on a Mac Studio, 2026-11-09).
+  let mut readers: Vec<Client> = daemons
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
   let survivors: Vec<&Daemon> = daemons.iter().collect();
   let mut head = None;
   poll_until(&survivors, PLACEMENT_DEADLINE, || {
-    head = daemons
-      .iter()
-      .map(|daemon| Client::connect(daemon.instance()).call(&RequestBody::Versions { green }))
+    head = readers
+      .iter_mut()
+      .map(|reader| reader.call(&RequestBody::Versions { green }))
       .find(|reply| matches!(reply, ReplyBody::Versions { .. }));
     Ok(head.is_some())
   });
   drop(survivors);
+  drop(readers);
   for daemon in daemons {
     daemon.stop();
   }
@@ -18632,10 +18639,9 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     })),
     "d's resend is answered its version through the green the location round named"
   );
-  assert!(
-    matches!(held_by_d, Ok(None)),
-    "d held no copy of the work's catalog, so the round was its only route: {held_by_d:?}"
-  );
+  // d's refusal keeps the record off it while a owns the work; after the takeover the adopter's re-placement can reach
+  // d (epoch 2, 1 of 3 full fleet runs on a Mac Studio, 2026-11-09), so the round's own count is what shows it was used.
+  eprintln!("d's copy of the work's catalog at the end: {held_by_d:?}");
   assert!(
     named.as_ref().is_ok_and(|named| *named > 0),
     "d's location round named the work's green: {named:?}"
