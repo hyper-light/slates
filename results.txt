@@ -1,0 +1,28 @@
+runner aarch64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit dace24e1f
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 1 exit 0 took 223s load 13.72
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 2 exit 0 took 184s load 13.82
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 3 exit 101 took 1403s load 13.91
+slates daemon: a taken-over green f2ed81b0870d8ff10000000000000006 was not materialized after 100 attempts, one a period (the failover SLO's worth), the last waiting on its chain; every verb on it answers NotRecovered
+slates daemon: the control shard's beat task ran 504 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 15 steps and 13 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 6 timers, waited 2 times, spawned 1 tasks and finished 0; 14 tasks live; its longest poll is 1374 ms and its timer overrun 396 ms
+--
+survivor 0 (successor true): holder state Ok(HolderMergeState { version: Some(2), refused: false }); takeover counters [("fleet.takeover.adopt_unplaced", 3), ("fleet.takeover.adopt_unplaced.no_holders", 2), ("fleet.takeover.adopt_unplaced.unacked", 1), ("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 3), ("fleet.takeover.stale_configuration", 3), ("fleet.takeover.unpromised", 4), ("merge.takeover_given_up", 1), ("merge.takeover_incomplete", 97), ("merge.takeover_waits_catalog", 3)]
+survivor 1 (successor false): holder state Ok(HolderMergeState { version: Some(3), refused: false }); takeover counters [("fleet.takeover.page_unbound", 3), ("fleet.takeover.page_unmatched", 2), ("fleet.takeover.pages_unsent", 1)]
+
+thread 'a_share_of_a_green_made_after_its_last_version_survives_a_takeover' (5723) panicked at crates/server/tests/fleet.rs:13896:3:
+the successor materialized the taken-over green at version 3
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 4 exit 0 took 228s load 13.99
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 5 exit 0 took 256s load 13.76
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 6 exit 0 took 210s load 13.97
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 7 exit 0 took 165s load 13.78
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 8 exit 0 took 252s load 13.82
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 9 exit 0 took 258s load 13.85
+a_share_of_a_green_made_after_its_last_version_survives_a_takeover run 10 exit 101 took 1388s load 13.88
+slates daemon: a taken-over green 1834a4e46ea07fc90000000000000007 was not materialized after 100 attempts, one a period (the failover SLO's worth), the last waiting on its chain; every verb on it answers NotRecovered
+slates daemon: the control shard's beat task ran 522 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 12 steps and 12 polls (0 long in a task, 0 blocked in the kernel, 1 preempted by the host, 1 unattributed), fired 9 timers, waited 0 times, spawned 0 tasks and finished 0; 13 tasks live; its longest poll is 1525 ms and its timer overrun 64 ms
+--
+survivor 0 (successor true): holder state Ok(HolderMergeState { version: Some(2), refused: false }); takeover counters [("fleet.takeover.adopted", 2), ("fleet.takeover.page_unbound", 7), ("fleet.takeover.page_unmatched", 3), ("fleet.takeover.pages_unsent", 3), ("fleet.takeover.stale_configuration", 1), ("fleet.takeover.unpromised", 8), ("merge.takeover_given_up", 1), ("merge.takeover_incomplete", 100)]
+survivor 1 (successor false): holder state Ok(HolderMergeState { version: Some(3), refused: false }); takeover counters [("fleet.takeover.page_unbound", 2), ("fleet.takeover.page_unmatched", 5), ("fleet.takeover.stale_configuration", 1)]
+
+thread 'a_share_of_a_green_made_after_its_last_version_survives_a_takeover' (6313) panicked at crates/server/tests/fleet.rs:13896:3:
+the successor materialized the taken-over green at version 3
+== a_share_of_a_green_made_after_its_last_version_survives_a_takeover passed 8 failed 2
