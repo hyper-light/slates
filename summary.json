@@ -1,0 +1,14 @@
+{
+  "guard": {
+    "result": "success",
+    "outputs": {}
+  },
+  "build": {
+    "result": "success",
+    "outputs": {}
+  },
+  "release": {
+    "result": "skipped",
+    "outputs": {}
+  }
+}
