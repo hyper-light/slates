@@ -1,0 +1,38 @@
+leg main-5000-arm, 4 CPUs, Tue Nov 10 00:29:36 UTC 2026, tree a3cea986d8f26bb88599a04d6e2bd2de1d9cbcb0
+== release build exit 0
+   r1 LD-CU backlog 5000 volumes f8d67744a22e64bd0000000000000055 f8d67744a22e64bd000000000000006b by shard {"0": ["f8d67744a22e64bd0000000000000055", "f8d67744a22e64bd000000000000006b"], "1": ["f8d67744a22e64bd000100000000002a"]}
+   r1 LD-CU prefill 7500 writes, 0 refused
+   r1 LD-CU quiet v2 n 6737 p50 367 us p99 548 us max 80536 us
+   r1 LD-CU ahead 5000 writes in 3.252577406s with the holder stopped
+   r1 LD-CU before resume: owner v1 head Some(12511), holder v1 head None
+   r1 LD-CU caught Some(678.837756ms) wall 685.219384ms; holder took 3 install(s) and held 14050 message(s) meanwhile
+   r1 LD-CU busy v2 n 414 refused 0 p50 356 us p99 2928 us max 380708 us
+   r1 LD-CU cpu owner total 239 ticks over 0.69 s; by thread [(236, "slates-shard-0:6288"), (3, "slates-shard-1:6289"), (0, "slates:6280"), (0, "slates-watchdog:6291")]
+== run 1 exit 0
+   r2 LD-CU backlog 5000 volumes 949cded318a97e2f000000000000008b 949cded318a97e2f00000000000000a1 by shard {"0": ["949cded318a97e2f000000000000008b", "949cded318a97e2f00000000000000a1"], "1": ["949cded318a97e2f0001000000000045"]}
+   r2 LD-CU prefill 7500 writes, 0 refused
+   r2 LD-CU quiet v2 n 7593 p50 343 us p99 427 us max 114025 us
+   r2 LD-CU ahead 5000 writes in 3.113230408s with the holder stopped
+   r2 LD-CU before resume: owner v1 head Some(12514), holder v1 head None
+   r2 LD-CU caught Some(624.833662ms) wall 660.326799ms; holder took 1 install(s) and held 15114 message(s) meanwhile
+   r2 LD-CU busy v2 n 241 refused 0 p50 349 us p99 7061 us max 449007 us
+   r2 LD-CU cpu owner total 262 ticks over 0.66 s; by thread [(245, "slates-shard-0:6471"), (17, "slates-shard-1:6472"), (0, "slates:6463"), (0, "slates-watchdog:6474")]
+== run 2 exit 0
+   r3 LD-CU backlog 5000 volumes fd0a1fbf026b9b7d000000000000006f fd0a1fbf026b9b7d0000000000000085 by shard {"0": ["fd0a1fbf026b9b7d000000000000006f", "fd0a1fbf026b9b7d0000000000000085"], "1": ["fd0a1fbf026b9b7d0001000000000037"]}
+   r3 LD-CU prefill 7500 writes, 0 refused
+   r3 LD-CU quiet v2 n 7445 p50 350 us p99 436 us max 83719 us
+   r3 LD-CU ahead 5000 writes in 3.075860088s with the holder stopped
+   r3 LD-CU before resume: owner v1 head Some(12514), holder v1 head None
+   r3 LD-CU caught Some(700.067014ms) wall 709.838829ms; holder took 2 install(s) and held 14988 message(s) meanwhile
+   r3 LD-CU busy v2 n 279 refused 0 p50 473 us p99 13147 us max 413499 us
+   r3 LD-CU cpu owner total 227 ticks over 0.71 s; by thread [(203, "slates-shard-0:6763"), (24, "slates-shard-1:6764"), (0, "slates:6755"), (0, "slates-watchdog:6766")]
+== run 3 exit 0
+   r4 LD-CU backlog 5000 volumes 6bcc2a0d305d03c600000000000000af 6bcc2a0d305d03c600000000000000c5 by shard {"0": ["6bcc2a0d305d03c600000000000000af", "6bcc2a0d305d03c600000000000000c5"], "1": ["6bcc2a0d305d03c60001000000000057"]}
+   r4 LD-CU prefill 7500 writes, 0 refused
+   r4 LD-CU quiet v2 n 7185 p50 362 us p99 460 us max 102696 us
+   r4 LD-CU ahead 5000 writes in 3.044554985s with the holder stopped
+   r4 LD-CU before resume: owner v1 head Some(12519), holder v1 head None
+   r4 LD-CU caught Some(770.77935ms) wall 775.1753ms; holder took 2 install(s) and held 14733 message(s) meanwhile
+   r4 LD-CU busy v2 n 380 refused 0 p50 393 us p99 5152 us max 409473 us
+   r4 LD-CU cpu owner total 247 ticks over 0.78 s; by thread [(220, "slates-shard-0:7018"), (27, "slates-shard-1:7019"), (0, "slates:7010"), (0, "slates-watchdog:7021")]
+== run 4 exit 0
