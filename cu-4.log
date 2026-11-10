@@ -1,0 +1,9 @@
+LD-CU backlog 5000 volumes 2663a50471a3cd4000000000000000b5 2663a50471a3cd4000000000000000cb by shard {"0": ["2663a50471a3cd4000000000000000b5", "2663a50471a3cd4000000000000000cb"], "1": ["2663a50471a3cd40000100000000005a"]}
+LD-CU prefill 7500 writes, 0 refused
+LD-CU quiet v2 n 6509 p50 413 us p99 527 us max 58402 us
+LD-CU ahead 5000 writes in 2.765117687s with the holder stopped
+LD-CU before resume: owner v1 head Some(12514), holder v1 head None
+LD-CU-S 550 owner Some(12516) holder Some(7514)
+LD-CU caught Some(913.142538ms) wall 919.24324ms; holder took 3 install(s) and held 14040 message(s) meanwhile
+LD-CU busy v2 n 498 refused 0 p50 388 us p99 4247 us max 519391 us
+LD-CU cpu owner total 377 ticks over 0.92 s; by thread [(373, "slates-shard-0:5843"), (4, "slates-shard-1:5844"), (0, "slates:5834"), (0, "slates-watchdog:5845")]
