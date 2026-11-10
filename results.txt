@@ -1,0 +1,15 @@
+b99a3b9 diag mutation: the Unix writer reports OwnMount as Unavailable (never main) on macos-latest
+steps: build success, test failure
+test a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open ... slates anchor: instance cli-ownland-11875 up; daemon pid 11896; 1 shards
+thread 'a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open' (23738) panicked at crates/cli/tests/cli.rs:12313:3:
+refused as the daemon's own mount, a landing target: {"error":{"kind":"refused","message":"TargetUnavailable { reason: \"OwnMount(11)\" }"}}
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 51 filtered out; finished in 2.54s
+--- the log's last lines
+failures:
+
+failures:
+    a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 51 filtered out; finished in 2.54s
+
+error: test failed, to rerun pass `-p slates-cli --test cli`
