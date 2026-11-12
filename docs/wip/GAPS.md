@@ -1097,9 +1097,10 @@
 >   owner's client waits up to the SLO where it was refused after about 1 s); and the seal's hedge compared two clocks
 >   (`docs/bugs/2026-11-08-a-seals-hedge-compared-two-clocks.md`). C+D (A-232, the window itself) are open, and owe one
 >   more wall budget found here: the forward lane gives up a batch whose session makes no progress for `stall_ns` of
->   wall time (`crates/server/src/forward_lane.rs:296`, `quiet_ns >= stall_ns` on `futures::now_ns()`), so a starved
+>   wall time (`crates/server/src/forward_lane.rs:328`, `quiet_ns >= stall_ns` on `futures::now_ns()`), so a starved
 >   origin refuses a forward to a live owner its peers know (the false-death test's remaining refusals, about 10-12 s in
->   at nice 19). Whoever next changes the lane derives that budget as A-232 rules. Found on
+>   at nice 19). loadtest-scale derives it on the lane's poll clock (6da9670d, red test
+>   `a_starved_origin_keeps_its_forward_to_a_live_owner`), not yet on main. Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
