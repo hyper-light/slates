@@ -1,0 +1,81 @@
+runner x86_64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit c990a993e
+async_core run 1 exit 0 load 9.44
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 61.45s
+async_core run 2 exit 101 load 11.33
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5808) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 56 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.89s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 3 exit 0 load 11.90
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 87.42s
+async_core run 4 exit 0 load 11.70
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 95.09s
+async_core run 5 exit 101 load 11.10
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5990) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 69 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.56s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 6 exit 101 load 11.02
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (6041) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 110 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 66.48s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 7 exit 101 load 11.81
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (6085) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 47 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 47.06s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 8 exit 101 load 12.17
+thread 'the_async_core_drives_a_daemon_by_spin_and_completion_fd' (6138) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 4 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+the_async_core_drives_a_daemon_by_spin_and_completion_fd --- FAILED
+test an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound has been running for over 60 seconds
+.
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 87.11s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 9 exit 0 load 12.07
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.08s
+async_core run 10 exit 101 load 11.51
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (6239) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 134 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 82.28s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+== async_core passed 4 failed 6
