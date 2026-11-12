@@ -1,0 +1,13 @@
+diff --git a/crates/bridge-winfsp/src/dispatcher.rs b/crates/bridge-winfsp/src/dispatcher.rs
+index 6ee3d5fa9..13f219180 100644
+--- a/crates/bridge-winfsp/src/dispatcher.rs
++++ b/crates/bridge-winfsp/src/dispatcher.rs
+@@ -501,7 +501,7 @@ fn operation(
+   };
+   PRIVATE_PURGE.set(purge);
+   CURRENT_HINT.set(request.hint());
+-  CREATOR_MAY_LINK.set(creator_may_link(request)?);
++  CREATOR_MAY_LINK.set(false);
+   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
+   // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
+   // throughout the synchronous call.
