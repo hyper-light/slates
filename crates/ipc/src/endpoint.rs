@@ -74,8 +74,8 @@ pub struct ClientEnd {
   /// again. Every park ends in a reply, one of these, or the deadline.
   unanswered_wakes: u64,
   /// The client's online wake estimate, its spin window: seeded with the window the daemon published
-  /// and fed the wake of each park a reply ended, from the daemon's reply stamp to the client running
-  /// again ([`Self::wait`]).
+  /// and fed the wake of each park a reply ended asleep, from the daemon's reply stamp to the client running
+  /// again ([`Self::wait`], [`wait_may_teach`]).
   wake: WakeEstimate,
   /// Parks whose wake fed the estimate (a non-vacuity count).
   wake_samples: u64,
@@ -509,8 +509,8 @@ impl ClientEnd {
 
   /// Waits for the next reply: spins for the wake estimate, then parks on the wake word
   /// (setting the parked flag and re-checking the slot to close the race), until the reply
-  /// arrives or `deadline_ns` (from the call) passes. A park a reply ended teaches the estimate
-  /// its wake.
+  /// arrives or `deadline_ns` (from the call) passes. A park a reply ended asleep teaches the
+  /// estimate its wake ([`wait_may_teach`]).
   pub fn wait(&mut self, deadline_ns: Option<u64>) -> Result<Reply, IpcError> {
     let started = Instant::now();
     let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
@@ -555,15 +555,21 @@ impl ClientEnd {
       }
       self.parks = self.parks.saturating_add(1);
       let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
+      let switches_before = slates_machine::switches::switches_now();
       let waiting_ns = slates_machine::clock::monotonic_ns();
       #[cfg(windows)]
       let woken = self.region.wake_wait(remaining)?;
       #[cfg(not(windows))]
       let woken = wake::wait(self.region.wake_word()?, expected, remaining)?;
       let returned_ns = slates_machine::clock::monotonic_ns();
+      let teaches = wait_may_teach(
+        WAKER_CONFIRMS,
+        switches_before,
+        slates_machine::switches::switches_now(),
+      );
       self.region.client_parked()?.store(0, Ordering::Release);
       if woken {
-        if let Some(unsettled) = self.unsettled.get_mut(slot) {
+        if teaches && let Some(unsettled) = self.unsettled.get_mut(slot) {
           *unsettled = Some((waiting_ns, returned_ns));
         }
         self.settle_wakes()?;
@@ -583,11 +589,27 @@ impl ClientEnd {
 }
 
 /// Format: whether the daemon's wake reports finding the client asleep, so a stamp is learned only once
-/// confirmed. Windows' auto-reset Event cannot tell a signal that met a sleeper from one that will be
-/// consumed later, so there a stamp inside the wait is learned unconfirmed. The boot probe no longer
-/// takes that stand-in: since A-223 it confirms its Windows waiter by its cycle count
-/// (`WakeLatency::asleep_confirmed`), which this wait, judged by the client alone, has no peer to read.
+/// confirmed (Linux's futex and macOS's ulock wakes answer it). Windows' auto-reset Event cannot tell a
+/// signal that met a sleeper from one consumed later, so there the client confirms its own sleep by its
+/// switch count across the wait ([`wait_may_teach`]), as the shards judge their parks and the boot probe
+/// its waiter (A-223), and a stamp it confirmed is learned once it falls inside the wait.
 const WAKER_CONFIRMS: bool = !cfg!(windows);
+
+/// Whether a park's wake goes on to be judged by its stamp ([`ClientEnd::settle_wakes`]), from the client's
+/// own switch count across its wait (`slates_machine::switches`). Where the daemon's wake confirms a sleeper
+/// found (`waker_confirms`), that confirmation judges and every park goes on. Elsewhere (Windows) the client
+/// judges itself: only a wait across which its count rose slept. A wait that found the reply's signal
+/// already set returned without switching, and timing it taught an on-CPU handoff (0.1–0.8 µs) for a
+/// sleeper's wake (6–9 µs on CI's Windows runners, A-223); a count the OS refused proves nothing, so the
+/// client learns nothing and keeps its seed.
+fn wait_may_teach(
+  waker_confirms: bool,
+  switches_before: Option<u64>,
+  switches_after: Option<u64>,
+) -> bool {
+  waker_confirms
+    || matches!((switches_before, switches_after), (Some(before), Some(after)) if after > before)
+}
 
 /// The client's parked flag for a park that names `slot`.
 fn parked_flag(slot: usize) -> u32 {
@@ -605,7 +627,8 @@ fn stamp_slot(parked: u32) -> usize {
 
 impl ClientEnd {
   /// Folds each unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
-  /// stamp to the client's return, when the daemon confirmed its wake found the client asleep and the
+  /// stamp to the client's return, when the client was confirmed asleep (by the daemon's wake, or on
+  /// Windows by its own switch count before the park was left unsettled, [`WAKER_CONFIRMS`]) and the
   /// stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
   /// while the park was being set up met a waiter not yet asleep: its wake finds no sleeper and is never
   /// confirmed, and timing it would teach a wake that never happened (measured: the bench's daemon,
@@ -836,6 +859,38 @@ impl DaemonEnd {
 
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod judged {
+  use super::wait_may_teach;
+
+  /// §4.7, §4.3 (A-223, sibling (d)): do judge waits by the client's own switch count, as on Windows, and by
+  /// the daemon's confirmation, as on Linux and macOS. Expect: under its own count only a wait across which
+  /// the count rose goes on to teach, while one it never moved across, or one whose count the OS refused (its
+  /// profiling declined), teaches nothing, so the estimate keeps its seed; under the daemon's confirmation
+  /// every wait goes on, its stamp judged when the confirmation lands.
+  #[test]
+  fn only_a_wait_that_switched_out_teaches_where_the_client_judges_itself() {
+    let waits = [
+      (Some(7), Some(8), true),
+      (Some(7), Some(7), false),
+      (None, None, false),
+      (Some(7), None, false),
+      (None, Some(8), false),
+    ];
+    for (before, after, slept) in waits {
+      assert_eq!(
+        wait_may_teach(false, before, after),
+        slept,
+        "the client's own count, {before:?} → {after:?}"
+      );
+      assert!(
+        wait_may_teach(true, before, after),
+        "the daemon's confirmation, {before:?} → {after:?}"
+      );
+    }
+  }
 }
 
 #[cfg(all(test, unix))]
