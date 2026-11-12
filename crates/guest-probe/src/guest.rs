@@ -178,6 +178,7 @@ fn execute(command: Command, map: &mut Option<SharedMap>, block: Option<&str>) -
       Reply::Done
     }
     Command::Device { at, bytes } => done_or_refused(write_device(block, at, &bytes)),
+    Command::Escalate { path } => escalate(&path).unwrap_or_else(Reply::Refused),
     other => match map.as_ref() {
       Some(mapped) => mapped.answer(other),
       None => Reply::Refused("no map has been made".to_owned()),
@@ -207,6 +208,40 @@ fn under_mount(path: &str) -> Result<std::path::PathBuf, String> {
 fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
   // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   std::fs::write(under_mount(path)?, bytes).map_err(|e| format!("write {path}: {e}"))
+}
+
+/// Format: the uid and gid a planted setuid program is run as: `nobody`'s 65534, which holds no privilege of its own
+/// (A-94's own test ran its planted `id` as it).
+const NOBODY: u32 = 65_534;
+/// Format: a setuid-root program's mode, `rwsr-xr-x`, the mode `dpkg` gives `sudo`.
+const SETUID_PROGRAM_MODE: u32 = 0o4755;
+
+/// A-94 by use ([`Command::Escalate`]): plants this probe at `path` as root's setuid program and runs it as `nobody`;
+/// the effective uid it reports.
+#[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
+fn escalate(path: &str) -> Result<Reply, String> {
+  use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::process::CommandExt;
+  let program = under_mount(path)?;
+  let this = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
+  std::fs::copy(&this, &program).map_err(|e| format!("copy to {path}: {e}"))?;
+  // structural: allow — as above: the mode the copy is given.
+  let setuid = std::fs::Permissions::from_mode(SETUID_PROGRAM_MODE);
+  // structural: allow — as above. The guest runs as root, so the copy is root's.
+  std::fs::set_permissions(&program, setuid).map_err(|e| format!("chmod {path}: {e}"))?;
+  let ran = std::process::Command::new(&program)
+    .arg(slates_guest_probe::protocol::REPORT_EUID)
+    .uid(NOBODY)
+    .gid(NOBODY)
+    .output()
+    .map_err(|e| format!("run {path} as {NOBODY}: {e}"))?;
+  let said = String::from_utf8_lossy(&ran.stdout);
+  let euid = said
+    .trim()
+    .parse()
+    .map_err(|_| format!("{path} as {NOBODY} said `{said}` ({})", ran.status))?;
+  Ok(Reply::Ran { euid })
 }
 
 /// Writes `bytes` into `path` at `at`.
@@ -483,7 +518,9 @@ fn option<'c>(cmdline: &'c str, key: &str) -> Option<&'c str> {
     .find_map(|word| word.strip_prefix(key))
 }
 
-/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names.
+/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names, `nosuid` and `nodev`, as
+/// every mount of a volume is (A-94): a volume has other writers, and a guest's root or an NFS client asserting uid 0
+/// can plant a setuid-root program in it.
 fn mount_tag(cmdline: &str) -> Result<(), String> {
   let tag = option(cmdline, TAG_KEY).unwrap_or(DEFAULT_TAG);
   let data = dax_option(cmdline)?;
@@ -491,7 +528,7 @@ fn mount_tag(cmdline: &str) -> Result<(), String> {
     tag,
     MOUNT_POINT,
     "virtiofs",
-    MountFlags::empty(),
+    MountFlags::NOSUID | MountFlags::NODEV,
     data.as_deref(),
   )
   .map_err(|e| format!("mount virtiofs tag {tag} at {MOUNT_POINT}: {e}"))
@@ -668,6 +705,7 @@ impl SharedMap {
       Command::Sweep { len, sweeps } => self.sweep(len, sweeps),
       Command::Map { .. }
       | Command::Quit
+      | Command::Escalate { .. }
       | Command::List
       | Command::Write { .. }
       | Command::Patch { .. }

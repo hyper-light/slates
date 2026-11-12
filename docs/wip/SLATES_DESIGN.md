@@ -12109,7 +12109,10 @@ group first).
 ### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
 Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
 `crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in
-`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS.
+`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS; and on 2026-11-09 to `docs/cli.md` (the guest's
+virtio-fs mount, documented as `-o dax=always` alone until then, now `dax=always,nosuid,nodev`), the guest probe's own
+mount of the tag (`crates/guest-probe/src/guest.rs`, `mount_tag`), and
+`a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest` (`crates/cli/tests/guest_vhost.rs`).
 Status: built 2026-10-05 (condition 4).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was

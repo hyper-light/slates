@@ -9,6 +9,15 @@
 > naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
 > `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 
+> **The documented guest mount honoured setuid: fixed (2026-11-09, §4.6; A-94).** `docs/cli.md` told a guest to mount
+> slates' virtio-fs tag `-o dax=always` alone, without the `nosuid,nodev` A-94 puts on every mount of a volume, and the
+> guest probe mounted it so. A setuid-root program on the volume then ran as root for any guest user, and any root
+> writer can make one: the guest's own root, or an NFS client asserting uid 0 (A-94 squashes no root). The documented
+> mount and the probe's now carry `nosuid,nodev`. Proven by use in CI's QEMU lane: the guest's root plants the probe as
+> a 04755 root program and runs it as `nobody`; RESULT-PENDING. A guest's own mount is the guest's to make: slates
+> cannot impose it, so the document is the guard there (the device-node question with Ada covers the same gap for
+> `nodev`).
+
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken

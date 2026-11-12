@@ -17,7 +17,9 @@
 //! - nothing it stores past the file's end in the volume, even once another path extends the file over those bytes: an
 //!   extension zeroes the hole it opens, in the volume and in every map (POSIX `mmap`: the system "shall never write
 //!   out any modified portions of the last page of an object which are beyond its end");
-//! - the session's origin untouched by any of it, and the origin's own later write never in the guest's map (A-166).
+//! - the session's origin untouched by any of it, and the origin's own later write never in the guest's map (A-166);
+//! - a setuid-root program planted on the volume by the guest's own root running with no privilege, since the guest
+//!   mounts the tag `nosuid,nodev` as A-94 says every mount of a volume is (`docs/cli.md` documents that mount).
 //!
 //! Gated: Linux, with the guest's kernel and the probe named in the environment as for `tests/guest_dax.rs`, and crosvm
 //! (`SLATES_GUEST_CROSVM`, with KVM) or QEMU (`SLATES_GUEST_QEMU`, with KVM where the host has it and its own emulation
@@ -1925,4 +1927,41 @@ fn daemons_killed_mid_write(gate: &Gate) {
     "the last VM powered off cleanly: {status}\n{}",
     last.transcript()
   );
+}
+
+/// Format: the uid the guest runs a planted program as (the probe's `nobody`, 65534).
+const NOBODY: u32 = 65_534;
+
+/// A-94 through a real guest. Do: boot a VM with slates' own device; have the guest's root copy the probe onto the
+/// session as a setuid-root program (mode 04755, owned by uid 0, as any root writer of a volume can make one: a guest's
+/// root, or an NFS client asserting uid 0, since A-94 squashes no root) and run it as `nobody`.
+///
+/// Expect: it runs as 65534, `nobody`, since the guest mounts the tag `nosuid,nodev` as `docs/cli.md` documents. Under
+/// the mount documented before (`-o dax=always` alone) it ran as uid 0: a setuid bit on a shared volume was root for any
+/// user of the guest.
+#[test]
+fn a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest() {
+  for gate in Gate::each_from_env() {
+    let (rig, _) = Rig::new(&gate, "nosuid");
+    let mut guest = rig.boot(&gate);
+    let reply = guest.ask(
+      &Ask::Escalate {
+        path: "suid-probe".to_owned(),
+      },
+      REPLY_WAIT,
+    );
+    assert_eq!(
+      reply,
+      Reply::Ran { euid: NOBODY },
+      "a planted setuid-root program runs as nobody in {}\n{}",
+      gate.vmm.name(),
+      guest.transcript()
+    );
+    let status = guest.quit();
+    assert!(
+      status.success(),
+      "the VM powered off cleanly: {status}\n{}",
+      guest.transcript()
+    );
+  }
 }
