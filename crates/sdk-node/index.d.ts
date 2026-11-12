@@ -24,13 +24,15 @@ export interface VolumeStatus {
   hostEpoch: number
 }
 
-/** A volume in a listing. */
+/** A volume in a listing. `notRecovered` is null, or for a volume recovery could not rebuild its cause's kind. */
 export interface VolumeEntry {
   id: string
   name: string
   referencedBytes: number
   uniqueBytes: number
   overlay: boolean
+  liveShipped: boolean
+  notRecovered: string | null
 }
 
 /** A work volume created over a green: its id (hex) and the green base version its edits submit against. */

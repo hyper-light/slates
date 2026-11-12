@@ -131,8 +131,10 @@ pub struct VolumeStatus {
   pub host_epoch: i64,
 }
 
-/// A volume in a listing (§4.4) as a plain JS object — its id (hex), name, byte accounting, and whether
-/// it overlays a host directory. napi's camelCase keys; the u64 counts range-checked to JS-safe integers.
+/// A volume in a listing (§4.4) as a plain JS object — its id (hex), name, byte accounting, whether it
+/// overlays a host directory, whether it is live-shipped (A-200), and `notRecovered`: `null`, or for a volume
+/// recovery could not rebuild, its cause's kind (`"BaseMissing"`, …; its status gives the whole cause). napi's
+/// camelCase keys; the u64 counts range-checked to JS-safe integers.
 #[napi(object)]
 pub struct VolumeEntry {
   pub id: String,
@@ -140,6 +142,8 @@ pub struct VolumeEntry {
   pub referenced_bytes: i64,
   pub unique_bytes: i64,
   pub overlay: bool,
+  pub live_shipped: bool,
+  pub not_recovered: Option<String>,
 }
 
 /// A work volume created over a green (§4.16): its id (hex) and the green base version its edits submit
@@ -489,6 +493,11 @@ fn volume_entry(volume: VolumeSummary) -> Result<VolumeEntry> {
     referenced_bytes: status_i64(volume.referenced_bytes, "referencedBytes")?,
     unique_bytes: status_i64(volume.unique_bytes, "uniqueBytes")?,
     overlay: volume.overlay,
+    live_shipped: volume.live_shipped,
+    not_recovered: volume
+      .not_recovered
+      .as_ref()
+      .map(|cause| cause.kind().to_owned()),
   })
 }
 
