@@ -39,8 +39,9 @@
 >     fell from main's 1,451–2,023 to 155–224 thousandths of a core on Linux, the loaded single-client p99 halved
 >     (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64), and the quiet p99 stayed within main's spread. As built
 >     (diag-liveness-37): 188–219 quiet and 293–365 loaded on Linux.
->   - **Open: the paced client's quiet cost.** The plan's bar is 150 thousandths of a core at two shards; Linux reads
->     188–219 and Windows 131–341. The window's length against the p99 it buys is the plan's step 6.
+>   - The paced client's quiet cost is judged by the supervisor's criteria, not a fixed bar: well below main's on
+>     Linux (188–219 against 1,451–2,023 thousandths of a core), and on Windows A-223-alone's level, kept by decision A
+>     (131–341). The plan's step 6 confirms it on the finished code against main.
 >   - Measured and rejected: the floor of confirmed wakes (it queued too, 0.33–33.8 ms), the floor less Linux's
 >     run-queue time (0 to 1.75 µs, the shards parked through a client's requests), the live floor × 100 capped at 4F
 >     (twice the paced CPU), and the boot probe's smallest wake as a second input to `max` (6.8–346 µs on a loaded
@@ -49,6 +50,13 @@
 >     so R9's floor alone made that the loaded single-client p99 (97–100 ms on windows-latest, 48–56 ms on
 >     windows-11-arm, against 125–127 µs medians at the multiple). Windows keeps the multiple, and its paced client
 >     the cost (177–435 thousandths of a core quiet), until that wait is understood and a window measured for it.
+> - **The client's Windows wake (sibling (d), fixed 2026-11-11).** The ipc client took any reply stamp inside its wait,
+>   since the Event cannot say a sleeper was found, so a reply sent before it blocked was learned as a handoff. It now
+>   judges its wait by its own switch count, as the shards do, and keeps its seed where the OS refuses the count. Of
+>   16,384 racing parks a run on CI's Windows runners, main learned 11–48 of those that never switched out, the fix
+>   none (`diag-liveness-client-4`, 10 runs a tree); the parked bench form's client estimate read 17–33 µs before and
+>   after. Seen on the way: `presentation.rs` failed on Windows (`Unsupported { feature: "landing" }`, no Windows
+>   landing writer, A-262), on main's code too, where CI never ran it; it now builds on Unix only, as the verb does.
 
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
