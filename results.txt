@@ -1,0 +1,22 @@
+runner aarch64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit 67e81e250
+async_core run 1 exit 0 load 10.04
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 63.87s
+async_core run 2 exit 0 load 11.96
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 89.09s
+async_core run 3 exit 0 load 12.61
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.75s
+async_core run 4 exit 0 load 12.61
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.73s
+async_core run 5 exit 0 load 12.77
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.53s
+async_core run 6 exit 0 load 12.82
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.14s
+async_core run 7 exit 0 load 12.68
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.58s
+async_core run 8 exit 0 load 12.35
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 88.19s
+async_core run 9 exit 0 load 12.59
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 91.75s
+async_core run 10 exit 0 load 12.51
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 90.83s
+== async_core passed 10 failed 0
