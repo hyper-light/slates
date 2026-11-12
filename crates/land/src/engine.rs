@@ -773,14 +773,7 @@ impl<H: LandFs> Landing<'_, H> {
     witness: &Witness,
   ) -> Result<Option<bool>, HostError> {
     match self.host.entry_fingerprint(dir, aside) {
-      Ok(moved) => Ok(Some(
-        Fingerprint {
-          ctime_ns: witness.fingerprint.ctime_ns,
-          uid: witness.fingerprint.uid,
-          gid: witness.fingerprint.gid,
-          ..moved
-        } == witness.fingerprint,
-      )),
+      Ok(moved) => Ok(Some(same_object_after_a_move(&witness.fingerprint, &moved))),
       Err(HostError::NotFound) => Ok(None),
       Err(e) => Err(e),
     }
@@ -928,14 +921,7 @@ impl<H: LandFs> Landing<'_, H> {
     let restored = self
       .restored
       .get(&entry.path)
-      .filter(|after| {
-        Fingerprint {
-          ctime_ns: witness.fingerprint.ctime_ns,
-          uid: witness.fingerprint.uid,
-          gid: witness.fingerprint.gid,
-          ..**after
-        } == witness.fingerprint
-      })
+      .filter(|after| same_object_after_a_move(&witness.fingerprint, after))
       .copied();
     Some(match restored {
       Some(after) => Witness {
@@ -1897,14 +1883,7 @@ impl<H: LandFs> Landing<'_, H> {
   /// or racy witness additionally requires the witnessed bytes and a stable read (§4.15).
   fn displaced_matches(&mut self, file: HostFile, witness: &Witness) -> Result<bool, HostError> {
     let before = self.host.fstat(file)?;
-    // A metadata-only change (the ctime, and the owner a `chown` moves with it) is not drift of the bytes.
-    let preserved = Fingerprint {
-      ctime_ns: witness.fingerprint.ctime_ns,
-      uid: witness.fingerprint.uid,
-      gid: witness.fingerprint.gid,
-      ..before
-    };
-    if preserved != witness.fingerprint {
+    if !same_object_after_a_move(&witness.fingerprint, &before) {
       return Ok(false);
     }
     if before == witness.fingerprint && !witness.racy {
@@ -3990,4 +3969,61 @@ fn advances(outcome: Option<&Outcome>) -> bool {
         | Outcome::Skipped(SkipReason::AlreadyThere | SkipReason::Drift)
     )
   )
+}
+
+/// Format: whether a file keeps its birth time through a move on this host. NTFS gives a file renamed onto a name another
+/// file left moments before that file's creation time ("tunneling"), and the landing's fallback does exactly that (the
+/// old file onto the hidden name the temporary just left): measured on jupiter (Windows 10.0.26200, 2026-10-26), every
+/// replacement was undone `TargetInUse` with the birth time the only other difference. Unix keeps it, and needs it: ext4
+/// hands a freed inode number to the next file (A-151), while NTFS's file index carries a sequence number.
+const BIRTH_SURVIVES_A_MOVE: bool = cfg!(not(windows));
+
+/// Whether `after` is the witnessed object `witness` after a move: every field equal but those a move or a
+/// metadata-only change may set without touching the bytes — the ctime, the owner a `chown` moves with it, and, where a
+/// move may set it ([`BIRTH_SURVIVES_A_MOVE`]), the birth time. A changed ctime or a racy witness still asks for the bytes.
+fn same_object_after_a_move(witness: &Fingerprint, after: &Fingerprint) -> bool {
+  Fingerprint {
+    ctime_ns: witness.ctime_ns,
+    uid: witness.uid,
+    gid: witness.gid,
+    birth_ns: if BIRTH_SURVIVES_A_MOVE {
+      after.birth_ns
+    } else {
+      witness.birth_ns
+    },
+    ..*after
+  } == *witness
+}
+
+#[cfg(test)]
+mod move_check_tests {
+  use super::{BIRTH_SURVIVES_A_MOVE, Fingerprint, same_object_after_a_move};
+
+  /// A-151 and NTFS tunneling. Do: compare a witnessed file with itself after a move that changed only its birth time.
+  /// Expect: on Unix another object, since a reused inode number can look like this and only the birth time tells;
+  /// on Windows the same object, since tunneling sets it and the file index cannot be reused unseen. A changed size is
+  /// another object everywhere.
+  #[test]
+  fn only_windows_sets_a_moved_files_birth_time_aside() {
+    let witness = Fingerprint {
+      ino: 7,
+      size: 11,
+      birth_ns: 1_000,
+      ..Fingerprint::default()
+    };
+    let new_birth = Fingerprint {
+      birth_ns: 2_000,
+      ..witness
+    };
+    assert_eq!(
+      same_object_after_a_move(&witness, &new_birth),
+      !BIRTH_SURVIVES_A_MOVE
+    );
+    assert_eq!(BIRTH_SURVIVES_A_MOVE, cfg!(not(windows)));
+    let new_size = Fingerprint {
+      size: 12,
+      ..witness
+    };
+    assert!(!same_object_after_a_move(&witness, &new_size));
+  }
 }

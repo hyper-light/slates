@@ -18,6 +18,10 @@ blake3 = { workspace = true }
 rustix = { workspace = true }
 libc = { workspace = true }
 
+# Windows' write seam (`src/os_windows.rs`): handle-relative creates, renames, removals and flushes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 

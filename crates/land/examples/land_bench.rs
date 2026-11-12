@@ -15,12 +15,7 @@
   clippy::indexing_slicing
 )]
 
-// `Path`, `Command`, `OS_DELTA` and `OS_BASE` serve only the OS rows (`os_rows`), which land through the Unix writer:
-// Windows has no landing writer yet, so there they would be unused (`cargo xwin clippy --examples`, 2026-11-08).
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
-#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -52,10 +47,8 @@ const RUNS: usize = 5;
 /// Shape: the delta the simulated rows land (entries).
 const SIM_DELTA: usize = 1_000;
 /// Shape: the delta the OS rows land (entries), T-1.17's 10k.
-#[cfg(unix)]
 const OS_DELTA: usize = 10_000;
 /// Shape: the base tree the OS rows land into (entries), T-1.17's 10^6.
-#[cfg(unix)]
 const OS_BASE: usize = 1_000_000;
 /// Shape: files per directory of the generated trees.
 const PER_DIR: usize = 100;
@@ -326,7 +319,6 @@ fn sim_rows() {
   row("land.replan_after_landing_nothing_diverged", second, true);
 }
 
-#[cfg(unix)]
 mod os_rows {
   use super::*;
   use slates_land::os::OsLand;
@@ -342,14 +334,23 @@ mod os_rows {
     }
   }
 
-  /// `cp -r` of the same delta (the edited files, written to a sibling tree) as the comparison.
+  /// `cp -r` of the same delta (the edited files, written to a sibling tree) as the comparison; on Windows the
+  /// system's own recursive copy, `xcopy /E /I /Q /Y` (A-185).
   #[allow(clippy::disallowed_methods)]
   fn cp_r_delta(src: &Path, dst: &Path) -> std::time::Duration {
     let started = Instant::now();
+    #[cfg(unix)]
     let status = Command::new("cp")
       .arg("-r")
       .arg(src)
       .arg(dst)
+      .status()
+      .unwrap();
+    #[cfg(windows)]
+    let status = Command::new("xcopy")
+      .arg(src)
+      .arg(dst)
+      .args(["/E", "/I", "/Q", "/Y"])
       .status()
       .unwrap();
     assert!(status.success());
@@ -483,15 +484,12 @@ fn main() {
     .ok()
     .and_then(|exe| exe.parent().map(PathBuf::from));
   match beside {
-    #[cfg(unix)]
     Some(build_output) => {
       os_rows::flat(&build_output);
       if !flat_only {
         os_rows::run(&build_output);
       }
     }
-    #[cfg(not(unix))]
-    Some(_) => println!("land bench: the OS rows run on Unix only"),
     None => println!("land bench: OS rows skipped — the binary's directory is unknown"),
   }
 }

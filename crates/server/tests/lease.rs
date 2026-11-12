@@ -11,9 +11,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // These integration tests drive the daemon's NFS-loopback transport and a real landing target — macOS
 // and Linux; on Windows the daemon lands nothing yet.
-#![cfg(unix)]
 
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use slates_client::{Client, ClientError, Landing, SnapshotId, VolumeId};
@@ -70,7 +70,8 @@ fn volume_on(
 /// case-insensitive volume. Judged by the directory's device and inode as the host reports them.
 fn alias_of(path: &str) -> Option<String> {
   let original = std::fs::metadata(path).ok()?;
-  let (parent, name) = path.rsplit_once('/')?;
+  let at = path.rfind(['/', '\\'])?;
+  let (parent, separator, name) = (path.get(..at)?, path.get(at..=at)?, path.get(at + 1..)?);
   let other_case: String = name
     .chars()
     .map(|c| {
@@ -83,14 +84,31 @@ fn alias_of(path: &str) -> Option<String> {
     .collect();
   [
     format!("/System/Volumes/Data{path}"),
-    format!("{parent}/{other_case}"),
+    format!("{parent}{separator}{other_case}"),
   ]
   .into_iter()
-  .find(|candidate| {
-    candidate != path
-      && std::fs::metadata(candidate)
-        .is_ok_and(|other| other.dev() == original.dev() && other.ino() == original.ino())
-  })
+  .find(|candidate| candidate != path && same_object(path, &original, candidate))
+}
+
+/// Whether `candidate` names the object `original` was read from: the same device and inode (Unix).
+#[cfg(unix)]
+fn same_object(_path: &str, original: &std::fs::Metadata, candidate: &str) -> bool {
+  std::fs::metadata(candidate)
+    .is_ok_and(|other| other.dev() == original.dev() && other.ino() == original.ino())
+}
+
+/// Whether `candidate` names the object `original` was read from (Windows): the same canonical path, which Windows
+/// reports in the object's own spelling whatever spelling opened it (the file index needs an unstable standard-library
+/// feature, and this test only compares two spellings of one directory).
+#[cfg(windows)]
+fn same_object(path: &str, _original: &std::fs::Metadata, candidate: &str) -> bool {
+  match (
+    std::fs::canonicalize(path),
+    std::fs::canonicalize(candidate),
+  ) {
+    (Ok(one), Ok(other)) => one == other,
+    _ => false,
+  }
 }
 
 /// A granted landing: its volume, snapshot, target spelling and grant.
@@ -225,11 +243,11 @@ fn one_target_has_one_landing_lease_whichever_shard_and_spelling_lands_it() {
   release(&daemon, &key, held.holder);
   all_land(&mut client, &landings);
   assert_eq!(
-    std::fs::read(format!("{}/a", target.path)).unwrap(),
+    std::fs::read(std::path::Path::new(&target.path).join("a")).unwrap(),
     b"from a"
   );
   assert_eq!(
-    std::fs::read(format!("{}/b", target.path)).unwrap(),
+    std::fs::read(std::path::Path::new(&target.path).join("b")).unwrap(),
     b"from b"
   );
   assert_eq!(

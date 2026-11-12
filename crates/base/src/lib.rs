@@ -95,7 +95,7 @@ pub(crate) fn windows_mode_and_bits(attributes: u32) -> (u32, u16) {
 #[cfg(unix)]
 pub use unix::OsHost;
 #[cfg(windows)]
-pub use windows::OsHost;
+pub use windows::{OsHost, WalkRefusal, walk_dir};
 
 /// Derived: the timestamp granularity in nanoseconds by filesystem type, from the cited table
 /// (`research/disk-source-of-truth.md` §4): ext4, XFS, Btrfs, tmpfs and APFS carry nanoseconds,

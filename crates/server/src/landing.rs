@@ -12,19 +12,17 @@
 //! The engine and the manifest are `slates-land`'s (Phase 1); this module is the wiring: it
 //! holds the runtime grant, lease and audit structures per shard, mirrors their mutations into
 //! the database's durable records, and maps the engine's refusals to the wire taxonomy. The
-//! write path runs on Linux and macOS; its tests land into a real directory on the host's disk in
+//! write path runs on Linux, macOS and Windows (A-185); its tests land into a real directory on the host's disk in
 //! the build output (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory), on every
 //! host, exactly as the Phase 1 landing tests do.
 
 use slates_db::Op;
-#[cfg(unix)]
 use slates_db::catalog::LandingRecord;
 use slates_db::catalog::{
   AuditKind as DbAuditKind, AuditRecord as DbAuditRecord, GrantRecord as DbGrantRecord,
   GrantScope as DbGrantScope, GrantState as DbGrantState, GrantSurface,
   LandingState as DbLandingState, Principal, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId,
 };
-#[cfg(unix)]
 use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
 };
@@ -32,9 +30,7 @@ use slates_ipc::protocol::{
   AuditEntry, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
 };
 use slates_land::engine::Audit;
-#[cfg(unix)]
 use slates_land::engine::{AuditKind, AuditRecord};
-#[cfg(unix)]
 use slates_land::engine::{
   Degradation, Durability, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingRun,
   Observer, settle_grant,
@@ -43,25 +39,17 @@ use slates_land::grant::{
   GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
   GrantState as LandGrantState, Grants, Surface, TargetIdentity,
 };
-#[cfg(unix)]
 use slates_land::grant::{GrantId, GrantRefusal, LandingLease};
-#[cfg(unix)]
 use slates_land::manifest::{Filter, LandingEntry, Manifest};
-#[cfg(unix)]
 use slates_land::os::{Away, OsLand, TargetRefusal};
-#[cfg(unix)]
 use slates_land::source::Source;
 use slates_vfs::clock::Clock;
-#[cfg(unix)]
 use slates_vfs::host::{Barrier, HostError, HostFs, LandFs};
-#[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
-#[cfg(unix)]
 use crate::error::refusal_of_vfs;
 use crate::state::ShardState;
 use crate::verbs::refused;
-#[cfg(unix)]
 use crate::verbs::{find, forbidden, rights_of, to_db_snapshot, to_db_volume};
 
 /// Shape: how many audit records the server keeps in memory before the ring trims them; the
@@ -203,7 +191,6 @@ impl Default for LandingState {
 }
 
 /// The identity of a landing: its id and what it lands where.
-#[cfg(unix)]
 struct LandingIds<'a> {
   landing_id: u64,
   /// Whether `landing_id` was allocated for this call (a presentation, or a granted landing no presentation
@@ -249,19 +236,7 @@ pub fn land_verb(
   ) {
     return reply;
   }
-  #[cfg(unix)]
-  {
-    land_verb_unix(state, client_id, principal, call)
-  }
-  #[cfg(not(unix))]
-  {
-    // The write path is the `os` module (Unix), the landing engine's only real writer; the
-    // Windows writer arrives with the Windows bridge (Phase 4). The verb refuses cleanly here.
-    let _ = (state, client_id, principal, call);
-    refused(Refusal::Unsupported {
-      feature: "landing".to_owned(),
-    })
-  }
+  land_verb_os(state, client_id, principal, call)
 }
 
 /// Takes the landing lease on the target whose canonical key is `key`, on this shard — the control shard,
@@ -273,7 +248,6 @@ pub fn land_verb(
 /// learned of would hold the target for a term. The generation is the take's log sequence on this
 /// partition, so it only grows, across releases and restarts: a release or a fence naming an older one
 /// names a lease that is gone.
-#[cfg(unix)]
 pub fn take_target_lease(
   state: &mut ShardState,
   key: String,
@@ -318,13 +292,11 @@ pub fn take_target_lease(
 
 /// Format: the landing-plane counter of a target-lease take that reached the control shard after its
 /// caller's deadline, and took nothing.
-#[cfg(unix)]
 const LEASE_TAKE_LATE: &str = "landing.lease_take_late";
 
 /// Releases every target lease whose term has ended, so the control partition holds no more records than
 /// the leases live at its last take (ban 8): a lease whose release never came — its attempt's compensation
 /// lost as well, or its daemon gone — would otherwise stay for good. Bounded by those records.
-#[cfg(unix)]
 fn release_expired_leases(state: &mut ShardState, now: u64) -> Result<(), Refusal> {
   let expired: Vec<String> = state
     .db
@@ -350,7 +322,6 @@ fn release_expired_leases(state: &mut ShardState, now: u64) -> Result<(), Refusa
 /// control) shard, and nothing otherwise: an attempt whose term ended, and whose target another has taken
 /// since, releases nothing of the new holder's. It is also the compensation for a take whose answer never
 /// came back: the attempt's own lease, if that take landed.
-#[cfg(unix)]
 pub fn release_target_lease(state: &mut ShardState, key: &str, holder: u64) -> Result<(), Refusal> {
   let held = state
     .db
@@ -408,14 +379,12 @@ pub fn abandon_presentations(state: &mut ShardState, client: u32) {
 /// a large landing never grows it without bound (ban 8): at capacity it sheds the oldest timing and
 /// counts the loss. It records only `(start, end)` — the land engine stays wire-free; the server builds
 /// the spans and assigns the shard's ids when it drains the observer ([`drain_land_spans`]).
-#[cfg(unix)]
 struct SpanObserver {
   entries: std::collections::VecDeque<(u64, u64)>,
   capacity: usize,
   dropped: u64,
 }
 
-#[cfg(unix)]
 impl SpanObserver {
   fn with_capacity(capacity: usize) -> SpanObserver {
     SpanObserver {
@@ -439,7 +408,6 @@ impl SpanObserver {
   }
 }
 
-#[cfg(unix)]
 impl<H: LandFs> Observer<H> for SpanObserver {
   fn before_write(&mut self, _host: &mut H, _entry: &LandingEntry) {}
 
@@ -452,7 +420,6 @@ impl<H: LandFs> Observer<H> for SpanObserver {
 /// (§4.14), each opened within the `shard.op` span of the verb that ran the landing — sharing its
 /// request and trace and naming it as the cause — and folds the observer's shed count into the ring's
 /// loss total. Called after `land` returns, so the ring is clear of the landing's borrows.
-#[cfg(unix)]
 fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
   let cause = state.current_span;
   let dropped = observer.dropped;
@@ -474,9 +441,8 @@ fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
   state.telemetry.record_dropped(dropped);
 }
 
-/// The Unix landing: open the target through `OsLand` and run the engine.
-#[cfg(unix)]
-fn land_verb_unix(
+/// The landing: open the target through `OsLand` (Unix, or Windows since A-185) and run the engine.
+fn land_verb_os(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
@@ -541,7 +507,6 @@ fn land_verb_unix(
 }
 
 /// A landing ready to run: its volume, its opened target and what its request and records name.
-#[cfg(unix)]
 struct Prepared {
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
   os: OsLand,
@@ -563,7 +528,6 @@ struct Prepared {
 /// between its slices cannot tear its manifest, and the snapshot is dropped when it is answered. It was one call: 1,000
 /// files of 16 KiB held the shard for one poll of 6.77 s on a Mac, 6.20 s of it the plan, and every verb on the shard
 /// waited for it (`crates/server/tests/presentation_fairness.rs`).
-#[cfg(unix)]
 fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
   let Some(request_id) = state.current_request else {
     return refused(Refusal::Unsupported {
@@ -670,7 +634,6 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
 
 /// A presentation's writer between its units: its own (a scratch volume's), or, an overlay's, lent back to the
 /// volume's slot with what the writer keeps of its own.
-#[cfg(unix)]
 enum Writer {
   Own(OsLand),
   Lent(slates_land::os::Away),
@@ -679,7 +642,6 @@ enum Writer {
 }
 
 /// A presentation between its units ([`defer_presentation`]).
-#[cfg(unix)]
 struct PresentJob {
   request_id: (u64, slates_wire::request::RequestId),
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -695,7 +657,6 @@ struct PresentJob {
   beginning: slates_land::engine::Beginning,
 }
 
-#[cfg(unix)]
 impl PresentJob {
   /// One unit of the presentation's beginning ([`step_beginning`]); its end once it has one.
   fn step(
@@ -722,7 +683,6 @@ impl PresentJob {
 /// Plans the presentation a slice at a time, then records it with the request's completion as one atom and delivers
 /// the reply. With the shard's state unreachable (its shutdown) no completion is recorded, so the client's retry
 /// presents again on the shard that succeeds it.
-#[cfg(unix)]
 async fn run_presentation(mut job: PresentJob) {
   let ended = loop {
     match crate::image::with(|s| crate::image::sliced(s, |s| Ok(job.step(s)))) {
@@ -765,7 +725,6 @@ async fn run_presentation(mut job: PresentJob) {
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
 /// refusal.
-#[cfg(unix)]
 fn not_landed(
   state: &mut ShardState,
   presenter: Presenter<'_>,
@@ -824,7 +783,6 @@ fn not_landed(
 /// and the request's completion committed as one atom, releases the lease, and then delivers the reply.
 /// Before 2026-09-29 the landing ran inside the verb and took a lease from its own shard's table, keyed by
 /// the target's path.
-#[cfg(unix)]
 fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> ReplyBody {
   let Some(request) = state.current_request else {
     return refused(Refusal::Unsupported {
@@ -922,7 +880,6 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
 /// what its reply and records need. The run owns its writer; an overlay volume's base host goes back to the
 /// volume's slot between slices (with the writer's own state kept `away`), so the volume serves its base
 /// while the landing waits.
-#[cfg(unix)]
 struct GrantedRun {
   run: LandingRun<'static, OsLand>,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -946,7 +903,6 @@ struct GrantedRun {
 }
 
 /// A granted landing that ended before running: what its reply needs.
-#[cfg(unix)]
 struct NotRun {
   refusal: LandingRefusal,
   landing_id: u64,
@@ -959,7 +915,6 @@ struct NotRun {
 }
 
 /// Where beginning a granted landing left it.
-#[cfg(unix)]
 enum Begun {
   /// Being planned: stepped in slices until its run begins.
   Planning(Box<Planning>),
@@ -973,7 +928,6 @@ enum Begun {
 }
 
 /// What one slice left the run at.
-#[cfg(unix)]
 enum Stepped {
   /// More host work remains.
   More,
@@ -988,7 +942,6 @@ enum Stepped {
 /// Drives a granted landing under its lease: begins it, steps it one slice per turn of the shard (yielding
 /// between, so the shard serves its other clients, lease checks and shutdown while a large landing runs),
 /// and finishes it where its records and the request's completion commit as one atom.
-#[cfg(unix)]
 async fn drive_granted_landing(
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
@@ -1036,7 +989,6 @@ async fn drive_granted_landing(
 /// A granted landing's finish: its O(entries) advance stepped a quantum at a time (A-133), the shard serving its other
 /// clients between and the lease kept alive; the outcome its completion then commits as one atom. `None` when the
 /// shard's state is gone (its shutdown).
-#[cfg(unix)]
 async fn advance_granted(
   granted: &mut GrantedRun,
   renew: LeaseAsk,
@@ -1058,7 +1010,6 @@ async fn advance_granted(
 }
 
 /// The reply to a granted landing that did not reach its run: its refusal, or what its not running is answered with.
-#[cfg(unix)]
 fn answer_unrun(state: &mut ShardState, ended: Begun) -> ReplyBody {
   match ended {
     Begun::NotRun(not_run) => reply_not_run(state, *not_run),
@@ -1071,7 +1022,6 @@ fn answer_unrun(state: &mut ShardState, ended: Begun) -> ReplyBody {
 }
 
 /// Completes a granted landing that did not reach its run, its reply recorded with the request's completion.
-#[cfg(unix)]
 fn finish_unrun(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
@@ -1084,7 +1034,6 @@ fn finish_unrun(
 
 /// A granted landing begun ([`begin_granted`]) and its plan (§4.15 steps 1–3) stepped a slice at a time, its lease kept
 /// alive between slices as its writes' is; what it began. `None` when the shard's state is gone (its shutdown).
-#[cfg(unix)]
 async fn start_granted(
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
@@ -1110,7 +1059,6 @@ async fn start_granted(
 /// the recall is revoked (§10.4.5), by the drain at the deadline, and the finish runs. Before 2026-10-05 the finish
 /// met the gate and the granted landing answered `Unpublished`, which `slates land` does not retry, and the recall it
 /// asked for was never sent, since nothing drained after a landing task's slices.
-#[cfg(unix)]
 async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &str) {
   let handle = granted.handle;
   let mut deadline: Option<u64> = None;
@@ -1158,20 +1106,17 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
 
 /// Counter: a granted landing that waited before its finish for delegations held on its volume's files (A-79).
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const LANDING_HELD_FOR_RECALL: &str = "landing.held_for_recall";
 
 /// Format: how much of its term a landing's lease has left when the landing renews it, in permille — half:
 /// the margin then covers a slice and the renewal's round trip to the control shard, each far shorter than
 /// the term, while a landing renews at most twice a term.
-#[cfg(unix)]
 const RENEW_AT_REMAINING_PERMILLE: u64 = 500;
 
 /// The keepalive between a landing's slices (AUD-29-25; the lease records waited for it): once half its
 /// lease's term has passed, the landing re-takes the lease on the control shard as its own holder and runs
 /// under the renewed term. A lease another attempt took meanwhile (this one's ended) is not renewed; the run's
 /// own per-entry fence then stops its writes, as before. Counted either way.
-#[cfg(unix)]
 async fn keep_lease_alive(held: &mut impl KeptLease, ask: LeaseAsk, key: &str) {
   let expires_ns = held.lease().expires_ns;
   let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
@@ -1212,7 +1157,6 @@ async fn keep_lease_alive(held: &mut impl KeptLease, ask: LeaseAsk, key: &str) {
 
 /// A landing that holds its target's lease between its slices: a running one ([`GrantedRun`]), or one still being
 /// planned ([`Planning`]); what [`keep_lease_alive`] keeps.
-#[cfg(unix)]
 trait KeptLease {
   /// The lease it holds now.
   fn lease(&self) -> &LandingLease;
@@ -1222,7 +1166,6 @@ trait KeptLease {
   fn seen_ns(&mut self) -> &mut u64;
 }
 
-#[cfg(unix)]
 impl KeptLease for GrantedRun {
   fn lease(&self) -> &LandingLease {
     self.run.lease()
@@ -1237,7 +1180,6 @@ impl KeptLease for GrantedRun {
   }
 }
 
-#[cfg(unix)]
 impl KeptLease for Planning {
   fn lease(&self) -> &LandingLease {
     &self.lease
@@ -1257,37 +1199,34 @@ impl KeptLease for Planning {
 }
 
 /// Format: the landing-plane counter of a lease a running landing renewed between its slices.
-#[cfg(unix)]
 const LEASE_RENEWED: &str = "landing.lease_renewed";
 
 /// Format: the landing-plane counter of a lease a running landing could not renew (another attempt holds the
 /// target, or the control shard did not answer): its term then ends the landing's writes.
-#[cfg(unix)]
 const LEASE_NOT_RENEWED: &str = "landing.lease_not_renewed";
 
 /// Counter: a landing batch's barrier run on a thread of its own while the shard served on (A-132).
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const BARRIERS_AWAY: &str = "landing.barriers_away";
 
 /// Counter: a barrier thread the system refused to start (a process or cgroup thread limit): the batch's entries
 /// fail with the refusal and the landing stops writing, for its resume, as at any refused host step.
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const BARRIER_THREAD_REFUSED: &str = "landing.barrier_thread_refused";
+
+/// Format: `EIO`, the outcome of a barrier whose thread went without one (the errno the engine reads, on every platform).
+const ERRNO_IO: i32 = 5;
 
 /// A landing batch's barrier on a thread of its own (A-132), owned by the landing's task: the thread sends the
 /// barrier's outcome over a channel of one and then wakes the task, so the wake always finds the outcome. Dropped
 /// before the outcome came (a shutdown while the barrier waits), it joins the thread first, so no thread outlives
 /// its owner; the join waits out the one barrier.
-#[cfg(unix)]
 struct BarrierThread {
   outcome: std::sync::mpsc::Receiver<Result<(), HostError>>,
   /// Joined on the landing's shard, which is marked as waiting on it meanwhile (A-228's transitive wait).
   thread: Option<slates_rt::registry::WaitedThread<()>>,
 }
 
-#[cfg(unix)]
 impl BarrierThread {
   /// Starts `barrier` on its own thread, `waker` woken once its outcome is sent; refused with the system's errno when
   /// no thread can start (the barrier is dropped unrun, its descriptors closed).
@@ -1316,9 +1255,7 @@ impl BarrierThread {
     let ran = match self.outcome.try_recv() {
       Ok(ran) => ran,
       Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-        Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()))
-      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(HostError::Unavailable(ERRNO_IO)),
     };
     self.join();
     Some(ran)
@@ -1333,7 +1270,6 @@ impl BarrierThread {
   }
 }
 
-#[cfg(unix)]
 impl Drop for BarrierThread {
   fn drop(&mut self) {
     self.join();
@@ -1345,7 +1281,6 @@ impl Drop for BarrierThread {
 /// them for its whole wait (1–160 ms a batch on a busy Linux machine, an `fsync` up to 206 ms a file on a busy Mac,
 /// 2026-10-10). The landing's lease is kept alive while the barrier lasts, as between slices. The outcome: the
 /// barrier's, or the refusal that no thread could start for it.
-#[cfg(unix)]
 async fn run_barrier_away(
   barrier: Box<dyn Barrier>,
   granted: &mut GrantedRun,
@@ -1386,7 +1321,6 @@ async fn run_barrier_away(
 
 /// How long until the landing's lease is due its renewal (`keep_lease_alive`, Unix's), `None` when it is due already (a
 /// renewal just refused leaves it so) or the shard's clock cannot be read.
-#[cfg(unix)]
 fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
   let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
   let due = granted.run.lease().expires_ns.saturating_sub(margin);
@@ -1397,7 +1331,6 @@ fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
 /// checks.
-#[cfg(unix)]
 fn begin_granted(
   state: &mut ShardState,
   prepared: Prepared,
@@ -1509,7 +1442,6 @@ fn begin_granted(
 
 /// A granted landing being planned between its slices ([`begin_granted`]): its beginning, its writer, and its lease,
 /// kept alive between slices as a running landing's is.
-#[cfg(unix)]
 struct Planning {
   beginning: slates_land::engine::Beginning,
   writer: Writer,
@@ -1531,7 +1463,6 @@ struct Planning {
 
 /// One slice of a granted landing's plan (`image::sliced`); what it began once planned: its run, or the refusal it
 /// ended with (the volume's, the target's, the grant's, its lease's).
-#[cfg(unix)]
 fn step_planning(state: &mut ShardState, planning: &mut Planning) -> Option<Begun> {
   let ended = match crate::image::sliced(state, |s| {
     Ok(step_beginning(
@@ -1554,7 +1485,6 @@ fn step_planning(state: &mut ShardState, planning: &mut Planning) -> Option<Begu
 /// A granted landing's plan, ended: its run begun under its lease (`begin_planned`), the overlay's host lent back to
 /// its slot between the run's slices; or, refused, its host given back, its implicit snapshot dropped, and the
 /// refusal it is answered with.
-#[cfg(unix)]
 fn finish_planning(
   state: &mut ShardState,
   planning: &mut Planning,
@@ -1671,7 +1601,6 @@ fn finish_planning(
 /// its end once it has one: the plan, or the landing refusal that ended it (a volume destroyed meanwhile, an overlay
 /// whose host is away, the volume's or the target's own). A presentation's and a granted landing's plan both step
 /// here.
-#[cfg(unix)]
 fn step_beginning(
   state: &mut ShardState,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -1712,7 +1641,6 @@ fn step_beginning(
 }
 
 /// Gives an overlay's base host back to its volume's slot between slices, keeping the writer's own state.
-#[cfg(unix)]
 fn lend_back(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) {
   if let Some(os) = granted.run.take_host() {
     let (host, away) = os.lend();
@@ -1722,7 +1650,6 @@ fn lend_back(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) {
 }
 
 /// Takes an overlay's base host from its volume's slot back into the run for a slice; whether it could.
-#[cfg(unix)]
 fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) -> bool {
   match (slot.host.take(), granted.away.take()) {
     (Some(host), Some(away)) => {
@@ -1739,7 +1666,6 @@ fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun)
 
 /// The writer's host after a landing that did not run: an overlay's own goes back to its slot, its walked
 /// target closed; a scratch volume's writer closes with it.
-#[cfg(unix)]
 fn give_host_back(
   slot: &mut crate::state::VolumeSlot,
   host: HostSlot<'static, OsLand>,
@@ -1755,7 +1681,6 @@ fn give_host_back(
 
 /// Destroys an unnamed landing's implicit snapshot of the head; a refusal is counted, never silent (the
 /// snapshot then stays as any snapshot does, until destroyed).
-#[cfg(unix)]
 fn drop_implicit(
   slot: &mut crate::state::VolumeSlot,
   store: &mut slates_vfs::volume::Store,
@@ -1771,33 +1696,26 @@ fn drop_implicit(
 }
 
 /// Format: the landing-plane counter of an unnamed landing's implicit snapshot whose destroy was refused.
-#[cfg(unix)]
 const IMPLICIT_SNAPSHOT_KEPT: &str = "landing.implicit_snapshot_kept";
 /// Format: the refusal-ledger names of a landing refused at each of its volume stages — the implicit snapshot
 /// of the head, the engine's read of the volume, the publication after it — so a refusal names its stage
 /// (a `NoSpace` seen only on the macOS runner, 2026-10-01, carried no stage).
-#[cfg(unix)]
 const LANDING_SNAPSHOT_REFUSED: &str = "landing.snapshot_refused";
 /// Format: see [`LANDING_SNAPSHOT_REFUSED`].
-#[cfg(unix)]
 const LANDING_VOLUME_REFUSED: &str = "landing.volume_refused";
 /// Format: see [`LANDING_SNAPSHOT_REFUSED`].
-#[cfg(unix)]
 const LANDING_PUBLISH_REFUSED: &str = "landing.publish_refused";
 
 /// Format: the share of the shard's step quantum one landing slice takes, in permille — half, as the
 /// archive walk's slice takes (`config::archive_slice_bytes`), so a slice leaves the rest of the shard's
 /// step to its other work.
-#[cfg(unix)]
 const LANDING_SLICE_PERMILLE: u64 = 500;
 /// Format: the permille scale.
-#[cfg(unix)]
 const PERMILLE: u64 = 1_000;
 
 /// One slice of a granted landing: the run stepped for its share of the shard's quantum, the base host lent
 /// back after. A volume gone meanwhile (destroyed) or whose base host is away ends the run, its entries left in
 /// the overlay as a crash leaves them.
-#[cfg(unix)]
 fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   let budget_ns = state
     .config
@@ -1845,9 +1763,7 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
 /// Finishes a granted landing inside its completion's atom: the run's finish (unless it `ended` early), its
 /// once-grant consumed, its spans drained, the writer's host settled, the implicit snapshot destroyed, and
 /// the reply with the landing's records.
-#[cfg(unix)]
 /// Where one step of the sliced finish left the advance (A-133).
-#[cfg(unix)]
 enum FinishStepped {
   /// The advance has more entries; the caller yields and steps again.
   More,
@@ -1859,7 +1775,6 @@ enum FinishStepped {
 /// shard's quantum, the base host lent back after — the same shape as [`step_granted`], so the shard serves its other
 /// clients between the advance's steps rather than holding them for its whole O(entries) run. A volume gone or a host
 /// away ends the finish with that refusal.
-#[cfg(unix)]
 fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishStepped {
   let budget_ns = state
     .config
@@ -1903,7 +1818,6 @@ fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishSteppe
 /// settled back into the volume's slot, the implicit snapshot destroyed, and the reply with the landing's records (the
 /// completion commits as one atom around this, A-127). `outcome` is the finish's, or the refusal a run that ended early
 /// carried.
-#[cfg(unix)]
 fn complete_finish(
   state: &mut ShardState,
   mut granted: GrantedRun,
@@ -1950,7 +1864,6 @@ fn complete_finish(
 }
 
 /// The reply to a granted landing refused before it ran.
-#[cfg(unix)]
 fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
   let ids = LandingIds {
     landing_id: not_run.landing_id,
@@ -1969,7 +1882,6 @@ fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
 
 /// Where a landing attempt asks for its target's lease: from this shard to the control shard, for the
 /// attempt `holder`, for `term` nanoseconds, answered by the monotonic `deadline`.
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct LeaseAsk {
   shard: u16,
@@ -1983,7 +1895,6 @@ struct LeaseAsk {
 /// take whose answer does not come back in that time is compensated — the attempt's own lease released,
 /// should the take have landed; a take still queued refuses itself past the deadline — so a lease outlives
 /// an attempt that never learned of it only when the compensation fails as well, and then by its term.
-#[cfg(unix)]
 async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease, Refusal> {
   let LeaseAsk {
     shard,
@@ -2021,12 +1932,10 @@ async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease
 }
 
 /// Format: the landing-plane counter of a target-lease take whose answer did not come back within its term.
-#[cfg(unix)]
 const LEASE_TAKE_UNANSWERED: &str = "landing.lease_take_unanswered";
 
 /// Format: the landing-plane counter of a target lease whose release did not reach the control shard (it
 /// ends by its term).
-#[cfg(unix)]
 const LEASE_UNRELEASED: &str = "landing.lease_unreleased";
 
 /// The placeholder a deferred landing's verb returns. It is never delivered: the verb deferred its reply, and
@@ -2058,7 +1967,6 @@ pub(crate) fn deferred_reply() -> ReplyBody {
 /// A granted landing's completion on its owner shard: the reply `produce` builds — the finished landing's
 /// records, or a refusal — and the request's completion committed as one atom. Returns the recorded reply
 /// and where it goes.
-#[cfg(unix)]
 fn complete_landing_with(
   state: &mut ShardState,
   (origin, id): (u64, slates_wire::request::RequestId),
@@ -2091,7 +1999,6 @@ fn complete_landing_with(
 
 /// Delivers a granted landing's reply to where its request waits, on its client's shard. A request with no
 /// route — a forward from another node — reads its completion record instead.
-#[cfg(unix)]
 fn deliver_landing(
   state: &mut ShardState,
   reply: ReplyBody,
@@ -2112,11 +2019,9 @@ fn deliver_landing(
 
 /// Format: the landing-plane counter of a granted landing's reply that could not be handed to its client's
 /// shard.
-#[cfg(unix)]
 const LANDING_UNDELIVERED: &str = "landing.reply_undelivered";
 
 /// The refusal-ledger name of a landing refused for a grant bound elsewhere, by the field that differed.
-#[cfg(unix)]
 fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str {
   use slates_land::grant::BindingField;
   match field {
@@ -2131,7 +2036,6 @@ fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str
 /// as it froze. A snapshot the catalog does not hold for this volume — never taken, destroyed, or another
 /// volume's — is `NotFound`, before any host access. Before 2026-09-30 the engine planned and wrote the head
 /// whatever snapshot was named, and a head changed since the snapshot was refused instead.
-#[cfg(unix)]
 fn named_snapshot_source(
   state: &ShardState,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -2163,7 +2067,6 @@ fn named_snapshot_source(
 /// Records the planned landing (AwaitingGrant) and its audit, and replies `GrantRequired`.
 /// Who presents a landing: the calling client (whose retirement abandons the presentation) and its
 /// principal.
-#[cfg(unix)]
 struct Presenter<'a> {
   client: u32,
   principal: &'a Principal,
@@ -2171,7 +2074,6 @@ struct Presenter<'a> {
 
 /// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
 /// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
-#[cfg(unix)]
 fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
   let replaces = state.landing.awaiting.values().any(|awaiting| {
     awaiting.client == client && awaiting.volume == volume && awaiting.target == target
@@ -2182,7 +2084,6 @@ fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, targe
 /// The presentation a granted landing lands (AUD-29-07): the awaiting landing whose manifest and binding the
 /// grant was issued from. `None` for a grant covering a plan no presentation made (a session grant's later
 /// plans), which lands under a fresh id.
-#[cfg(unix)]
 fn presentation_for(state: &ShardState, grant: u64) -> Option<u64> {
   let granted = state.landing.grants.get(GrantId(grant))?;
   state
@@ -2195,7 +2096,6 @@ fn presentation_for(state: &ShardState, grant: u64) -> Option<u64> {
     .map(|(id, _)| *id)
 }
 
-#[cfg(unix)]
 fn present(
   state: &mut ShardState,
   presenter: Presenter<'_>,
@@ -2279,7 +2179,6 @@ fn present(
 }
 
 /// Persists a finished landing: the record, its terminal audit, and the consumed grant.
-#[cfg(unix)]
 fn finish(
   state: &mut ShardState,
   principal: &Principal,
@@ -2360,7 +2259,6 @@ fn finish(
 
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
 /// the landing made a scratch volume an overlay.
-#[cfg(unix)]
 fn closing_ops(state: &ShardState, ids: &LandingIds<'_>, grant: Option<u64>) -> Vec<Op> {
   let mut ops = Vec::new();
   // The grant's transition as it happened (AUD-29-06): the engine consumes a single-use grant whose landing
@@ -2393,7 +2291,6 @@ fn closing_ops(state: &ShardState, ids: &LandingIds<'_>, grant: Option<u64>) -> 
 
 /// Publishes the shard's content images after a landing that advanced the volume (see the body); the refusal
 /// to reply with when the volume was not captured, else `None`.
-#[cfg(unix)]
 fn publish_landed(
   state: &mut ShardState,
   ids: &LandingIds<'_>,
@@ -2426,7 +2323,6 @@ fn publish_landed(
 }
 
 /// The engine's durability as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped it).
-#[cfg(unix)]
 fn durability_of(durability: &Durability) -> LandingDurability {
   LandingDurability {
     data_synced: durability.data_synced,
@@ -2439,7 +2335,6 @@ fn durability_of(durability: &Durability) -> LandingDurability {
 
 /// A Degraded cell the engine met, as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped
 /// every one).
-#[cfg(unix)]
 fn degradation_of(degradation: &Degradation) -> LandingDegradation {
   match degradation {
     Degradation::NoExchange { widest_window_ns } => LandingDegradation::NoExchange {
@@ -2470,7 +2365,6 @@ fn degradation_of(degradation: &Degradation) -> LandingDegradation {
 }
 
 /// A host refusal as the reply carries it.
-#[cfg(unix)]
 fn answer_of(error: HostError) -> HostAnswer {
   match error {
     HostError::NotFound => HostAnswer::NotFound,
@@ -2774,7 +2668,6 @@ fn session_of(principal: &Principal) -> u64 {
   }
 }
 
-#[cfg(unix)]
 fn to_land_filter(filter: &slates_ipc::protocol::Filter) -> Filter {
   Filter {
     include: filter.include.iter().map(|s| s.as_str().into()).collect(),
@@ -2782,7 +2675,6 @@ fn to_land_filter(filter: &slates_ipc::protocol::Filter) -> Filter {
   }
 }
 
-#[cfg(unix)]
 fn summary_of(manifest: &Manifest) -> LandingSummary {
   LandingSummary {
     by_action: manifest
@@ -2799,7 +2691,6 @@ fn summary_of(manifest: &Manifest) -> LandingSummary {
   }
 }
 
-#[cfg(unix)]
 fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
   if matches!(refusal, TargetRefusal::OwnMount) {
     return Refusal::OwnMount {
@@ -2818,7 +2709,6 @@ fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
   }
 }
 
-#[cfg(unix)]
 fn db_landing_state(state: &slates_land::engine::LandingState) -> DbLandingState {
   use slates_land::engine::LandingState as L;
   match state {
@@ -2851,7 +2741,6 @@ fn landing_state_name(state: DbLandingState) -> String {
   .to_owned()
 }
 
-#[cfg(unix)]
 fn db_audit(audit: &AuditRecord, principal: &Principal) -> DbAuditRecord {
   DbAuditRecord {
     seq: 0,
@@ -2865,7 +2754,6 @@ fn db_audit(audit: &AuditRecord, principal: &Principal) -> DbAuditRecord {
   }
 }
 
-#[cfg(unix)]
 fn db_audit_kind(kind: AuditKind) -> DbAuditKind {
   match kind {
     AuditKind::LandingPlanned => DbAuditKind::LandingPlanned,
@@ -2913,7 +2801,7 @@ fn grant_state_name(state: DbGrantState) -> String {
   .to_owned()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
   use super::{
     ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, release_target_lease,
