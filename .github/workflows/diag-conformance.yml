@@ -1,0 +1,106 @@
+# Diagnostics for the conformance agent: never on main. Triggered only by pushes to diag-conformance-* branches.
+# conformance-18 (A-275): diag-46's three runs left the contended open p50 ambiguous (main 83.7 µs median, the branch
+# 98.7). Three arms interleaved in one mount_bench process by docs/wip/bench/fsbench/windows-ab.sh, six runs, quiet and
+# with two spinners a logical CPU: main (1c49c33f); the branch; and the branch with the link-privilege token read cut
+# (creator_may_link never called), which separates the judgment's cost from the reparse points' own. Results go to
+# diag-results/conformance-<run>-bench, read with git fetch.
+name: diag-conformance
+
+on:
+  push:
+    branches: ['diag-conformance-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  bench:
+    name: "A-275: the WinFsp drive per-call latency, main against the branch"
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-results/conformance-${{ github.run_id }}-bench
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The results publisher
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUB'
+          #!/bin/bash
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in results/*; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f") || exit 0
+            entries="$entries$(printf '100644 blob %s\t%s' "$blob" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUB
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          mkdir -p results
+          { echo "tree $(git rev-parse HEAD) $(date -u +%FT%TZ)"; uname -a; } > results/00-image.txt
+          "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: a275-bench3
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Release builds of main (1c49c33f) and of the branch, and mount_bench
+        timeout-minutes: 90
+        run: |
+          set -e
+          git worktree add ../main 1c49c33f459561bc4c1fc90859f473a5253fbc2c
+          (cd ../main && cargo build --release --locked -p slates-cli --bin slates)
+          git worktree add ../nojudge HEAD
+          sed -i 's/CREATOR_MAY_LINK.set(creator_may_link(request)?);/CREATOR_MAY_LINK.set(false);/' ../nojudge/crates/bridge-winfsp/src/dispatcher.rs
+          git -C ../nojudge diff > results/06-nojudge.diff
+          (cd ../nojudge && cargo build --release --locked -p slates-cli --bin slates)
+          cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+          { echo "main $(git -C ../main rev-parse HEAD)"; echo "branch $(git rev-parse HEAD)"; } > results/05-builds.txt
+          "$RUNNER_TEMP/publish.sh"
+      - name: The A/B/C, six runs
+        timeout-minutes: 200
+        run: |
+          set +e
+          printf '#!/bin/bash\ncp "$RUNNER_TEMP/ab.log" "$GITHUB_WORKSPACE/results/10-ab.log"\n"$RUNNER_TEMP/publish.sh"\n' > "$RUNNER_TEMP/after-run.sh"
+          chmod +x "$RUNNER_TEMP/after-run.sh"
+          ARMS="main=$(cd ../main && pwd)/target/release/slates.exe a275=$PWD/target/release/slates.exe nojudge=$(cd ../nojudge && pwd)/target/release/slates.exe" \
+            BENCH=$PWD/target/release/examples/mount_bench.exe RUNS=6 SPINNERS_PER_CPU=2 \
+            AFTER_RUN="$RUNNER_TEMP/after-run.sh" \
+            bash docs/wip/bench/fsbench/windows-ab.sh > "$RUNNER_TEMP/ab.log" 2>&1
+          echo "exit $?" >> "$RUNNER_TEMP/ab.log"
+          cp "$RUNNER_TEMP/ab.log" results/10-ab.log
+          grep -E "^## |^\| (create|open) |^\*\*(quiet|contended)\*\*|exit " results/10-ab.log > results/11-ab-create-open.txt
+          "$RUNNER_TEMP/publish.sh"
