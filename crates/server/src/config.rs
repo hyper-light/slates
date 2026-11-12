@@ -913,7 +913,14 @@ impl DaemonConfig {
     // R9's floor. `spin_ns` is the boot value, kept by a runtime that tracks no estimate.
     if let Some(tracking) = runtime.wake_tracking.as_mut() {
       tracking.idle_ratio = loaded_wake_ratio().get();
-      tracking.idle_floor_ns = PROVISION_FLOOR_NS;
+      // Diagnostics only (A-223 step 6, option 1): SLATES_DIAG_WINDOW_PER_SHARD scales the floor by the shard count.
+      #[allow(clippy::disallowed_methods)]
+      let per_shard = std::env::var("SLATES_DIAG_WINDOW_PER_SHARD").is_ok();
+      tracking.idle_floor_ns = if per_shard {
+        PROVISION_FLOOR_NS.saturating_mul(u64::from(runtime.shards.max(1)))
+      } else {
+        PROVISION_FLOOR_NS
+      };
     }
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
