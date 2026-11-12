@@ -981,10 +981,15 @@ pub(crate) fn published(
   }
 }
 
-/// The retained tail's byte bound a publication sets (`Shipper::retain_up_to`): the size of the volume's last whole
-/// record or install image, `last_whole`.
-fn retain_bound(last_whole: usize, _referenced: u64) -> usize {
-  last_whole
+/// The retained tail's byte bound a publication sets (`Shipper::retain_up_to`). Derived: what installing the volume
+/// would send now, the larger of its referenced bytes and its last whole record or install image (`last_whole`), so a
+/// laggard is shipped the entries it lacks while they cost no more than installing it. Set only at a whole record or an
+/// image, the bound stayed at the last one's size however the volume grew, and a whole record comes only once the log
+/// reaches the volume's quota ([`kept_reaches_size`]): 215,997 bytes at head 16,526, so a holder 12 entries behind fell
+/// past the tail and was installed whole, its 195 to 219 MB image built on the owner's shard, 2 to 6 times in each
+/// catch-up (diag-live-durability-81 and -82).
+fn retain_bound(last_whole: usize, referenced: u64) -> usize {
+  last_whole.max(usize::try_from(referenced).unwrap_or(usize::MAX))
 }
 
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
