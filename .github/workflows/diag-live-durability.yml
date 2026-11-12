@@ -1,0 +1,62 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main: retain-1's red check and the fix's tests (the shared Mac is out of disk).
+# Results to diag-results/live-durability-83-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: retain (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: red, ref: 84acf4ae0ca4206909adaa851dcb6dba3f5b6b0e }
+          - { leg: fix, ref: bb3c389998d3a5832105e4c265748d86e86525f6 }
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: The checks
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          echo "leg ${{ matrix.leg }}, tree $(git rev-parse HEAD)" > $R
+          cargo fmt --all -- --check > ../fmt.log 2>&1; echo "== fmt exit $?" >> $R
+          cargo test --locked -p slates-server --lib the_retained_tail_follows_the_volume_as_it_is_now > ../one.log 2>&1; echo "== the test exit $?" >> $R
+          grep -E 'panicked|left|right|test result' -A1 ../one.log | head -12 >> $R
+          if [ "${{ matrix.leg }}" = fix ]; then
+            cargo test --locked -p slates-server --lib > ../lib.log 2>&1; echo "== server lib exit $?" >> $R
+            grep -E '^test .*FAILED|test result' ../lib.log | head -12 >> $R
+            cargo clippy --locked -p slates-server --all-targets -- -D warnings > ../clippy.log 2>&1; echo "== clippy exit $?" >> $R
+            grep -E '^(error|warning: [a-z])' -A6 ../clippy.log | grep -v aws-lc | head -30 >> $R
+          fi
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-83-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-83 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
