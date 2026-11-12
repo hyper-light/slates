@@ -38,8 +38,21 @@ teardown() {
   local index
   for index in "${!NAMES[@]}"; do
     local drive=${DRIVES[$index]:-} instance=${INSTANCES[$index]:-} anchor=${ANCHORS[$index]:-}
-    if [ -n "$drive" ] && [ -e "$drive/" ]; then "${BINARIES[$index]}" --instance "$instance" unmount "$drive"; fi
-    if [ -n "$anchor" ]; then kill "$anchor" 2>/dev/null; wait "$anchor" 2>/dev/null; fi
+    # diag-50: whether a daemon that printed nothing at its end crashed or was killed here.
+    if [ -n "$drive" ] && [ -e "$drive/" ]; then
+      local said status
+      said=$("${BINARIES[$index]}" --instance "$instance" unmount "$drive" 2>&1)
+      status=$?
+      echo "# teardown: unmount $drive of $instance answered exit $status: $(echo "$said" | tr -d '\r' | tr '\n' ' ' | cut -c1-300)"
+    else
+      echo "# teardown: $instance's drive '$drive' was gone before its unmount"
+    fi
+    if [ -n "$anchor" ]; then
+      echo "# teardown: $instance's processes before its anchor is ended:"
+      powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='slates.exe'\" | Where-Object { \$_.CommandLine -like '*$instance*' } | ForEach-Object { '  pid {0}, parent {1}: {2}' -f \$_.ProcessId, \$_.ParentProcessId, \$_.CommandLine }" 2>&1 | tr -d '\r'
+      kill "$anchor" 2>/dev/null; wait "$anchor" 2>/dev/null
+      echo "# teardown: $instance's anchor ended (wait answered $?)"
+    fi
   done
   ANCHORS=() DRIVES=()
   set -e
@@ -221,7 +234,7 @@ for run in $(seq 1 "$RUNS"); do
   outcome=done
   beat "run $run: the bench"
   "$BENCH" "${arms[@]}" --spinners-per-cpu "$SPINNERS_PER_CPU" \
-    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} 2> "$W/bench.log" &
+    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} ${PASS:+--pass "$PASS"} 2> "$W/bench.log" &
   echo $! > "$W/bench.pid"
   wait "$(cat "$W/bench.pid")" || outcome=FAILED
   # The bench's own error output; its progress lines were for the stall detector.
