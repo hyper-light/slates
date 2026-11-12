@@ -1,0 +1,72 @@
+name: diag-liveness-client
+
+# Diagnostics only, never on main (A-223 sibling (d)): cargo test -p slates-ipc -p slates-client on the branch's head
+# (Windows one test at a time, as CI runs the client binary there), and the racing test three times. Results go to
+# diag-results/liveness-client-5-<os>.
+on:
+  push:
+    branches: ["diag-liveness-client-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  HEAD_SHA: 43343c284e887609674113f38794b9944d0cd3df
+
+jobs:
+  suites:
+    name: A-223 (d) suites (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The suites and the racing test on the head
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          git worktree add ../src "$HEAD_SHA" > /dev/null 2>&1
+          ( cd ../src && git log -1 --format="head %h %s" | cut -c1-100 ) | tee -a $R
+          threads=""; case "${{ matrix.os }}" in windows-*) threads="--test-threads=1";; esac
+          ( cd ../src && CARGO_TARGET_DIR=../target cargo test --locked --no-fail-fast -p slates-ipc -p slates-client -- $threads ) > ../suites.log 2>&1; status=$?
+          echo "== suites exit $status" | tee -a $R
+          grep -E 'FAILED|panicked' ../suites.log | cut -c1-300 | tee -a $R
+          grep -h '^test result' ../suites.log | awk '{p+=$4; f+=$6; i+=$8} END{print "== suites total: "p" passed, "f" failed, "i" ignored"}' | tee -a $R
+          for round in 1 2 3; do
+            ( cd ../src && CARGO_TARGET_DIR=../target cargo test --locked -p slates-ipc --test rings a_reply_sent_before -- --nocapture ) > ../run.log 2>&1; status=$?
+            grep -E 'sleepers|SKIP|never switched out|test result' ../run.log | cut -c1-300 | tee -a $R
+            echo "== racing round=$round exit $status" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-client-5-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../suites.log suites.log 2>/dev/null || true
+          git add results.txt suites.log
+          git commit -qm "diag-liveness-client-5 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
