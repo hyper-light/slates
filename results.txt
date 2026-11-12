@@ -1,0 +1,94 @@
+runner macos-latest, 3 CPUs, Thu Nov 12 08:15:27 UTC 2026
+tree red 8e0aa6a70 diag only (A-223 (d)): the failing test (16,384 racing parks) and the bench's cli
+== test red round=1
+sleepers: 160 samples in 160 trips, estimate 16668 ns; racing: 16384 parks in 16391 trips, 9707 taught nothing, 16 taught a handoff [997, 995, 997, 987, 997, 995, 994, 994, 985, 996, 988, 997, 989, 990, 987, 990] ns, 14 trips taught two, estimate 12255 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (19024) panicked at crates/ipc/tests/rings.rs:358:3:
+16 racing parks taught a wake under 1000 ns: [997, 995, 997, 987, 997, 995, 994, 994, 985, 996, 988, 997, 989, 990, 987, 990] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.41s
+== exit 101
+== test red round=2
+sleepers: 160 samples in 160 trips, estimate 17511 ns; racing: 16384 parks in 16392 trips, 8005 taught nothing, 18 taught a handoff [992, 988, 993, 990, 996, 992, 998, 997, 994, 996, 994, 995, 987, 992, 990, 999, 999, 992] ns, 9 trips taught two, estimate 9022 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (19073) panicked at crates/ipc/tests/rings.rs:358:3:
+18 racing parks taught a wake under 1000 ns: [992, 988, 993, 990, 996, 992, 998, 997, 994, 996, 994, 995, 987, 992, 990, 999, 999, 992] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.41s
+== exit 101
+== test red round=3
+sleepers: 160 samples in 160 trips, estimate 24552 ns; racing: 16384 parks in 16409 trips, 8706 taught nothing, 10 taught a handoff [993, 990, 997, 995, 996, 999, 999, 999, 998, 993] ns, 17 trips taught two, estimate 13708 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (19125) panicked at crates/ipc/tests/rings.rs:358:3:
+10 racing parks taught a wake under 1000 ns: [993, 990, 997, 995, 996, 999, 999, 999, 998, 993] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.41s
+== exit 101
+tree fix ed3c06657 diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+sleepers: 160 samples in 160 trips, estimate 14428 ns; racing: 16384 parks in 16402 trips, 3553 taught nothing, 1 taught a handoff [997] ns, 25 trips taught two, estimate 9665 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (30948) panicked at crates/ipc/tests/rings.rs:358:3:
+1 racing parks taught a wake under 1000 ns: [997] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.57s
+== exit 101
+== test fix round=2
+sleepers: 160 samples in 160 trips, estimate 12075 ns; racing: 16384 parks in 16388 trips, 12261 taught nothing, 1 taught a handoff [991] ns, 8 trips taught two, estimate 5182 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (30994) panicked at crates/ipc/tests/rings.rs:358:3:
+1 racing parks taught a wake under 1000 ns: [991] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.63s
+== exit 101
+== test fix round=3
+sleepers: 160 samples in 160 trips, estimate 13228 ns; racing: 16384 parks in 16389 trips, 10494 taught nothing, 3 taught a handoff [995, 999, 993] ns, 6 trips taught two, estimate 7585 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (31070) panicked at crates/ipc/tests/rings.rs:358:3:
+3 racing parks taught a wake under 1000 ns: [995, 999, 993] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.56s
+== exit 101
+== suites exit 101
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_client-ef5e56995216634e)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/acknowledge.rs (../target-fix/debug/deps/acknowledge-01de66f7bd244b24)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+     Running tests/async_core.rs (../target-fix/debug/deps/async_core-fc5c52ed4136d30b)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+     Running tests/cipher_keys.rs (../target-fix/debug/deps/cipher_keys-b52f6b7c8111ea92)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+     Running tests/client.rs (../target-fix/debug/deps/client-b68ca263b828c75e)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.15s
+     Running tests/consumer.rs (../target-fix/debug/deps/consumer-17dc011c5d7e4195)
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.35s
+     Running tests/driver.rs (../target-fix/debug/deps/driver-1363a204d8961828)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.35s
+     Running tests/edit_and_submit.rs (../target-fix/debug/deps/edit_and_submit-dfd4da925bc14d9f)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+     Running tests/image.rs (../target-fix/debug/deps/image-2c0291626f719efc)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+     Running tests/merge_chaos.rs (../target-fix/debug/deps/merge_chaos-9cdccb522dbfb20d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+     Running tests/merge_identity.rs (../target-fix/debug/deps/merge_identity-425bb1832c19f07d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+     Running tests/merge_post_state.rs (../target-fix/debug/deps/merge_post_state-bda4e21aae921aab)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+     Running tests/netns.rs (../target-fix/debug/deps/netns-d93b5d7b3f7bc756)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/presentation.rs (../target-fix/debug/deps/presentation-7701e8f68f814e0e)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+     Running tests/reap.rs (../target-fix/debug/deps/reap-de0ef9b465a05e65)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.33s
+     Running tests/reap_map.rs (../target-fix/debug/deps/reap_map-1ad3964c41b817a4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.71s
+     Running tests/shards.rs (../target-fix/debug/deps/shards-6f413147c3edf5a3)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_ipc-2851b0678065ac5b)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 0.00s
+test result: ok. 39 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.18s
+     Running tests/delivery.rs (../target-fix/debug/deps/delivery-2d083c8682b469ae)
+test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/rendezvous.rs (../target-fix/debug/deps/rendezvous-3cd61e149b6ba1ae)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+     Running tests/rings.rs (../target-fix/debug/deps/rings-f0f8e997b76a0f5c)
+test a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing ... FAILED
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (52723) panicked at crates/ipc/tests/rings.rs:358:3:
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+     Running tests/status.rs (../target-fix/debug/deps/status-a86a1de3eb52cc85)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/stream_exec.rs (../target-fix/debug/deps/stream_exec-9580a16d6ace717c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/stream_spawn.rs (../target-fix/debug/deps/stream_spawn-d4162ada7faaff32)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== suites total: 139 passed, 1 failed, 5 ignored
