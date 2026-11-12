@@ -5838,6 +5838,11 @@ const DEAD_SESSION_BURST_CLIENTS: usize = 256;
 /// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
 static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
+/// Whether the burst has sent its first round: the session goes deaf only after, so b's lane is full when it does. A
+/// fixed wait was not enough: with the Mac at load 56 to 66, the 256 clients' connects outlasted it, the session went
+/// deaf over an empty lane, and the burst finished no round (2026-11-12, 3 of 3).
+static DEAD_SESSION_BURST_SENT: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
 /// so the client node's record session to it looked valid, and borrowers kept forwarding into a session the new process
@@ -5874,6 +5879,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
   let through_b = daemons[1].instance().to_owned();
   DEAD_SESSION_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
+  DEAD_SESSION_BURST_SENT.store(false, std::sync::atomic::Ordering::Release);
   let burst_read = read.clone();
   let burst = std::thread::spawn(move || {
     let mut clients: Vec<Client> = (0..DEAD_SESSION_BURST_CLIENTS)
@@ -5884,6 +5890,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
       for client in &mut clients {
         client.send_burst(&burst_read, slots);
       }
+      DEAD_SESSION_BURST_SENT.store(true, std::sync::atomic::Ordering::Release);
       for client in &mut clients {
         client.collect_tagged(slots, ADMITTED_FORWARDS_READ);
       }
@@ -5891,7 +5898,15 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     }
     rounds
   });
-  // The lane busy for a budget before the session goes deaf.
+  // The burst's first round sent, however long its clients took to connect, then the lane busy for a budget before the
+  // session goes deaf.
+  let starting = Instant::now();
+  while !DEAD_SESSION_BURST_SENT.load(std::sync::atomic::Ordering::Acquire)
+    && starting.elapsed() < DEAD_SESSION_WATCH
+  {
+    std::thread::yield_now();
+  }
+  let sent = DEAD_SESSION_BURST_SENT.load(std::sync::atomic::Ordering::Acquire);
   let busy_until = Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS);
   while Instant::now() < busy_until {
     std::thread::yield_now();
@@ -5950,6 +5965,10 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   assert!(routed, "b routed the volume to a: {last:?}");
   assert_eq!(held, Ok(()), "b's discovery to a was held");
   assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(
+    sent,
+    "the burst sent its first round within {DEAD_SESSION_WATCH:?} of starting"
+  );
   assert!(rounds > 0, "the burst kept b's lane busy");
   let recovered = recovered.unwrap_or_else(|| {
     panic!(
