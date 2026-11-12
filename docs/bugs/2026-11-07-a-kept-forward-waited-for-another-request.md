@@ -44,8 +44,8 @@ of its own: nothing rings when the owner's channel gets room.
 
 ## Fix
 
-While a forward is kept, the serve loop idles at most its idle window, the shard's measured wake cost ×
-`IDLE_WINDOW_RATIO`, about 4 ms on this Mac. It then serves a round, which sends the forward again. With no forward
+While a forward is kept, the serve loop idles at most its idle window, then the shard's measured wake cost ×
+100, about 4 ms on this Mac (since A-223's window rule, R9's 50 µs floor on Linux and macOS). It then serves a round, which sends the forward again. With no forward
 kept, it idles as before, until a ring wakes it. That bounds a kept forward's wait at one idle window past the
 channel's room, at a cost of one timer a window while forwards wait.
 

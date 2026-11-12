@@ -45,8 +45,14 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// The current shard's idle window in nanoseconds (`ShardContext::idle_window_ns`): what the daemon's serve
+/// loop keeps polling for after its last work. `None` off a shard thread.
+pub fn idle_window_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.idle_window_ns())
+}
+
 /// The current shard's online wake estimate in nanoseconds (the configured step budget when it tracks
-/// none); what the daemon's own idle window scales. `None` off a shard thread.
+/// none). `None` off a shard thread.
 pub fn wake_cost_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.wake_cost_ns())
 }

@@ -5,7 +5,7 @@
 On Windows the boot wake probe (`crates/machine/src/wake.rs`) and every shard's online wake estimate
 (`crates/rt/src/shard.rs` `note_wake`) measured an on-CPU handoff, not a sleeping thread woken. On jupiter (Windows
 x86_64, 32 logical CPUs, 15 shards; main b502cf96, 2026-11-05) the profile's wake mean read 0.56 µs and each shard's
-estimate 0.62–0.83 µs. The idle window is 100 times the estimate (`IDLE_WINDOW_RATIO`), so about 58 µs, and owner
+estimate 0.62–0.83 µs. The idle window was then 100 times the estimate (the daemon's idle ratio; A-223's window rule replaced it), so about 58 µs, and owner
 shards parked between a single client's creates. Over 9 runs of 2,000 single-client creates the owner parked during
 221–546 creates, and 20 or 21 of each run's 21 slowest creates had their owner park during the create. p99 was
 5.8–14.2 ms (jupiter at 30–41 % CPU from other work).

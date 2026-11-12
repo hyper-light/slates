@@ -57,7 +57,7 @@ slept (Linux: 3, 2, 1, 2, 3).
 
 **Consumers read the estimate live.** The step quantum (`ShardContext::quantum_ns`; the I/O harvest
 cadence, the long-step judgement, `slates_rt::futures::step_budget_ns`), the shard's idle spin
-(estimate × `WakeTracking::idle_ratio`, the daemon's `IDLE_WINDOW_RATIO`), the destroy and archive
+(estimate × `WakeTracking::idle_ratio`, then 100 for the daemon; since A-223's window rule, R9's floor on Linux and macOS), the destroy and archive
 slices (`DaemonConfig::step_quantum_ns`, `archive_slice_bytes`), the serve loop's idle window
 (`futures::wake_cost_ns`), and the client's spin and reconnect pause. The timer tick is fixed by the
 wheel's construction and keeps the boot mean. `ShardPulse::wake_cost_ns` reports each shard's

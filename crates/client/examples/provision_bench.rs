@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass};
 use slates_machine::process_clock::process_cpu;
 use slates_machine::{MachineProfile, ProfileOptions};
+use slates_server::config::PROVISION_FLOOR_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: runs per row.
@@ -40,9 +41,6 @@ const PARKED_SAMPLES: usize = 500;
 const PARKED_PAUSE: Duration = Duration::from_millis(1);
 /// Shape: the concurrent client counts of T-2.6.
 const CLIENT_COUNTS: &[usize] = &[1, 8, 64];
-/// Shape: the initial floor of AC-2.1 (R9): fifty microseconds; the ratchet's ceiling
-/// tightens below it.
-const PROVISION_FLOOR_NS: u64 = 50_000;
 /// Shape: the bounded volume created per sample.
 const VOLUME_BYTES: u64 = 1 << 20;
 /// Format: the percentiles reported, in parts per thousand.
