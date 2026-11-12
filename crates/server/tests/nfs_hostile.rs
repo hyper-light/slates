@@ -44,6 +44,8 @@ const COUNTER_BITS: std::ops::Range<usize> = 152..200;
 const NFSPROC3_READ: u32 = 6;
 /// Format: NFSPROC3_WRITE (RFC 1813).
 const NFSPROC3_WRITE: u32 = 7;
+/// Format: `NFS3ERR_FBIG` (RFC 1813 §2.6): the file is too large, or a write would make it larger than the server keeps.
+const NFS3ERR_FBIG: u32 = 27;
 /// Format: NFSPROC3_READDIRPLUS (RFC 1813).
 const NFSPROC3_READDIRPLUS: u32 = 17;
 /// Format: the record marker's last-fragment bit (RFC 5531 §11).
@@ -1734,8 +1736,9 @@ fn a_forged_readdir_cookie_is_bounded_and_the_daemon_survives() {
 /// A WRITE at a colossal offset (§4.6; checked arithmetic, no unbounded allocation). A client controls the WRITE
 /// offset; `offset + count` overflowing `u64` must be a typed refusal, never a wrap to a small offset, and a
 /// colossal sparse offset must not drive the daemon to allocate the whole span (OOM). Over a live socket, the
-/// overflowing write is refused and a normal write/read round-trips afterwards — the daemon never wrapped, paniced
-/// or OOM'd.
+/// overflowing write is refused `NFS3ERR_FBIG`, RFC 1813 §3.3.7's status for a write past the largest file the server
+/// keeps (it was `NFS3ERR_SERVERFAULT`, the server's own failure, until 2026-11-11), and a normal write/read
+/// round-trips afterwards — the daemon never wrapped, paniced or OOM'd.
 #[test]
 fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
   let (daemon, instance) = single_shard_daemon("writeoverflow");
@@ -1750,9 +1753,9 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
   // a colossal (non-overflowing) sparse offset: whatever the policy, it must not OOM the daemon.
   let colossal = write_at_status(&mut s, &f, 1u64 << 60, b"x", 4);
   eprintln!("PROBE write offset: overflow(u64::MAX-5)={overflow} colossal(2^60)={colossal}");
-  assert_ne!(
-    overflow, 0,
-    "a WRITE whose offset+count overflows u64 is refused, not wrapped (FBIG)"
+  assert_eq!(
+    overflow, NFS3ERR_FBIG,
+    "a WRITE whose offset+count overflows u64 is refused NFS3ERR_FBIG, not wrapped and not SERVERFAULT"
   );
 
   // The colossal non-overflowing offset is a sparse write — normal POSIX (a hole costs no space; slates charges

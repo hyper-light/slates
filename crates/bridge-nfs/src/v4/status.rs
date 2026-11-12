@@ -198,6 +198,7 @@ impl Nfsstat4 {
       Nfsstat3::Notdir => Nfsstat4::Notdir,
       Nfsstat3::Isdir => Nfsstat4::Isdir,
       Nfsstat3::Inval => Nfsstat4::Inval,
+      Nfsstat3::Fbig => Nfsstat4::Fbig,
       Nfsstat3::Nospc => Nfsstat4::Nospc,
       Nfsstat3::Rofs => Nfsstat4::Rofs,
       Nfsstat3::Nametoolong => Nfsstat4::Nametoolong,

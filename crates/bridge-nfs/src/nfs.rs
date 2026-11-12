@@ -32,6 +32,8 @@ pub enum Nfsstat3 {
   Isdir = 21,
   /// Format: NFS3ERR_INVAL — an invalid argument.
   Inval = 22,
+  /// Format: NFS3ERR_FBIG — the file is too large: a write past the largest offset the server keeps (RFC 1813 §2.6).
+  Fbig = 27,
   /// Format: NFS3ERR_NOSPC — no space left on the device.
   Nospc = 28,
   /// Format: NFS3ERR_ROFS — a read-only filesystem.
@@ -88,6 +90,7 @@ impl Nfsstat3 {
       Notdir,
       Isdir,
       Inval,
+      Fbig,
       Nospc,
       Rofs,
       Nametoolong,

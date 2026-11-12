@@ -3132,6 +3132,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::IsDirectory => Nfsstat3::Isdir,
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
+    // An offset or length past what the volume addresses: the file would be too large (RFC 1813 §2.6), never the
+    // server's own fault.
+    VfsError::FileTooLarge => Nfsstat3::Fbig,
     VfsError::NotPermitted => Nfsstat3::Perm,
     // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
     // `Nfsstat4::of_v3`).
