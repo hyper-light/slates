@@ -1,0 +1,105 @@
+tree bcdc421 diag only (A-223 step 4): the paced-client test repeated with its vacuity bound at 4x; not for main
+runner macos-latest, 5 CPUs, Thu Nov 12 09:30:52 UTC 2026
+== fmt exit 0
+== clippy exit 0
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal_prefixed
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-apple-darwin'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/Users/runner/work/slates/slates/target/debug/build/aws-lc-sys-ea2f93f5a7d7729f/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/Users/runner/work/slates/slates/target/debug/build/aws-lc-sys-ea2f93f5a7d7729f/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/Users/runner/work/slates/slates/target/debug/build/aws-lc-sys-ea2f93f5a7d7729f/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/Users/runner/work/slates/slates/target/debug/build/aws-lc-sys-ea2f93f5a7d7729f/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+    Checking rustls-webpki v0.103.15
+    Checking hyper-seal v0.1.0 (/Users/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+    Checking hyper-datagram v0.1.0 (/Users/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+    Checking slates-ipc v0.1.0 (/Users/runner/work/slates/slates/crates/ipc)
+    Checking rcgen v0.13.2
+    Checking slates-client v0.1.0 (/Users/runner/work/slates/slates/crates/client)
+    Checking slates-transport v0.1.0 (/Users/runner/work/slates/slates/crates/transport)
+    Checking slates-cluster v0.1.0 (/Users/runner/work/slates/slates/crates/cluster)
+--
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+== idle_window run 1 exit 101
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (35739) panicked at crates/server/tests/idle_window.rs:139:3:
+the spinners queued a woken shard, so its estimate rose to 4 times the boot prior of 9305 ns within 1024 paced requests: [ShardPulse { shard: 0, steps: 6314, waits: 1641, spawns: 1175, completed: 1169, admission_refused: 0, longest_step_ns: 5666000, parked: true, kicks_skipped: 563, ring_full_events: 0, scheduler_overrun_ns: 124874, wake_cost_ns: 9831, idle_window_ns: 50000 }, ShardPulse { shard: 1, steps: 9572, waits: 1078, spawns: 1168, completed: 1166, admission_refused: 0, longest_step_ns: 4564334, parked: false, kicks_skipped: 1070, ring_full_events: 0, scheduler_overrun_ns: 1176, wake_cost_ns: 10982, idle_window_ns: 50000 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.83s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
+== idle_window run 2 exit 101
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (36088) panicked at crates/server/tests/idle_window.rs:139:3:
+the spinners queued a woken shard, so its estimate rose to 4 times the boot prior of 5528 ns within 1024 paced requests: [ShardPulse { shard: 0, steps: 6267, waits: 1630, spawns: 1175, completed: 1169, admission_refused: 0, longest_step_ns: 2888042, parked: true, kicks_skipped: 580, ring_full_events: 0, scheduler_overrun_ns: 8956, wake_cost_ns: 9397, idle_window_ns: 50000 }, ShardPulse { shard: 1, steps: 9604, waits: 1107, spawns: 1168, completed: 1166, admission_refused: 0, longest_step_ns: 2451000, parked: false, kicks_skipped: 1052, ring_full_events: 0, scheduler_overrun_ns: 110638, wake_cost_ns: 10202, idle_window_ns: 50000 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.68s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
+== idle_window run 3 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+== idle_window run 4 exit 101
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (36537) panicked at crates/server/tests/idle_window.rs:139:3:
+the spinners queued a woken shard, so its estimate rose to 4 times the boot prior of 6599 ns within 1024 paced requests: [ShardPulse { shard: 0, steps: 6078, waits: 1620, spawns: 1175, completed: 1169, admission_refused: 0, longest_step_ns: 2988000, parked: true, kicks_skipped: 592, ring_full_events: 0, scheduler_overrun_ns: 8673, wake_cost_ns: 10021, idle_window_ns: 50000 }, ShardPulse { shard: 1, steps: 9927, waits: 1138, spawns: 1168, completed: 1166, admission_refused: 0, longest_step_ns: 2543167, parked: false, kicks_skipped: 1025, ring_full_events: 0, scheduler_overrun_ns: 3185, wake_cost_ns: 12055, idle_window_ns: 50000 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.64s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
+== idle_window run 5 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+== idle_window run 6 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+== idle_window run 7 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+== idle_window run 8 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+== idle_window run 9 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+== idle_window run 10 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
