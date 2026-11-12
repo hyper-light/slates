@@ -1,0 +1,110 @@
+tree 9c85912 diag only (A-223 step 4): gates and tests with the multiple as paired cfg functions; not for main
+== fmt exit 0
+== xtask exit 0
+literals: ok
+== clippy exit 0
+== machine_rt exit 101
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/slates_machine-69bb0c552448ff5d)
+
+running 69 tests
+test bench::tests::throughput_arithmetic_never_overflows ... ok
+test derived::tests::a_derived_value_carries_its_formula_and_anchors ... ok
+test facts::tests::a_budget_covers_what_it_buys_and_the_tightest_share_binds ... ok
+test facts::tests::a_cgroup_limit_is_a_bound_only_when_it_is_a_byte_count ... ok
+--
+test a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs ... FAILED
+
+failures:
+
+---- a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs stdout ----
+
+thread 'a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs' (42447) panicked at crates/rt/tests/wake_estimate.rs:254:3:
+the spinners queued the woken shard, so its mean rose far past the quiet prior: Counters { steps: 514, polls: 257, long_steps: 0, blocked_steps: 0, preempted_steps: 0, unattributed_steps: 0, longest_step_ns: 8125, wake_samples: 256, wake_stale: 0, wake_unslept: 0, wake_cost_ns: 14305, idle_window_ns: 50000, spawns: 1, completed: 1, cancelled: 0, wakes_pair: 0, wakes_foreign: 256, controls: 0, stale_wakes: 0, timers_fired: 0, timer_waits: 0, waits: 256, completions: 0, driver_lost: 0, driver_errors: 0, nested_borrows: 0, admission_refused: 0, refused_at_shutdown: 0, spin_hits: 0, poller_wakes: 0, spin_misses: 0, spin_deadlines: 0, scheduler_overrun_ns: 0, pin_refused: 0, interests_unclaimed: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+
+error: test failed, to rerun pass `-p slates-rt --test wake_estimate`
+test result: ok. 67 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.46s
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+== test config exit 0
+test config::tests::a_durability_bound_surfaces_a_breach ... ok
+test config::tests::a_breach_reports_its_measured_shortfall ... ok
+test config::tests::a_fleet_configuration_derives_its_own_task_share_from_the_peer_count ... ok
+test config::tests::a_laptops_control_shard_holds_no_forward_lane ... ok
+test config::tests::the_derived_scatter_is_the_recovery_floor_above_the_candidate_floor ... ok
+test config::tests::the_direct_maps_a_shard_may_hold_follow_the_process_limits ... ok
+test config::tests::the_idle_window_is_the_floor_or_the_platforms_cover_of_a_loaded_wake ... ok
+test config::tests::the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records ... ok
+test daemon::tests::a_breaching_configuration_moves_the_durability_signal ... ok
+test live_ship::tests::a_recorded_holder_takes_its_owners_entry_though_its_configuration_lags ... ok
+test config::tests::a_memory_bound_below_total_caps_the_reserve ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test member_task::tests::another_regions_configuration_version_never_supersedes_the_owner_lease ... ok
+test config::tests::the_rings_that_wrap_fit_in_the_memory_the_daemon_may_use ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out; finished in 0.98s
+== test wake_estimate exit 101
+test a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks ... ok
+test a_poll_blocked_in_a_call_past_the_quantum_is_its_tasks_where_blocks_are_counted ... ok
+test a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended ... ok
+test a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs ... FAILED
+thread 'a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs' (55837) panicked at crates/rt/tests/wake_estimate.rs:254:3:
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+== test idle_window_1 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_raises_their_wake_estimates ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+== test idle_window_2 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_raises_their_wake_estimates ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+== test idle_window_3 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_raises_their_wake_estimates ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+== test forward_retry exit 0
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the control shard's beat task ran 1025 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 14 steps and 26 polls (8 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 4 times, spawned 36 tasks and finished 21; 22 tasks live; its longest poll is 1020 ms and its timer overrun 0 ms
+test a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.92s
