@@ -3,6 +3,12 @@
 //! reset memory from a receive that may have taken requests. Readers inspect it only after the previous owner ended;
 //! this is crash publication, not a shared atomic or lock on a request path. A published saved response is replayed
 //! first, so a second crash cannot lose an already-issued open by overwriting its only complete response.
+//!
+//! An acknowledged response stays in the journal, settled, until the next response's save overwrites it (audit step 7,
+//! cut (c)). The receive worker no longer waits for the shard to confirm an open it has handed the driver: the
+//! confirmation goes to the shard behind no wait, and recovery keeps the open from its settled response, which is never
+//! replayed (its request was answered) and is read whatever the phase. The worker sees that the confirmation was applied
+//! before it overwrites that response (`super::settle`).
 
 use super::{
   BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, Scratch, index, read_u32, read_u64,
@@ -19,6 +25,9 @@ pub const BYTES: usize = PHASE_BYTES + BATCH_BYTES + SAVED_HEADER + RESPONSE_MAX
 const RECEIVING: u8 = 1;
 /// Format: one marks a complete saved response; zero marks an unfinished save. It is written only after its body/CRC.
 const PUBLISHED: u8 = 1;
+/// Format: two marks a complete saved response whose request was acknowledged: kept for the open it may have issued, never
+/// replayed. Only an acknowledgement writes it, over PUBLISHED.
+const SETTLED: u8 = 2;
 /// Format: the saved response's length follows its state word, and its CRC32C follows the length.
 const LENGTH_AT: usize = size_of::<u32>();
 /// Format: see LENGTH_AT.
@@ -64,10 +73,10 @@ impl<'a> Capture<'a> {
   /// Clears an already-settled buffer, then records the new receive before lending it to the driver. A dropped
   /// unfinished batch stays RECEIVING, so it cannot be silently replaced by a fresh receive. `used` is what this owner's
   /// last batch filled ([`filled`]); `None`, an owner's first receive, clears all of it, since a predecessor may have
-  /// died part-way through. Only the saved response's header is cleared: its state word says whether a body exists, and
-  /// no reader goes past a body's own length (A-212).
+  /// died part-way through. The saved response is left as it is: only a settled one can be there, kept for the open it
+  /// may have issued until the next save (cut (c)); a published one means a request that was never acknowledged.
   pub fn begin(self, used: Option<usize>) -> Result<Receiving<'a>, Refusal> {
-    if self.phase.first() != Some(&0) {
+    if self.phase.first() != Some(&0) || self.saved.first() == Some(&PUBLISHED) {
       return Err(Refusal::Unsettled);
     }
     let cleared = match used {
@@ -76,11 +85,17 @@ impl<'a> Capture<'a> {
     };
     cleared.fill(0);
     stored(cleared);
-    let header = self.saved.get_mut(..SAVED_HEADER).ok_or(Refusal::Length)?;
-    header.fill(0);
-    stored(header);
     set(self.phase.first_mut().ok_or(Refusal::Length)?, RECEIVING);
     Ok(Receiving { capture: self })
+  }
+
+  /// The open a saved response may have issued, published or settled, whatever the phase: the one unconfirmed context
+  /// recovery may retain (`crate::opens::Ledger::settle_pending`).
+  pub fn saved_open(&self) -> Result<Option<(u64, u64)>, Refusal> {
+    match kept_response(self.saved)? {
+      Some(response) => super::opened_context(response),
+      None => Ok(None),
+    }
   }
 
   /// Takes the retained batch before the first new receive. Reset memory is ignored, including a partially cleared
@@ -134,10 +149,11 @@ pub struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-  /// The saved successful open whose response may have reached the kernel. It is the only unconfirmed context that
-  /// recovery may retain; earlier responses were acknowledged before their saved bytes could be overwritten.
+  /// The saved successful open whose response may have reached the kernel, published or settled. It is the only
+  /// unconfirmed context recovery may retain; an earlier open's confirmation was applied before its response was
+  /// overwritten.
   pub fn saved_open(&self) -> Result<Option<(u64, u64)>, Refusal> {
-    match saved_response(self.saved)? {
+    match kept_response(self.saved)? {
       Some(response) => super::opened_context(response),
       None => Ok(None),
     }
@@ -248,6 +264,8 @@ impl<'a> Batch<'a> {
       return Err(Refusal::Hint);
     }
     self.current = None;
+    // Settled before the phase is reset: the response stays for the open it may have issued, and is never replayed.
+    set(self.saved.first_mut().ok_or(Refusal::Length)?, SETTLED);
     if self.pending.frames.is_empty() {
       set(self.phase.first_mut().ok_or(Refusal::Length)?, 0);
     }
@@ -281,10 +299,20 @@ fn stored(bytes: &[u8]) {
 #[cfg(not(test))]
 fn stored(_bytes: &[u8]) {}
 
+/// A published saved response: one whose request has not been acknowledged, so recovery replays it first.
 fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
+  if bytes.first() == Some(&SETTLED) {
+    kept_response(bytes)?;
+    return Ok(None);
+  }
+  kept_response(bytes)
+}
+
+/// A complete saved response, published or settled; checked whole either way.
+fn kept_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
   match bytes.first() {
     Some(0) => return Ok(None),
-    Some(&PUBLISHED) => {}
+    Some(&PUBLISHED | &SETTLED) => {}
     _ => return Err(Refusal::State),
   }
   if bytes
@@ -415,7 +443,9 @@ mod tests {
   }
 
   /// A-198. Do: crash with a complete saved response for the second request, then crash again just after replaying
-  /// it. Expect: neither recovery overwrites that result by first replaying an earlier completed request.
+  /// and acknowledging it. Expect: neither recovery overwrites that result by first replaying an earlier completed
+  /// request; once acknowledged it is settled, so the third owner keeps it but does not send it again, and answers the
+  /// batch's remaining requests without completing the recycled caller (cut (c) of audit step 7).
   #[test]
   fn a_saved_result_in_the_middle_of_a_batch_survives_a_second_crash() {
     let mut scratch = Scratch::new().unwrap();
@@ -456,16 +486,11 @@ mod tests {
         .resume(&mut scratch)
         .unwrap()
         .unwrap();
-      let saved_request = batch.next_request().unwrap().unwrap();
-      assert_eq!(
-        complete(
-          batch.response_for(&saved_request).unwrap().unwrap(),
-          &mut kernel
-        ),
-        None
-      );
-      batch.acknowledge(saved_request.hint()).unwrap();
       while let Some(request) = batch.next_request().unwrap() {
+        assert!(
+          batch.response_for(&request).unwrap().is_none(),
+          "a settled response was offered for replay"
+        );
         let response = request.cancelled_response().unwrap();
         batch.record_response(&request, &response).unwrap();
         let caller = complete(&response, &mut kernel);
