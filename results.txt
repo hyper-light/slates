@@ -1,0 +1,22 @@
+runner x86_64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit 67e81e250
+async_core run 1 exit 0 load 10.45
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.16s
+async_core run 2 exit 0 load 11.53
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 79.40s
+async_core run 3 exit 0 load 11.22
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 73.55s
+async_core run 4 exit 0 load 12.16
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.02s
+async_core run 5 exit 0 load 12.43
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 77.47s
+async_core run 6 exit 0 load 11.92
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.34s
+async_core run 7 exit 0 load 12.02
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.85s
+async_core run 8 exit 0 load 11.85
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.53s
+async_core run 9 exit 0 load 11.84
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 80.60s
+async_core run 10 exit 0 load 12.15
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.96s
+== async_core passed 10 failed 0
