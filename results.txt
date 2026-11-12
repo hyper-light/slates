@@ -1,0 +1,51 @@
+tree a976db5 diag only (A-223 step 4): the failing test, red before the rule; not for main
+runner ubuntu-24.04-arm, 4 CPUs, Thu Nov 12 04:58:58 UTC 2026
+== fmt exit 0
+== clippy exit 0
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'aarch64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'neon_sha3_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-neon_sha3_check/7dfda64fdf5a526c-neon_sha3_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-7b3f3ac13613ef88/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Checking rustls-webpki v0.103.15
+    Checking slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+    Checking hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+    Checking hyper-datagram v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-datagram)
+    Checking slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+    Checking rcgen v0.13.2
+    Checking slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+    Checking slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+--
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+== idle_window run 1 exit 101
+slates daemon: idle_window_ns = 703500: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (7806) panicked at crates/server/tests/idle_window.rs:128:5:
+shard 0's idle window grew with the load: 30429500 ns against 703500 ns at boot, its estimate 304295 ns against a boot prior of 7035 ns, after 64 paced requests: [ShardPulse { shard: 0, steps: 20702, waits: 5, spawns: 85, completed: 80, admission_refused: 0, longest_step_ns: 3012236, parked: false, kicks_skipped: 75, ring_full_events: 0, scheduler_overrun_ns: 0, wake_cost_ns: 304295, idle_window_ns: 30429500 }, ShardPulse { shard: 1, steps: 21076, waits: 9, spawns: 80, completed: 78, admission_refused: 0, longest_step_ns: 7148096, parked: false, kicks_skipped: 70, ring_full_events: 0, scheduler_overrun_ns: 0, wake_cost_ns: 158482, idle_window_ns: 15848200 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
+== idle_window run 2 exit 101
+slates daemon: idle_window_ns = 696900: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (7838) panicked at crates/server/tests/idle_window.rs:128:5:
+shard 0's idle window grew with the load: 30963200 ns against 696900 ns at boot, its estimate 309632 ns against a boot prior of 6969 ns, after 64 paced requests: [ShardPulse { shard: 0, steps: 33338, waits: 4, spawns: 85, completed: 80, admission_refused: 0, longest_step_ns: 10005544, parked: false, kicks_skipped: 72, ring_full_events: 0, scheduler_overrun_ns: 0, wake_cost_ns: 309632, idle_window_ns: 30963200 }, ShardPulse { shard: 1, steps: 28408, waits: 2, spawns: 80, completed: 78, admission_refused: 0, longest_step_ns: 8182733, parked: false, kicks_skipped: 75, ring_full_events: 0, scheduler_overrun_ns: 0, wake_cost_ns: 211658, idle_window_ns: 21165800 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
+== idle_window run 3 exit 101
+slates daemon: idle_window_ns = 1532700: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (7868) panicked at crates/server/tests/idle_window.rs:128:5:
+shard 0's idle window grew with the load: 27381900 ns against 1532700 ns at boot, its estimate 273819 ns against a boot prior of 15327 ns, after 64 paced requests: [ShardPulse { shard: 0, steps: 47088, waits: 9, spawns: 85, completed: 80, admission_refused: 0, longest_step_ns: 4984796, parked: false, kicks_skipped: 68, ring_full_events: 0, scheduler_overrun_ns: 1520930, wake_cost_ns: 273819, idle_window_ns: 27381900 }, ShardPulse { shard: 1, steps: 15781, waits: 5, spawns: 80, completed: 78, admission_refused: 0, longest_step_ns: 21455282, parked: false, kicks_skipped: 72, ring_full_events: 0, scheduler_overrun_ns: 0, wake_cost_ns: 125726, idle_window_ns: 12572600 }]
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+error: test failed, to rerun pass `-p slates-server --test idle_window`
