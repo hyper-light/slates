@@ -1,0 +1,82 @@
+name: diag-liveness-a223-step4-cfg-pair
+
+# Diagnostics only, never on main (A-223 step 4): the window rule with its multiple as paired #[cfg] functions
+# (loaded_wake_ratio()), no arithmetic changed: gates (fmt, xtask check, clippy), the machine and rt suites, and the
+# rule's tests on every runner (the paced-client test is not built on Windows). Results go to
+# diag-results/liveness-40-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  rule:
+    name: A-223 window rule built (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Gates
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          git log -1 --format="tree %h %s" | cut -c1-120 | tee -a $R
+          step() { local name=$1; shift; "$@" > ../$name.log 2>&1; local status=$?; echo "== $name exit $status" | tee -a $R; [ $status -eq 0 ] || grep -E '^(error|warning)|FAILED|panicked|violation|literal|Diff in' -A8 ../$name.log | head -60 | tee -a $R; }
+          step fmt cargo fmt --all --check
+          step xtask cargo xtask check
+          grep -E '^literals:' ../xtask.log | tee -a $R
+          case "${{ matrix.os }}" in
+            windows-*) step clippy cargo clippy --locked -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings ;;
+            *) step clippy cargo clippy --locked --workspace --all-targets -- -D warnings ;;
+          esac
+          step machine_rt cargo test --locked -p slates-machine -p slates-rt
+          grep -E '^test result' ../machine_rt.log | tee -a $R
+      - name: The rule's tests
+        if: always()
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          run() { local name=$1; shift; "$@" > ../test-$name.log 2>&1; local status=$?; echo "== test $name exit $status" | tee -a $R; grep -E '^test |^test result|slates daemon:|panicked|grew with|queued a woken' ../test-$name.log | cut -c1-500 | tee -a $R; }
+          run config cargo test --locked -p slates-server --lib config
+          run wake_estimate cargo test --locked -p slates-rt --test wake_estimate
+          case "${{ matrix.os }}" in
+            windows-*) ;;
+            *)
+              for i in 1 2 3; do run idle_window_$i cargo test --locked -p slates-server --test idle_window -- --nocapture; done
+              run forward_retry cargo test --locked -p slates-server --test forward_retry
+              ;;
+          esac
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-40-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-40 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
