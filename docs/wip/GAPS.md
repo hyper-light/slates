@@ -1,7 +1,7 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **The fault probe can read a page fault as free under load (found 2026-11-09 by the A-223 plan; open, owner
-> liveness).** `slates_machine::probes::faults` takes `base_ns` as the median of map, touch every page and unmap,
+> **The fault probe can read a page fault as free under load (found 2026-11-09 by the A-223 plan; fixed 2026-11-11 by
+> liveness, 15e27a90 on agents/liveness-fault-probe).** `slates_machine::probes::faults` takes `base_ns` as the median of map, touch every page and unmap,
 > less the median of map and unmap alone, over 256 pages, with a saturating subtraction. The two medians are taken in
 > separate measurements, so under load the second can come within 256 ns of the first or pass it, and the cost reads 0.
 > - **Seen:** `profile::tests::a_profile_measures_within_its_budget_and_round_trips_through_json` asserts
@@ -10,8 +10,13 @@
 >   in the suite.
 > - **Why it matters:** consumers take `faults.base_ns.max(1)` (`config.rs`, `region.rs`), so nothing divides by zero.
 >   But a 1 ns fault then feeds derived bounds, among them the arena region (`pages = 100 × 2 × syscall / fault`) and the
->   pre-fault slice. Owed: a failing test that drives the probe to a zero difference, and a probe that refuses or
->   re-measures a non-positive difference rather than reporting it.
+>   pre-fault slice.
+> - **Fixed:** `faults` returns a `Result` and refuses a non-positive per-page difference with
+>   `MeasurementTimeout { probe: "faults" }`, so `MachineProfile::measure_patiently` measures again within the probe's
+>   wall ceiling. A populated or huge-page region measured at nothing reads `None`. Tests (red on main, `Ok(0)` and
+>   `Some(0)`): `a_touched_region_no_slower_than_the_untouched_one_is_refused_never_a_zero_fault` and
+>   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
+>   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
 > **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window it scales, open).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
