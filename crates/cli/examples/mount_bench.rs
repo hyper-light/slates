@@ -13,7 +13,12 @@
 //! - stat;
 //! - open, then read (the bytes back, compared, so a fast wrong answer is a failed run, not a result);
 //! - rename (within the directory);
-//! - unlink.
+//! - unlink;
+//! - on Windows, create then a security query, and create then a stream query, each on its own files and timed from the
+//!   create's start to the query's answer. WinFsp answers both without calling slates' host, which registers neither
+//!   callback, so each is a request no shard call precedes, right after a Create: where an open's confirmation posted
+//!   behind no wake would hold the receive worker (A-274). An error answer is that case, not a failure: it is counted
+//!   and printed, never dropped.
 //!
 //! Each phase runs over all of a round's files before the next, so the directory holds them from the creates to the
 //! unlinks, as a tree being written does. Rounds interleave the arms and rotate which goes first, so a load that
@@ -84,10 +89,26 @@ const PERMILLE: u64 = 1000;
 const NS_PER_US: u64 = 1000;
 /// Format: see [`NS_PER_US`].
 const NS_PER_TENTH_US: u64 = 100;
-/// Format: the operations, in the order a round makes them.
-const OPERATIONS: [&str; 9] = [
-  "create", "write", "fsync", "close", "stat", "open", "read", "rename", "unlink",
+/// Format: the operations, in the order a round makes them. The last two are Windows' alone.
+const OPERATIONS: [&str; 11] = [
+  "create",
+  "write",
+  "fsync",
+  "close",
+  "stat",
+  "open",
+  "read",
+  "rename",
+  "unlink",
+  "create_security",
+  "create_streams",
 ];
+/// Format: the index of [`OPERATIONS`]' create-then-security-query.
+#[cfg(windows)]
+const CREATE_SECURITY: usize = 9;
+/// Format: the index of [`OPERATIONS`]' create-then-stream-query.
+#[cfg(windows)]
+const CREATE_STREAMS: usize = 10;
 
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -135,10 +156,12 @@ impl Arm {
   }
 }
 
-/// One arm's samples of each operation, in [`OPERATIONS`] order.
+/// One arm's samples of each operation, in [`OPERATIONS`] order, and of each the calls answered with an error (the
+/// count, and the last error's code).
 #[derive(Default)]
 struct Samples {
-  by_operation: [Vec<u64>; 9],
+  by_operation: [Vec<u64>; OPERATIONS.len()],
+  errors: [(u64, u32); OPERATIONS.len()],
 }
 
 impl Samples {
@@ -147,7 +170,85 @@ impl Samples {
       samples.push(ns(ended.saturating_duration_since(started)));
     }
   }
+
+  /// Counts a timed call answered with `code`, kept as a result: on WinFsp an answer made without the host is an error.
+  #[cfg(windows)]
+  fn answered_error(&mut self, operation: usize, code: u32) {
+    if let Some(errors) = self.errors.get_mut(operation) {
+      errors.0 = errors.0.saturating_add(1);
+      errors.1 = code;
+    }
+  }
 }
+
+/// A query the file system can answer without calling slates' host: its security, or its streams.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Query {
+  Security,
+  Streams,
+}
+
+#[cfg(windows)]
+impl Query {
+  /// The query on `file`'s handle: its answer, or the error's Win32 code.
+  fn ask(self, file: &std::fs::File) -> Result<(), u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use windows_sys::Win32::Storage::FileSystem::{FileStreamInfo, GetFileInformationByHandleEx};
+    let handle = file.as_raw_handle();
+    match self {
+      Query::Security => {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is the open file's for the whole call; the out-pointers are this frame's, and only the
+        // owner is asked for, so no ACL pointer is written.
+        let code = unsafe {
+          GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+          )
+        };
+        if !descriptor.is_null() {
+          // SAFETY: a successful GetSecurityInfo hands its descriptor to the caller to free with LocalFree, once.
+          unsafe { LocalFree(descriptor) };
+        }
+        if code == 0 { Ok(()) } else { Err(code) }
+      }
+      Query::Streams => {
+        let mut buffer = [0u64; STREAM_INFO_WORDS];
+        // SAFETY: the handle is the open file's for the whole call, and the buffer is this frame's, eight-byte aligned
+        // and as long as the size given.
+        let answered = unsafe {
+          GetFileInformationByHandleEx(
+            handle,
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(size_of_val(&buffer)).unwrap_or(u32::MAX),
+          )
+        };
+        if answered != 0 {
+          Ok(())
+        } else {
+          // SAFETY: no call has been made on this thread since the one whose error this is.
+          Err(unsafe { GetLastError() })
+        }
+      }
+    }
+  }
+}
+
+/// Shape: the stream query's buffer in eight-byte words: a page, room for a file's default stream and a few more.
+#[cfg(windows)]
+const STREAM_INFO_WORDS: usize = 512;
 
 /// A file's bytes: its round and index in the first sixteen, then a pattern of both, so a read of another file's bytes
 /// is caught.
@@ -201,6 +302,29 @@ fn round(
     samples.push(1, created, written);
     samples.push(2, written, synced);
     samples.push(3, synced, closed);
+  }
+  #[cfg(windows)]
+  for (operation, query, tag) in [
+    (CREATE_SECURITY, Query::Security, "s"),
+    (CREATE_STREAMS, Query::Streams, "q"),
+  ] {
+    for index in 0..files {
+      let path = work.join(format!("{pass}-r{round}-{tag}{index}"));
+      let started = Instant::now();
+      let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| fail("create", &path, e))?;
+      let answer = query.ask(&file);
+      samples.push(operation, started, Instant::now());
+      if let Err(code) = answer {
+        samples.answered_error(operation, code);
+      }
+      drop(file);
+      // Untimed: these files are the op's own, so the directory the other phases see is unchanged.
+      std::fs::remove_file(&path).map_err(|e| fail("unlink", &path, e))?;
+    }
   }
   for index in 0..files {
     let path = made(index);
@@ -424,11 +548,24 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
   println!("# pass {}: {load}", measured.name);
   let mut cells: Vec<Vec<String>> = OPERATIONS.iter().map(|_| Vec::new()).collect();
   for (arm, samples) in arms.iter().zip(measured.samples.iter_mut()) {
-    for ((operation, column), samples) in OPERATIONS
+    for (((operation, column), samples), (errors, code)) in OPERATIONS
       .iter()
       .zip(cells.iter_mut())
       .zip(samples.by_operation.iter_mut())
+      .zip(samples.errors)
     {
+      // An operation this platform does not make (the Windows queries elsewhere) prints no row and an empty cell.
+      if samples.is_empty() {
+        column.push("—".to_owned());
+        continue;
+      }
+      if errors > 0 {
+        println!(
+          "# {} {operation}: {errors} of {} calls answered error {code}",
+          arm.name,
+          samples.len()
+        );
+      }
       let ranks = summary(samples);
       println!(
         "fsbench\t{}\t{}\t{operation}\t{}\t{}\t{}\t{}\t{}",
@@ -459,6 +596,9 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
   println!("| op | {} |", names.join(" | "));
   println!("|---|{}", "---|".repeat(arms.len()));
   for (operation, row) in OPERATIONS.iter().zip(cells) {
+    if row.iter().all(|cell| cell == "—") {
+      continue;
+    }
     println!("| {operation} | {} |", row.join(" | "));
   }
   println!();
