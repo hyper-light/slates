@@ -964,16 +964,6 @@ volume requires a matching profile), `MeasurementTimeout`.
 
 > **Status (2026-11-07, a starved wake probe measures; a stuck one refuses).** Past its wall (`PROBE_WALL_BUDGET`, 250 ms) the probe runs on while each round's waiter runs at all, rounds doubling from one window to `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s), and refuses `MeasurementTimeout` after a round whose waiter was never scheduled. That is the watchdog's rule (A-228) and the anchor's start judgment applied to the probe: slow progress is starvation, no progress is stuck. The extension past the wall is bounded by 31 windows (7.75 s). Under 144 nice-19 spinners on 18 CPUs a wake took 68-174 ms at the median, the floor needed over a second, and the 250 ms wall refused the quick profile, and the anchor's boot with it, 19 times in 20. Record: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
 
-> **Status (2026-11-09, A-223 (i): the idle spin is priced on the wake's floor, the step quantum on its mean).** The
-> statement below that the wake's tail is part of a park's cost holds for latency, not for CPU. A wake measured kick to
-> running includes the time the woken thread waits runnable for a CPU. That wait costs no CPU, and a spinning shard
-> lengthens it itself: under two spinners a logical CPU each shard's estimate read 0.2-6.1 ms, and an idle window of
-> 100 times it spun for hundreds of milliseconds. The idle spin is therefore priced on the floor of the confirmed
-> wakes, the smallest over the last one to two windows of 2^shift wakes (`WakeEstimate::floor_ns`, seeded with the
-> probe's `WakeLatency::floor_ns`, its smallest kept wake). A low wake leaves the floor once the window after its own
-> has filled. The mean still prices the step quantum and a waiter's own spin before it parks for a reply. Test:
-> `crates/rt/tests/wake_estimate.rs`, a loaded shard's idle window reads its unqueued wake.
-
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
 step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
@@ -4559,8 +4549,8 @@ drops.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
-= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the floor of the shard's wake
-estimate (§4.3) × measured spin-to-park ratio target.
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
+measured spin-to-park ratio target.
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop

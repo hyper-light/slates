@@ -34,10 +34,9 @@ use crate::{derived, probes, wake};
 /// placement counts shards in physical cores, as §4.1 says (A-208); version 3 counted every hardware thread.
 /// 5 (2026-11-05): the wake confirms its waiter asleep on Windows too, by its cycle count, and counts the wakes
 /// it dropped because the waiter had run before its kick ([`crate::wake::WakeLatency::woke_running`], A-223);
-/// version 4's Windows wake let the waiter's announcement stand in. 6 (2026-11-09): the wake reports its floor, the
-/// smallest kept wake ([`crate::wake::WakeLatency::floor_ns`], A-223), which seeds the idle spin's.
+/// version 4's Windows wake let the waiter's announcement stand in.
 /// Format: the version this build writes and the only one it reads.
-pub const PROFILE_VERSION: u32 = 6;
+pub const PROFILE_VERSION: u32 = 5;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,10 +371,6 @@ pub struct DerivedConstants {
   /// 2-competitive spin-then-park rule of Karlin et al. (spin as long as parking is expected to cost, then
   /// park), with the tail included because it is a cost of parking, not noise ([`crate::wake`]).
   pub spin_before_park_ns: Derived<u64>,
-  /// What a park costs a waiter whose CPU is free: the floor of the probe's kept wakes, with no wait for a
-  /// CPU in it. The idle spin is priced on it, since time spent runnable and waiting for a CPU spends no CPU
-  /// (A-223); the step quantum and the waiter's own spin keep the mean ([`crate::wake::WakeEstimate`]).
-  pub wake_floor_ns: Derived<u64>,
   /// The arena region size: the size at which one map syscall is one percent of the faults it
   /// amortizes, rounded to a power of two and to the huge page where the huge class is cheaper.
   pub arena_region_bytes: Derived<u64>,
@@ -413,11 +408,6 @@ impl DerivedConstants {
         wake_mean,
         "wake.mean (the expected cost of parking: the 2-competitive spin-then-park threshold)",
         ["wake.mean_ns"]
-      ),
-      wake_floor_ns: derived!(
-        p.wake.floor_ns.max(1),
-        "wake.floor (the smallest kept wake: a park's cost with the waiter's CPU free, the idle spin's price)",
-        ["wake.floor_ns"]
       ),
       arena_region_bytes: derived!(
         arena_region(p, page, syscall, fault),
@@ -474,7 +464,6 @@ impl DerivedConstants {
     }
     vec![
       line("spin_before_park_ns", &self.spin_before_park_ns),
-      line("wake_floor_ns", &self.wake_floor_ns),
       line("arena_region_bytes", &self.arena_region_bytes),
       line("timer_tick_ns", &self.timer_tick_ns),
       line("task_step_budget_ns", &self.task_step_budget_ns),
@@ -603,24 +592,8 @@ mod tests {
       "the discard threshold is a measured copy size or never: {discard}"
     );
     let lines = d.lines();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 7);
     assert!(lines.iter().all(|l| l.contains("anchors:")), "{lines:?}");
-  }
-
-  /// A-223 (i): the profile's wake floor is the probe's smallest kept wake, never above its mean, and the
-  /// derived constant the idle spin is priced on reads it.
-  #[test]
-  fn the_derived_wake_floor_is_the_probes_smallest_wake() {
-    let profile = measured_once();
-    assert!(
-      profile.wake.floor_ns <= profile.wake.mean_ns,
-      "{:?}",
-      profile.wake
-    );
-    assert_eq!(
-      profile.derived().wake_floor_ns.get(),
-      profile.wake.floor_ns.max(1)
-    );
   }
 
   /// §4.1: a re-measure of the cheap, power-sensitive subset leaves the rest of the profile alone — the fault

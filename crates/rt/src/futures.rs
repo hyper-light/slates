@@ -46,16 +46,9 @@ pub fn step_budget_ns() -> Option<u64> {
 }
 
 /// The current shard's online wake estimate in nanoseconds (the configured step budget when it tracks
-/// none). `None` off a shard thread.
+/// none); what the daemon's own idle window scales. `None` off a shard thread.
 pub fn wake_cost_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.wake_cost_ns())
-}
-
-/// The floor of the current shard's online wake estimate in nanoseconds: what a park costs it with its CPU
-/// free, which the daemon's idle window is priced on (A-223; the configured step budget when it tracks none).
-/// `None` off a shard thread.
-pub fn wake_floor_ns() -> Option<u64> {
-  registry::with_current(|ctx| ctx.wake_floor_ns())
 }
 
 /// The task being polled on this thread, if any.

@@ -118,7 +118,6 @@ fn park_and_kick(ctx: &slates_rt::shard::ShardContext, wakers: &Receiver<Waker>)
 fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
   let tracking = WakeTracking {
     prior_ns: PRIOR_NS,
-    prior_floor_ns: PRIOR_NS,
     shift: SHIFT,
     idle_ratio: 1,
   };
@@ -183,16 +182,12 @@ const QUIET_PRIOR_NS: u64 = 10_000;
 /// Shape: how far past the quiet prior the loaded mean must rise before the test judges anything: a mean that
 /// stayed near it saw no queueing, and the run proves nothing (the non-vacuity bound).
 const QUEUED_FACTOR: u64 = 10;
-/// Shape: the loaded test's weighting shift, a window of sixty-four wakes: the floor is the smallest of one to
-/// two windows, and a window that long holds a wake that met a free CPU even beside two spinners a CPU on a
-/// host loaded past them (a window of sixteen held none once in ten at load 71 on fedora-2).
-const LOADED_SHIFT: u32 = 6;
-/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`LOADED_SHIFT`], so every
-/// window the floor keeps has turned over at least once and the seed has expired from it.
-const LOADED_KICKS: u64 = 4 << LOADED_SHIFT;
+/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so every window
+/// the floor keeps has turned over at least once and the seed has expired from it.
+const LOADED_KICKS: u64 = 4 << SHIFT;
 /// Shape: kicked parks the loaded test drives at most, waiting for the spinners' queueing to show in the mean
 /// (a run in which the scheduler happened to place the woken shard well needs more kicks to show it).
-const MOST_LOADED_KICKS: u64 = 16 << LOADED_SHIFT;
+const MOST_LOADED_KICKS: u64 = 16 << SHIFT;
 /// Shape: how far under the loaded mean the idle window must sit. A window that follows the mean is the mean;
 /// one that reads the unqueued wake sits an order of magnitude under it.
 const WINDOW_UNDER_MEAN: u64 = 4;
@@ -210,8 +205,7 @@ const SPINNERS_PER_CPU: usize = 2;
 fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
   let tracking = WakeTracking {
     prior_ns: QUIET_PRIOR_NS,
-    prior_floor_ns: QUIET_PRIOR_NS,
-    shift: LOADED_SHIFT,
+    shift: SHIFT,
     idle_ratio: 1,
   };
   let rt = LocalRuntime::new(&config(QUIET_PRIOR_NS, Some(tracking))).unwrap();
@@ -250,7 +244,7 @@ fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
   step_until_idle(ctx);
   let counters = ctx.counters();
   assert!(
-    counters.wake_samples >= 2 << LOADED_SHIFT,
+    counters.wake_samples >= 2 << SHIFT,
     "enough kicks met a sleeping shard to turn the floor's windows over: {counters:?}"
   );
   assert!(
