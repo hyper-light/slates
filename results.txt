@@ -1,0 +1,74 @@
+runner macos-latest, 3 CPUs, Thu Nov 12 06:34:00 UTC 2026
+tree red 54f20bc38 diag only (A-223 (d)): the failing test alone, on agents/liveness-a223; not for m
+== test red round=1
+sleepers: 160 samples in 160 trips, estimate 21689 ns; racing: 256 parks in 256 trips, 145 more samples, estimate 11378 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.21s
+== exit 0
+== test red round=2
+sleepers: 160 samples in 160 trips, estimate 21605 ns; racing: 256 parks in 256 trips, 252 more samples, estimate 3005 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.39s
+== exit 0
+== test red round=3
+sleepers: 160 samples in 160 trips, estimate 18178 ns; racing: 256 parks in 256 trips, 232 more samples, estimate 9073 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.66s
+== exit 0
+tree fix af9e5a883 diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+sleepers: 160 samples in 160 trips, estimate 16385 ns; racing: 256 parks in 256 trips, 199 more samples, estimate 10295 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.19s
+== exit 0
+== test fix round=2
+sleepers: 160 samples in 160 trips, estimate 17593 ns; racing: 256 parks in 257 trips, 227 more samples, estimate 5182 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.38s
+== exit 0
+== test fix round=3
+sleepers: 160 samples in 160 trips, estimate 22802 ns; racing: 256 parks in 256 trips, 256 more samples, estimate 4437 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.54s
+== exit 0
+== suites exit 127
+== suites total:  passed,  failed,  ignored
+== bench red round=1 at 06:44:51
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4566 ns, idle window at boot 456600 ns, floor 50000 ns
+  provision.spinning_1_p99: 664583 ns [463583, 910625] over 3 runs: [664583, 463583, 910625]
+  provision.parked_1 parks per 1000 creates: shard 0: 1227 (wake 6952 ns), shard 1: 1142 (wake 7042 ns)
+  provision.parked_1_p99: 821792 ns [675458, 851959] over 3 runs: [821792, 851959, 675458]
+== exit 1
+== bench fix round=1 at 06:45:43
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3876 ns, idle window at boot 387600 ns, floor 50000 ns
+  provision.spinning_1_p99: 269666 ns [208334, 279333] over 3 runs: [208334, 269666, 279333]
+  provision.parked_1-0-0 client wake: 19254 ns from 1060 parked wakes (1061 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 18074 ns from 1062 parked wakes (1064 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 23324 ns from 1060 parked wakes (1061 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 670 (wake 16580 ns), shard 1: 526 (wake 14294 ns)
+  provision.parked_1_p99: 878167 ns [569625, 895500] over 3 runs: [569625, 878167, 895500]
+== exit 1
+== bench red round=2 at 06:46:25
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3292 ns, idle window at boot 329200 ns, floor 50000 ns
+  provision.spinning_1_p99: 199000 ns [164667, 303000] over 3 runs: [199000, 164667, 303000]
+  provision.parked_1 parks per 1000 creates: shard 0: 524 (wake 19113 ns), shard 1: 457 (wake 14743 ns)
+  provision.parked_1_p99: 766834 ns [591333, 828542] over 3 runs: [828542, 766834, 591333]
+== exit 1
+== bench fix round=2 at 06:47:05
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4824 ns, idle window at boot 482400 ns, floor 50000 ns
+  provision.spinning_1_p99: 236833 ns [194458, 255125] over 3 runs: [194458, 236833, 255125]
+  provision.parked_1-0-0 client wake: 13899 ns from 1065 parked wakes (1065 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 11966 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 14494 ns from 1066 parked wakes (1067 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 1172 (wake 8059 ns), shard 1: 1155 (wake 7597 ns)
+  provision.parked_1_p99: 726834 ns [681416, 1025291] over 3 runs: [726834, 681416, 1025291]
+== exit 1
+== bench red round=3 at 06:47:51
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3438 ns, idle window at boot 343800 ns, floor 50000 ns
+  provision.spinning_1_p99: 176291 ns [176042, 190833] over 3 runs: [190833, 176291, 176042]
+  provision.parked_1 parks per 1000 creates: shard 0: 744 (wake 21327 ns), shard 1: 727 (wake 19608 ns)
+  provision.parked_1_p99: 686125 ns [638459, 890458] over 3 runs: [890458, 638459, 686125]
+== exit 1
+== bench fix round=3 at 06:48:28
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 2706 ns, idle window at boot 270600 ns, floor 50000 ns
+  provision.spinning_1_p99: 207709 ns [193334, 217375] over 3 runs: [207709, 217375, 193334]
+  provision.parked_1-0-0 client wake: 8402 ns from 1065 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 7434 ns from 1065 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 8691 ns from 1065 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 1207 (wake 4612 ns), shard 1: 1158 (wake 4443 ns)
+  provision.parked_1_p99: 718333 ns [717292, 795625] over 3 runs: [795625, 718333, 717292]
+== exit 1
