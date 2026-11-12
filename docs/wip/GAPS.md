@@ -692,8 +692,13 @@
 >   (main failed 3 of 6 at load 69 to 112 under two spinners a CPU). It now predicts from the largest record it has seen,
 >   an early snapshot's lower bound included: 6 of 6 at load 116 to 143, though at 135 and above the approach stopped
 >   after one record (`docs/bugs/2026-11-09-the-cadence-tests-approach-predicted-the-next-record-from-the-last.md`).
->   Open, raft's: the trigger times replay work on the wall, so preemption counts as work; the thread's CPU time would
->   remove the spikes from the trigger and the test alike.
+>   Whether the trigger should charge the thread's CPU time instead of the wall was then measured and rejected (below).
+>   **The trigger in CPU time, measured and rejected (2026-11-09, A-243's amendment; closed, no change).** Charging a
+>   commit's replay work in the committing thread's CPU time snapshotted more often than the wall, per 200,000 records
+>   with a 10 ms budget: quiet 5, 5, 5 against 4, 4, 5, and under 24 busy loops 10, 8, 10 against 7, 6, 7 (adacachy,
+>   load 123–143). The CPU clock's reads are system calls that land inside the spans they time, and a contended record
+>   burns more CPU that a quiet replay would not repeat. The trigger stays on the wall;
+>   `measure_snapshots_per_thousand_records` (ignored) is the recorded command.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
@@ -1601,6 +1606,14 @@
 > the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
+> **The same test failed once more, in its setup, not its round: closed (2026-11-09).** On Windows arm64 (main's push
+> run 42528348387, job 128876826808, "aarch64 windows (native, by test)") it panicked at `fleet.rs:4990`, "the owner's
+> node reported its status": `share_with_fleet`'s `DaemonStatus` came back in pages, the harness acknowledged between
+> them, and that cancelled the capture, so the call got `Refused { NotFound }` before any location round ran. It passed
+> in both of release's diags (diag-release-8). Fixed by learner-3's eb896b61e ("the fleet harness reads a paged status
+> whole across an acknowledgement"), on main since B10 (db9c514e). Read from the run's log by the supervisor and by
+> raft-chaos; no product change.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from

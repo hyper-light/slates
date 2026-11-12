@@ -5722,7 +5722,8 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > owner shard spent about 1,800 of 2,241 samples doing it. A partition now snapshots once the log since its last
 > snapshot has taken the recovery budget's worth of replay work and is at least that snapshot's size
 > (`replay::snapshot_due`). The work is timed on each commit's append and apply, the work a replay repeats per record,
-> and never extrapolated from one stretch of log to the next, whose records may differ in size. So snapshot work stays
+> and never extrapolated from one stretch of log to the next, whose records may differ in size. It is timed on the
+> wall: the committing thread's CPU time was measured and rejected on 2026-11-09 (A-243's amendment below). So snapshot work stays
 > within about twice the log it absorbs, whatever the partition's size, and `slates status` shows each shard's
 > snapshots, their bytes and longest duration, the log appended, the tail's bytes and measured work, the budget and
 > the floor.
@@ -15500,6 +15501,31 @@ Applied in the same change to:
 - **Owed.**
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
+- **Measured and rejected 2026-11-09: the work charged in the committing thread's CPU time (the supervisor's question to
+  raft, from loadtest-scale's cadence work). The trigger stays on the wall; closed with no change.**
+  - *The argument for it.* The rule charges a commit what a replay repeats of it, its append's encode, checksum and
+    copy and its apply, "never on a wait". Preemption is a wait inside those spans that a replay never repeats, so
+    CPU time looked the faithful measure: the wall charged a preempted commit its wait, and so would bring the trigger
+    early exactly when the machine was busiest.
+  - *Measured* (adacachy, 2026-11-09, release builds, the two triggers interleaved; command:
+    `cargo test --release -p slates-db --test snapshot_cadence measure_snapshots_per_thousand_records -- --ignored
+    --exact --nocapture` on each arm). Snapshots per 200,000 small records with a 10 ms budget:
+
+    | phase (load) | wall (main) | thread CPU time |
+    |---|---|---|
+    | quiet (123–125) | 4, 4, 5 | 5, 5, 5 |
+    | 24 busy loops in the unit (125–143) | 7, 6, 7 | 10, 8, 10 |
+
+    The CPU-time trigger snapshots more often than the wall, and more so under load, the opposite of the argument. Two
+    causes. A thread CPU clock read is a system call on Linux where the wall's is a vDSO read, and part of each read
+    lands inside the span it times, so a record of about a microsecond is charged its own clock reads, more under load.
+    And a contended record burns more CPU (shared cores, cache pressure, lower clocks), which a quiet replay would not
+    repeat either. The reads also add two system calls to every commit. A calibrated subtraction of the read's cost
+    would be a second correction on a measure already worse, so it was not tried.
+  - *What failed instead.* `snapshot_cadence.rs`'s longest-tail test failed on a Mac (3 of 6 at load 69–112, and in
+    B10's Mac gate at load 62–78) because its approach predicted the next record from the last, which a preempted
+    record inflated. loadtest-scale's fix (predicting from the largest record seen) addressed it. On adacachy both
+    triggers passed that test 6 of 6 under 24 busy loops at load 32–72.
 
 ### A-274 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
 
