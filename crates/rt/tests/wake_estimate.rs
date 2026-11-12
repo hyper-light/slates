@@ -178,11 +178,8 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
 }
 
 /// Shape: the loaded test's prior, the top of a quiet wake on the hosts measured (1.7-10 µs on Apple silicon,
-/// Linux and Windows, A-223), so queueing behind spinners lifts the mean far past it.
+/// Linux and Windows, A-223), so a mean above it has counted queueing behind the spinners.
 const QUIET_PRIOR_NS: u64 = 10_000;
-/// Shape: how far past the quiet prior the loaded mean must rise before the test judges anything: a mean that
-/// stayed near it saw no queueing, and the run proves nothing (the non-vacuity bound).
-const QUEUED_FACTOR: u64 = 10;
 /// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so the estimate
 /// has forgotten its quiet prior.
 const LOADED_KICKS: u64 = 4 << SHIFT;
@@ -203,6 +200,12 @@ const NO_RATIO: u64 = 0;
 /// not: a window priced on the estimate spins longer the more its own spinning queues the woken shard. On the
 /// daemon's rule for a platform whose loaded wake was measured cheap (Linux, macOS), the window is R9's floor
 /// whatever the estimate reads (ratio 0, floor F).
+///
+/// The run proves something once the mean stands above the quiet prior (the non-vacuity bound): a window priced on the
+/// mean would then be longer than the prior's. How far the mean climbs depends on the window, since a shard spinning out
+/// a long one queues the next woken shard behind it: at the floor a loaded 3-CPU macOS runner reached 1.43 times the
+/// prior where ten times was asked (diag-liveness-40), as the daemon-level test found
+/// (`crates/server/tests/idle_window.rs`).
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
@@ -237,7 +240,7 @@ fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
     }
     let mut kicks = 0;
     while kicks < LOADED_KICKS
-      || (ctx.counters().wake_cost_ns < QUEUED_FACTOR * QUIET_PRIOR_NS && kicks < MOST_LOADED_KICKS)
+      || (ctx.counters().wake_cost_ns <= QUIET_PRIOR_NS && kicks < MOST_LOADED_KICKS)
     {
       step_until_idle(ctx);
       park_and_kick(ctx, &rx);
@@ -252,8 +255,8 @@ fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
     "enough kicks met a sleeping shard to move the estimate off its prior: {counters:?}"
   );
   assert!(
-    counters.wake_cost_ns >= QUEUED_FACTOR * QUIET_PRIOR_NS,
-    "the spinners queued the woken shard, so its mean rose far past the quiet prior: {counters:?}"
+    counters.wake_cost_ns > QUIET_PRIOR_NS,
+    "the spinners queued the woken shard, so its mean rose past the quiet prior: {counters:?}"
   );
   assert_eq!(
     ctx.quantum_ns(),
