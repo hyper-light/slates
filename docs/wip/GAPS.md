@@ -1096,6 +1096,11 @@
 >   shard at nice 19 beside two spinners: main gave up 2 to 1,208 batches in 6 of 6 runs, the fix none
 >   (`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). Still open in C+D: the client's
 >   own reply deadline (clients) and the location budget's wall (`verbs::locate_within_budget`).
+>   Its cost, about 60 ms at the median on a deaf session's first answer (142 against 84 ms), is in BENCHMARKS beside the
+>   A/B. **Unexplained, kept open:** one run of the dead-session test missed its 1.1 s bound at 1.33 s (adacachy2, load
+>   41, `2577aa61` with an uncommitted diagnostic: a probe client's 20 s Status read through b, issued just after the
+>   deafness, its test thread blocked in it). The other 4 runs with that probe answered in 118 to 198 ms, and 6 runs
+>   without it in 60 to 205 ms. Not reproduced; a recurrence in a gate run is the data point to chase.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
