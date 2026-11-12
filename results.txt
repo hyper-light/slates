@@ -1,0 +1,171 @@
+tree 27db460 diag only (A-223 step 4): the rule as built, gates, tests and provision_bench at two shards; not for main
+== fmt exit 0
+== xtask exit 0
+literals: ok
+== clippy exit 0
+== machine_rt exit 0
+test result: ok. 67 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.67s
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+runner macos-latest, 3 CPUs, Thu Nov 12 08:25:26 UTC 2026
+== quiet round=1 at 08:25:26
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4446 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 1 thousandths of a core over 3071 ms with no client
+  provision.spinning_1_cpu_2_shards: [1141, 1111, 1160] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 630 (wake 15022 ns), shard 1: 309 (wake 11566 ns)
+  provision.spinning_1_p99: 289709 ns [286959, 450417] over 3 runs: [286959, 450417, 289709]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 289709 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [2639, 2592, 2384] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 916458 ns [837833, 1341541] over 3 runs: [837833, 916458, 1341541]
+  provision.spinning_64_cpu_2_shards: [2446, 2743, 2532] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [121, 89, 93] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1693 (wake 22884 ns), shard 1: 1438 (wake 18744 ns)
+  provision.parked_1_p99: 1185000 ns [857291, 1844667] over 3 runs: [1844667, 1185000, 857291]
+== exit 1
+== quiet round=2 at 08:26:17
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3654 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 1 thousandths of a core over 3002 ms with no client
+  provision.spinning_1_cpu_2_shards: [1192, 1192, 1163] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 566 (wake 4571 ns), shard 1: 275 (wake 4063 ns)
+  provision.spinning_1_p99: 258916 ns [248583, 278125] over 3 runs: [278125, 248583, 258916]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 258916 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [2792, 2571, 2486] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 979542 ns [656000, 988875] over 3 runs: [656000, 988875, 979542]
+  provision.spinning_64_cpu_2_shards: [2620, 2584, 2747] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [78, 88, 90] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1628 (wake 6633 ns), shard 1: 1416 (wake 7735 ns)
+  provision.parked_1_p99: 1106333 ns [920542, 1261917] over 3 runs: [920542, 1106333, 1261917]
+== exit 1
+== quiet round=3 at 08:27:09
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4106 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 1 thousandths of a core over 3091 ms with no client
+  provision.spinning_1_cpu_2_shards: [1115, 1147, 1224] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 602 (wake 10317 ns), shard 1: 305 (wake 12052 ns)
+  provision.spinning_1_p99: 292458 ns [220792, 382542] over 3 runs: [382542, 292458, 220792]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 292458 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [1968, 2476, 2558] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 886875 ns [847875, 1134042] over 3 runs: [1134042, 847875, 886875]
+  provision.spinning_64_cpu_2_shards: [2736, 2576, 2616] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [101, 97, 102] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1767 (wake 24373 ns), shard 1: 1508 (wake 18542 ns)
+  provision.parked_1_p99: 1167333 ns [948666, 1180500] over 3 runs: [1167333, 948666, 1180500]
+== exit 1
+== busy round=1 at 08:28:01
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3994 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 1 thousandths of a core over 3007 ms with no client
+  provision.spinning_1_cpu_2_shards: [288, 203, 225] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 644 (wake 4729 ns), shard 1: 307 (wake 4528 ns)
+  provision.spinning_1_p99: 3799500 ns [3765125, 3951333] over 3 runs: [3765125, 3951333, 3799500]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 3799500 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [1315, 1377, 1476] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 2784875 ns [2138916, 2866417] over 3 runs: [2866417, 2784875, 2138916]
+  provision.spinning_64_cpu_2_shards: [1536, 1461, 1566] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [119, 90, 60] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1644 (wake 11384 ns), shard 1: 1301 (wake 11804 ns)
+  provision.parked_1_p99: 3419084 ns [1335917, 3933833] over 3 runs: [3933833, 3419084, 1335917]
+== exit 1
+== busy round=2 at 08:29:23
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3068 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 1 thousandths of a core over 3150 ms with no client
+  provision.spinning_1_cpu_2_shards: [223, 207, 252] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 648 (wake 9308 ns), shard 1: 279 (wake 10317 ns)
+  provision.spinning_1_p99: 3703625 ns [3634625, 3767000] over 3 runs: [3703625, 3767000, 3634625]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 3703625 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [1326, 1236, 1411] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 2736375 ns [2079541, 2932750] over 3 runs: [2736375, 2932750, 2079541]
+  provision.spinning_64_cpu_2_shards: [1524, 1571, 1454] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [75, 83, 68] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1797 (wake 32697 ns), shard 1: 1308 (wake 14024 ns)
+  provision.parked_1_p99: 2504833 ns [1277875, 3034250] over 3 runs: [2504833, 1277875, 3034250]
+== exit 1
+== busy round=3 at 08:30:41
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 6879 ns, idle window at boot 50000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 0 thousandths of a core over 3054 ms with no client
+  provision.spinning_1_cpu_2_shards: [321, 239, 384] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 607 (wake 7363 ns), shard 1: 313 (wake 6390 ns)
+  provision.spinning_1_p99: 3477042 ns [1903708, 3554208] over 3 runs: [3554208, 3477042, 1903708]
+ac-2.1: 1 client spinning (3 cores, 2 shards), provisioning p99 3477042 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_cpu_2_shards: [1289, 1392, 1544] thousandths of a core per run (clients included)
+  provision.spinning_8_p99: 2348584 ns [1811208, 2659666] over 3 runs: [2659666, 2348584, 1811208]
+  provision.spinning_64_cpu_2_shards: [1522, 1577, 1478] thousandths of a core per run (clients included)
+  provision.paced_1_1000us_cpu_2_shards: [85, 80, 74] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1732 (wake 16666 ns), shard 1: 1327 (wake 11120 ns)
+  provision.parked_1_p99: 2430667 ns [2239084, 2953334] over 3 runs: [2239084, 2953334, 2430667]
+== exit 1
+== test config exit 0
+test config::tests::a_durability_bound_surfaces_a_breach ... ok
+test config::tests::a_breach_reports_its_measured_shortfall ... ok
+test config::tests::a_fleet_configuration_derives_its_own_task_share_from_the_peer_count ... ok
+test config::tests::a_laptops_control_shard_holds_no_forward_lane ... ok
+test config::tests::a_memory_bound_below_total_caps_the_reserve ... ok
+test config::tests::the_direct_maps_a_shard_may_hold_follow_the_process_limits ... ok
+test config::tests::the_idle_window_is_the_floor_or_the_platforms_cover_of_a_loaded_wake ... ok
+test config::tests::the_derived_scatter_is_the_recovery_floor_above_the_candidate_floor ... ok
+test daemon::tests::a_breaching_configuration_moves_the_durability_signal ... ok
+test live_ship::tests::a_recorded_holder_takes_its_owners_entry_though_its_configuration_lags ... ok
+test config::tests::the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records ... ok
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test member_task::tests::another_regions_configuration_version_never_supersedes_the_owner_lease ... ok
+test config::tests::the_rings_that_wrap_fit_in_the_memory_the_daemon_may_use ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out; finished in 1.31s
+== test wake_estimate exit 0
+test a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks ... ok
+test a_poll_blocked_in_a_call_past_the_quantum_is_its_tasks_where_blocks_are_counted ... ok
+test a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended ... ok
+test a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s
+== test idle_window_1 exit 101
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+thread 'a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes' (118917) panicked at crates/server/tests/idle_window.rs:137:3:
+the spinners queued a woken shard, so its estimate rose to 10 times the boot prior of 4788 ns within 1024 paced requests: [ShardPulse { shard: 0, steps: 6019, waits: 1773, spawns: 1175, completed: 1169, admission_refused: 0, longest_step_ns: 7524625, parked: true, kicks_skipped: 404, ring_full_events: 0, scheduler_overrun_ns: 457841, wake_cost_ns: 28353, idle_window_ns: 50000 }, ShardPulse { shard: 1, steps: 8178, waits: 1178, spawns: 1168, completed: 1166, admission_refused: 0, longest_step_ns:
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.78s
+== test idle_window_2 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+== test idle_window_3 exit 0
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: loaded_wake_ratio = 0: none: the window is F alone where a loaded wake was measured cheap (anchors ["diag-liveness-35", "A-223"])
+slates daemon: idle_window_ns = 50000: max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns (anchors ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"])
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+test a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+== test forward_retry exit 0
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+slates daemon: the control shard's beat task ran 1118 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 14 steps and 20 polls (7 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 2 timers, waited 4 times, spawned 24 tasks and finished 15; 16 tasks live; its longest poll is 1110 ms and its timer overrun 0 ms
+test a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.73s
