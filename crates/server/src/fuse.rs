@@ -113,6 +113,11 @@ const WRITEBACK_CONFLICTS: &str = "fuse.writeback_conflicts";
 /// Format: cache write-backs applied whole over stale bytes that equal the file's bytes now (A-248), as NFS counts
 /// `nfs.writeback_identical`.
 const WRITEBACK_IDENTICAL: &str = "fuse.writeback_identical";
+/// Format: cache write-backs applied whole with no stale byte: a page written back before any other path changed the
+/// bytes it carries. The dirty-page tests read it to prove their precondition, that a store's page was still dirty when
+/// the other path's write came: an applied write-back between the two means the kernel wrote the page back first, so the
+/// run proves nothing about the rule (`crates/cli/tests/cli.rs`, `a_dirty_shared_map_page_never_undoes_...`).
+const WRITEBACKS_APPLIED: &str = "fuse.writebacks_applied";
 /// Format: cache write-backs refused `EIO` because which of their bytes were stale could not be told: the file's byte
 /// states were lost (the metadata ledger refused their room, or the journal no longer held the records since the
 /// mount last consumed it), or a file with no states was judged against records already gone. Zero is the healthy
@@ -943,6 +948,8 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(WRITEBACK_CONFLICTS, conflicts);
   let identical = mount.serve.take_writeback_identical();
   s.count(WRITEBACK_IDENTICAL, identical);
+  let applied = mount.serve.take_writebacks_applied();
+  s.count(WRITEBACKS_APPLIED, applied);
   let unknown = mount.serve.take_writebacks_unknown();
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();

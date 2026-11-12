@@ -664,6 +664,10 @@ pub struct ServeState {
   /// Cache write-backs applied whole over stale bytes that equal the file's bytes now, since this was last read. Read
   /// and cleared by the owner that reports it.
   writeback_identical: u64,
+  /// Cache write-backs applied whole with no stale byte at all, since this was last read: a page written back before
+  /// any other path changed the bytes it carries. Read and cleared by the owner that reports it. The dirty-page tests
+  /// read it to prove their precondition, that a store's page was still dirty when the other path's write came.
+  writebacks_applied: u64,
   /// The bytes of each file a refused cache write-back carried, its kernel's copy of which no invalidation may ever name
   /// ([`serve_writeback`]): owed as an inode invalidation at the next round after the reply. One covering range a file,
   /// so at most one entry for each file its kernel holds open for writing (a write-back holds its file open until it is
@@ -729,6 +733,7 @@ impl ServeState {
       takeover_invalidated: 0,
       writeback_conflicts: 0,
       writeback_identical: 0,
+      writebacks_applied: 0,
       refused_writebacks: std::collections::BTreeMap::new(),
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
@@ -762,6 +767,12 @@ impl ServeState {
   /// ([`dispatch_request`]).
   pub fn take_writeback_identical(&mut self) -> u64 {
     std::mem::take(&mut self.writeback_identical)
+  }
+
+  /// The cache write-backs applied whole with no stale byte since this was last asked, and zero afterwards
+  /// ([`dispatch_request`]).
+  pub fn take_writebacks_applied(&mut self) -> u64 {
+    std::mem::take(&mut self.writebacks_applied)
   }
 
   /// Whether a refused cache write-back's pages are still owed an invalidation ([`serve_writeback`]): its owner runs a
@@ -1884,7 +1895,9 @@ fn serve_writeback(
     None => WritebackVerdict::Unknown,
   };
   match verdict {
-    WritebackVerdict::Apply => {}
+    WritebackVerdict::Apply => {
+      state.writebacks_applied = state.writebacks_applied.saturating_add(1);
+    }
     WritebackVerdict::Identical => {
       state.writeback_identical = state.writeback_identical.saturating_add(1);
     }

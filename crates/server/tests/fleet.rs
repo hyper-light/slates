@@ -5379,6 +5379,15 @@ fn summed_counters(daemon: &Daemon) -> std::collections::BTreeMap<&'static str, 
   sums
 }
 
+/// The longest single poll `daemon`'s control shard has run, nanoseconds (its registry pulse, read with no shard
+/// round-trip, so a shard held inside a poll is still read).
+fn control_longest_poll_ns(daemon: &Daemon) -> u64 {
+  daemon
+    .shard_pulses()
+    .first()
+    .map_or(0, |pulse| pulse.longest_step_ns)
+}
+
 /// The tasks `daemon`'s control shard has refused at admission so far (`tasks_refused` in `slates status`).
 fn control_tasks_refused(daemon: &Daemon) -> u64 {
   daemon
@@ -5463,6 +5472,7 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     .map(|_| Client::connect(daemons[1].instance()))
     .collect();
   let refused_before = control_tasks_refused(&daemons[1]);
+  let longest_before = control_longest_poll_ns(&daemons[1]);
   let measured = routed.then(|| {
     ADMITTED_OWNER_HELD.store(false, std::sync::atomic::Ordering::Release);
     let hold = daemons[0]
@@ -5590,12 +5600,13 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
           || name.starts_with("fleet.owner_location")
       })
       .collect();
-    (refused_during, replies, hops, last_reply)
+    let longest_after = control_longest_poll_ns(&daemons[1]);
+    (refused_during, replies, hops, last_reply, longest_after)
   });
   for daemon in daemons {
     daemon.stop();
   }
-  let (refused_during, replies, hops, last_reply) = measured
+  let (refused_during, replies, hops, last_reply, longest_after) = measured
     .unwrap_or_else(|| panic!("b routed the read to a before the hold (last reply: {last:?})"));
   let answered: usize = replies.iter().map(Vec::len).sum();
   let served = replies
@@ -5631,6 +5642,23 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     answered,
     clients * slots,
     "every read is answered; b's hop counters summed over its shards: {hops:?}"
+  );
+  // §4.3 "a step longer than a peer's wake starves the shard", and the watchdog's window: a control shard that runs one
+  // poll as long as the anchor's liveness window has its beat withheld and is killed. fixtures' and loadtest-scale's
+  // f = 1 primary-kill rungs (2026-11-08, 6 of 6 runs) had the client node's control shard spin 1.09 s in one poll as
+  // the restarted primary's replies came back: the lane took every open forward's reply through a full drain of the
+  // session, a clock read each, so a turn cost the forwards open times the drain.
+  eprintln!(
+    "b's control shard: longest poll {} ms before the burst, {} ms after",
+    longest_before / 1_000_000,
+    longest_after / 1_000_000
+  );
+  assert!(
+    longest_after < slates_server::daemon::LIVENESS_BUDGET_NS,
+    "b's control shard ran one poll {} ms long draining the burst, a liveness window ({} ms) or more: the watchdog \
+     withholds its beat and the anchor kills the node",
+    longest_after / 1_000_000,
+    slates_server::daemon::LIVENESS_BUDGET_NS / 1_000_000
   );
 }
 
@@ -5788,6 +5816,153 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
       other => panic!("a filler's admission: {other:?}"),
     }
   }
+}
+
+/// Shape: how long a test waits, in the daemons' own time, for b to drop a deaf session and answer on a new one: the
+/// rule's window (a liveness budget, or the session's persistent-congestion duration if longer, about 2 s), the next
+/// return of the session by whichever borrower holds it (every hold is bounded by a derived budget), and the redial.
+const DEAD_SESSION_WATCH: Duration = Duration::from_nanos(8 * LIVENESS_BUDGET_NS);
+/// Shape: [`DEAD_SESSION_WATCH`] as the fleet's own periods, one a heartbeat, so a watch that never holds (the red case)
+/// spends its own periods rather than `poll_until`'s whole convergence budget (about 400 s).
+const DEAD_SESSION_WATCH_PERIODS: u64 =
+  8 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
+/// Shape: how soon after the drop the forward lane's first answer on the replacement must come: the link dials again at
+/// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
+/// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
+const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon::HEARTBEAT_NS;
+/// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
+/// returns it and the link never finds it in its slot, as the rung's thousand clients did. Measured 2026-11-08: at 32
+/// the link's own discovery refresh found the deaf session in its slot and replaced it, and the read was served in
+/// 267 ms without the dead-session check; at 256 it was refused `OwnerUnreachable` after 18.7 s, as on the rung.
+const DEAD_SESSION_BURST_CLIENTS: usize = 256;
+/// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
+static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
+/// so the client node's record session to it looked valid, and borrowers kept forwarding into a session the new process
+/// had no state for; every request through the client node waited 25 to 135 s. The condition is injected here rather
+/// than hoped for from the load: b's session to a drops everything it receives (`Daemon::inject_session_deafness`, cut at
+/// the session's receive path, so the product's own judgment runs). Do: three nodes; a volume on a read through b; a
+/// burst of reads through b kept going (256 clients, so the session is never in its slot); b's session to a made deaf.
+/// Expect: b judges the session silent where a borrower returns it (`fleet::return_sessions`), drops it, and the forward
+/// lane's first answer on the replacement comes within a liveness budget of the drop. Before: no borrower judged it,
+/// the lane forwarded into it, and every forward through b gave up until its failover bound. (A read through b served
+/// within that bound behind the resends' backlog is a separate finding, tested with its fix.)
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "deaf-session", &daemons);
+  let mut probe = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
+  let through_b = daemons[1].instance().to_owned();
+  DEAD_SESSION_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
+  let burst_read = read.clone();
+  let burst = std::thread::spawn(move || {
+    let mut clients: Vec<Client> = (0..DEAD_SESSION_BURST_CLIENTS)
+      .map(|_| Client::connect(&through_b))
+      .collect();
+    let mut rounds = 0u64;
+    while DEAD_SESSION_BURST_ON.load(std::sync::atomic::Ordering::Acquire) {
+      for client in &mut clients {
+        client.send_burst(&burst_read, slots);
+      }
+      for client in &mut clients {
+        client.collect_tagged(slots, ADMITTED_FORWARDS_READ);
+      }
+      rounds += 1;
+    }
+    rounds
+  });
+  // The lane busy for a budget before the session goes deaf.
+  let busy_until = Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS);
+  while Instant::now() < busy_until {
+    std::thread::yield_now();
+  }
+  // The link's own discovery refresh, which can take the session from its slot when a page falls due, is held, so the
+  // rescue tested is the one at the return of a borrow, which every borrower's bounded hold reaches.
+  let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  let holding = Instant::now();
+  while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
+    held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  }
+  // Installed once the control shard answers (busy with the burst, an observation can miss its budget).
+  let mut marked = daemons[1].inject_session_deafness(hosts[0]);
+  let marking = Instant::now();
+  while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
+    marked = daemons[1].inject_session_deafness(hosts[0]);
+  }
+  // Until the lane has answered on the replacement, charged in the daemons' own periods (`poll_for_periods`).
+  let mut recovered = None;
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  poll_for_periods(
+    &everyone,
+    DEAD_SESSION_WATCH,
+    DEAD_SESSION_WATCH_PERIODS,
+    || {
+      recovered = daemons[1]
+        .observation(
+          Some(daemons[1].shards()[0]),
+          slates_server::daemon::OBSERVE_BUDGET_NS,
+          |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
+        )?
+        .wait()?;
+      Ok(recovered.is_some())
+    },
+  );
+  drop(everyone);
+  DEAD_SESSION_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
+  let rounds = burst.join().unwrap();
+  let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
+    .into_iter()
+    .filter(|(name, _)| {
+      name.contains("judged_dead")
+        || name.contains("given_up")
+        || name.contains("replaced_answered")
+    })
+    .collect();
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; burst rounds {rounds}; b's \
+     counters {counters:?}",
+    recovered.map(Duration::from_nanos)
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(held, Ok(()), "b's discovery to a was held");
+  assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(rounds > 0, "the burst kept b's lane busy");
+  let recovered = recovered.unwrap_or_else(|| {
+    panic!(
+      "b never answered on a replacement within the watch ({DEAD_SESSION_WATCH:?} of the daemons' periods) of the \
+       session going deaf: no borrower judged it silent (counters {counters:?})"
+    )
+  });
+  assert!(
+    recovered <= DEAD_SESSION_RECOVERY_NS,
+    "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
+    Duration::from_nanos(recovered),
+    Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
+  );
 }
 
 /// §4.9, found by fixtures' 1,000-client replica-kill rung (2026-11-07): the client node's control shard refused 117

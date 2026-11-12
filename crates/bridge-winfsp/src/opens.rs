@@ -322,7 +322,9 @@ impl<M: Memory> Ledger<M> {
     )
   }
 
-  /// Marks an open handed only after its response was accepted by the driver, before another callback is admitted.
+  /// Marks an open handed only after its response was accepted by the driver. The receive worker posts it and goes on;
+  /// the shard applies it ahead of the worker's next request, and before the journal's settled copy of the open's
+  /// response is overwritten (A-274), so a pending open always has its response in the journal.
   pub fn confirmed(&mut self, context: u64) -> Result<(), Refusal> {
     self.get(context)?;
     let (index, _) = unpack(context)?;
@@ -341,7 +343,8 @@ impl<M: Memory> Ledger<M> {
     Ok(())
   }
 
-  /// Before restoring reference counts, retain an unhanded open only when the journal has its successful response.
+  /// Before restoring reference counts, retain an unhanded open only when the journal has its successful response,
+  /// published or settled (A-274).
   /// Otherwise retire its ledger context; its unpublished/local bridge handle is not a restored sibling's reference.
   pub fn settle_pending(&mut self, saved_open: Option<(u64, u64)>) -> Result<(), Refusal> {
     if let Some((context, hint)) = self.pending {

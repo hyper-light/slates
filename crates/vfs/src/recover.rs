@@ -79,9 +79,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
 /// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
+/// 25 (A-251, 2026-11-09) each held register carries the acceptor's whole persisted state, the retired owner an install
+/// last moved its authority from too (`slates_db::register::PersistedAcceptor`), so a warm restart keeps the move.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 24;
+const IMAGE_VERSION: u16 = 25;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

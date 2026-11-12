@@ -2317,10 +2317,7 @@ fn summary_line(volume: &VolumeSummary) -> String {
     volume.live_shipped
   );
   match &volume.not_recovered {
-    Some(cause) => format!(
-      "{line} not_recovered={}",
-      slates_mcp::recovery_cause_kind(cause)
-    ),
+    Some(cause) => format!("{line} not_recovered={}", cause.kind()),
     None => line,
   }
 }

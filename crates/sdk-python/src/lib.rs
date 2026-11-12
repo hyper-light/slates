@@ -216,6 +216,11 @@ fn summary_dict(py: Python<'_>, volume: VolumeSummary) -> PyResult<Py<PyDict>> {
   dict.set_item("referenced_bytes", volume.referenced_bytes)?;
   dict.set_item("unique_bytes", volume.unique_bytes)?;
   dict.set_item("overlay", volume.overlay)?;
+  dict.set_item("live_shipped", volume.live_shipped)?;
+  dict.set_item(
+    "not_recovered",
+    volume.not_recovered.as_ref().map(|cause| cause.kind()),
+  )?;
   Ok(dict.into())
 }
 
@@ -355,8 +360,10 @@ impl Client {
   }
 
   /// Lists the daemon's volumes (§4.4) as a list of dicts — each with its `id` (hex), `name`, the byte
-  /// accounting (`referenced_bytes`, `unique_bytes`), and whether it is an `overlay` of a host directory.
-  /// The plain shape `slates list` prints, one dict per volume.
+  /// accounting (`referenced_bytes`, `unique_bytes`), whether it is an `overlay` of a host directory, whether it is
+  /// `live_shipped` (A-200), and `not_recovered`: `None`, or for a volume recovery could not rebuild, its cause's kind
+  /// (`"BaseMissing"`, …; its status gives the whole cause). The shape `slates volume list --json` prints, one dict
+  /// per volume.
   fn list(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let volumes = self.inner.list().map_err(refusal)?;
     volumes
