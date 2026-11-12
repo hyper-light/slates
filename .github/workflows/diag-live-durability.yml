@@ -1,0 +1,73 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200): a resumed holder 20,000 entries behind on one volume, a second volume on the
+# same owner shard written through its catch-up: main, the retention fix, and the retention fix with the fold fix,
+# both arches, x4 per leg. Results to diag-results/live-durability-84-<leg>.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SLATES_TEST_CLI: "1"
+
+jobs:
+  check:
+    name: catch-up-scale (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: main-x86, os: ubuntu-latest, ref: 1e9f3287319a6c704b44e649c2a3c3fff7c31809, backlog: "20000" }
+          - { leg: retain-x86, os: ubuntu-latest, ref: 1d154518fb9314b5bdd7b0d5a2536464820978c8, backlog: "20000" }
+          - { leg: both-x86, os: ubuntu-latest, ref: 42275fe6a60107a15287aa81f3e07fc3814c6a07, backlog: "20000" }
+          - { leg: main-arm, os: ubuntu-24.04-arm, ref: 1e9f3287319a6c704b44e649c2a3c3fff7c31809, backlog: "20000" }
+          - { leg: retain-arm, os: ubuntu-24.04-arm, ref: 1d154518fb9314b5bdd7b0d5a2536464820978c8, backlog: "20000" }
+          - { leg: both-arm, os: ubuntu-24.04-arm, ref: 42275fe6a60107a15287aa81f3e07fc3814c6a07, backlog: "20000" }
+    runs-on: ${{ matrix.os }}
+    env:
+      SLATES_DIAG_BACKLOG: ${{ matrix.backlog }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: The runs
+        shell: bash {0}
+        run: |
+          R=../results.txt
+          mkdir -p ../kept
+          echo "leg ${{ matrix.leg }}, $(nproc) CPUs, $(date -u), tree $(git rev-parse HEAD)" > $R
+          timeout 1800 cargo build --release --locked -p slates-cli --bin slates --test live_chaos > ../build.log 2>&1; status=$?
+          echo "== release build exit $status" >> $R
+          [ $status -ne 0 ] && grep -E '^error' -A8 ../build.log | head -40 >> $R
+          for run in 1 2 3 4; do
+            timeout 900 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 --exact diag_a_resumed_holders_catch_up_beside_a_busy_volume > ../run.log 2>&1; status=$?
+            grep -E '^LD-CU |panicked' ../run.log | cut -c1-600 | sed "s/^/   r$run /" >> $R || true
+            echo "== run $run exit $status" >> $R
+            { grep -E '^LD-CU|panicked' ../run.log | cut -c1-600; } > ../kept/cu-$run.log
+          done
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-84-${{ matrix.leg }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../kept/*.log . 2>/dev/null || true
+          git add results.txt *.log 2>/dev/null || git add results.txt
+          git commit -qm "diag-live-durability-84 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
