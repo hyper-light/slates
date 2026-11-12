@@ -1,0 +1,107 @@
+name: diag-liveness-a223-step6-abc
+
+# Diagnostics only, never on main (A-223 step 6, the three window rules against each other): main, W = F (the kept
+# rule), W = F x shards (SLATES_DIAG_WINDOW_PER_SHARD=1) and W = 2F x shards (=2), on all five runners at 2 shards and
+# derived. Quiet and two spinning shell loops per logical CPU, three rounds, the arms alternating. Results go to
+# diag-results/liveness-45-<os>-<shards>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  RULE_SHA: 15add74a402976aa12ef0dd10c8944f578965c59
+  MAIN_SHA: 29ef4521d9711fd380b7fde45f63e83bac3166c7
+
+jobs:
+  step6:
+    name: A-223 step 6 ABC (${{ matrix.os }}, ${{ matrix.shards }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, shards: "2" }
+          - { os: windows-latest, shards: derived }
+          - { os: windows-11-arm, shards: "2" }
+          - { os: windows-11-arm, shards: derived }
+          - { os: ubuntu-latest, shards: "2" }
+          - { os: ubuntu-latest, shards: derived }
+          - { os: ubuntu-24.04-arm, shards: "2" }
+          - { os: ubuntu-24.04-arm, shards: derived }
+          - { os: macos-latest, shards: "2" }
+          - { os: macos-latest, shards: derived }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the three arms' bench
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          mkdir -p ../arms
+          for arm in main rule; do
+            case $arm in main) sha=$MAIN_SHA;; rule) sha=$RULE_SHA;; esac
+            git worktree add "../src-$arm" "$sha" > /dev/null 2>&1
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench ) > ../build-$arm.log 2>&1 || { echo "== build $arm failed" | tee -a $R; grep -E '^error' -A6 ../build-$arm.log | head -30 >> $R; exit 1; }
+            cp "../target-$arm/release/examples/provision_bench$ext" "../arms/bench-$arm$ext"
+            ( cd "../src-$arm" && git log -1 --format="arm $arm %h %s" | cut -c1-90 ) | tee -a $R
+          done
+      - name: The three arms, quiet and loaded, three rounds, alternating
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, shards ${{ matrix.shards }}, $(date -u)" | tee -a $R
+          if [ "${{ matrix.shards }}" = derived ]; then unset PROVISION_BENCH_SHARDS; else export PROVISION_BENCH_SHARDS=${{ matrix.shards }}; fi
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              for arm in main wF k1 k2; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round=$round arm=$arm at $(date -u +%H:%M:%S)" | tee -a $R
+                bin=rule; [ $arm = main ] && bin=main
+                case $arm in k1) export SLATES_DIAG_WINDOW_PER_SHARD=1;; k2) export SLATES_DIAG_WINDOW_PER_SHARD=2;; *) unset SLATES_DIAG_WINDOW_PER_SHARD;; esac
+                timeout 1500 "../arms/bench-$bin$ext" > ../run.log 2>&1; status=$?
+                unset SLATES_DIAG_WINDOW_PER_SHARD
+                for p in $pids; do kill "$p" 2>/dev/null; done
+                wait 2>/dev/null
+                grep -E 'provisioning histogram|_cpu_|parks per 1000|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|panicked' ../run.log | cut -c1-600 | tee -a $R
+                echo "== exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-45-${{ matrix.os }}-${{ matrix.shards }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-45 results, ${{ matrix.os }}, ${{ matrix.shards }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
