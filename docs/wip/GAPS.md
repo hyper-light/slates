@@ -1088,6 +1088,22 @@
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
+> **The armed step-start account read is the runtime's remaining per-step cost (measured 2026-11-09, liveness; left as
+> it is, 2026-11-11).**
+>
+> - **Where it comes from:** A-31's attribution arms a shard once a long poll finds no window that decides it
+>   (`crates/rt/src/attribution.rs`, `Tracker`). An armed shard reads its thread's CPU account at every step's start.
+>   A busy period that runs no long poll disarms it.
+> - **Measured** under W1's 3,000 clients on adas-mac-studio.local-2:
+>   - every shard stays armed, since each busy period runs a poll past a quantum of a few microseconds;
+>   - the read is 31 of the owner shard's ~1,100 samples a 2 s profile, and 700 to 860 a run over the 23 shards;
+>   - one read is an 88 ns trap on a quiet Studio, more under load.
+>   BENCHMARKS has it: "A shard's clock reads under 3,000 clients: one reading a poll, measured and rejected".
+> - **Left as it is:** cutting it changes which polls get a window. Changing A-228's arming is not worth about 3% of the
+>   owner today.
+> - **The candidate, if the provisioning or edit-merge histograms ever show it:** re-derive the arming rule, so that a
+>   busy shard does not stay armed for good.
+
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
 > child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe
