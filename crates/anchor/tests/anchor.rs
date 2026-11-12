@@ -39,6 +39,10 @@ const EXIT: i32 = 3;
 #[cfg(unix)]
 const CHILD_NFS_PORT: &str = "SLATES_ANCHOR_TEST_NFS_PORT";
 
+/// Format: the variable carrying how long the slow children's starts run (milliseconds), and turning this binary into
+/// [`slow_failing_child`] or [`briefly_serving_child`].
+const CHILD_START_MS: &str = "SLATES_ANCHOR_TEST_START_MS";
+
 /// A segment name unique to this process: a fixed name collides when two runs of these tests overlap
 /// on a platform that names its shared objects (macOS, Windows), and the second run's create removes
 /// the first's name or meets its object. The re-invoked child learns the name from the handoff.
@@ -251,6 +255,144 @@ fn serving_child() {
   }
   supervision.mark_serving(beats);
   std::process::exit(exit);
+}
+
+/// The child whose start runs [`CHILD_START_MS`] and fails before it serves: it attaches, beats, waits out its start and
+/// exits. Ignored, and run by its parent with `--ignored --exact`.
+#[test]
+#[ignore = "the slow-failing child; run by a_crash_loop_of_starts_longer_than_the_window_is_backed_off with --ignored"]
+fn slow_failing_child() {
+  let Ok(start_ms) = std::env::var(CHILD_START_MS) else {
+    return;
+  };
+  let start = Duration::from_millis(start_ms.parse().unwrap());
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  supervision.beat(1);
+  // A child stands in for a daemon's start: a wait is what it takes here (the lint's stated exception).
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(start);
+  std::process::exit(EXIT);
+}
+
+/// The child that starts for [`CHILD_START_MS`], serves for a tenth of that, and exits: a daemon that dies soon after it
+/// serves, every time. Ignored, and run by its parent with `--ignored --exact`.
+#[test]
+#[ignore = "the briefly serving child; run by a_daemon_that_dies_soon_after_it_serves_is_backed_off with --ignored"]
+fn briefly_serving_child() {
+  let Ok(start_ms) = std::env::var(CHILD_START_MS) else {
+    return;
+  };
+  let start = Duration::from_millis(start_ms.parse().unwrap());
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let supervision = segment.supervision().unwrap();
+  supervision.beat(1);
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(start);
+  supervision.mark_serving(2);
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(start / 10);
+  std::process::exit(EXIT);
+}
+
+/// Supervises `child` (a role of this binary) with its start set to `start`, until a crash loop is reported or `exits`
+/// exits have passed: the back-off the crash loop scheduled, if one came, and the exits before it.
+fn exits_until_backed_off(
+  name: &str,
+  child: &str,
+  policy: RestartPolicy,
+  start: Duration,
+  exits: u32,
+) -> (Option<u64>, u32) {
+  let segment = AnchorSegment::create(&unique_name(name), &identity(), geometry()).unwrap();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    child.to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
+  // SAFETY: the test sets the child's environment before it spawns any child; the variable is read by the slow children
+  // only, whatever the tests beside it spawn.
+  unsafe {
+    std::env::set_var(CHILD_START_MS, start.as_millis().to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let mut seen = 0u32;
+  let life = start * 3 + Duration::from_millis(CHILD_WAIT_MS);
+  while seen < exits && clock.elapsed() < life * exits {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } => {
+        assert_eq!(exit_code, Some(EXIT));
+        seen += 1;
+      }
+      Step::CrashLoop { retry_in_ns, .. } => {
+        supervisor.stop().ok();
+        return (Some(retry_in_ns), seen + 1);
+      }
+      other => panic!("supervision ended: {other:?}"),
+    }
+  }
+  // The child restarted last is stopped before the segment goes, so it never starts against a segment that is gone.
+  supervisor.stop().ok();
+  (None, seen)
+}
+
+/// Shape: the window of [`a_crash_loop_of_starts_longer_than_the_window_is_backed_off`]'s policy, shorter than its
+/// child's start, as the anchor's second (`slates_db::replay::RECOVERY_BUDGET_NS`) is shorter than a 407-shard start
+/// under load (B10's Linux gate on adacachy2, 2026-11-11: every start killed after 1,009-1,037 ms of one thread's CPU).
+const SHORT_WINDOW_NS: u64 = 200_000_000;
+
+/// §2.6 step 1 (A-119): a crash loop is starts that fail in a row, however long each start takes. Do: supervise a child
+/// whose every start runs twice the policy's window and fails before it serves, under the policy the anchor derives
+/// before any start is measured (the window its budget, one start). Expect the crash loop reported by the third exit,
+/// backed off at least as long as a failed start. On main every failed start fell in a window of its own, so it was
+/// restarted at once, for good: B10's Linux gate restarted a 407-shard start every second for 27 minutes.
+#[test]
+fn a_crash_loop_of_starts_longer_than_the_window_is_backed_off() {
+  let start = Duration::from_nanos(SHORT_WINDOW_NS * 2);
+  let (backoff, exits) = exits_until_backed_off(
+    "slates-anchor-test-slow-loop",
+    "slow_failing_child",
+    RestartPolicy::derive(SHORT_WINDOW_NS, SHORT_WINDOW_NS).get(),
+    start,
+    4,
+  );
+  let start_ns = u64::try_from(start.as_nanos()).unwrap();
+  assert!(
+    backoff.is_some_and(|backoff| backoff >= start_ns) && exits <= 3,
+    "a start that fails in a row is backed off at least its own length by the third exit: backed off {backoff:?} ns \
+     after {exits} exits"
+  );
+}
+
+/// §2.6 step 1 (A-119): a daemon that serves, but dies before it has served as long as its start took, is a crash loop
+/// too; restarted at once each time, it would spend nearly all its time restarting. Do: supervise a child that starts
+/// for 400 ms, serves a tenth of that and exits, every time. Expect the crash loop reported by the third exit, backed off at least
+/// as long as a start. On main a served exit was restarted at once, always.
+#[test]
+fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
+  // The start of the slow loop's test: the two run in parallel and share the process's environment, which carries it.
+  let start = Duration::from_nanos(SHORT_WINDOW_NS * 2);
+  let (backoff, exits) = exits_until_backed_off(
+    "slates-anchor-test-brief-serve",
+    "briefly_serving_child",
+    RestartPolicy::derive(SHORT_WINDOW_NS, SHORT_WINDOW_NS).get(),
+    start,
+    4,
+  );
+  let start_ns = u64::try_from(start.as_nanos()).unwrap();
+  assert!(
+    backoff.is_some_and(|backoff| backoff >= start_ns) && exits <= 3,
+    "a daemon that dies soon after it serves is backed off at least its start's length by the third exit: backed off \
+     {backoff:?} ns after {exits} exits"
+  );
 }
 
 /// The NFS-listener-inheritance child (§4.6): it verifies it inherited the anchor's held listener

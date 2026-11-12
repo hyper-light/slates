@@ -836,8 +836,12 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
       break;
     }
+    // The test's bound is the anchor's own verdict: it expects no start killed, so the first kill ends the watch and fails
+    // it with the anchor's line. Before 2026-11-11 the watch read on, and with no back-off for starts that each fail past
+    // the window it read for good: B10's Linux gate restarted the start every second for 27 minutes.
     if line.contains(START_KILL_LINE) {
       kills.push(line.trim_end().to_owned());
+      break;
     }
   }
   let served = line.contains(&serving_line);
