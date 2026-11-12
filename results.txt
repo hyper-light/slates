@@ -1,0 +1,284 @@
+arm main 29ef4521d merge: agents/loadtest-scale-spin at d56ad2b3 onto the B11 stack -- a r
+arm x100 3603ab9d7 rt: a loaded shard's idle window must stay at its floor while its queue
+arm rule adb383f26 merge: origin/main 29ef4521 (B11) into the A-223 branch -- BENCHMARKS a
+== fmt exit 0
+version: ok (0.1.0 in Cargo.toml; the Python wheel derives it through maturin; @hyper-light/slates and its 7 platform packages pinned to it)
+toolchain: every pin names 1.98.1
+capabilities: ok (15 rows, each proof a runnable test)
+== xtask check exit 0
+== clippy exit 0
+ok lines 38
+== suites exit 0
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 220 filtered out; finished in 0.49s
+== server config exit 0
+runner windows-11-arm, 4 CPUs, shards 2, Thu Nov 12 14:45:46 UTC 2026
+== quiet round=1 arm=main at 14:45:46
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 615 ns, idle window at boot 61500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3028 ms with no client
+  provision.spinning_1_cpu_2_shards: [2312, 2351, 2398] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 4 (wake 798 ns), shard 1: 3 (wake 733 ns)
+  provision.spinning_1_p99: 34300 ns [31100, 47000] over 3 runs: [47000, 34300, 31100]
+  provision.spinning_8_cpu_2_shards: [3439, 3595, 3611] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 2 (wake 1724 ns), shard 1: 3 (wake 1628 ns)
+  provision.spinning_8_p99: 510600 ns [507500, 518800] over 3 runs: [510600, 507500, 518800]
+  provision.spinning_64_cpu_2_shards: [3423, 3427, 3356] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 2023 ns), shard 1: 0 (wake 2368 ns)
+  provision.paced_1_1000us_cpu_2_shards: [66, 72, 78] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1373 (wake 6765 ns), shard 1: 1170 (wake 4881 ns)
+  provision.parked_1_p99: 447800 ns [445600, 501900] over 3 runs: [445600, 447800, 501900]
+== exit 0
+== quiet round=1 arm=x100 at 14:46:38
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8705 ns, idle window at boot 870500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3020 ms with no client
+  provision.spinning_1_cpu_2_shards: [2191, 2373, 2472] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 8799 ns), shard 1: 1 (wake 8784 ns)
+  provision.spinning_1_p99: 34000 ns [32700, 37800] over 3 runs: [37800, 32700, 34000]
+  provision.spinning_8_cpu_2_shards: [3336, 3493, 3491] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 8799 ns), shard 1: 0 (wake 9070 ns)
+  provision.spinning_8_p99: 520900 ns [517100, 534900] over 3 runs: [534900, 517100, 520900]
+  provision.spinning_64_cpu_2_shards: [3394, 3397, 3461] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 8799 ns), shard 1: 0 (wake 9760 ns)
+  provision.paced_1_1000us_cpu_2_shards: [143, 149, 209] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1408 (wake 16752 ns), shard 1: 1162 (wake 16366 ns)
+  provision.parked_1_p99: 477800 ns [444600, 509900] over 3 runs: [444600, 509900, 477800]
+== exit 0
+== quiet round=1 arm=rule at 14:47:28
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 9325 ns, idle window at boot 932500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3032 ms with no client
+  provision.spinning_1_cpu_2_shards: [2359, 2379, 2425] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 10287 ns), shard 1: 1 (wake 10663 ns)
+  provision.spinning_1_p99: 33800 ns [32100, 40400] over 3 runs: [40400, 33800, 32100]
+  provision.spinning_8_cpu_2_shards: [3567, 3621, 3456] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 10287 ns), shard 1: 0 (wake 13237 ns)
+  provision.spinning_8_p99: 528300 ns [516800, 528600] over 3 runs: [528600, 516800, 528300]
+  provision.spinning_64_cpu_2_shards: [3437, 3361, 3442] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 10287 ns), shard 1: 0 (wake 26258 ns)
+  provision.paced_1_1000us_cpu_2_shards: [270, 281, 261] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1413 (wake 27431 ns), shard 1: 1173 (wake 24707 ns)
+  provision.parked_1_p99: 647300 ns [497600, 674500] over 3 runs: [674500, 647300, 497600]
+== exit 0
+== quiet round=2 arm=main at 14:48:19
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 628 ns, idle window at boot 62800 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3028 ms with no client
+  provision.spinning_1_cpu_2_shards: [2167, 2314, 3076] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 5 (wake 629 ns), shard 1: 3 (wake 628 ns)
+  provision.spinning_1_p99: 33600 ns [31800, 40000] over 3 runs: [40000, 33600, 31800]
+  provision.spinning_8_cpu_2_shards: [3175, 3460, 3636] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 18 (wake 677 ns), shard 1: 17 (wake 673 ns)
+  provision.spinning_8_p99: 510900 ns [507900, 522700] over 3 runs: [522700, 507900, 510900]
+  provision.spinning_64_cpu_2_shards: [3315, 3357, 3352] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 1 (wake 707 ns), shard 1: 0 (wake 689 ns)
+  provision.paced_1_1000us_cpu_2_shards: [37, 33, 31] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1878 (wake 794 ns), shard 1: 1576 (wake 758 ns)
+  provision.parked_1_p99: 581200 ns [559000, 637400] over 3 runs: [637400, 559000, 581200]
+== exit 0
+== quiet round=2 arm=x100 at 14:49:11
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 33832 ns, idle window at boot 3383200 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 10 thousandths of a core over 3014 ms with no client
+  provision.spinning_1_cpu_2_shards: [2191, 2460, 2526] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 33831 ns), shard 1: 1 (wake 33831 ns)
+  provision.spinning_1_p99: 33100 ns [31500, 42200] over 3 runs: [42200, 31500, 33100]
+  provision.spinning_8_cpu_2_shards: [3469, 3522, 3594] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 33831 ns), shard 1: 0 (wake 33831 ns)
+  provision.spinning_8_p99: 523400 ns [522200, 528600] over 3 runs: [523400, 522200, 528600]
+  provision.spinning_64_cpu_2_shards: [3477, 3390, 3298] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 33831 ns), shard 1: 0 (wake 33834 ns)
+  provision.paced_1_1000us_cpu_2_shards: [381, 276, 361] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1411 (wake 33810 ns), shard 1: 1164 (wake 33818 ns)
+  provision.parked_1_p99: 480300 ns [463800, 485600] over 3 runs: [485600, 463800, 480300]
+== exit 0
+== quiet round=2 arm=rule at 14:50:02
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 9130 ns, idle window at boot 913000 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3019 ms with no client
+  provision.spinning_1_cpu_2_shards: [2040, 2320, 2349] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 11183 ns), shard 1: 1 (wake 12141 ns)
+  provision.spinning_1_p99: 41700 ns [39800, 125300] over 3 runs: [125300, 41700, 39800]
+  provision.spinning_8_cpu_2_shards: [3276, 3268, 3497] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 11183 ns), shard 1: 0 (wake 15114 ns)
+  provision.spinning_8_p99: 703000 ns [518400, 747500] over 3 runs: [703000, 747500, 518400]
+  provision.spinning_64_cpu_2_shards: [3471, 3511, 3357] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 11183 ns), shard 1: 0 (wake 44989 ns)
+  provision.paced_1_1000us_cpu_2_shards: [376, 323, 301] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1394 (wake 24437 ns), shard 1: 1164 (wake 29054 ns)
+  provision.parked_1_p99: 591000 ns [476900, 632400] over 3 runs: [591000, 632400, 476900]
+== exit 0
+== quiet round=3 arm=main at 14:50:53
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 595 ns, idle window at boot 59500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3015 ms with no client
+  provision.spinning_1_cpu_2_shards: [2221, 2392, 2386] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 3 (wake 709 ns), shard 1: 3 (wake 674 ns)
+  provision.spinning_1_p99: 32000 ns [29600, 40400] over 3 runs: [40400, 32000, 29600]
+  provision.spinning_8_cpu_2_shards: [3614, 3559, 3368] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 4 (wake 1361 ns), shard 1: 4 (wake 1347 ns)
+  provision.spinning_8_p99: 495100 ns [494400, 497600] over 3 runs: [495100, 497600, 494400]
+  provision.spinning_64_cpu_2_shards: [3505, 3447, 3417] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1613 ns), shard 1: 0 (wake 1845 ns)
+  provision.paced_1_1000us_cpu_2_shards: [62, 57, 51] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1409 (wake 4254 ns), shard 1: 1175 (wake 3218 ns)
+  provision.parked_1_p99: 599700 ns [576300, 605900] over 3 runs: [605900, 599700, 576300]
+== exit 0
+== quiet round=3 arm=x100 at 14:51:44
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 9012 ns, idle window at boot 901200 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3013 ms with no client
+  provision.spinning_1_cpu_2_shards: [2355, 2919, 3115] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 11334 ns), shard 1: 1 (wake 10785 ns)
+  provision.spinning_1_p99: 32600 ns [30300, 36300] over 3 runs: [36300, 32600, 30300]
+  provision.spinning_8_cpu_2_shards: [3566, 3451, 3722] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 11334 ns), shard 1: 0 (wake 12187 ns)
+  provision.spinning_8_p99: 507900 ns [507100, 512100] over 3 runs: [507100, 507900, 512100]
+  provision.spinning_64_cpu_2_shards: [3484, 3439, 3463] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 11334 ns), shard 1: 0 (wake 48107 ns)
+  provision.paced_1_1000us_cpu_2_shards: [394, 279, 256] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1400 (wake 29682 ns), shard 1: 1162 (wake 23947 ns)
+  provision.parked_1_p99: 461100 ns [458600, 490700] over 3 runs: [490700, 461100, 458600]
+== exit 0
+== quiet round=3 arm=rule at 14:52:34
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 9141 ns, idle window at boot 914100 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 10 thousandths of a core over 3021 ms with no client
+  provision.spinning_1_cpu_2_shards: [2207, 2569, 2832] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 15111 ns), shard 1: 1 (wake 10541 ns)
+  provision.spinning_1_p99: 31100 ns [30300, 57900] over 3 runs: [57900, 31100, 30300]
+  provision.spinning_8_cpu_2_shards: [3506, 3549, 3515] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 15111 ns), shard 1: 0 (wake 10637 ns)
+  provision.spinning_8_p99: 516800 ns [511200, 534600] over 3 runs: [511200, 516800, 534600]
+  provision.spinning_64_cpu_2_shards: [3514, 3480, 3442] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 15111 ns), shard 1: 0 (wake 33495 ns)
+  provision.paced_1_1000us_cpu_2_shards: [322, 302, 267] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1426 (wake 20215 ns), shard 1: 1165 (wake 20437 ns)
+  provision.parked_1_p99: 452900 ns [438300, 462500] over 3 runs: [452900, 438300, 462500]
+== exit 0
+== busy round=1 arm=main at 14:53:27
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 1077 ns, idle window at boot 107700 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 20 thousandths of a core over 3071 ms with no client
+  provision.spinning_1_cpu_2_shards: [61, 144, 184] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 281 (wake 34138 ns), shard 1: 281 (wake 34753 ns)
+  provision.spinning_1_p99: 46242300 ns [44962500, 48113200] over 3 runs: [48113200, 46242300, 44962500]
+  provision.spinning_8_cpu_2_shards: [277, 343, 358] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 39 (wake 73384 ns), shard 1: 39 (wake 74591 ns)
+  provision.spinning_8_p99: 51716500 ns [49780800, 62950900] over 3 runs: [49780800, 51716500, 62950900]
+  provision.spinning_64_cpu_2_shards: [584, 590, 609] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 5 (wake 122870 ns), shard 1: 5 (wake 125148 ns)
+  provision.paced_1_1000us_cpu_2_shards: [420, 418, 432] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 756 (wake 148115 ns), shard 1: 656 (wake 146162 ns)
+  provision.parked_1_p99: 107906800 ns [103522100, 110582800] over 3 runs: [107906800, 110582800, 103522100]
+== exit 1
+== busy round=1 arm=x100 at 15:01:27
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 7579 ns, idle window at boot 757900 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3032 ms with no client
+  provision.spinning_1_cpu_2_shards: [831, 802, 692] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 919403 ns), shard 1: 0 (wake 562690 ns)
+  provision.spinning_1_p99: 100300 ns [73200, 14462300] over 3 runs: [100300, 73200, 14462300]
+  provision.spinning_8_cpu_2_shards: [811, 824, 796] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1090680 ns), shard 1: 0 (wake 1134709 ns)
+  provision.spinning_8_p99: 46396500 ns [46012300, 46994800] over 3 runs: [46994800, 46012300, 46396500]
+  provision.spinning_64_cpu_2_shards: [898, 921, 906] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1774364 ns), shard 1: 0 (wake 2013423 ns)
+  provision.paced_1_1000us_cpu_2_shards: [745, 744, 742] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 0 (wake 2057697 ns), shard 1: 0 (wake 2013423 ns)
+  provision.parked_1_p99: 129024700 ns [106461800, 137693200] over 3 runs: [137693200, 129024700, 106461800]
+== exit 1
+== busy round=1 arm=rule at 15:05:13
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 6685 ns, idle window at boot 668500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 10 thousandths of a core over 3058 ms with no client
+  provision.spinning_1_cpu_2_shards: [749, 717, 803] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 1370997 ns), shard 1: 0 (wake 664693 ns)
+  provision.spinning_1_p99: 112500 ns [39900, 142600] over 3 runs: [112500, 142600, 39900]
+  provision.spinning_8_cpu_2_shards: [863, 840, 834] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1559305 ns), shard 1: 0 (wake 1556535 ns)
+  provision.spinning_8_p99: 45993600 ns [44560900, 46469600] over 3 runs: [44560900, 46469600, 45993600]
+  provision.spinning_64_cpu_2_shards: [896, 883, 889] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1559305 ns), shard 1: 0 (wake 2050239 ns)
+  provision.paced_1_1000us_cpu_2_shards: [724, 741, 739] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 1 (wake 2151560 ns), shard 1: 0 (wake 2050239 ns)
+  provision.parked_1_p99: 141706900 ns [139176600, 149598900] over 3 runs: [139176600, 141706900, 149598900]
+== exit 1
+== busy round=2 arm=main at 15:09:03
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 889 ns, idle window at boot 88900 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3039 ms with no client
+  provision.spinning_1_cpu_2_shards: [500, 565, 636] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 6 (wake 177446 ns), shard 1: 6 (wake 167205 ns)
+  provision.spinning_1_p99: 101800 ns [88700, 22126000] over 3 runs: [22126000, 101800, 88700]
+  provision.spinning_8_cpu_2_shards: [813, 814, 804] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 293353 ns), shard 1: 0 (wake 401795 ns)
+  provision.spinning_8_p99: 46218100 ns [46127100, 47226700] over 3 runs: [47226700, 46127100, 46218100]
+  provision.spinning_64_cpu_2_shards: [872, 896, 876] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 865593 ns), shard 1: 0 (wake 891897 ns)
+  provision.paced_1_1000us_cpu_2_shards: [730, 735, 725] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 13 (wake 972472 ns), shard 1: 8 (wake 947928 ns)
+  provision.parked_1_p99: 116514900 ns [110541600, 136974500] over 3 runs: [110541600, 136974500, 116514900]
+== exit 1
+== busy round=2 arm=x100 at 15:13:05
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 7129 ns, idle window at boot 712900 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3032 ms with no client
+  provision.spinning_1_cpu_2_shards: [779, 556, 831] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 1499148 ns), shard 1: 0 (wake 997735 ns)
+  provision.spinning_1_p99: 100200 ns [75900, 418100] over 3 runs: [100200, 75900, 418100]
+  provision.spinning_8_cpu_2_shards: [834, 834, 801] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1643328 ns), shard 1: 0 (wake 1802788 ns)
+  provision.spinning_8_p99: 45389900 ns [43793200, 46581500] over 3 runs: [45389900, 43793200, 46581500]
+  provision.spinning_64_cpu_2_shards: [880, 880, 912] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1885994 ns), shard 1: 0 (wake 2915454 ns)
+  provision.paced_1_1000us_cpu_2_shards: [754, 740, 727] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 2 (wake 2232205 ns), shard 1: 0 (wake 2915454 ns)
+  provision.parked_1_p99: 136383200 ns [108727400, 136926000] over 3 runs: [136383200, 136926000, 108727400]
+== exit 1
+== busy round=2 arm=rule at 15:17:06
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 7511 ns, idle window at boot 751100 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3037 ms with no client
+  provision.spinning_1_cpu_2_shards: [639, 731, 769] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 482631 ns), shard 1: 1 (wake 318353 ns)
+  provision.spinning_1_p99: 79000 ns [73600, 90000] over 3 runs: [79000, 90000, 73600]
+  provision.spinning_8_cpu_2_shards: [837, 815, 797] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1024476 ns), shard 1: 0 (wake 1303028 ns)
+  provision.spinning_8_p99: 47899100 ns [46326100, 49085500] over 3 runs: [47899100, 46326100, 49085500]
+  provision.spinning_64_cpu_2_shards: [824, 884, 930] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1879109 ns), shard 1: 0 (wake 2204155 ns)
+  provision.paced_1_1000us_cpu_2_shards: [738, 735, 751] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 0 (wake 1943217 ns), shard 1: 0 (wake 2204155 ns)
+  provision.parked_1_p99: 116061300 ns [90434100, 146536600] over 3 runs: [90434100, 116061300, 146536600]
+== exit 1
+== busy round=3 arm=main at 15:21:16
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 615 ns, idle window at boot 61500 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3048 ms with no client
+  provision.spinning_1_cpu_2_shards: [450, 742, 738] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 7 (wake 185915 ns), shard 1: 6 (wake 188187 ns)
+  provision.spinning_1_p99: 24252200 ns [133200, 31880300] over 3 runs: [31880300, 24252200, 133200]
+  provision.spinning_8_cpu_2_shards: [812, 829, 766] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 401969 ns), shard 1: 0 (wake 418531 ns)
+  provision.spinning_8_p99: 46518000 ns [41598400, 46604300] over 3 runs: [46604300, 41598400, 46518000]
+  provision.spinning_64_cpu_2_shards: [876, 880, 876] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 878002 ns), shard 1: 0 (wake 897728 ns)
+  provision.paced_1_1000us_cpu_2_shards: [736, 730, 723] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 14 (wake 978710 ns), shard 1: 12 (wake 953969 ns)
+  provision.parked_1_p99: 114515200 ns [110563500, 127162500] over 3 runs: [114515200, 127162500, 110563500]
+== exit 1
+== busy round=3 arm=x100 at 15:25:21
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 7088 ns, idle window at boot 708800 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3048 ms with no client
+  provision.spinning_1_cpu_2_shards: [717, 711, 661] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 642542 ns), shard 1: 1 (wake 565726 ns)
+  provision.spinning_1_p99: 95900 ns [73600, 96500] over 3 runs: [95900, 73600, 96500]
+  provision.spinning_8_cpu_2_shards: [870, 837, 819] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1016636 ns), shard 1: 0 (wake 1204328 ns)
+  provision.spinning_8_p99: 46268300 ns [40868800, 46710200] over 3 runs: [40868800, 46268300, 46710200]
+  provision.spinning_64_cpu_2_shards: [893, 913, 912] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1640647 ns), shard 1: 0 (wake 2035778 ns)
+  provision.paced_1_1000us_cpu_2_shards: [735, 725, 745] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 2 (wake 1874864 ns), shard 1: 0 (wake 2143757 ns)
+  provision.parked_1_p99: 155381900 ns [152469600, 159982500] over 3 runs: [152469600, 155381900, 159982500]
+== exit 1
+== busy round=3 arm=rule at 15:29:07
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 7166 ns, idle window at boot 716600 ns, floor 50000 ns
+  provision.rest_cpu_2_shards: 5 thousandths of a core over 3053 ms with no client
+  provision.spinning_1_cpu_2_shards: [819, 561, 773] thousandths of a core per run (clients included)
+  provision.spinning_1 parks per 1000 creates: shard 0: 1 (wake 575985 ns), shard 1: 1 (wake 559955 ns)
+  provision.spinning_1_p99: 141100 ns [108000, 18762400] over 3 runs: [18762400, 108000, 141100]
+  provision.spinning_8_cpu_2_shards: [812, 819, 844] thousandths of a core per run (clients included)
+  provision.spinning_8 parks per 1000 creates: shard 0: 0 (wake 1255783 ns), shard 1: 0 (wake 1170573 ns)
+  provision.spinning_8_p99: 45597800 ns [43854300, 45879500] over 3 runs: [45597800, 45879500, 43854300]
+  provision.spinning_64_cpu_2_shards: [890, 887, 877] thousandths of a core per run (clients included)
+  provision.spinning_64 parks per 1000 creates: shard 0: 0 (wake 1631045 ns), shard 1: 0 (wake 2289926 ns)
+  provision.paced_1_1000us_cpu_2_shards: [745, 732, 738] thousandths of a core per run (clients included)
+  provision.parked_1 parks per 1000 creates: shard 0: 2 (wake 1833443 ns), shard 1: 0 (wake 2392263 ns)
+  provision.parked_1_p99: 122558300 ns [109016500, 133441000] over 3 runs: [122558300, 109016500, 133441000]
+== exit 1
