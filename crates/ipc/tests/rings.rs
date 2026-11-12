@@ -200,6 +200,168 @@ fn a_client_learns_its_wake_from_the_parks_a_reply_ended() {
   );
 }
 
+/// Format: the request payload that asks the racing test's daemon to hold its reply until the client is asleep.
+const ASLEEP: &[u8] = b"asleep";
+/// Format: the request payload that asks it to reply the instant the client's parked flag rises.
+const RACE: &[u8] = b"race";
+/// Shape: wakes the sleepers must teach before the race: ten times the estimate's window of sixteen, so the
+/// published 200 µs seed is left with under a hundred-thousandth of its weight, a few nanoseconds.
+const SLEEPER_SAMPLES: u64 = 160;
+/// Shape: the sleeper phase's cap on trips: four times its samples, room for the trips a slow wake loses.
+const SLEEPER_TRIP_CAP: u64 = 4 * SLEEPER_SAMPLES;
+/// Shape: parks the racing phase drives with the reply sent the instant the client's flag rises. On CI's Windows
+/// runners the reply lands between the client's re-check and its block in 0–18 of 4,096 parks, and 0–26 of them were
+/// learned as handoffs on main (`diag-liveness-client-2`), so the phase drives four times that.
+const RACING_PARKS: u64 = 16_384;
+/// Shape: the racing phase's cap on trips: a racing trip may take its reply at the park's re-check and never
+/// park, so the phase runs until it has parked [`RACING_PARKS`] times, within this many trips.
+const RACING_TRIP_CAP: u64 = 4 * RACING_PARKS;
+/// Shape: the racing phase's wall bound, the reply deadline's five seconds: about a second on CI's quiet runners
+/// (60 µs a trip), while on a machine so loaded that each wake takes milliseconds (load 190, this Mac) the phase
+/// stops early, and there no reply races the client anyway.
+const RACING_WALL: Duration = Duration::from_nanos(REPLY_DEADLINE_NS);
+/// Shape: a microsecond, between the two figures a park's wake can read. A sleeper woken takes 2.0–3.3 µs on
+/// macOS (the boot probe, 2026-09-25) and 6–9 µs on CI's Windows runners (2026-11-06), more under load, never
+/// less; a reply sent before the client blocked is an on-CPU handoff of 0.1–0.8 µs (A-223, jupiter and CI).
+const SLEEPER_WAKE_FLOOR_NS: u64 = 1_000;
+
+/// The one wake a client's estimate learned between two reads of it, from the mean before and after
+/// (`WakeEstimate::record`: the scaled sum loses a `2^shift`-th of itself and gains the wake), to within the
+/// `2^shift` nanoseconds the mean's truncation hides.
+fn learned_wake_ns(mean_before_ns: u64, mean_after_ns: u64) -> i128 {
+  ((i128::from(mean_after_ns) - i128::from(mean_before_ns)) << SPIN_SHIFT)
+    + i128::from(mean_before_ns)
+}
+
+/// The racing test's daemon: replies to each request [`ASLEEP_AFTER`] after the client raised its parked flag
+/// ([`ASLEEP`]), or the instant the flag rises, spinning on it ([`RACE`]), until an empty request ends it. A
+/// client spinning for nothing raises its flag on every trip, so every trip has a flag to wait for.
+fn reply_asleep_or_racing(mut daemon: DaemonEnd) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || {
+    loop {
+      let request = take_within(|| daemon.try_take().unwrap(), "a request");
+      if request.payload.is_empty() {
+        return;
+      }
+      let racing = request.payload == RACE;
+      let flagged = Instant::now();
+      while daemon
+        .region()
+        .client_parked()
+        .unwrap()
+        .load(Ordering::Acquire)
+        == 0
+      {
+        assert!(
+          flagged.elapsed() < Duration::from_nanos(REPLY_DEADLINE_NS),
+          "the client did not arm its wait"
+        );
+        if racing {
+          std::hint::spin_loop();
+        } else {
+          std::thread::yield_now();
+        }
+      }
+      if !racing {
+        let raised = Instant::now();
+        while raised.elapsed() < ASLEEP_AFTER {
+          std::thread::yield_now();
+        }
+      }
+      daemon
+        .reply(&Slot::inline(request.request, b"done").unwrap())
+        .unwrap();
+    }
+  })
+}
+
+/// §4.7, §4.3 (A-223, sibling (d)): a park whose reply was sent before the client blocked never slept, so it
+/// teaches the estimate nothing, however its stamp falls. Do: a client that always parks (a chosen zero spin)
+/// against a daemon that first holds each reply until the client is asleep, until 160 wakes are learned, then
+/// replies the instant the client's parked flag rises, until the client has parked 16,384 more times (or five
+/// seconds pass); read back
+/// each wake a racing trip taught from the estimate's move. Expect: the sleepers taught the estimate (the
+/// non-vacuity count), and no racing trip taught a wake under a microsecond. A run in which no race reached the
+/// client's wait (no park that taught nothing or taught a handoff: a machine too loaded for the daemon to reply
+/// first) skips loudly. Before A-223's switch count reached the client, Windows
+/// learned each such race as an on-CPU handoff, since its auto-reset Event carries a signal set before the wait
+/// and the daemon cannot confirm a sleeper there; Linux and macOS are held by the daemon's confirmation.
+#[test]
+fn a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing() {
+  let region = ClientRegion::create(
+    &format!("slates-ipc-rings-race-{}", std::process::id()),
+    11,
+    0,
+    geometry(),
+  )
+  .unwrap();
+  let (handoff, len) = region.handoff().unwrap();
+  let server = reply_asleep_or_racing(DaemonEnd::new(region));
+  let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+  client.set_spin_ns(Some(0));
+  let mut trip = 0;
+  let mut round_trip = |client: &mut ClientEnd, payload: &[u8]| {
+    trip += 1;
+    client.send(&Slot::inline(trip, payload).unwrap()).unwrap();
+    let reply = client.wait(Some(REPLY_DEADLINE_NS)).unwrap();
+    assert_eq!(reply.request, trip);
+  };
+  let mut sleeper_trips = 0;
+  while client.wake_samples() < SLEEPER_SAMPLES && sleeper_trips < SLEEPER_TRIP_CAP {
+    round_trip(&mut client, ASLEEP);
+    sleeper_trips += 1;
+  }
+  let (slept_samples, slept_ns) = (client.wake_samples(), client.wake_estimate_ns());
+  let (parks_before_racing, samples_before_racing) = (client.park_ratio().0, client.wake_samples());
+  let (mut racing_trips, mut handoffs, mut unread) = (0, Vec::new(), 0);
+  let racing_started = Instant::now();
+  while client.park_ratio().0 - parks_before_racing < RACING_PARKS
+    && racing_trips < RACING_TRIP_CAP
+    && racing_started.elapsed() < RACING_WALL
+  {
+    let (samples_before, mean_before) = (client.wake_samples(), client.wake_estimate_ns());
+    round_trip(&mut client, RACE);
+    racing_trips += 1;
+    match client.wake_samples() - samples_before {
+      0 => {}
+      1 => {
+        let learned = learned_wake_ns(mean_before, client.wake_estimate_ns());
+        if learned < i128::from(SLEEPER_WAKE_FLOOR_NS) {
+          handoffs.push(learned);
+        }
+      }
+      _ => unread += 1,
+    }
+  }
+  client.send(&Slot::inline(0, &[]).unwrap()).unwrap();
+  server.join().unwrap();
+  let racing_parks = client.park_ratio().0 - parks_before_racing;
+  let untaught = racing_parks - (client.wake_samples() - samples_before_racing);
+  eprintln!(
+    "sleepers: {slept_samples} samples in {sleeper_trips} trips, estimate {slept_ns} ns; racing: {racing_parks} \
+     parks in {racing_trips} trips, {untaught} taught nothing, {} taught a handoff {handoffs:?} ns, {unread} trips \
+     taught two, estimate {} ns",
+    handoffs.len(),
+    client.wake_estimate_ns()
+  );
+  assert!(
+    slept_samples >= SLEEPER_SAMPLES,
+    "the sleepers taught the estimate: {slept_samples} samples in {sleeper_trips} trips, {slept_ns} ns"
+  );
+  if untaught == 0 && handoffs.is_empty() {
+    eprintln!(
+      "SKIP (loud): no racing reply reached the client's wait in {racing_parks} parks (every park slept and \
+       taught a sleeper's wake), so nothing was judged"
+    );
+    return;
+  }
+  assert!(
+    handoffs.is_empty(),
+    "{} racing parks taught a wake under {SLEEPER_WAKE_FLOOR_NS} ns: {handoffs:?} ns",
+    handoffs.len()
+  );
+}
+
 /// The ring's credit: with every slot holding an untaken request the next send refuses
 /// `RingFull`; once the daemon takes one, the send goes through; nothing was dropped.
 #[test]
