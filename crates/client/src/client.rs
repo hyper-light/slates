@@ -1218,6 +1218,12 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// The sync wait's wake estimate now, nanoseconds, and the parked wakes that taught it: what the client spins
+  /// for before it parks, seeded with the daemon's published window (`ClientEnd::wake_estimate_ns`).
+  pub fn wake_estimate(&self) -> (u64, u64) {
+    (self.end.wake_estimate_ns(), self.end.wake_samples())
+  }
+
   /// The client's ring slots: the requests it may hold in flight, and half the completion records the daemon keeps
   /// for it unacknowledged (§4.9; the server's `completion_bound` is twice this).
   pub fn ring_slots(&self) -> usize {
