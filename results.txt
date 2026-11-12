@@ -1,2 +1,8 @@
 tested d8350621516b9ddce74f9a274b1f5c722122f916 on macos-latest
 build exit 0
+wheel exit 0
+python exit 0
+Connecting to an instance with no daemon raises SlatesError carrying the typed refusal — the ... ok
+The extension loads and exposes the Client class, the SlatesError exception, and a version. ... ok
+Ran 6 tests in 44.616s
+OK
