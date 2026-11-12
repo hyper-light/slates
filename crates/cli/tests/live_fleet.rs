@@ -2149,7 +2149,15 @@ fn restart_flow(take_over: bool) {
     );
     return;
   }
-  let mut fleet = start_fleet_as("live-restart", "anchor");
+  // Each flow its own fleet name: instance names are `{tag}-{node}-{pid}`, and the two tests share one process, so a
+  // shared tag gave both flows the same daemons' names (each refused the other's, at `run_ready`, once the takeover
+  // flow ran beside the restart flow).
+  let tag = if take_over {
+    "live-restart-takeover"
+  } else {
+    "live-restart"
+  };
+  let mut fleet = start_fleet_as(tag, "anchor");
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
   let candidates: Vec<usize> = (0..fleet.instances.len())

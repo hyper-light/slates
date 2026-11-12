@@ -7088,7 +7088,11 @@ mod tests {
         .and_then(|acceptor| acceptor.moved_from());
       // The checkpoint, before the move.
       let checkpoint = crate::content_holder::held_image(state);
-      crate::content_holder::held_committed(state, crate::content_holder::whole_of(&checkpoint), true);
+      crate::content_holder::held_committed(
+        state,
+        crate::content_holder::whole_of(&checkpoint),
+        true,
+      );
       let mut journal: std::collections::BTreeMap<_, _> = checkpoint
         .into_iter()
         .map(|piece| (piece.key, piece.bytes))
@@ -7135,7 +7139,10 @@ mod tests {
       let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
       (before_move, in_delta, restored_from, departed, page)
     });
-    assert_eq!(before_move, None, "the checkpoint was taken before the move");
+    assert_eq!(
+      before_move, None,
+      "the checkpoint was taken before the move"
+    );
     assert!(in_delta > 0, "the delta carried the moved register's piece");
     assert_eq!(
       restored_from,
