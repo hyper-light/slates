@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
+> `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
+> Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
+> kernel 7.3 a process spawn while the page is dirty does that: 6 attempts of 6 with a spawn in the window. That
+> write-back is fresh and rightly applied, so the run tested nothing. The daemon now counts `fuse.writebacks_applied`.
+> The test reads it around each store and retries an attempt whose precondition did not hold, up to 6, then fails
+> naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
+> `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
+
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
@@ -963,6 +972,20 @@
 > list and the analyzer are under `~/.cache/slates-agents-scratch/fixtures/rungs11-a228/` on adacachy
 > (`r3k-clean-a228.log`, `.samples`, `.units`, `analyze.py`).
 
+> **A capped unit on adacachy can be frozen: check before reading a stall as the product's (2026-11-09, fixtures).** A-228
+> step 5's two 3,000-client clean rungs on main `1ed67337` (`CPUWeight=1`, `capped3.sh` unit, 100 ms sampler) ran into
+> their 1,800 s bound having done 236 and 191 of 3,000 agents, and are recorded invalid (BENCHMARKS, "A-228 step 5"). In
+> about 98% of the samples every shard thread of all four daemons was in `do_freezer_trap`, a cgroup freezer's; the unit
+> used 127 s and 124 s of CPU over about 1,800 s at `cpu.pressure` about 0, and the run-queue wait per timeslice (0.11
+> ms) matched a healthy rung's (0.10 ms). What looked like the product's fault was the freezer's: a council RTT tail of
+> 46 s, a root RTT tail of 70 s, a session `pto` of 54 s on loopback, 18,645 `lease.refused.unconfirmed` on the primary
+> (855 on `rungs8/r3k-clean2`) and a replica whose status did not answer. Its own and every ancestor's `cgroup.freeze`
+> read 0 whenever looked at, so a measurement on adacachy reads the threads' `wchan` (or samples `cgroup.events`) through
+> the run before charging a stall to slates. Whether kiln's headroom pacing should freeze `app.slice` units is Ada's call.
+> The 0 wedged, starved, spinning and lapsed lines of both runs say nothing about A-228: a frozen fleet freezes its
+> watchdog too. Files: `~/.cache/slates-agents-scratch/fixtures/rungs12-a228/` on adacachy (`.log`, `.samples`, `.mon`,
+> `.stall`, `starve.py`, `wake.py`).
+
 > **A starved shard was judged wedged (found 2026-11-07 by fixtures, fixed 2026-11-08, A-228).** A shard held off its CPU
 > shows no CPU progress, as a blocked one does, so the watchdog withheld the beat and the anchor killed a live daemon. The
 > watchdog now asks the scheduler; a shard waiting for a CPU is `Starved` and goes on beating (§4.14 status). Linux reads
@@ -1231,7 +1254,9 @@
 >   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
 >   (with A-257's whole replay, state A under load on main 80be552a: unsliced 198 spinning lines and 203 restarts for 5
 >   kills, no restart whole; sliced 0 lines, every restart read back whole; the first CPU figures here measured fenced
->   replays and are withdrawn, the comparison owed); the records' sort computes each key once (it recomputed the lineage depth,
+>   replays and were withdrawn; measured again 2026-11-09, shard 0's recovery CPU sliced is within 10% of unsliced in
+>   every 5-restart comparison, +1.5% to +1.9% pooled at 100 works and −12.7% at 1,000, and a takeover is not
+>   stretched: BENCHMARKS, "Recovery sliced against unsliced"); the records' sort computes each key once (it recomputed the lineage depth,
 >   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
 >   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
 >   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over
@@ -5901,8 +5926,10 @@ a holder answers from its own records with no routing filter, and the successor 
 line of its authority, or of the owner an install moved that authority from (shape (i): 0 lost, none of the asker's own
 objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
 "the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
-**Owed, after raft-7 (A-270) lands:** the held image carrying `Acceptor::moved_from`, with the next image version and an
-old image refused typed; until then a warm restart forgets an earlier move. (d), the process test, is built.
+The held image carries `Acceptor::moved_from` as the acceptor's one encoding (`PersistedAcceptor`), at image version
+25 and delta version 8 (after conformance-14's A-262; raft-7 takes the numbers after), so a warm restart keeps an
+earlier move; an older image or delta is refused by its version, never read as "moved from none". (d), the process
+test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

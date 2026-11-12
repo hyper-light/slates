@@ -51,6 +51,31 @@ step lands with the writer (`agents/release-wincov-lib`).
   warnings were fixed meanwhile. `cargo xwin clippy --workspace --examples -D warnings` is clean, and the Windows lanes
   now lint `slates-cli` and `slates-land` with `--all-targets`, so the next such example fails CI.
 
+## The Windows fleet step: a deadline for each test (2026-11-09)
+
+Both Windows lanes run `crates/server/tests/fleet.rs` through `xtask/src/bin/each_test.rs`. Each test runs alone, in a
+process of its own, with a 240 s deadline, so a hung test fails by name with its last 400 lines kept. Before this, in
+nightly run 42609672766, arm64's `a_learner_fetches_the_councils_committed_configuration_over_the_transport` (1.7–2.3 s when
+it passes) sat silent for 409 s, and the step's 20-minute limit cut the job before libtest said which test it was.
+
+| measured | x86_64 | arm64 | source |
+|---|---|---|---|
+| tests run | 110 | 110 | push run 42528348387 (2026-11-08) and diag-release-8 (2026-11-09) |
+| slowest passing test | 93.6 s | 109.3 s (107.9 s through the runner) | both |
+| median test | 3.8 s, 4.6 s through the runner | 3.8 s, 4.5 s through the runner | both |
+| passing tests' whole, libtest in one process | 770.5 s | 794.8 s | 42528348387 |
+| passing tests' whole, a process each | 846.8 s | 872.3 s | diag-release-8 |
+| a forced hang (an ignored diag-only test sleeping 600 s) | `TIMED OUT` at 240.0 s, by name | `TIMED OUT` at 240.1 s, by name | diag-release-8 |
+
+- **Deadline:** 2 × max(the slowest passing test, 109.3 s; the suite's own longest wait, `SLATES_TEST_FLEET_DEADLINE_SECS` =
+  120 s) = 240 s. A slow test passes, a test at its own bound reports its own assertion first, and a silent one is killed.
+- **Step limit:** ⌈(1.5 × 872.3 s + 240 s for one killed test + 300 s to build the runner and the test binary) / 60⌉ = 31
+  minutes. The job's ceiling is GitHub's default 360 minutes, so the suite is one step on each runner.
+- **Cost:** a process per test adds about 0.7 s a test (846.8 s against 770.5 s on x86_64).
+- **Seen while measuring:** in push run 42528348387, arm64's
+  `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` failed (`fleet.rs:4990`), and passed in both diag
+  runs; an intermittent failure, not a hang.
+
 ## The gaps, and the cheapest lane for each
 
 1. **Five CLI suites run nowhere** (every test skips for `SLATES_TEST_CLI`, which only the CLI steps set):
