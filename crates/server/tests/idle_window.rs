@@ -36,11 +36,8 @@ const SHIFT: u32 = 4;
 const PACE: Duration = Duration::from_millis(1);
 /// Shape: paced requests the test sends at least: four weighting windows, so the estimate has forgotten its prior.
 const LEAST_REQUESTS: usize = 4 << SHIFT;
-/// Shape: paced requests the test sends at most, waiting for the spinners' queueing to show in an estimate.
+/// Shape: paced requests the test sends at most, waiting for the load to show in an estimate.
 const MOST_REQUESTS: usize = 64 << SHIFT;
-/// Shape: how far past the boot prior some shard's estimate must rise before the run proves anything: an estimate
-/// that stayed near it saw no queueing (the non-vacuity bound).
-const QUEUED_FACTOR: u64 = 10;
 /// Shape: spinning threads per logical CPU, as the window rule's A/B loads a machine (A-223).
 const SPINNERS_PER_CPU: usize = 2;
 /// Shape: the bounded volume each request creates and destroys.
@@ -48,11 +45,17 @@ const VOLUME_BYTES: u64 = 1 << 20;
 
 /// A-223 (i), §4.3, §4.7. Do: start a two-shard daemon as derived for this machine (its estimate's weighting window
 /// shortened so the test is quick); beside two spinning threads a logical CPU, send one create and its destroy each
-/// millisecond from one client until some shard's wake estimate has risen to ten times the boot prior. Expect: every
-/// shard's idle window is still no longer than the window the daemon derived at boot, while the estimate it would
-/// have been priced on climbed. Before, the window was the estimate times 100 and grew with it.
+/// millisecond from one client until some shard's wake estimate stands above the boot prior. Expect: every shard's
+/// idle window is still no longer than the window the daemon derived at boot. Before, the window was the estimate times
+/// 100, so it passed the boot window as soon as the estimate passed the prior, and grew with it to 23-84 ms against
+/// 0.2-1.5 ms at boot (diag-liveness-36).
+///
+/// The run proves something once an estimate stands above the prior, since only then would a window priced on it have
+/// grown: that is the non-vacuity bound. How far it rises depends on the rule, since a shard spinning out a long window
+/// queues the next woken shard behind it: before the rule estimates reached 23 to 200 times the prior; under it a
+/// loaded 3-CPU macOS runner reached 1.06 to 5.9 times (diag-liveness-37, -38).
 #[test]
-fn a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes() {
+fn a_paced_clients_shards_keep_their_idle_window_while_load_raises_their_wake_estimates() {
   let profile = common::machine_profile();
   let instance = format!("srv-idle-window-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
@@ -85,11 +88,11 @@ fn a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes()
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = common::client::connect(&instance);
   client.spin_for(None);
-  let queued = |daemon: &Daemon| {
+  let risen = |daemon: &Daemon| {
     daemon
       .shard_pulses()
       .iter()
-      .any(|pulse| pulse.wake_cost_ns >= QUEUED_FACTOR.saturating_mul(prior_ns))
+      .any(|pulse| pulse.wake_cost_ns > prior_ns)
   };
   let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
   let stop = AtomicBool::new(false);
@@ -102,7 +105,7 @@ fn a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes()
       });
     }
     let mut sent = 0;
-    while sent < LEAST_REQUESTS || (sent < MOST_REQUESTS && !queued(&daemon)) {
+    while sent < LEAST_REQUESTS || (sent < MOST_REQUESTS && !risen(&daemon)) {
       std::thread::park_timeout(PACE);
       let volume = client
         .create(&CreateSpec {
@@ -135,10 +138,8 @@ fn a_paced_clients_shards_keep_their_idle_window_while_load_queues_their_wakes()
     );
   }
   assert!(
-    pulses
-      .iter()
-      .any(|pulse| pulse.wake_cost_ns >= QUEUED_FACTOR.saturating_mul(prior_ns)),
-    "the spinners queued a woken shard, so its estimate rose to {QUEUED_FACTOR} times the boot prior of {prior_ns} \
-     ns within {sent} paced requests: {pulses:?}"
+    pulses.iter().any(|pulse| pulse.wake_cost_ns > prior_ns),
+    "some shard's estimate rose above the boot prior of {prior_ns} ns within {sent} paced requests, so a window priced \
+     on it would have grown: {pulses:?}"
   );
 }
