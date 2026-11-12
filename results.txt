@@ -2,3 +2,7 @@ tested d8350621516b9ddce74f9a274b1f5c722122f916 on ubuntu-latest
 clippy exit 101
 error[E0533]: expected value, found struct variant `RequestBody::List`
 error: could not compile `slates-server` (test "fleet") due to 1 previous error
+server exit 0
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.01s
