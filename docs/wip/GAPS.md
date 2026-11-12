@@ -14,7 +14,11 @@
 > `AnswerUnstarted`) hands the reply to the client's shard's channel at once and waits on a task of its own shard only
 > when that channel is full: a task for every reply failed main's `a_forward_refused_at_admission_answers_its_client` 3 of
 > 3, since an `AnswerUnstarted` drops because its own shard's arena is full (found on adacachy, 2 of 3 there; fixed
-> 2026-11-09, 3 of 3 pass). Failing first:
+> 2026-11-09, 3 of 3 pass). What bounds the waiting (CLAUDE.md §2 item 8): a result waits in a task that exists for
+> its request anyway, or in the one task `carry_home` spawns for it, so the waits on a shard are at most its requests in
+> flight (a client's, within `clients_per_shard × slots` of credit; an acknowledgement's parts, within
+> `ack_scatter_bound`; a call's) and at most its task arena, where a spawn is refused typed and counted. They are
+> counted (`xshard.room_waits_started`, `_ended`, `_peak`, the most held at once). Failing first:
 > `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`).
 > Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, and every direct `send_control` of a reply in
 > `crates/server/src`. Siblings reported, not changed (not replies, each counted where lost): a client handed to a shard

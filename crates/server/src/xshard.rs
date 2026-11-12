@@ -184,8 +184,18 @@ impl<T: 'static> Future for CrossShardCall<T> {
 /// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer), and
 /// waits for room when the origin's control channel is full, retried at [`REPLY_PACE_NS`], for as long as the origin
 /// lives (§4.3: backpressure, never a drop). A full channel drains as the origin turns. Only an origin gone (its client
-/// with it) leaves the result undelivered, counted on this shard (`xshard.reply_dropped`). Bounded by what waits: one
-/// result a request in flight, which the clients' credit bounds. Before 2026-10-07 every refusal dropped the reply at
+/// with it) leaves the result undelivered, counted on this shard (`xshard.reply_dropped`).
+///
+/// **What bounds the waiting (CLAUDE.md §2 item 8).** A result waits inside a task that exists for it anyway (the task
+/// that ran a forwarded verb, a scatter part, or a call), or, from a caller that cannot await, in the one task
+/// [`carry_home`] spawns for it when the channel is full. So the results waiting on a shard are at most the tasks it
+/// holds, and every one answers a request in flight: a client's (each client holds at most its region's `slots` of
+/// credit, so a shard serves at most `clients_per_shard × slots` of them at once), an acknowledgement's parts (at most
+/// `ack_scatter_bound` scatters a shard) or a call (its caller's own in-flight bound). The hard bound is the shard's task
+/// arena: a waiting task it cannot take is refused at its spawn with a typed error the caller counts
+/// (`xshard.unstarted_unanswered`, a caller's own undelivered counter), never queued. The waits are counted
+/// ([`ROOM_WAITS_STARTED`], [`ROOM_WAITS_ENDED`], [`ROOM_WAITS_PEAK`]), so the bound is seen held.
+/// Before 2026-10-07 every refusal dropped the reply at
 /// once and unseen; until 2026-11-09 one still refused after a coordinator period was dropped: about 4,300 a run of the
 /// 3,000-client rung on main, every one an acknowledgement scatter's part, whose loss refused its client
 /// `AcknowledgementOwed` until a later acknowledgement settled the release (`crates/server/tests/reply_room.rs` shows the
@@ -197,8 +207,10 @@ pub async fn send_back(origin: u16, back: SpawnRequest) {
 }
 
 /// Sends `message` to `target`, waiting out a full channel for as long as `target` lives: whether it was sent; `false`
-/// only for a shard gone, or a pause the runtime refused (off a shard, a tripwire).
+/// only for a shard gone, or a pause the runtime refused (off a shard, a tripwire). A wait is counted from the first
+/// full channel to its end ([`RoomWait`]).
 async fn given_room(target: u16, mut message: Control) -> bool {
+  let mut waiting: Option<RoomWait> = None;
   loop {
     match registry::send_control_or_return(target, message) {
       Ok(()) => return true,
@@ -208,6 +220,7 @@ async fn given_room(target: u16, mut message: Control) -> bool {
       }) => message = unsent,
       Err(_) => return false,
     }
+    waiting.get_or_insert_with(RoomWait::begin);
     if slates_rt::futures::sleep(REPLY_PACE_NS).await.is_err() {
       state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
       return false;
@@ -267,6 +280,7 @@ pub fn run_on_waiting(
 /// in `crates/server/tests/ack_release.rs`).
 pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
   let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
+  let mut waiting: Option<RoomWait> = None;
   loop {
     match registry::send_control_or_return(target, message) {
       Ok(()) => return true,
@@ -276,6 +290,7 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
       }) => message = unsent,
       Err(_) => return false,
     }
+    waiting.get_or_insert_with(RoomWait::begin);
     let left = deadline.saturating_sub(slates_rt::futures::now_ns());
     if left == 0 {
       return false;
@@ -296,6 +311,51 @@ pub(crate) const ROOM_PAUSE_REFUSED: &str = "xshard.room_pause_refused";
 /// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
 /// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
 const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+
+/// Format: the status counter of waits for room this shard began ([`given_room`], [`given_room_within`]).
+pub(crate) const ROOM_WAITS_STARTED: &str = "xshard.room_waits_started";
+/// Format: the status counter of waits for room this shard ended, sent or not: with [`ROOM_WAITS_STARTED`], the waits
+/// it holds now.
+pub(crate) const ROOM_WAITS_ENDED: &str = "xshard.room_waits_ended";
+/// Format: the status counter that rises each time this shard holds more waits for room at once than it ever had, by
+/// the difference: its value is the most it has held at once.
+pub(crate) const ROOM_WAITS_PEAK: &str = "xshard.room_waits_peak";
+
+thread_local! {
+  /// This shard thread's waits for room now, and the most it has held at once ([`RoomWait`]).
+  static ROOM_WAITS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// One wait for room in progress on this shard ([`given_room`], [`given_room_within`]): counted when it begins and,
+/// dropped, when it ends,
+/// however it ends (sent, the target gone, its task cancelled).
+struct RoomWait;
+
+impl RoomWait {
+  fn begin() -> RoomWait {
+    let (now, peak) = ROOM_WAITS.with(Cell::get);
+    let now = now.saturating_add(1);
+    ROOM_WAITS.with(|waits| waits.set((now, peak.max(now))));
+    let raised = now.saturating_sub(peak);
+    state::with_state_counted(|s| {
+      s.count(ROOM_WAITS_STARTED, 1);
+      if raised > 0 {
+        s.count(ROOM_WAITS_PEAK, raised);
+      }
+    });
+    RoomWait
+  }
+}
+
+impl Drop for RoomWait {
+  fn drop(&mut self) {
+    ROOM_WAITS.with(|waits| {
+      let (now, peak) = waits.get();
+      waits.set((now.saturating_sub(1), peak));
+    });
+    state::with_state_counted(|s| s.count(ROOM_WAITS_ENDED, 1));
+  }
+}
 
 /// Format: the status counter of results that could not be carried home because the shard they went to is gone
 /// ([`send_back`]).
