@@ -12115,3 +12115,51 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## What a verdict compares and copies, and what the owner spends a verdict on (§4.16 "The verdict"; 2026-11-11)
+
+**The question (the supervisor's, 2026-11-11):** `Green::decide` is about half the green owner's CPU, and `memcmp` and
+`memmove` lead its self time. Is that work proportional to the change, the file, or the green?
+
+**The engine alone: `crates/merge/examples/verdict_bench.rs`.** One slot replacement (a delete and an insert of 16
+bytes, as an SDK edit composes) submitted to a green of one measured file among 754, 7,540 or 75,400 small ones, in
+three cases: overlapping an intervening replacement with other bytes (conflict), with the same bytes (converges), and a
+disjoint edit at the head (accepted). Fastest of 7 rounds of 2,000 submits, each outcome checked. `cargo run --release -p
+slates-merge --example verdict_bench`, adas-mac-studio.local-2, load 2.3 to 3.3, main db9c514e against perf-decide
+63d63b23 (the whole-file identity check compared run by run in the content history), alternated, 3 rounds a side, the
+range over the rounds. Nanoseconds a submit:
+
+| paths | file | conflict, main → cut | converge, main → cut | accept (both) |
+|---|---|---|---|---|
+| 754 | 4 KiB | 684–1,121 → 466–660 | 723–830 → 462–493 | 1,156–1,187 |
+| 754 | 21 KiB | 1,467–1,504 → 420–447 | 1,805–1,854 → 447–458 | 2,001–2,050 |
+| 754 | 1 MiB | 40,819–41,508 → 417–447 | 50,252–51,283 → 444–457 | 37,198–37,824 |
+| 75,400 | 21 KiB | 1,660–1,693 → 557–590 | 2,041–2,078 → 584–618 | 2,470–2,582 |
+| 75,400 | 1 MiB | 41,445–42,102 → 571–601 | 50,810–51,812 → 584–625 | 39,102–39,666 |
+
+- The verdict's cost does not follow the green: a hundred times the paths adds about 0.15 µs (the maps' searches).
+- It followed the edited file twice over: the whole-file identity check of a length-changing edit that overlaps an
+  intervening change (rebuild the base, apply the ops to a copy, compare the copy with the head), and every accept
+  (`apply` writes the new file; the history checks its splice against it byte for byte). The first now follows the
+  change (a 1 MiB file: 41–51 µs to 0.42–0.63 µs); the accept still follows the file.
+
+**The daemon: not moved.** The owner's thread CPU per verdict and per rebase (`tools/owner_cpu_patch.py`, not
+committed), the anchor recipe, interleaved, 5 rounds a side, oracle 0 in all 40 runs:
+
+| | main db9c514e | + the cut | W1 c349a42a | + the cut |
+|---|---|---|---|---|
+| 3,000 clients, µs a verdict | 48.9–51.0 | 49.2–51.1 | 21.3–22.0 | 21.1–22.1 |
+| 3,000 clients, µs a rebase | 27.2–27.8 | 27.3–28.2 | 12.1–12.5 | 12.0–12.5 |
+| 1,000 clients, µs a verdict | 37.1–39.3 | 37.0–38.7 | 23.0–23.6 | 22.1–23.0 |
+
+At the rung's files (21 KiB on average, the slots in their first 512 bytes) the identity check costs a few µs of a verdict,
+so the cut is even there: by the rule a dead-even A/B does not land, so it waits on perf-decide for a workload with large
+files to judge it.
+
+**Where W1's owner spends a verdict (a second diagnostic, `tools/engine_split_patch.py`, the engine call timed apart by
+the thread's CPU clock).** 3,000 clients, 3 runs, oracle 0: a verdict 21.4–21.7 µs, of it the engine (`submit_resolved`)
+13.0–13.1 and the rest (composing the admission, the chain's admission, retention, the span, the durable records)
+8.3–8.7; a rebase 12.3–12.4 µs, the engine (`Green::rebase`) 9.5–9.6 and the rest 2.7–2.8. Verdicts and rebases are
+51–53% of the owner's wall (`merge-util`), the engine 68% of that. A rung verdict costs the engine 13 µs where the bench's
+one-path verdict costs under 2.5 µs, and 82% of the rung's verdicts are conflicts: what in a rung increment costs the
+engine the difference is the next measurement (a line-table build, `sample`'s call sites resolved by `atos`).
