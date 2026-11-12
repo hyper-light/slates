@@ -1,0 +1,13 @@
+runner windows-latest, 4 CPUs, Thu Nov 12 10:01:46 UTC 2026
+head 43343c284 client: the presentation test builds on Unix only, as the landing verb does -- a Wind
+== suites exit 0
+== suites total: 114 passed, 0 failed, 5 ignored
+sleepers: 160 samples in 160 trips, estimate 18328 ns; racing: 16384 parks in 16385 trips, 120 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 9895 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== racing round=1 exit 0
+sleepers: 160 samples in 160 trips, estimate 16833 ns; racing: 16384 parks in 16386 trips, 85 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10451 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.44s
+== racing round=2 exit 0
+sleepers: 160 samples in 160 trips, estimate 14129 ns; racing: 16384 parks in 16384 trips, 30 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 9404 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.44s
+== racing round=3 exit 0
