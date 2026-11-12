@@ -33,6 +33,9 @@
 //! - The release lane's tasks are a binary of their own, `release` (`src/bin/release.rs`, `release.rs`; Appendix
 //!   B.2, A-210), because they must build on Windows and the conformance and KIND tasks here reach Unix-only calls:
 //!   `cargo run -p xtask --bin release -- smoke ...` and `... -- artifacts ...`.
+//! - `each_test` (`src/bin/each_test.rs`) runs one test target's tests each in a process of its own with a deadline, so
+//!   a hung test fails by name with its output kept (the Windows fleet step): `cargo run -p xtask --bin each_test --
+//!   --package PKG --test TARGET --per-test-secs N`. A binary of its own for the same reason as `release`.
 //! - `cargo xtask tsan` — the ThreadSanitizer lane: the race canary must be reported, then the
 //!   threaded crates' tests run instrumented and any report fails (see `tsan.rs`; needs nightly
 //!   with `rust-src`).

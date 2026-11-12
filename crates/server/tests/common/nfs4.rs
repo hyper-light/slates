@@ -144,6 +144,30 @@ impl Session {
     last_result(&reply)
   }
 
+  /// Runs `operation` on the object the file handle `fh` names (SEQUENCE, PUTFH and the operation), as a client does
+  /// for a file it holds open, whose name may be gone: the operation's result body, or the first failing status. The
+  /// reply is not kept for a retry, so a READ's may be any size the session allows.
+  pub(crate) fn on(
+    &mut self,
+    fh: &[u8],
+    operation: impl FnOnce(&mut XdrWriter),
+  ) -> Result<Vec<u8>, u32> {
+    self.sequence += 1;
+    let mut args = frame(3);
+    args.u32(op::SEQUENCE);
+    args.fixed(&self.sessionid);
+    args.u32(self.sequence);
+    args.u32(0); // slot
+    args.u32(0); // highest slot
+    args.bool(false);
+    args.u32(op::PUTFH);
+    args.opaque(fh);
+    operation(&mut args);
+    self.last = args.as_slice().to_vec();
+    let reply = self.compound(args.as_slice());
+    last_result(&reply)
+  }
+
   /// Sends the last compound again, unchanged — the same slot and sequence id, so a retry of it (RFC 8881
   /// §2.10.6.2): the last operation's result body, or the first failing status.
   pub(crate) fn resend(&mut self) -> Result<Vec<u8>, u32> {

@@ -3699,6 +3699,86 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
   }
 }
 
+/// Whether a status refusal line (`shard N refused <counter>: <count>`) is one forming a fleet may show: superseded link
+/// work, and the events of formation's ordinary work that the counter map carries beside refusals.
+fn formation_counter_allowed(line: &str) -> bool {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  let Some(counter) = line
+    .split_whitespace()
+    .nth(3)
+    .and_then(|counter| counter.strip_suffix(':'))
+  else {
+    return false;
+  };
+  [
+    "fleet.discovery.invalidated",
+    "fleet.link.stale_return",
+    "fleet.accept.replaced",
+    "fleet.fan.sent",
+    "fleet.fan.unchanged",
+    // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+    // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
+    // announcement pass's lent sessions and sends.
+    "fleet.discovery.pages",
+    "fleet.learner.fetches",
+    "fleet.learner.fetch_paced",
+    // A learner's fetch period that found no session to any member of its region yet, skipped and asked again the next
+    // period, as `fetch_paced` is (310d7010 added it; B10's Linux gate found each forming node counting it once).
+    "fleet.learner.no_session",
+    "fleet.plane.announce_lends",
+    "fleet.plane.announcements_sent",
+    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
+    // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
+    CONTENT_PURGED,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+    GIVE_BACK_LEFT,
+    // A record link dropped because its anchor's learned member became another incarnation
+    // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
+    // superseded link work — exactly what this assertion permits — and it is counted during formation
+    // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
+    "fleet.link.invalid.member_changed",
+  ]
+  .contains(&counter)
+}
+
+/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
+/// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
+/// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
+#[test]
+fn the_formation_check_allows_every_reap_tick_event() {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  for counter in [
+    CONTENT_PURGED,
+    GIVE_BACK_LEFT,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+  ] {
+    let line = format!("shard 0 refused {counter}: 1");
+    assert!(
+      formation_counter_allowed(&line),
+      "the formation check allows {line:?}"
+    );
+  }
+}
+
 /// Every process derived the same fleet from the one manifest: the same three member ids (its own among
 /// them, distinct per node) and both peers probed.
 fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
@@ -3740,39 +3820,7 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
         .refusals
         .split(';')
         .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-          [
-            "fleet.discovery.invalidated:",
-            "fleet.link.stale_return:",
-            "fleet.accept.replaced:",
-            "fleet.fan.sent:",
-            "fleet.fan.unchanged:",
-            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
-            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
-            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
-            "fleet.discovery.pages:",
-            "fleet.learner.fetches:",
-            "fleet.learner.fetch_paced:",
-            "fleet.plane.announce_lends:",
-            "fleet.plane.announcements_sent:",
-            "content.purged_bytes:",
-            // The reap tick's record of what a shard was doing (A-214: sealing, deferred, busy, idle) and the
-            // bytes an idle shard kept pre-faulted for its next write burst: events of a shard's ordinary
-            // ticks, counted during formation like `content.purged_bytes` (main CI 42172125695, macos-latest).
-            "content.ticks.sealing:",
-            "content.ticks.deferred:",
-            "content.ticks.busy:",
-            "content.ticks.idle:",
-            "content.prefaulted_bytes:",
-            // A record link dropped because its anchor's learned member became another incarnation
-            // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
-            // superseded link work — exactly what this assertion permits — and it is counted during formation
-            // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
-            "fleet.link.invalid.member_changed:",
-          ]
-          .iter()
-          .any(|counter| line.split_whitespace().nth(3) == Some(counter))
-        }),
+        .all(formation_counter_allowed),
       "only superseded link work may end during formation: {views:?}"
     );
   }
@@ -8072,17 +8120,95 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
 /// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
 /// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
+///
+/// **Its precondition, proved each attempt.** The rule is tested only if the store's page is still dirty when the other
+/// path writes. The kernel may write it back first. On adacachy2's 7.3 kernel a process spawn from the test's process
+/// while the page is dirty did so, as a sibling test's spawn would: with one `Command` spawn between the store and the
+/// replacement, 6 attempts of 6 found the page written back first, 3-6 ms after the store (2026-11-09, a daemon trace),
+/// while a 50 ms sleep there left it dirty. That write-back is fresh, so it is rightly applied, and the sync then has
+/// nothing to refuse. Before 2026-11-09 the test took that run for a lost refusal ("the sync says so: Ok(())", B10's
+/// gate at load about 66). So each attempt reads the daemon's `fuse.writebacks_applied` just before the store and just
+/// after the other path's write: an applied write-back between them can only have come first, since after the write
+/// every byte of a page fetched before it is stale. An attempt whose precondition did not hold says so and starts
+/// again with a fresh fixture, up to [`DIRTY_PAGE_ATTEMPTS`]; it never passes or fails on the rule.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   if !live_mount_runs() {
     return;
   }
-  let mut fixture = MappedThroughAMount::with_pages("mapdirty", b'A', 2);
+  let mut missed = Vec::new();
+  for attempt in 1..=DIRTY_PAGE_ATTEMPTS {
+    match dirty_page_attempt(attempt) {
+      DirtyPageAttempt::Held => return,
+      DirtyPageAttempt::Missed(miss) => {
+        eprintln!(
+          "attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}: precondition not held, retrying: {miss}"
+        );
+        missed.push(miss);
+      }
+    }
+  }
+  panic!(
+    "the precondition (a store's page still dirty when another path writes) never held in {DIRTY_PAGE_ATTEMPTS} \
+     attempts, so the write-back rule was never tested: {missed:?}"
+  );
+}
+
+/// Derived: attempts at [`a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`]'s precondition.
+/// The run on main held it 10 of 10 at load 66-68 (adacachy2, 2026-11-09), a miss rate under 30% at 95% confidence (3
+/// / 10, the rule of three); at 30% six attempts all miss with 0.3^6 = 0.0007, under one in a thousand.
+#[cfg(target_os = "linux")]
+const DIRTY_PAGE_ATTEMPTS: u32 = 6;
+
+/// How one attempt at the dirty-page rule went: its precondition held and every assertion passed, or it did not hold
+/// in the phase named (the kernel wrote the store's page back before the other path's write).
+#[cfg(target_os = "linux")]
+enum DirtyPageAttempt {
+  Held,
+  Missed(String),
+}
+
+/// One attempt at the dirty-page rule, with a fresh fixture: [`DirtyPageAttempt::Missed`] naming the phase whose
+/// precondition did not hold, the rule's own assertions otherwise.
+#[cfg(target_os = "linux")]
+fn dirty_page_attempt(attempt: u32) -> DirtyPageAttempt {
+  let mut fixture = MappedThroughAMount::with_pages(&format!("mapdirty{attempt}"), b'A', 2);
   let second = fixture.mount_again();
+  if let Some(miss) = stale_whole_file_phase(&mut fixture) {
+    return DirtyPageAttempt::Missed(miss);
+  }
+  match stale_part_phase(&mut fixture, &second) {
+    Some(miss) => DirtyPageAttempt::Missed(miss),
+    None => DirtyPageAttempt::Held,
+  }
+}
+
+/// The daemon's applied cache write-backs and refused ones (`fuse.writebacks_applied`, `fuse.writeback_conflicts`).
+#[cfg(target_os = "linux")]
+fn writeback_counts(instance: &str) -> (u64, u64) {
+  (
+    status_counter(instance, "fuse.writebacks_applied"),
+    status_counter(instance, "fuse.writeback_conflicts"),
+  )
+}
+
+/// The whole-file phase: a store left dirty, the whole file replaced through the SDK, the sync refused. Then the control:
+/// a store into the page fetched after the replacement, applied whole. `Some` naming the miss when the store's page was
+/// written back before the replacement.
+#[cfg(target_os = "linux")]
+fn stale_whole_file_phase(fixture: &mut MappedThroughAMount) -> Option<String> {
   let length = fixture.length;
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the whole-file phase: {early} write-back(s) of the store's page applied before the replacement"
+    ));
+  }
   let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
@@ -8091,6 +8217,10 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   assert!(
     stale_whole.is_err(),
     "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
+  );
+  assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts, the rule's non-vacuity count)"
   );
   assert!(
     fixture.follows(b'S'),
@@ -8104,9 +8234,26 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     fresh.is_ok() && fixture.volume_bytes() == expected,
     "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
   );
+  None
+}
+
+/// The second-mount phase: a store left dirty, other bytes of its page written through a second mount, the sync
+/// refused whole. `Some` naming the miss when the store's page was written back before the second mount's write.
+#[cfg(target_os = "linux")]
+fn stale_part_phase(fixture: &mut MappedThroughAMount, second: &SecondMount) -> Option<String> {
+  let mut expected = vec![b'S'; fixture.length];
+  expected[10] = b'M';
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[20] = b'N';
   let written = 100..200;
   second.write_at(written.start, &vec![b'R'; written.len()]);
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the second-mount phase: {early} write-back(s) of the store's page applied before the second mount's write"
+    ));
+  }
   let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
@@ -8118,9 +8265,14 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts)"
+  );
+  assert!(
     fixture.follows_bytes(&expected),
     "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
+  None
 }
 
 /// §4.6 the mount route's dirty pages on macOS (A-192). Apple's NFS client writes a page dirtied through a shared map back
@@ -12573,11 +12725,70 @@ fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_ke
   );
 }
 
+/// Makes a volume named `name` over a host directory in `scratch`, removes the directory and restarts the daemon in
+/// order (`SIGTERM`, no kernel mount involved), so the successor holds the volume's record but could not rebuild it.
+/// Returns the volume's id and the removed base.
+#[cfg(unix)]
+fn an_unrecovered_volume(instance: &str, scratch: &ScratchDir, name: &str) -> (String, String) {
+  let base = format!("{}/{name}-base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      name,
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("rmdir {base}"));
+  restart_in_order(instance);
+  (id, base)
+}
+
+/// Stops the instance's daemon with `SIGTERM` and waits for its successor.
+#[cfg(unix)]
+fn restart_in_order(instance: &str) {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(instance, Some(stopped), &[]);
+}
+
+/// `slates <verb...>` on the unrecovered volume is refused `NotRecovered`, by kind.
+#[cfg(unix)]
+fn refused_not_recovered(instance: &str, verb: &[&str]) {
+  let (code, out, err) = run(instance, verb);
+  assert_ne!(
+    code, 0,
+    "{verb:?} on a volume recovery could not rebuild: {out}"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "{verb:?} is refused because recovery could not rebuild the volume, by kind: {err}"
+  );
+}
+
 /// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
 /// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
-/// state: the recovery refusal by kind. Do: create a volume over a host directory, remove the directory, and restart the
-/// daemon in order (no kernel mount is involved). Expect: `volume list` still shows the volume, and its `status` is
-/// refused `NotRecovered`, naming the missing base.
+/// state: the recovery refusal by kind. The sweep of 2026-11-08 (GAPS): `volume list` names why on the volume's line,
+/// and the verbs that would change it refuse typed, a share included, though a share touches only the catalog. Do:
+/// create a volume over a host directory, remove the directory, and restart the daemon in order (no kernel mount is
+/// involved). Expect: `volume list` shows the volume with `not_recovered=BaseMissing`; its `status`, a `volume snapshot`
+/// and a `share` are each refused `NotRecovered`, naming the missing base.
 #[cfg(unix)]
 #[test]
 fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
@@ -12592,43 +12803,74 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   let scratch = ScratchDir {
     path: build_output_dir("slates-unrecovered"),
   };
-  let base = format!("{}/base", scratch.path);
-  shell(&format!("mkdir {base}"));
-  let (code, out, err) = run(
-    &instance,
-    &[
-      "volume",
-      "create",
-      "unrecovered",
-      "--bounded",
-      "8MiB",
-      "--base",
-      &base,
-    ],
-  );
-  assert_eq!(code, 0, "{err}");
-  let id = value_of(&out, "id");
-  shell(&format!("rmdir {base}"));
-  let stopped = daemon_pid(&instance).expect("the daemon answers");
-  assert!(
-    Command::new("kill")
-      .args(["-TERM", &stopped.to_string()])
-      .status()
-      .unwrap()
-      .success(),
-    "SIGTERM sent"
-  );
-  await_daemon(&instance, Some(stopped), &[]);
+  let (id, base) = an_unrecovered_volume(&instance, &scratch, "unrecovered");
   let (code, out, err) = run(&instance, &["volume", "list"]);
   assert_eq!(code, 0, "{err}");
   assert!(
-    out.contains("unrecovered"),
-    "the catalog still lists the volume: {out}"
+    out
+      .lines()
+      .any(|line| line.contains(" unrecovered ") && line.ends_with(" not_recovered=BaseMissing")),
+    "the catalog lists the volume, naming why it was not rebuilt: {out}"
   );
   let (code, out, err) = run(&instance, &["status", &id]);
   assert_ne!(code, 0, "the volume was not rebuilt: {out}");
   assert!(
     err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
     "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  refused_not_recovered(&instance, &["volume", "snapshot", &id]);
+  refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
+/// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
+/// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
+/// in order, then `volume destroy` it. Expect: the destroy succeeds; `volume list` no longer names it and its `status`
+/// answers `NotFound`; its name can be given to a new volume; and after a second restart nothing is reported not
+/// rebuilt and the volume is still gone.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_destroyed_and_stays_gone() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's destroy: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-undestroyed-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-undestroyed"),
+  };
+  let (id, _) = an_unrecovered_volume(&instance, &scratch, "undestroyed");
+  let (code, out, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(
+    code, 0,
+    "a volume recovery could not rebuild is destroyed: {out}{err}"
+  );
+  assert_gone(&instance, &id);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "undestroyed", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "the destroyed volume's name is free: {err}");
+  restart_in_order(&instance);
+  assert_gone(&instance, &id);
+}
+
+/// `volume list` names no `undestroyed` volume recovery could not rebuild, and `status` of `id` answers `NotFound`.
+#[cfg(unix)]
+fn assert_gone(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.contains("not_recovered="),
+    "no volume is listed as not rebuilt: {out}"
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_ne!(code, 0, "the destroyed volume has no status: {out}");
+  assert!(
+    err.contains("NotFound"),
+    "the destroyed volume is not found: {err}"
   );
 }

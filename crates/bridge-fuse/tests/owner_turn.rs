@@ -203,7 +203,7 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     )
     .unwrap()
     {
-      Turn::Idle | Turn::Dropped | Turn::Replayed => {}
+      Turn::Idle | Turn::Dropped | Turn::Replayed | Turn::Refused => {}
       Turn::Continued => tally.continued += 1,
       Turn::Ended => {
         // The test thread may already have failed and gone; then there is no one to tell.

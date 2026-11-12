@@ -32,8 +32,8 @@ use slates_client::{
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
   GreenBase, GroupReport, HostAnswer, Intent, KernelCache, Landing, LandingDegradation,
   LandingOutcome, LandingSummary, NamePolicy, OciBinding, ReadAt, ReadWritePolicy, Rebased,
-  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  RecoveryCause, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
+  Submitted, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,
 };
 
@@ -1488,6 +1488,8 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
     "referenced_bytes": v.referenced_bytes,
     "unique_bytes": v.unique_bytes,
     "overlay": v.overlay,
+    "live_shipped": v.live_shipped,
+    "not_recovered": v.not_recovered.as_ref().map(RecoveryCause::kind),
   })
 }
 

@@ -1106,7 +1106,11 @@ impl Promise {
 /// configuration generation the round runs under, and the object after which this page starts (`None` for the
 /// first). One round per retired host replaces a round per object: a holder answers for all of that host's
 /// objects whose successor is the asker, and a holder that holds nothing answers too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A request may instead name objects (A-251 (b)): the successor asks a holder whose pages are complete about each
+/// object it learned that the holder did not list, and the holder answers each alone, from its own records, with no
+/// routing in the way. A request that names objects asks no page.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPrepare {
   /// The retired host whose objects are taken over.
   pub departed: HostId,
@@ -1118,6 +1122,9 @@ pub struct HostPrepare {
   pub generation: u64,
   /// The object after which this page starts, `None` for the first page.
   pub after: Option<ObjectId>,
+  /// The objects asked about by name, each answered alone; empty for a page request. Appended to the wire only when
+  /// not empty, so a page request's bytes are as before A-251.
+  pub named: Vec<ObjectId>,
 }
 
 /// Format: an absent optional field on the takeover wire.
@@ -1125,9 +1132,12 @@ const FIELD_ABSENT: u8 = 0;
 /// Format: a present optional field on the takeover wire; its value follows.
 const FIELD_PRESENT: u8 = 1;
 
-/// Format: the widest [`HostPrepare`]: departed, owner, epoch, generation (u64 LE each), then the page start's
-/// presence byte and object.
-const HOST_PREPARE_BYTES: usize = 4 * size_of::<u64>() + 1 + OBJECT_BYTES;
+/// Format: a page request's widest bytes ([`HostPrepare`]): departed, owner, epoch, generation (u64 LE each), then the
+/// page start's presence byte and object. A request naming objects appends their count (u32 LE) and the objects.
+pub const HOST_PREPARE_BYTES: usize = 4 * size_of::<u64>() + 1 + OBJECT_BYTES;
+
+/// Format: the bytes an appended list of objects takes before its objects: its count (u32 LE).
+pub const OBJECT_LIST_HEADER_BYTES: usize = size_of::<u32>();
 
 impl HostPrepare {
   /// The canonical bytes: departed, owner, epoch, generation (each u64 LE), then a presence byte and, when
@@ -1139,6 +1149,7 @@ impl HostPrepare {
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
     put_optional_object(&mut out, self.after);
+    put_object_list(&mut out, &self.named);
     out
   }
 
@@ -1151,6 +1162,7 @@ impl HostPrepare {
     let epoch = HostEpoch(reader.word()?);
     let generation = reader.word()?;
     let after = reader.optional_object()?;
+    let named = reader.object_list()?;
     reader.finish()?;
     Ok(HostPrepare {
       departed,
@@ -1158,6 +1170,7 @@ impl HostPrepare {
       epoch,
       generation,
       after,
+      named,
     })
   }
 }
@@ -1166,10 +1179,11 @@ impl HostPrepare {
 /// is the asker, each with the highest record it holds — its fence raised to the epoch and the asker's
 /// authority installed before this answer was formed — where the next page starts if the holder has more, and
 /// the highest fence it found above the epoch on an object it therefore could not promise, so the asker retries
-/// above it. A holder's **complete** answer (every page, until `next` is `None`) promises the asker every object
-/// of the retired host whose successor it is: those it lists, and — by listing nothing more — every one it holds
-/// nothing of. That empty promise binds as a listed one does: the retired host is no member, so no holder
-/// accepts its records, and the successor is the only member the configuration names for the object.
+/// above it. A page promises what it lists, and nothing of what it does not (A-251): a holder's routing decides what
+/// its pages list, and it can leave out a copy it holds. An object the holder did not list is promised only by name:
+/// the asker names it ([`HostPrepare::named`]) and the holder reports its record or, in `nothing`, that it holds none.
+/// That empty promise binds as a listed one does: the retired host is no member, so no holder accepts its records, and
+/// the successor is the only member the configuration names for the object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPromise {
   /// The answering holder.
@@ -1190,6 +1204,10 @@ pub struct HostPromise {
   /// a page is no answer for what it leaves out, so the asker does not count it as complete. Listing nothing means
   /// holding nothing only when this is zero.
   pub unpromised: u32,
+  /// Of the objects a request named (A-251 (b)), those this holder holds nothing of: its promise of each, alone. A
+  /// named object it holds is among `entries`; one it could not answer is in neither. Appended to the wire only when
+  /// not empty.
+  pub nothing: Vec<ObjectId>,
 }
 
 /// Format: the fixed width of one [`HostPromise`] entry before its value: the object (16 bytes), the record's
@@ -1244,6 +1262,7 @@ impl HostPromise {
       out.extend_from_slice(&value_len.to_le_bytes());
       out.extend_from_slice(&accepted.value);
     }
+    put_object_list(&mut out, &self.nothing);
     out
   }
 
@@ -1284,6 +1303,7 @@ impl HostPromise {
         },
       ));
     }
+    let nothing = reader.object_list()?;
     reader.finish()?;
     Ok(HostPromise {
       holder,
@@ -1294,6 +1314,7 @@ impl HostPromise {
       next,
       fenced,
       unpromised,
+      nothing,
     })
   }
 }
@@ -1306,6 +1327,22 @@ fn put_optional_object(out: &mut Vec<u8>, object: Option<ObjectId>) {
       out.push(FIELD_PRESENT);
       out.extend_from_slice(&object.0);
     }
+  }
+}
+
+/// Appends a list of objects when it is not empty: its count, then the objects. An empty list writes nothing, so a
+/// message without one keeps its earlier bytes.
+fn put_object_list(out: &mut Vec<u8>, objects: &[ObjectId]) {
+  if objects.is_empty() {
+    return;
+  }
+  out.extend_from_slice(
+    &u32::try_from(objects.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  for object in objects {
+    out.extend_from_slice(&object.0);
   }
 }
 
@@ -1380,6 +1417,23 @@ impl<'a> WireReader<'a> {
     }
   }
 
+  /// An appended list of objects ([`put_object_list`]): empty when no bytes are left; otherwise a count of at least one
+  /// that the bytes left can hold, then the objects. A count of zero is refused, so each list has one encoding.
+  fn object_list(&mut self) -> Result<Vec<ObjectId>, RegisterError> {
+    if self.rest.is_empty() {
+      return Ok(Vec::new());
+    }
+    let count = usize::try_from(self.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+    if count == 0 || count > self.remaining() / OBJECT_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let mut objects = Vec::with_capacity(count);
+    for _ in 0..count {
+      objects.push(self.object()?);
+    }
+    Ok(objects)
+  }
+
   /// The bytes left to read.
   fn remaining(&self) -> usize {
     self.rest.len()
@@ -1405,6 +1459,9 @@ impl<'a> WireReader<'a> {
 pub struct Acceptor {
   id: HostId,
   authority: Authority,
+  /// The owner an install last moved this acceptor's authority from (A-251): a takeover moves a retired owner's copies
+  /// to its successor, and only this keeps whose object the copy was once the authority names the successor.
+  moved_from: Option<HostId>,
   fence: Fence,
   accepted: std::collections::BTreeMap<(ObjectId, u64), (HostEpoch, Vec<u8>)>,
 }
@@ -1412,12 +1469,49 @@ pub struct Acceptor {
 /// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
 pub type AcceptedPositions = Vec<(ObjectId, u64, HostEpoch, Vec<u8>)>;
 
+/// One acceptor's durable state as a recovery image keeps it (§4.8 "persistence before reply"; A-251): the owner and
+/// configuration generation it serves under, the epoch its fence has seen, every position it accepted, and the retired
+/// owner an install last moved its authority from. [`Acceptor::to_persisted`] makes it and [`Acceptor::from_persisted`]
+/// rebuilds the same acceptor from it, so a restarted holder lists, refuses and accepts as it did before.
+///
+/// Format: the `Wire` encoding of its fields in this order. The moved-from owner is last, so the layout without it (the
+/// held image's register before A-251) is refused as truncated, never read as "moved from none" (CLAUDE.md §2.7); the
+/// image's version is what refuses an older image whole.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PersistedAcceptor {
+  /// The owner it serves under ([`Authority::owner`]).
+  pub owner: HostId,
+  /// The configuration generation it serves under ([`Authority::generation`]).
+  pub generation: u64,
+  /// The highest epoch its fence has seen.
+  pub promised: u64,
+  /// Every position it accepted, in key order.
+  pub accepted: Vec<PersistedPosition>,
+  /// The retired owner an install last moved its authority from ([`Acceptor::moved_from`]).
+  pub moved_from: Option<HostId>,
+}
+
+/// One accepted position of a [`PersistedAcceptor`]: the object, its ledger position, the epoch it was accepted at and
+/// the record's bytes.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PersistedPosition {
+  /// The object the record belongs to.
+  pub object: [u8; 16],
+  /// Its ledger position.
+  pub sequence: u64,
+  /// The epoch it was accepted at.
+  pub epoch: u64,
+  /// The record's bytes.
+  pub value: Vec<u8>,
+}
+
 impl Acceptor {
   /// A fresh acceptor for holder `id` serving under `authority`, having accepted nothing.
   pub fn new(id: HostId, authority: Authority) -> Acceptor {
     Acceptor {
       id,
       authority,
+      moved_from: None,
       fence: Fence::new(),
       accepted: std::collections::BTreeMap::new(),
     }
@@ -1441,6 +1535,7 @@ impl Acceptor {
     Acceptor {
       id,
       authority,
+      moved_from: None,
       fence,
       accepted,
     }
@@ -1461,6 +1556,59 @@ impl Acceptor {
   /// [`raise_fence`](Acceptor::raise_fence)).
   pub fn owner(&self) -> HostId {
     self.authority.owner
+  }
+
+  /// The retired owner an install last moved this acceptor's authority from ([`Acceptor::move_authority`]), `None` when
+  /// none has (A-251). Persisted with the acceptor, so a restart keeps it ([`Acceptor::to_persisted`]).
+  pub fn moved_from(&self) -> Option<HostId> {
+    self.moved_from
+  }
+
+  /// This acceptor's whole durable state, its moved-from owner too, as a recovery image keeps it (A-251).
+  pub fn to_persisted(&self) -> PersistedAcceptor {
+    let (promised, accepted) = self.persisted();
+    PersistedAcceptor {
+      owner: self.authority.owner,
+      generation: self.authority.generation,
+      promised: promised.0,
+      accepted: accepted
+        .into_iter()
+        .map(|(object, sequence, epoch, value)| PersistedPosition {
+          object: object.0,
+          sequence,
+          epoch: epoch.0,
+          value,
+        })
+        .collect(),
+      moved_from: self.moved_from,
+    }
+  }
+
+  /// The acceptor holder `id` kept as `persisted` ([`Acceptor::to_persisted`]), rebuilt after a restart.
+  pub fn from_persisted(id: HostId, persisted: PersistedAcceptor) -> Acceptor {
+    let accepted = persisted
+      .accepted
+      .into_iter()
+      .map(|position| {
+        (
+          ObjectId(position.object),
+          position.sequence,
+          HostEpoch(position.epoch),
+          position.value,
+        )
+      })
+      .collect();
+    let mut acceptor = Acceptor::recovered(
+      id,
+      Authority {
+        generation: persisted.generation,
+        owner: persisted.owner,
+      },
+      HostEpoch(persisted.promised),
+      accepted,
+    );
+    acceptor.moved_from = persisted.moved_from;
+    acceptor
   }
 
   /// The configuration generation this acceptor serves under: what a recovery image keeps with its records, so a
@@ -1588,6 +1736,11 @@ impl Acceptor {
     Ok(())
   }
 
+  /// The authority this acceptor serves now: the generation and the owner allowed to write.
+  pub fn authority(&self) -> Authority {
+    self.authority
+  }
+
   /// Installs a new configuration authority — the holder applying the configuration update the regional
   /// group distributed on a takeover or reconfiguration (§4.8 "the configuration is written only through
   /// the regional group, read by every node from its local copy"). A generation below the holder's
@@ -1603,6 +1756,23 @@ impl Acceptor {
       });
     }
     self.authority = authority;
+    Ok(())
+  }
+
+  /// Installs `authority` as [`install_authority`](Acceptor::install_authority) does, and when it moves the authority
+  /// away from an owner the caller knows is retired (`from_retired`: a takeover moving a retired owner's copy to its
+  /// successor), records that owner as [`moved_from`](Acceptor::moved_from) (A-251). One owner, overwritten by the next
+  /// such move, never a growing list; an install that changes no owner, or moves from a live one, leaves it as it was.
+  pub fn move_authority(
+    &mut self,
+    authority: Authority,
+    from_retired: bool,
+  ) -> Result<(), RegisterError> {
+    let previous = self.authority.owner;
+    self.install_authority(authority)?;
+    if from_retired && previous != authority.owner {
+      self.moved_from = Some(previous);
+    }
     Ok(())
   }
 
@@ -2131,10 +2301,14 @@ pub enum Lineage {
   },
   /// No survivor of the object's recovery cohorts was ranked: nothing can recover it.
   Lost,
-  /// A retirement in the object's line is no longer kept: its takeover is done — every survivor confirmed its
-  /// share, so the object was adopted elsewhere — or the retirement was dropped past the bound, beyond the
-  /// failures the region tolerates. A holder's copy of it is stale.
+  /// A retirement in the object's line is no longer kept because its takeover is done: every survivor confirmed its
+  /// share, and a survivor confirms only once every object it learned was adopted (A-272). A holder's copy is stale.
   Settled,
+  /// Nothing shows where the object went (A-272): a retirement in its line was dropped before every survivor
+  /// confirmed ([`RegionalConfiguration::dropped_unconfirmed`]), or its ranked successor is neither a member nor a kept
+  /// retirement. Not settled: absence is no evidence of adoption, and a holder keeps its copy. Owed (A-272 ii): kept
+  /// adoption records, and a round of the current members for such objects.
+  Unresolved,
 }
 
 /// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
@@ -2174,6 +2348,12 @@ pub struct RegionalConfiguration {
   /// An entry is assigned by the council leader after its phase one and dropped once its successor reports it serves
   /// the object ([`adopted`](RegionalConfiguration::adopted)), so it holds only adoptions in flight.
   pub adoptions: std::collections::BTreeMap<ObjectId, Adoption>,
+  /// The retired hosts whose takeover ended without every survivor's confirmation (A-272): a retirement dropped by
+  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) while a survivor still owed its share, or a host
+  /// retired with no settled neighbourhood to recover through. Their objects' lines are [`Lineage::Unresolved`], never
+  /// settled: nothing shows they were adopted, and a holder told settled reclaims its copy. In id order. It grows only
+  /// on a region losing more hosts than it tolerates, which a pruned retirement never records.
+  pub dropped_unconfirmed: Vec<HostId>,
 }
 
 /// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
@@ -2213,6 +2393,7 @@ impl RegionalConfiguration {
       settled: std::collections::BTreeMap::new(),
       retired: std::collections::BTreeMap::new(),
       adoptions: std::collections::BTreeMap::new(),
+      dropped_unconfirmed: Vec::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2383,6 +2564,9 @@ impl RegionalConfiguration {
           unconfirmed,
         },
       );
+    } else {
+      // Retired with no neighbourhood to recover through: nothing will confirm its objects adopted (A-272).
+      self.record_dropped_unconfirmed(member);
     }
     self.prune_retirements();
     self.bound_retirements();
@@ -2609,7 +2793,13 @@ impl RegionalConfiguration {
     let mut departed = owner;
     for _ in 0..=self.retired.len() {
       if !self.retired.contains_key(&departed) {
-        return Lineage::Settled;
+        // Settled only on evidence: a pruned retirement, every survivor having confirmed after adopting. One dropped
+        // unconfirmed proves nothing (A-272).
+        return if self.dropped_unconfirmed.contains(&departed) {
+          Lineage::Unresolved
+        } else {
+          Lineage::Settled
+        };
       }
       let Some(successor) = self.successor(departed, object) else {
         return Lineage::Lost;
@@ -2622,10 +2812,11 @@ impl RegionalConfiguration {
           successor,
         };
       } else {
-        return Lineage::Settled;
+        // A ranked successor neither a member nor a kept retirement: its absence is no evidence of adoption (A-272).
+        return Lineage::Unresolved;
       }
     }
-    Lineage::Settled
+    Lineage::Unresolved
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
@@ -2668,6 +2859,16 @@ impl RegionalConfiguration {
   /// oldest (by the version that retired it, the id breaking a tie) beyond it. A takeover whose retirement is
   /// dropped this way can no longer name its successors, so its objects stay unowned; a node sees the loss as a
   /// recovery owner that names a retirement no longer kept.
+  /// Records `host` among [`dropped_unconfirmed`](RegionalConfiguration::dropped_unconfirmed), in id order.
+  fn record_dropped_unconfirmed(&mut self, host: HostId) {
+    if let Err(position) = self
+      .dropped_unconfirmed
+      .binary_search_by_key(&host.0, |dropped| dropped.0)
+    {
+      self.dropped_unconfirmed.insert(position, host);
+    }
+  }
+
   fn bound_retirements(&mut self) {
     while self.retired.len() > self.retirement_bound() {
       let oldest = self
@@ -2677,7 +2878,18 @@ impl RegionalConfiguration {
         .map(|(host, _)| *host);
       match oldest {
         Some(host) => {
+          // Dropped before every survivor confirmed (one that retired first never did; its own retirement carried the
+          // takeover): recorded, so its line reads unresolved, never settled.
+          let unconfirmed = self.retired.get(&host).is_some_and(|retirement| {
+            !retirement
+              .survivors
+              .iter()
+              .all(|survivor| retirement.confirmed.contains(survivor))
+          });
           self.retired.remove(&host);
+          if unconfirmed {
+            self.record_dropped_unconfirmed(host);
+          }
         }
         None => break,
       }
@@ -4327,6 +4539,72 @@ mod tests {
     );
   }
 
+  /// A-272: an object whose ranked successor is neither a member nor a kept retirement is unresolved, never settled. Do
+  /// retire an owner, then its object's ranked successor (which carries the owner's takeover), then have the
+  /// successor's survivors confirm its share, so its retirement is pruned while the owner's is still kept. Expect the
+  /// object's lineage unresolved. Before, it answered Settled, and every holder told so reclaims its copy
+  /// (`takeover::resolve_held_objects`): the successor's absence was read as adoption.
+  #[test]
+  fn an_absent_ranked_successor_leaves_the_object_unresolved_not_settled() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    regional.take_over(first, scatter);
+    let object = (0..64u64)
+      .map(|index| ObjectId::new(first, index))
+      .find(|object| {
+        regional
+          .survivors_of(first)
+          .contains(&successor_of(&regional, first, *object))
+      })
+      .expect("an object of the first owner");
+    let carrier = successor_of(&regional, first, object);
+    regional.take_over(carrier, scatter);
+    for host in regional.survivors_of(carrier) {
+      regional.confirm(carrier, host);
+    }
+    assert!(
+      !regional.retired.contains_key(&carrier),
+      "the carrier's retirement was pruned on its survivors' confirmations"
+    );
+    assert!(
+      regional.retired.contains_key(&first),
+      "the first owner's is kept: its survivors have not all confirmed"
+    );
+    assert_eq!(
+      regional.lineage(first, object),
+      Lineage::Unresolved,
+      "the ranked successor is gone: nothing shows the object adopted"
+    );
+  }
+
+  /// A-272: a retirement the bound drops before every survivor confirmed leaves its objects unresolved. Do retire
+  /// hosts until the region keeps fewer retirements than it has, so the bound drops the oldest with no survivor having
+  /// confirmed. Expect it recorded as dropped unconfirmed and its object's lineage unresolved. Before, the dropped
+  /// retirement read Settled and its objects' holders reclaimed their copies.
+  #[test]
+  fn a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    let object = ObjectId::new(first, 3);
+    regional.take_over(first, scatter);
+    regional.take_over(HostId(2), scatter);
+    regional.take_over(HostId(3), scatter);
+    assert!(
+      !regional.retired.contains_key(&first),
+      "the bound dropped the oldest retirement"
+    );
+    assert_eq!(
+      regional.dropped_unconfirmed,
+      vec![first],
+      "recorded as dropped before its survivors confirmed"
+    );
+    assert_eq!(
+      regional.lineage(first, object),
+      Lineage::Unresolved,
+      "its object is unresolved, not settled"
+    );
+  }
+
   /// §4.8 "Promotion and takeover": once every survivor has confirmed its share the retirement is dropped, a
   /// holder's copy of one of its objects resolves as settled (stale), and the retired host may be admitted again
   /// — never before, while its retirement still ranks successors.
@@ -4473,6 +4751,7 @@ mod tests {
       next: Some(ObjectId::new(HostId(1), 8)),
       fenced: Some(HostEpoch(6)),
       unpromised: 3,
+      nothing: Vec::new(),
     }
   }
 
@@ -4486,12 +4765,13 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 9,
       after: Some(ObjectId::new(HostId(1), 3)),
+      named: Vec::new(),
     };
     let first_page = HostPrepare {
       after: None,
-      ..prepare
+      ..prepare.clone()
     };
-    for request in [prepare, first_page] {
+    for request in [prepare.clone(), first_page] {
       assert_eq!(HostPrepare::decode(&request.encode()), Ok(request));
     }
     let answer = sample_host_promise();
@@ -4506,11 +4786,11 @@ mod tests {
     assert!(answer.binds(&prepare));
     assert!(!answer.binds(&HostPrepare {
       epoch: HostEpoch(5),
-      ..prepare
+      ..prepare.clone()
     }));
     assert!(!answer.binds(&HostPrepare {
       departed: HostId(7),
-      ..prepare
+      ..prepare.clone()
     }));
     assert_eq!(
       answer.encode().len(),
@@ -4535,6 +4815,7 @@ mod tests {
       epoch: HostEpoch(4),
       generation: 9,
       after: Some(ObjectId::new(HostId(1), 3)),
+      named: Vec::new(),
     }
     .encode();
     let answer = sample_host_promise().encode();
@@ -4572,6 +4853,220 @@ mod tests {
       HostPromise::decode(&lying),
       Err(RegisterError::MalformedRecord)
     );
+  }
+
+  /// A-251 (b): a by-name question and its answer round-trip with their appended lists, and a page request or answer
+  /// with none keeps exactly the bytes it had before A-251, so a holder or successor that predates it reads them as
+  /// before. Do: encode a request naming two objects and an answer holding one and naming one held nothing of; encode
+  /// both with empty lists and compare with the fields alone. Expect: equal round trips; the empty lists add no bytes.
+  #[test]
+  fn a_named_question_and_its_answer_round_trip_and_a_page_keeps_its_bytes() {
+    let named = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: None,
+      named: vec![ObjectId::new(HostId(1), 3), ObjectId::new(HostId(1), 8)],
+    };
+    assert_eq!(HostPrepare::decode(&named.encode()), Ok(named.clone()));
+    assert_eq!(
+      named.encode().len(),
+      4 * size_of::<u64>() + 1 + OBJECT_LIST_HEADER_BYTES + 2 * OBJECT_BYTES
+    );
+    let page = HostPrepare {
+      named: Vec::new(),
+      ..named
+    };
+    assert_eq!(
+      page.encode().len(),
+      4 * size_of::<u64>() + 1,
+      "a page request's bytes are unchanged"
+    );
+    let answer = HostPromise {
+      nothing: vec![ObjectId::new(HostId(1), 9)],
+      ..sample_host_promise()
+    };
+    assert_eq!(HostPromise::decode(&answer.encode()), Ok(answer.clone()));
+    assert_eq!(
+      answer.encode().len(),
+      sample_host_promise().encode().len() + OBJECT_LIST_HEADER_BYTES + OBJECT_BYTES,
+      "an answer without the list keeps its bytes"
+    );
+  }
+
+  /// Hostile input on A-251's appended lists: a list cut anywhere, a count of zero (which no encoder writes, so a list
+  /// has one encoding), a count beyond what its bytes hold, and a stray byte after it are typed refusals, on the
+  /// question and on the answer.
+  #[test]
+  fn a_hostile_named_list_is_refused() {
+    let question = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: None,
+      named: vec![ObjectId::new(HostId(1), 3), ObjectId::new(HostId(1), 8)],
+    }
+    .encode();
+    let answer = HostPromise {
+      nothing: vec![ObjectId::new(HostId(1), 9), ObjectId::new(HostId(1), 10)],
+      ..sample_host_promise()
+    }
+    .encode();
+    let question_list = 4 * size_of::<u64>() + 1;
+    let answer_list = sample_host_promise().encode().len();
+    for (bytes, list_at, decodes) in [
+      (
+        &question,
+        question_list,
+        (|b: &[u8]| HostPrepare::decode(b).is_ok()) as fn(&[u8]) -> bool,
+      ),
+      (&answer, answer_list, |b: &[u8]| {
+        HostPromise::decode(b).is_ok()
+      }),
+    ] {
+      for cut in list_at + 1..bytes.len() {
+        assert!(!decodes(&bytes[..cut]), "cut at {cut}");
+      }
+      let mut zero = bytes[..list_at].to_vec();
+      zero.extend_from_slice(&0u32.to_le_bytes());
+      assert!(!decodes(&zero), "a count of zero");
+      let mut lying = bytes.clone();
+      lying[list_at..list_at + OBJECT_LIST_HEADER_BYTES].copy_from_slice(&u32::MAX.to_le_bytes());
+      assert!(!decodes(&lying), "a count beyond the bytes");
+      let mut trailing = bytes.clone();
+      trailing.push(0);
+      assert!(!decodes(&trailing), "a stray byte after the list");
+    }
+  }
+
+  /// An acceptor with two accepted records, moved from a retired owner, for the persisted-state tests (A-251).
+  fn moved_acceptor() -> Acceptor {
+    let generation = 9;
+    let mut acceptor = Acceptor::new(
+      HostId(5),
+      Authority {
+        generation,
+        owner: HostId(1),
+      },
+    );
+    let object = ObjectId::new(HostId(1), 3);
+    for (sequence, value) in [(1, b"first".to_vec()), (2, b"second".to_vec())] {
+      acceptor
+        .accept(&Record {
+          object,
+          sequence,
+          epoch: FIRST_EPOCH,
+          generation,
+          owner: HostId(1),
+          value,
+        })
+        .unwrap();
+    }
+    acceptor
+      .move_authority(
+        Authority {
+          generation,
+          owner: HostId(2),
+        },
+        true,
+      )
+      .unwrap();
+    acceptor
+  }
+
+  /// A-251: an acceptor's persisted state round-trips through its encoding whole, its moved-from owner too, and the
+  /// encoding is canonical. Do: encode a moved acceptor's state, decode it, rebuild, and encode again. Expect: the same
+  /// authority, moved-from owner, fence and positions, and the same bytes.
+  #[test]
+  fn an_acceptors_persisted_state_round_trips_through_its_encoding() {
+    use slates_wire::Wire;
+    let acceptor = moved_acceptor();
+    let bytes = acceptor.to_persisted().to_bytes();
+    let rebuilt =
+      Acceptor::from_persisted(HostId(5), PersistedAcceptor::from_bytes(&bytes).unwrap());
+    assert_eq!(rebuilt.authority(), acceptor.authority());
+    assert_eq!(rebuilt.moved_from(), Some(HostId(1)));
+    assert_eq!(rebuilt.persisted(), acceptor.persisted());
+    assert_eq!(rebuilt.to_persisted().to_bytes(), bytes);
+  }
+
+  /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its bounds: a body cut at every byte and a
+  /// stray byte after it are each a typed refusal, with and without a moved-from owner. The layout before A-251 (no
+  /// moved-from owner) is refused as truncated, never read as "moved from none" (§2.7).
+  #[test]
+  fn a_cut_or_overlong_persisted_acceptor_is_refused() {
+    use slates_wire::{Wire, WireError};
+    let mut acceptor = moved_acceptor();
+    let moved = acceptor.to_persisted().to_bytes();
+    acceptor.moved_from = None;
+    let unmoved = acceptor.to_persisted().to_bytes();
+    for bytes in [&moved, &unmoved] {
+      for cut in 0..bytes.len() {
+        assert!(
+          matches!(
+            PersistedAcceptor::from_bytes(&bytes[..cut]),
+            Err(WireError::Truncated { .. })
+          ),
+          "cut at {cut}"
+        );
+      }
+      let mut trailing = bytes.clone();
+      trailing.push(0);
+      assert!(matches!(
+        PersistedAcceptor::from_bytes(&trailing),
+        Err(WireError::TrailingBytes { count: 1 })
+      ));
+    }
+    // The layout before A-251: the same fields without the moved-from owner's option.
+    let host_bytes = HostId(0).to_bytes().len();
+    let before = &moved[..moved.len() - 1 - host_bytes];
+    assert!(matches!(
+      PersistedAcceptor::from_bytes(before),
+      Err(WireError::Truncated { .. })
+    ));
+  }
+
+  /// Hostile input on an acceptor's persisted encoding (A-251; CLAUDE.md §4), its contents: an accepted count and a
+  /// record length of `u32::MAX` and a foreign tag where the moved-from owner's option is are each a typed refusal, and
+  /// no single flipped bit panics: it is refused or decodes to a state that rebuilds and encodes back to the flipped
+  /// bytes.
+  #[test]
+  fn a_hostile_persisted_acceptor_is_refused() {
+    use slates_wire::{Wire, WireError};
+    let moved = moved_acceptor().to_persisted().to_bytes();
+    let host_bytes = HostId(0).to_bytes().len();
+    // Lengths past what arrived: the accepted count, then the first record's value length.
+    let count_at = host_bytes + 2 * size_of::<u64>();
+    let value_length_at = count_at + size_of::<u32>() + OBJECT_BYTES + 2 * size_of::<u64>();
+    for at in [count_at, value_length_at] {
+      let mut lying = moved.clone();
+      lying[at..at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+      assert!(
+        matches!(
+          PersistedAcceptor::from_bytes(&lying),
+          Err(WireError::Truncated { .. })
+        ),
+        "a length of u32::MAX at {at}"
+      );
+    }
+    let mut foreign = moved.clone();
+    let tag_at = moved.len() - 1 - host_bytes;
+    foreign[tag_at] = slates_wire::codec::OPTION_SOME + 1;
+    assert!(matches!(
+      PersistedAcceptor::from_bytes(&foreign),
+      Err(WireError::BadTag { .. })
+    ));
+    for bit in 0..moved.len() * 8 {
+      let mut flipped = moved.clone();
+      flipped[bit / 8] ^= 1 << (bit % 8);
+      if let Ok(decoded) = PersistedAcceptor::from_bytes(&flipped) {
+        let rebuilt = Acceptor::from_persisted(HostId(5), decoded.clone());
+        assert_eq!(decoded.to_bytes(), flipped, "bit {bit} decodes canonically");
+        assert_eq!(rebuilt.moved_from(), decoded.moved_from, "bit {bit}");
+      }
+    }
   }
 
   /// Banned item 8: retirements nobody confirms stay bounded by the members, the oldest dropped first, however

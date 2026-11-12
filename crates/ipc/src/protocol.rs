@@ -1268,6 +1268,23 @@ pub struct ShardReport {
   /// Of `peers_in_contact`, those with no formed probe session yet: zero once this node's mesh is up
   /// (`Daemon::fleet_meshed`). Appended.
   pub peers_unmeshed: u32,
+  /// This node's council configuration fetches as a learner (control shard only; empty elsewhere). Appended.
+  pub learner: LearnerReport,
+}
+
+/// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
+/// fetch, how many members that fetch asked, and how long ago it asked. What tells a learner that stopped learning
+/// from one that learns (a node held at version 8 while its council stood at 12 or 13, CI diag-raft-chaos-60).
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LearnerReport {
+  /// The council configuration version this node holds.
+  pub council_version: u64,
+  /// The version it held once its last fetch's replies were adopted; zero before any fetch.
+  pub fetched_version: u64,
+  /// The members its last fetch asked; zero before any fetch.
+  pub asked: u32,
+  /// How long ago, in nanoseconds of the daemon's clock, its last fetch asked; `None` before any.
+  pub last_asked_ago_ns: Option<u64>,
 }
 
 /// A partition's snapshots and their cadence, as `slates status` shows them (A-243).
@@ -1398,6 +1415,8 @@ pub struct FleetReport {
   pub peers_in_contact: u32,
   /// Of `peers_in_contact`, those with no formed probe session yet: the mesh is up at zero. Appended.
   pub peers_unmeshed: u32,
+  /// This node's council configuration fetches as a learner, from its control shard. Appended.
+  pub learner: LearnerReport,
 }
 
 impl RequestBody {
@@ -1853,6 +1872,9 @@ pub struct VolumeSummary {
   pub overlay: bool,
   /// Whether it is live-shipped (A-200). Appended.
   pub live_shipped: bool,
+  /// Why recovery could not rebuild it after the daemon's restart, when it could not (§4.8): every verb on it but its
+  /// destroy answers [`Refusal::NotRecovered`] with this cause. Appended.
+  pub not_recovered: Option<RecoveryCause>,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
@@ -3112,6 +3134,24 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
+}
+
+impl RecoveryCause {
+  /// The cause's kind, its variant's name, as every listing names it (`volume list`, its JSON, the MCP surface and
+  /// the SDKs, one definition): the whole cause, with its path or reason, is in the volume's status.
+  #[must_use]
+  pub fn kind(&self) -> &'static str {
+    match self {
+      RecoveryCause::NoImage => "NoImage",
+      RecoveryCause::BlocksUnclaimed => "BlocksUnclaimed",
+      RecoveryCause::BaseMissing { .. } => "BaseMissing",
+      RecoveryCause::BaseOnOwnMount { .. } => "BaseOnOwnMount",
+      RecoveryCause::BaseUnavailable { .. } => "BaseUnavailable",
+      RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
+      RecoveryCause::ImageRefused { .. } => "ImageRefused",
+      RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+    }
+  }
 }
 
 /// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.

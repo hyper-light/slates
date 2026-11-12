@@ -3501,6 +3501,23 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       0
     },
+    learner: if is_control_shard(state) {
+      learner_report(state)
+    } else {
+      slates_ipc::protocol::LearnerReport::default()
+    },
+  }
+}
+
+/// This node's council configuration fetches as a learner, for status ([`slates_ipc::protocol::LearnerReport`]).
+pub(crate) fn learner_report(state: &ShardState) -> slates_ipc::protocol::LearnerReport {
+  let now = slates_rt::futures::now_ns();
+  let log = state.learner_fetch;
+  slates_ipc::protocol::LearnerReport {
+    council_version: state.council.configuration().version,
+    fetched_version: log.fetched_version,
+    asked: log.asked,
+    last_asked_ago_ns: log.asked_at_ns.map(|at| now.saturating_sub(at)),
   }
 }
 
@@ -3687,6 +3704,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     peers_unmeshed: shards
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
+    learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
   }
 }
 
@@ -4404,6 +4422,7 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     Some(Err(refusal)) => return refused(refusal),
     Some(Ok(())) => {}
   }
+  let mut fenced = Vec::new();
   for shard in shards.iter().copied() {
     let marked = crate::xshard::call_in_shard_time(
       origin,
@@ -4415,15 +4434,44 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
     match marked {
       None => return refused(Refusal::NotFound),
       Some(Err(refusal)) => return refused(refusal),
-      Some(Ok(())) => {}
+      Some(Ok(mounts)) if mounts.is_empty() => {}
+      Some(Ok(mounts)) => fenced.push((shard, mounts)),
     }
   }
+  revoked_mounts_ended(origin, fenced).await;
   ReplyBody::Revoked
 }
 
+/// Waits until every FUSE mount the revocation fenced (each shard's, by attachment and volume) has had its kernel drop
+/// what it cached and ended (AUD-29-84; `crate::fuse::fence_if_mounted`), so no process reads, after the revocation is
+/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most [`crate::told::TOLD_WAIT_NS`],
+/// the bound a writer waits for the same kernels to be told of a change; one past it is counted and the revocation
+/// acknowledged anyway, since every request of the mount is already refused.
+#[cfg(target_os = "linux")]
+async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
+  for (shard, mounts) in fenced {
+    let ended = crate::xshard::task_within(
+      origin,
+      shard,
+      move || crate::fuse::revoked_mounts_ended(mounts),
+      crate::told::TOLD_WAIT_NS,
+    )
+    .await;
+    if ended.is_none() {
+      let _ = crate::state::with_state_counted(|s| s.count(REVOKED_MOUNTS_OVERDUE, 1));
+    }
+  }
+}
+
+/// Elsewhere no mount is fenced this way: nothing to wait for.
+#[cfg(not(target_os = "linux"))]
+async fn revoked_mounts_ended(_origin: u16, _fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {}
+
 /// Marks every slot on this shard bound to `consumer` revoked, so its next verb's gate — one local read
 /// in `serve` — refuses before any effect (banned item 10: no cross-shard call on a write path).
-fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
+/// Returns the FUSE mounts the ending fenced, each by attachment and volume: they end once their kernels have dropped
+/// what they cached, which the revocation awaits (`revoked_mounts_ended`).
+fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<Vec<(u64, DbVolumeId)>, Refusal> {
   let bound: Vec<Handle<ClientSlot>> = s
     .clients
     .iter()
@@ -4450,10 +4498,27 @@ fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
     .into_iter()
     .cloned()
     .collect();
-  for record in held {
-    end_attachment(s, &record, Ending::Otherwise).map_err(|e| refusal_of_db(&e))?;
+  for record in &held {
+    end_attachment(s, record, Ending::Otherwise).map_err(|e| refusal_of_db(&e))?;
   }
-  Ok(())
+  Ok(fenced_mounts(s, &held))
+}
+
+/// The FUSE mounts of `ended` attachments still served on this shard: fenced, and ending once their kernels have dropped
+/// what they cached (`crate::fuse::fence_if_mounted`).
+#[cfg(target_os = "linux")]
+fn fenced_mounts(s: &ShardState, ended: &[AttachmentRecord]) -> Vec<(u64, DbVolumeId)> {
+  ended
+    .iter()
+    .filter(|record| s.fuse_mounts.contains_key(&record.id))
+    .map(|record| (record.id, record.volume))
+    .collect()
+}
+
+/// Elsewhere there is no FUSE mount.
+#[cfg(not(target_os = "linux"))]
+fn fenced_mounts(_s: &ShardState, _ended: &[AttachmentRecord]) -> Vec<(u64, DbVolumeId)> {
+  Vec::new()
 }
 
 /// Sets `subject`'s rights on `volume` (§4.13 "Access lists": `admin` covers changing the list; the owner
@@ -8481,6 +8546,10 @@ pub(crate) fn end_attachment(
     #[cfg(target_os = "linux")]
     crate::fuse::unmount_if_mounted(state, record.id);
   }
+  // However it ends, a FUSE mount of the attachment serves nothing more: its registry attachment is revoked, as a host
+  // mount's is below, so a revoked consumer's mount reaches nothing (AUD-29-84).
+  #[cfg(target_os = "linux")]
+  crate::fuse::fence_if_mounted(state, record.id);
   // A WinFsp mount ends with its attachment, however it ends: a drive letter has no directory beneath it for a later
   // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
   #[cfg(windows)]
@@ -8495,6 +8564,8 @@ pub(crate) fn end_attachment(
     state.attachments.revoke(mount.registry);
     state.attachments.drain(mount.registry);
   }
+  // What NFSv4 clients held open through it is held no longer: no request is served under it again (A-260).
+  crate::nfs_state::release_attachment(state, record.volume, record.id);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -8667,6 +8738,9 @@ fn resize(
 
 fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
   if let Some(reply) = crate::merge_service::destroy_merge_volume(state, principal, volume) {
+    return reply;
+  }
+  if let Some(reply) = destroy_unrecovered(state, principal, volume) {
     return reply;
   }
   let (handle, record) = match find(state, volume) {
@@ -8856,18 +8930,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       // If this volume is a clone, capture its pin on the origin snapshot before the record goes, so
       // the pin can be released once its destroy completes (§4.5): the origin can then reclaim that
       // snapshot. Best-effort — the origin may be gone or on another shard.
-      let origin_pin = state
-        .db
-        .partition()
-        .lineage(id)
-        .map(|e| (e.origin_volume, e.origin_snapshot))
-        .or_else(
-          || match state.db.partition().volume(id).map(|record| &record.base) {
-            // An image volume's pin on the snapshot it was built from goes with it (A-160).
-            Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
-            _ => None,
-          },
-        );
+      let origin_pin = origin_pin_of(state, id);
       let now = state.clock.monotonic_ns();
       let name = state
         .db
@@ -8890,17 +8953,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       if let Some(name) = name {
         release_name_alias(state, id, &name);
       }
-      if let Some((origin_volume, origin_snapshot)) = origin_pin
-        && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
-      {
-        unpin_origin(
-          state,
-          origin_handle,
-          SnapshotId {
-            value: origin_snapshot.value,
-          },
-        );
-      }
+      release_origin_pin(state, origin_pin);
       if let Ok(slot) = state.volumes.remove(handle) {
         release_slot_credits(state, &slot);
       }
@@ -8910,6 +8963,112 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any
+}
+
+/// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
+/// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
+fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSnapshotId)> {
+  state
+    .db
+    .partition()
+    .lineage(id)
+    .map(|e| (e.origin_volume, e.origin_snapshot))
+    .or_else(
+      || match state.db.partition().volume(id).map(|record| &record.base) {
+        Some(BaseRecord::Image { volume, snapshot }) => Some((*volume, *snapshot)),
+        _ => None,
+      },
+    )
+}
+
+/// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
+/// Best-effort: the origin may be gone or on another shard.
+fn release_origin_pin(state: &mut ShardState, origin_pin: Option<(DbVolumeId, DbSnapshotId)>) {
+  if let Some((origin_volume, origin_snapshot)) = origin_pin
+    && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
+  {
+    unpin_origin(
+      state,
+      origin_handle,
+      SnapshotId {
+        value: origin_snapshot.value,
+      },
+    );
+  }
+}
+
+/// Destroys a volume recovery could not rebuild (§4.8; GAPS, 2026-11-08), or `None` for any other volume. It has no
+/// slot and holds nothing in this process, so, as a merge volume's destroy is, it is recorded in one step: its
+/// attachments' records end, then `Destroying`, the lease's release and `VolumeDestroyed`, which takes its snapshots'
+/// records, its lineage and its keys with it and leaves the tombstone a fleet's holders release its copies by. Its name
+/// alias and its pin on an origin's snapshot are given back. Nothing is materialized. Before, every verb on such a
+/// volume answered `NotRecovered`, `destroy` too, so its record stayed for good (banned item 8).
+fn destroy_unrecovered(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if !state.unrecovered.contains_key(&id) {
+    return None;
+  }
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    state.unrecovered.remove(&id);
+    return Some(refused(Refusal::NotFound));
+  };
+  if !rights_of(&record, principal).admin {
+    return Some(forbidden("destroy"));
+  }
+  // A volume whose snapshot a green names as its origin is held with it (A-217), as a rebuilt one is.
+  if state
+    .db
+    .partition()
+    .green_origin_refs()
+    .any(|(_, held)| held.volume == id)
+  {
+    return Some(refused(refusal_of_vfs(&slates_vfs::VfsError::Pinned)));
+  }
+  Some(match record_unrecovered_destroy(state, &record) {
+    Ok(()) => ReplyBody::Destroyed,
+    Err(e) => refused(refusal_of_db(&e)),
+  })
+}
+
+/// Records [`destroy_unrecovered`]'s one step for `record`, then gives back what the volume held outside the catalog.
+/// A refusal part-way leaves what was recorded: a `Destroying` volume is completed at the next start
+/// (`complete_recovered_destroys`), and one still unrecovered is destroyed again.
+fn record_unrecovered_destroy(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Result<(), DbError> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)?;
+  }
+  let origin_pin = origin_pin_of(state, record.id);
+  let now = state.clock.monotonic_ns();
+  for op in [
+    Op::VolumeStateChanged {
+      id: record.id,
+      state: VolumeState::Destroying,
+    },
+    Op::LeaseReleased { volume: record.id },
+    Op::VolumeDestroyed { id: record.id },
+  ] {
+    state.db.mutate(&mut state.segment, &op, now)?;
+  }
+  state.unrecovered.remove(&record.id);
+  release_name_alias(state, record.id, &record.name);
+  release_origin_pin(state, origin_pin);
+  crate::live_ship::forget(state, record.id);
+  retire_local_tombstones(state);
+  Ok(())
 }
 
 /// Returns every credit a torn-down volume held to the shard's ledgers (§4.2 accounting through
@@ -9831,6 +9990,7 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
         .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
       overlay: matches!(v.base, BaseRecord::Path { .. }),
       live_shipped: v.policy.live_shipped,
+      not_recovered: state.unrecovered.get(&v.id).cloned(),
     })
     .collect();
   ReplyBody::Listed { volumes }
@@ -10660,6 +10820,9 @@ async fn rebuild_records(
       let (snapshots, attachments) = reconcile_lost(state, record);
       rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
       rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+      // The NFSv4 opens and delegations the partition journaled hold their files again before the settle reclaims the
+      // files no one holds (A-260): the image carries none of these holds.
+      crate::nfs_state::hold_recovered(state, record.id);
       rebuilt.orphans_reclaimed = rebuilt
         .orphans_reclaimed
         .saturating_add(settle_references(state, record));
@@ -12433,6 +12596,11 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
 /// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
 /// its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
+/// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
+/// `told::TOLD_WAIT_NS` (AUD-29-84): its requests were refused, but a page its kernel held may have been read meanwhile.
+/// Zero is the healthy reading.
+#[cfg(target_os = "linux")]
+const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 #[cfg(target_os = "linux")]

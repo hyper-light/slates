@@ -533,9 +533,9 @@ pub struct ShardState {
   /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
   /// bounded by the neighbourhood.
   pub member_anchors: std::collections::BTreeMap<slates_db::HostId, u64>,
-  /// The recipient public keys of peers by stable anchor, asked over their authenticated sessions and kept (A-92 piece
-  /// 4b), bounded by the fleet's peer capacity.
-  pub peer_recipients: BTreeMap<u64, hyper_seal::recipient::RecipientPublic>,
+  /// The recipient public keys of peers by stable anchor, each with the member it was learned from, asked over their
+  /// authenticated sessions and kept (A-92 piece 4b), bounded by the fleet's peer capacity (`fleet::kept_recipient`).
+  pub peer_recipients: BTreeMap<u64, (slates_db::HostId, hyper_seal::recipient::RecipientPublic)>,
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.
@@ -756,6 +756,9 @@ pub struct ShardState {
   pub config_refresh_wanted: bool,
   /// When an uninitialized council learner fetches next, and the wait after it (`fleet::next_learner_wait`).
   pub(crate) council_learner_pace: crate::fleet::LearnerPace,
+  /// This node's last council configuration fetch as a learner: when it asked, how many, and the version it held after
+  /// (`fleet::drive_learner_fetch`), for status.
+  pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
@@ -810,6 +813,19 @@ pub struct ShardState {
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
   pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
+  /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
+  /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
+  pub injected_deaf_session: Option<slates_db::HostId>,
+  /// Test support (never reachable from the wire): a peer whose record link pages no discovery while set, so a test can
+  /// hold the one rescue that does not depend on a borrower (`Daemon::inject_discovery_hold`). `None` in production.
+  pub injected_discovery_hold: Option<slates_db::HostId>,
+  /// When each peer's record session was last dropped as failed or silent (a peer's reset, the transport's silence rule,
+  /// a discovery page that failed), until the forward lane's first reply on its replacement logs and counts the gap. One
+  /// entry a peer, so bounded by the roster.
+  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, u64>,
+  /// How long after the last silent session's drop the forward lane's first reply on its replacement came (logged too):
+  /// what a test or an operator reads to see the lane back on a live session. `None` until it has happened.
+  pub dead_session_recovered_ns: Option<u64>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,

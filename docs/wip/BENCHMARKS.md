@@ -8626,6 +8626,81 @@ in order, up to the last whole record's size, and appended them as the credit fr
 
 Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
 
+### The council's voter change after a candidate's node is replaced (§4.8; 2026-11-09, diag-live-durability-71)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, main 80be552a. **Flow:**
+a three-node anchored fleet; one candidate's node is killed and a fresh one started in its place (a new member id),
+quiet or under the write stream. Every node's status is polled every 10 ms for `fleet_council_joint` and the voter
+ids. Joint closed means every node reports no joint configuration, with the new id seated and the old one gone. 8
+runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the kill.
+
+| arch, load | answered → joint entered | joint open (entered → closed everywhere) | kill → closed |
+|---|---|---|---|
+| x86, quiet | median 1.90 s, max 2.61 s | median 0.21 s, max 0.35 s | median 2.16 s, max 2.88 s |
+| x86, loaded | median 1.93 s, max 2.87 s | median 0.15 s, max 0.33 s | median 2.17 s, max 3.32 s |
+| arm, quiet | median 1.91 s, max 2.30 s | median 0.21 s, max 0.22 s | median 2.15 s, max 2.56 s |
+| arm, loaded | median 2.00 s, max 4.02 s | median 0.22 s, max 1.18 s | median 2.23 s, max 5.26 s |
+
+**Reading.** The joint follows the replacement's catch-up on the council log, about 0.2 s. The ~1.9 s before it opens
+is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
+dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
+that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
+for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+it in 6 of 6 x86 runs.
+
+### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
+
+**The change.** A lane's install exchange ends only on its reply or its deadline, and the deadline has no ceiling (up to
+77 s and 614 s measured, diag-live-durability-56). The watch ended it early once the owner kept no direct contact with
+the holder (`keeps_direct_contact_with`) and the session had acknowledged nothing for a silence. That silence was first
+a fixed liveness budget (1 s, `agents/live-durability-watch-2`), then the session's own persistent-congestion duration:
+three probe timeouts, each at least the initial 666 ms (`agents/live-durability-watch-3`). On the simulated fabric the
+fixed second cut a live holder whose acknowledgements a queue held back 1.1 to 2.0 s apart; the duration never did.
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, the watch switched on or off
+in one binary.
+
+**diag-live-durability-65: a holder restarted mid-install** (watch-2's rule, 12 restarts and 10 rolling partitions a
+leg, at the budgets the code computes and at a 30 s floor on installs of 64 KiB or more):
+
+| leg | restarts over 1 s | catch-up median | worst | partitions passed | cuts |
+|---|---|---|---|---|---|
+| real, off, x86 | 1 of 12 | 31 ms | 3.87 s | 10 of 10 | 0 |
+| real, on, x86 | 0 of 12 | 24 ms | 0.05 s | 10 of 10 | 0 |
+| real, off, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| real, on, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| floor, off, x86 | 4 of 12 | 894 ms | 7.01 s | 10 of 10 | 0 |
+| floor, on, x86 | 2 of 12 | 25 ms | 32.42 s | 10 of 10 | 1 |
+| floor, off, arm | 7 of 12 | 2,038 ms | 13.05 s | 10 of 10 | 0 |
+| floor, on, arm | 1 of 12 | 21 ms | 29.14 s | 10 of 10 | 0 |
+
+The watch's case does not occur in this flow: the restarted holder's successor answers under its id 3 to 27 ms after
+the kill, so the owner never loses contact, and no kept restart log shows a cut. diag-67 and -68 meant to stop a holder
+for good but armed the stop for any daemon, and the other candidate stopped itself: none of 96 runs reached the case.
+
+**diag-live-durability-70: a holder stopped on its install for 20 s, then resumed** (watch-3's rule, 30 s floor, the
+stop armed for the target alone, 12 runs a leg, 48 of 48 passed, every one stopped on its install). Catch-up is from the
+resume until the holder is within 50 entries of the owner's head; none = not within 50 s:
+
+| leg | the stopped holder's exchange | catch-up, each run (s) | median | not caught |
+|---|---|---|---|---|
+| off, x86 | held 20.1 s, then answered (the stale install) | 2.05 3.88 2.67 none 2.35 2.22 1.31 none 2.01 none none 2.06 | 2.14 s | 4 of 12 |
+| on, x86 | cut, median 2.12 s (12 of 12) | 1.88 2.04 2.86 none 27.73 11.06 none 1.86 2.16 none none 2.22 | 2.19 s | 4 of 12 |
+| off, arm | held 20.1 s, then answered | 3.68 none 6.40 1.84 33.83 6.20 3.32 6.40 4.09 2.01 1.29 2.35 | 3.68 s | 1 of 12 |
+| on, arm | cut, median 3.48 s (12 of 12) | 1.66 1.80 2.35 3.44 1.61 3.72 1.35 3.95 3.03 1.72 1.68 1.87 | 1.84 s | 0 of 12 |
+
+Mann–Whitney, off slower than on: x86 U = 68.5 of 144, z = −0.21, p ≈ 0.84 (even; 4 of 12 over 4 s or not caught
+off, 6 on); arm U = 111.5 of 144, z = 2.28, p ≈ 0.023 (6 of 12 off, 0 on), the two sets overlapping (on's worst
+3.95 s against off's median 3.68 s).
+
+**Reading.** The watch does what its rule says: the stopped holder's exchange was cut every time, a little past 2 s on
+x86 and later on arm, where the session's probe timeout is larger. On x86 catch-up after the resume is even, with the
+watch's tail worse (27.7 s against 3.88 s worst). On arm it is likely faster with the watch, but no mechanism is known:
+the freed lane leads to a holder that is stopped anyway, and answering the stale install on resume caught up in most
+runs as fast as a fresh image. **Held, not landed:** the decision waits on why arm's runs without the watch stall after
+the resume (GAPS). If it is the stale install answered late, the watch earns its place on arm; if it is the slow
+catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
+are that slow catch-up.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -11837,6 +11912,146 @@ it is **rejected**, and A-198 stays as written. The ledger's own writes, the oth
 against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
 2.3 against 3.2 and 2.0 against 2.8).
 
+### Cut (c): an open's confirmation off the receive worker's path (A-274; audit step 7; 2026-11-09)
+
+**The change.** After sending a successful Create's response the receive worker had waited for the shard to confirm the
+open: a round on every open, 9.9 µs at the mean on arm64 quiet and 139.6 µs loaded (`diag-winfsp-overlap-50`, run
+42506936806). Now it posts the confirmation, wakes the mount's task and goes on; the journal keeps the open's response,
+settled, until the confirmation is applied (A-274, `agents/winfsp-overlap-24`).
+
+**The A/B.** Diag `diag-winfsp-overlap-51` (run 42675148419): main `9ba16222`, a control (the same commit built again, the
+bench's own floor) and the cut (`b9e300cd`), interleaved on one VM of each runner, quiet and loaded (two spinners a
+logical CPU), ten runs a lane, 0 failed, the list rotating each run (windows-ab.sh), with the stall detector (no stall).
+windows-11-arm: win11-vs2026-arm64 20261101.203.1, 4 CPUs. windows-latest: win25-vs2026 20261103.298.1, 4 CPUs. Each cell
+is the arm minus main within each run, every run shown, sorted; the cut is called against the control's spread.
+
+**Verdict: it lands.** A one-path change is judged on loaded tails first.
+- arm64 loaded is faster within every run on stat, write, rename and unlink:
+  - p50: −6.3, −23.8, −12.8 and −16.0 µs (10 of 10 runs each); write and unlink beyond the control's spread;
+  - p99: −1,750, −1,522, −1,395 and −2,375 µs (8, 9, 9 and 8 of 10); write beyond the control's spread, the rest
+    inside its very wide spread.
+- No x86_64 loaded p99 moves beyond the control's spread.
+- **The cost: a quiet stat.** p50 +8.1 µs on arm64 (3 of 10 runs faster; beyond the control's −3.8 to +2.9) and +4.0 µs
+  on x86_64 (0 of 10 faster; the control's −5.8 to +16.4). Under no load the shard has time to spare, and the wake the
+  post makes costs about what the round it replaces did. The variant that posts without the wake is measured next, as
+  its own A/B against this one, with "a Create then a security query" a named op.
+
+#### arm64 (windows-11-arm): 10 runs
+
+arm64 (windows-11-arm), loaded, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1231.8 | -863.4 -686.0 -114.1 +64.0 +118.0 +317.5 +461.9 +588.1 +627.3 +796.9 | +317.5 (3/10 faster) | -513.1 -506.2 -440.1 -159.9 +63.7 +94.3 +331.6 +678.0 +722.9 +1105.2 | +94.3 (4/10 faster) | within the control |
+| stat | 4040.4 | -9402.2 -7296.6 -3977.3 -3423.7 -2850.0 -1749.8 -1162.8 -899.9 +2612.8 +6183.1 | -1749.8 (8/10 faster) | -6781.1 -3311.3 -2125.9 -1847.2 -959.7 -656.4 -182.1 +324.1 +1320.4 +1585.5 | -656.4 (7/10 faster) | within the control |
+| read | 92.8 | -3.0 -1.4 -0.2 +0.4 +0.7 +2.6 +3.2 +4.1 +4.4 +6.0 | +2.6 (3/10 faster) | -3.1 -2.7 -1.6 -1.4 -0.9 -0.8 +0.7 +1.3 +1.3 +6.3 | -0.8 (6/10 faster) | within the control |
+| write | 2761.0 | -2755.0 -2635.2 -2557.1 -2118.6 -1906.9 -1522.4 -1301.6 -1273.0 -55.4 +323.3 | -1522.4 (9/10 faster) | -959.4 -914.1 +172.3 +297.6 +398.4 +483.0 +933.5 +1050.3 +1194.3 +7459.0 | +483.0 (2/10 faster) | **faster** beyond the control |
+| rename | 36452.2 | -2687.0 -2423.7 -1872.5 -1851.0 -1410.7 -1394.5 -1349.0 -1137.6 -300.8 +235.0 | -1394.5 (9/10 faster) | -1782.2 -1284.8 -629.2 -205.2 +238.9 +341.4 +468.7 +874.1 +1612.9 +3360.7 | +341.4 (4/10 faster) | within the control |
+| unlink | 27342.3 | -5623.1 -5382.4 -4402.1 -3925.8 -2782.2 -2375.0 -876.8 -204.3 +453.0 +1940.4 | -2375.0 (8/10 faster) | -6144.8 -3447.3 -2869.9 -1776.1 +771.6 +1466.4 +2048.0 +2093.5 +3483.9 +6100.7 | +1466.4 (4/10 faster) | within the control |
+| fsync | 378.5 | -261.8 -192.5 -130.0 -36.1 -30.5 -5.9 +0.3 +7.0 +22.3 +55.6 | -5.9 (6/10 faster) | -262.4 -131.4 -90.1 -42.1 -27.4 -23.1 -0.5 +17.9 +18.0 +19.2 | -23.1 (7/10 faster) | within the control |
+| open | 42098.2 | -3411.0 -2092.8 -204.9 +570.0 +2123.8 +3448.0 +3631.3 +4602.9 +4720.6 +5712.2 | +3448.0 (3/10 faster) | -2824.0 -2724.6 -11.6 +331.8 +2738.3 +2754.4 +2923.2 +4098.6 +4946.9 +5601.7 | +2754.4 (3/10 faster) | within the control |
+| close | 41643.0 | -3062.9 -1921.0 -1891.7 -1306.0 -602.7 +1316.0 +1891.2 +2466.0 +2504.1 +2601.3 | +1316.0 (5/10 faster) | -4538.2 -2128.7 -1042.2 +510.3 +643.1 +1742.8 +1788.2 +1870.0 +2720.7 +5440.6 | +1742.8 (3/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 214.5 | -7.3 -4.6 -2.5 -2.4 -0.7 +0.2 +1.4 +2.1 +5.3 +8.8 | +0.2 (5/10 faster) | -7.6 -5.6 -3.5 -3.5 -2.7 -1.8 -1.7 -1.1 +2.6 +10.6 | -1.8 (8/10 faster) | within the control |
+| stat | 160.8 | -8.8 -8.6 -8.2 -7.7 -6.5 -6.3 -6.2 -5.3 -5.0 -3.2 | -6.3 (10/10 faster) | -8.5 -6.0 -4.1 -4.1 -1.6 -1.6 -1.5 -0.9 +0.3 +1.4 | -1.6 (8/10 faster) | within the control |
+| read | 50.3 | -2.5 -1.2 -1.1 -0.4 -0.4 -0.1 +0.3 +1.0 +1.5 +2.4 | -0.1 (6/10 faster) | -1.7 -0.9 -0.8 -0.6 -0.3 -0.1 +0.2 +0.4 +1.5 +1.8 | -0.1 (6/10 faster) | within the control |
+| write | 200.8 | -34.5 -33.5 -30.1 -28.9 -27.9 -23.8 -21.7 -17.3 -17.1 -15.7 | -23.8 (10/10 faster) | -7.1 -2.6 -2.3 -2.2 -2.0 -0.2 +0.7 +3.6 +3.8 +4.1 | -0.2 (6/10 faster) | **faster** beyond the control |
+| rename | 535.2 | -54.6 -44.5 -30.0 -27.9 -22.9 -12.8 -8.1 -7.5 -5.8 -2.1 | -12.8 (10/10 faster) | -51.0 -13.1 -8.9 -7.3 -2.0 +3.7 +9.1 +16.2 +21.9 +34.9 | +3.7 (5/10 faster) | within the control |
+| unlink | 351.1 | -24.3 -21.8 -20.9 -20.2 -17.7 -16.0 -15.1 -13.4 -8.5 -7.6 | -16.0 (10/10 faster) | -13.1 -9.8 -8.5 -6.4 -5.0 -3.7 -1.3 +1.5 +4.7 +11.9 | -3.7 (7/10 faster) | **faster** beyond the control |
+| fsync | 115.7 | -6.5 -3.9 -1.7 -1.4 +2.2 +2.8 +4.4 +6.8 +9.6 +11.1 | +2.8 (4/10 faster) | -12.6 -10.9 -8.9 -7.2 -4.4 -2.6 -1.0 -0.7 +4.0 +13.2 | -2.6 (8/10 faster) | within the control |
+| open | 4040.9 | -159.6 -152.8 -147.9 -80.1 -44.4 +11.4 +166.8 +198.0 +243.9 +387.3 | +11.4 (5/10 faster) | -365.5 -306.1 -258.4 -166.5 +110.3 +122.3 +164.4 +177.1 +224.3 +241.1 | +122.3 (4/10 faster) | within the control |
+| close | 4683.7 | -340.5 -314.2 -165.3 -147.0 -71.0 -43.3 +143.7 +248.2 +268.9 +372.7 | -43.3 (6/10 faster) | -285.0 -223.0 -222.2 -175.4 +48.6 +56.9 +103.7 +153.2 +202.0 +249.5 | +56.9 (4/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 453.0 | -50.7 -46.7 -20.6 -8.7 +7.5 +15.1 +20.7 +26.7 +29.5 +59.3 | +15.1 (4/10 faster) | -115.3 -72.9 -27.0 -26.6 -0.3 +18.2 +21.5 +36.2 +43.8 +114.1 | +18.2 (5/10 faster) | within the control |
+| stat | 284.2 | -187.2 -161.8 -109.0 -76.8 -42.7 -12.4 -9.0 +33.3 +50.3 +123.5 | -12.4 (7/10 faster) | -199.6 -93.0 -79.0 -12.1 +17.9 +41.4 +62.3 +76.6 +193.5 +221.6 | +41.4 (4/10 faster) | within the control |
+| read | 77.9 | -6.9 -6.4 -4.6 -4.3 -3.5 -3.5 +2.7 +4.1 +6.7 +12.1 | -3.5 (6/10 faster) | -4.8 -2.1 -1.9 -1.9 -1.8 -0.5 +1.6 +3.3 +3.8 +7.6 | -0.5 (6/10 faster) | within the control |
+| write | 266.8 | -37.2 -15.2 -13.4 -5.1 +1.5 +1.5 +5.8 +7.8 +13.5 +18.8 | +1.5 (4/10 faster) | -33.4 -32.8 -18.1 -15.8 -5.7 +10.2 +10.7 +12.1 +29.7 +38.6 | +10.2 (5/10 faster) | within the control |
+| rename | 1265.5 | -437.5 -364.5 -168.8 -132.0 -6.5 +101.8 +278.1 +327.3 +385.2 +918.1 | +101.8 (5/10 faster) | -715.7 -58.6 -16.5 +84.8 +150.6 +201.5 +382.7 +649.4 +669.4 +809.2 | +201.5 (3/10 faster) | within the control |
+| unlink | 564.7 | -141.1 -77.3 -65.6 -31.3 -28.4 +5.4 +5.6 +17.0 +89.5 +150.6 | +5.4 (5/10 faster) | -102.9 -25.7 -0.4 +31.2 +39.0 +67.2 +81.6 +101.6 +185.9 +234.5 | +67.2 (3/10 faster) | within the control |
+| fsync | 204.7 | -31.5 -20.2 -12.5 -10.3 -9.0 +2.6 +2.8 +5.6 +7.8 +12.1 | +2.6 (5/10 faster) | -25.6 -19.4 -11.2 -5.0 -4.7 -0.7 +2.3 +2.9 +3.7 +11.7 | -0.7 (6/10 faster) | within the control |
+| open | 5731.1 | -256.7 -248.7 -229.7 -178.6 -103.3 -100.0 -17.5 +155.8 +389.7 +391.5 | -100.0 (7/10 faster) | -392.5 -383.9 -234.1 -95.5 -18.0 -4.4 +10.3 +70.6 +178.0 +700.9 | -4.4 (6/10 faster) | within the control |
+| close | 6876.5 | -1182.5 -596.2 -393.6 -322.8 -295.5 -175.2 -95.4 +310.6 +981.6 +1221.5 | -175.2 (7/10 faster) | -1866.0 -1128.3 -112.4 -96.9 -70.5 +55.9 +132.8 +509.9 +4072.7 +6155.7 | +55.9 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 200.2 | -11.1 -3.5 -1.3 -0.9 +0.4 +0.4 +2.0 +7.2 +9.9 +10.8 | +0.4 (4/10 faster) | -5.4 -1.6 +0.0 +0.2 +0.6 +3.6 +4.1 +5.5 +6.0 +7.8 | +3.6 (2/10 faster) | within the control |
+| stat | 150.1 | -3.0 -0.8 -0.7 +0.4 +6.9 +8.1 +8.8 +15.4 +15.6 +20.8 | +8.1 (3/10 faster) | -3.8 -3.7 -1.5 -0.8 +0.3 +0.7 +1.1 +1.4 +1.9 +2.9 | +0.7 (4/10 faster) | **slower** beyond the control |
+| read | 41.9 | -10.3 -3.7 -1.3 -1.1 -0.7 -0.4 +3.7 +4.5 +6.6 +11.6 | -0.4 (6/10 faster) | -3.7 -1.4 -0.1 +0.4 +1.4 +3.4 +4.6 +4.9 +6.5 +9.7 | +3.4 (3/10 faster) | within the control |
+| write | 97.9 | -4.9 -3.3 -2.5 -1.6 -1.1 -0.6 +0.0 +0.1 +3.8 +6.1 | -0.6 (6/10 faster) | -4.4 -4.0 -2.1 -1.7 -1.2 -1.1 -0.9 -0.1 +1.2 +3.4 | -1.1 (8/10 faster) | within the control |
+| rename | 464.4 | -15.2 -14.3 -6.0 -1.9 -0.6 +0.3 +6.4 +8.0 +8.3 +9.0 | +0.3 (5/10 faster) | -16.5 -9.5 -6.5 -5.2 +0.6 +3.6 +3.7 +4.5 +6.0 +9.3 | +3.6 (4/10 faster) | within the control |
+| unlink | 288.1 | -8.8 -7.3 -5.4 -4.6 -2.3 -2.1 +0.9 +1.4 +3.2 +4.0 | -2.1 (6/10 faster) | -9.2 -5.3 -3.4 +1.0 +2.2 +3.9 +4.3 +6.7 +7.4 +9.0 | +3.9 (3/10 faster) | within the control |
+| fsync | 112.5 | -6.0 -5.3 -4.3 -1.7 -1.1 -0.7 +1.6 +2.1 +2.3 +11.3 | -0.7 (6/10 faster) | -7.8 -6.7 -6.0 -2.8 -1.7 -1.4 -1.3 -0.9 -0.1 +7.4 | -1.4 (9/10 faster) | within the control |
+| open | 1156.8 | -705.1 -202.4 -135.2 -93.4 -19.2 +178.1 +330.3 +856.4 +2450.4 +2656.1 | +178.1 (5/10 faster) | -176.3 -105.4 +109.4 +132.4 +153.7 +221.0 +262.8 +341.1 +751.8 +2338.5 | +221.0 (2/10 faster) | within the control |
+| close | 3826.4 | -115.8 -72.2 -15.5 -10.3 -3.5 +1.1 +11.8 +26.3 +89.7 +147.3 | +1.1 (5/10 faster) | -102.8 -55.6 -50.4 -21.1 +7.5 +9.0 +13.0 +28.9 +30.3 +52.9 | +9.0 (4/10 faster) | within the control |
+
+#### x86_64 (windows-latest): 10 runs
+
+x86_64 (windows-latest), loaded, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 102497.6 | -31758.8 -2422.8 -2050.7 -1672.5 -1317.9 -1314.0 +722.9 +1214.3 +4083.9 +7175.7 | -1314.0 (6/10 faster) | -30827.6 -3854.9 -3376.3 -3300.6 -2394.8 -2281.3 -1824.3 -956.9 +1966.3 +2243.4 | -2281.3 (8/10 faster) | within the control |
+| stat | 3857.9 | -15959.9 -5365.2 -1247.3 +110.0 +412.7 +1989.6 +3724.1 +5488.1 +12598.8 +19597.3 | +1989.6 (3/10 faster) | -15916.3 -2745.8 -2140.8 -207.0 -52.6 +279.6 +1854.8 +2569.1 +5079.0 +5874.3 | +279.6 (5/10 faster) | within the control |
+| read | 291.2 | -15.5 -15.3 -6.7 -6.1 -0.4 +2.4 +3.4 +4.9 +5.6 +24.4 | +2.4 (5/10 faster) | -23.0 -18.0 -6.5 -4.6 -2.4 -1.1 +9.2 +11.9 +12.6 +13.7 | -1.1 (6/10 faster) | within the control |
+| write | 509.3 | -551.0 -77.1 -40.1 -37.2 -30.6 -8.0 -5.6 +47.6 +59.5 +60.1 | -8.0 (7/10 faster) | -481.8 -61.0 -52.6 -44.2 -43.4 -37.1 -33.2 -25.2 -2.3 +16.5 | -37.1 (9/10 faster) | within the control |
+| rename | 61975.5 | -5393.6 -4808.5 -3465.8 +1023.7 +1984.8 +3250.0 +4114.7 +6679.4 +6715.0 +10289.9 | +3250.0 (3/10 faster) | -8243.9 -2166.0 -1084.6 -718.8 -370.3 +2885.1 +5930.6 +6851.1 +7230.7 +7781.7 | +2885.1 (5/10 faster) | within the control |
+| unlink | 33442.3 | -771.3 +10.0 +50.2 +97.5 +161.7 +466.5 +805.2 +844.8 +977.0 +1234.3 | +466.5 (1/10 faster) | -1253.2 -1035.2 -989.4 -881.7 -835.0 -429.7 -225.0 +370.6 +1052.9 +1167.6 | -429.7 (7/10 faster) | within the control |
+| fsync | 564.5 | -318.3 -247.6 -128.9 -36.5 -0.1 +10.7 +116.0 +123.8 +329.4 +331.1 | +10.7 (5/10 faster) | -294.1 -251.6 -166.6 -64.9 -53.1 -38.5 +37.3 +39.0 +74.7 +132.4 | -38.5 (6/10 faster) | within the control |
+| open | 1916.6 | -4580.1 -1214.4 -922.0 -23.5 +137.2 +275.2 +368.7 +1856.8 +3463.5 +3954.6 | +275.2 (4/10 faster) | -3620.6 -868.4 -737.7 -426.7 -79.1 -27.1 +136.5 +957.1 +2367.1 +8864.1 | -27.1 (6/10 faster) | within the control |
+| close | 236.9 | -15.5 -3.5 -2.2 +1.6 +2.7 +4.1 +6.2 +11.2 +12.7 +13.4 | +4.1 (3/10 faster) | -34.0 -14.0 -12.1 -11.8 -5.4 -5.0 -4.7 -3.2 +20.3 +32.4 | -5.0 (8/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1811.8 | -179.4 -92.6 -41.4 -12.2 +5.7 +6.0 +16.0 +18.5 +21.9 +28.2 | +6.0 (4/10 faster) | -164.5 -93.0 -92.4 -47.6 -47.0 +4.1 +8.1 +11.2 +19.3 +53.3 | +4.1 (5/10 faster) | within the control |
+| stat | 282.0 | -77.0 -24.4 -15.7 -15.3 -11.5 -9.7 +1.7 +3.8 +31.8 +68.5 | -9.7 (6/10 faster) | -73.8 -26.2 -7.8 -5.4 -4.7 +6.6 +10.5 +14.7 +26.1 +57.3 | +6.6 (5/10 faster) | within the control |
+| read | 101.5 | -29.2 -0.5 +0.6 +1.0 +1.6 +1.9 +2.4 +2.5 +4.8 +32.3 | +1.9 (2/10 faster) | -30.0 -1.9 -0.8 -0.7 -0.7 -0.4 -0.1 +0.6 +0.7 +31.1 | -0.4 (7/10 faster) | within the control |
+| write | 108.1 | -28.6 -27.2 -0.6 +1.1 +1.3 +1.6 +1.6 +3.3 +5.2 +29.4 | +1.6 (3/10 faster) | -29.0 -28.6 -4.5 -1.9 -1.7 +0.4 +0.5 +0.6 +22.9 +29.5 | +0.4 (5/10 faster) | within the control |
+| rename | 706.5 | -170.9 +3.0 +3.3 +12.1 +17.3 +17.4 +21.1 +26.7 +100.4 +189.7 | +17.4 (1/10 faster) | -178.0 -45.3 -3.6 -3.2 -2.7 +1.7 +11.8 +18.9 +97.9 +183.4 | +1.7 (5/10 faster) | within the control |
+| unlink | 435.1 | -47.5 -3.8 +1.2 +6.2 +10.0 +10.6 +22.6 +37.2 +38.9 +55.9 | +10.6 (2/10 faster) | -38.4 -33.7 -18.7 -7.5 -4.3 +0.5 +5.1 +13.6 +24.8 +34.8 | +0.5 (5/10 faster) | within the control |
+| fsync | 150.6 | -60.3 -27.9 -3.5 +1.3 +1.9 +3.2 +4.5 +6.0 +27.4 +63.5 | +3.2 (3/10 faster) | -55.7 -32.4 -8.2 -3.5 +1.0 +1.1 +2.5 +4.3 +41.7 +61.4 | +1.1 (4/10 faster) | within the control |
+| open | 249.7 | -46.6 -3.1 -1.7 +5.3 +6.3 +7.1 +7.9 +18.3 +33.5 +58.1 | +7.1 (3/10 faster) | -32.1 -23.8 -19.6 -10.7 -3.7 -1.3 +0.3 +24.0 +26.4 +29.1 | -1.3 (6/10 faster) | within the control |
+| close | 74.4 | -4.3 -1.8 -0.4 -0.2 +0.3 +0.4 +0.5 +0.6 +2.6 +28.9 | +0.4 (4/10 faster) | -4.2 -1.7 -1.6 -1.2 -0.5 -0.4 -0.1 +0.1 +3.0 +29.5 | -0.4 (7/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p99: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1463.4 | -83.0 -70.3 -66.5 -48.5 -15.7 -13.3 +26.4 +32.4 +70.3 +198.9 | -13.3 (6/10 faster) | -130.4 -85.2 -54.6 -48.3 -47.1 -17.1 +2.3 +3.0 +79.8 +169.4 | -17.1 (6/10 faster) | within the control |
+| stat | 329.7 | -5.5 -1.4 +4.9 +7.7 +18.2 +20.9 +20.9 +36.1 +41.7 +61.1 | +20.9 (2/10 faster) | -29.4 -20.2 -9.1 -0.4 +14.6 +21.3 +31.7 +35.7 +44.7 +68.2 | +21.3 (4/10 faster) | within the control |
+| read | 21.2 | -1.3 -0.9 -0.8 -0.3 -0.3 -0.2 +0.1 +0.3 +0.7 +0.9 | -0.2 (6/10 faster) | -1.2 -1.0 -0.7 -0.5 -0.4 -0.3 -0.2 +0.1 +0.1 +0.7 | -0.3 (7/10 faster) | within the control |
+| write | 187.0 | -16.6 -14.3 -4.8 -1.7 +0.6 +0.8 +1.3 +5.4 +10.4 +15.1 | +0.8 (4/10 faster) | -43.0 -24.3 -15.9 -10.5 -1.9 -0.4 +4.5 +7.7 +14.8 +15.1 | -0.4 (6/10 faster) | within the control |
+| rename | 814.4 | -160.2 -91.2 -18.0 -15.6 -3.7 -1.4 +38.4 +65.0 +73.3 +105.5 | -1.4 (6/10 faster) | -250.2 -155.6 -139.3 -138.0 -94.3 -71.5 -24.4 -16.7 +26.4 +53.2 | -71.5 (8/10 faster) | within the control |
+| unlink | 713.5 | -40.3 -37.8 -27.1 -11.9 -11.0 -10.7 +6.9 +14.6 +33.1 +92.0 | -10.7 (6/10 faster) | -72.3 -61.6 -58.5 -36.9 -13.3 -5.5 -1.3 +10.4 +61.6 +90.1 | -5.5 (7/10 faster) | within the control |
+| fsync | 180.2 | -16.2 -11.3 -4.9 -4.4 +1.5 +2.7 +2.7 +9.7 +10.1 +17.7 | +2.7 (4/10 faster) | -40.6 -13.6 -10.8 -3.3 -0.4 +0.6 +3.4 +4.8 +6.0 +9.9 | +0.6 (5/10 faster) | within the control |
+| open | 217.5 | -49.6 -29.7 -17.2 -14.3 -8.4 +1.2 +6.6 +14.3 +15.1 +54.9 | +1.2 (5/10 faster) | -40.0 -33.9 -26.7 -22.8 -7.6 +4.4 +24.1 +25.5 +27.2 +27.3 | +4.4 (5/10 faster) | within the control |
+| close | 109.3 | -7.9 -5.4 -4.9 -3.2 -1.1 -0.2 -0.1 +3.1 +7.5 +8.2 | -0.2 (7/10 faster) | -20.1 -7.2 -3.2 -3.0 +1.0 +1.9 +2.6 +4.6 +7.5 +7.5 | +1.9 (4/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 711.2 | -15.4 -7.6 +1.2 +7.1 +9.7 +14.9 +15.9 +24.0 +25.3 +46.7 | +14.9 (2/10 faster) | -24.5 -18.6 -11.7 -3.0 -1.5 +4.1 +8.5 +16.1 +34.5 +50.1 | +4.1 (5/10 faster) | within the control |
+| stat | 172.7 | +0.0 +1.6 +2.6 +3.1 +3.2 +4.0 +5.3 +6.6 +8.3 +9.4 | +4.0 (0/10 faster) | -5.8 -3.6 -1.3 -0.4 +0.9 +1.2 +1.4 +4.4 +7.6 +16.4 | +1.2 (4/10 faster) | within the control |
+| read | 6.5 | -0.2 -0.1 -0.1 -0.1 +0.0 +0.0 +0.1 +0.1 +0.1 +0.1 | +0.0 (4/10 faster) | -0.1 -0.1 -0.1 +0.0 +0.0 +0.0 +0.0 +0.0 +0.1 +0.1 | +0.0 (3/10 faster) | within the control |
+| write | 56.0 | -1.5 -0.8 -0.6 +0.1 +0.4 +0.6 +1.2 +2.1 +2.4 +2.6 | +0.6 (3/10 faster) | -2.1 -1.6 -1.3 -1.2 -0.5 -0.3 +0.0 +1.0 +2.1 +3.9 | -0.3 (6/10 faster) | within the control |
+| rename | 349.4 | -11.1 -1.1 -0.9 +1.4 +2.3 +3.1 +3.6 +4.0 +6.1 +11.4 | +3.1 (3/10 faster) | -14.5 -8.5 -4.8 -3.5 -1.5 -1.5 -1.4 -0.3 +3.2 +12.6 | -1.5 (8/10 faster) | within the control |
+| unlink | 214.0 | -28.7 -2.2 +0.5 +1.0 +1.4 +2.7 +3.7 +5.3 +6.7 +39.7 | +2.7 (2/10 faster) | -27.4 -14.0 -2.8 -2.2 +0.2 +0.5 +2.1 +3.6 +10.5 +27.7 | +0.5 (4/10 faster) | within the control |
+| fsync | 84.9 | -2.0 -1.0 -0.6 +0.0 +0.2 +0.6 +0.8 +2.2 +3.2 +3.7 | +0.6 (3/10 faster) | -2.5 -1.7 -1.2 -0.7 -0.1 +0.0 +0.2 +2.3 +3.3 +4.6 | +0.0 (5/10 faster) | within the control |
+| open | 91.8 | -9.1 -1.8 -1.2 +0.0 +0.1 +0.2 +0.3 +0.4 +0.4 +0.8 | +0.2 (3/10 faster) | -9.6 -2.4 -1.5 -0.6 -0.5 -0.5 -0.3 -0.1 +0.7 +1.2 | -0.5 (8/10 faster) | within the control |
+| close | 43.8 | -0.7 -0.4 -0.4 -0.2 -0.1 +0.3 +0.5 +1.1 +1.4 +1.7 | +0.3 (5/10 faster) | -1.4 -0.8 -0.6 -0.6 -0.3 -0.1 +0.0 +0.9 +1.2 +1.9 | -0.1 (6/10 faster) | within the control |
+
 ### Step 7's verdict
 
 - **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
@@ -11853,6 +12068,8 @@ against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64
 - **What is left that crash safety does not need:** the open's confirmation round on the worker's path, 3.6 µs an open
   on arm64 and 3.0 on x86_64. The separate send is A-215's, rejected. A reply channel per shard call and a path's
   String the DLL arm pays too.
+- **Cut (c), that round off the worker's path (A-274, 2026-11-09):** landed on arm64's loaded tails (write p99 −1,522
+  µs, 9 of 10 runs, beyond the control); a quiet stat costs +8.1 µs on arm64 and +4.0 on x86_64 (above).
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
 
@@ -11996,3 +12213,158 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
+
+## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
+
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+
+**Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
+
+**Command.** `cargo build --release --locked -p slates-client --example provision_bench`, run with no arguments and with `PROVISION_BENCH_SHARDS=2`. Diagnostics runs [diag-liveness-31](https://github.com/hyper-light/slates/actions/runs/42648540654) (windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-latest) and diag-liveness-32 (windows-11-arm), results pushed to `diag-results/liveness-31-<os>` and `liveness-32-windows-11-arm`. Main is 80be552a with this bench applied (2e435448). The A-223 arm is A-223 merged onto 80be552a (d0106bec). Each runner has 4 CPUs (macos-latest 3). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU. Three rounds per cell, the arms alternating. A paced cell has 9 runs (3 rounds of 3), a rest cell 3, a p99 cell 9 (3 rounds of the bench's 3 runs). Ranges are the lowest to the highest run.
+
+**Main, two shards, one client paced at 1 ms:**
+
+| runner | at rest, quiet | paced, quiet | paced, loaded | single-client p99, quiet |
+|---|---|---|---|---|
+| Windows x86_64 (windows-latest) | 0–5 | 34–71 | 742–754 | 40.3 µs–80.1 µs |
+| Windows arm64 (windows-11-arm) | 5–15 | 31–104 | 100–269 | 30.1 µs–70.0 µs |
+| Linux x86_64 (ubuntu-latest) | 1–3 | 1464–2024 | 936–1102 | 17.4 µs–22.4 µs |
+| Linux arm64 (ubuntu-24.04-arm) | 1–2 | 1773–2022 | 859–1111 | 22.3 µs–24.4 µs |
+| macOS arm64 (macos-latest) | 1 | 132–466 | 77–480 | 242.4 µs–1.1 ms |
+
+**Main at each runner's derived shard count:**
+
+| runner | shards | at rest, quiet | paced, quiet | paced, loaded |
+|---|---|---|---|---|
+| Windows x86_64 | 1 | 0–15 | 12–39 | 11–30 |
+| Windows arm64 | 3 | 0–5 | 88–176 | 104–1342 |
+| Linux x86_64 | 1 | 0–1 | 609–692 | 622–863 |
+| Linux arm64 | 3 | 1–2 | 1709–2545 | 1148–1420 |
+| macOS arm64 | 2 | 1 | 180–394 | 127–288 |
+
+**A-223 beside it, two shards:** the paced cost, quiet then loaded, main → A-223.
+
+| runner | paced, quiet | paced, loaded |
+|---|---|---|
+| Windows x86_64 | 34–71 → 191–493 | 742–754 → 756–778 |
+| Windows arm64 | 31–104 → 230–404 | 100–269 → 728–745 |
+| Linux x86_64 | 1464–2024 → 1466–2026 | 936–1102 → 971–1031 |
+| Linux arm64 | 1773–2022 → 1727–2022 | 859–1111 → 848–1206 |
+| macOS arm64 | 132–466 → 117–356 | 77–480 → 118–194 |
+
+**What it means.**
+- **Linux pays on main, and A-223 does not change it.** At two shards a 1 ms-paced client costs Linux x86_64 1,464 to 2,024 thousandths of a core and Linux arm64 1,773 to 2,022, against 0 to 3 at rest. The boot probe's wake was 5.9 to 7.3 µs, so the boot window (0.59 to 0.73 ms) is shorter than the pause. In the paced form, though, the owner shard (shard 1) parked 0 times per 1,000 creates in every round on both runners. Its live estimate had risen to 34 to 70 µs, making its window 3.4 to 7.0 ms. The other shard parked 0 to 819 times per 1,000 (`provision.parked_1 parks per 1000 creates`). The estimate feeding on its own spinning is the window rule's item (i).
+- **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
+- **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
+- **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
+
+Recorded so no one reads them as a result. The command, per run: `bash rungs12-a228/run.sh` (and `run2.sh`) on adacachy
+(AMD Ryzen 9 9950X3D2, 32 CPUs, Linux 7.2.9-2-cachyos): a release build of main `1ed67337` with the harness's share fix
+(`agents/fixtures-load-scale-share`), then `load_scale.rs` at 3,000 clients, one client node, `--hot-files 2400
+--reply-patience 60 --per-connection 32 --think-us 0`, Linux v7.4-rc1 `kernel/`, in a `systemd-run --user` unit at
+`CPUWeight=1`, `Nice=19`, `CPUQuota=800%`, a quarter of available memory, with a 100 ms sampler of every shard thread's
+`/proc` state, `wchan` and `schedstat` outside the unit.
+
+| Run | Load 1 m min/median/max | Agents done at the 1,800 s bound | Unit CPU | Samples in `do_freezer_trap` | Run-queue wait / timeslice | Wedged / starved / spinning / lapsed |
+|---|---|---|---|---|---|---|
+| `r3k-clean` | 38.4 / 94.5 / 195.4 | 236 of 3,000 | 127 s | about 98% | 0.11 ms | 0 / 0 / 0 / 0 |
+| `r3k-clean-2` | 22.6 / 46.4 / 151.6 | 191 of 3,000 | 124 s | about 98% | 0.12 ms | 0 / 0 / 0 / 0 |
+
+Invalid: a cgroup freezer held the fleet, not the scheduler (GAPS, "A capped unit on adacachy can be frozen"). Neither
+reached its oracle, so neither has latencies. The healthy reference for the wait per timeslice is `rungs9/ab-clean-2`, 0.10
+ms. Step 5 is closed without a third run: A-228 stands on its own red and green evidence.
+
+
+## Recovery sliced against unsliced: shard 0's recovery CPU and the takeover's latency (A-228; 2026-11-08 and 09)
+
+A shard's start runs alone, and its recovery yields between units (GAPS, "recovery in one poll closed"). These runs
+measure what slicing costs, which was owed once the first CPU figures were withdrawn as fenced replays. They also check
+whether slicing stretches a takeover.
+
+### Shard 0's recovery CPU
+
+**Command.** `ab-final.sh` with `recrun-sliced.sh` (kept with this record's session, `liveness/slice4`). Each run uses
+loadtest-scale's harness to build merge state over `linux-v7.4-rc1/kernel`:
+`load_bench --keep-works --clients N --hot-files 800 --per-connection 32 --rounds 3`. It records what the daemon
+acknowledged, then kills the anchored daemon 5 times. Each restart is read back by content, so a fenced green fails the
+run. The figure is shard 0's CPU from the boot line (`shard 0 initialized in ... µs, ... µs of its CPU, in S slices`),
+one a restart.
+- **Arms.** Main 80be552a, unsliced, with the boot line's CPU added; slice6, sliced. Release builds, no LTO.
+- **States.** State A is 1,000 works and state B is 100.
+- **Conditions.** Quiet means a run started under a one-minute load of 30; loaded means 8 `nice -n 19` spinners a CPU.
+- **Order.** Rounds alternate the build order.
+
+**Hardware and load.** adas-macbook-pro-2, Apple M5 Max, 18 CPUs, 128 GB, macOS, 2026-11-08 and 09, shared with other
+agents. Two runs started without a quiet spell (load 35 to 46), and the log says which.
+
+| State B, ms | unsliced: median [the 5 restarts] | sliced: median [the 5 restarts] | change |
+|---|---|---|---|
+| quiet r1 | 139.2 [113.8 116.2 140.7 155.1 139.2] | 137.8 [115.4 137.8 135.2 180.2 158.2] | −1.0% |
+| quiet r2 | 220.6 [190.0 216.9 220.6 235.7 256.1] | 209.2 [209.2 193.2 203.9 240.5 266.8] | −5.2% |
+| quiet r3 | unpaired: the machine stalled (below) | | |
+| quiet r4 | 225.1 [196.8 204.0 225.1 232.8 255.5] | 215.4 [208.9 207.8 215.4 225.3 259.3] | −4.3% |
+| loaded r1 | [183.6 211.9 221.7 234.7 178.7] | [210.1 227.1 235.1 181.5 191.8] | −0.8% |
+| loaded r2 | [207.5 218.6 174.4 183.9 210.7] | [213.5 219.2 186.2 188.7 206.8] | −0.3% |
+| loaded r3 | [215.0 180.6 201.0 206.9 189.2] | [213.5 215.0 185.2 186.1 210.0] | +4.5% |
+| loaded r4 | [199.4 184.6 192.2 205.3 215.7] | [205.5 231.5 175.8 204.9 203.3] | +2.7% |
+
+Pooled over the paired rounds: quiet 204.0 to 207.8 ms (+1.9%, 15 restarts each); loaded 203.1 to 206.1 ms (+1.5%, 20
+each). Every 5-run comparison is within 10%.
+
+| State A quiet, ms | unsliced: every restart | sliced: every restart | change of medians |
+|---|---|---|---|
+| r1 | 1419.0 1384.8 1402.1 1090.3 1118.9 | 1133.0 1210.9 1213.2 1169.6 1086.9 | −15.5% |
+| r2 | 1354.8 1296.7 1372.3 1407.2 1395.1 | 1124.1 1109.9 1182.2 1131.6 1183.6 | −17.5% |
+| r3 | 1140.5 1222.6 1250.0 1295.8 1287.3, then 1258.6 1308.3 | 1135.3 927.0 892.0 937.6 923.3 | −25.8% |
+
+Round 3's unsliced run restarted 7 times for 5 kills, and its change is over the first five. Pooled: 1296.7 to 1131.6 ms
+(−12.7%).
+
+State A loaded has no CPU comparison. The unsliced build crash-looped in all three rounds (14, 194 and 198 heartbeat
+lapses), so shard 0's boot line never reported. The sliced build recovered in about 926 ms with 0 spinning lines, and
+every restart read back whole.
+
+**Round 3's state B quiet: a machine stall, not slicing.** Both arms had heartbeat lapses in the same minutes:
+- the unsliced run, 18:24:01 to 18:24:24 UTC: 2 lapses, and its harness aborted in setup;
+- the sliced run, 18:24:24 to 18:26:07 UTC: 5 lapses, and the watchdog verdict "shard 0 is wedged: no step, no CPU
+  progress and no wait for a CPU for 1116 ms".
+
+The shard ran no CPU and nothing was waiting for one. On the same Mac, the supervisor's B8 gate saw a whole-process
+stall of about 20 s at 18:23 UTC: the server library took 127 s to build against 5 s, with about 80 GB in the memory
+compressor.
+
+### The takeover's latency
+
+A takeover runs no sliced code. The successor rebuilds the green with the unsliced `replay_green`; `spawn_alone` and
+`RecoverySlices` run only in a shard's own start.
+
+**Command.** `run.sh` (kept with this record's session, `liveness/takeover-ship`). It runs the two green-takeover fleet
+tests, `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` and
+`a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor`, each alone. There are 8 rounds each,
+with the build order alternating. A diagnostic line times the owner's `stop()` to the successor's placed version 3.
+- **Arms.** Main 80be552a, unsliced, against slice6 7074a17e, sliced; debug test binaries.
+- **Conditions.** Quiet ran at load 6 to 7 (one run at 17 to 20). Loaded ran beside 2 `nice -n 19` spinners a CPU, at
+  load 25 to 77.
+
+All 64 runs passed. adas-mac-studio.local-2, 32 CPUs, macOS, 2026-11-09.
+
+| ms | quiet unsliced | quiet sliced | loaded unsliced | loaded sliced |
+|---|---|---|---|---|
+| median | 2380 | 2195 | 2349 | 2362 |
+| p75 | 4577 | 2548 | 2844 | 3959 |
+| max | 8835 | 4949 | 5152 | 6749 |
+| runs over 3.5 s | 6 of 16 | 4 of 16 | 4 of 16 | 5 of 16 |
+
+Every run, the share test then the every-version test, each list rounds 1 to 8:
+- quiet unsliced: 2434 8835 2130 2329 2328 2431 2320 4577 | 2040 4753 1935 4520 2224 4756 2236 4933
+- quiet sliced: 2019 2117 2127 2548 2059 2242 2335 2140 | 4857 4949 4845 2148 1921 2136 2337 4744
+- loaded unsliced: 2455 2503 2316 3949 2844 3735 1922 2290 | 2289 1967 1985 2044 1840 5152 2381 3980
+- loaded sliced: 2345 6749 2415 5047 1977 1957 2047 4720 | 2566 2378 1979 2033 4104 3959 2097 2295
+
+Both arms show the same two modes, about 2.0 to 2.5 s and about 4 to 5 s. The slow mode is a step of about 2.5 s that
+both arms hit at similar rates, so slicing does not stretch a takeover. The step is the failure detector's timer
+floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
+pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
+owner led the council.

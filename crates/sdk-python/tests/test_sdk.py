@@ -5,9 +5,12 @@ The daemon round-trip is gated: it runs only when a built `slates` daemon binary
 SLATES_DAEMON, and otherwise skips loudly (never fails on a machine without the binary) — the vorpal
 env-gated discipline. Run: `maturin develop && python3 -m unittest discover crates/sdk-python/tests`."""
 
+import json
 import os
+import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -94,6 +97,32 @@ def _listed_until_gone(client, volume):
             return False
         time.sleep(POLL_SECS)
     return True
+
+
+def _cli(binary, instance, *args):
+    """Runs `slates --instance INSTANCE ARGS...` and returns its standard output, failing on a refusal."""
+    done = subprocess.run([binary, "--instance", instance, *args], capture_output=True, text=True,
+                          timeout=STARTUP_SECS)
+    if done.returncode != 0:
+        raise AssertionError(f"slates {' '.join(args)}: {done.stderr}")
+    return done.stdout
+
+
+def _listed_until(instance, predicate):
+    """Lists through a fresh SDK client until some entry satisfies `predicate`, within the startup budget: across a
+    daemon's restart the first lists may be refused or may not yet show the recovered catalog. Returns the last list
+    and whether it held."""
+    deadline = time.monotonic() + STARTUP_SECS
+    listed = []
+    while time.monotonic() < deadline:
+        try:
+            listed = _connect_when_ready(instance).list()
+        except slates.SlatesError:
+            listed = []
+        if any(predicate(v) for v in listed):
+            return listed, True
+        time.sleep(POLL_SECS)
+    return listed, False
 
 
 class SlatesSdkSurface(unittest.TestCase):
@@ -234,6 +263,58 @@ class SlatesSdkRoundTrip(unittest.TestCase):
                 pass
             anchor.wait()
 
+
+    @unittest.skipIf(
+        _daemon_binary() is None,
+        "no built `slates` daemon binary (set SLATES_DAEMON or build the cli) — listing round-trip skipped loudly",
+    )
+    def test_a_listing_says_which_volumes_are_live_shipped_and_which_recovery_could_not_rebuild(self):
+        """The two listing fields the CLI's `volume list` shows, by use against a real anchor+daemon: a volume made
+        live-shipped lists `live_shipped` true; a volume over a host directory whose directory is removed before the
+        daemon restarts lists `not_recovered` as its cause's kind, `"BaseMissing"`; and neither field is set on a
+        volume it does not describe. Before 2026-11-09 the SDK's entries carried neither."""
+        binary = _daemon_binary()
+        instance = f"slates-sdk-list-{os.getpid()}"
+        anchor = subprocess.Popen(
+            [binary, "--instance", instance, "anchor", "--quick", "--shards", "1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        scratch = tempfile.mkdtemp(prefix="slates-sdk-list-")
+        try:
+            client = _connect_when_ready(instance)
+            _cli(binary, instance, "bootstrap", "root")
+            live = client.create("sdk-live", VOLUME_BYTES)
+            _cli(binary, instance, "live-ship", live)
+            base = os.path.join(scratch, "base")
+            os.mkdir(base)
+            created = _cli(binary, instance, "volume", "create", "sdk-unrecovered", "--bounded", "8MiB",
+                           "--base", base)
+            unrecovered = next(line.split(": ", 1)[1].strip() for line in created.splitlines()
+                               if line.startswith("id: "))
+            _cli(binary, instance, "volume", "snapshot", unrecovered)
+            os.rmdir(base)
+            # The daemon restarts in order under its anchor; its successor holds the record and cannot rebuild it.
+            daemon = json.loads(_cli(binary, instance, "status", "--json"))["pid"]
+            os.kill(daemon, signal.SIGTERM)
+            listed, recovered = _listed_until(
+                instance, lambda v: v["id"] == unrecovered and v["not_recovered"] is not None
+            )
+            self.assertTrue(recovered, f"the restarted daemon lists the unrecovered volume: {listed}")
+            entries = {v["id"]: v for v in listed}
+            self.assertEqual(entries[unrecovered]["not_recovered"], "BaseMissing")
+            self.assertFalse(entries[unrecovered]["live_shipped"])
+            self.assertTrue(entries[unrecovered]["overlay"])
+            self.assertTrue(entries[live]["live_shipped"], f"the live-shipped volume says so: {entries[live]}")
+            self.assertIsNone(entries[live]["not_recovered"])
+        finally:
+            try:
+                os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            anchor.wait()
+            shutil.rmtree(scratch, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main()
