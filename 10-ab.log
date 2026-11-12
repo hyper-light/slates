@@ -2853,3 +2853,6 @@ slates daemon: control_shard_capacity = ShardCapacity { tasks: 10593, timers: 10
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
 slates daemon: instance fsb-601-6-nojudge serving on 1 shards under the anchor
 ## run 6 of 6 done, 2026-11-12T05:52:25Z
+To https://github.com/hyper-light/slates
+   4e5b35820..5e2441c4b  5e2441c4b036a99a517909b8c958ab98f9fd384a -> diag-results/conformance-43146153406-bench
+exit 0
