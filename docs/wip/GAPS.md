@@ -8,6 +8,15 @@
 > raises them before the lane; the image stays 26.04. Record:
 > `docs/bugs/2026-11-09-kind-on-ubuntu-26-04-ran-out-of-inotify-instances.md`.
 
+> **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
+> `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
+> Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
+> kernel 7.3 a process spawn while the page is dirty does that: 6 attempts of 6 with a spawn in the window. That
+> write-back is fresh and rightly applied, so the run tested nothing. The daemon now counts `fuse.writebacks_applied`.
+> The test reads it around each store and retries an attempt whose precondition did not hold, up to 6, then fails
+> naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
+> `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
+
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
@@ -671,6 +680,29 @@
 >   O(forwarders) a tick while its session is lent (64 to 105 s to drain 20,700 forwards on a 4-core runner), which
 >   is the shared session owed by "Open — one session per peer is lent exclusively" (its 2026-11-07 status).
 >
+> - **A dead record session was lent on, because nobody that held it judged it** (found 2026-11-08 on the f = 1
+>   primary-kill rung). The restarted primary kept its member id, and borrowers kept the client node's session to it out
+>   of its slot, so the link never replaced it: requests through the client node waited 25 to 135 s. Now
+>   `fleet::return_sessions` drops a session returned silent past the transport's one rule (`peer_silent_past`), and the
+>   link redials. Deaf-session test with discovery held: red 5 of 5, green 5 of 5, dropped 0 to 209 ms past its 1,998 ms
+>   window (that lateness is the lane's return cadence, since the judgement runs only when a borrower returns),
+>   answered on the replacement 26 to 336 ms later. **The division, so no timer is added "just in case":**
+>   `return_sessions` judges every borrowed session (every borrower's hold is bounded by a derived budget), the link's
+>   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
+>   sooner where it is heard
+>   (`docs/bugs/2026-11-09-a-dead-record-session-was-lent-on-for-want-of-anyone-judging-it.md`).
+>
+> - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
+>   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
+>   about 20,000 queued behind the stream credit the forwarder turned in one poll until its stall budget: client-0's
+>   control shard spun about 1.09 s, 6 of 6 runs, and its anchor killed it. A turn now ends early only for a newly
+>   queued forward, and the forwarder yields between turns: 0 of 6, one restart a run, oracle 0. With it, a turn costs
+>   what changed (completed and progressed exchanges), and the endpoint's completed set, which grew with every exchange
+>   a record session completed, holds only open ones
+>   (`docs/bugs/2026-11-08-a-forward-lane-turned-without-end-while-its-forwards-waited-on-the-stream-credit.md`).
+>   `slates_cluster`'s `take_completed_replies` still asks each of a dispatch's exchanges: a lookup a holder, since a
+>   second consumer of the completed set would take the lane's.
+>
 > - **A forward its owner never answered stayed open on a busy session** (found 2026-11-07 by fixtures' f = 1
 >   primary kill). A forward's stall budget counted any byte its session consumed, so 298 forwards to an owner that
 >   never answered them stayed open for good while the session carried other replies. Progress is now its own
@@ -948,6 +980,20 @@
 > list and the analyzer are under `~/.cache/slates-agents-scratch/fixtures/rungs11-a228/` on adacachy
 > (`r3k-clean-a228.log`, `.samples`, `.units`, `analyze.py`).
 
+> **A capped unit on adacachy can be frozen: check before reading a stall as the product's (2026-11-09, fixtures).** A-228
+> step 5's two 3,000-client clean rungs on main `1ed67337` (`CPUWeight=1`, `capped3.sh` unit, 100 ms sampler) ran into
+> their 1,800 s bound having done 236 and 191 of 3,000 agents, and are recorded invalid (BENCHMARKS, "A-228 step 5"). In
+> about 98% of the samples every shard thread of all four daemons was in `do_freezer_trap`, a cgroup freezer's; the unit
+> used 127 s and 124 s of CPU over about 1,800 s at `cpu.pressure` about 0, and the run-queue wait per timeslice (0.11
+> ms) matched a healthy rung's (0.10 ms). What looked like the product's fault was the freezer's: a council RTT tail of
+> 46 s, a root RTT tail of 70 s, a session `pto` of 54 s on loopback, 18,645 `lease.refused.unconfirmed` on the primary
+> (855 on `rungs8/r3k-clean2`) and a replica whose status did not answer. Its own and every ancestor's `cgroup.freeze`
+> read 0 whenever looked at, so a measurement on adacachy reads the threads' `wchan` (or samples `cgroup.events`) through
+> the run before charging a stall to slates. Whether kiln's headroom pacing should freeze `app.slice` units is Ada's call.
+> The 0 wedged, starved, spinning and lapsed lines of both runs say nothing about A-228: a frozen fleet freezes its
+> watchdog too. Files: `~/.cache/slates-agents-scratch/fixtures/rungs12-a228/` on adacachy (`.log`, `.samples`, `.mon`,
+> `.stall`, `starve.py`, `wake.py`).
+
 > **A starved shard was judged wedged (found 2026-11-07 by fixtures, fixed 2026-11-08, A-228).** A shard held off its CPU
 > shows no CPU progress, as a blocked one does, so the watchdog withheld the beat and the anchor killed a live daemon. The
 > watchdog now asks the scheduler; a shard waiting for a CPU is `Starved` and goes on beating (§4.14 status). Linux reads
@@ -1207,7 +1253,9 @@
 >   at least half the live step quantum a slice, its yields held to 5% of its time, at most a heartbeat period a slice
 >   (with A-257's whole replay, state A under load on main 80be552a: unsliced 198 spinning lines and 203 restarts for 5
 >   kills, no restart whole; sliced 0 lines, every restart read back whole; the first CPU figures here measured fenced
->   replays and are withdrawn, the comparison owed); the records' sort computes each key once (it recomputed the lineage depth,
+>   replays and were withdrawn; measured again 2026-11-09, shard 0's recovery CPU sliced is within 10% of unsliced in
+>   every 5-restart comparison, +1.5% to +1.9% pooled at 100 works and −12.7% at 1,000, and a takeover is not
+>   stretched: BENCHMARKS, "Recovery sliced against unsliced"); the records' sort computes each key once (it recomputed the lineage depth,
 >   listing the whole catalog, at every comparison: 132-141 ms of a 1,001-volume recovery) and recovery decodes only the
 >   newest snapshot slot that decodes. The boot log names each shard's slices, units, CPU and its most CPU in one slice.
 >   Still one unit each: the catalog's replay (206-261 ms for 1,001 volumes on this Mac) and a green's engine built over
@@ -5877,8 +5925,10 @@ a holder answers from its own records with no routing filter, and the successor 
 line of its authority, or of the owner an install moved that authority from (shape (i): 0 lost, none of the asker's own
 objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
 "the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
-**Owed, after raft-7 (A-270) lands:** the held image carrying `Acceptor::moved_from`, with the next image version and an
-old image refused typed; until then a warm restart forgets an earlier move. (d), the process test, is built.
+The held image carries `Acceptor::moved_from` as the acceptor's one encoding (`PersistedAcceptor`), at image version
+25 and delta version 8 (after conformance-14's A-262; raft-7 takes the numbers after), so a warm restart keeps an
+earlier move; an older image or delta is refused by its version, never read as "moved from none". (d), the process
+test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one

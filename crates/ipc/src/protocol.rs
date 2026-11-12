@@ -3136,6 +3136,24 @@ pub enum RecoveryCause {
   },
 }
 
+impl RecoveryCause {
+  /// The cause's kind, its variant's name, as every listing names it (`volume list`, its JSON, the MCP surface and
+  /// the SDKs, one definition): the whole cause, with its path or reason, is in the volume's status.
+  #[must_use]
+  pub fn kind(&self) -> &'static str {
+    match self {
+      RecoveryCause::NoImage => "NoImage",
+      RecoveryCause::BlocksUnclaimed => "BlocksUnclaimed",
+      RecoveryCause::BaseMissing { .. } => "BaseMissing",
+      RecoveryCause::BaseOnOwnMount { .. } => "BaseOnOwnMount",
+      RecoveryCause::BaseUnavailable { .. } => "BaseUnavailable",
+      RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
+      RecoveryCause::ImageRefused { .. } => "ImageRefused",
+      RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+    }
+  }
+}
+
 /// What a path refused [`Refusal::OwnMount`] was given as (A-227). Append-only.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnMountUse {

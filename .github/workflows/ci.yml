@@ -681,18 +681,29 @@ jobs:
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
       # ICMP-reset report turned off, or a send to a closed port fails the next receive and 3 of 4 fleet starts never
-      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). One test at a time, as the other daemon suites.
-      # Measured on the runners (diagnostics run 42340483175, 2026-11-07): 85 passed, 3 ignored, in 418 s on x86_64 and 365 s
-      # on arm64; the bound is about three times that.
-      - name: Test the fleet over real UDP sessions, one test at a time (native Windows)
+      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). Each test runs alone in a process of its own with a
+      # deadline (`xtask/src/bin/each_test.rs`), so a test that hangs fails by name with its last 400 lines printed rather
+      # than running out the step: in nightly run 42609672766 (2026-11-09) arm64's
+      # `a_learner_fetches_the_councils_committed_configuration_over_the_transport`, 1.7-2.3 s when it passes, sat silent
+      # for 409 s until the step's limit cut the job before libtest named it.
+      # - The deadline, 240 s, is twice the larger of the slowest test measured (109.3 s, arm64's
+      #   `a_silent_forward_gives_up_while_its_session_carries_others`; push run 42528348387, 2026-11-08, 110 tests on each
+      #   runner, median 3.8 s) and the suite's own longest wait (`SLATES_TEST_FLEET_DEADLINE_SECS`, 120 s below). A test
+      #   slow but progressing passes, a test at its own bound reports its own assertion first, and a silent one is killed.
+      # - The step's limit, 31 minutes, is the passing tests' measured whole through this runner (872.3 s on arm64, 846.8 s
+      #   on x86_64, a process start included; diagnostics run on diag-release-8, 2026-11-09) half again, plus one test
+      #   killed at its deadline (240 s), plus 300 s to build the runner and the test binary: 1.5 x 872.3 + 240 + 300 =
+      #   1,848 s. The job's own ceiling is the default 360 minutes, so the suite stays one step. docs/wip/ci-matrix.md
+      #   records the numbers.
+      - name: Test the fleet over real UDP sessions, one test at a time, each with a deadline (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
-        timeout-minutes: 20
+        timeout-minutes: 31
         env:
           SLATES_FLEET_TRACE: "1"
           SLATES_TEST_HEDGE_STARVATION_SECS: "20"
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
-        run: cargo test -p slates-server --test fleet -- --test-threads=1
+        run: cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240
       # The client binary whole on Windows, and the async driver: an in-process `slates-server` daemon found through the
       # Win32 rendezvous bootstrap object, driven over the rings through the whole lifecycle; the same-kernel direct map
       # by handle duplication (§4.6, A-175: zero copy asserted, the hostile holder's escalations refused, the neighbour's
@@ -996,18 +1007,29 @@ jobs:
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
       # ICMP-reset report turned off, or a send to a closed port fails the next receive and 3 of 4 fleet starts never
-      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). One test at a time, as the other daemon suites.
-      # Measured on the runners (diagnostics run 42340483175, 2026-11-07): 85 passed, 3 ignored, in 418 s on x86_64 and 365 s
-      # on arm64; the bound is about three times that.
-      - name: Test the fleet over real UDP sessions, one test at a time (native Windows)
+      # formed (the liveness agent's fix in crates/rt/src/netsys.rs). Each test runs alone in a process of its own with a
+      # deadline (`xtask/src/bin/each_test.rs`), so a test that hangs fails by name with its last 400 lines printed rather
+      # than running out the step: in nightly run 42609672766 (2026-11-09) arm64's
+      # `a_learner_fetches_the_councils_committed_configuration_over_the_transport`, 1.7-2.3 s when it passes, sat silent
+      # for 409 s until the step's limit cut the job before libtest named it.
+      # - The deadline, 240 s, is twice the larger of the slowest test measured (109.3 s, arm64's
+      #   `a_silent_forward_gives_up_while_its_session_carries_others`; push run 42528348387, 2026-11-08, 110 tests on each
+      #   runner, median 3.8 s) and the suite's own longest wait (`SLATES_TEST_FLEET_DEADLINE_SECS`, 120 s below). A test
+      #   slow but progressing passes, a test at its own bound reports its own assertion first, and a silent one is killed.
+      # - The step's limit, 31 minutes, is the passing tests' measured whole through this runner (872.3 s on arm64, 846.8 s
+      #   on x86_64, a process start included; diagnostics run on diag-release-8, 2026-11-09) half again, plus one test
+      #   killed at its deadline (240 s), plus 300 s to build the runner and the test binary: 1.5 x 872.3 + 240 + 300 =
+      #   1,848 s. The job's own ceiling is the default 360 minutes, so the suite stays one step. docs/wip/ci-matrix.md
+      #   records the numbers.
+      - name: Test the fleet over real UDP sessions, one test at a time, each with a deadline (native Windows)
         if: ${{ !cancelled() }}
-        timeout-minutes: 20
+        timeout-minutes: 31
         env:
           SLATES_FLEET_TRACE: "1"
           SLATES_TEST_HEDGE_STARVATION_SECS: "20"
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
-        run: cargo test -p slates-server --test fleet -- --test-threads=1
+        run: cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240
       - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20

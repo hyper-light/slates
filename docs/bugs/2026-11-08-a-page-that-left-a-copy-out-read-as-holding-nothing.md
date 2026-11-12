@@ -60,8 +60,9 @@ successor (`slates_db::takeover::copy_falls_to`). Routing plays no part.
   `an_acceptors_persisted_state_round_trips_with_its_moved_from_owner`: red with the persisted state dropping the field,
   and with a rebuild ignoring it. `a_hostile_persisted_acceptor_is_refused`: red with the field encoded before the
   positions.
-- **Owed, after raft-7:** the held image's register piece as `PersistedAcceptor`, with the next image version; until then
-  a warm restart forgets an earlier move.
+- `a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed` (a held image written and restored on a real
+  shard): red with the held image dropping the field, and with the authority reconcile recording no move.
+- The held image's register carries `PersistedAcceptor` (image version 25, delta version 8).
 
 The process test is step (d): `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`.
 

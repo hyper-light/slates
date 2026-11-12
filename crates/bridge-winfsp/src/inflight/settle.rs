@@ -25,8 +25,11 @@ pub trait Edges {
     response: &mut [u8],
     replaying: bool,
   ) -> Result<usize, Self::Error>;
-  /// Tells the shard the driver accepted the open `context` names.
-  fn confirm_open(&mut self, context: u64) -> Result<(), Self::Error>;
+  /// Tells the shard the driver accepted the open `context` names, without waiting for it to apply that: the shard's
+  /// FIFO channel applies it ahead of this owner's next request (audit step 7, cut (c)).
+  fn post_confirm(&mut self, context: u64) -> Result<(), Self::Error>;
+  /// Answers once the shard has applied the confirmation last posted, if one is outstanding; refuses one it refused.
+  fn confirmed(&mut self) -> Result<(), Self::Error>;
   /// Finishes the durable name updates of a successful rename before its saved success reaches the driver.
   fn rename_open_names(&mut self, from: &str, to: &str) -> Result<(), Self::Error>;
 }
@@ -71,17 +74,11 @@ pub fn receive<'a, E: Edges>(
   Ok(Some(filled))
 }
 
-/// The saved successful open of the batch a dead owner left, read from a copy of its journal before the ledger settles
-/// its one unconfirmed open (`crate::opens::Ledger::settle_pending`).
-pub fn saved_open(
-  journal: &mut [u8],
-  scratch: &mut Scratch,
-) -> Result<Option<(u64, u64)>, Refusal> {
-  Capture::new(journal)?
-    .resume(scratch)?
-    .map(|batch| batch.saved_open())
-    .transpose()
-    .map(Option::flatten)
+/// The saved successful open a dead owner left, published or settled, read from a copy of its journal before the ledger
+/// settles its one unconfirmed open (`crate::opens::Ledger::settle_pending`). Read whatever the phase: a settled response
+/// outlives its batch until the next save, so an open whose confirmation the shard had not applied is kept.
+pub fn saved_open(journal: &mut [u8]) -> Result<Option<(u64, u64)>, Refusal> {
+  Capture::new(journal)?.saved_open()
 }
 
 /// Whether a response's status is a refusal: any status but success.
@@ -106,13 +103,16 @@ fn settle<E: Edges>(
     } else {
       let length = edges.operate(&request, response, false)?;
       let answer = response.get(..length).ok_or(Refusal::Length)?;
+      // The settled response this save overwrites keeps the last posted open until the shard has applied its
+      // confirmation; by now this request's own shard call has normally carried it there.
+      edges.confirmed()?;
       batch.record_response(&request, answer)?;
       if let Some((from, to)) = request.successful_rename(answer)? {
         edges.rename_open_names(&from, &to)?;
       }
       edges.send(answer)?;
       if let Some((_, context)) = super::opened_context(answer)? {
-        edges.confirm_open(context)?;
+        edges.post_confirm(context)?;
       }
     }
     batch.acknowledge(request.hint())?;
