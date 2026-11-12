@@ -14364,7 +14364,7 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
 /// green's head at version 1.
 #[test]
 fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once() {
-  submit_resent_after_its_owner_restarted(false);
+  submit_resent_after_its_owner_restarted(RestartCase::default());
 }
 
 /// §4.16 "Commit", A-252: the resend arrives while the version still cannot commit (the holders still withhold it) on an
@@ -14372,7 +14372,34 @@ fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_versio
 /// durable wait, never `Seen::New`), then the version it was accepted as once the record commits.
 #[test]
 fn a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait() {
-  submit_resent_after_its_owner_restarted(true);
+  submit_resent_after_its_owner_restarted(RestartCase {
+    before_lift: true,
+    ..RestartCase::default()
+  });
+}
+
+/// §4.16 "Commit", A-252, the snapshot case: the owner's partition is snapshotted after the version was appended and
+/// while its submit waits, so recovery reads the submit's durable wait from the snapshot, not from the log entry that
+/// staged it. Expect the resend answered `Submitted { version: Some(1) }` and the green at version 1, as without one.
+#[test]
+fn a_submit_resent_after_its_owners_snapshot_and_restart_is_answered_its_version_once() {
+  submit_resent_after_its_owner_restarted(RestartCase {
+    snapshot_before_restart: true,
+    ..RestartCase::default()
+  });
+}
+
+/// §4.16 "Commit", A-252, the long replay: 300 versions committed before the waiting one, so the restarted owner replays
+/// a 301-entry chain and re-enqueues the waiting version's record (A-246) while the resend arrives. Expect the resend
+/// answered `Submitted { version: Some(301) }` and the green at 301: the wait survives the replay, never `Seen::New`.
+#[test]
+fn a_submit_resent_while_its_owner_replays_a_long_chain_is_answered_its_version_once() {
+  /// Shape: committed versions before the waiting one, a replay far longer than one shard step's slice.
+  const PRIOR_VERSIONS: u64 = 300;
+  submit_resent_after_its_owner_restarted(RestartCase {
+    prior_versions: PRIOR_VERSIONS,
+    ..RestartCase::default()
+  });
 }
 
 /// Shape: how long a resend is watched for an answer it must not get while its version cannot commit: a liveness
@@ -14404,6 +14431,10 @@ fn answer_while_waiting(client: &mut slates_client::Client, word: u64) -> Option
 
 /// What [`submit_resent_after_its_owner_restarted`] saw, for [`check_resent_after_restart`].
 struct ResentAfterRestart {
+  /// The versions committed before the waiting one: it is version `prior + 1`.
+  prior: u64,
+  /// Whether the owner's partition snapshot was taken before the restart, when the case asked for one.
+  snapshotted: Option<Result<bool, ObserveError>>,
   edited: ReplyBody,
   faulted: Vec<Result<(), ObserveError>>,
   lifted: Vec<Result<(), ObserveError>>,
@@ -14443,6 +14474,14 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     "version 1 was appended and its submit waited before the restart"
   );
   assert!(
+    seen
+      .snapshotted
+      .as_ref()
+      .is_none_or(|taken| matches!(taken, Ok(true))),
+    "the owner's partition snapshot was taken before the restart: {:?}",
+    seen.snapshotted
+  );
+  assert!(
     seen.reconnected,
     "the client reconnected under its id after the restart"
   );
@@ -14458,14 +14497,16 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     );
     assert_eq!(
       *held,
-      ReplyBody::Versions { head: 1 },
+      ReplyBody::Versions {
+        head: seen.prior + 1
+      },
       "and nothing ran again: the green holds the one version appended before the restart"
     );
   }
   assert_eq!(
     seen.answer,
     Some(Ok(ReplyBody::Submitted {
-      version: Some(1),
+      version: Some(seen.prior + 1),
       conflicts: Vec::new(),
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
@@ -14473,15 +14514,33 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
   );
   assert_eq!(
     seen.head,
-    ReplyBody::Versions { head: 1 },
-    "the green holds the submit once: its head is version 1, not a second copy"
+    ReplyBody::Versions {
+      head: seen.prior + 1
+    },
+    "the green holds the submit once: its head is the version it was accepted as, not a second copy"
   );
 }
 
-/// The restart cases of A-252. `before_lift`: the client resends while the holders still withhold the version's record
-/// and is held to no answer and no second version until they lift it; else the fault is lifted first.
+/// One restart case of A-252 ([`submit_resent_after_its_owner_restarted`]).
+#[derive(Clone, Copy, Default)]
+struct RestartCase {
+  /// The client resends while the holders still withhold the version's record, and is held to no answer and no second
+  /// version until they lift it; else the fault is lifted first.
+  before_lift: bool,
+  /// The owner's partition is snapshotted after the version is appended, so recovery reads the wait from the snapshot.
+  snapshot_before_restart: bool,
+  /// Versions committed before the waiting one, each from its own work, so the restart replays a chain that long.
+  prior_versions: u64,
+}
+
+/// The restart cases of A-252, each a [`RestartCase`].
 #[allow(clippy::cognitive_complexity)]
-fn submit_resent_after_its_owner_restarted(before_lift: bool) {
+fn submit_resent_after_its_owner_restarted(case: RestartCase) {
+  let RestartCase {
+    before_lift,
+    snapshot_before_restart,
+    prior_versions,
+  } = case;
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let profiles: Vec<_> = ["once-restart-a", "once-restart-b", "once-restart-c"]
@@ -14556,6 +14615,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
   let ReplyBody::GreenCreated { id: green } = created else {
     panic!("create green: {created:?}");
   };
+  let prior = timed_submits(&mut client, green, prior_versions);
   let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
     green,
     name: "work".to_owned(),
@@ -14591,6 +14651,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .ok()
     .and_then(|word| answer_within(&mut resender, *word));
   let awaiting_before = daemons[0].merge_awaiting(green);
+  let snapshotted = snapshot_before_restart.then(|| daemons[0].snapshot_green_partition(green));
   drop(client);
   daemons.remove(0).stop();
   daemons.insert(
@@ -14645,7 +14706,16 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
   for daemon in daemons {
     daemon.stop();
   }
+  assert!(
+    prior.iter().all(|(index, _, submitted, _)| matches!(
+      submitted,
+      ReplyBody::Submitted { version: Some(version), .. } if *version == index + 1
+    )),
+    "every earlier version committed in order before the waiting one"
+  );
   check_resent_after_restart(ResentAfterRestart {
+    prior: prior_versions,
+    snapshotted,
     edited,
     faulted,
     lifted,
