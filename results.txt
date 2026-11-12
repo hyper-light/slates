@@ -1,0 +1,124 @@
+runner ubuntu-latest, 4 CPUs, Thu Nov 12 06:02:52 UTC 2026
+tree red 54f20bc38 diag only (A-223 (d)): the failing test alone, on agents/liveness-a223; not for m
+== test red round=1
+sleepers: 160 samples in 160 trips, estimate 11968 ns; racing: 256 parks in 256 trips, 72 more samples, estimate 7866 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+== test red round=2
+sleepers: 160 samples in 160 trips, estimate 11805 ns; racing: 256 parks in 256 trips, 48 more samples, estimate 7836 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+== test red round=3
+sleepers: 160 samples in 160 trips, estimate 12240 ns; racing: 256 parks in 256 trips, 53 more samples, estimate 7561 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+tree fix af9e5a883 diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+sleepers: 160 samples in 160 trips, estimate 11855 ns; racing: 256 parks in 256 trips, 68 more samples, estimate 8420 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+== test fix round=2
+sleepers: 160 samples in 160 trips, estimate 13398 ns; racing: 256 parks in 256 trips, 180 more samples, estimate 8191 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+== test fix round=3
+sleepers: 160 samples in 160 trips, estimate 12230 ns; racing: 256 parks in 256 trips, 226 more samples, estimate 6640 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.17s
+== exit 0
+== suites exit 0
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_client-3d3248510fdba652)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/acknowledge.rs (../target-fix/debug/deps/acknowledge-79ceb3f6e5aa4edd)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+     Running tests/async_core.rs (../target-fix/debug/deps/async_core-e57c010c0e76f59e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+     Running tests/cipher_keys.rs (../target-fix/debug/deps/cipher_keys-c43c5595e341b116)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+     Running tests/client.rs (../target-fix/debug/deps/client-e9af8ca01000d5b2)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.79s
+     Running tests/consumer.rs (../target-fix/debug/deps/consumer-24755e56cf154e4b)
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.25s
+     Running tests/driver.rs (../target-fix/debug/deps/driver-1d53732b11d23d51)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.31s
+     Running tests/edit_and_submit.rs (../target-fix/debug/deps/edit_and_submit-9f2b6d2716beadd8)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+     Running tests/image.rs (../target-fix/debug/deps/image-824e5b00965a8ecc)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+     Running tests/merge_chaos.rs (../target-fix/debug/deps/merge_chaos-bacd9d65a3803f11)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+     Running tests/merge_identity.rs (../target-fix/debug/deps/merge_identity-a7d09823387e865f)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+     Running tests/merge_post_state.rs (../target-fix/debug/deps/merge_post_state-c082ca68cb5152b9)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+     Running tests/netns.rs (../target-fix/debug/deps/netns-a6e648af91f5ae4b)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running tests/presentation.rs (../target-fix/debug/deps/presentation-3835b952a8c61f03)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+     Running tests/reap.rs (../target-fix/debug/deps/reap-dcb7915ae1d2ea78)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+     Running tests/reap_map.rs (../target-fix/debug/deps/reap_map-c78ce73eb23571be)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.32s
+     Running tests/shards.rs (../target-fix/debug/deps/shards-869f3b8675f7d14e)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_ipc-cfd0976e476b30fb)
+test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s
+     Running tests/delivery.rs (../target-fix/debug/deps/delivery-8a83b5a0fb678bbc)
+test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/rendezvous.rs (../target-fix/debug/deps/rendezvous-7a8f72071f2391db)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+     Running tests/rings.rs (../target-fix/debug/deps/rings-30b3e2afa6c2072f)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+     Running tests/status.rs (../target-fix/debug/deps/status-1a3a288af539d791)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/stream_exec.rs (../target-fix/debug/deps/stream_exec-43786c72e865d490)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/stream_spawn.rs (../target-fix/debug/deps/stream_spawn-4469c86ae6e8a838)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== suites total: 140 passed, 0 failed, 5 ignored
+== bench red round=1 at 06:13:35
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8273 ns, idle window at boot 827300 ns, floor 50000 ns
+  provision.spinning_1_p99: 34531 ns [34261, 37045] over 3 runs: [34261, 37045, 34531]
+  provision.parked_1 parks per 1000 creates: shard 0: 284 (wake 16085 ns), shard 1: 0 (wake 108047 ns)
+  provision.parked_1_p99: 88693 ns [77987, 90596] over 3 runs: [88693, 77987, 90596]
+== exit 0
+== bench fix round=1 at 06:14:02
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8409 ns, idle window at boot 840900 ns, floor 50000 ns
+  provision.spinning_1_p99: 37065 ns [36375, 38958] over 3 runs: [38958, 37065, 36375]
+  provision.parked_1-0-0 client wake: 10650 ns from 773 parked wakes (809 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 10144 ns from 948 parked wakes (964 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 10415 ns from 806 parked wakes (856 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 400 (wake 14326 ns), shard 1: 15 (wake 30271 ns)
+  provision.parked_1_p99: 81302 ns [78768, 93360] over 3 runs: [93360, 78768, 81302]
+== exit 0
+== bench red round=2 at 06:14:30
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8236 ns, idle window at boot 823600 ns, floor 50000 ns
+  provision.spinning_1_p99: 34001 ns [31577, 38057] over 3 runs: [38057, 34001, 31577]
+  provision.parked_1 parks per 1000 creates: shard 0: 316 (wake 14586 ns), shard 1: 0 (wake 65115 ns)
+  provision.parked_1_p99: 76825 ns [72729, 91197] over 3 runs: [91197, 72729, 76825]
+== exit 0
+== bench fix round=2 at 06:14:57
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8336 ns, idle window at boot 833600 ns, floor 50000 ns
+  provision.spinning_1_p99: 36055 ns [33671, 40060] over 3 runs: [40060, 36055, 33671]
+  provision.parked_1-0-0 client wake: 10383 ns from 970 parked wakes (991 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 10877 ns from 798 parked wakes (862 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 10580 ns from 821 parked wakes (845 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 320 (wake 14831 ns), shard 1: 181 (wake 15581 ns)
+  provision.parked_1_p99: 87321 ns [81833, 89534] over 3 runs: [89534, 87321, 81833]
+== exit 0
+== bench red round=3 at 06:15:24
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8388 ns, idle window at boot 838800 ns, floor 50000 ns
+  provision.spinning_1_p99: 34632 ns [34151, 38728] over 3 runs: [38728, 34632, 34151]
+  provision.parked_1 parks per 1000 creates: shard 0: 358 (wake 12512 ns), shard 1: 0 (wake 97564 ns)
+  provision.parked_1_p99: 90786 ns [69405, 93921] over 3 runs: [90786, 69405, 93921]
+== exit 0
+== bench fix round=3 at 06:15:51
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 8310 ns, idle window at boot 831000 ns, floor 50000 ns
+  provision.spinning_1_p99: 40901 ns [40070, 41022] over 3 runs: [40070, 41022, 40901]
+  provision.parked_1-0-0 client wake: 10784 ns from 815 parked wakes (832 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 10720 ns from 954 parked wakes (968 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 10228 ns from 770 parked wakes (831 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 332 (wake 14177 ns), shard 1: 101 (wake 15598 ns)
+  provision.parked_1_p99: 80951 ns [73430, 105408] over 3 runs: [105408, 80951, 73430]
+== exit 0
