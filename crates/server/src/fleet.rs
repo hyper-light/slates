@@ -4524,20 +4524,30 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
 /// DIAG (never for main): for each other member, its direct-contact reason and this node's membership belief about it.
 pub(crate) fn diag_contacts(state: &ShardState) -> Vec<String> {
   let host = state.fleet.host();
-  state
-    .fleet
-    .members()
-    .iter()
-    .filter(|&&peer| peer != host)
-    .map(|&peer| {
-      format!(
-        "{} {} believed={:?}",
-        peer.0,
-        direct_contact_reason(state, peer),
-        state.fleet.membership().state(peer)
-      )
-    })
-    .collect()
+  let membership = state.fleet.membership();
+  let mut known: Vec<HostId> = membership.alive();
+  known.extend(membership.suspects().into_iter().map(|(peer, _)| peer));
+  known.extend(membership.dead().into_iter().map(|(peer, _)| peer));
+  known.sort();
+  known.dedup();
+  let mut lines = vec![
+    format!("self {}", host.0),
+    format!(
+      "council_voters {:?} known_voters {:?} fleet_members {:?}",
+      state.council.voters().iter().map(|voter| voter.0).collect::<Vec<_>>(),
+      state.council.known_voters().iter().map(|voter| voter.0).collect::<Vec<_>>(),
+      state.fleet.members().iter().map(|member| member.0).collect::<Vec<_>>()
+    ),
+  ];
+  lines.extend(known.into_iter().filter(|&peer| peer != host).map(|peer| {
+    format!(
+      "{} {} believed={:?}",
+      peer.0,
+      direct_contact_reason(state, peer),
+      membership.state(peer)
+    )
+  }));
+  lines
 }
 
 pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String {
