@@ -140,6 +140,12 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     samples.push(ns(started.elapsed()));
     client.destroy(id).unwrap();
   }
+  if pause.is_some() {
+    let ((wake_ns, taught), (parks, replies)) = (client.wake_estimate(), client.park_ratio());
+    println!(
+      "  provision.{tag} client wake: {wake_ns} ns from {taught} parked wakes ({parks} parks, {replies} replies)"
+    );
+  }
   samples
 }
 
