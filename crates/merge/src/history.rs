@@ -597,6 +597,22 @@ mod tests {
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
+    /// The engine's `apply` reserves its output once at the length `applied_len` counts. Do: generated ops (every kind,
+    /// sources and lengths past the post-state among them) over a generated base. Expect: the count is exactly the
+    /// length `apply` makes, so the reservation is never short (a reallocation) nor long (a wasted large allocation).
+    #[test]
+    fn the_counted_length_is_the_applied_length(
+      base in prop::collection::vec(any::<u8>(), 0..512),
+      raw in prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..8),
+      post in prop::collection::vec(any::<u8>(), 0..300),
+    ) {
+      let ops = ops_over(base.len() as u64, &raw);
+      prop_assert_eq!(
+        crate::engine::applied_len_for_tests(base.len() as u64, &ops, post.len()),
+        apply(&base, &ops, &post).len()
+      );
+    }
+
     /// §4.16 "The verdict" (the whole-file identity check). Do: from a generated first value, build a head by a
     /// generated chain of versions (each spliced from the one before, or, at a generated version, stored whole from
     /// its bytes so it shares nothing); pick a generated base among the versions and generated ops over it, the

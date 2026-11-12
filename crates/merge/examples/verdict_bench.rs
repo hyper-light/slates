@@ -1,7 +1,8 @@
 //! The verdict's CPU per submit, by the size of the file an edit lands in (§4.16 "The verdict"), for the three paths a
 //! slot replacement takes: an edit that overlaps an intervening change with other bytes (a conflict, found by the
 //! whole-file identity check), one that overlaps it with the same bytes (converges, found by the same check), and a
-//! disjoint edit at the head (accepted: `apply` writes the new file and the history splices it).
+//! disjoint edit at the head (accepted: `apply` writes the new file and the history splices it); and the load rung's
+//! shape, a conflicting slot beside clean edits of other files of the same size, which conflicts as a whole.
 //!
 //! Each case submits a fresh increment (a new identity, so no cache answers it) to a green holding the measured file
 //! and as many small files as the load rung's `kernel/` green holds, so the maps a verdict searches are the rung's size.
@@ -37,54 +38,70 @@ const SUBMITS: u64 = 2_000;
 /// Shape: rounds a case; the fastest round's mean is reported, the noise of a busy host taken out.
 const ROUNDS: usize = 7;
 
-/// The measured file's path.
-const PATH: &str = "kernel/measured.c";
+/// The measured files' paths: the first is the one every single-path case edits, the rest the clean files of the mixed
+/// case (a rung round edits 4 slots).
+const PATHS: [&str; 4] = [
+  "kernel/measured.c",
+  "kernel/measured_b.c",
+  "kernel/measured_c.c",
+  "kernel/measured_d.c",
+];
 
-/// An increment based at `base` that replaces the `SLOT` bytes at `at` of the measured file with `bytes` (a delete and
-/// an insert at one offset, as an SDK edit composes), its identity `n`.
-fn replace(base: u64, at: u64, bytes: &[u8], n: u64) -> Increment {
+/// An increment based at `base` that replaces the `SLOT` bytes at each edit's offset of its measured file with its
+/// bytes (a delete and an insert at one offset, as an SDK edit composes), its identity `n`.
+fn edits(base: u64, edits: &[(&str, u64, &[u8])], n: u64) -> Increment {
   let mut doc = OpsDoc::default();
-  let path = doc.paths.intern(PATH);
-  let len = bytes.len() as u64;
-  doc.ops = vec![
-    Op {
+  let mut post_state = Vec::new();
+  for (file, at, bytes) in edits {
+    let path = doc.paths.intern(file);
+    let len = bytes.len() as u64;
+    let src = post_state.len() as u64;
+    post_state.extend_from_slice(bytes);
+    doc.ops.push(Op {
       kind: OpKind::Delete,
       flags: 0,
       path,
-      at,
+      at: *at,
       len,
       src: 0,
-    },
-    Op {
+    });
+    doc.ops.push(Op {
       kind: OpKind::Insert,
       flags: 0,
       path,
-      at,
+      at: *at,
       len,
-      src: 0,
-    },
-  ];
+      src,
+    });
+  }
   let mut id = [0u8; 32];
   id[..8].copy_from_slice(&n.to_le_bytes());
   Increment {
     id,
     base,
     doc,
-    post_state: bytes.to_vec(),
+    post_state,
     evidence: Vec::new(),
   }
 }
 
-/// A green holding the measured file of `size` bytes and `paths - 1` small ones, its middle slot then replaced at
+/// One slot replacement of the first measured file.
+fn replace(base: u64, at: u64, bytes: &[u8], n: u64) -> Increment {
+  edits(base, &[(PATHS[0], at, bytes)], n)
+}
+
+/// A green holding the measured files of `size` bytes and small ones up to `paths`, its middle slot then replaced at
 /// version 1 with `b'B'` bytes: what every overlapping case is judged against.
 fn green(size: usize, paths: usize) -> Green {
-  let mut files: Vec<(String, Vec<u8>)> = (1..paths)
-    .map(|n| (format!("kernel/file{n:04}.c"), vec![b'.'; SMALL]))
+  let mut files: Vec<(String, Vec<u8>)> = (PATHS.len()..paths)
+    .map(|n| (format!("kernel/file{n:05}.c"), vec![b'.'; SMALL]))
     .collect();
-  files.push((
-    PATH.to_owned(),
-    (0..size).map(|n| (n % 251) as u8).collect(),
-  ));
+  for path in PATHS {
+    files.push((
+      path.to_owned(),
+      (0..size).map(|n| (n % 251) as u8).collect(),
+    ));
+  }
   let mut green = Green::with_origin(Origin {
     files,
     ..Origin::default()
@@ -152,8 +169,27 @@ fn main() {
         },
         |outcome| matches!(outcome, Outcome::Accepted { .. }),
       );
+      // The rung's shape: the first file's middle slot overlaps the intervening change with other bytes, the other
+      // three files' slots are clean, and the increment conflicts as a whole.
+      let mixed = time(
+        shape,
+        |_, n| {
+          let quarter = (size / 4) as u64;
+          edits(
+            0,
+            &[
+              (PATHS[0], middle(size), &[b'C'; SLOT]),
+              (PATHS[1], quarter, &[b'D'; SLOT]),
+              (PATHS[2], quarter, &[b'E'; SLOT]),
+              (PATHS[3], quarter, &[b'F'; SLOT]),
+            ],
+            n,
+          )
+        },
+        |outcome| matches!(outcome, Outcome::Conflict { .. }),
+      );
       println!(
-        "verdict\tpaths\t{paths}\tfile_bytes\t{size}\tconflict_ns\t{conflict}\tconverge_ns\t{converge}\taccept_ns\t{accept}"
+        "verdict\tpaths\t{paths}\tfile_bytes\t{size}\tconflict_ns\t{conflict}\tconverge_ns\t{converge}\taccept_ns\t{accept}\tmixed_conflict_ns\t{mixed}"
       );
     }
   }

@@ -668,7 +668,16 @@ fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
 /// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
 fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   let base_len = base.len() as u64;
+  // Reserved once at the length it ends at: grown a run at a time, a large file's output was reallocated and copied
+  // again as it grew (2026-11-11: `realloc` into the allocator's large-allocation path under the owner's verdicts). The
+  // reservation is a hint the copies below need not have: one the allocator refuses leaves the output to grow as before.
   let mut out = Vec::new();
+  if out
+    .try_reserve_exact(applied_len(base_len, ops, post_state.len()))
+    .is_err()
+  {
+    out = Vec::new();
+  }
   let mut pos = 0u64;
   for op in ops {
     if op.at > pos {
@@ -696,6 +705,45 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
     );
   }
   out
+}
+
+/// The length [`apply`] makes of a base of `base_len` bytes with `ops` over a post-state of `post_len` bytes: the same
+/// walk, counting instead of copying, so the output is allocated once. A count that overflows is clamped.
+fn applied_len(base_len: u64, ops: &[Op], post_len: usize) -> usize {
+  let post_len = post_len as u64;
+  let mut len = 0u64;
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      len = len.saturating_add(op.at.min(base_len).saturating_sub(pos.min(base_len)));
+      pos = op.at;
+    }
+    let added = || {
+      let start = op.src.min(post_len);
+      start
+        .saturating_add(op.len)
+        .min(post_len)
+        .saturating_sub(start)
+    };
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        len = len.saturating_add(added());
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => len = len.saturating_add(added()),
+      _ => {}
+    }
+  }
+  len = len.saturating_add(base_len.saturating_sub(pos));
+  usize::try_from(len).unwrap_or(usize::MAX)
+}
+
+/// [`applied_len`], for its oracle (`crate::history`'s tests).
+#[cfg(test)]
+pub(crate) fn applied_len_for_tests(base_len: u64, ops: &[Op], post_len: usize) -> usize {
+  applied_len(base_len, ops, post_len)
 }
 
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
@@ -769,6 +817,12 @@ enum Effect {
   /// Set the file to these bytes, recording these ops (head coordinates) as its content delta; the last field says how a
   /// replay arrives at the same bytes (`crate::chain_entry`).
   SetContent(String, Vec<u8>, Vec<Op>, ContentSource),
+  /// Splice these mapped ops (head coordinates) into the file, their bytes read from the increment's post-state, and
+  /// record them as its content delta. The verdict's content effect: its bytes are made only when it is committed
+  /// ([`Green::commit`]) or restated ([`Green::rebased_from`]), so a verdict that conflicts makes none. Until 2026-11-11
+  /// the verdict made every clean path's new file before it knew the increment's outcome: 32% of the engine's verdict
+  /// samples at 3,000 clients over `kernel/`, where 82% of verdicts conflict and throw them away.
+  Splice(String, Vec<Op>),
   /// Remove the file.
   RemoveContent(String),
   /// Create a directory.
@@ -794,8 +848,6 @@ enum Effect {
 /// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
 #[derive(Clone, Debug)]
 enum ContentSource {
-  /// The effect's mapped ops, spliced into the file, from the increment's post-state.
-  Mapped,
   /// These declared ops over nothing, from the increment's post-state.
   Created(Vec<Op>),
   /// The bytes another file holds at this version.
@@ -809,9 +861,7 @@ impl Effect {
     match self {
       Effect::Special(path, node) => Applied::Special(path.clone(), *node),
       Effect::RemoveSpecial(path) => Applied::RemoveSpecial(path.clone()),
-      Effect::SetContent(path, _, ops, ContentSource::Mapped) => {
-        Applied::Spliced(path.clone(), ops.clone())
-      }
+      Effect::Splice(path, ops) => Applied::Spliced(path.clone(), ops.clone()),
       Effect::SetContent(path, _, _, ContentSource::Created(declared)) => {
         Applied::Created(path.clone(), declared.clone())
       }
@@ -838,7 +888,9 @@ impl Effect {
   fn identity_key(&self) -> IdentityKey {
     match self {
       Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
-      Effect::SetContent(path, ..) | Effect::RemoveContent(path) => IdentityKey::File(path.clone()),
+      Effect::SetContent(path, ..) | Effect::Splice(path, _) | Effect::RemoveContent(path) => {
+        IdentityKey::File(path.clone())
+      }
       Effect::MakeDir(path) | Effect::RemoveDir(path) => IdentityKey::Dir(path.clone()),
       Effect::Mode(path, _) => IdentityKey::Mode(path.clone()),
       Effect::Symlink(path, _) | Effect::RemoveSymlink(path) => IdentityKey::Symlink(path.clone()),
@@ -2158,15 +2210,7 @@ impl Green {
     if mapped.is_empty() {
       return Ok(None);
     }
-    let empty = Vec::new();
-    let current = self.content.get(path).unwrap_or(&empty);
-    let next = apply(current, &mapped, &inc.post_state);
-    Ok(Some(Effect::SetContent(
-      path.to_owned(),
-      next,
-      mapped,
-      ContentSource::Mapped,
-    )))
+    Ok(Some(Effect::Splice(path.to_owned(), mapped)))
   }
 
   /// Merges a directory creation.
@@ -2583,7 +2627,7 @@ impl Green {
   }
 
   /// Applies the accepted effects, committing version `version`.
-  fn commit(&mut self, effects: Vec<Effect>, version: u64) {
+  fn commit(&mut self, effects: Vec<Effect>, version: u64, post_state: &[u8]) {
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
     let mut set_content: Vec<(String, Vec<u8>, Vec<Op>)> = Vec::new();
@@ -2596,6 +2640,19 @@ impl Green {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
         Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
+        // The head's file is the one the ops were mapped onto: no content is set until every effect is staged.
+        Effect::Splice(path, ops) => {
+          let bytes = apply(
+            self
+              .content
+              .get(&path)
+              .map(Vec::as_slice)
+              .unwrap_or_default(),
+            &ops,
+            post_state,
+          );
+          set_content.push((path, bytes, ops));
+        }
         Effect::RemoveContent(path) => removed_content.push(path),
         Effect::MakeDir(path) => {
           self.dirs.insert(path.clone());
@@ -2742,7 +2799,7 @@ impl Green {
         let applied = effects.iter().map(Effect::applied).collect();
         // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
         let version = self.head().saturating_add(1);
-        self.commit(effects, version);
+        self.commit(effects, version, &inc.post_state);
         self.accepted.insert(inc.id, version);
         (Outcome::Accepted { version }, Some(applied))
       }
@@ -2774,7 +2831,7 @@ impl Green {
       .map(|effect| self.effect_of(effect, &inc.post_state))
       .collect();
     let version = self.head().saturating_add(1);
-    self.commit(effects, version);
+    self.commit(effects, version, &inc.post_state);
     self.accepted.insert(inc.id, version);
     version
   }
@@ -2785,16 +2842,7 @@ impl Green {
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
-      Applied::Spliced(path, ops) => {
-        let empty = Vec::new();
-        let current = self.content.get(path).unwrap_or(&empty);
-        Effect::SetContent(
-          path.clone(),
-          apply(current, ops, post_state),
-          ops.clone(),
-          ContentSource::Mapped,
-        )
-      }
+      Applied::Spliced(path, ops) => Effect::Splice(path.clone(), ops.clone()),
       Applied::Created(path, declared) => {
         let bytes = apply(&[], declared, post_state);
         let ops = vec![insert_whole(bytes.len() as u64)];
@@ -3177,7 +3225,7 @@ impl Green {
     self.fast_path_hits = fast_path_before;
     match decision {
       Err(windows) => Rebased::Conflict { windows },
-      Ok(effects) => self.rebased_from(effects, to),
+      Ok(effects) => self.rebased_from(effects, to, &inc.post_state),
     }
   }
 
@@ -3185,7 +3233,7 @@ impl Green {
   /// journal: each content effect's file, kept only where it ends different from the head's; the
   /// journal is the effects as declared operations in head coordinates (a content op keeps its mapped
   /// range, a file new to the head is created first). The green is not touched.
-  fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
+  fn rebased_from(&self, effects: Vec<Effect>, to: u64, post_state: &[u8]) -> Rebased {
     use crate::increment::VolumeOp;
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
@@ -3203,6 +3251,24 @@ impl Green {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
+          for op in &ops {
+            if let Some(volume_op) = content_volume_op(&path, op) {
+              journal.push(volume_op);
+            }
+          }
+          changed.insert(path, Some(bytes));
+        }
+        // A clean rebase's mapped content: its bytes are made here, over the head's file the ops were mapped onto.
+        Effect::Splice(path, ops) => {
+          let bytes = apply(
+            self
+              .content
+              .get(&path)
+              .map(Vec::as_slice)
+              .unwrap_or_default(),
+            &ops,
+            post_state,
+          );
           for op in &ops {
             if let Some(volume_op) = content_volume_op(&path, op) {
               journal.push(volume_op);
