@@ -2317,10 +2317,7 @@ fn summary_line(volume: &VolumeSummary) -> String {
     volume.live_shipped
   );
   match &volume.not_recovered {
-    Some(cause) => format!(
-      "{line} not_recovered={}",
-      slates_mcp::recovery_cause_kind(cause)
-    ),
+    Some(cause) => format!("{line} not_recovered={}", cause.kind()),
     None => line,
   }
 }
@@ -2525,6 +2522,9 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
   out
 }
 
+/// Format: nanoseconds in a millisecond, for a status line printed in milliseconds.
+const NANOS_PER_MILLISECOND: u64 = 1_000_000;
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
 /// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
@@ -2614,6 +2614,19 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&format!(
     "fleet_peers_in_contact: {}\nfleet_peers_unmeshed: {}\n",
     report.fleet.peers_in_contact, report.fleet.peers_unmeshed
+  ));
+  // A learner's configuration fetches: the council version it holds, the version after its last fetch, how many members
+  // that fetch asked and how long ago, `never` before any. A node held at an old version says here whether it asked.
+  let learner = &report.fleet.learner;
+  out.push_str(&format!(
+    "fleet_learner: council_version={} fetched_version={} asked={} last_asked_ago_ms={}\n",
+    learner.council_version,
+    learner.fetched_version,
+    learner.asked,
+    learner.last_asked_ago_ns.map_or_else(
+      || "never".to_owned(),
+      |ns| (ns / NANOS_PER_MILLISECOND).to_string()
+    )
   ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(

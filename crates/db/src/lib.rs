@@ -45,6 +45,7 @@ pub mod reconfig;
 pub mod record;
 pub mod register;
 pub mod replay;
+pub mod takeover;
 
 pub use art::Art;
 pub use error::DbError;

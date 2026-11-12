@@ -186,7 +186,10 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 `fleet_peers_probed` (peers with a formed probe session), `fleet_peers_in_contact` (the members it keeps direct
 contact with: its holders and the voters, and every member while it votes) and `fleet_peers_unmeshed` (those of them
 not probed yet: its mesh is up at 0; two members that neither hold for each other nor vote keep no contact, so
-`fleet_peers_probed` need not reach the member count less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
+`fleet_peers_probed` need not reach the member count less one), `fleet_learner: council_version=… fetched_version=…
+asked=… last_asked_ago_ms=…` (as a learner: the council version it holds, the version after its last configuration
+fetch, how many members that fetch asked, and how long ago, `never` before any; a node held at an old version says
+here whether it is asking), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
 `fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
 finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
 it has installed; each admission, retirement, settlement and takeover confirmation advances it); then
@@ -331,7 +334,12 @@ drain's markers, the `chokepoints` registry with each chokepoint's `fresh`/`late
 `expected`, and the `spans` with their `request`, `trace`, `span` and `cause` identities), exactly what
 the text form prints and the MCP `slates.status` tool returns.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
-NFS bridge (FUSE on Linux); `slates unmount PATH` removes it. `--subtree DIR` presents only that
+NFS bridge (FUSE on Linux); `slates unmount PATH` removes it. On Linux the FUSE mount goes through the system's
+`fusermount3`. Ubuntu 26.04 confines `fusermount3` with an AppArmor profile (`/etc/apparmor.d/fusermount3`) that allows
+FUSE mounts and unmounts only under your home directory, `/mnt`, `/media`, `/tmp` and `/run/user/UID`, for every caller
+and inside containers too; a `PATH` anywhere else is refused `Permission denied` ("the mount helper returned no device
+descriptor … fusermount3: mount failed"). Mount under one of those directories, or have an administrator allow the
+path in `/etc/apparmor.d/local/fusermount3` and reload the profile (`apparmor_parser -r /etc/apparmor.d/fusermount3`). `--subtree DIR` presents only that
 directory of the volume: it is the mount's root, and nothing outside it can be reached through the mount,
 not even by a handle made by hand. A subtree that is a file or does not exist is refused, and nothing is mounted. `slates advance ATTACHMENT
 [SNAPSHOT]` moves a snapshot's mount to another snapshot of the volume (the newest when none is given) and prints

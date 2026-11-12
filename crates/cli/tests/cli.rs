@@ -3725,6 +3725,9 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.discovery.pages",
     "fleet.learner.fetches",
     "fleet.learner.fetch_paced",
+    // A learner's fetch period that found no session to any member of its region yet, skipped and asked again the next
+    // period, as `fetch_paced` is (310d7010 added it; B10's Linux gate found each forming node counting it once).
+    "fleet.learner.no_session",
     "fleet.plane.announce_lends",
     "fleet.plane.announcements_sent",
     // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
@@ -8117,17 +8120,95 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
 /// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
 /// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
+///
+/// **Its precondition, proved each attempt.** The rule is tested only if the store's page is still dirty when the other
+/// path writes. The kernel may write it back first. On adacachy2's 7.3 kernel a process spawn from the test's process
+/// while the page is dirty did so, as a sibling test's spawn would: with one `Command` spawn between the store and the
+/// replacement, 6 attempts of 6 found the page written back first, 3-6 ms after the store (2026-11-09, a daemon trace),
+/// while a 50 ms sleep there left it dirty. That write-back is fresh, so it is rightly applied, and the sync then has
+/// nothing to refuse. Before 2026-11-09 the test took that run for a lost refusal ("the sync says so: Ok(())", B10's
+/// gate at load about 66). So each attempt reads the daemon's `fuse.writebacks_applied` just before the store and just
+/// after the other path's write: an applied write-back between them can only have come first, since after the write
+/// every byte of a page fetched before it is stale. An attempt whose precondition did not hold says so and starts
+/// again with a fresh fixture, up to [`DIRTY_PAGE_ATTEMPTS`]; it never passes or fails on the rule.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   if !live_mount_runs() {
     return;
   }
-  let mut fixture = MappedThroughAMount::with_pages("mapdirty", b'A', 2);
+  let mut missed = Vec::new();
+  for attempt in 1..=DIRTY_PAGE_ATTEMPTS {
+    match dirty_page_attempt(attempt) {
+      DirtyPageAttempt::Held => return,
+      DirtyPageAttempt::Missed(miss) => {
+        eprintln!(
+          "attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}: precondition not held, retrying: {miss}"
+        );
+        missed.push(miss);
+      }
+    }
+  }
+  panic!(
+    "the precondition (a store's page still dirty when another path writes) never held in {DIRTY_PAGE_ATTEMPTS} \
+     attempts, so the write-back rule was never tested: {missed:?}"
+  );
+}
+
+/// Derived: attempts at [`a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`]'s precondition.
+/// The run on main held it 10 of 10 at load 66-68 (adacachy2, 2026-11-09), a miss rate under 30% at 95% confidence (3
+/// / 10, the rule of three); at 30% six attempts all miss with 0.3^6 = 0.0007, under one in a thousand.
+#[cfg(target_os = "linux")]
+const DIRTY_PAGE_ATTEMPTS: u32 = 6;
+
+/// How one attempt at the dirty-page rule went: its precondition held and every assertion passed, or it did not hold
+/// in the phase named (the kernel wrote the store's page back before the other path's write).
+#[cfg(target_os = "linux")]
+enum DirtyPageAttempt {
+  Held,
+  Missed(String),
+}
+
+/// One attempt at the dirty-page rule, with a fresh fixture: [`DirtyPageAttempt::Missed`] naming the phase whose
+/// precondition did not hold, the rule's own assertions otherwise.
+#[cfg(target_os = "linux")]
+fn dirty_page_attempt(attempt: u32) -> DirtyPageAttempt {
+  let mut fixture = MappedThroughAMount::with_pages(&format!("mapdirty{attempt}"), b'A', 2);
   let second = fixture.mount_again();
+  if let Some(miss) = stale_whole_file_phase(&mut fixture) {
+    return DirtyPageAttempt::Missed(miss);
+  }
+  match stale_part_phase(&mut fixture, &second) {
+    Some(miss) => DirtyPageAttempt::Missed(miss),
+    None => DirtyPageAttempt::Held,
+  }
+}
+
+/// The daemon's applied cache write-backs and refused ones (`fuse.writebacks_applied`, `fuse.writeback_conflicts`).
+#[cfg(target_os = "linux")]
+fn writeback_counts(instance: &str) -> (u64, u64) {
+  (
+    status_counter(instance, "fuse.writebacks_applied"),
+    status_counter(instance, "fuse.writeback_conflicts"),
+  )
+}
+
+/// The whole-file phase: a store left dirty, the whole file replaced through the SDK, the sync refused. Then the control:
+/// a store into the page fetched after the replacement, applied whole. `Some` naming the miss when the store's page was
+/// written back before the replacement.
+#[cfg(target_os = "linux")]
+fn stale_whole_file_phase(fixture: &mut MappedThroughAMount) -> Option<String> {
   let length = fixture.length;
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the whole-file phase: {early} write-back(s) of the store's page applied before the replacement"
+    ));
+  }
   let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
@@ -8136,6 +8217,10 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   assert!(
     stale_whole.is_err(),
     "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
+  );
+  assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts, the rule's non-vacuity count)"
   );
   assert!(
     fixture.follows(b'S'),
@@ -8149,9 +8234,26 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     fresh.is_ok() && fixture.volume_bytes() == expected,
     "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
   );
+  None
+}
+
+/// The second-mount phase: a store left dirty, other bytes of its page written through a second mount, the sync
+/// refused whole. `Some` naming the miss when the store's page was written back before the second mount's write.
+#[cfg(target_os = "linux")]
+fn stale_part_phase(fixture: &mut MappedThroughAMount, second: &SecondMount) -> Option<String> {
+  let mut expected = vec![b'S'; fixture.length];
+  expected[10] = b'M';
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[20] = b'N';
   let written = 100..200;
   second.write_at(written.start, &vec![b'R'; written.len()]);
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the second-mount phase: {early} write-back(s) of the store's page applied before the second mount's write"
+    ));
+  }
   let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
@@ -8163,9 +8265,14 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts)"
+  );
+  assert!(
     fixture.follows_bytes(&expected),
     "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
+  None
 }
 
 /// §4.6 the mount route's dirty pages on macOS (A-192). Apple's NFS client writes a page dirtied through a shared map back

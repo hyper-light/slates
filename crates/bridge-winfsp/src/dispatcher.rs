@@ -315,6 +315,8 @@ struct Dll<'a> {
   confirmations: &'a SyncSender<crate::host::Request>,
   wake: &'a std::task::Waker,
   bound: usize,
+  /// The answer of the open's confirmation posted last, until it is taken (audit step 7, cut (c)): at most one.
+  confirming: Option<crate::host::Confirming>,
 }
 
 impl inflight::settle::Edges for Dll<'_> {
@@ -364,8 +366,24 @@ impl inflight::settle::Edges for Dll<'_> {
     length
   }
 
-  fn confirm_open(&mut self, context: u64) -> Result<(), WinFspError> {
-    crate::host::confirm_open(self.confirmations, self.wake, context)
+  fn post_confirm(&mut self, context: u64) -> Result<(), WinFspError> {
+    // The protocol takes the previous answer before any later save, so at most one is outstanding.
+    if self.confirming.is_some() {
+      return Err(WinFspError::Capture(Refusal::Unsettled));
+    }
+    self.confirming = Some(crate::host::post_confirm(
+      self.confirmations,
+      self.wake,
+      context,
+    )?);
+    Ok(())
+  }
+
+  fn confirmed(&mut self) -> Result<(), WinFspError> {
+    match self.confirming.take() {
+      Some(answer) => crate::host::confirmed_open(&answer, self.wake),
+      None => Ok(()),
+    }
   }
 
   fn rename_open_names(&mut self, from: &str, to: &str) -> Result<(), WinFspError> {
@@ -477,6 +495,7 @@ fn receive_loop(
     confirmations,
     wake,
     bound,
+    confirming: None,
   };
   let mut response = Box::new(Packet([0; RESPONSE_MAX]));
   let mut view = CaptureView::new(section, bound)?;
