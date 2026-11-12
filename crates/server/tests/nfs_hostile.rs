@@ -20,7 +20,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
-  lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status,
+  lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status, readdirplus,
   readdirplus_status, readlink, remove_status, rmdir_status, status, symlink_status, write,
   write_at_status,
 };
@@ -44,6 +44,8 @@ const COUNTER_BITS: std::ops::Range<usize> = 152..200;
 const NFSPROC3_READ: u32 = 6;
 /// Format: NFSPROC3_WRITE (RFC 1813).
 const NFSPROC3_WRITE: u32 = 7;
+/// Format: NFSPROC3_READDIRPLUS (RFC 1813).
+const NFSPROC3_READDIRPLUS: u32 = 17;
 /// Format: the record marker's last-fragment bit (RFC 5531 §11).
 const LAST_FRAGMENT: u32 = 0x8000_0000;
 
@@ -1796,6 +1798,81 @@ fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
   );
   wedged.join().unwrap();
   drop(daemon);
+}
+
+/// A volume named `hostile-control-N` that the control shard (partition 0) owns, created through the client: a name's
+/// partition is its hash's, so names are tried until one lands there, as [`provision_remote_volume`] tries for the other.
+fn provision_control_volume(instance: &str) -> String {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let started = Instant::now();
+  let mut client = loop {
+    match slates_client::Client::connect(instance, deadlines) {
+      Ok(client) => break client,
+      Err(e) => assert!(started.elapsed() < SETTLE, "connect: {e}"),
+    }
+  };
+  for attempt in 0u32..32 {
+    let name = format!("hostile-control-{attempt}");
+    let id = client
+      .create(&slates_client::CreateSpec {
+        name: name.clone(),
+        size: SizeClass::Bounded { limit: 64 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    if slates_server::verbs::owner_of(id) == 0 {
+      return name;
+    }
+  }
+  panic!("no volume landed on the control shard in 32 attempts");
+}
+
+/// §4.13 (AUD-01), D-14 ("ids route to owners"). Do: on a two-shard daemon with a volume the control shard owns, mount
+/// the host root under that volume's capability, then hold the other shard in a poll that sleeps three liveness windows,
+/// as a wedged shard does, and list the host root meanwhile. Expect: the listing answered (accept status 0) before the
+/// hold ends, and the volume's name in it once the hold is over. A capability authorizes one attachment, which names the
+/// partition that holds it, and only that partition can list anything under it, so the listing asks that one shard.
+/// Before, a root `READDIR` asked every shard and waited on each, so a wedged shard the capability has nothing on
+/// failed the listing `SYSTEM_ERR` after a window, and any capability holder made every shard answer as often as it
+/// liked (GAPS: A-192's open list, found sweeping for the connection end's siblings).
+#[test]
+fn a_host_root_listing_asks_only_the_shard_its_capability_names() {
+  let (daemon, instance) = two_shard_daemon("root-listing");
+  let name = provision_control_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let (_, capability) = export.rsplit_once('@').unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &format!("/@{capability}"), 1);
+  let mut args = Vec::new();
+  opaque(&root, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let wedged = hold_shard(&daemon, 1, WINDOW * 3, false);
+  let started = Instant::now();
+  let accepted = call_accept_status(&mut stream, NFS_PROGRAM, NFSPROC3_READDIRPLUS, &args, 2);
+  let took = started.elapsed();
+  wedged.join().unwrap();
+  let listed = readdirplus(&mut stream, &root, 3);
+  drop(daemon);
+  assert!(
+    accepted == 0 && took < WINDOW * 3,
+    "the host root listed under one volume's capability while another shard was wedged (status {accepted} after \
+     {took:?}, the hold {:?})",
+    WINDOW * 3
+  );
+  assert!(
+    listed.contains(&name),
+    "the listing holds the volume the capability authorizes: {listed:?}"
+  );
 }
 
 /// The pressure tests' scopes end on a failure (2026-11-07). Do: in a scope, start a thread that spins until a flag is
