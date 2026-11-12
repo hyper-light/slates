@@ -45,7 +45,7 @@ const BUDGET_LOG_BYTES: u64 = 128 << 20;
 /// and of its records' kind, long after the fresh boot.
 const SETTLING_SNAPSHOTS: u64 = 4;
 /// Shape: snapshots a stall may bring early while the longest-tail test approaches the trigger, each restarting the
-/// approach, before the test gives up.
+/// approach, which then predicts from at least that stall, before the test gives up.
 const EARLY_SNAPSHOTS: u64 = 3;
 /// Shape: recoveries of the same tail, the median judged: recovery writes nothing to a tail that verifies, so each
 /// replays the same bytes. The budget is a bound a recovery meets on the machine as it is, so the median, not the
@@ -239,10 +239,11 @@ fn account(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id: VolumeId
 }
 
 /// A-243, §4.8 (raft's check of the bound). Do: on a fresh segment with a 10 ms recovery budget, append small records
-/// past a few snapshots, then stop one record short of the next, by the tail's own measured work and bytes, and recover
-/// from the segment five times, timed. Expect: the median replay of that tail, the longest one the trigger allows,
-/// fits the budget. A rate timed on the apply alone left out the replay's read, checksum and decode, so its cadence
-/// allowed a tail 16 to 21 times the budget (CI runs 42389990113 and 42390241110).
+/// past a few snapshots, then stop one record short of the next, predicting the next record from the largest the
+/// approach has seen, by the tail's own measured work and bytes, and recover from the segment five times, timed.
+/// Expect: the median replay of that tail, the longest one the trigger allows, fits the budget. A rate timed on the
+/// apply alone left out the replay's read, checksum and decode, so its cadence allowed a tail 16 to 21 times the budget
+/// (CI runs 42389990113 and 42390241110).
 #[test]
 fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
   let mut seg = segment(BUDGET_LOG_BYTES);
@@ -257,28 +258,42 @@ fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
     n += 1;
     account(&mut db, &mut seg, id, n);
   }
-  let mut last = Tail::default();
+  // The largest record the approach has seen, since the settling snapshots and across its restarts: the next record is
+  // predicted from it, not from the last one alone. A record whose commit was preempted measures the preemption as
+  // replay work (1 to 8 ms of a 10 ms budget at load 49 to 71 on the shared Mac, against about 5 us a record), so the
+  // last one alone let a spike past the prediction three times running (raft-chaos's gate, load 48 to 64).
+  let mut largest = Tail::default();
   loop {
     let now = db.stats();
-    if now.tail.replay_ns + 2 * last.replay_ns >= SMALL_BUDGET_NS
-      && now.tail.bytes + 2 * last.bytes >= now.snapshot_floor_bytes
+    if now.tail.replay_ns + 2 * largest.replay_ns >= SMALL_BUDGET_NS
+      && now.tail.bytes + 2 * largest.bytes >= now.snapshot_floor_bytes
     {
       break;
     }
     n += 1;
-    account(&mut db, &mut seg, id, n);
+    let bytes = account(&mut db, &mut seg, id, n);
     let after = db.stats();
     if after.snapshots != now.snapshots {
       assert!(
         after.snapshots < SETTLING_SNAPSHOTS + EARLY_SNAPSHOTS,
-        "a snapshot came before the approach stopped {EARLY_SNAPSHOTS} times"
+        "a snapshot came before the approach stopped {EARLY_SNAPSHOTS} times; the largest record seen took {} ns",
+        largest.replay_ns
       );
-      last = Tail::default();
+      // The snapshot was due, so the record that brought it took at least the room the tail had left: the restarted
+      // approach predicts from that.
+      largest = Tail {
+        bytes: largest.bytes.max(bytes),
+        replay_ns: largest
+          .replay_ns
+          .max(SMALL_BUDGET_NS.saturating_sub(now.tail.replay_ns)),
+      };
       continue;
     }
-    last = Tail {
-      bytes: after.tail.bytes - now.tail.bytes,
-      replay_ns: after.tail.replay_ns - now.tail.replay_ns,
+    largest = Tail {
+      bytes: largest.bytes.max(bytes),
+      replay_ns: largest
+        .replay_ns
+        .max(after.tail.replay_ns - now.tail.replay_ns),
     };
   }
   let settled = db.stats();
@@ -305,10 +320,11 @@ fn a_fresh_partitions_longest_tail_replays_within_its_recovery_budget() {
   let median = in_order.get(RECOVERIES / 2).copied().unwrap();
   println!(
     "budget {SMALL_BUDGET_NS} ns: tail {tail} bytes, {} ns of replay work as the commits measured it ({} bytes/us), \
-     floor {} bytes; replayed {replayed} bytes; recoveries {replay_ns:?} ns, median {median} ns ({} bytes/us), {} per \
+     the largest record {} ns, floor {} bytes; replayed {replayed} bytes; recoveries {replay_ns:?} ns, median {median} ns ({} bytes/us), {} per \
      mille of the budget",
     settled.tail.replay_ns,
     tail * 1_000 / settled.tail.replay_ns.max(1),
+    largest.replay_ns,
     settled.snapshot_floor_bytes,
     replayed * 1_000 / median.max(1),
     median * 1_000 / SMALL_BUDGET_NS

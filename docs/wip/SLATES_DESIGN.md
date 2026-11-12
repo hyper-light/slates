@@ -2180,7 +2180,16 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
 > held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
-> so none serves a request after the acknowledgement.
+> so none serves a request after the acknowledgement. **2026-11-09:** on Linux the ended FUSE mount's own registry
+> attachment is revoked too (`fuse::fence_if_mounted`); before, it was not, and a revoked consumer's FUSE mount read on
+> (`docs/bugs/2026-11-09-a-revoked-consumers-linux-fuse-mount-went-on-serving.md`). The same day the fenced mount's
+> kernel cache was closed as well: a page the kernel holds is read with no request, so a descriptor opened before the
+> revocation read a page its readahead had fetched and the process never asked for. The fence now wakes the mount,
+> which tells its kernel to drop the root and every node it references (`FUSE_NOTIFY_INVAL_INODE` of all data, sliced
+> under the shard's budget, written on the notify thread) while it answers every request `ENOTCONN`, and ends only once
+> the last slice is written; the revocation is acknowledged after the mount has ended, bounded by the told wait (§4.6,
+> `told::TOLD_WAIT_NS`) and counted past it (`fuse.revoked_overdue`). The cost is one message per node the kernel
+> references, at most the volume's inode allowance.
 
 > **Amendment (2026-10-17): invalidations are delivered off the answering thread, not before each request.**
 > "Before each request" was not merely an ordering preference — it deadlocked the mount, and could not be kept.
@@ -4977,6 +4986,12 @@ and cannot replace an initialized group. Separate group genesis identities never
 state. Both regional and root groups follow this rule, as does N=1.
 An initialized learner keeps a fetched read view separate from its Raft fold, so catching up
 cannot apply a takeover or home change twice. The view is dropped when replay reaches its version.
+A regional learner fetches from every member of its region it holds a session to, not from the voters alone: its voter
+list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
+to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
+adoption only moves forward.
+A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
+voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -20068,6 +20083,118 @@ old build has bytes left over (`LengthMismatch`). Every caller refuses rather th
 A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
 But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
 none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
+
+### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
+
+A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
+every object of the retired host the holder did not list: listing nothing meant holding nothing. A holder whose page
+leaves out a copy it holds therefore reads as holding nothing. Two things left copies out:
+- its routing disagreed with the successor's (`takeover::list_page` lists only objects whose owner, by the holder's
+  routing, is the asker);
+- it could not promise the copy (closed by step (c), `docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`).
+
+The successor can then reach an object's recovery quorum with such an empty promise and adopt an older record over a
+committed newer one. That breaks NoLoss.
+
+The change, in four steps:
+- **(c), landed:** a copy a holder cannot promise is a typed refusal that keeps its answer incomplete
+  (`HostPromise::unpromised`).
+- **(a), built:** the counting rule is a pure function, `slates_db::takeover::readiness`, under a `CountingRule`.
+  `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover:
+  - one or two cohorts per object;
+  - writes to one cohort (a later owner in the recovery chain) or to all of them (a joint write), each committed by
+    `Quorum::committed_within` in every cohort it targets;
+  - the successor's own copies behind its lease gate, learned through its routing as any holder's are;
+  - pages answered in a generated order;
+  - a nemesis that leaves objects out of holders' pages while the pages still end complete.
+
+  Its oracle is NoLoss: an adopted record is at least as new as every committed one. Over 2,000 generated histories,
+  today's rule lost 0 records with the nemesis off and 216 with it on. A-251's rule (below) lost none, and 400 of its
+  adoptions came only from a holder's answer by name. Each of three mutants of the rule turns the model red:
+  - the named rule also counting a complete page;
+  - only an object's first cohort judged;
+  - the recovery quorum one short. The minimal history is
+  `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`.
+- **(b), built:** after a holder's pages are complete, the successor asks it by name for each learned object it did not
+  list, among the objects whose recovery cohorts it is in. The holder answers from a direct `holder_records` look-up,
+  with no routing filter (`takeover::answer_by_name`): its highest record, promised as a page promises it, or "nothing
+  held" for that object alone. The rule is now `CountingRule::NamedAnswer`: a member promised an object when it listed
+  it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise case (a
+  survivor that never received an object) still completes: that survivor answers "nothing held" by name.
+  - **The successor answers itself by name too.** It learns its own copies through its routing (`promise_local_copies`),
+    which can lose one as any holder's can. So under the named rule its open lease gate is no promise on its own: while
+    the gate is open, it answers itself by name for each learned object it has not reported, from its own records
+    (`takeover::answer_own_copies_by_name`, at the start of `ready_objects`). With the nemesis also leaving out the
+    successor's own copies, a successor that counted its gate instead lost 86 committed records over the 2,000 histories.
+  - **What stands in for routing.** A warm-restarted holder loses its routing and its `departed_owners`, so neither can
+    decide. A holder answers only when the committed configuration names the asker the object's successor and the
+    copy's acceptor serves an owner in the retired host's recovery chain, or the asker already. So a question never
+    installs the asker over a live owner's object. Anything else is refused, counted `fleet.takeover.named_refused`,
+    and stays unanswered.
+  - **The wire.** `HostPrepare::named` and `HostPromise::nothing` are lists appended to the existing messages, written
+    only when not empty, so a page request and its answer keep their bytes. Hostile-input tests cover both sides. A
+    holder from before A-251 refuses a question that names objects. A successor then waits on that holder's answer as
+    on a silent member, which the cohort's quorum tolerates up to `f`: liveness only, until it is upgraded.
+  - A by-name answer is bounded by a page's bytes, and a question by the ids that fit one page. What is left out is
+    asked again next period.
+- **(d), owed:** the process test.
+
+**How a successor learns the names (folded into (b), the supervisor's direction).** Asking by name helps only once
+the successor knows the name. An object that every holder leaves out of its pages, the successor's own learning
+included, is never learned, so the round confirms without it and NoLoss breaks silently. The model's nemesis now lets
+any holder leave out any object. Over 1,000 histories (2,950 objects), the named rule with today's routing-selected
+pages left 620 committed objects unlearned. Two shapes were run against that nemesis, neither a global catalog
+(D-14 forbids one for lookups, not a host's own recovery directory):
+- **(i), chosen, as one rule with no routing in it: a holder lists a copy by its authority's line, or by the line
+  of the owner an install moved that authority from.**
+  - **The rule.** A page lists, and a successor learns of its own, every copy whose acceptor's authority, or the owner an
+    install last moved that authority from (`Acceptor::moved_from`), has a line in the configuration
+    (`RegionalConfiguration::lineage`) that ends in this round with the asker as its successor
+    (`slates_db::takeover::copy_falls_to`). Today's routing filter is gone (CLAUDE.md §2.7: one rule, not a rule and a
+    second path).
+  - **Why the moved-from owner.** The install's authority reconcile moves a retired owner's copies to its successor.
+    After a warm restart, such a copy routes to the successor as a live owner, so neither routing nor the authority
+    alone names the retired host.
+  - **Why not the asker's authority alone.** The asker's own live objects never fall here. Listing one would raise its
+    fence to the round's epoch and could refuse the asker's own writes.
+  - **Measured over 1,000 histories (2,950 objects).** The model gives copies an authority an install may move, and
+    holds the asker's own objects:
+    - routing plus a chain path (the first shape (i) built) lost 204 records;
+    - the literal "chain or the asker" lost none, but learned the asker's own objects in every history; its minimal
+      counterexample is `the_chain_or_asker_rule_learns_the_askers_own_object`;
+    - this rule lost none and learned none.
+    The first two are rejected.
+  - **Cost.** No write: the authority and its last move are kept with the copy.
+  - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
+    retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
+    holds one owner, overwritten by the next such move, never a list.
+  - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
+    owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
+    test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
+    byte. The layout without the field is refused as truncated, never read as "moved from none".
+  - **The image (owed, after raft-7).** conformance-14 (A-262) and then raft-7 (A-270) land first, each with its own
+    image and delta versions. Then the held image's register piece is this encoding, at the image and delta versions
+    after raft-7's, and an image or delta of another version is refused typed (`VfsError::RecoveryVersion`). A missing field is never read as none: that would be the compatibility shim §2.7
+    forbids. Until then a warm restart forgets an earlier move, as main does today.
+  - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
+- **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
+  configuration group keeps membership, read by the successor for every name.
+  - Measured: 0 records lost over the same histories.
+  - Cost: one more committed record for every object created (2,950 over the 2,950 objects), on the create path.
+  - It loses nothing more than (i) does and costs a commit per create, so it is rejected.
+
+The successor answers itself by name too: under the named rule its open gate alone is no promise, so a successor
+holding nothing of an object in whose cohort it is must say so (`answer_own_copies_by_name`).
+
+Applied in the same change to:
+- `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, `promise_object`,
+  `falls_to`, `AcceptorStore`, `answer_by_name`, with unit tests.
+- `crates/db/src/register.rs`: `HostPrepare::named`, `HostPromise::nothing`, `Acceptor::authority`.
+- `crates/db/tests/takeover_model.rs` (new).
+- `crates/server/src/takeover.rs`: `ready_objects`, `fold_answers`, `begin_round`, `serve_host_prepare`, `list_page`,
+  `promise_local_copies`, `initial_epoch`, `answer_own_copies_by_name`, and the module doc's account of the empty
+  promise.
+- Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.
 
 ### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
 Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
