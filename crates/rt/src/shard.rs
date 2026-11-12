@@ -1484,6 +1484,7 @@ impl ShardContext {
       inner.counters.wake_cost_ns = mean;
     });
     entry.pulse.record_wake_cost(mean);
+    entry.pulse.record_idle_window(self.spin_window_ns());
   }
 
   /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it
