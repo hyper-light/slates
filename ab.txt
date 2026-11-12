@@ -270,3 +270,11 @@ slates daemon: the control shard's beat task ran 786 ms after its last turn (a n
 slates daemon: the control shard's beat task ran 863 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 483 ms and its timer overrun 45 ms
 slates-winfsp diag-52: requests taken by kind 1:273017 3:273009 4:273009 5:21000 6:21000 8:105001 11:21000 12:21003 14:157220 19:294006; confirmations taken 273009, the worker waited for 13179
 ## run 1 of 1 done, 2026-11-12T04:58:08Z
+remote: 
+remote: Create a pull request for 'diag-results/winfsp-overlap-43148071819-probe-x86' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-results/winfsp-overlap-43148071819-probe-x86        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      e42d67de81caa2d0fc957e9b48ec1f7b02dd48a1 -> diag-results/winfsp-overlap-43148071819-probe-x86
+# teardown: fsb-227-1-a's drive '' was gone before its unmount
+# teardown: fsb-227-1-b's drive '' was gone before its unmount
