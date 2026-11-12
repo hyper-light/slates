@@ -1,0 +1,59 @@
+name: diag-liveness-a223-step4-vacuity
+
+# Diagnostics only, never on main (A-223 step 4): the paced-client test on the rule's tree with its non-vacuity bound
+# the estimate passing its boot prior (a multiple missed on macOS: 1 of 3 at ten times, 3 of 10 at four): ten runs on
+# macOS, five on each Linux runner. Results go to diag-results/liveness-39-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  red:
+    name: A-223 step 4 vacuity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: The paced-client test, repeated
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          git log -1 --format="tree %h %s" | cut -c1-120 | tee -a $R
+          echo "runner ${{ matrix.os }}, $(nproc 2>/dev/null || sysctl -n hw.ncpu) CPUs, $(date -u)" | tee -a $R
+          cargo fmt --all --check > ../fmt.log 2>&1; echo "== fmt exit $?" | tee -a $R; head -20 ../fmt.log | tee -a $R
+          cargo clippy --locked -p slates-rt -p slates-server --all-targets -- -D warnings > ../clippy.log 2>&1; echo "== clippy exit $?" | tee -a $R; grep -E '^(error|warning)' -A8 ../clippy.log | head -40 | tee -a $R
+          n=5; case "${{ matrix.os }}" in macos-*) n=10;; esac
+          for i in $(seq 1 $n); do
+            cargo test --locked -p slates-server --test idle_window -- --nocapture > ../t.log 2>&1; echo "== idle_window run $i exit $?" | tee -a $R
+            grep -E '^test |slates daemon:|panicked|grew with|queued a woken|^error' ../t.log | cut -c1-1200 | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-39-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-39 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
