@@ -1,0 +1,113 @@
+name: diag-liveness-client
+
+# Diagnostics only, never on main (A-223 sibling (d): the ipc client's Windows wake is a confirmed sleeper's).
+# Two trees: RED (agents/liveness-a223 plus the failing test and the bench's client-wake line) and FIX (the test and the switch-count check).
+# 1. The new test, three times a tree. 2. cargo test -p slates-ipc -p slates-client on FIX (Windows one test at a
+# time, as CI runs the client binary there). 3. provision_bench at 2 shards, quiet, three rounds, trees alternating:
+# the parked form's client wake estimate. Results go to diag-results/liveness-client-N-<os>.
+on:
+  push:
+    branches: ["diag-liveness-client-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  RED_SHA: 5d9c1c57b4d00de25381991e7eb87ce57e4f4391
+  FIX_SHA: 53ee210195b4fd1725d76f06543739f5ed74be37
+  DIAG: 2
+
+jobs:
+  client:
+    name: A-223 (d) client wake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The new test on both trees, three times each
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          for tree in red fix; do
+            case $tree in red) sha=$RED_SHA;; fix) sha=$FIX_SHA;; esac
+            git worktree add "../src-$tree" "$sha" > /dev/null 2>&1
+            ( cd "../src-$tree" && git log -1 --format="tree $tree %h %s" | cut -c1-100 ) | tee -a $R
+            ( cd "../src-$tree" && CARGO_TARGET_DIR="../target-$tree" cargo test --locked -p slates-ipc --test rings --no-run ) > ../build-$tree.log 2>&1 || { echo "== build $tree failed" | tee -a $R; grep -E '^error' -A6 ../build-$tree.log | head -30 >> $R; }
+            for round in 1 2 3; do
+              echo "== test $tree round=$round" | tee -a $R
+              ( cd "../src-$tree" && CARGO_TARGET_DIR="../target-$tree" cargo test --locked -p slates-ipc --test rings a_reply_sent_before -- --nocapture ) > ../run.log 2>&1; status=$?
+              grep -E 'sleepers|panicked|SKIP|taught a wake under|racing phase|taught the estimate|test result' ../run.log | cut -c1-400 | tee -a $R
+              echo "== exit $status" | tee -a $R
+            done
+          done
+      - name: The presentation test on the red tree (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          ( cd ../src-red && CARGO_TARGET_DIR=../target-red cargo test --locked -p slates-client --test presentation -- --test-threads=1 ) > ../presentation-red.log 2>&1; status=$?
+          echo "== presentation on red exit $status" | tee -a $R
+          grep -E '^test result|panicked|Err` value' ../presentation-red.log | cut -c1-300 | tee -a $R
+      - name: The ipc and client suites on the fixed tree
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          threads=""; case "${{ matrix.os }}" in windows-*) threads="--test-threads=1";; esac
+          ( cd ../src-fix && CARGO_TARGET_DIR=../target-fix timeout 9000 cargo test --locked --no-fail-fast -p slates-ipc -p slates-client -- $threads ) > ../suites.log 2>&1; status=$?
+          echo "== suites exit $status" | tee -a $R
+          grep -E '^test result|FAILED|panicked|Running ' ../suites.log | cut -c1-300 | tee -a $R
+          grep -h '^test result' ../suites.log | awk '{p+=$4; f+=$6; i+=$8} END{print "== suites total: "p" passed, "f" failed, "i" ignored"}' | tee -a $R
+      - name: The bench's client wake, 2 shards, quiet, three rounds alternating
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          mkdir -p ../arms
+          for tree in red fix; do
+            ( cd "../src-$tree" && CARGO_TARGET_DIR="../target-$tree" cargo build --release --locked -p slates-client --example provision_bench ) > ../bench-build-$tree.log 2>&1 || { echo "== bench build $tree failed" | tee -a $R; grep -E '^error' -A6 ../bench-build-$tree.log | head -30 >> $R; }
+            cp "../target-$tree/release/examples/provision_bench$ext" "../arms/bench-$tree$ext"
+          done
+          export PROVISION_BENCH_SHARDS=2
+          for round in 1 2 3; do
+            for tree in red fix; do
+              echo "== bench $tree round=$round at $(date -u +%H:%M:%S)" | tee -a $R
+              timeout 1500 "../arms/bench-$tree$ext" > ../bench.log 2>&1; status=$?
+              grep -E 'provisioning histogram|wake probe|client wake|parked_1 parks|^  provision\.(spinning_1|parked_1)_p99:|panicked' ../bench.log | cut -c1-400 | tee -a $R
+              echo "== exit $status" | tee -a $R
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-client-$DIAG-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          cp ../suites.log suites.log 2>/dev/null || true
+          git add results.txt suites.log
+          git commit -qm "diag-liveness-client-$DIAG results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
