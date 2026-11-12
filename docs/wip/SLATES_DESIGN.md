@@ -15711,7 +15711,10 @@ Applied in the same change to:
   5. Another build's image or CRC-valid delta frame is refused `RecoveryVersion` by the version it carries, before
      anything after it is decoded. It is never read under this layout, and never taken for a torn frame, which would
      recover the checkpoint without the acknowledged deltas after it.
-- **Measured** (adacachy, 2026-11-08). The failing test's late median dropped from 55,216 bytes to one record's.
+- **Measured** (adacachy, 2026-11-08, and again 2026-11-11 on the tip after B11). The failing test's late median dropped
+  from 55,216 bytes to one record's. At load 11–13, five rounds interleaved: what live shipping adds to a stable write
+  at the median, pieces 85.5–92.9 µs (median 91.6), main 70.9–99.5 µs (88.5), the whole image 225.3–325.4 µs (231.2)
+  (BENCHMARKS).
   Interleaved at load 42–113, live shipping adds 65–79 µs to a stable write at the median with pieces, 65–76 µs on main
   (which persists no live copy) and 207–225 µs with the whole image (BENCHMARKS).
 - **Red-checks.** The generated-history oracle fails with `get_mut` left unmarked, and with a copy made again at slot 0.

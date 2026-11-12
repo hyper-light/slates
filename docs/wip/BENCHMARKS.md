@@ -12393,6 +12393,21 @@ Seven arm runs printed no figures (each of the three in the second A/B's first r
 second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
 each), so the test reports failure after printing; the figures stand.
 
+**On raft-7's tip after B11 (2026-11-11, load 11–13, adacachy, the same command and arms: main at 29ef4521, whole at
+c07d1de6, pieces at 2c93f4c9, where the register piece carries A-251's `PersistedAcceptor`).** Every round, interleaved.
+Microseconds: added at the median; live p99.
+
+| round | main | whole | pieces |
+|---|---|---|---|
+| 1 | 70.9; 284.8 | 231.2; 900.6 | 92.9; 525.4 |
+| 2 | 99.5; 471.7 | 225.3; 774.1 | 85.5; 467.8 |
+| 3 | 90.0; 443.8 | 325.4; 1,456.1 | 92.2; 387.0 |
+| 4 | 87.5; 300.0 | 241.2; 1,123.0 | 86.0; 464.8 |
+| 5 | 88.5; 498.8 | 230.7; 800.6 | 91.6; 511.6 |
+
+Medians of the rounds: main 88.5, pieces 91.6, whole 231.2. The pieces sit inside main's own spread (70.9–99.5); the
+whole image is about 140 µs above both, and its p99 is about twice theirs.
+
 **Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
 65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
 pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
