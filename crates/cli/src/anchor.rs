@@ -357,28 +357,43 @@ fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
   // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
   // read nothing is judged spinning, and the progress alone judges a start wedged.
-  let cpu = pid
-    .and_then(slates_machine::process_clock::process_cpu)
-    .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
+  let read_cpu = || {
+    pid
+      .and_then(slates_machine::process_clock::process_cpu)
+      .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress))
+  };
+  let cpu = read_cpu();
   // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
   // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner).
-  let run = pid
-    .and_then(slates_rt::process_runnable)
-    .map(|runnable| slates_rt::RunReading {
-      state: if runnable {
-        slates_rt::RunState::Runnable
-      } else {
-        slates_rt::RunState::Blocked
-      },
-      waited_ns: None,
-    });
-  let look = Look {
+  let runnable = pid.and_then(slates_rt::process_runnable);
+  judge_start_from(watch, now, cpu, runnable, read_cpu)
+}
+
+/// Judges a start from its process clock as first read (`cpu`), then what the scheduler said of it (`runnable`), and
+/// `read_again`, which reads its clock once more ([`Look::told`]).
+fn judge_start_from(
+  watch: &mut ShardWatch,
+  now: u64,
+  cpu: Option<(u64, u64)>,
+  runnable: Option<bool>,
+  read_again: impl FnOnce() -> Option<(u64, u64)>,
+) -> Verdict {
+  let run = runnable.map(|runnable| slates_rt::RunReading {
+    state: if runnable {
+      slates_rt::RunState::Runnable
+    } else {
+      slates_rt::RunState::Blocked
+    },
+    waited_ns: None,
+  });
+  let mut look = Look {
     steps: 0,
     parked: false,
     cpu,
-    run,
+    run: None,
     now_ns: now,
   };
+  look.told(run, read_again);
   let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
   *watch = next;
   verdict
@@ -658,6 +673,31 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
+
+  /// bug-sweep's finding (2026-11-09, `observe::WindowJudge`), the anchor's sibling: a start's process clock is read,
+  /// then whether the process is runnable, and a start held off its CPUs and released between the two reads runs and
+  /// waits before it is asked. Do: judge a start whose clock stood still for a window, the scheduler then saying it is not
+  /// runnable, and its clock read again moved. Expect: not stuck. And with the clock still unmoved when read again:
+  /// stuck, as before.
+  #[test]
+  fn a_start_released_between_its_clock_and_the_scheduler_is_not_killed() {
+    let start = |again: (u64, u64)| {
+      let mut watch = ShardWatch::default();
+      judge_start_from(&mut watch, TURN, Some((10, 10)), Some(true), || None);
+      judge_start_from(
+        &mut watch,
+        TURN + BUDGET,
+        Some((10, 10)),
+        Some(false),
+        || Some(again),
+      )
+    };
+    assert_eq!(start_stuck(start((10 + TURN / 2, 11))), None);
+    assert!(
+      start_stuck(start((10, 10))).is_some(),
+      "a start whose clock is still unmoved when read again is stuck"
+    );
+  }
 
   /// A-228, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each wait
   /// 300 ms over its pause), with early-ended waits between, and more waits than it keeps. Expect: a quiet anchor holds a

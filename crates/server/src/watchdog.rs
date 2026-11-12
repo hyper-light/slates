@@ -221,6 +221,15 @@ pub struct Look {
   pub now_ns: u64,
 }
 
+impl Look {
+  /// Takes the scheduler's answer about this look's thread, `run`, asked after the look's clock was read. `read_again`
+  /// reads the clock once more.
+  pub fn told(&mut self, run: Option<RunReading>, read_again: impl FnOnce() -> Option<(u64, u64)>) {
+    let _ = read_again;
+    self.run = run;
+  }
+}
+
 impl ShardWatch {
   /// Whether `look` leaves the shard under suspicion, so the scheduler is asked about its thread: it is not parked, has
   /// completed no step since the last look, and its CPU clock did not rise. A shard that steps or parks costs nothing.
@@ -391,8 +400,10 @@ fn read_runs(holders: &[SlotHolder], watches: &[ShardWatch], looks: &mut [Option
   }
   let asked: Vec<SlotHolder> = suspects.iter().map(|(_, holder)| *holder).collect();
   let readings = slates_rt::registry::shard_run_readings(&asked);
-  for ((look, _), reading) in suspects.into_iter().zip(readings) {
-    look.run = reading;
+  for ((look, holder), reading) in suspects.into_iter().zip(readings) {
+    look.told(reading, || {
+      slates_rt::registry::shard_cpu(holder).map(|cpu| (cpu.spent_ns, cpu.progress))
+    });
   }
 }
 
@@ -487,6 +498,27 @@ mod tests {
       verdicts.push(verdict);
     }
     verdicts
+  }
+
+  /// bug-sweep's finding (2026-11-09, `observe::WindowJudge`), the watchdog's sibling: the scheduler is asked after the
+  /// clock is read, and a starved shard released between the two reads runs, ends its poll and parks before it is asked.
+  /// Do: watch a shard whose clock has stood still since its last step a window ago, read its clock at the look unmoved,
+  /// have the scheduler then say it is not runnable (jupiter's thread `Waiting` on `WrQueue`), and have the clock read
+  /// again show it ran. Expect: alive, not wedged: a thread cannot go from runnable to blocked without running.
+  #[test]
+  fn a_shard_released_between_its_clock_and_the_scheduler_is_not_judged_wedged() {
+    let (_, watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let mut released = look(5, false, Some((10, 10)), TURN + WINDOW);
+    released.told(blocked(None), || Some((10 + TURN / 2, 11)));
+    let (verdict, _) = watch.judge(released, WINDOW);
+    assert_eq!(verdict, Verdict::Alive, "{verdict:?}");
+    // A clock still unmoved when read again is wedged, as before.
+    let mut stuck = look(5, false, Some((10, 10)), TURN + WINDOW);
+    stuck.told(blocked(None), || Some((10, 10)));
+    assert!(
+      matches!(watch.judge(stuck, WINDOW).0, Verdict::Wedged { .. }),
+      "an unmoved clock read again is wedged"
+    );
   }
 
   /// The turn of a replay's first wedged verdict.
