@@ -1,0 +1,113 @@
+runner windows-latest, 4 CPUs, Thu Nov 12 08:33:04 UTC 2026
+tree red 6344c478f diag only (A-223 (d)): the failing test judged by the thread's switch count, and 
+== test red round=1
+sleepers: 160 samples in 160 trips, estimate 13756 ns; racing: 16384 parks in 16386 trips, 25 parked and never switched out, 22 of them taught a wake [30085, 899, 4297, 699, 908, 4496, 2701, 1707, 18405, 3401, 19488, 21789, 4402, 20594, 23300, 998, 2992, 23586, 30997, 205, 893, 895] ns, 0 trips unjudged, estimate 9889 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (5348) panicked at crates\ipc\tests\rings.rs:362:3:
+22 of 25 parks that never switched out taught a wake: [30085, 899, 4297, 699, 908, 4496, 2701, 1707, 18405, 3401, 19488, 21789, 4402, 20594, 23300, 998, 2992, 23586, 30997, 205, 893, 895] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.43s
+== exit 101
+== test red round=2
+sleepers: 160 samples in 160 trips, estimate 13822 ns; racing: 16384 parks in 16386 trips, 16 parked and never switched out, 13 of them taught a wake [792, 998, 689, 997, 1208, 3101, 3799, 1804, 1594, 1603, 1907, 1100, 1711] ns, 0 trips unjudged, estimate 9975 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (8908) panicked at crates\ipc\tests\rings.rs:362:3:
+13 of 16 parks that never switched out taught a wake: [792, 998, 689, 997, 1208, 3101, 3799, 1804, 1594, 1603, 1907, 1100, 1711] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== exit 101
+== test red round=3
+sleepers: 160 samples in 160 trips, estimate 13456 ns; racing: 16384 parks in 16385 trips, 27 parked and never switched out, 21 of them taught a wake [1599, 2598, 1898, 801, 4688, 25205, 601, 3504, 702, 1504, 996, 1008, 699, 1706, 1405, 1501, 1405, 796, 997, 3998, 30301] ns, 0 trips unjudged, estimate 9922 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (6276) panicked at crates\ipc\tests\rings.rs:362:3:
+21 of 27 parks that never switched out taught a wake: [1599, 2598, 1898, 801, 4688, 25205, 601, 3504, 702, 1504, 996, 1008, 699, 1706, 1405, 1501, 1405, 796, 997, 3998, 30301] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.43s
+== exit 101
+== test red round=4
+sleepers: 160 samples in 160 trips, estimate 13286 ns; racing: 16384 parks in 16385 trips, 20 parked and never switched out, 17 of them taught a wake [794, 790, 1091, 2711, 798, 1004, 4103, 4200, 704, 2697, 1188, 1199, 24511, 22407, 1498, 793, 3103] ns, 0 trips unjudged, estimate 12688 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (2896) panicked at crates\ipc\tests\rings.rs:362:3:
+17 of 20 parks that never switched out taught a wake: [794, 790, 1091, 2711, 798, 1004, 4103, 4200, 704, 2697, 1188, 1199, 24511, 22407, 1498, 793, 3103] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== exit 101
+== test red round=5
+sleepers: 160 samples in 160 trips, estimate 16891 ns; racing: 16384 parks in 16386 trips, 25 parked and never switched out, 21 of them taught a wake [18904, 2009, 1301, 2087, 906, 903, 1903, 1708, 1707, 987, 6306, 800, 1603, 2191, 65500, 798, 1994, 796, 19993, 14898, 2804] ns, 0 trips unjudged, estimate 9790 ns
+thread 'a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing' (10152) panicked at crates\ipc\tests\rings.rs:362:3:
+21 of 25 parks that never switched out taught a wake: [18904, 2009, 1301, 2087, 906, 903, 1903, 1708, 1707, 987, 6306, 800, 1603, 2191, 65500, 798, 1994, 796, 19993, 14898, 2804] ns
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== exit 101
+tree fix 999a5ae8c diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+sleepers: 160 samples in 160 trips, estimate 19925 ns; racing: 16384 parks in 16387 trips, 78 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10295 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== exit 0
+== test fix round=2
+sleepers: 160 samples in 160 trips, estimate 14209 ns; racing: 16384 parks in 16385 trips, 73 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10415 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.44s
+== exit 0
+== test fix round=3
+sleepers: 160 samples in 160 trips, estimate 14605 ns; racing: 16384 parks in 16386 trips, 63 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10192 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.45s
+== exit 0
+== test fix round=4
+sleepers: 160 samples in 160 trips, estimate 18055 ns; racing: 16384 parks in 16385 trips, 81 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10240 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.44s
+== exit 0
+== test fix round=5
+sleepers: 160 samples in 160 trips, estimate 16571 ns; racing: 16384 parks in 16385 trips, 95 parked and never switched out, 0 of them taught a wake [] ns, 0 trips unjudged, estimate 10174 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.44s
+== exit 0
+== presentation on red exit 101
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (3604) panicked at crates\client\tests\presentation.rs:60:6:
+called `Result::unwrap()` on an `Err` value: Refused(Unsupported { feature: "landing" })
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (7520) panicked at crates\client\tests\presentation.rs:112:6:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+== suites exit 101
+     Running unittests src\lib.rs (../target-fix\debug\deps\slates_client-82b8e855812269d2.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\acknowledge.rs (../target-fix\debug\deps\acknowledge-269f5ca48c9559b4.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.44s
+     Running tests\async_core.rs (../target-fix\debug\deps\async_core-d8b69679e919d65e.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\cipher_keys.rs (../target-fix\debug\deps\cipher_keys-775a983494240deb.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+     Running tests\client.rs (../target-fix\debug\deps\client-be976b23f312d6d8.exe)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.76s
+     Running tests\consumer.rs (../target-fix\debug\deps\consumer-c9aaca71341f015e.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\driver.rs (../target-fix\debug\deps\driver-87c480e152f8b83c.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.37s
+     Running tests\edit_and_submit.rs (../target-fix\debug\deps\edit_and_submit-e81f2eeeccd323b8.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.74s
+     Running tests\image.rs (../target-fix\debug\deps\image-8497543a37b0deeb.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+     Running tests\merge_chaos.rs (../target-fix\debug\deps\merge_chaos-483b6c6be6cd57b5.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+     Running tests\merge_identity.rs (../target-fix\debug\deps\merge_identity-f794454d8c9310fb.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+     Running tests\merge_post_state.rs (../target-fix\debug\deps\merge_post_state-f24bad74dfa0ac89.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+     Running tests\netns.rs (../target-fix\debug\deps\netns-ae0c19ea6add5f1b.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\presentation.rs (../target-fix\debug\deps\presentation-938d056c9006319e.exe)
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (8764) panicked at crates\client\tests\presentation.rs:60:6:
+FAILED
+thread 'a_killed_clients_presented_landing_is_abandoned_with_it' (3760) panicked at crates\client\tests\presentation.rs:112:6:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+     Running tests\reap.rs (../target-fix\debug\deps\reap-46d30880d2ee6bed.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.30s
+     Running tests\reap_map.rs (../target-fix\debug\deps\reap_map-7bf32601649b252d.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\shards.rs (../target-fix\debug\deps\shards-c4e13258d847cd5f.exe)
+test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.08s
+     Running unittests src\lib.rs (../target-fix\debug\deps\slates_ipc-7a619c7baea74dfa.exe)
+test result: ok. 18 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.12s
+     Running tests\delivery.rs (../target-fix\debug\deps\delivery-0479ce7ba33bcb70.exe)
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\rendezvous.rs (../target-fix\debug\deps\rendezvous-2901c0e8d81770ef.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+     Running tests\rings.rs (../target-fix\debug\deps\rings-768cc83a505244a9.exe)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+     Running tests\status.rs (../target-fix\debug\deps\status-9afa9e7b785ace95.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\stream_exec.rs (../target-fix\debug\deps\stream_exec-9fd3b5f74e2117ad.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\stream_spawn.rs (../target-fix\debug\deps\stream_spawn-91e4e461ce98e7dd.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== suites total: 114 passed, 1 failed, 5 ignored
