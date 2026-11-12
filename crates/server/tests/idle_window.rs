@@ -39,8 +39,10 @@ const LEAST_REQUESTS: usize = 4 << SHIFT;
 /// Shape: paced requests the test sends at most, waiting for the spinners' queueing to show in an estimate.
 const MOST_REQUESTS: usize = 64 << SHIFT;
 /// Shape: how far past the boot prior some shard's estimate must rise before the run proves anything: an estimate
-/// that stayed near it saw no queueing (the non-vacuity bound).
-const QUEUED_FACTOR: u64 = 10;
+/// that stayed near it saw no queueing (the non-vacuity bound). Four times is far past the probe's own spread, ±20–30 %
+/// on a virtual machine (§4.1), and within what a loaded 3-CPU macOS runner reaches: 5.9 times in the run where ten
+/// was not reached (diag-liveness-37), against 23 to 200 times on Linux and macOS before the rule.
+const QUEUED_FACTOR: u64 = 4;
 /// Shape: spinning threads per logical CPU, as the window rule's A/B loads a machine (A-223).
 const SPINNERS_PER_CPU: usize = 2;
 /// Shape: the bounded volume each request creates and destroys.
@@ -48,7 +50,7 @@ const VOLUME_BYTES: u64 = 1 << 20;
 
 /// A-223 (i), §4.3, §4.7. Do: start a two-shard daemon as derived for this machine (its estimate's weighting window
 /// shortened so the test is quick); beside two spinning threads a logical CPU, send one create and its destroy each
-/// millisecond from one client until some shard's wake estimate has risen to ten times the boot prior. Expect: every
+/// millisecond from one client until some shard's wake estimate has risen to four times the boot prior. Expect: every
 /// shard's idle window is still no longer than the window the daemon derived at boot, while the estimate it would
 /// have been priced on climbed. Before, the window was the estimate times 100 and grew with it.
 #[test]
