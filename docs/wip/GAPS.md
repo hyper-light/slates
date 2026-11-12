@@ -40,8 +40,8 @@
 >   judges its wait by its own switch count, as the shards do, and keeps its seed where the OS refuses the count. Of
 >   16,384 racing parks a run on CI's Windows runners, main learned 11–48 of those that never switched out, the fix
 >   none (`diag-liveness-client-4`, 10 runs a tree); the parked bench form's client estimate read 17–33 µs before and
->   after. Seen on the way, not changed: `presentation.rs` fails on Windows (`Unsupported { feature: "landing" }`,
->   no Windows landing writer, A-262), on main's code too; CI does not run that binary there.
+>   after. Seen on the way: `presentation.rs` failed on Windows (`Unsupported { feature: "landing" }`, no Windows
+>   landing writer, A-262), on main's code too, where CI never ran it; it now builds on Unix only, as the verb does.
 
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
