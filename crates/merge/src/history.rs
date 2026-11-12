@@ -138,6 +138,61 @@ enum Pending {
   Added { at: usize, len: usize },
 }
 
+/// A run of the bytes the engine's `apply` writes ([`Value::applied_runs`]): a run of the value it keeps, or bytes of the
+/// increment's post-state.
+#[derive(Clone, Copy)]
+enum Applied {
+  /// A run of the value, by its piece.
+  Shared(Piece),
+  /// `len` bytes of the post-state at `src`.
+  Post { src: usize, len: usize },
+}
+
+impl Applied {
+  /// A kept run of the value, from what [`Value::share`] collected.
+  fn of_shared(run: Pending) -> Option<Applied> {
+    match run {
+      Pending::Shared(piece) => Some(Applied::Shared(piece)),
+      Pending::Added { .. } => None,
+    }
+  }
+
+  /// The post-state run `op` adds, clamped to the post-state's `post_len` bytes as `apply`'s `push_slice` clamps it.
+  fn post(op: &Op, post_len: usize) -> Option<Applied> {
+    let src = usize::try_from(op.src).unwrap_or(usize::MAX).min(post_len);
+    let end = src
+      .saturating_add(usize::try_from(op.len).ok()?)
+      .min(post_len);
+    Some(Applied::Post {
+      src,
+      len: end.saturating_sub(src),
+    })
+  }
+
+  /// Its length.
+  fn len(&self) -> usize {
+    match self {
+      Applied::Shared(piece) => piece.len,
+      Applied::Post { len, .. } => *len,
+    }
+  }
+
+  /// What is left of it past its first `step` bytes.
+  fn after(self, step: usize) -> Applied {
+    match self {
+      Applied::Shared(piece) => Applied::Shared(Piece {
+        chunk: piece.chunk,
+        at: piece.at.saturating_add(step),
+        len: piece.len.saturating_sub(step),
+      }),
+      Applied::Post { src, len } => Applied::Post {
+        src: src.saturating_add(step),
+        len: len.saturating_sub(step),
+      },
+    }
+  }
+}
+
 impl Value {
   /// The value's length.
   pub(crate) fn len(&self) -> usize {
@@ -208,6 +263,98 @@ impl Value {
       at = end;
     }
     at == bytes.len()
+  }
+
+  /// Whether the bytes `ops` make of this value, their added bytes read from `post_state` as the engine's `apply` reads
+  /// them, are `other`'s bytes: compared run against run, so a stretch both name in the same chunk at the same offset
+  /// is equal unread, and only the runs the ops added and the runs the two values do not share are read. What the
+  /// verdict's whole-file identity check needs (`Green::lands_on_head`): it materialized this value, applied the ops
+  /// to a second copy and compared that with the head, the file's size three times over, where the two values share
+  /// every run neither changed.
+  pub(crate) fn applied_equals(
+    &self,
+    chunks: &Chunks,
+    (ops, post_state): (&[Op], &[u8]),
+    other: &Value,
+  ) -> bool {
+    let Some(runs) = self.applied_runs(ops, post_state.len()) else {
+      return false;
+    };
+    let len = runs
+      .iter()
+      .fold(0usize, |sum, run| sum.saturating_add(run.len()));
+    if len != other.len {
+      return false;
+    }
+    let mut theirs = other.pieces.iter().copied();
+    let mut current: Option<Piece> = None;
+    for run in runs {
+      let mut run = run;
+      while run.len() > 0 {
+        let piece = match current.take().filter(|piece| piece.len > 0) {
+          Some(piece) => piece,
+          None => match theirs.next() {
+            Some(piece) => piece,
+            None => return false,
+          },
+        };
+        let step = run.len().min(piece.len);
+        let same = match run {
+          Applied::Shared(mine) => {
+            (mine.chunk == piece.chunk && mine.at == piece.at)
+              || chunks.bytes_of(&Piece { len: step, ..mine })
+                == chunks.bytes_of(&Piece { len: step, ..piece })
+          }
+          Applied::Post { src, .. } => {
+            post_state.get(src..src.saturating_add(step))
+              == Some(chunks.bytes_of(&Piece { len: step, ..piece }))
+          }
+        };
+        if !same {
+          return false;
+        }
+        run = run.after(step);
+        current = Some(Piece {
+          chunk: piece.chunk,
+          at: piece.at.saturating_add(step),
+          len: piece.len.saturating_sub(step),
+        });
+      }
+    }
+    true
+  }
+
+  /// The runs the engine's `apply` writes when it applies `ops` to this value over a post-state of `post_len` bytes:
+  /// runs of this value it keeps and runs of the post-state it adds, each clamped as `apply` clamps them. `None` when
+  /// an offset does not fit a `usize`.
+  fn applied_runs(&self, ops: &[Op], post_len: usize) -> Option<Vec<Applied>> {
+    let base_len = u64::try_from(self.len).ok()?;
+    let mut runs = Vec::new();
+    let mut shared = Vec::new();
+    let mut pos = 0u64;
+    for op in ops {
+      if op.at > pos {
+        self.share(pos.min(base_len), op.at.min(base_len), 0, &mut shared)?;
+        pos = op.at;
+      }
+      runs.extend(shared.drain(..).filter_map(Applied::of_shared));
+      match op.kind {
+        OpKind::Delete => pos = pos.saturating_add(op.len),
+        OpKind::Truncate => pos = base_len,
+        OpKind::Overwrite => {
+          runs.push(Applied::post(op, post_len)?);
+          pos = pos.saturating_add(op.len);
+        }
+        OpKind::Insert | OpKind::Extend => runs.push(Applied::post(op, post_len)?),
+        _ => {}
+      }
+    }
+    if pos < base_len {
+      self.share(pos, base_len, 0, &mut shared)?;
+    }
+    runs.extend(shared.drain(..).filter_map(Applied::of_shared));
+    runs.retain(|run| run.len() > 0);
+    Some(runs)
   }
 
   /// Gives the value's chunks back: each piece's reference released.
@@ -444,6 +591,51 @@ mod tests {
         value.release(&mut chunks);
       }
       prop_assert_eq!(chunks.bytes(), 0);
+    }
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+    /// §4.16 "The verdict" (the whole-file identity check). Do: from a generated first value, build a head by a
+    /// generated chain of versions (each spliced from the one before, or, at a generated version, stored whole from
+    /// its bytes so it shares nothing); pick a generated base among the versions and generated ops over it, the
+    /// head's own last ops among them so the two converge. Expect: `applied_equals` answers exactly whether `apply`
+    /// of the ops to the base's bytes equals the head's bytes, for every pick.
+    #[test]
+    fn applied_equals_is_the_bytes_compared(
+      first in prop::collection::vec(any::<u8>(), 0..256),
+      chain in prop::collection::vec(prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..5), 1..8),
+      whole_at in any::<u8>(),
+      pick in any::<u8>(),
+      raw in prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..5),
+      converge in any::<bool>(),
+      post in prop::collection::vec(any::<u8>(), 0..300),
+    ) {
+      let mut chunks = Chunks::default();
+      let mut kept = vec![(first.clone(), Value::whole(&mut chunks, &first), Vec::new())];
+      for (n, step) in chain.iter().enumerate() {
+        let (bytes, value, _) = kept.last().unwrap();
+        let ops = ops_over(bytes.len() as u64, step);
+        let next = apply(bytes, &ops, &post);
+        let made = if n == usize::from(whole_at) % chain.len() {
+          Value::whole(&mut chunks, &next)
+        } else {
+          value.spliced(&mut chunks, &ops, &next)
+        };
+        kept.push((next, made, ops));
+      }
+      let (head_bytes, head, head_ops) = kept.last().unwrap();
+      // Converging: the version before the head, with the ops that made the head of it.
+      let at = if converge { kept.len() - 2 } else { usize::from(pick) % kept.len() };
+      let (base_bytes, base, _) = &kept[at];
+      let ops = if converge {
+        head_ops.clone()
+      } else {
+        ops_over(base_bytes.len() as u64, &raw)
+      };
+      let expected = apply(base_bytes, &ops, &post) == *head_bytes;
+      prop_assert_eq!(base.applied_equals(&chunks, (&ops, &post), head), expected);
     }
   }
 

@@ -1720,6 +1720,32 @@ impl Green {
     }
   }
 
+  /// Whether `ops`, applied to `path` as it was at `base`, make exactly the head's file: the whole-file identity check
+  /// of a length-changing op that overlaps an intervening change. Compared through the content history's values
+  /// ([`crate::history::Value::applied_equals`]): the base's value and the head's share every run no version between
+  /// them changed, and those are equal unread, so the check reads what the ops added and what changed since the base,
+  /// not the file. Until 2026-11-09 it materialized the base, applied the ops to a copy and compared the copy with the
+  /// head, three passes over the file per verdict: the largest self time under the owner's `decide` (`memcmp`,
+  /// `memmove`) at 3,000 clients over `kernel/`. A path absent at `base` is empty there, as before. The head's value is
+  /// the history's last, which every writer of the content pushes with it (`commit`, `restore_file`, the origin).
+  fn lands_on_head(&self, path: &str, base: u64, ops_and_post: (&[Op], &[u8])) -> bool {
+    let Some(history) = self.content_history.get(path) else {
+      return false;
+    };
+    let empty = crate::history::Value::default();
+    let at_base = history
+      .iter()
+      .rposition(|(recorded, _)| *recorded <= base)
+      .and_then(|index| history.get(index))
+      .and_then(|(_, value)| value.as_ref())
+      .unwrap_or(&empty);
+    let head = history
+      .last()
+      .and_then(|(_, value)| value.as_ref())
+      .unwrap_or(&empty);
+    at_base.applied_equals(&self.chunks, ops_and_post, head)
+  }
+
   /// Drops `path`'s content history, its chunks released and the running totals with it.
   fn clear_content_history(&mut self, path: &str) {
     let Some(history) = self.content_history.remove(path) else {
@@ -2081,14 +2107,7 @@ impl Green {
     // A length-changing op overlapped: the whole-file identity check decides the path (owed: full
     // per-range identity for shifting ops), so a currently-accepted convergent case never regresses.
     if let Some(range) = shifting_overlap {
-      let base_bytes = self.content_at(path, inc.base).unwrap_or_default();
-      let agent_final = apply(&base_bytes, ops, &inc.post_state);
-      let current = self
-        .content
-        .get(path)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-      if agent_final == current {
+      if self.lands_on_head(path, inc.base, (ops, &inc.post_state)) {
         return Ok(None);
       }
       return Err(vec![ConflictWindow {
