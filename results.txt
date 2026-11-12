@@ -1,0 +1,11 @@
+leg red, tree 84acf4ae0ca4206909adaa851dcb6dba3f5b6b0e
+== fmt exit 0
+== the test exit 101
+thread 'live_ship::tests::the_retained_tail_follows_the_volume_as_it_is_now' (5591) panicked at crates/server/src/live_ship.rs:3117:5:
+assertion `left == right` failed: a laggard is kept entries up to what installing the volume now would send
+  left: 215997
+ right: 200000000
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s
+
