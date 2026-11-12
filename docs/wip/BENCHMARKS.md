@@ -2711,7 +2711,7 @@ step, spin, park and send), and the probe's own overhead reversed the result: al
   one miss per round trip). Its window is the 2-competitive spin-then-park threshold (spin for the expected cost of
   parking; Karlin, Manasse, McGeoch and Owicki 1991), and that threshold took the startup profile's `wake.mean`
   (1.7 µs on macOS), well below the wakes actually paid under load.
-- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (`IDLE_WINDOW_RATIO`)
+- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (the daemon's idle ratio then)
   with the online estimate on, alternating, three rounds: always-kick 4,875–5,917 ns, the candidate 12,167–12,791 ns.
   Still rejected.
 - **The window is not the cause.** The shards' counters show 1–2 real driver waits per 2,000 round trips: nearly
@@ -12074,7 +12074,7 @@ with one step, so the cost needs a starved shard.
 
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
-**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × the daemon's idle ratio (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
 
 **Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
 
@@ -12118,7 +12118,7 @@ with one step, so the cost needs a starved shard.
 
 ## The idle window's rule, measured: main, x100, and three rules against it (A-223; R9; CI; 2026-11-09)
 
-**What was asked.** A-223 measures a real Windows wake, which made the idle window (the shard's wake estimate × `IDLE_WINDOW_RATIO`, 100) span a 1 ms pause and feed on its own spinning's queueing. The same rule already spun through a 1 ms pause on main on Linux (the window rule's baseline, above). The supervisor asked for a rule priced on something load cannot grow, judged by (a) the paced client's CPU, (b) quiet single-client p99, (c) loaded single-client p99 and (d) parks in the paced form above 0.
+**What was asked.** A-223 measures a real Windows wake, which made the idle window (the shard's wake estimate × the daemon's idle ratio, 100) span a 1 ms pause and feed on its own spinning's queueing. The same rule already spun through a 1 ms pause on main on Linux (the window rule's baseline, above). The supervisor asked for a rule priced on something load cannot grow, judged by (a) the paced client's CPU, (b) quiet single-client p99, (c) loaded single-client p99 and (d) parks in the paced form above 0.
 
 **Measured and rejected: the floor of confirmed wakes** (605ec524, 2389b0d9, diag-liveness-33). The window priced on the smallest confirmed wake over the last one to two windows of 2^shift wakes. Under two spinners a logical CPU at 2 shards the floor itself queued: largest shard floor 33.8 ms on windows-latest, 17.3 ms on windows-11-arm, 0.90 ms on ubuntu-latest and 0.33 ms on ubuntu-24.04-arm, against at most 15 µs quiet.
 
@@ -12193,3 +12193,4 @@ All rules-binary boots: quiet floor 0.9, 0.9, 1.0, 1.0, 1.0, 1.3, 1.3, 2.3, 2.8 
 - **The loaded boot inflates option 2's input.** A Linux daemon booted beside two spinners a CPU read the probe's smallest wake at 6.8-259 µs (x86_64) and 8.2-346 µs (arm64), past F in 5 of 9 boots on each runner, against 5.4-6.6 µs quiet. So the boot minimum cannot be trusted under load, and option 2 becomes W = F alone. Windows' loaded boots read 4.7-10.1 µs and macOS's 0.7-2.8 µs.
 - **Windows: option 2 fails (c).** A shard parked under two spinners a CPU pays a wake of 50-100 ms on every request. On windows-latest the loaded single-client p99 was 97-100 ms in all nine runs, against x100's median 127 µs and main's 129 µs. Every loaded option 2 run, and two of three loaded option 3 runs, ran past the bench's 1,500 s limit before the paced form. On windows-11-arm the loaded p99 was 47.8-56.2 ms, against x100's median 125 µs. Windows' paced CPU was already low on main (29-69 quiet), and option 2 keeps it there (20-67 quiet), so a short window buys little on Windows and costs its loaded tail. This repeats A-218's Windows finding.
 - **The rule for Windows is the supervisor's decision** (A-223 plan, 2026-11-09). The choices are W = F on Linux and macOS with x100 kept on Windows, W = F everywhere, or a Windows window measured first.
+- **Decided (the supervisor, 2026-11-11): the first choice, with Windows' own window as the follow-up.** The idle window is `max(F, wake estimate × LOADED_WAKE_RATIO)`, F = R9's 50 µs (`config::PROVISION_FLOOR`) and the multiple 0 on Linux and macOS, 100 on Windows (`config::idle_window_ns`; SLATES_DESIGN, A-223's window rule). Option 2's boot-floor term is measured and rejected, by the loaded boots above. Option 3 is measured and rejected, by its paced CPU.

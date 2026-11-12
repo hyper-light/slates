@@ -18,7 +18,7 @@
 >   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
 >   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
-> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window it scales, open).**
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, Windows' own window open).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
 > 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
@@ -28,13 +28,24 @@
 >   single-client creates fell from 30–88 to 0–1 per shard on x86_64 and from 2–7 to 0–1 on arm64. The single-client
 >   p99 went from 45.5–49.3 to 33.3–37.7 µs (x86_64) and from 32.8–35.0 to 28.9–31.4 µs (arm64). The 8-client p99 stayed
 >   within 7 % (495–503 against 511–519 µs; 474–494 against 499–531 µs). The probe reads 7.1–9.1 µs, confirmed.
-> - **Open: the idle window's rule.** `IDLE_WINDOW_RATIO` (100, §5) now multiplies a real wake: 0.71–0.91 ms at boot.
->   - A client paced at 1 ms keeps its shards spinning: 0.21–0.38 core of CPU, against 0.03–0.06 on main. With no
->     client, 0–0.005 core either way.
->   - Under two spinners a logical CPU, each shard's estimate counts the run-queue wait its own spinning causes
->     (0.2–6.1 ms), and the window follows it to hundreds of milliseconds.
->   - The rule needs a measured bound before the spin's cost is acceptable. A measured floor for the window was the
->     other candidate the supervisor named; it is not built.
+> - **The idle window's rule: decided and built (2026-11-11, the supervisor's decision A).** The ratio of 100 had
+>   come to multiply a real wake, 0.71–0.91 ms of window at boot, and the shard's live estimate, which counts the
+>   run-queue wait its own spinning causes, lengthened it to hundreds of milliseconds under load. Now the window is
+>   `max(F, the shard's wake estimate × the platform's multiple)` (`config::idle_window_ns`, §4.3, §4.7). F is R9's
+>   50 µs provisioning floor (`config::PROVISION_FLOOR`), which `provision_bench` gates on too. The multiple
+>   (`config::LOADED_WAKE_RATIO`) is 0 on Linux and macOS, so no estimate prices the window there and a shard's own
+>   spinning cannot lengthen it (`crates/server/tests/idle_window.rs`), and 100 on Windows (§5).
+>   - Measured at two shards on CI (diag-liveness-35, BENCHMARKS "The idle window's rule"): a 1 ms-paced client's CPU
+>     fell from main's 1,451–2,023 to 155–224 thousandths of a core on Linux, the loaded single-client p99 halved
+>     (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64), and the quiet p99 stayed within main's spread.
+>   - Measured and rejected: the floor of confirmed wakes (it queued too, 0.33–33.8 ms), the floor less Linux's
+>     run-queue time (0 to 1.75 µs, the shards parked through a client's requests), the live floor × 100 capped at 4F
+>     (twice the paced CPU), and the boot probe's smallest wake as a second input to `max` (6.8–346 µs on a loaded
+>     boot, past F in 5 of 9 boots on each Linux runner).
+>   - **Open (C): Windows' own window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+>     so R9's floor alone made that the loaded single-client p99 (97–100 ms on windows-latest, 48–56 ms on
+>     windows-11-arm, against 125–127 µs medians at the multiple). Windows keeps the multiple, and its paced client
+>     the cost (177–435 thousandths of a core quiet), until that wait is understood and a window measured for it.
 
 > **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
@@ -2400,6 +2411,11 @@ are retained with their scope; no documentation edit is an implementation accept
   cost is measured (§4.3), which `RuntimeConfig::from_profile` says in its formula string.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
+- The idle window's multiple of the wake estimate on Windows (100, `config::LOADED_WAKE_RATIO`, a `derived!` naming
+  this entry): the ratio every platform had before A-223, kept on Windows by the supervisor's decision (2026-11-11)
+  because R9's floor alone cost a loaded single-client p99 of 48–100 ms there. It stands until Windows' own window is
+  measured (A-223's open item (C)). Linux and macOS take none: their window is R9's floor, F
+  (`config::PROVISION_FLOOR`, 50 µs), which is the requirement itself.
 - The format floor for compression (savings must exceed the chunk's metadata overhead) is
   derived from the format, not a literal.
 - The racy-window timestamp granularity per base filesystem (§4.15) is a cited table keyed by

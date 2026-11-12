@@ -321,6 +321,8 @@ pub struct ShardContext {
   wake: Cell<Option<WakeEstimate>>,
   /// The idle spin window as a multiple of the wake estimate, while tracking.
   idle_ratio: u64,
+  /// The least idle spin window, while tracking (A-223).
+  idle_floor_ns: u64,
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
   fixed_spin_ns: u64,
@@ -504,6 +506,11 @@ impl ShardContext {
       idle_ratio: config
         .wake_tracking
         .map_or(1, |tracking| tracking.idle_ratio),
+      idle_floor_ns: config
+        .wake_tracking
+        .map_or(crate::runtime::NO_IDLE_FLOOR_NS, |tracking| {
+          tracking.idle_floor_ns
+        }),
       fixed_quantum_ns: config.step_budget_ns,
       fixed_spin_ns: config.spin_ns,
       real_time: driver.kind() != DriverKind::Simulation,
@@ -652,7 +659,7 @@ impl ShardContext {
       .try_borrow()
       .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
-    c.idle_window_ns = self.spin_window_ns();
+    c.idle_window_ns = self.idle_window_ns();
     c
   }
 
@@ -1210,7 +1217,7 @@ impl ShardContext {
     let Some(activity) = self.activity_ns.get() else {
       return false;
     };
-    let window_end = activity.saturating_add(self.spin_window_ns());
+    let window_end = activity.saturating_add(self.idle_window_ns());
     if self.now_ns() >= window_end {
       return false;
     }
@@ -1425,11 +1432,17 @@ impl ShardContext {
       .max(1)
   }
 
-  /// The idle spin window now: the online wake estimate times the configured idle ratio while the shard
-  /// tracks one (the 2-competitive spin, §4.3), else the configured spin.
-  fn spin_window_ns(&self) -> u64 {
+  /// The idle spin window now, while the shard tracks an estimate: the online wake estimate times the configured
+  /// idle ratio, and at least the configured floor (§4.3, §4.7; A-223). The runtime's own spin-then-park has
+  /// ratio 1 and no floor, the 2-competitive spin. The daemon's floor is R9's provisioning floor, and its ratio
+  /// what the platform's loaded wake was measured to need (`slates_server::config::loaded_wake_ratio`). The
+  /// configured spin while the shard tracks none.
+  pub fn idle_window_ns(&self) -> u64 {
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
-      estimate.mean_ns().saturating_mul(self.idle_ratio)
+      estimate
+        .mean_ns()
+        .saturating_mul(self.idle_ratio)
+        .max(self.idle_floor_ns)
     })
   }
 
@@ -1484,7 +1497,7 @@ impl ShardContext {
       inner.counters.wake_cost_ns = mean;
     });
     entry.pulse.record_wake_cost(mean);
-    entry.pulse.record_idle_window(self.spin_window_ns());
+    entry.pulse.record_idle_window(self.idle_window_ns());
   }
 
   /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it
