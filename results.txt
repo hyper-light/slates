@@ -1,0 +1,2 @@
+tested d8350621516b9ddce74f9a274b1f5c722122f916 on macos-latest
+build exit 0
