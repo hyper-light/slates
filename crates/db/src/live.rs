@@ -723,6 +723,18 @@ pub enum Next {
   Fenced(HostEpoch),
 }
 
+/// What a holder's answer leaves it lacking, as the owner's fold names it ([`Shipper::on_reply`] builds it).
+enum Folded {
+  /// Nothing, or nothing to send it (a refusal, a host it does not ship to).
+  Nothing,
+  /// The retained entries after this position (all of them when `None`).
+  After(Option<u64>),
+  /// An install: it is off the chain or behind the retained tail.
+  Install,
+  /// A later epoch has superseded this owner.
+  Fenced(HostEpoch),
+}
+
 /// The owner's side of one live-shipped volume: its chain, the entries it retains, what each holder holds of it, and
 /// the durable position.
 #[derive(Clone, Debug)]
@@ -1015,34 +1027,62 @@ impl Shipper {
     })
   }
 
+  /// Folds a holder's answer as [`Shipper::on_reply`] does, building nothing to send: for a caller that sends from
+  /// [`Shipper::pending`] when it sends. `Some(epoch)` when a later epoch has superseded this owner. Through
+  /// `on_reply`, every answer of a holder far behind cloned each retained entry it lacked, for the daemon to drop: 1.4 ms
+  /// a reply 1,000 entries behind, so the owner shard spent itself on one resumed holder's replies, writes fell to about
+  /// 210 a second, and the holder never came within 50 entries of the head in 6 of 24 x86 runs
+  /// (diag-live-durability-73).
+  pub fn fold_reply(
+    &mut self,
+    holder: HostId,
+    reply: Result<Option<Head>, LiveError>,
+  ) -> Option<HostEpoch> {
+    match self.fold(holder, reply) {
+      Folded::Fenced(current) => Some(current),
+      Folded::Nothing | Folded::After(_) | Folded::Install => None,
+    }
+  }
+
   /// Folds a holder's answer (to an entry or an install) and says what to send it next. A head on this chain is an
   /// acknowledgement of every position up to it; a head off the chain or behind the retained tail draws an install; a
   /// fence above this epoch means the owner has been superseded.
   pub fn on_reply(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Next {
+    match self.fold(holder, reply) {
+      Folded::Fenced(current) => Next::Fenced(current),
+      Folded::Nothing => Next::Nothing,
+      Folded::Install => Next::Install,
+      Folded::After(position) => self.entries_after(position),
+    }
+  }
+
+  /// The fold of [`Shipper::on_reply`] and [`Shipper::fold_reply`]: what the holder's answer leaves it lacking, named
+  /// and not built.
+  fn fold(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Folded {
     if !self.ships_to(holder) {
-      return Next::Nothing;
+      return Folded::Nothing;
     }
     let held = match reply {
       Err(LiveError::StaleEpoch { current }) if current > self.epoch => {
-        return Next::Fenced(current);
+        return Folded::Fenced(current);
       }
       Err(LiveError::Behind { head }) | Ok(head) => head,
-      Err(_) => return Next::Nothing,
+      Err(_) => return Folded::Nothing,
     };
     if let Some(head) = held
       && head.epoch > self.epoch
     {
-      return Next::Fenced(head.epoch);
+      return Folded::Fenced(head.epoch);
     }
     let Some(own) = self.head else {
-      return Next::Nothing;
+      return Folded::Nothing;
     };
     let Some(head) = held else {
-      return self.owe(holder, self.entries_after(None));
+      return self.owe_after(holder, None);
     };
     if !self.on_chain(holder, &head) {
       self.owed_install.insert(holder);
-      return Next::Install;
+      return Folded::Install;
     }
     self.owed_install.remove(&holder);
     let newer = self
@@ -1055,20 +1095,38 @@ impl Shipper {
       self.durable = self.recompute_durable();
     }
     if head == own {
-      Next::Nothing
+      Folded::Nothing
     } else {
-      let next = self.entries_after(Some(head.position));
-      self.owe(holder, next)
+      self.owe_after(holder, Some(head.position))
     }
   }
 
-  /// Notes an `Install` answer as owed to `holder`, so [`Shipper::pending`] keeps answering it until the holder is back
-  /// on the chain.
-  fn owe(&mut self, holder: HostId, next: Next) -> Next {
-    if next == Next::Install {
-      self.owed_install.insert(holder);
+  /// What `holder` lacks after `position`, named: an install is noted owed to it, so [`Shipper::pending`] keeps answering
+  /// it until the holder is back on the chain.
+  fn owe_after(&mut self, holder: HostId, position: Option<u64>) -> Folded {
+    match self.reaches(position) {
+      None => Folded::Nothing,
+      Some(false) => {
+        self.owed_install.insert(holder);
+        Folded::Install
+      }
+      Some(true) => Folded::After(position),
     }
-    next
+  }
+
+  /// Whether the retained tail reaches the entry after `position` (from position 0 when `None`): `None` when there is no
+  /// position after it.
+  fn reaches(&self, position: Option<u64>) -> Option<bool> {
+    let first = match position {
+      Some(position) => position.checked_add(1)?,
+      None => 0,
+    };
+    Some(
+      self
+        .retained
+        .front()
+        .is_some_and(|oldest| oldest.position <= first),
+    )
   }
 
   /// What `holder` lacks by the head it last reported (everything, when it has reported none; an install when its last

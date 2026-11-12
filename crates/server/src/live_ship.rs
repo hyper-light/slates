@@ -2066,7 +2066,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     let before = live.shipper.durable();
     let held_before = live.shipper.held_by(host);
     let reply = decode_reply(&bytes);
-    if let Next::Fenced(current) = live.shipper.on_reply(host, reply) {
+    if let Some(current) = live.shipper.fold_reply(host, reply) {
       // A later epoch holds the volume: this owner was superseded, ships no more of it, and tells every write waiting
       // on it so.
       live.fenced = Some(current);
