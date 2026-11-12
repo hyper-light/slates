@@ -1,0 +1,189 @@
+## image: ubuntu26 20261101.186.1
+7.0.0-1019-azure
+/usr/bin/strace
+lrwxrwxrwx 1 root root 32 Mar 30  2026 /usr/bin/mkdir -> ../lib/cargo/bin/coreutils/mkdir
+rust-coreutils: /usr/lib/cargo/bin/coreutils/mkdir
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded autocfg v1.5.1
+  Downloaded arrayvec v0.7.8
+  Downloaded bit-set v0.8.0
+  Downloaded bitflags v2.13.1
+  Downloaded bit-vec v0.8.0
+  Downloaded fnv v1.0.7
+  Downloaded itoa v1.0.18
+  Downloaded wait-timeout v0.2.1
+  Downloaded rand_xorshift v0.4.0
+  Downloaded cpufeatures v0.3.1
+  Downloaded cfg-if v1.0.4
+  Downloaded unarray v0.1.4
+  Downloaded errno v0.3.14
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded quick-error v1.2.3
+  Downloaded constant_time_eq v0.4.2
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded quote v1.0.47
+  Downloaded jobserver v0.1.35
+  Downloaded fastrand v2.5.0
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded shlex v2.0.1
+  Downloaded rusty-fork v0.3.1
+  Downloaded zmij v1.0.23
+  Downloaded zstd v0.13.3
+  Downloaded rand_chacha v0.9.0
+  Downloaded zstd-safe v7.3.0
+  Downloaded once_cell v1.21.4
+  Downloaded pkg-config v0.3.34
+  Downloaded twox-hash v2.1.4
+  Downloaded tempfile v3.27.0
+  Downloaded getrandom v0.3.4
+  Downloaded num-traits v0.2.19
+  Downloaded serde_core v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded rand_core v0.9.5
+  Downloaded proc-macro2 v1.0.107
+  Downloaded lz4_flex v0.11.6
+  Downloaded memmap2 v0.9.11
+  Downloaded getrandom v0.4.3
+  Downloaded tinyvec v1.13.2
+  Downloaded serde_derive v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded cc v1.4.5
+  Downloaded rand v0.9.5
+  Downloaded memchr v2.8.3
+  Downloaded blake3 v1.8.7
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_json v1.0.151
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.56
+  Downloaded syn v3.0.5
+  Downloaded syn v2.0.119
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+grep: write error: Broken pipe
+## run 1 done
+
+running 1 test
+owner_turn: refused the barrier of Some(MkDir)
+owner_turn diag: ok=true err:
+/usr/lib/cargo/bin/coreutils/mkdir
+mkdir (uutils coreutils) 0.10.0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/", {st_mode=S_IFDIR|0755, st_size=20480, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  statx(AT_FDCWD, "/usr/share/coreutils/locales/mkdir", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4033  statx(AT_FDCWD, "/usr/share/coreutils/locales/uucore", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4033  statx(3, "", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFREG|0777, stx_size=4113, ...}) = 0
+4033  statx(AT_FDCWD, "/usr/share/coreutils/locales/mkdir", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4033  statx(AT_FDCWD, "/home/runner/work/slates/slates/target/tmp/slates-owner-turn-3999/mnt/d", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffe3ea75100) = -1 ENOENT (No such file or directory)
+4033  mkdir("/home/runner/work/slates/slates/target/tmp/slates-owner-turn-3999/mnt/d", 0777) = -1 EIO (Input/output error)
+4033  statx(AT_FDCWD, "/home/runner/work/slates/slates/target/tmp/slates-owner-turn-3999/mnt/d", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_BASIC_STATS|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0755, stx_size=0, ...}) = 0
+4033  +++ exited with 0 +++
+mkdir exit 0
+
+
+thread 'a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio' (4000) panicked at crates/bridge-fuse/tests/owner_turn.rs:301:3:
+the refused barrier answered EIO: /usr/lib/cargo/bin/coreutils/mkdir
+mkdir (uutils coreutils) 0.10.0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v4/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v3/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v2/", 0x7ffe3ea75020, 0) = -1 ENOENT (No such file or directory)
+4033  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/", {st_mode=S_IFDIR|0755, st_size=20480, ...}, 0) = 0
+## run 2 done
+
+running 1 test
+owner_turn: refused the barrier of Some(MkDir)
+owner_turn diag: ok=true err:
+/usr/lib/cargo/bin/coreutils/mkdir
+mkdir (uutils coreutils) 0.10.0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/", {st_mode=S_IFDIR|0755, st_size=20480, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  statx(AT_FDCWD, "/usr/share/coreutils/locales/mkdir", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4080  statx(AT_FDCWD, "/usr/share/coreutils/locales/uucore", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4080  statx(3, "", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFREG|0777, stx_size=4113, ...}) = 0
+4080  statx(AT_FDCWD, "/usr/share/coreutils/locales/mkdir", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_ALL|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0777, stx_size=4096, ...}) = 0
+4080  statx(AT_FDCWD, "/home/runner/work/slates/slates/target/tmp/slates-owner-turn-4046/mnt/d", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffc5f9c80c0) = -1 ENOENT (No such file or directory)
+4080  mkdir("/home/runner/work/slates/slates/target/tmp/slates-owner-turn-4046/mnt/d", 0777) = -1 EIO (Input/output error)
+4080  statx(AT_FDCWD, "/home/runner/work/slates/slates/target/tmp/slates-owner-turn-4046/mnt/d", AT_STATX_SYNC_AS_STAT, STATX_ALL, {stx_mask=STATX_BASIC_STATS|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0755, stx_size=0, ...}) = 0
+4080  +++ exited with 0 +++
+mkdir exit 0
+
+
+thread 'a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio' (4047) panicked at crates/bridge-fuse/tests/owner_turn.rs:301:3:
+the refused barrier answered EIO: /usr/lib/cargo/bin/coreutils/mkdir
+mkdir (uutils coreutils) 0.10.0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/blake3-39bfaba9c57f2789/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/build/zstd-sys-ea73af569428b273/out/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v4/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v3/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/glibc-hwcaps/x86-64-v2/", 0x7ffc5f9c7fe0, 0) = -1 ENOENT (No such file or directory)
+4080  newfstatat(AT_FDCWD, "/home/runner/work/slates/slates/target/debug/deps/", {st_mode=S_IFDIR|0755, st_size=20480, ...}, 0) = 0
+## run 3 done
