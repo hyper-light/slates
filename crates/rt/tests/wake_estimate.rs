@@ -120,6 +120,7 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     prior_ns: PRIOR_NS,
     shift: SHIFT,
     idle_ratio: 1,
+    idle_floor_ns: slates_rt::runtime::NO_IDLE_FLOOR_NS,
   };
   let rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
   let ctx = rt.context();
@@ -182,31 +183,34 @@ const QUIET_PRIOR_NS: u64 = 10_000;
 /// Shape: how far past the quiet prior the loaded mean must rise before the test judges anything: a mean that
 /// stayed near it saw no queueing, and the run proves nothing (the non-vacuity bound).
 const QUEUED_FACTOR: u64 = 10;
-/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so every window
-/// the floor keeps has turned over at least once and the seed has expired from it.
+/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so the estimate
+/// has forgotten its quiet prior.
 const LOADED_KICKS: u64 = 4 << SHIFT;
 /// Shape: kicked parks the loaded test drives at most, waiting for the spinners' queueing to show in the mean
 /// (a run in which the scheduler happened to place the woken shard well needs more kicks to show it).
 const MOST_LOADED_KICKS: u64 = 16 << SHIFT;
-/// Shape: how far under the loaded mean the idle window must sit. A window that follows the mean is the mean;
-/// one that reads the unqueued wake sits an order of magnitude under it.
-const WINDOW_UNDER_MEAN: u64 = 4;
 /// Shape: spinning threads per logical CPU, as the A/B bar loads a machine (two a CPU, A-223).
 const SPINNERS_PER_CPU: usize = 2;
 
-/// A-223 (i): a tracking shard kicked while asleep beside more spinning threads than CPUs learns wakes
-/// that include its queueing for a CPU. Its mean rises, and the step quantum follows it. Its idle window
-/// must not: the window prices what a park costs the shard, and time spent runnable waiting for a CPU,
-/// which its own spinning lengthens, costs no CPU. The window reads the floor of its confirmed wakes, so it
-/// stays near the unqueued wake while the mean climbs (the shard's idle ratio is 1 here, so the window is
-/// the estimate it reads).
+/// Shape: the least idle window the loaded test's shard is given, the daemon's own on Linux and macOS: R9's
+/// provisioning floor, 50 µs (A-223).
+const IDLE_FLOOR_NS: u64 = 50_000;
+/// Shape: the loaded test's idle ratio, the daemon's on Linux and macOS: no multiple of the estimate.
+const NO_RATIO: u64 = 0;
+
+/// A-223 (i): a tracking shard kicked while asleep beside more spinning threads than CPUs learns wakes that
+/// include its queueing for a CPU, so its mean rises, and the step quantum follows it. Its idle window must
+/// not: a window priced on the estimate spins longer the more its own spinning queues the woken shard. On the
+/// daemon's rule for a platform whose loaded wake was measured cheap (Linux, macOS), the window is R9's floor
+/// whatever the estimate reads (ratio 0, floor F).
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
-fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
+fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
   let tracking = WakeTracking {
     prior_ns: QUIET_PRIOR_NS,
     shift: SHIFT,
-    idle_ratio: 1,
+    idle_ratio: NO_RATIO,
+    idle_floor_ns: IDLE_FLOOR_NS,
   };
   let rt = LocalRuntime::new(&config(QUIET_PRIOR_NS, Some(tracking))).unwrap();
   let ctx = rt.context();
@@ -245,7 +249,7 @@ fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
   let counters = ctx.counters();
   assert!(
     counters.wake_samples >= 2 << SHIFT,
-    "enough kicks met a sleeping shard to turn the floor's windows over: {counters:?}"
+    "enough kicks met a sleeping shard to move the estimate off its prior: {counters:?}"
   );
   assert!(
     counters.wake_cost_ns >= QUEUED_FACTOR * QUIET_PRIOR_NS,
@@ -256,9 +260,9 @@ fn a_loaded_shards_idle_window_reads_its_unqueued_wake_not_its_queued_mean() {
     counters.wake_cost_ns,
     "the step quantum still reads the mean"
   );
-  assert!(
-    counters.idle_window_ns <= counters.wake_cost_ns / WINDOW_UNDER_MEAN,
-    "the idle window reads the unqueued wake, not the queued mean: {counters:?}"
+  assert_eq!(
+    counters.idle_window_ns, IDLE_FLOOR_NS,
+    "the idle window is the floor however far the queued mean climbed: {counters:?}"
   );
 }
 
