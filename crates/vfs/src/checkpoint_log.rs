@@ -37,8 +37,9 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed; 5 (A-231, 2026-11-05) the
 /// held connections' byte states; 6 (A-262, 2026-11-08) every inode image it carries holds the Windows attribute bits
 /// kept beside the mode (image version 23); 7 (A-262, 2026-11-08) every fingerprint a witness in it carries holds the
-/// disk's Windows attribute bits (image version 24); 9 (A-270, 2026-11-09) what the shard holds for other owners as the
-/// pieces put and the keys removed since the last publication, never the whole held image (image version 26).
+/// disk's Windows attribute bits (image version 24); 8 (A-251, 2026-11-09) the held replicas' image it carries holds
+/// each register's moved-from owner (image version 25); 9 (A-270, 2026-11-09) what the shard holds for other owners as
+/// the pieces put and the keys removed since the last publication, never the whole held image (image version 26).
 /// Format: the delta format's version, the latest entry of the history above.
 pub const DELTA_VERSION: u16 = 9;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.

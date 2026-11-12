@@ -2169,7 +2169,16 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
 > held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
-> so none serves a request after the acknowledgement.
+> so none serves a request after the acknowledgement. **2026-11-09:** on Linux the ended FUSE mount's own registry
+> attachment is revoked too (`fuse::fence_if_mounted`); before, it was not, and a revoked consumer's FUSE mount read on
+> (`docs/bugs/2026-11-09-a-revoked-consumers-linux-fuse-mount-went-on-serving.md`). The same day the fenced mount's
+> kernel cache was closed as well: a page the kernel holds is read with no request, so a descriptor opened before the
+> revocation read a page its readahead had fetched and the process never asked for. The fence now wakes the mount,
+> which tells its kernel to drop the root and every node it references (`FUSE_NOTIFY_INVAL_INODE` of all data, sliced
+> under the shard's budget, written on the notify thread) while it answers every request `ENOTCONN`, and ends only once
+> the last slice is written; the revocation is acknowledged after the mount has ended, bounded by the told wait (§4.6,
+> `told::TOLD_WAIT_NS`) and counted past it (`fuse.revoked_overdue`). The cost is one message per node the kernel
+> references, at most the volume's inode allowance.
 
 > **Amendment (2026-10-17): invalidations are delivered off the answering thread, not before each request.**
 > "Before each request" was not merely an ordering preference — it deadlocked the mount, and could not be kept.
@@ -4966,6 +4975,12 @@ and cannot replace an initialized group. Separate group genesis identities never
 state. Both regional and root groups follow this rule, as does N=1.
 An initialized learner keeps a fetched read view separate from its Raft fold, so catching up
 cannot apply a takeover or home change twice. The view is dropped when replay reaches its version.
+A regional learner fetches from every member of its region it holds a session to, not from the voters alone: its voter
+list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
+to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
+adoption only moves forward.
+A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
+voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -13932,6 +13947,12 @@ rule's reader), `crates/server` (`fuse.rs`: `fuse.writeback_conflicts` and `fuse
 rule), `crates/cli` (`tests/cli.rs`: the dirty-page, truncation and unsynced-history tests, and A-152's release test for
 U10's rule; `tests/guest_dax.rs`: the oracle), the bug record
 `docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+- **A third count (2026-11-09).** `fuse.writebacks_applied` counts write-backs applied with no stale byte at all. The
+  dirty-page test reads it to prove its precondition, that the store's page was still dirty when the other path wrote.
+  On kernel 7.3 a process spawn while a shared-map page is dirty writes it back at once, and that write-back is fresh,
+  so it is applied and the rule is never exercised. Applied in the same change to: GAPS, `crates/bridge-fuse`
+  (`channel.rs`), `crates/server` (`fuse.rs`), `crates/cli` (`tests/cli.rs`), the bug record
+  `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 - **The decision.** Ada, 2026-11-07, asked whether the host FUSE mount should go on applying a stale write-back outside
   its stale bytes (A-139, A-140) or refuse it as NFS does (A-192): "Refuse, like NFS."
 - **Changes §4.6.** A `FUSE_WRITE_CACHE` write-back is applied whole or refused whole. One whose stale bytes (another
@@ -15475,6 +15496,51 @@ Applied in the same change to:
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
 
+### A-274 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp`:
+  - `inflight/capture.rs`: a third saved-response state, SETTLED, which the acknowledgement writes; `begin` leaves the
+    saved response and refuses a published one; `Capture::saved_open` reads a published or settled response whatever the
+    phase. A settled response is never replayed.
+  - `inflight/settle.rs`: `Edges::post_confirm` after the send and `Edges::confirmed` before the next save, in place of
+    the confirmation's round; `saved_open` reads the journal whatever its phase.
+  - `host.rs`: `post_confirm` (the Confirm put on the mount's channel, the mount's task woken, no wait) and
+    `confirmed_open`; `dispatcher.rs` holds the one outstanding answer.
+  - `opens.rs`: the docs of `confirmed` and `settle_pending`.
+- The tests: `an_opens_confirmation_does_not_hold_the_receive_worker` (first: 3 of 3 opens held the worker), and the
+  crash oracle with a security query answered without the shard after each Create and the shard's confirmations both
+  prompt and lagging to the protocol's latest moment.
+- **What was there.** After sending a successful Create's response the worker waited for the shard to confirm the open:
+  a round on every open, 9.9 µs at the mean on arm64 quiet and 139.6 µs loaded (diag-winfsp-overlap-50, run
+  42506936806). The confirmation had to be applied before the acknowledgement, because the next receive cleared the
+  saved response, and recovery keeps an unconfirmed open only on the journal's word.
+- **The rule.**
+  - A pending open always has its successful response in the journal, published or settled.
+  - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
+    confirmation ahead of the worker's next request.
+  - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
+    it, and a request answered without the shard can come right after a Create: the host registers no GetSecurity
+    callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without
+    calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and QueryStreamInformation likewise
+    (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
+    replaces.
+  - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
+    posted confirmation's answer, waiting only if the shard has not yet applied it (a request answered without the shard,
+    such as a security query, can come next).
+  - Recovery reads a settled response only for the open it may have issued, never to replay it: its request was
+    answered.
+- **Checked.** The crash oracle, at every store and torn inside each, twice over. Put in by hand, each of these is
+  caught: no check before the save, recovery that ignores a settled response, and `begin` clearing the saved response.
+- **Measured.** `diag-winfsp-overlap-51` (run 42675148419), main against a control (main built again) against the cut,
+  ten runs on each Windows runner, quiet and loaded (BENCHMARKS, "Cut (c)"). arm64 loaded is faster within every run on
+  stat, write, rename and unlink: p50 −6.3, −23.8, −12.8 and −16.0 µs (10 of 10 each), p99 −1,750, −1,522, −1,395 and
+  −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
+  moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
+  about what the round did when the shard is idle.
+
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
 Applied in the same change to:
@@ -15611,8 +15677,11 @@ Applied in the same change to:
     `DELTA_VERSION` 8 → 9.
   - `error.rs`: `VfsError::RecoveryVersion { found, expected }`.
 - `crates/server`:
-  - `tracked.rs` (new): `Tracked`, a map that marks every key reached mutably since its owner last published.
-  - `content_holder.rs`: `held_image`, `held_changes`, `held_committed`, `split_held` and `HeldRefused`.
+  - `tracked.rs` (new): `Tracked`, a map that marks every key reached mutably since its owner last published, and
+    `slates_db::takeover::AcceptorStore` for it (A-251's by-name answer reaches held acceptors through `get_mut`).
+  - `content_holder.rs`: `held_image`, `held_changes`, `held_committed`, `split_held` and `HeldRefused`. A held
+    register's piece carries A-251's `HeldRegister { object, acceptor: PersistedAcceptor }` (`Acceptor::to_persisted`,
+    restored with `from_persisted`), its moved-from owner included, so a move rides the next delta like any change.
   - `live_ship.rs`: `Held.first` and its slots, and `LiveState.slot_floor`.
   - `state.rs`: `holder_records` and `live.held` tracked, and `published_held`.
   - `verbs.rs`: the checkpoint and delta paths, `read_journal`, and `committed_held_agrees`.
@@ -15620,6 +15689,9 @@ Applied in the same change to:
   - `a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds` (`crates/server/tests/recovery.rs`,
     failing first).
   - `folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds` (`crates/server/src/daemon.rs`).
+  - `a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed` (`crates/server/src/daemon.rs`):
+    A-251's moved case reaching the journal only in a delta. Red with the piece writing `moved_from: None`, and with
+    `Tracked::get_mut` left unmarked.
   - From `crates/vfs/tests/checkpoint_log.rs`: the journal model with held pieces,
     `an_image_of_another_version_is_refused_by_its_version`, `a_delta_of_another_version_is_refused_not_read_as_torn`
     and `a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new`.
@@ -20127,3 +20199,116 @@ old build has bytes left over (`LengthMismatch`). Every caller refuses rather th
 A fleet that mixes builds therefore stops with a typed refusal; it never reads an old entry as "nothing dropped".
 But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
 none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
+
+### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
+
+A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
+every object of the retired host the holder did not list: listing nothing meant holding nothing. A holder whose page
+leaves out a copy it holds therefore reads as holding nothing. Two things left copies out:
+- its routing disagreed with the successor's (`takeover::list_page` lists only objects whose owner, by the holder's
+  routing, is the asker);
+- it could not promise the copy (closed by step (c), `docs/bugs/2026-11-08-a-holder-that-could-not-promise-a-copy-read-as-holding-nothing.md`).
+
+The successor can then reach an object's recovery quorum with such an empty promise and adopt an older record over a
+committed newer one. That breaks NoLoss.
+
+The change, in four steps:
+- **(c), landed:** a copy a holder cannot promise is a typed refusal that keeps its answer incomplete
+  (`HostPromise::unpromised`).
+- **(a), built:** the counting rule is a pure function, `slates_db::takeover::readiness`, under a `CountingRule`.
+  `crates/db/tests/takeover_model.rs` models a paged, multi-object takeover:
+  - one or two cohorts per object;
+  - writes to one cohort (a later owner in the recovery chain) or to all of them (a joint write), each committed by
+    `Quorum::committed_within` in every cohort it targets;
+  - the successor's own copies behind its lease gate, learned through its routing as any holder's are;
+  - pages answered in a generated order;
+  - a nemesis that leaves objects out of holders' pages while the pages still end complete.
+
+  Its oracle is NoLoss: an adopted record is at least as new as every committed one. Over 2,000 generated histories,
+  today's rule lost 0 records with the nemesis off and 216 with it on. A-251's rule (below) lost none, and 400 of its
+  adoptions came only from a holder's answer by name. Each of three mutants of the rule turns the model red:
+  - the named rule also counting a complete page;
+  - only an object's first cohort judged;
+  - the recovery quorum one short. The minimal history is
+  `today_s_rule_adopts_an_older_record_when_a_holder_leaves_a_copy_out`.
+- **(b), built:** after a holder's pages are complete, the successor asks it by name for each learned object it did not
+  list, among the objects whose recovery cohorts it is in. The holder answers from a direct `holder_records` look-up,
+  with no routing filter (`takeover::answer_by_name`): its highest record, promised as a page promises it, or "nothing
+  held" for that object alone. The rule is now `CountingRule::NamedAnswer`: a member promised an object when it listed
+  it or answered for it by name, and a whole answer's silence counts for nothing. The 2026-09-29 empty-promise case (a
+  survivor that never received an object) still completes: that survivor answers "nothing held" by name.
+  - **The successor answers itself by name too.** It learns its own copies through its routing (`promise_local_copies`),
+    which can lose one as any holder's can. So under the named rule its open lease gate is no promise on its own: while
+    the gate is open, it answers itself by name for each learned object it has not reported, from its own records
+    (`takeover::answer_own_copies_by_name`, at the start of `ready_objects`). With the nemesis also leaving out the
+    successor's own copies, a successor that counted its gate instead lost 86 committed records over the 2,000 histories.
+  - **What stands in for routing.** A warm-restarted holder loses its routing and its `departed_owners`, so neither can
+    decide. A holder answers only when the committed configuration names the asker the object's successor and the
+    copy's acceptor serves an owner in the retired host's recovery chain, or the asker already. So a question never
+    installs the asker over a live owner's object. Anything else is refused, counted `fleet.takeover.named_refused`,
+    and stays unanswered.
+  - **The wire.** `HostPrepare::named` and `HostPromise::nothing` are lists appended to the existing messages, written
+    only when not empty, so a page request and its answer keep their bytes. Hostile-input tests cover both sides. A
+    holder from before A-251 refuses a question that names objects. A successor then waits on that holder's answer as
+    on a silent member, which the cohort's quorum tolerates up to `f`: liveness only, until it is upgraded.
+  - A by-name answer is bounded by a page's bytes, and a question by the ids that fit one page. What is left out is
+    asked again next period.
+- **(d), owed:** the process test.
+
+**How a successor learns the names (folded into (b), the supervisor's direction).** Asking by name helps only once
+the successor knows the name. An object that every holder leaves out of its pages, the successor's own learning
+included, is never learned, so the round confirms without it and NoLoss breaks silently. The model's nemesis now lets
+any holder leave out any object. Over 1,000 histories (2,950 objects), the named rule with today's routing-selected
+pages left 620 committed objects unlearned. Two shapes were run against that nemesis, neither a global catalog
+(D-14 forbids one for lookups, not a host's own recovery directory):
+- **(i), chosen, as one rule with no routing in it: a holder lists a copy by its authority's line, or by the line
+  of the owner an install moved that authority from.**
+  - **The rule.** A page lists, and a successor learns of its own, every copy whose acceptor's authority, or the owner an
+    install last moved that authority from (`Acceptor::moved_from`), has a line in the configuration
+    (`RegionalConfiguration::lineage`) that ends in this round with the asker as its successor
+    (`slates_db::takeover::copy_falls_to`). Today's routing filter is gone (CLAUDE.md §2.7: one rule, not a rule and a
+    second path).
+  - **Why the moved-from owner.** The install's authority reconcile moves a retired owner's copies to its successor.
+    After a warm restart, such a copy routes to the successor as a live owner, so neither routing nor the authority
+    alone names the retired host.
+  - **Why not the asker's authority alone.** The asker's own live objects never fall here. Listing one would raise its
+    fence to the round's epoch and could refuse the asker's own writes.
+  - **Measured over 1,000 histories (2,950 objects).** The model gives copies an authority an install may move, and
+    holds the asker's own objects:
+    - routing plus a chain path (the first shape (i) built) lost 204 records;
+    - the literal "chain or the asker" lost none, but learned the asker's own objects in every history; its minimal
+      counterexample is `the_chain_or_asker_rule_learns_the_askers_own_object`;
+    - this rule lost none and learned none.
+    The first two are rejected.
+  - **Cost.** No write: the authority and its last move are kept with the copy.
+  - **The field, as bounded.** `Acceptor::moved_from` is set only by an install that moves the authority away from a
+    retired owner (`Acceptor::move_authority`, from a takeover's page or answer and from the authority reconcile). It
+    holds one owner, overwritten by the next such move, never a list.
+  - **The encoding.** `slates_db::register::PersistedAcceptor` is the acceptor's whole durable state, the moved-from
+    owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
+    test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
+    byte. The layout without the field is refused as truncated, never read as "moved from none".
+  - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
+    an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
+    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7), and raft-7 (A-270) takes the
+    numbers after. An image or delta of another version is refused by its version. A missing field is never read as
+    none: that would be the compatibility shim §2.7 forbids.
+  - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
+- **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
+  configuration group keeps membership, read by the successor for every name.
+  - Measured: 0 records lost over the same histories.
+  - Cost: one more committed record for every object created (2,950 over the 2,950 objects), on the create path.
+  - It loses nothing more than (i) does and costs a commit per create, so it is rejected.
+
+The successor answers itself by name too: under the named rule its open gate alone is no promise, so a successor
+holding nothing of an object in whose cohort it is must say so (`answer_own_copies_by_name`).
+
+Applied in the same change to:
+- `crates/db/src/takeover.rs` (new): `CountingRule`, `Heard`, `Readiness`, `readiness`, `promise_object`,
+  `falls_to`, `AcceptorStore`, `answer_by_name`, with unit tests.
+- `crates/db/src/register.rs`: `HostPrepare::named`, `HostPromise::nothing`, `Acceptor::authority`.
+- `crates/db/tests/takeover_model.rs` (new).
+- `crates/server/src/takeover.rs`: `ready_objects`, `fold_answers`, `begin_round`, `serve_host_prepare`, `list_page`,
+  `promise_local_copies`, `initial_epoch`, `answer_own_copies_by_name`, and the module doc's account of the empty
+  promise.
+- Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.

@@ -116,6 +116,20 @@ impl<K: Ord + Copy, V> Tracked<K, V> {
   }
 }
 
+/// A held register's acceptor reached by a takeover's by-name answer (A-251's `answer_by_name`, which raises fences and
+/// installs authority): through [`Tracked::get_mut`], so every acceptor it changes is marked, and the change rides the
+/// next delta (A-270).
+impl slates_db::takeover::AcceptorStore
+  for Tracked<slates_db::register::ObjectId, slates_db::register::Acceptor>
+{
+  fn acceptor_mut(
+    &mut self,
+    object: &slates_db::register::ObjectId,
+  ) -> Option<&mut slates_db::register::Acceptor> {
+    self.get_mut(object)
+  }
+}
+
 impl<'a, K: Ord + Copy, V> IntoIterator for &'a Tracked<K, V> {
   type Item = (&'a K, &'a V);
   type IntoIter = btree_map::Iter<'a, K, V>;

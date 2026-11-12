@@ -11,8 +11,7 @@ use std::collections::BTreeMap;
 
 use slates_cluster::content::ContentAccess;
 use slates_db::register::{
-  Acceptor, Authority, HostEpoch, HostId, ObjectId, RegionId, RegionalConfiguration,
-  RootConfiguration,
+  Acceptor, HostId, ObjectId, PersistedAcceptor, RegionId, RegionalConfiguration, RootConfiguration,
 };
 use slates_wire::Wire;
 
@@ -148,24 +147,14 @@ pub(crate) const CONTENT_ANSWERED_EMPTY: &str = "fleet.content.answered_empty";
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 pub(crate) const CONTENT_UNPUBLISHED: &str = "fleet.content.unpublished";
 
-/// One held register as a recovery image keeps it (§4.8 "persistence before reply"): the owner and configuration
-/// generation it serves under, the epoch its fence has seen, and every position it accepted.
+/// One held register as a recovery image keeps it (§4.8 "persistence before reply"): its object and the acceptor's
+/// whole durable state in the acceptor's one encoding (`PersistedAcceptor`: the owner and configuration generation it
+/// serves under, the epoch its fence has seen, every position it accepted, and the retired owner an install last moved
+/// its authority from, A-251).
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 struct HeldRegister {
   object: [u8; 16],
-  owner: u64,
-  generation: u64,
-  promised: u64,
-  accepted: Vec<HeldPosition>,
-}
-
-/// One accepted position of a held register.
-#[derive(Clone, Debug, PartialEq, Eq, Wire)]
-struct HeldPosition {
-  object: [u8; 16],
-  sequence: u64,
-  epoch: u64,
-  value: Vec<u8>,
+  acceptor: PersistedAcceptor,
 }
 
 /// Format: the kind byte of a held piece's key (A-270; `slates_vfs::recover::HeldPiece`): the content hold's image, the
@@ -256,23 +245,12 @@ fn whole_pieces(state: &ShardState) -> BTreeMap<PieceKey, Vec<u8>> {
   pieces
 }
 
-/// One held register's piece: its owner, generation, fence and every position it accepted.
+/// One held register's piece: its object and the acceptor's whole durable state in the acceptor's one encoding
+/// (`Acceptor::to_persisted`, A-251), its moved-from owner included.
 fn register_piece(object: ObjectId, acceptor: &Acceptor) -> slates_vfs::recover::HeldPiece {
-  let (promised, accepted) = acceptor.persisted();
   let register = HeldRegister {
     object: object.0,
-    owner: acceptor.owner().0,
-    generation: acceptor.generation(),
-    promised: promised.0,
-    accepted: accepted
-      .into_iter()
-      .map(|(object, sequence, epoch, value)| HeldPosition {
-        object: object.0,
-        sequence,
-        epoch: epoch.0,
-        value,
-      })
-      .collect(),
+    acceptor: acceptor.to_persisted(),
   };
   slates_vfs::recover::HeldPiece {
     key: piece_key(KIND_REGISTER, object.0, 0),
@@ -552,8 +530,8 @@ pub(crate) fn split_held(
   Ok(held)
 }
 
-/// Rebuilds the held registers of a recovered image as `local`, each with its fence and accepted positions
-/// (`Acceptor::recovered`); the count rebuilt.
+/// Rebuilds the held registers of a recovered image as `local`, each the acceptor it persisted
+/// (`Acceptor::from_persisted`: its fence, accepted positions and moved-from owner); the count rebuilt.
 pub(crate) fn restore_held_registers(
   state: &mut ShardState,
   local: HostId,
@@ -572,28 +550,9 @@ pub(crate) fn restore_held_registers(
     }
   }
   for register in held.registers {
-    let accepted = register
-      .accepted
-      .into_iter()
-      .map(|position| {
-        (
-          ObjectId(position.object),
-          position.sequence,
-          HostEpoch(position.epoch),
-          position.value,
-        )
-      })
-      .collect();
-    let (object, owner) = (ObjectId(register.object), HostId(register.owner));
-    let acceptor = Acceptor::recovered(
-      local,
-      Authority {
-        generation: register.generation,
-        owner,
-      },
-      HostEpoch(register.promised),
-      accepted,
-    );
+    let object = ObjectId(register.object);
+    let acceptor = Acceptor::from_persisted(local, register.acceptor);
+    let owner = acceptor.owner();
     state.holder_records.insert(object, acceptor);
     // The routing view is not persisted, and every install reaches a held object only through it: the takeover's
     // resolve moves it to its successor, the authority reconcile raises it to the installed generation, and a page
