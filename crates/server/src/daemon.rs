@@ -296,6 +296,9 @@ pub struct ShardPulse {
   /// parks it paid (§4.3), which its step quantum and idle windows follow; 0 until its first measured
   /// wake.
   pub wake_cost_ns: u64,
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake (`ShardContext::counters`); 0 until its
+  /// first. Beside `wake_cost_ns` it shows whether the window follows the estimate (A-223).
+  pub idle_window_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -1433,6 +1436,7 @@ impl Daemon {
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
+          idle_window_ns: entry.pulse.idle_window_ns(),
         })
       })
       .collect()
