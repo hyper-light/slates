@@ -6,3 +6,9 @@ Connecting to an instance with no daemon raises SlatesError carrying the typed r
 The extension loads and exposes the Client class, the SlatesError exception, and a version. ... ok
 Ran 6 tests in 41.093s
 OK
+addon exit 0
+node exit 0
+ℹ tests 6
+ℹ pass 6
+ℹ fail 0
+DONE
