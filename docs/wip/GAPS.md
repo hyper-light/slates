@@ -33,7 +33,7 @@
 >   run-queue wait its own spinning causes, lengthened it to hundreds of milliseconds under load. Now the window is
 >   `max(F, the shard's wake estimate × the platform's multiple)` (`config::idle_window_ns`, §4.3, §4.7). F is R9's
 >   50 µs provisioning floor (`config::PROVISION_FLOOR`), which `provision_bench` gates on too. The multiple
->   (`config::LOADED_WAKE_RATIO`) is 0 on Linux and macOS, so no estimate prices the window there and a shard's own
+>   (`config::loaded_wake_ratio`, paired `#[cfg]` functions) is 0 on Linux and macOS, so no estimate prices the window there and a shard's own
 >   spinning cannot lengthen it (`crates/server/tests/idle_window.rs`), and 100 on Windows (§5).
 >   - Measured at two shards on CI (diag-liveness-35, BENCHMARKS "The idle window's rule"): a 1 ms-paced client's CPU
 >     fell from main's 1,451–2,023 to 155–224 thousandths of a core on Linux, the loaded single-client p99 halved
@@ -2414,7 +2414,7 @@ are retained with their scope; no documentation edit is an implementation accept
   cost is measured (§4.3), which `RuntimeConfig::from_profile` says in its formula string.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
-- The idle window's multiple of the wake estimate on Windows (100, `config::LOADED_WAKE_RATIO`, a `derived!` naming
+- The idle window's multiple of the wake estimate on Windows (100, `config::loaded_wake_ratio` on Windows, a `derived!` naming
   this entry): the ratio every platform had before A-223, kept on Windows by the supervisor's decision (2026-11-11)
   because R9's floor alone cost a loaded single-client p99 of 48–100 ms there. It stands until Windows' own window is
   measured (A-223's open item (C)). Linux and macOS take none: their window is R9's floor, F
