@@ -1,0 +1,33 @@
+LD-CU backlog 20000 volumes 833390ac4a8186310000000000000053 833390ac4a8186310000000000000069 by shard {"0": ["833390ac4a8186310000000000000053", "833390ac4a8186310000000000000069"], "1": ["833390ac4a8186310001000000000029"]}
+LD-CU prefill 30000 writes, 0 refused
+LD-CU quiet v2 n 5904 p50 451 us p99 601 us max 83016 us
+LD-CU ahead 20000 writes in 14.359912972s with the holder stopped
+LD-CU before resume: owner v1 head Some(50030), holder v1 head None
+LD-CU-S 517 owner Some(50032) holder Some(30469)
+LD-CU-S 1045 owner Some(50032) holder Some(31683)
+LD-CU-S 1551 owner Some(50032) holder Some(32307)
+LD-CU-S 2083 owner Some(50032) holder Some(32878)
+LD-CU-S 2596 owner Some(50032) holder Some(33366)
+LD-CU-S 3134 owner Some(50032) holder Some(34126)
+LD-CU-S 3660 owner Some(50032) holder Some(34880)
+LD-CU-S 4184 owner Some(50032) holder Some(35528)
+LD-CU-S 4706 owner Some(50032) holder Some(36311)
+LD-CU-S 5232 owner Some(50032) holder Some(37152)
+LD-CU-S 5746 owner Some(50032) holder Some(37929)
+LD-CU-S 6248 owner Some(50032) holder Some(38724)
+LD-CU-S 6760 owner Some(50032) holder Some(39544)
+LD-CU-S 7267 owner Some(50032) holder Some(40330)
+LD-CU-S 7781 owner Some(50032) holder Some(41165)
+LD-CU-S 8289 owner Some(50032) holder Some(41982)
+LD-CU-S 8799 owner Some(50032) holder Some(42748)
+LD-CU-S 9309 owner Some(50032) holder Some(43642)
+LD-CU-S 9819 owner Some(50032) holder Some(44471)
+LD-CU-S 10322 owner Some(50032) holder Some(45312)
+LD-CU-S 10822 owner Some(50032) holder Some(46131)
+LD-CU-S 11333 owner Some(50032) holder Some(47028)
+LD-CU-S 11845 owner Some(50032) holder Some(47768)
+LD-CU-S 12358 owner Some(50032) holder Some(48523)
+LD-CU-S 12859 owner Some(50032) holder Some(49288)
+LD-CU caught Some(13.33720137s) wall 13.337348221s; holder took 0 install(s) and held 55964 message(s) meanwhile
+LD-CU busy v2 n 9259 refused 0 p50 1053 us p99 5307 us max 192446 us
+LD-CU cpu owner total 2618 ticks over 13.34 s; by thread [(1528, "slates-shard-0:7960"), (1090, "slates-shard-1:7961"), (0, "slates:7951"), (0, "slates-watchdog:7962")]
