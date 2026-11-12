@@ -1,0 +1,79 @@
+runner ubuntu-latest, 4 CPUs, Thu Nov 12 08:32:38 UTC 2026
+tree red 6344c478f diag only (A-223 (d)): the failing test judged by the thread's switch count, and 
+== test red round=1
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+== test red round=2
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+== test red round=3
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+tree fix 999a5ae8c diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+== test fix round=2
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+== test fix round=3
+SKIP (loud): this OS counts no switches for the thread here; the daemon's wake confirms the sleeper instead
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.16s
+== exit 0
+== suites exit 0
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_client-3d3248510fdba652)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/acknowledge.rs (../target-fix/debug/deps/acknowledge-79ceb3f6e5aa4edd)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+     Running tests/async_core.rs (../target-fix/debug/deps/async_core-e57c010c0e76f59e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+     Running tests/cipher_keys.rs (../target-fix/debug/deps/cipher_keys-c43c5595e341b116)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+     Running tests/client.rs (../target-fix/debug/deps/client-e9af8ca01000d5b2)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.21s
+     Running tests/consumer.rs (../target-fix/debug/deps/consumer-24755e56cf154e4b)
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.23s
+     Running tests/driver.rs (../target-fix/debug/deps/driver-1d53732b11d23d51)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
+     Running tests/edit_and_submit.rs (../target-fix/debug/deps/edit_and_submit-9f2b6d2716beadd8)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+     Running tests/image.rs (../target-fix/debug/deps/image-824e5b00965a8ecc)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+     Running tests/merge_chaos.rs (../target-fix/debug/deps/merge_chaos-bacd9d65a3803f11)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+     Running tests/merge_identity.rs (../target-fix/debug/deps/merge_identity-a7d09823387e865f)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+     Running tests/merge_post_state.rs (../target-fix/debug/deps/merge_post_state-c082ca68cb5152b9)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+     Running tests/netns.rs (../target-fix/debug/deps/netns-a6e648af91f5ae4b)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/presentation.rs (../target-fix/debug/deps/presentation-3835b952a8c61f03)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.20s
+     Running tests/reap.rs (../target-fix/debug/deps/reap-dcb7915ae1d2ea78)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.21s
+     Running tests/reap_map.rs (../target-fix/debug/deps/reap_map-c78ce73eb23571be)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+     Running tests/shards.rs (../target-fix/debug/deps/shards-869f3b8675f7d14e)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+     Running unittests src/lib.rs (../target-fix/debug/deps/slates_ipc-cfd0976e476b30fb)
+test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s
+     Running tests/delivery.rs (../target-fix/debug/deps/delivery-8a83b5a0fb678bbc)
+test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/rendezvous.rs (../target-fix/debug/deps/rendezvous-7a8f72071f2391db)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+     Running tests/rings.rs (../target-fix/debug/deps/rings-30b3e2afa6c2072f)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+     Running tests/status.rs (../target-fix/debug/deps/status-1a3a288af539d791)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/stream_exec.rs (../target-fix/debug/deps/stream_exec-43786c72e865d490)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/stream_spawn.rs (../target-fix/debug/deps/stream_spawn-4469c86ae6e8a838)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== suites total: 140 passed, 0 failed, 5 ignored
