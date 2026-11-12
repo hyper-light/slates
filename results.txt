@@ -1,0 +1,61 @@
+runner aarch64, 4 CPUs, 8 spinners, 10 runs, tests at nice 19, commit c990a993e
+async_core run 1 exit 0 load 10.92
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.54s
+async_core run 2 exit 101 load 11.75
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5504) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 2 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+.
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.52s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 3 exit 101 load 12.00
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5546) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 33 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.34s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 4 exit 0 load 12.99
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 99.57s
+async_core run 5 exit 0 load 12.59
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 81.52s
+async_core run 6 exit 0 load 12.43
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 95.16s
+async_core run 7 exit 0 load 12.77
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.63s
+async_core run 8 exit 101 load 12.40
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5803) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 37 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.17s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 9 exit 101 load 12.53
+thread 'an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound' (5847) panicked at crates/client/tests/async_core.rs:189:5:
+a reply for RequestId { client: 1, sequence: 51 } arrived within the deadline
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound --- FAILED
+
+failures:
+--
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.71s
+
+[1m[91merror[0m: test failed, to rerun pass `-p slates-client --test async_core`
+async_core run 10 exit 0 load 12.66
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 87.83s
+== async_core passed 6 failed 4
