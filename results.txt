@@ -1,0 +1,83 @@
+runner macos-latest, 3 CPUs, Thu Nov 12 07:21:44 UTC 2026
+tree red 5d9c1c57b diag only (A-223 (d)): the failing test and the bench's client-wake line, on agen
+== test red round=1
+sleepers: 160 samples in 160 trips, estimate 18752 ns; racing: 4096 parks in 4100 trips, 3519 taught nothing, 0 taught a handoff [] ns, 5 trips taught two, estimate 9864 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.20s
+== exit 0
+== test red round=2
+sleepers: 160 samples in 160 trips, estimate 18148 ns; racing: 4096 parks in 4102 trips, 3685 taught nothing, 0 taught a handoff [] ns, 1 trips taught two, estimate 17290 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.21s
+== exit 0
+== test red round=3
+sleepers: 160 samples in 160 trips, estimate 14726 ns; racing: 4096 parks in 4101 trips, 3853 taught nothing, 0 taught a handoff [] ns, 0 trips taught two, estimate 11819 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.22s
+== exit 0
+tree fix 53ee21019 diag only (A-223 (d)): the client judges its Windows wait by its own switch count
+== test fix round=1
+sleepers: 160 samples in 160 trips, estimate 13600 ns; racing: 4096 parks in 4099 trips, 2813 taught nothing, 0 taught a handoff [] ns, 5 trips taught two, estimate 18845 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.24s
+== exit 0
+== test fix round=2
+sleepers: 160 samples in 160 trips, estimate 11762 ns; racing: 4096 parks in 4098 trips, 2143 taught nothing, 0 taught a handoff [] ns, 5 trips taught two, estimate 10514 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.23s
+== exit 0
+== test fix round=3
+sleepers: 160 samples in 160 trips, estimate 22165 ns; racing: 4096 parks in 4099 trips, 3304 taught nothing, 0 taught a handoff [] ns, 1 trips taught two, estimate 11408 ns
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.24s
+== exit 0
+== suites exit 127
+== suites total:  passed,  failed,  ignored
+== bench red round=1 at 07:33:49
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3958 ns, idle window at boot 395800 ns, floor 50000 ns
+  provision.spinning_1_p99: 283709 ns [256917, 336541] over 3 runs: [283709, 336541, 256917]
+  provision.parked_1-0-0 client wake: 4301 ns from 1065 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 4370 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 4256 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 1285 (wake 4131 ns), shard 1: 1168 (wake 4148 ns)
+  provision.parked_1_p99: 919000 ns [758709, 970125] over 3 runs: [919000, 970125, 758709]
+== exit 1
+== bench fix round=1 at 07:34:38
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3858 ns, idle window at boot 385800 ns, floor 50000 ns
+  provision.spinning_1_p99: 318500 ns [219916, 369959] over 3 runs: [318500, 369959, 219916]
+  provision.parked_1-0-0 client wake: 18644 ns from 1064 parked wakes (1065 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 17937 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 18497 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 960 (wake 11592 ns), shard 1: 715 (wake 12128 ns)
+  provision.parked_1_p99: 859417 ns [763417, 1570459] over 3 runs: [1570459, 859417, 763417]
+== exit 1
+== bench red round=2 at 07:35:19
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3850 ns, idle window at boot 385000 ns, floor 50000 ns
+  provision.spinning_1_p99: 326917 ns [312292, 408750] over 3 runs: [312292, 408750, 326917]
+  provision.parked_1-0-0 client wake: 13319 ns from 1065 parked wakes (1065 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 14289 ns from 1065 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 13004 ns from 1064 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 1174 (wake 8567 ns), shard 1: 1091 (wake 9425 ns)
+  provision.parked_1_p99: 1116375 ns [993708, 1200416] over 3 runs: [1200416, 993708, 1116375]
+== exit 1
+== bench fix round=2 at 07:36:08
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 3429 ns, idle window at boot 342900 ns, floor 50000 ns
+  provision.spinning_1_p99: 185709 ns [159208, 198000] over 3 runs: [198000, 185709, 159208]
+  provision.parked_1-0-0 client wake: 20985 ns from 1057 parked wakes (1062 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 23877 ns from 1057 parked wakes (1059 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 23835 ns from 1057 parked wakes (1060 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 505 (wake 25304 ns), shard 1: 440 (wake 21386 ns)
+  provision.parked_1_p99: 1212875 ns [727000, 1228000] over 3 runs: [1228000, 1212875, 727000]
+== exit 1
+== bench red round=3 at 07:36:53
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4302 ns, idle window at boot 430200 ns, floor 50000 ns
+  provision.spinning_1_p99: 994417 ns [739417, 1113792] over 3 runs: [994417, 1113792, 739417]
+  provision.parked_1-0-0 client wake: 18686 ns from 1063 parked wakes (1064 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 16631 ns from 1063 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 21303 ns from 1062 parked wakes (1065 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 763 (wake 14397 ns), shard 1: 725 (wake 11311 ns)
+  provision.parked_1_p99: 1129708 ns [696542, 1294416] over 3 runs: [1294416, 696542, 1129708]
+== exit 1
+== bench fix round=3 at 07:37:38
+provisioning histogram: 2 shards (PROVISION_BENCH_SHARDS), spin window 4367 ns, idle window at boot 436700 ns, floor 50000 ns
+  provision.spinning_1_p99: 244167 ns [210791, 259416] over 3 runs: [210791, 259416, 244167]
+  provision.parked_1-0-0 client wake: 20688 ns from 1065 parked wakes (1065 parks, 1066 replies)
+  provision.parked_1-1-0 client wake: 21695 ns from 1066 parked wakes (1066 parks, 1066 replies)
+  provision.parked_1-2-0 client wake: 17082 ns from 1052 parked wakes (1058 parks, 1066 replies)
+  provision.parked_1 parks per 1000 creates: shard 0: 1056 (wake 10929 ns), shard 1: 889 (wake 10137 ns)
+  provision.parked_1_p99: 987125 ns [624916, 1032375] over 3 runs: [987125, 1032375, 624916]
+== exit 1
