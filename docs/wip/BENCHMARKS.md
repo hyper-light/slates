@@ -12207,3 +12207,18 @@ both arms hit at similar rates, so slicing does not stretch a takeover. The step
 floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
 pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
 owner led the council.
+
+**The tests' bound, derived from that step (2026-11-11).** Two things decide the takeover tests' wait for a young
+fleet: the young pair's worst case, and the waits after detection.
+- **The young pair's worst case:** the timer's second to suspect, then the doubled timer to condemn, 30 periods. In
+  20 more marked runs, each slow suspicion came with the pool holding no verdict (`CorrelationUnmeasured`, 48 to 130
+  samples). The members' measured lateness G stayed at 38 to 453 µs, so it plays no part.
+- **The waits after detection:** the probe round, the death-confirmation window (the election-timeout base, 10
+  periods, after the last death verdict in every run), the retirement round at the longest election timeout, and the
+  adoption.
+
+In all, 64 of the fleet's own periods: `a_young_fleets_green_is_taken_over_within_its_detectors_young_pair_bound`
+passed 12 of 12, and without its young-pair term (34 periods) failed 2 of 12, the slow mode's share. Starting the
+election at the death verdict would have saved nothing in 17 of those 20 runs, and 95 to 206 ms in 3, since the
+confirmation window holds the retirement anyway. The change that would lift the step belongs to hyper-swim, so it goes
+to hyper-raft's owner as a proposal (Ada's decision).

@@ -14388,6 +14388,84 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   );
 }
 
+/// Derived: the timeout hyper-swim's detector gives a pair it judges by its own retransmission timer, before the member's
+/// pool has measured the host's stalls: RFC 6298 (2.1)'s initial second before any round trip, and (2.4)'s least second
+/// after (`vendor/hyper-raft/hyper-swim/src/detector.rs`, `INITIAL_RTO_NS` and `MINIMUM_RTO_NS`, private there and so
+/// stated here with their source). A young fleet's pairs are judged this way until the pool configures: 6 of 20
+/// instrumented takeovers on adas-mac-studio.local-2 (2026-11-09) suspected the owner at 1,058 to 1,245 ms by it.
+const YOUNG_PAIR_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// Derived: the expiries of a young pair's timer that take a dead peer from alive to dead. The first unanswered probe
+/// suspects it; the buddy probe that tells it so, unanswered under the doubled timeout (RFC 6298 (5.5)), condemns it. So
+/// the detection is the timeout and twice the timeout, three timeouts in all.
+const YOUNG_PAIR_DETECTION_TIMEOUTS: u64 = 3;
+
+/// Derived: the takeover's own rounds after the retirement commits, a record period each: the successor's adoption of the
+/// green's records, and the period that places the adopted head.
+const ADOPTION_PERIODS: u64 = 2;
+
+/// The periods, a fleet's own, in which a young fleet of `nodes` takes a dead owner's green over in the worst case its
+/// detector allows. Detection is [`YOUNG_PAIR_DETECTION_TIMEOUTS`] of [`YOUNG_PAIR_TIMEOUT_NS`]; a relay asked meanwhile
+/// states its deadline by the same timer. The probe round is `nodes - 1` periods, since a member probes its peers one a
+/// period in turn. The death watch then holds the member dead for the election-timeout base before the leader retires
+/// it (`stable_dead_council_members`). The retirement is a consensus round, which the council never extends past the
+/// longest election timeout, base plus span ([`slates_cluster::timing::ELECTION_MARGIN`]). The adoption and its
+/// placement follow ([`ADOPTION_PERIODS`]).
+fn young_takeover_periods(nodes: u64) -> u64 {
+  let election = slates_cluster::timing::ElectionTiming::floor();
+  let base = u64::from(election.base_periods);
+  let span = u64::from(election.span_periods);
+  let detection = YOUNG_PAIR_TIMEOUT_NS
+    .saturating_mul(YOUNG_PAIR_DETECTION_TIMEOUTS)
+    .div_ceil(HEARTBEAT_NS);
+  detection
+    .saturating_add(nodes.saturating_sub(1))
+    .saturating_add(base)
+    .saturating_add(base.saturating_add(span))
+    .saturating_add(ADOPTION_PERIODS)
+}
+
+/// §4.16 owner-loss recovery in a young fleet. Do: form a three-node fleet at `f = 1`, commit a green three versions on
+/// its owner, and kill the owner at once, in the fleet's first seconds, while a survivor's pair to it may still be judged
+/// by its retransmission timer. Expect a survivor to hold the green placed at version 3 within
+/// [`young_takeover_periods`] of the survivors' own periods. The takeover in a young fleet is bimodal: about 2 s when the
+/// survivors' pools judge the owner, 4 to 5 s when one survivor's timer does (BENCHMARKS, "The takeover's latency"). A
+/// test bound to the fast mode alone fails 2 to 6 runs in 20, and the detector's own floors, not load, decide which.
+#[test]
+fn a_young_fleets_green_is_taken_over_within_its_detectors_young_pair_bound() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "young-takeover", &daemons);
+  commit_three_versions(&mut client, work);
+  drop(client);
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let bound = young_takeover_periods(u64::try_from(names.len()).unwrap());
+  let served = poll_for_periods(&survivors, PLACEMENT_DEADLINE, bound, || {
+    Ok(daemons[0].merge_record_placed(green, 3)? || daemons[1].merge_record_placed(green, 3)?)
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "a survivor took the green over within {bound} of its own periods"
+  );
+}
+
 /// A-237 (§4.13, §4.16 owner-loss recovery): a share of a green made after its last version survives the owner's
 /// death. Do X (advance a green three versions on A, then share it read-only with node a's account 7777, kill A),
 /// expect Y (the green's catalog register carrying the share reaches both survivors, and the successor rebuilds the
