@@ -7,7 +7,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 
@@ -200,5 +202,84 @@ test('lifecycle round trip over a live daemon', async (t) => {
     } catch {
       // The group is already gone; nothing to reap.
     }
+  }
+});
+
+// Runs `slates --instance INSTANCE ARGS...` and returns its standard output, throwing on a refusal.
+function cli(daemon, instance, ...args) {
+  const done = spawnSync(daemon, ['--instance', instance, ...args], { encoding: 'utf8', timeout: STARTUP_MS });
+  if (done.status !== 0) throw new Error(`slates ${args.join(' ')}: ${done.stderr}`);
+  return done.stdout;
+}
+
+// Lists through a fresh client until some entry satisfies `predicate`, within the startup budget: across a daemon's
+// restart the first lists may be refused or may not yet show the recovered catalog. The last list and whether it held.
+async function listedUntil(slates, instance, predicate) {
+  const deadline = Date.now() + STARTUP_MS;
+  let listed = [];
+  while (Date.now() < deadline) {
+    try {
+      listed = (await connectWhenReady(slates, instance)).list();
+    } catch {
+      listed = [];
+    }
+    if (listed.some(predicate)) return { listed, held: true };
+    await sleep(POLL_MS);
+  }
+  return { listed, held: false };
+}
+
+// The two listing fields the CLI's `volume list` shows, by use against a real anchor+daemon: a volume made live-shipped
+// lists `liveShipped` true; a volume over a host directory whose directory is removed before the daemon restarts lists
+// `notRecovered` as its cause's kind, 'BaseMissing'; and neither is set on a volume it does not describe. Before
+// 2026-11-09 the SDK's entries carried neither.
+test('a listing says which volumes are live-shipped and which recovery could not rebuild', async (t) => {
+  const daemon = process.env.SLATES_DAEMON;
+  if (!addonPath || !existsSync(addonPath)) {
+    t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
+    return;
+  }
+  if (!daemon || !existsSync(daemon)) {
+    t.skip('SLATES_DAEMON is not set to a built `slates` binary — listing round-trip skipped loudly');
+    return;
+  }
+  const slates = require(addonPath);
+  const instance = `slates-sdk-node-list-${process.pid}`;
+  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
+    stdio: 'ignore',
+    detached: true,
+  });
+  const scratch = mkdtempSync(join(tmpdir(), 'slates-sdk-node-list-'));
+  try {
+    const client = await connectWhenReady(slates, instance);
+    cli(daemon, instance, 'bootstrap', 'root');
+    const live = client.create('sdk-live', VOLUME_BYTES);
+    cli(daemon, instance, 'live-ship', live);
+    const base = join(scratch, 'base');
+    mkdirSync(base);
+    const created = cli(daemon, instance, 'volume', 'create', 'sdk-unrecovered', '--bounded', '8MiB', '--base', base);
+    const unrecovered = created.split('\n').find((line) => line.startsWith('id: ')).slice('id: '.length).trim();
+    cli(daemon, instance, 'volume', 'snapshot', unrecovered);
+    rmdirSync(base);
+    // The daemon restarts in order under its anchor; its successor holds the record and cannot rebuild it.
+    const pid = JSON.parse(cli(daemon, instance, 'status', '--json')).pid;
+    process.kill(pid, 'SIGTERM');
+    const { listed, held } = await listedUntil(
+      slates, instance, (v) => v.id === unrecovered && v.notRecovered != null,
+    );
+    assert.ok(held, `the restarted daemon lists the unrecovered volume: ${JSON.stringify(listed)}`);
+    const entries = Object.fromEntries(listed.map((v) => [v.id, v]));
+    assert.equal(entries[unrecovered].notRecovered, 'BaseMissing');
+    assert.equal(entries[unrecovered].liveShipped, false);
+    assert.equal(entries[unrecovered].overlay, true);
+    assert.equal(entries[live].liveShipped, true, `the live-shipped volume says so: ${JSON.stringify(entries[live])}`);
+    assert.ok(entries[live].notRecovered == null, `no recovery cause on a live volume: ${JSON.stringify(entries[live])}`);
+  } finally {
+    try {
+      process.kill(-anchor.pid, 'SIGKILL');
+    } catch {
+      // The group is already gone; nothing to reap.
+    }
+    rmSync(scratch, { recursive: true, force: true });
   }
 });

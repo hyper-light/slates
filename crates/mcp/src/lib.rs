@@ -1488,23 +1488,9 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
     "referenced_bytes": v.referenced_bytes,
     "unique_bytes": v.unique_bytes,
     "overlay": v.overlay,
-    "not_recovered": v.not_recovered.as_ref().map(recovery_cause_kind),
+    "live_shipped": v.live_shipped,
+    "not_recovered": v.not_recovered.as_ref().map(RecoveryCause::kind),
   })
-}
-
-/// The kind of why recovery could not rebuild a volume (§4.8), as `volume list` and its JSON name it: the
-/// [`RecoveryCause`] variant's name. The whole cause, with its path or reason, is in the volume's `status` refusal.
-pub fn recovery_cause_kind(cause: &RecoveryCause) -> &'static str {
-  match cause {
-    RecoveryCause::NoImage => "NoImage",
-    RecoveryCause::BlocksUnclaimed => "BlocksUnclaimed",
-    RecoveryCause::BaseMissing { .. } => "BaseMissing",
-    RecoveryCause::BaseOnOwnMount { .. } => "BaseOnOwnMount",
-    RecoveryCause::BaseUnavailable { .. } => "BaseUnavailable",
-    RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
-    RecoveryCause::ImageRefused { .. } => "ImageRefused",
-    RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
-  }
 }
 
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
