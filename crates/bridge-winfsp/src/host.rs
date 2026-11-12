@@ -1261,6 +1261,27 @@ pub(crate) fn post_confirm(
   Ok(confirming)
 }
 
+/// Diag only: [`confirmed_open`], answering whether the worker had to wait for it.
+pub(crate) fn confirmed_open_waited(confirming: &Confirming, wake: &Waker) -> Result<bool, WinFspError> {
+  let Confirming(answer) = confirming;
+  let (reply, waited) = match answer.try_recv() {
+    Ok(reply) => (reply, false),
+    Err(TryRecvError::Empty) => {
+      wake.wake_by_ref();
+      (crate::reply::await_reply(answer).map_err(|_| WinFspError::MountThread)?, true)
+    }
+    Err(TryRecvError::Disconnected) => return Err(WinFspError::MountThread),
+  };
+  match reply {
+    Reply::Ok => Ok(waited),
+    Reply::Err(status) => Err(WinFspError::Api {
+      call: "confirm handed open",
+      status,
+    }),
+    _ => Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt)),
+  }
+}
+
 /// Takes a posted confirmation's answer, waking the mount's task first when it has not been applied yet.
 pub(crate) fn confirmed_open(confirming: &Confirming, wake: &Waker) -> Result<(), WinFspError> {
   let Confirming(answer) = confirming;

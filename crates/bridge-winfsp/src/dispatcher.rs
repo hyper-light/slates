@@ -317,6 +317,28 @@ struct Dll<'a> {
   bound: usize,
   /// The answer of the open's confirmation posted last, until it is taken (audit step 7, cut (c)): at most one.
   confirming: Option<crate::host::Confirming>,
+  /// Diag only: requests taken, by kind; confirmations taken, and those the worker had to wait for.
+  kinds: [u64; inflight::KIND_COUNT as usize],
+  confirms_taken: u64,
+  confirms_waited: u64,
+}
+
+impl Drop for Dll<'_> {
+  fn drop(&mut self) {
+    let taken: Vec<String> = self
+      .kinds
+      .iter()
+      .enumerate()
+      .filter(|(_, count)| **count > 0)
+      .map(|(kind, count)| format!("{kind}:{count}"))
+      .collect();
+    slates_machine::log_line!(
+      "slates-winfsp diag-52: requests taken by kind {}; confirmations taken {}, the worker waited for {}",
+      taken.join(" "),
+      self.confirms_taken,
+      self.confirms_waited
+    );
+  }
 }
 
 impl inflight::settle::Edges for Dll<'_> {
@@ -354,6 +376,12 @@ impl inflight::settle::Edges for Dll<'_> {
     response: &mut [u8],
     replaying: bool,
   ) -> Result<usize, WinFspError> {
+    if let Some(count) = usize::try_from(request.kind())
+      .ok()
+      .and_then(|kind| self.kinds.get_mut(kind))
+    {
+      *count += 1;
+    }
     REPLAYING.set(replaying);
     let length = operation(
       self.file_system,
@@ -381,7 +409,14 @@ impl inflight::settle::Edges for Dll<'_> {
 
   fn confirmed(&mut self) -> Result<(), WinFspError> {
     match self.confirming.take() {
-      Some(answer) => crate::host::confirmed_open(&answer, self.wake),
+      Some(answer) => {
+        self.confirms_taken += 1;
+        let waited = crate::host::confirmed_open_waited(&answer, self.wake)?;
+        if waited {
+          self.confirms_waited += 1;
+        }
+        Ok(())
+      }
       None => Ok(()),
     }
   }
@@ -496,6 +531,9 @@ fn receive_loop(
     wake,
     bound,
     confirming: None,
+    kinds: [0; inflight::KIND_COUNT as usize],
+    confirms_taken: 0,
+    confirms_waited: 0,
   };
   let mut response = Box::new(Packet([0; RESPONSE_MAX]));
   let mut view = CaptureView::new(section, bound)?;
