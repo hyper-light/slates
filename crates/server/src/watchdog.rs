@@ -221,12 +221,39 @@ pub struct Look {
   pub now_ns: u64,
 }
 
+/// The read order a judgment of "no progress, not runnable" needs (A-228; bug-sweep, 2026-11-09), one rule for every
+/// such judgment: the watchdog's looks ([`Look::told`]), the anchor's start judgment, and a wait in a shard's own time
+/// (`observe::WindowJudge`). A thread's clock and its scheduler state cannot be read at one instant. Read the clock first
+/// and the state second, and a thread released between the two runs, ends what it was doing and blocks before the state
+/// is read: no progress and not runnable, the moment it ran. On jupiter (Windows 11) an observation of a starved shard was
+/// given up on so, its thread `Waiting` on `WrQueue` with its clock unmoved since the wait began. A thread cannot go from
+/// runnable to blocked without running, so after a not-runnable answer the clock is read again (`read_again`): a reading
+/// whose progress passed `progress` says the thread ran in between, and is returned for the judgment to take in place of
+/// the first. `None`: the thread is runnable, or did not run.
+pub fn ran_while_asked<R>(
+  runnable: bool,
+  progress: u64,
+  read_again: impl FnOnce() -> Option<R>,
+  progress_of: impl Fn(&R) -> u64,
+) -> Option<R> {
+  if runnable {
+    return None;
+  }
+  read_again().filter(|again| progress_of(again) > progress)
+}
+
 impl Look {
-  /// Takes the scheduler's answer about this look's thread, `run`, asked after the look's clock was read. `read_again`
-  /// reads the clock once more.
+  /// Takes the scheduler's answer about this look's thread, `run`, asked after the look's clock was read, by
+  /// [`ran_while_asked`]: after a not-runnable answer the clock is read again (`read_again`), and one that moved replaces
+  /// the look's reading, so a thread released between the two reads is seen to have run, not judged wedged.
   pub fn told(&mut self, run: Option<RunReading>, read_again: impl FnOnce() -> Option<(u64, u64)>) {
-    let _ = read_again;
     self.run = run;
+    let runnable = run.is_some_and(|reading| reading.state == RunState::Runnable);
+    if let Some((_, progress)) = self.cpu
+      && let Some(again) = ran_while_asked(runnable, progress, read_again, |(_, moved)| *moved)
+    {
+      self.cpu = Some(again);
+    }
   }
 }
 

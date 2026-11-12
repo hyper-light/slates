@@ -930,9 +930,12 @@
 >   runnable" (jupiter: 1 of 12 whole-suite runs, its thread `Waiting` on `WrQueue` with its clock unmoved since the wait
 >   began, logged by the give-up's new record). A not-runnable state is now followed by a second read of the clock
 >   (`observe::WindowJudge`), red first in its unit tests; 12 of 12 after on jupiter
->   (`docs/bugs/2026-11-09-a-starved-shard-released-between-two-reads-was-judged-wedged.md`). **Open, the same order:**
->   the watchdog (`watchdog::read_runs`, a withheld beat for one look) and the anchor's start judgment
->   (`anchor::judge_start_of`, which kills a start on one wedged look) read the clock before the scheduler too.
+>   (`docs/bugs/2026-11-09-a-starved-shard-released-between-two-reads-was-judged-wedged.md`). **The same order in
+>   two more places, fixed 2026-11-11 (liveness):** the watchdog (`watchdog::read_runs`, a withheld beat for one look)
+>   and the anchor's start judgment (`anchor::judge_start_of`, which killed a start on one wedged look) read the clock
+>   before the scheduler too. All three now read by one rule, `watchdog::ran_while_asked`; each red first with a
+>   replayed reading (`a_shard_released_between_its_clock_and_the_scheduler_is_not_judged_wedged`,
+>   `a_start_released_between_its_clock_and_the_scheduler_is_not_killed`).
 >   And on jupiter the liveness suite run whole fails 1 to 5 of its beat tests every run, before this change and after
 >   (`a_daemon_beside_two_spinners_a_core_keeps_beating`, `a_wedged_shard_stops_the_beat`, ...), while CI's runners
 >   pass them: not diagnosed. The anchor's start judgment

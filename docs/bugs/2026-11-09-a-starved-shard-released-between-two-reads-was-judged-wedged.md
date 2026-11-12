@@ -53,10 +53,14 @@ every give-up is logged with its reason, the clock and the scheduler's own words
 An observation or a cross-shard call of a starved shard could be refused `Deadline` at the moment the shard was released,
 on any platform; Windows' slow snapshot made it likely enough to be seen.
 
-## Siblings (open)
+## Siblings (fixed 2026-11-11, liveness)
 
-- The watchdog (`watchdog::read_runs`) asks the scheduler only about shards its clock reading suspects, after that
-  reading: a shard released between them reads wedged for one look, its beat withheld once.
-- The anchor's start judgment (`anchor::judge_start_of`) reads the process's clock, then `process_runnable`: a start
-  released between them reads wedged, and one wedged look kills it.
-- Either is closed the same way, a second read of the clock after a not-runnable state, or the state read first.
+- The watchdog (`watchdog::read_runs`) asked the scheduler only about shards its clock reading suspected, after that
+  reading: a shard released between them read wedged for one look, its beat withheld once.
+- The anchor's start judgment (`anchor::judge_start_of`) read the process's clock, then `process_runnable`: a start
+  released between them read wedged, and one wedged look killed it.
+- Both now take the scheduler's answer through `Look::told`, which reads by the rule `observe::WindowJudge` reads by,
+  now one function, `watchdog::ran_while_asked`: after a not-runnable answer the clock is read again, and a clock that
+  moved replaces the first reading. Red first, each with a replayed reading:
+  `a_shard_released_between_its_clock_and_the_scheduler_is_not_judged_wedged` (`crates/server/src/watchdog.rs`) and
+  `a_start_released_between_its_clock_and_the_scheduler_is_not_killed` (`crates/cli/src/anchor.rs`).

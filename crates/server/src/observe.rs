@@ -344,7 +344,8 @@ impl WindowJudge {
   /// up on so 1 of 12 runs of the whole liveness suite, its log reading the shard's clock unmoved since the wait began and
   /// its thread `Waiting` on `WrQueue`, its completion port; CI's windows-latest x86_64 failed the same test once. So a
   /// state that says not runnable is followed by the clock read again: a thread cannot go from runnable to blocked without
-  /// running, so a clock that moved since says it ran, and only one still unmoved ends the wait.
+  /// running, so a clock that moved since says it ran, and only one still unmoved ends the wait: the one rule every such
+  /// judgment reads by, [`crate::watchdog::ran_while_asked`].
   fn judge(
     &mut self,
     mut read_clock: impl FnMut() -> Option<slates_rt::CpuReading>,
@@ -372,7 +373,9 @@ impl WindowJudge {
       if runnable() {
         return Ok(unspent);
       }
-      if let Some(again) = read_clock().filter(|again| again.progress > now.progress) {
+      if let Some(again) =
+        crate::watchdog::ran_while_asked(false, now.progress, read_clock, |again| again.progress)
+      {
         self.mark = Some(again.progress);
         return Ok(unspent);
       }
