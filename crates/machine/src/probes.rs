@@ -24,16 +24,17 @@ use crate::stats::Xorshift;
 /// Fault costs per page class, in nanoseconds per page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultCosts {
-  /// Nanoseconds per base-page fault when touching an anonymous mapping (map/unmap subtracted).
+  /// Nanoseconds per base-page fault when touching an anonymous mapping (map/unmap subtracted). Never zero: a probe that
+  /// measured the touched region no slower than the untouched one is refused ([`faults_from`]).
   pub base_ns: u64,
   /// The measurement behind `base_ns`, per region.
   pub base_region: Measurement,
   /// The map-and-unmap cost of the region alone, the subtracted baseline.
   pub map_unmap_region: Measurement,
   /// Nanoseconds per base page when the OS pre-populates the mapping (Linux `MAP_POPULATE`),
-  /// `None` where the OS has no such call.
+  /// `None` where the OS has no such call, or where the populated region measured no slower than the untouched one.
   pub populated_ns: Option<u64>,
-  /// Nanoseconds per base page inside a transparent-huge-page region, `None` where unavailable.
+  /// Nanoseconds per base page inside a transparent-huge-page region, `None` where unavailable or measured at nothing.
   pub huge_ns: Option<u64>,
   /// How many base pages each region held.
   pub pages_per_region: u64,
@@ -164,13 +165,24 @@ pub(crate) fn faults_from(
   let per_probe = budget.checked_div(3).unwrap_or_default();
   let map_unmap_region = region(Touch::None, per_probe);
   let base_region = region(Touch::Every, per_probe);
-  let base_ns = base_region
-    .median_ns()
-    .saturating_sub(map_unmap_region.median_ns())
-    / FAULT_REGION_PAGES;
-  let populated_ns = populated(per_probe)
-    .map(|m| m.median_ns().saturating_sub(map_unmap_region.median_ns()) / FAULT_REGION_PAGES);
-  let huge_ns = huge(per_probe).map(|(m, pages)| m.median_ns().checked_div(pages).unwrap_or(0));
+  // Touching a page costs at least a nanosecond. A region whose touches came out cheaper, the two medians taken apart
+  // while a loaded machine ran them, measured the load and not the faults, so it reports no cost: the base pages'
+  // probe is refused as one that could not measure within its bound, which the profile's patient re-measurement takes
+  // again (`MachineProfile::measure_patiently`), and a populated region is unmeasured. Before 2026-11-11 the difference
+  // saturated to zero, and every bound derived from the fault cost took a fault that costs nothing.
+  let per_page = |touched: &Measurement| {
+    touched
+      .median_ns()
+      .checked_sub(map_unmap_region.median_ns())
+      .map(|added| added / FAULT_REGION_PAGES)
+      .filter(|ns| *ns > 0)
+  };
+  let base_ns =
+    per_page(&base_region).ok_or(MachineError::MeasurementTimeout { probe: "faults" })?;
+  let populated_ns = populated(per_probe).and_then(|m| per_page(&m));
+  let huge_ns = huge(per_probe)
+    .and_then(|(m, pages)| m.median_ns().checked_div(pages))
+    .filter(|ns| *ns > 0);
   Ok(FaultCosts {
     base_ns,
     base_region,
