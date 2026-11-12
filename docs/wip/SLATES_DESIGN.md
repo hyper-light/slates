@@ -4554,8 +4554,9 @@ drops.
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
-`LOADED_WAKE_RATIO`), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which the
-bench gates on too) and the multiple is 0 on Linux and macOS and 100 on Windows (A-223's window rule, below).
+the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
+the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
+on Linux and macOS and 100 on Windows (A-223's window rule, below).
 
 > **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
 > window was the shard's live wake estimate × 100. The estimate counts the time a woken shard waits for a CPU, which
@@ -14290,7 +14291,7 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 ### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
 Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
 constants and a status), A-42's entry (its wording), GAPS (A-223's entry, §5), BENCHMARKS ("The idle window's rule"),
-`crates/server` (`config.rs`: `PROVISION_FLOOR`, `LOADED_WAKE_RATIO` and `idle_window_ns` replace the idle
+`crates/server` (`config.rs`: `PROVISION_FLOOR`, `loaded_wake_ratio` and `idle_window_ns` replace the idle
 ratio of 100; `daemon.rs`: the serve loop reads the shard's window, `ShardPulse` reports it), `crates/rt`
 (`WakeTracking::idle_floor_ns`, `ShardContext::idle_window_ns`, `Pulse::idle_window_ns`), `provision_bench` (it reads
 F from the library), and the tests `crates/server/tests/idle_window.rs`, `crates/rt/tests/wake_estimate.rs` and the
@@ -14300,7 +14301,7 @@ rule's table in `config.rs`.
   window fed on its own spinning. Under two spinners a logical CPU the estimates reached 0.2–6.1 ms and the windows
   hundreds of milliseconds. Even quiet, a Linux client paced at 1 ms kept its owner shard spinning at 1.5–2.0 cores on
   main, because its live estimate of 34–70 µs made a 3.4–7.0 ms window over a 1 ms pause.
-- **The rule.** `W = max(F, wake × LOADED_WAKE_RATIO)`. F is R9's provisioning floor, 50 µs, written as a `derived!`
+- **The rule.** `W = max(F, wake × loaded_wake_ratio())`. F is R9's provisioning floor, 50 µs, written as a `derived!`
   whose formula is R9's bound (AC-2.1): it is a requirement, not a measurement, so no load moves it, and the bench's
   gate reads the same constant. A closed-loop client that meets R9 sends its next request within F of its last reply,
   so it finds its shards still polling. The multiple is 0 on Linux and macOS, so there no estimate prices the window,
