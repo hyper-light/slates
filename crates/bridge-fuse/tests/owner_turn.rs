@@ -293,7 +293,11 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
   allocate_through_the_mount(&mount_point);
   tmpfile_through_the_mount(&mount_point);
   refuse_tx.send(()).unwrap();
-  let (ok, err) = through_the_mount(&mount_point, "mkdir \"$1/d\"");
+  let (ok, err) = through_the_mount(
+    &mount_point,
+    "readlink -f \"$(command -v mkdir)\" >&2; mkdir --version 2>&1 | head -1 >&2; strace -f -e trace=mkdir,mkdirat,newfstatat,statx,stat -o /dev/stderr mkdir \"$1/d\"; echo \"mkdir exit $?\" >&2",
+  );
+  eprintln!("owner_turn diag: ok={ok} err:\n{err}");
   assert!(
     !ok && err.contains("Input/output error"),
     "the refused barrier answered EIO: {err}"

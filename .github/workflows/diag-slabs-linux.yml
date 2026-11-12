@@ -1,0 +1,49 @@
+name: "DIAG slabs -- owner_turn's mkdir on the 26.04 image, which tool and what its syscall answered (not for main)"
+
+# The owner_turn test fails 400 of 400 on the ubuntu-26.04 image (diag-slabs-58) with the mkdir's barrier refused and the
+# mkdir still succeeding. This runs it three times with the test's mkdir traced: the tool's path and version, and the
+# mkdir system calls and stats it made, with their answers.
+
+on:
+  push:
+    branches: ['diag-slabs-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  trace:
+    name: owner_turn's mkdir traced on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RESULTS_BRANCH: diag-slabs-results-${{ github.ref_name }}-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Trace
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set +e
+          {
+            echo "## image: ${ImageOS:-?} ${ImageVersion:-?}"; uname -r
+            sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq strace >/dev/null 2>&1; command -v strace
+            ls -l /usr/bin/mkdir; dpkg -S "$(readlink -f /usr/bin/mkdir)" 2>&1 | head -2
+            for run in 1 2 3; do
+              cargo test --locked -p slates-bridge-fuse --test owner_turn -- --nocapture 2>&1 | grep -v "^ *Compiling\|^ *Running\|^ *Finished" | head -60
+              echo "## run $run done"
+            done
+          } 2>&1 | tee own.txt
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          blob=$(git hash-object -w own.txt); tree=$(printf '100644 blob %s\town.txt\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID at $(date -u +%FT%TZ)")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH" || echo "::warning::could not publish"
+          exit 0
