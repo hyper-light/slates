@@ -1,0 +1,110 @@
+name: diag-liveness-a223-window-rule-built
+
+# Diagnostics only, never on main (A-223 step 4): the idle window's rule as built, max(F, wake x LOADED_WAKE_RATIO)
+# with F = 50 us and the multiple 0 on Linux and macOS, 100 on Windows. provision_bench at two shards, quiet and with
+# two spinning shell loops per logical CPU, three rounds each; then the rule's tests on every runner (the paced-client
+# test is not built on Windows). Results go to diag-results/liveness-37-<os>.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  rule:
+    name: A-223 window rule built (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Gates
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          git log -1 --format="tree %h %s" | cut -c1-120 | tee -a $R
+          step() { local name=$1; shift; "$@" > ../$name.log 2>&1; local status=$?; echo "== $name exit $status" | tee -a $R; [ $status -eq 0 ] || grep -E '^(error|warning)|FAILED|panicked|violation|literal|Diff in' -A8 ../$name.log | head -60 | tee -a $R; }
+          step fmt cargo fmt --all --check
+          step xtask cargo xtask check
+          grep -E '^literals:' ../xtask.log | tee -a $R
+          case "${{ matrix.os }}" in
+            windows-*) step clippy cargo clippy --locked -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings ;;
+            *) step clippy cargo clippy --locked --workspace --all-targets -- -D warnings ;;
+          esac
+          step machine_rt cargo test --locked -p slates-machine -p slates-rt
+          grep -E '^test result' ../machine_rt.log | tee -a $R
+      - name: Build the bench
+        run: |
+          set +e +o pipefail
+          cargo build --release --locked -p slates-client --example provision_bench > ../build.log 2>&1 || { echo "== build failed" | tee -a ../results.txt; grep -E '^error' -A6 ../build.log | head -30 >> ../results.txt; exit 1; }
+      - name: The rule, quiet and loaded, three rounds each
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          command -v timeout > /dev/null || { if command -v gtimeout > /dev/null; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi; }
+          ext=""; case "${{ matrix.os }}" in windows-*) ext=".exe";; esac
+          B="target/release/examples/provision_bench$ext"
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          export PROVISION_BENCH_SHARDS=2
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              pids=""
+              if [ $cond = busy ]; then
+                for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+              fi
+              echo "== $cond round=$round at $(date -u +%H:%M:%S)" | tee -a $R
+              timeout 1500 "$B" > ../run.log 2>&1; status=$?
+              for p in $pids; do kill "$p" 2>/dev/null; done
+              wait 2>/dev/null
+              grep -E 'provisioning histogram|_cpu_|spinning_1 parks|parked_1 parks|^  provision\.(spinning_1|spinning_8|parked_1)_p99:|ac-2.1: 1 client spinning|panicked' ../run.log | cut -c1-600 | tee -a $R
+              echo "== exit $status" | tee -a $R
+            done
+          done
+      - name: The rule's tests
+        if: always()
+        run: |
+          set +e +o pipefail
+          R=../results.txt
+          run() { local name=$1; shift; "$@" > ../test-$name.log 2>&1; local status=$?; echo "== test $name exit $status" | tee -a $R; grep -E '^test |^test result|slates daemon:|panicked|grew with|queued a woken' ../test-$name.log | cut -c1-500 | tee -a $R; }
+          run config cargo test --locked -p slates-server --lib config
+          run wake_estimate cargo test --locked -p slates-rt --test wake_estimate
+          case "${{ matrix.os }}" in
+            windows-*) ;;
+            *)
+              for i in 1 2 3; do run idle_window_$i cargo test --locked -p slates-server --test idle_window -- --nocapture; done
+              run forward_retry cargo test --locked -p slates-server --test forward_retry
+              ;;
+          esac
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-37-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-37 results, ${{ matrix.os }}"
+          git push -q -f origin "HEAD:refs/heads/$branch"
