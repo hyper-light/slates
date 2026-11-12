@@ -926,6 +926,11 @@ pub(crate) fn published(
     refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
+  let referenced = state
+    .by_id
+    .get(&id)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+    .map_or(0, |slot| slot.volume.accounting().referenced_bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
@@ -956,6 +961,10 @@ pub(crate) fn published(
         live.whole_entry = Some(head);
         live.image_anchors = None;
       }
+      let last_whole = live.whole.as_ref().map_or(0, |(_, image)| image.len());
+      live
+        .shipper
+        .retain_up_to(retain_bound(last_whole, referenced));
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
@@ -970,6 +979,17 @@ pub(crate) fn published(
     }
     Err(_) => refuse(state, id, "fleet.live.refused.no_credit"),
   }
+}
+
+/// The retained tail's byte bound a publication sets (`Shipper::retain_up_to`). Derived: what installing the volume
+/// would send now, the larger of its referenced bytes and its last whole record or install image (`last_whole`), so a
+/// laggard is shipped the entries it lacks while they cost no more than installing it. Set only at a whole record or an
+/// image, the bound stayed at the last one's size however the volume grew, and a whole record comes only once the log
+/// reaches the volume's quota ([`kept_reaches_size`]): 215,997 bytes at head 16,526, so a holder 12 entries behind fell
+/// past the tail and was installed whole, its 195 to 219 MB image built on the owner's shard, 2 to 6 times in each
+/// catch-up (diag-live-durability-81 and -82).
+fn retain_bound(last_whole: usize, referenced: u64) -> usize {
+  last_whole.max(usize::try_from(referenced).unwrap_or(usize::MAX))
 }
 
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
@@ -3090,6 +3110,26 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A live volume grown far past its last whole record: do ask what a publication bounds the retained tail by. Expect
+  /// the volume as it is now, what installing it would send. A whole record comes only once the log reaches the volume's
+  /// quota, so the last one may be very old: diag-live-durability-82 found 215,997 bytes at head 16,526 (checkpoint 49),
+  /// a holder 12 entries behind past the tail and installed whole (195 to 219 MB images built on the owner's shard), and
+  /// 2 to 6 such installs in every catch-up of -81 and -82.
+  #[test]
+  fn the_retained_tail_follows_the_volume_as_it_is_now() {
+    let (last_whole, referenced) = (215_997_usize, 200_000_000_u64);
+    assert_eq!(
+      retain_bound(last_whole, referenced),
+      200_000_000,
+      "a laggard is kept entries up to what installing the volume now would send"
+    );
+    assert_eq!(
+      retain_bound(300, 200),
+      300,
+      "a whole record or image larger than the referenced bytes keeps its size"
+    );
+  }
 
   /// A-240 with an install image beside the log: do ask whether the log covers candidates a and b when the last whole
   /// entry's anchors hold both keys and the install image's hold only a's. Expect not: a holder installed from the image
