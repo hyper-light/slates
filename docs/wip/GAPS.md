@@ -297,11 +297,16 @@
 > answered late, the watch earns its place on arm; if it is the slow catch-up below, fixing that may erase the
 > difference. The watch is held unlanded on `agents/live-durability-watch-3` until then.
 
-> **Open (live-durability, 2026-11-09): a holder resumed after a stop mid-install did not catch up within 50 s.** In 4 of
-> 12 runs on x86 with the install watch on or off alike, and 1 of 12 (off) on arm; the rest caught up in a median of 1.8
-> to 3.7 s (diag-live-durability-70: the holder stopped on its install for 20 s under a 30 s install floor, then
-> resumed). Where those runs wait after the resume, and what the holder and the owner each take its head to be, is not
-> yet measured. The restart flow's open note on holders below the tail ("a holder repeating the head") may be the same.
+> **Open (live-durability, 2026-11-09, measured 2026-11-11): a resumed holder's catch-up saturates its owner's shard.**
+> A holder resumed after a stop mid-install did not catch up within 50 s in 4 of 12 x86 runs (diag-live-durability-70),
+> 6 of 24 (-73), 2 of 24 (-76). Measured: after its install the gap held at 350 to 900 entries while the owner's writes
+> fell from about 3,000 to 90 to 400 a second, the holder moving at about that rate (-73, -76). With a second volume on
+> the owner's shard written through a catch-up (-81, both arches): the volume shard at about 100% of a CPU for the
+> catch-up's length, the holder taking 2 to 4 installs beside its entries, and the neighbour's worst write up to 1.57 s
+> (x86) and 1.17 s (arm) with 20,000 entries behind (p50 untouched, p99 3 to 15 times quiet). Not the reply fold's clone: removing it
+> moved none of this (BENCHMARKS "A lagging holder's reply folded without building its backlog"). Owed: where the
+> shard's time goes during a catch-up (the installs' images and encodes, per-entry sends), and why 2 to 4 installs
+> while the backlog lies inside retention.
 
 > **Open (live-durability, 2026-11-08): hundreds of writes reach the log as one entry.** Entries of 64 KiB or more were
 > 507 deltas and 178 whole records in 60 rolling partition runs (diag-live-durability-56); a delta carried a median of

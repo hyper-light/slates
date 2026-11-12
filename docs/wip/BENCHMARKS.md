@@ -12115,3 +12115,42 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+### A lagging holder's reply folded without building its backlog: measured and rejected (A-200; 2026-11-09 to 2026-11-11, `agents/live-durability-catchup-1`, unlanded)
+
+**The cost.** Every reply of a holder still lacking entries was folded through `Shipper::on_reply`, which built (cloned)
+every retained entry after the holder's head, and `live_ship::fold_into` dropped the result unless it was a fence.
+Timed on the Mac (release, 8 KiB entries, one `on_reply`): 27 us a reply 100 entries behind, **1.4 ms 1,000 behind,
+7.1 ms 5,000 behind**, against 6 to 14 us for a caught-up holder's. A counted test (`live_fold_cost`, allocator calls per
+thread) read 21 allocations 16 behind and 1,035 at 1,024 behind; the fix (`Shipper::fold_reply` naming what the holder
+lacks and building nothing) made them equal.
+
+**The flow A/B, diag-live-durability-76** (diag-70's holder stopped mid-install for 20 s, resumed under the write
+stream; main 1c49c33f against the fix, x86 two legs a side, arm one, 12 runs each): never caught up in 50 s, x86, main 2
+of 24, fix 1 of 24; arm 1 of 12 each. Median catch-up x86 main 4.77 and 2.65 s, fix 3.09 and 3.76 s. **Not separating**:
+in the slow runs of both arms the owner's writes fell to 90 to 400 a second and the holder moved at about that rate.
+
+**The neighbour A/B, diag-live-durability-81** (a holder stopped while one volume ran 5,000 or 20,000 entries ahead,
+resumed, a second volume on the same owner shard written through the catch-up; main db9c514e against the fix merged
+with it, both arches, 4 runs a leg, 32 of 32 passed). x86, ranges over the four runs:
+
+| behind | arm | catch-up | neighbour p50 (quiet) | neighbour p99 | neighbour max | owner shard busy |
+|---|---|---|---|---|---|---|
+| 5,000 | main | 0.91-1.01 s | 386-465 us (387-413) | 4.2-5.9 ms | 0.51-0.56 s | ~100% |
+| 5,000 | fix | 0.73-0.95 s | 178-288 us (169-179) | 3.9-6.6 ms | 0.27-0.46 s | ~100% |
+| 20,000 | main | 2.64-3.10 s | 370-445 us (408-420) | 2.9-6.2 ms | 0.35-1.57 s | ~100% |
+| 20,000 | fix | 2.85-3.24 s | 389-490 us (377-401) | 2.9-8.4 ms | 1.39-1.72 s | ~100% |
+
+Arm is the same shape (20,000 behind: main 1.50-1.90 s, max 0.83-1.17 s; fix 2.10-2.40 s, max 1.15-1.29 s; the two arms
+ran on different runners, whose quiet p50 differs 147 to 358 us, so arm's main-faster reading is the runners, not the
+fix). **Not separating.** In every run of both arms the holder
+took 2 to 4 installs beside its entries (36,000 to 46,000 messages at 20,000 behind), so the clone's path carried only
+part of the backlog; and the owner's volume shard ran at about 100% of a CPU for the whole catch-up (689 to 780 ticks over
+2.7 to 3.1 s, x86 main, 20,000 behind), the other shard and threads near zero, in both arms.
+
+**Verdict.** The fold fix is right in kind (a reply's cost no longer follows the backlog) but moves nothing measured at
+the flow level: rejected, unlanded. What is measured instead, on main: one resumed holder's catch-up saturates its
+owner shard for the catch-up's length, and a neighbour volume's worst write rises to as much as 1.57 s (x86) and 1.17 s
+(arm) at 20,000 behind
+(GAPS, the resumed holder's catch-up).
+
