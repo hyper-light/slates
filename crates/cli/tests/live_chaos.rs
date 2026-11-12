@@ -1623,12 +1623,19 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_settled_generation")
             || line.starts_with("fleet_neighbourhood_generation")
             || line.starts_with("fleet_takeovers_pending")
+            || line.starts_with("fleet_takeover_lost")
             || line.starts_with("fleet_held_records")
             || line.starts_with("fleet_configuration_version")
             || line.contains("anchor")
             || line.starts_with("fleet_host")
             || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
+            // Whether a member behind the council's configuration fetched it, and from which voters (diag-35 runs 5
+            // and 8: a stale holder resumed at version 7 against 23, with nothing here to say whether it asked).
+            || line.starts_with("fleet_council_")
+            || line.contains("fleet.learner.")
+            || line.contains("fleet.council.")
+            || line.contains("consensus")
         })
         .collect();
       format!(

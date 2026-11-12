@@ -200,7 +200,12 @@ neighbourhood were fixed at: they differ while its records are being moved onto 
 `fleet_retirement: host=… version=… survivors=[…] confirmed=[…] unconfirmed=[…]` line per retirement the
 council still keeps (the retired member, the version that retired it, the members its objects' successors are
 ranked among, those that have confirmed their share, and the takeovers it carried unconfirmed — a retirement
-whose survivors have not all confirmed is a takeover still running); then the two consensus groups as this
+whose survivors have not all confirmed is a takeover still running), and one `fleet_takeover_lost: departed=…
+object=… owner=… retired_at=… settled_generation=… configuration_version=… needed=… current=[…] retired=[…]
+departed_hosts=[…]` line per takeover this node runs that judged an object lost (`fleet.takeover.lost`): the last
+such object, the recovery owner whose settled cohort fell short, the versions that retired it and fixed that
+cohort, the version judged under, the cohort's recovery quorum, and its hosts as members, as retirements kept, and
+as neither; then the two consensus groups as this
 node drives them — `fleet_council_leads` (whether
 this node is the regional configuration council's elected leader), `fleet_council_base_periods` and
 `fleet_council_span_periods` (the election timeout it derived, in coordinator periods: base

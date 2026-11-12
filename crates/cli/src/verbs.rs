@@ -2519,6 +2519,21 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
       ids(&retirement.unconfirmed)
     ));
   }
+  for lost in &report.lost {
+    let object: String = lost.object.iter().map(|b| format!("{b:02x}")).collect();
+    out.push_str(&format!(
+      "fleet_takeover_lost: departed={} object={object} owner={} retired_at={} settled_generation={} configuration_version={} needed={} current=[{}] retired=[{}] departed_hosts=[{}]\n",
+      lost.departed,
+      lost.owner,
+      lost.retired_at,
+      lost.settled_generation,
+      lost.configuration_version,
+      lost.needed,
+      ids(&lost.current),
+      ids(&lost.retired),
+      ids(&lost.departed_hosts)
+    ));
+  }
   out
 }
 

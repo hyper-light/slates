@@ -142,6 +142,10 @@ pub struct SealJob {
   pub snapshot: SnapshotId,
   /// The head sequence the seal places for (the snapshot's epoch).
   pub sequence: u64,
+  /// The sequence the content is put at: `sequence`, or the next one for a heal that republishes the head. A holder
+  /// whose newest head is at `sequence` and does not name it refuses a put there (`content_retention::admits`), and
+  /// admits one ahead of its records, which it keeps until the republished head at that sequence names it.
+  pub put_sequence: u64,
   /// The walk in progress, until the archive is complete.
   pub archiver: Option<SnapshotArchiver>,
   /// The complete archive, kept until its content places (then dropped — the volume holds the bytes).
@@ -165,6 +169,10 @@ pub struct SealJob {
   /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
   /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
   pub healing: bool,
+  /// For a healing job that replaces a holder the shipped head names that is no longer a member: once its placement is
+  /// recorded the head is republished at `put_sequence` naming the new set, since a holder never takes a new value at a
+  /// position it holds (§4.10 "the healer"; 2026-11-09). False for every other job.
+  pub republish: bool,
   /// For a mirror shipment (`crate::mirror`): the mirror holders of its content that acknowledged its head and
   /// catalog records. Placed in the mirror once `f + 1` hold both. Empty for a home seal.
   pub records_acked: Vec<HostId>,

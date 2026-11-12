@@ -375,7 +375,12 @@
 > stale one). Now `W = max(n − f, f)` of `n` holders (raft's review: `n − f` alone answered a write on the owner and one
 > holder at `f = 2` with three holders, two copies that two failures lose), never durable on fewer than `f`.
 > `a_write_is_durable_only_where_every_takeover_quorum_meets_it` was red on both earlier counts; the model, naming
-> `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes.
+> `2f + 1` and `1..2f − 1` sets and taking owners over inside each transition window, passes. The interim count of
+> 6dd512b4 ("never durable at `n <= f`") also had a liveness hole the floor closes: a three-node fleet's successor ships
+> to one holder (`n = f = 1`), so none of its writes became durable, and `a_superseded_owner_resumed_after_its_takeover_is_fenced`
+> timed out 3 of 3 on raft-chaos-1 at 43bb3a27, which carries it (live-durability's bisect, CI diag-live-durability-33);
+> on trees carrying the floor (d263229f) it passes: 2 of 2 each in CI diag-raft-chaos-sup-red-35 and -green-36, and 3 of 3
+> in diag-raft-chaos-final-37-superseded (live-durability's straggler-3, 8b0f0341).
 >
 > **Open (live-fixes): an ex-holder keeps its live copy until the volume's tombstone.** A holder the joint transition
 > drops keeps its copy at an old fence (memory, not safety: no phase one counts it, and with `n − f` no owner commits
@@ -9323,6 +9328,79 @@ new process. In simulation the session ended one round trip after its first pack
   - Tests, failing first: `a_refused_admission_leaves_the_pool_to_the_other_shards`,
     `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
   - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
+
+### 2026-11-08: a mirror holder that loses its copy is never repaired (open, AC-8.15)
+
+- **Found** reading the mirror path while fixing the healer (live-fixes, 2026-11-08; not run). A snapshot's mirror
+  shipment is due only while its mirror placement is unrecorded (`fleet::mirror_due`: `PlacementState::Placed { mirror:
+  None, .. }`). Once recorded, nothing re-checks the mirror holders: there is no mirror healer. A mirror holder that
+  loses its copy (a RAM-only holder's restart) is never re-shipped to, and the mirror's head record keeps naming it.
+- **Impact.** A region's only protection against its own loss is its mirror. Promotion after a lost home region reads the
+  mirror's records (`mirror::successor_of` ranks the holders the mirror head names), so it can name a holder that holds
+  nothing, and the promoted region cannot serve the content although the mirror placement was recorded whole.
+- **What it needs** (ruling, 2026-11-08): a mirror healer on the coordinator's period that re-checks the mirror holders
+  against the recorded mirror placement, re-ships what was lost, and republishes the mirror head at the next sequence,
+  since a mirror holder keeps the first value at a position (`MirrorRecords::accept`). Red test: a mirror holder loses
+  its copy, the home region is lost, and the promoted mirror serves the content. Owner: live-fixes, after the home
+  healer fix and its siblings.
+
+### 2026-11-09: a fresh member that joins against a stale configuration holds no session for a whole fleet wait (open)
+
+- **Found** by raft-chaos's confirmation of learner-3 (diag-raft-chaos-ab-66, 00a2589f), under diag-60's one-CPU load.
+  The test `a_member_that_never_held_the_log_never_stands_in_for_its_holder` failed at `live_chaos.rs:410`, "the fleet
+  formed, or kept changing, within each fleet wait": 1 of 48 runs, 6 runners × 8, load 15 to 23.
+- **What the stuck node showed.** b is the fresh member that replaced a killed voter. Through the whole second
+  formation wait, t = 0 to 50.3 s:
+  - `fleet_peers_in_contact` 0 and `fleet_peers_unmeshed` 0, though it counted members 5 and `fleet_peers_probed` 4.
+    The other four nodes were each in contact with 4.
+  - `fleet_configuration_version` 0. Its council stood at the fetched v8, whose voters included the replaced member.
+  - `fleet_learner`: `asked` frozen at 3, and `last_asked_ago_ms` climbing from 179 to 50,648.
+  - `fleet.learner.no_session` climbing from 1 to 99, about 2 a second.
+  - The rest of the fleet reached v15, with b among its members, by t = 11.3 s.
+- **Both arms.**
+  - Before, main 84d1f59a (learner-3's base): diag-live-fixes-70, the same harness, test, load and count. 40 of 48
+    passed: 6 failed at :457 (the learner stall that learner-3 fixes) and 2 at :410.
+  - After, learner-3: 47 of 48 passed, with 1 at :410 (the run above) and none at :457.
+  - The base's two :410 failures show the same signature. In each, one node ends the wait with in contact 0 and
+    configuration version 0, as b did (runner 1 pair 8 and runner 3 pair 8, both node c). In each, another node also
+    sits at configuration v8 with only the bootstrap voter, in contact 3 of 4: that is the learner stall.
+  - So the stall is older than learner-3: 2 of 48 on the base, 1 of 48 with it.
+- **Hypothesis (unverified, read from the code and the counters, never run).** b holds a configuration that predates its
+  own admission. Its probe plane installs none (version 0), its contact rule keeps no peer, so it holds no session.
+  With no session it cannot fetch the configuration that includes it, and the cycle never breaks.
+  - A gap in the reading: learner-3's contact rule keeps a peer that the fetched voters name, and two of b's fetched
+    voters were alive and meshed elsewhere. So either b's membership held its peers not alive, or the rule ran on
+    something other than v8.
+  - raft-chaos's diag-raft-chaos-68 adds a status line per peer with its contact reason and b's membership belief,
+    which will decide between these.
+- **Owner:** live-fixes.
+
+### 2026-11-09: a heal left the head naming a holder that had left the fleet (fixed)
+
+- **Found** fixing the healer (live-fixes). On a five-node `f = 1` fleet, after a holder the head named was stopped and
+  retired, both survivors that held the head still named it 300 periods later, and nothing was republished: 453 s for a
+  plain volume, 456 s for a live one, on a Mac at load 30 to 72.
+- **Cause:** a head is never rewritten at its sequence, so the heal's re-recorded placement never reached it. Two more
+  faults surfaced in the fix's own measured runs:
+  - A replacement put at the head's own sequence is refused by a cohort member that holds that head and is not named
+    in it (`content_retention::admits`).
+  - A heal had no bound, so a single refused replace stayed open, and the healer skipped the volume for good.
+- **Fixed:**
+  - A heal that finds a named holder gone puts its content on the current cohort at the next sequence. That put is
+    ahead of every holder's records, so the door admits it.
+  - Once recorded, the head is republished at exactly that sequence.
+  - Every heal ends at the membership horizon, counted `fleet.heal.unfinished`, and is taken up again on a later step.
+  - Tests, each red on the old code: `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+    `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left`, and
+    `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`. The last is also red with only the
+    bound removed (`fleet.heal.unfinished` 0).
+  - Bug doc: `docs/bugs/2026-11-09-a-heal-left-the-head-naming-a-holder-that-had-left.md`.
+- **Reopened:** the cause of `a_holder_that_lost_placed_content_is_repaired_by_the_healer`'s failure under the suite's
+  load. The account given on 2026-11-08 (a heal offering the first-ranked candidate first) was never measured and is
+  wrong: on three nodes the door refuses that candidate's put, and its test passed 3 of 3 on the old code
+  (diag-live-fixes-66).
+- **Open siblings, reported, not changed:** a takeover's re-commit and a neighbourhood change re-place content under a
+  new holder set, and are owed a test of the same shape. The mirror's own healer is the entry above.
 
 ### 2026-11-08: a learner lost the only voters it knew and stopped learning configurations (fixed)
 
