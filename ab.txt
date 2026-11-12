@@ -202,3 +202,11 @@ slates-server: shard 2 initialized in 648 µs, 0 µs of its CPU, in 6 slices of 
 slates-winfsp: reply spin window = 6600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates-winfsp diag-52: requests taken by kind 1:210016 3:210008 4:210008 5:21000 6:21000 8:105001 11:21000 12:21004 19:21000; confirmations taken 210008, the worker waited for 13165
 ## run 1 of 1 done, 2026-11-12T04:57:34Z
+remote: 
+remote: Create a pull request for 'diag-results/winfsp-overlap-43148071819-probe-arm' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-results/winfsp-overlap-43148071819-probe-arm        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      b7a215151870503369ac9a5e94a4fdcf8fc0238b -> diag-results/winfsp-overlap-43148071819-probe-arm
+# teardown: fsb-1931-1-a's drive '' was gone before its unmount
+# teardown: fsb-1931-1-b's drive '' was gone before its unmount
