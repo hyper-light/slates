@@ -13938,6 +13938,12 @@ rule's reader), `crates/server` (`fuse.rs`: `fuse.writeback_conflicts` and `fuse
 rule), `crates/cli` (`tests/cli.rs`: the dirty-page, truncation and unsynced-history tests, and A-152's release test for
 U10's rule; `tests/guest_dax.rs`: the oracle), the bug record
 `docs/bugs/2026-11-07-a-fuse-write-back-was-applied-around-its-stale-bytes.md`.
+- **A third count (2026-11-09).** `fuse.writebacks_applied` counts write-backs applied with no stale byte at all. The
+  dirty-page test reads it to prove its precondition, that the store's page was still dirty when the other path wrote.
+  On kernel 7.3 a process spawn while a shared-map page is dirty writes it back at once, and that write-back is fresh,
+  so it is applied and the rule is never exercised. Applied in the same change to: GAPS, `crates/bridge-fuse`
+  (`channel.rs`), `crates/server` (`fuse.rs`), `crates/cli` (`tests/cli.rs`), the bug record
+  `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 - **The decision.** Ada, 2026-11-07, asked whether the host FUSE mount should go on applying a stale write-back outside
   its stale bytes (A-139, A-140) or refuse it as NFS does (A-192): "Refuse, like NFS."
 - **Changes §4.6.** A `FUSE_WRITE_CACHE` write-back is applied whole or refused whole. One whose stale bytes (another
@@ -15480,6 +15486,51 @@ Applied in the same change to:
 - **Owed.**
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
+
+### A-274 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp`:
+  - `inflight/capture.rs`: a third saved-response state, SETTLED, which the acknowledgement writes; `begin` leaves the
+    saved response and refuses a published one; `Capture::saved_open` reads a published or settled response whatever the
+    phase. A settled response is never replayed.
+  - `inflight/settle.rs`: `Edges::post_confirm` after the send and `Edges::confirmed` before the next save, in place of
+    the confirmation's round; `saved_open` reads the journal whatever its phase.
+  - `host.rs`: `post_confirm` (the Confirm put on the mount's channel, the mount's task woken, no wait) and
+    `confirmed_open`; `dispatcher.rs` holds the one outstanding answer.
+  - `opens.rs`: the docs of `confirmed` and `settle_pending`.
+- The tests: `an_opens_confirmation_does_not_hold_the_receive_worker` (first: 3 of 3 opens held the worker), and the
+  crash oracle with a security query answered without the shard after each Create and the shard's confirmations both
+  prompt and lagging to the protocol's latest moment.
+- **What was there.** After sending a successful Create's response the worker waited for the shard to confirm the open:
+  a round on every open, 9.9 µs at the mean on arm64 quiet and 139.6 µs loaded (diag-winfsp-overlap-50, run
+  42506936806). The confirmation had to be applied before the acknowledgement, because the next receive cleared the
+  saved response, and recovery keeps an unconfirmed open only on the journal's word.
+- **The rule.**
+  - A pending open always has its successful response in the journal, published or settled.
+  - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
+    confirmation ahead of the worker's next request.
+  - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
+    it, and a request answered without the shard can come right after a Create: the host registers no GetSecurity
+    callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without
+    calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and QueryStreamInformation likewise
+    (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
+    replaces.
+  - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
+    posted confirmation's answer, waiting only if the shard has not yet applied it (a request answered without the shard,
+    such as a security query, can come next).
+  - Recovery reads a settled response only for the open it may have issued, never to replay it: its request was
+    answered.
+- **Checked.** The crash oracle, at every store and torn inside each, twice over. Put in by hand, each of these is
+  caught: no check before the save, recovery that ignores a settled response, and `begin` clearing the saved response.
+- **Measured.** `diag-winfsp-overlap-51` (run 42675148419), main against a control (main built again) against the cut,
+  ten runs on each Windows runner, quiet and loaded (BENCHMARKS, "Cut (c)"). arm64 loaded is faster within every run on
+  stat, write, rename and unlink: p50 −6.3, −23.8, −12.8 and −16.0 µs (10 of 10 each), p99 −1,750, −1,522, −1,395 and
+  −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
+  moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
+  about what the round did when the shard is idle.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
@@ -20170,10 +20221,11 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     owner last (`Acceptor::to_persisted`, `Acceptor::from_persisted`). It round-trips canonically. Its hostile-input
     test refuses, each as a typed refusal: a cut at every byte, lengths of `u32::MAX`, a foreign option tag, and a stray
     byte. The layout without the field is refused as truncated, never read as "moved from none".
-  - **The image (owed, after raft-7).** conformance-14 (A-262) and then raft-7 (A-270) land first, each with its own
-    image and delta versions. Then the held image's register piece is this encoding, at the image and delta versions
-    after raft-7's, and an image or delta of another version is refused typed (`VfsError::RecoveryVersion`). A missing field is never read as none: that would be the compatibility shim §2.7
-    forbids. Until then a warm restart forgets an earlier move, as main does today.
+  - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
+    an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
+    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7), and raft-7 (A-270) takes the
+    numbers after. An image or delta of another version is refused by its version. A missing field is never read as
+    none: that would be the compatibility shim §2.7 forbids.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.

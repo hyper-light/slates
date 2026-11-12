@@ -4725,7 +4725,9 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       discovery_wait = HEARTBEAT_NS;
       discovery_due = 0;
     }
-    if !absent && futures::now_ns() >= discovery_due {
+    let discovery_held =
+      state::with_state(|s| s.injected_discovery_hold == Some(peer_host)).unwrap_or(false);
+    if !absent && !discovery_held && futures::now_ns() >= discovery_due {
       let before = discovery_cursor.settled();
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
       discovery_wait = next_discovery_wait(before, discovery_cursor.settled(), discovery_wait);
@@ -4937,6 +4939,9 @@ async fn refresh_discovery(
         }
       } else {
         state.record_sessions.remove(&peer_host);
+        state
+          .dead_session_dropped_at
+          .insert(peer_host, futures::now_ns());
       }
     });
   }
@@ -7920,6 +7925,12 @@ pub(crate) fn take_sessions(
   .unwrap_or_default()
 }
 
+/// Format: nanoseconds per millisecond, for the link's log lines.
+const NS_PER_MS: u64 = 1_000_000;
+/// The status count of a record session dropped on its return because its peer was silent past the rule
+/// ([`return_sessions`]), for the link to dial again.
+const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
@@ -7928,6 +7939,16 @@ pub(crate) fn take_sessions(
 /// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
 /// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
 /// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
+///
+/// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one
+/// judgement of a dead session (`Endpoint::peer_silent_past`, fleet-transport.md §5), an ack-eliciting packet
+/// unanswered for a liveness budget or the session's persistent-congestion duration, whichever is longer. It covers a
+/// reset lost and a peer that is silent. Judged at the one place every borrower hands the session back, and every
+/// borrower's hold is bounded by a derived budget, so a silent session is judged within its window plus one hold: with
+/// a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward lane's
+/// own check never got a turn (2026-11-09). A starved node can judge a live peer dead: that costs a session replaced,
+/// and the forwards on it are answered unanswered and sent again under their own ids, never run twice. A reset is
+/// checked first, so it is counted as one.
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
@@ -7938,6 +7959,25 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
+        }
+        Some(link)
+          if link.endpoint.is_none()
+            && link.borrowed == returned
+            && endpoint.peer_silent_past(crate::daemon::LIVENESS_BUDGET_NS) =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_SESSION_JUDGED_DEAD, 1);
+          // How far past the window the judgment came, so the margin over the duration is on record, not just a count.
+          slates_machine::log_line!(
+            "slates-server: record session to {host:?} dropped silent after {} ms, its window {} ms",
+            endpoint.peer_silence_ns().unwrap_or(0) / NS_PER_MS,
+            endpoint
+              .persistent_congestion_duration()
+              .max(crate::daemon::LIVENESS_BUDGET_NS)
+              / NS_PER_MS
+          );
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
