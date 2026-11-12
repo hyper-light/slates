@@ -17,6 +17,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::{Measurement, bytes_per_second, measure};
+use crate::error::MachineError;
 use crate::facts::{CoreFacts, Facts, PageFacts};
 use crate::stats::Xorshift;
 
@@ -133,35 +134,51 @@ pub fn syscall(budget: Duration) -> Measurement {
   measure(platform::null_syscall, budget)
 }
 
-/// Measures fault costs per page class.
-pub fn faults(page: &PageFacts, budget: Duration) -> FaultCosts {
+/// Measures fault costs per page class: [`faults_from`] over this machine's own mappings.
+pub fn faults(page: &PageFacts, budget: Duration) -> Result<FaultCosts, MachineError> {
   let region = page.base.saturating_mul(FAULT_REGION_PAGES);
+  faults_from(
+    budget,
+    |touch, within| {
+      measure(
+        || platform::map_touch_unmap(region, page.base, touch),
+        within,
+      )
+    },
+    |within| platform::populated(region, page.base, within),
+    |within| platform::huge(page, within),
+  )
+}
+
+/// The fault costs from the measurements of a region of [`FAULT_REGION_PAGES`] base pages: `region` measures mapping
+/// and unmapping it, touched as [`Touch`] says, within a budget; `populated` measures it mapped pre-populated, where the
+/// OS can; `huge` measures a transparent-huge-page region and says how many base pages it spans. The per-page cost is
+/// what touching adds to the mapping alone, per page.
+pub(crate) fn faults_from(
+  budget: Duration,
+  mut region: impl FnMut(Touch, Duration) -> Measurement,
+  populated: impl FnOnce(Duration) -> Option<Measurement>,
+  huge: impl FnOnce(Duration) -> Option<(Measurement, u64)>,
+) -> Result<FaultCosts, MachineError> {
   // Shape: the three sub-probes (map/unmap baseline, base pages, populated pages) share the budget.
   let per_probe = budget.checked_div(3).unwrap_or_default();
-  let map_unmap_region = measure(
-    || platform::map_touch_unmap(region, page.base, Touch::None),
-    per_probe,
-  );
-  let base_region = measure(
-    || platform::map_touch_unmap(region, page.base, Touch::Every),
-    per_probe,
-  );
+  let map_unmap_region = region(Touch::None, per_probe);
+  let base_region = region(Touch::Every, per_probe);
   let base_ns = base_region
     .median_ns()
     .saturating_sub(map_unmap_region.median_ns())
     / FAULT_REGION_PAGES;
-  let populated_ns = platform::populated(region, page.base, per_probe)
+  let populated_ns = populated(per_probe)
     .map(|m| m.median_ns().saturating_sub(map_unmap_region.median_ns()) / FAULT_REGION_PAGES);
-  let huge_ns =
-    platform::huge(page, per_probe).map(|(m, pages)| m.median_ns().checked_div(pages).unwrap_or(0));
-  FaultCosts {
+  let huge_ns = huge(per_probe).map(|(m, pages)| m.median_ns().checked_div(pages).unwrap_or(0));
+  Ok(FaultCosts {
     base_ns,
     base_region,
     map_unmap_region,
     populated_ns,
     huge_ns,
     pages_per_region: FAULT_REGION_PAGES,
-  }
+  })
 }
 
 /// How a region is touched after mapping.
@@ -1006,10 +1023,72 @@ mod tests {
     assert!(m.interval.lower <= m.interval.upper);
   }
 
+  /// A region measurement whose median is `median_ns`, as a converged probe would report it.
+  fn region_measured_at(median_ns: u64) -> Measurement {
+    Measurement {
+      interval: crate::stats::Interval {
+        median: median_ns,
+        lower: median_ns,
+        upper: median_ns,
+      },
+      p99_ns: median_ns,
+      min_ns: median_ns,
+      samples: 1,
+      batch: 1,
+      quick: false,
+    }
+  }
+
+  /// A loaded machine measures the two regions apart, and the untouched one can come out as slow as the touched one
+  /// (1 of 10 full suite runs on fedora-2 at load 21-34, `faults.base_ns` 0; A-223's gate). Do: hand the fault probe a
+  /// touched region no slower than the untouched one. Expect the probe refused `MeasurementTimeout`, as a probe that
+  /// could not measure within its bound is, so the profile's patient re-measurement takes it again; never a fault cost
+  /// of zero, which every bound derived from it would take as a fault that costs nothing.
+  #[test]
+  fn a_touched_region_no_slower_than_the_untouched_one_is_refused_never_a_zero_fault() {
+    for (untouched, touched) in [(40_000, 40_000), (40_000, 40_100), (40_000, 39_000)] {
+      let measured = faults_from(
+        short(),
+        |touch, _| match touch {
+          Touch::None => region_measured_at(untouched),
+          Touch::Every => region_measured_at(touched),
+        },
+        |_| None,
+        |_| None,
+      );
+      assert_eq!(
+        measured.map(|costs| costs.base_ns),
+        Err(MachineError::MeasurementTimeout { probe: "faults" }),
+        "untouched {untouched} ns, touched {touched} ns"
+      );
+    }
+  }
+
+  /// The pre-populated region is judged by the same rule: one no slower than the untouched region measured nothing, and
+  /// the profile says it was not measured rather than a populated page that costs nothing. A touched region slower than
+  /// the untouched one is the per-page difference.
+  #[test]
+  fn a_populated_region_no_slower_than_the_untouched_one_is_unmeasured() {
+    let pages = FAULT_REGION_PAGES;
+    let measured = faults_from(
+      short(),
+      |touch, _| match touch {
+        Touch::None => region_measured_at(40_000),
+        Touch::Every => region_measured_at(40_000 + 300 * pages),
+      },
+      |_| Some(region_measured_at(40_000)),
+      |_| None,
+    );
+    assert_eq!(
+      measured.map(|costs| (costs.base_ns, costs.populated_ns)),
+      Ok((300, None))
+    );
+  }
+
   #[test]
   fn faults_cost_more_than_map_and_unmap_alone() {
     let facts = Facts::query();
-    let f = faults(&facts.page, short());
+    let f = faults(&facts.page, short()).expect("the fault probe measures");
     assert!(
       f.base_region.median_ns() > f.map_unmap_region.median_ns(),
       "{f:?}"

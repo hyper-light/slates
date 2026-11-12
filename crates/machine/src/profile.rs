@@ -150,7 +150,7 @@ impl MachineProfile {
     let budget = options.budget_per_probe;
     let timer_overhead_ns = timer_overhead_ns();
     let syscall = probes::syscall(budget);
-    let faults = probes::faults(&facts.page, budget);
+    let faults = probes::faults(&facts.page, budget)?;
     let wake = wake::wake(budget, &Placement::of(&facts.cores, facts.cpu_budget))?;
     let (core_rtt, pinning) = if options.core_matrix {
       probes::core_matrix(&facts.cores, budget)
