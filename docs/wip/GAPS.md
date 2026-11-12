@@ -14547,6 +14547,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
         and the failing run's daemon reported its shard starved 1.6 s (`a heartbeat came 1626 ms after the last`).
         Arm B's one stall of the stale-handle test's attackers (0 attempts in its 2 s window, 1 of 14 runs; arm A 0 of
         13) has the same look, in a test where arm B does nothing but look its tracker up.
+        **Not reproduced on 1c49c33f (fs-server, 2026-11-11), closed by 4ae3f84b:** since 2026-11-06 a forwarded call
+        waits for its owner in the owner's own time (`xshard::task_in_shard_time`, A-65's rule), so a starved owner's
+        reply is heard and only a wedged one's is given up. 20 of 20 runs of
+        `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` passed beside 36 spinners in a 2-CPU unit
+        at load 17–201 on adacachy (at the recorded 1 in 5, twenty clean runs come by chance about 1% of the time).
       - Main's, found sweeping for the connection end's siblings: a READDIR of the host root asks every shard for its
         entries (`nfs.rs` `gather_all_entries`), though the capability it presents authorizes one volume, whose owner its
         id names (D-14); a client holding a capability can make every shard answer as often as it likes. **Fixed
