@@ -4,7 +4,7 @@
 # Red-1 put two spinners a CPU in one weight-100 cgroup: the probe kept 1/101 of the machine, calls took ~225 ms and
 # none stalled in 20 runs; the fixtures' starvation (A-228) came from many default-weight units. Red-2 starved the
 # probe from its start, and its machine profile was refused before any daemon existed; the probe now starts unstarved
-# and is moved once its daemon answers. Each run prints every call that failed
+# and is moved once its daemon answers. Red-3 moved timeout's pid instead of the probe's, so nothing was starved. Each run prints every call that failed
 # Stalled and whether the daemon's own watchdog withheld a beat across it.
 set +e
 R=../results.txt
@@ -39,9 +39,15 @@ for run in $(seq 10); do
   log=../probe-$run.log
   timeout 900 "$bin" --nocapture --test-threads=1 > $log 2>&1 &
   probe=$!
+  # The pid the probe names itself: `$!` is timeout's, and moving it left the probe where it was (red-3, 0 ms in the
+  # starved cgroup, 10 of 10 runs).
   for wait in $(seq 600); do grep -q A232-READY $log && break; kill -0 $probe 2>/dev/null || break; sleep 1; done
-  echo $probe | sudo tee $cg/a232-starved/cgroup.procs > /dev/null
-  echo "probe $probe moved after ${wait} s: $(grep -h '' /proc/$probe/cgroup 2>/dev/null)" >> $log
+  test_pid=$(sed -n 's/^A232-READY pid \([0-9]*\).*/\1/p' $log | head -1)
+  echo $test_pid | sudo tee $cg/a232-starved/cgroup.procs > /dev/null
+  echo "probe $test_pid moved after ${wait} s: $(grep -h '' /proc/$test_pid/cgroup 2>/dev/null)" | tee -a $R
+  # Back out once it has said what it saw, so its daemon's teardown is not starved too.
+  for wait in $(seq 900); do grep -q A232-SUMMARY $log && break; kill -0 $probe 2>/dev/null || break; sleep 1; done
+  echo $test_pid | sudo tee $cg/cgroup.procs > /dev/null 2>&1
   wait $probe
   code=$?
   out=$(cat $log)
@@ -49,7 +55,7 @@ for run in $(seq 10); do
   live=$(echo "$out" | grep -c "LIVE: no beat withheld")
   if [ "$live" -gt 0 ]; then red=$((red+1)); elif [ $code -eq 0 ]; then green=$((green+1)); else broken=$((broken+1)); fi
   echo "== run $run exit $code, stalled-live calls $live, probe CPU $(( (used_after - used_before) / 1000 )) ms, load $(cut -d' ' -f1 /proc/loadavg)" | tee -a $R
-  echo "$out" | grep -E '^probe [0-9]+ moved|A232-|slates daemon: (shard|the watchdog)|panicked|test result' | cut -c1-400 | tee -a $R
+  echo "$out" | grep -E 'A232-|slates daemon: (shard|the watchdog)|panicked|test result' | cut -c1-400 | tee -a $R
 done
 echo "== a232_red: red (a live daemon's call failed Stalled) $red, green $green, other failure $broken, of 10" | tee -a $R
 kill "${pids[@]}" 2>/dev/null
