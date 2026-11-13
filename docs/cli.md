@@ -10,7 +10,11 @@ locked backing, and bounded/dynamic claims do not yet provide the design's host-
 guarantee. A daemon restart under the same anchor keeps acknowledged content and its snapshots
 (`acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte`); the anchor's own death
 loses RAM by design.
-`attach` returns an attachment record without creating a mounted path. `exec` is Linux-only
+`attach` returns an attachment record without creating a mounted path. A CLI attachment outlives the `slates attach`
+that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). It lasts one
+term, the daemon's failover SLO (10 s unless `slates anchor` is given another), and every verb that names it renews the
+term. It ends at the term's lapse with the write lease it held. A verb that names it after is refused
+`AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
 There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)
 and the Python and Node SDKs are implemented (§4.12). On macOS a volume can be mounted for real
@@ -84,9 +88,12 @@ account may issue bootstrap; an enrolled consumer or forwarded fleet request can
 the request to the current daemon member id, so automatic retries cannot bootstrap a replacement.
 
 Startup alone serves discovery and status but refuses writes until initialized and admitted.
-Every daemon restart currently loses its Raft state and uses a fresh member id. It joins through a
-surviving voting quorum. A standalone restart loses the sole quorum, requiring explicit new-group
-creation; that does not restore a lost consensus history. See [AUD-07](bugs/2026-09-14-raft-voter-state-loss.md).
+A daemon restarted under its anchor keeps its Raft state and its member id: the anchor holds both groups
+and the voter identity, retained before any consensus reply escapes, so it rejoins without bootstrap.
+A start that lost the anchor's RAM (the anchor itself died, or the pod was replaced) has no Raft state
+and uses a fresh member id. It joins through a surviving voting quorum. A standalone node that lost
+its anchor loses the sole quorum, requiring explicit new-group creation; that does not restore a lost
+consensus history. See [AUD-07](bugs/2026-09-14-raft-voter-state-loss.md) and §4.8 "Consensus lifetime".
 Never add bootstrap to a pod's recurring startup command or readiness probe.
 
 ## Deploying a fleet
@@ -176,8 +183,10 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and
-`fleet_peers_probed` (peers with a formed session; the mesh is up when this is the member count
-less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
+`fleet_peers_probed` (peers with a formed probe session), `fleet_peers_in_contact` (the members it keeps direct
+contact with: its holders and the voters, and every member while it votes) and `fleet_peers_unmeshed` (those of them
+not probed yet: its mesh is up at 0; two members that neither hold for each other nor vote keep no contact, so
+`fleet_peers_probed` need not reach the member count less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
 `fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
 finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
 it has installed; each admission, retirement, settlement and takeover confirmation advances it); then
@@ -296,12 +305,16 @@ slates profile [--quick] [--json]
 slates mcp [--instance NAME] [--http PORT]
 ```
 
+`slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
+is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
+It needs `admin` on the volume, as `share` does.
+
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.
 
 Output is plain and stable: one `key: value` per line (`create`, `stat`, `status`, `attach`,
 `snapshot`, `clone`, `pin`), one record per line (`list`: id, name, `referenced=`, `unique=`,
-`overlay=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
+`overlay=`, `live_shipped=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
 return nothing, and the raw bytes for `base read`.
 
 `--json` emits a machine-readable form of every verb — the read and query verbs (`status`,

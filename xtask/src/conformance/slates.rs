@@ -116,6 +116,12 @@ impl Reply {
 }
 
 impl SlatesBinary {
+  /// The binary at `path`, built elsewhere (a test given `SLATES_TEST_BINARY`).
+  #[cfg(test)]
+  pub(crate) fn at(path: PathBuf) -> SlatesBinary {
+    SlatesBinary { path }
+  }
+
   /// Builds `slates-cli` and locates the executable cargo reports.
   pub(crate) fn build(root: &Path) -> Result<SlatesBinary, Failure> {
     SlatesBinary::build_as(root, false)
@@ -217,6 +223,17 @@ impl Anchor {
     scratch: &Path,
     tracer: Option<&[String]>,
   ) -> Result<Anchor, Failure> {
+    Anchor::start_with(binary, instance, scratch, tracer, &[])
+  }
+
+  /// [`Anchor::start`] with `extra` arguments after the anchor's own (a fleet node's `--fleet PATH --node NAME`).
+  pub(crate) fn start_with(
+    binary: &SlatesBinary,
+    instance: &str,
+    scratch: &Path,
+    tracer: Option<&[String]>,
+    extra: &[String],
+  ) -> Result<Anchor, Failure> {
     let log = scratch.join(format!("anchor-{instance}.log"));
     let mut log_file = open_log(&log)?;
     let (mut drained, stderr) =
@@ -238,6 +255,7 @@ impl Anchor {
         "--shards",
         SHARDS,
       ])
+      .args(extra)
       .current_dir(scratch)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -259,6 +277,12 @@ impl Anchor {
     };
     anchor.wait_ready(binary)?;
     Ok(anchor)
+  }
+
+  /// The anchor's own process id.
+  #[cfg(test)]
+  pub(crate) fn pid(&self) -> u32 {
+    self.child.id()
   }
 
   /// The anchor's log: its stderr and its daemon's, the processes' own standard stream.
@@ -301,6 +325,7 @@ impl Anchor {
   /// The command line this instance's daemon runs under, which names it among every process on the host:
   /// a pid can be reused once the daemon leaves, and the instance is this run's own.
   /// The anchor's command line, as `pkill -f` matches it.
+  #[cfg(unix)]
   fn anchor_command(&self) -> String {
     format!("slates --instance {} anchor", self.instance)
   }
@@ -349,6 +374,30 @@ impl Anchor {
   /// its log for its own violations
   /// (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`). Whether the
   /// daemon left.
+  #[cfg(windows)]
+  fn end(&mut self) -> bool {
+    // On Windows the anchor holds its daemon in a job that ends with it (`crates/anchor`), so the anchor's kill takes
+    // the daemon along; its departure shows as the end of the log's pipe, which the drain reads to the end then.
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+    let started = Instant::now();
+    while self
+      .drain
+      .as_ref()
+      .is_some_and(|drain| !drain.is_finished())
+    {
+      if started.elapsed() > START_WAIT {
+        return false;
+      }
+      pause();
+    }
+    if let Some(drain) = self.drain.take() {
+      let _ = drain.join();
+    }
+    true
+  }
+
+  #[cfg(unix)]
   fn end(&mut self) -> bool {
     let _ = self.child.kill();
     // Under a root tracer (`sudo strace -u USER`) the child is `sudo`, not ours to signal: the anchor it runs is,
@@ -375,6 +424,7 @@ impl Anchor {
 }
 
 /// Polls until no process runs `command`, for at most [`START_WAIT`]; whether none does.
+#[cfg(unix)]
 fn none_running(command: &str) -> bool {
   let started = Instant::now();
   loop {
@@ -493,6 +543,15 @@ enum MountMethod {
   /// `slates mount --shared` on Linux: the daemon's FUSE mount a container runtime binds; unmade with
   /// `fusermount3 -u -z` (no privilege).
   SharedFuse,
+  /// `slates mount ID E:` on Windows: the daemon's WinFsp drive; unmade with `slates unmount E:`.
+  WinFsp {
+    /// The binary that made it.
+    binary: PathBuf,
+    /// The instance whose daemon serves it.
+    instance: String,
+    /// The drive (`E:`).
+    drive: String,
+  },
 }
 
 /// A live kernel mount: force-unmounted and its directory removed on drop.
@@ -527,13 +586,40 @@ impl Drop for Mount {
           .arg(&self.path)
           .output();
       }
+      MountMethod::WinFsp {
+        ref binary,
+        ref instance,
+        ref drive,
+      } => {
+        let _ = Command::new(binary)
+          .args(["--instance", instance, "unmount", drive])
+          .output();
+        // A drive letter is no directory of the harness's: nothing to remove.
+        return;
+      }
     }
     drop(self.export.take());
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }
 
+/// Whether the drive answers: Windows keeps no mount table a user lists, and a WinFsp drive's root answers a look-up
+/// once it serves (`crates/cli/tests/winfsp.rs`, `wait_ready`).
+#[cfg(windows)]
+fn is_mounted(path: &Path) -> bool {
+  std::fs::metadata(path).is_ok()
+}
+
+/// The first drive letter from `E:` to `Z:` whose root answers nothing, as `crates/cli/tests/winfsp.rs` picks one.
+fn free_drive() -> Result<String, Failure> {
+  ('E'..='Z')
+    .map(|letter| format!("{letter}:"))
+    .find(|drive| std::fs::metadata(format!("{drive}\\")).is_err())
+    .ok_or_else(|| Failure("no drive letter from E: to Z: is free".to_owned()))
+}
+
 /// Whether the mount table lists `path`.
+#[cfg(unix)]
 fn is_mounted(path: &Path) -> bool {
   let listed = stdout_of("mount", &[]);
   listed
@@ -550,17 +636,42 @@ fn fresh_mount_point() -> Result<PathBuf, Failure> {
 }
 
 /// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux, or for the Linux container form
-/// the daemon's shared FUSE mount.
+/// the daemon's shared FUSE mount. With `read_only`, a read attachment under a writable kernel mount, so each change
+/// reaches slates and is answered there: only the Linux NFS export allows that, since every other `--read-only` mount is
+/// read-only at the kernel too, and a suite over it would measure the kernel's refusal, not slates'.
 pub(crate) fn mount_volume(
   run: &Run<'_>,
   binary: &SlatesBinary,
-  instance: &str,
-  id: &str,
-  name: &str,
+  (instance, id, name): (&str, &str, &str),
+  read_only: bool,
 ) -> Result<Mount, Failure> {
-  let point = fresh_mount_point()?;
+  let linux_nfs = run.os == HostOs::Linux && run.transport != Transport::OciLinux;
+  if read_only && !linux_nfs {
+    return Err(Failure(format!(
+      "--read-only runs over the Linux NFS export only: {}'s read-only mount is read-only at the kernel, which would \
+       refuse each change before slates answered it",
+      run.transport.slug()
+    )));
+  }
   let mount = match run.os {
+    // WinFsp mounts at a drive letter (§4.6 "Windows", A-177): no directory is made.
+    HostOs::Windows => {
+      let drive = free_drive()?;
+      binary
+        .run(instance, &["mount", id, &drive])?
+        .expect_ok("slates mount")?;
+      Mount {
+        path: PathBuf::from(format!("{drive}\\")),
+        method: MountMethod::WinFsp {
+          binary: binary.path().to_path_buf(),
+          instance: instance.to_owned(),
+          drive,
+        },
+        export: None,
+      }
+    }
     HostOs::Macos => {
+      let point = fresh_mount_point()?;
       binary
         .run(instance, &["mount", id, &point.display().to_string()])?
         .expect_ok("slates mount")?;
@@ -572,6 +683,7 @@ pub(crate) fn mount_volume(
     }
     // The Linux container form binds the daemon's own shared FUSE mount: no privilege, no adapter.
     HostOs::Linux if run.transport == Transport::OciLinux => {
+      let point = fresh_mount_point()?;
       binary
         .run(
           instance,
@@ -585,6 +697,7 @@ pub(crate) fn mount_volume(
       }
     }
     HostOs::Linux => {
+      let point = fresh_mount_point()?;
       // Own cleanup before invoking the helper: a failed mount must not leave its durable
       // attachment (or its write lease) behind. UMNT may already have detached it on success.
       let mut mount = Mount {
@@ -598,7 +711,7 @@ pub(crate) fn mount_volume(
         id,
         name,
         LINUX_NFS_SERVER,
-        mount_deadlines(),
+        (mount_deadlines(), read_only),
       )?);
       let (kind, options) = if run.transport == Transport::NativeLinuxNfs4 {
         ("nfs4", format!("{LINUX_NFS4_OPTIONS},port={port}"))
@@ -624,7 +737,6 @@ pub(crate) fn mount_volume(
       }
       mount
     }
-    HostOs::Windows => return Err(Failure("the harness has no WinFsp mount step".to_owned())),
   };
   let started = Instant::now();
   while !is_mounted(&mount.path) {
@@ -637,6 +749,22 @@ pub(crate) fn mount_volume(
     pause();
   }
   Ok(mount)
+}
+
+/// Waits until `path`, made through another mount of the same volume, shows on this one: an NFS client caches a
+/// directory's attributes for the mount's `actimeo` (a second here), within [`MOUNT_WAIT`].
+pub(crate) fn visible(path: &Path) -> Result<(), Failure> {
+  let started = Instant::now();
+  while !path.exists() {
+    if started.elapsed() > MOUNT_WAIT {
+      return Err(Failure(format!(
+        "{} made through the setup mount does not show on the read-only mount after {MOUNT_WAIT:?}",
+        path.display()
+      )));
+    }
+    pause();
+  }
+  Ok(())
 }
 
 /// Whether a directory's filesystem folds names (`probe-a` and `probe-A` are one entry), so the
@@ -765,8 +893,13 @@ pub(crate) struct Session {
   /// notes, which name the admitted size.
   pub(crate) size_note: Option<String>,
   pub(crate) mount: Mount,
+  /// With `--read-only`, a writable mount of the same volume, through which the session makes what the suite's own
+  /// read-only mount cannot: its work directories, and the probe's tree. Dropped with the suite's mount.
+  setup: Option<(Mount, PathBuf)>,
   pub(crate) anchor: Anchor,
   base: PathBuf,
+  /// With `--live-ship`, the fleet's candidates, dropped after the owner's mount and anchor.
+  live: Option<super::live_fleet::LiveFleet>,
 }
 
 /// Shape: how many lines of the anchor's log a record carries when the daemon stopped answering —
@@ -794,6 +927,9 @@ impl Session {
     (suite, size, fold): (&str, &str, bool),
     tracer: Option<&[String]>,
   ) -> Result<Session, Failure> {
+    if run.options.live_ship {
+      return Session::open_live(run, binary, (suite, size, fold), tracer);
+    }
     let instance = format!("conf-{suite}-{}", std::process::id());
     let anchor = Anchor::start(&binary, &instance, run.scratch.path(), tracer)?;
     // A fresh daemon serves no placement until its configuration group is bootstrapped (the
@@ -806,21 +942,110 @@ impl Session {
       .expect_ok("bootstrap root")?;
     let volume_name = format!("{suite}-vol");
     let created = create_volume(&binary, &instance, &volume_name, size, fold)?;
+    Session::mounted(run, binary, instance, anchor, created, (&volume_name, None))
+  }
+
+  /// A session whose volume is live-shipped on an `f = 1` fleet (`--live-ship`, A-200): the fleet started, the volume
+  /// created on its first node and turned live-shipped, then mounted through that node as a plain volume is.
+  fn open_live(
+    run: &Run<'_>,
+    binary: SlatesBinary,
+    (suite, size, fold): (&str, &str, bool),
+    tracer: Option<&[String]>,
+  ) -> Result<Session, Failure> {
+    if tracer.is_some() {
+      return Err(Failure(
+        "a live-shipped session runs no tracer: the hermeticity suite traces one anchor".to_owned(),
+      ));
+    }
+    let started = super::live_fleet::LiveFleet::start(&binary, suite, run.scratch.path())?;
+    let volume_name = format!("{suite}-vol");
+    let created = {
+      let deadline = Instant::now() + START_WAIT;
+      loop {
+        match create_volume(&binary, &started.owner_instance, &volume_name, size, fold) {
+          Err(Failure(why))
+            if why.contains("ConsensusNotInitialized") && Instant::now() < deadline =>
+          {
+            pause()
+          }
+          other => break other?,
+        }
+      }
+    };
+    super::live_fleet::LiveFleet::ship(&binary, &started.owner_instance, &created.id)?;
+    Session::mounted(
+      run,
+      binary,
+      started.owner_instance,
+      started.owner,
+      created,
+      (&volume_name, Some(started.fleet)),
+    )
+  }
+
+  /// Mounts a created volume and makes the session.
+  fn mounted(
+    run: &Run<'_>,
+    binary: SlatesBinary,
+    instance: String,
+    anchor: Anchor,
+    created: CreatedVolume,
+    (volume_name, live): (&str, Option<super::live_fleet::LiveFleet>),
+  ) -> Result<Session, Failure> {
     let volume_id = created.id;
-    let mount = mount_volume(run, &binary, &instance, &volume_id, &volume_name)?;
-    let base = mount
-      .path()
-      .join(format!("conformance-{}", std::process::id()));
-    create_dir(&base)?;
+    let names = (instance.as_str(), volume_id.as_str(), volume_name);
+    let directory = format!("conformance-{}", std::process::id());
+    let setup = if run.options.read_only {
+      let writable = mount_volume(run, &binary, names, false)?;
+      let base = writable.path().join(&directory);
+      create_dir(&base)?;
+      Some((writable, base))
+    } else {
+      None
+    };
+    let mount = mount_volume(run, &binary, names, run.options.read_only)?;
+    let base = mount.path().join(&directory);
+    match &setup {
+      Some(_) => visible(&base)?,
+      None => create_dir(&base)?,
+    }
     Ok(Session {
       binary,
       instance,
       volume_id,
       size_note: created.note,
       mount,
+      setup,
       anchor,
       base,
+      live,
     })
+  }
+
+  /// Whether the daemon still answers and, for a live-shipped session, the run shipped ([`Session::live_shipped`]);
+  /// and the live note the record carries, for a live-shipped session.
+  pub(crate) fn alive_and_shipped(&self) -> (bool, Option<String>) {
+    let alive = self.daemon_alive();
+    match self.live_shipped() {
+      Some((shipped, note)) => (alive && shipped, Some(note)),
+      None => (alive, None),
+    }
+  }
+
+  /// The live fleet's candidates, for a test that stops them.
+  #[cfg(test)]
+  pub(crate) fn live_fleet(&self) -> Option<&super::live_fleet::LiveFleet> {
+    self.live.as_ref()
+  }
+
+  /// With `--live-ship`, whether the run shipped (the owner's log durable at its head, both candidates holding it) and
+  /// the note the record carries; `None` for a plain session.
+  pub(crate) fn live_shipped(&self) -> Option<(bool, String)> {
+    self
+      .live
+      .as_ref()
+      .map(|fleet| fleet.caught_up(&self.binary, &self.instance, &self.volume_id))
   }
 
   /// The tail of the anchor's log — what a record carries when the daemon stopped answering, so the
@@ -829,11 +1054,24 @@ impl Session {
     self.anchor.log_tail(ANCHOR_LOG_TAIL_LINES)
   }
 
-  /// A fresh working directory inside the mount.
+  /// A fresh working directory inside the mount; with `--read-only`, made through the writable setup mount and
+  /// returned once the suite's own mount shows it.
   pub(crate) fn workdir(&self, name: &str) -> Result<PathBuf, Failure> {
     let path = self.base.join(name);
-    create_dir(&path)?;
+    match &self.setup {
+      Some((_, base)) => {
+        create_dir(&base.join(name))?;
+        visible(&path)?;
+      }
+      None => create_dir(&path)?,
+    }
     Ok(path)
+  }
+
+  /// With `--read-only`, the writable path matching `path`, a path under the suite's own mount; `None` otherwise.
+  pub(crate) fn writable(&self, path: &Path) -> Option<PathBuf> {
+    let (_, base) = self.setup.as_ref()?;
+    Some(base.join(path.strip_prefix(&self.base).ok()?))
   }
 
   /// Whether the daemon still answers.

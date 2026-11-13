@@ -106,11 +106,11 @@ impl CompletionBridge {
   /// reply, whose read end the SDK polls. The thread parks on the region's wake word through its
   /// own mapping.
   pub fn start(region: &ClientRegion) -> Result<CompletionBridge, IpcError> {
-    let (handoff, len) = region.handoff()?;
     // Two independent second mappings of the one shared region: the thread waits on one, the owner
-    // wakes the other to stop it. Both see the same physical wake word (the doorbell pattern).
-    let waiter = ClientRegion::open(&handoff, len)?;
-    let waker = ClientRegion::open(&handoff, len)?;
+    // wakes the other to stop it. Both see the same physical wake word (the doorbell pattern). Each maps a
+    // duplicate of the region's descriptor, since the region has no name to open (GAP-A9-9).
+    let waiter = region.open_again()?;
+    let waker = region.open_again()?;
     let (read, write) = self_pipe()?;
     // The flag lives for the client: the thread holds it as `&'static` and the owner stops the
     // thread through it, as the daemon's doorbell thread does. No `Arc` (R2).

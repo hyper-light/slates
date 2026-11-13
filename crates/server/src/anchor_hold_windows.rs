@@ -139,14 +139,14 @@ pub(crate) fn adopt(bound: usize) -> Handed {
   let (channel, entries) = match handles::parse_env(&value, bound) {
     Ok(parsed) => parsed,
     Err(error) => {
-      eprintln!("slates-server: Windows hold handoff refused: {error}");
+      slates_machine::log_line!("slates-server: Windows hold handoff refused: {error}");
       return handed;
     }
   };
   handed.channel = match adopted(channel) {
     Ok(channel) => Some(channel),
     Err(error) => {
-      eprintln!("slates-server: Windows hold channel refused: {error}");
+      slates_machine::log_line!("slates-server: Windows hold channel refused: {error}");
       None
     }
   };
@@ -157,7 +157,7 @@ pub(crate) fn adopt(bound: usize) -> Handed {
       match adopted(value) {
         Ok(handle) => owned.push(handle),
         Err(error) => {
-          eprintln!("slates-server: Windows held handle refused: {error}");
+          slates_machine::log_line!("slates-server: Windows held handle refused: {error}");
           refused = true;
         }
       }
@@ -165,7 +165,7 @@ pub(crate) fn adopt(bound: usize) -> Handed {
     let adoptable =
       !refused && entry.what == WHAT_WINFSP_MOUNT && owned.len() == handles::MAX_HANDLES;
     if !adoptable {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: held entry {} has an unsupported or unusable mount shape",
         entry.id
       );

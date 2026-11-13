@@ -62,15 +62,69 @@ mod linux {
     cpu_list(list)
   }
 
-  /// The CPU time this process's cgroup grants as `(quota, period)` microseconds (cgroup v2 `cpu.max`
-  /// at the root of the process's cgroup namespace, where a container sees its own); `None` when the
-  /// quota is `max` or the file is absent.
+  /// The tightest CPU time this process's cgroups grant, as `(quota, period)` microseconds: cgroup v2
+  /// `cpu.max`, or v1 `cpu.cfs_quota_us` over `cpu.cfs_period_us`, at the process's own cgroup (from
+  /// `/proc/self/cgroup`) and at every ancestor up to the root, since a parent's quota binds its children.
+  /// `None` when none of them sets one. The machine facts take the same tightest budget over the same walk,
+  /// and the test reads the kernel's files itself, so it judges the placement against the kernel. Until
+  /// 2026-11-05 it read the root's `cpu.max` alone: in a `systemd-run --user -p CPUQuota=1200%` unit on a
+  /// 32-CPU host the facts saw the unit's 12-CPU quota and left the shards to the scheduler, as the design
+  /// says, while the test read no quota and failed the owned-cpuset case 3 of 3.
   fn cpu_budget() -> Option<(u64, u64)> {
-    let text = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut tightest: Option<(u64, u64)> = None;
+    for line in cgroup.lines() {
+      // `id:controllers:path`; a v1 hierarchy names its controllers, the v2 one names none.
+      let mut fields = line.splitn(3, ':');
+      let (Some(_), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+      else {
+        continue;
+      };
+      let v1 = !controllers.is_empty();
+      if v1 && !controllers.split(',').any(|controller| controller == "cpu") {
+        continue;
+      }
+      let mut dir = path.trim_end_matches('/').to_owned();
+      loop {
+        if let Some(budget) = budget_at(&dir, v1) {
+          tightest = Some(match tightest {
+            Some(held) if share_at_most(held, budget) => held,
+            _ => budget,
+          });
+        }
+        if dir.is_empty() {
+          break;
+        }
+        match dir.rfind('/') {
+          Some(cut) => dir.truncate(cut),
+          None => dir.clear(),
+        }
+      }
+    }
+    tightest
+  }
+
+  /// The `(quota, period)` one cgroup directory states, `None` for no quota (`max`, v1's `-1`) or no file.
+  fn budget_at(dir: &str, v1: bool) -> Option<(u64, u64)> {
+    let read = |path: String| std::fs::read_to_string(path).ok();
+    if v1 {
+      let quota = read(format!("/sys/fs/cgroup/cpu{dir}/cpu.cfs_quota_us"))?;
+      let period = read(format!("/sys/fs/cgroup/cpu{dir}/cpu.cfs_period_us"))?;
+      return Some((
+        quota.trim().parse::<u64>().ok()?,
+        period.trim().parse::<u64>().ok()?,
+      ));
+    }
+    let text = read(format!("/sys/fs/cgroup{dir}/cpu.max"))?;
     let mut fields = text.split_whitespace();
     let quota = fields.next()?.parse::<u64>().ok()?;
     let period = fields.next()?.parse::<u64>().ok()?;
     Some((quota, period))
+  }
+
+  /// Whether budget `a` grants at most the CPU share `b` does: `a.quota / a.period <= b.quota / b.period`.
+  fn share_at_most(a: (u64, u64), b: (u64, u64)) -> bool {
+    u128::from(a.0) * u128::from(b.1) <= u128::from(b.0) * u128::from(a.1)
   }
 
   /// Whether a budget of `(quota, period)` buys every one of `cores` CPUs at once.

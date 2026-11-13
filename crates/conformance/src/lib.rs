@@ -36,10 +36,13 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod capability;
 pub mod civil;
+pub mod differential;
 pub mod exerciser;
 pub mod expected;
 pub mod matrix;
@@ -47,6 +50,7 @@ pub mod pjdfstest;
 pub mod record;
 pub mod tap;
 pub mod trace;
+pub mod winfstest;
 pub mod workload;
 
 pub use record::{Counts, Host, Outcome, Privilege, Record, SkipReason, Suite, Transport};

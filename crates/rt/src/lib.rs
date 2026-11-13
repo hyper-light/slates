@@ -31,6 +31,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod attribution;
@@ -55,7 +57,7 @@ pub mod shard;
 pub mod sim;
 pub mod task;
 mod thread_clock;
-pub use thread_clock::CpuReading;
+pub use thread_clock::{CpuReading, RunReading, RunState, process_runnable};
 // Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
 // network export ride it (`docs/wip/platforms.md`, gap 1).
 pub mod tcp;
@@ -75,7 +77,7 @@ pub mod kqueue;
 pub use driver::{Driver, DriverKind};
 pub use error::RtError;
 pub use registry::SlotHolder;
-pub use runtime::{Runtime, RuntimeConfig, WakeTracking};
+pub use runtime::{Runtime, RuntimeConfig, ShardCapacity, WakeTracking};
 pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;

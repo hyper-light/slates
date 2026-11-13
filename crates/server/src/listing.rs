@@ -52,7 +52,7 @@ pub(crate) fn read_dir(
     },
     slates_db::catalog::Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(work) => match listed(work_paths(work), dir) {
+        Some(work) => match listed(work_paths(state, work), dir) {
           Some(entries) => page_of_sorted(entries, cursor, room),
           None => refused(Refusal::NotFound),
         },
@@ -153,7 +153,7 @@ fn listed(paths: Vec<(String, EntryKind, u64)>, dir: &str) -> Option<Vec<DirEntr
 
 /// Every path a work holds: its files, and the directories and symlinks its journal declared and did not later
 /// remove.
-fn work_paths(work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
+fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
   let mut dirs: BTreeSet<String> = BTreeSet::new();
   let mut symlinks: BTreeSet<String> = BTreeSet::new();
   for op in &work.journal {
@@ -181,13 +181,12 @@ fn work_paths(work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
       _ => {}
     }
   }
-  let files = work.content.iter().map(|(path, bytes)| {
-    (
-      path.clone(),
-      EntryKind::File,
-      u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-    )
-  });
+  // Its files: the base's it did not change and its own (`crate::work_files`).
+  let files = work
+    .files
+    .sizes(crate::merge_service::work_base(state, work))
+    .into_iter()
+    .map(|(path, len)| (path.to_owned(), EntryKind::File, len));
   files
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(

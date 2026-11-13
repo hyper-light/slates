@@ -28,16 +28,10 @@ const TRANSACT_READY: u32 = (9 << 16) | ((0x800 + b'T' as u32) << 2);
 pub(crate) const TRANSACT_TIMEOUT_MS: u32 = 1000;
 /// Shape: the stop channel carries no messages; dropping its sender is the worker's cancellation signal.
 const STOP_BOUND: usize = 0;
-/// Format: status and size offsets in the checked response header (fsctl.h).
+/// Format: the status offset in the checked response header (fsctl.h).
 const STATUS_AT: usize = 20;
 /// Format: the status occupies the final word of the common response header.
 const STATUS_END: usize = STATUS_AT + size_of::<i32>();
-/// Format: see STATUS_AT.
-const SIZE_AT: usize = 2;
-/// Format: the response size is a two-byte field after its version.
-const SIZE_END: usize = SIZE_AT + size_of::<u16>();
-/// Format: FSP_FSCTL_DEFAULT_ALIGNMENT.
-const ALIGNMENT: usize = 8;
 
 thread_local! {
   /// Only a marker-authenticated Create may resolve the pending coherence file by identity.
@@ -46,6 +40,13 @@ thread_local! {
   static CURRENT_HINT: Cell<u64> = const { Cell::new(0) };
   /// Void Cleanup/Close callbacks still carry their typed refusal into this operation's kernel response.
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
+  /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
+  static REPLAYING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
+pub(crate) fn replaying() -> bool {
+  REPLAYING.get()
 }
 
 pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePath>, i32> {
@@ -57,8 +58,9 @@ pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePat
   })
 }
 
-/// The command thread brackets one purge at a time. Its bounded channel carries the old End and next Begin; the
-/// receiver drains it before each callback and while control I/O waits: a refused drive open may produce no callback.
+/// The command thread brackets one purge at a time, each naming the purge client's process, and publishes it in one slot
+/// the receiver reads when a Create arrives (`crate::purge_intents`): nothing waits on the receiver, so a drive open the
+/// kernel refuses before any callback holds no publisher.
 pub(crate) struct PrivateOpens {
   marker: crate::purge_token::Marker,
   intents: crate::purge_intents::Intents,
@@ -76,12 +78,15 @@ impl PrivateOpens {
     &mut self,
     request: &Request<'_>,
   ) -> Result<Option<crate::purge::Purge>, WinFspError> {
-    self.intents.progress()?;
-    if request.kind() != inflight::CREATE_KIND
-      || request.process_id().map_err(WinFspError::Capture)? != std::process::id()
-    {
+    // Only the purge client's process makes a purge's opens (`crate::purge_client`); no daemon thread opens its own
+    // volume (§4.6). Without a purge in progress, or from any other process, a Create is a program's.
+    if request.kind() != inflight::CREATE_KIND {
       return Ok(None);
     }
+    let process = request.process_id().map_err(WinFspError::Capture)?;
+    let Some(intent) = self.intents.current_for(process)? else {
+      return Ok(None);
+    };
     let value = usize::try_from(request.access_token().map_err(WinFspError::Capture)?)
       .map_err(|_| WinFspError::Capture(Refusal::Length))?;
     if value == 0 {
@@ -93,12 +98,7 @@ impl PrivateOpens {
     if !self.marker.matches(token)? {
       return Ok(None);
     }
-    self
-      .intents
-      .current()
-      .cloned()
-      .map(Some)
-      .ok_or(WinFspError::Capture(Refusal::State))
+    Ok(Some(intent.purge))
   }
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn record_terminal_refusal(status: i32) {
 
 pub(crate) fn announce_ready(
   control: HANDLE,
-  intents: &mut crate::purge_intents::Intents,
+  intents: &crate::purge_intents::Intents,
 ) -> Result<(), WinFspError> {
   transaction(control, TRANSACT_READY, &[], &mut [], intents).map(|_| ())
 }
@@ -137,21 +137,23 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = receive_loop(
-          file_system,
-          section,
-          bound,
-          Receive {
-            stopped,
-            confirmations: &confirmations,
-            wake: &wake,
-            outcomes: &outcomes,
-            private,
-          },
-        ) {
-          eprintln!("slates-winfsp: receive worker ended: {error}");
+        if let Err(error) = crate::reply::measure().and_then(|()| {
+          receive_loop(
+            file_system,
+            section,
+            bound,
+            Receive {
+              stopped,
+              confirmations: &confirmations,
+              wake: &wake,
+              outcomes: &outcomes,
+              private,
+            },
+          )
+        }) {
+          slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
-            eprintln!(
+            slates_machine::log_line!(
               "slates-winfsp: receive worker's owner ended before its failure was reported"
             );
           }
@@ -230,7 +232,7 @@ impl Drop for CaptureView {
       })
     } == 0
     {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-winfsp: {}",
         os_error("unmap the held receive buffer")
       );
@@ -246,7 +248,7 @@ fn transaction(
   code: u32,
   input: &[u8],
   output: &mut [u8],
-  intents: &mut crate::purge_intents::Intents,
+  intents: &crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
   let mut overlapped = OVERLAPPED {
     hEvent: intents.completion_event(),
@@ -286,16 +288,12 @@ fn transaction(
         code: error.raw_os_error(),
       });
     }
-    let progress = intents.wait();
     // SAFETY: this is the same outstanding overlapped I/O, with all its buffers and event still owned. Waiting settles
     // the request before any return can free them; an idle receive has the volume's finite transaction wait.
     if unsafe { GetOverlappedResult(control, &overlapped, &mut done, 1) } == 0 {
       return Err(os_error("complete WinFsp control transaction"));
     }
-    // Even a failed event wait or channel drain cannot return before the control I/O has settled its borrowed pages.
-    progress?;
   }
-  intents.progress()?;
   usize::try_from(done).map_err(|_| WinFspError::Capture(Refusal::Length))
 }
 
@@ -304,22 +302,99 @@ fn transaction(
 #[repr(align(8))]
 struct Packet([u8; RESPONSE_MAX]);
 
+/// The receive worker's edges for [`inflight::settle`]: the driver's transaction, the DLL's operation table and the
+/// owner shard's channel, with the private-open state and the working packet every operation uses, made once for the
+/// worker's life. Zeroing two fresh packets a request cost 2.6-4.4 us of each IRP on arm64 and 1.7-2.0 us on x86_64
+/// (diagnostics run 42091919319); WinFsp's own dispatcher clears nothing (dll/fs.c:303-305).
+struct Dll<'a> {
+  file_system: *mut FileSystem,
+  control: HANDLE,
+  private: PrivateOpens,
+  working: Box<Packet>,
+  stopped: &'a Receiver<()>,
+  confirmations: &'a SyncSender<crate::host::Request>,
+  wake: &'a std::task::Waker,
+  bound: usize,
+}
+
+impl inflight::settle::Edges for Dll<'_> {
+  type Error = WinFspError;
+
+  fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, WinFspError> {
+    let reported = transaction(
+      self.control,
+      TRANSACT_BATCH,
+      &[],
+      buffer,
+      &self.private.intents,
+    )?;
+    // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
+    if is_stopped(self.stopped) {
+      return Ok(None);
+    }
+    Ok(Some(reported))
+  }
+
+  fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
+    transaction(
+      self.control,
+      TRANSACT_BATCH,
+      response,
+      &mut [],
+      &self.private.intents,
+    )
+    .map(|_| ())
+  }
+
+  fn operate(
+    &mut self,
+    request: &Request<'_>,
+    response: &mut [u8],
+    replaying: bool,
+  ) -> Result<usize, WinFspError> {
+    REPLAYING.set(replaying);
+    let length = operation(
+      self.file_system,
+      request,
+      &mut self.private,
+      &mut self.working,
+      response,
+    );
+    REPLAYING.set(false);
+    length
+  }
+
+  fn confirm_open(&mut self, context: u64) -> Result<(), WinFspError> {
+    crate::host::confirm_open(self.confirmations, self.wake, context)
+  }
+
+  fn rename_open_names(&mut self, from: &str, to: &str) -> Result<(), WinFspError> {
+    crate::host::rename_open_names(self.confirmations, self.wake, from, to, self.bound)
+  }
+}
+
+/// One DLL operation on the worker's reused packets. The request is copied whole into the working packet, and the
+/// callbacks read nothing past its own size. Only the response's fixed part is cleared, as the header the callback
+/// fills: a callback writes whatever it returns past that part and sets the size over it, and
+/// [`inflight::finish_response`] clears the padding up to the aligned length, so no byte of an earlier response is sent.
+/// `response` is the worker's own [`Packet`], lent through the protocol; any other buffer is refused.
 fn operation(
   file_system: *mut FileSystem,
   request: &Request<'_>,
-  packet: &mut Packet,
   private: &mut PrivateOpens,
+  working: &mut Packet,
+  response: &mut [u8],
 ) -> Result<usize, WinFspError> {
-  let mut working = Packet([0; RESPONSE_MAX]);
+  if response.len() != RESPONSE_MAX || !response.as_ptr().cast::<u64>().is_aligned() {
+    return Err(WinFspError::Capture(Refusal::Length));
+  }
   working
     .0
     .get_mut(..request.bytes().len())
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(request.bytes());
-  packet.0.fill(0);
   let header = request.cancelled_response().map_err(WinFspError::Capture)?;
-  packet
-    .0
+  response
     .get_mut(..RESPONSE_BASE)
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(&header);
@@ -333,9 +408,8 @@ fn operation(
   let purge = match private.authenticate(request) {
     Ok(purge) => purge,
     Err(error) => {
-      eprintln!("slates-winfsp: private open refused: {error}");
-      packet
-        .0
+      slates_machine::log_line!("slates-winfsp: private open refused: {error}");
+      response
         .get_mut(STATUS_AT..STATUS_END)
         .ok_or(WinFspError::Capture(Refusal::Length))?
         .copy_from_slice(
@@ -349,12 +423,13 @@ fn operation(
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
-  // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
+  // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
+  // throughout the synchronous call.
   let callback_status = unsafe {
     callback(
       file_system,
       working.0.as_mut_ptr().cast(),
-      packet.0.as_mut_ptr().cast(),
+      response.as_mut_ptr().cast(),
     )
   };
   let terminal_status = TERMINAL_REFUSAL.replace(0);
@@ -365,156 +440,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(None);
   CURRENT_HINT.set(0);
-  packet
-    .0
-    .get_mut(STATUS_AT..STATUS_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .copy_from_slice(&status.to_le_bytes());
-  let size: [u8; 2] = packet
-    .0
-    .get(SIZE_AT..SIZE_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .try_into()
-    .map_err(|_| WinFspError::Capture(Refusal::Length))?;
-  let size = usize::from(u16::from_le_bytes(size))
-    .checked_next_multiple_of(ALIGNMENT)
-    .ok_or(WinFspError::Capture(Refusal::Length))?;
-  if !(RESPONSE_BASE..=RESPONSE_MAX).contains(&size) {
-    return Err(WinFspError::Capture(Refusal::Length));
-  }
-  packet
-    .0
-    .get_mut(SIZE_AT..SIZE_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .copy_from_slice(
-      &u16::try_from(size)
-        .map_err(|_| WinFspError::Capture(Refusal::Length))?
-        .to_le_bytes(),
-    );
-  Ok(size)
-}
-
-fn settle(
-  file_system: *mut FileSystem,
-  batch: &mut inflight::capture::Batch<'_>,
-  recovered: bool,
-  confirmations: &SyncSender<crate::host::Request>,
-  wake: &std::task::Waker,
-  private: &mut PrivateOpens,
-  bound: usize,
-) -> Result<u64, WinFspError> {
-  // SAFETY: same owner/worker lifetime as operation; volume control remains owned by the DLL object.
-  let control = unsafe { (*file_system).volume_handle };
-  let mut packet = Packet([0; RESPONSE_MAX]);
-  let mut count = 0u64;
-  while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
-    if recovered {
-      let saved = batch.response_for(&request).map_err(WinFspError::Capture)?;
-      // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
-      // an old process mapping (sys/read.c), so all other buffer-bearing operations cancel without dereferencing it.
-      if let Some(saved) = replayable_response(&request, saved, confirmations, wake, bound)? {
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          saved,
-          &mut [],
-          &mut private.intents,
-        )?;
-      } else if matches!(
-        request.kind(),
-        inflight::CLEANUP_KIND | inflight::CLOSE_KIND
-      ) {
-        let length = operation(file_system, &request, &mut packet, private)?;
-        let response = packet
-          .0
-          .get(..length)
-          .ok_or(WinFspError::Capture(Refusal::Length))?;
-        if saved.is_none() {
-          batch
-            .record_response(&request, response)
-            .map_err(WinFspError::Capture)?;
-        }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          response,
-          &mut [],
-          &mut private.intents,
-        )?;
-      } else {
-        let response = request.cancelled_response().map_err(WinFspError::Capture)?;
-        if saved.is_none() {
-          batch
-            .record_response(&request, &response)
-            .map_err(WinFspError::Capture)?;
-        }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          &response,
-          &mut [],
-          &mut private.intents,
-        )?;
-      }
-    } else {
-      let length = operation(file_system, &request, &mut packet, private)?;
-      let response = packet
-        .0
-        .get(..length)
-        .ok_or(WinFspError::Capture(Refusal::Length))?;
-      batch
-        .record_response(&request, response)
-        .map_err(WinFspError::Capture)?;
-      if let Some((from, to)) = request
-        .successful_rename(response)
-        .map_err(WinFspError::Capture)?
-      {
-        crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
-      }
-      transaction(
-        control,
-        TRANSACT_BATCH,
-        response,
-        &mut [],
-        &mut private.intents,
-      )?;
-      if let Some((_, context)) =
-        inflight::opened_context(response).map_err(WinFspError::Capture)?
-      {
-        crate::host::confirm_open(confirmations, wake, context)?;
-      }
-    }
-    batch
-      .acknowledge(request.hint())
-      .map_err(WinFspError::Capture)?;
-    count = count.saturating_add(1);
-  }
-  Ok(count)
-}
-
-/// Saved Create and successful Rename responses refer only to kernel-owned state. Other buffer-bearing responses
-/// can refer into the dead process. Durable name updates finish before the saved rename success reaches the kernel.
-fn replayable_response<'a>(
-  request: &Request<'_>,
-  saved: Option<&'a [u8]>,
-  confirmations: &SyncSender<crate::host::Request>,
-  wake: &std::task::Waker,
-  bound: usize,
-) -> Result<Option<&'a [u8]>, WinFspError> {
-  let Some(saved) = saved else {
-    return Ok(None);
-  };
-  if request.kind() == inflight::CREATE_KIND {
-    return Ok(Some(saved));
-  }
-  if let Some((from, to)) = request
-    .successful_rename(saved)
-    .map_err(WinFspError::Capture)?
-  {
-    crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
-    return Ok(Some(saved));
-  }
-  Ok(None)
+  inflight::finish_response(response, status).map_err(WinFspError::Capture)
 }
 
 /// The receive worker's owned control channels and immutable reporting endpoints.
@@ -537,57 +463,52 @@ fn receive_loop(
     confirmations,
     wake,
     outcomes,
-    mut private,
+    private,
   } = channels;
   let file_system = file_system as *mut FileSystem;
+  // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
+  let control = unsafe { (*file_system).volume_handle };
+  let mut edges = Dll {
+    file_system,
+    control,
+    private,
+    working: Box::new(Packet([0; RESPONSE_MAX])),
+    stopped: &stopped,
+    confirmations,
+    wake,
+    bound,
+  };
+  let mut response = Box::new(Packet([0; RESPONSE_MAX]));
   let mut view = CaptureView::new(section, bound)?;
-  if let Some(mut batch) = view.capture()?.resume().map_err(WinFspError::Capture)? {
-    let count = settle(
-      file_system,
-      &mut batch,
-      true,
-      confirmations,
-      wake,
-      &mut private,
-      bound,
-    )?;
-    eprintln!("slates-winfsp: settled {count} captured requests before receiving");
+  // This worker's index of its batch's frames, reserved once, so taking a batch allocates nothing (audit step 7).
+  let mut scratch = inflight::Scratch::new().map_err(WinFspError::Capture)?;
+  if let Some(settled) =
+    inflight::settle::recover(view.capture()?, &mut scratch, &mut edges, &mut response.0)?
+  {
+    slates_machine::log_line!(
+      "slates-winfsp: settled {} captured requests before receiving, {} of them a replayed cleanup or close refused",
+      settled.answered,
+      settled.refused
+    );
     outcomes
-      .send(crate::host::Outcome::Recovered(count))
+      .send(crate::host::Outcome::Recovered {
+        settled: settled.answered,
+        refused: settled.refused,
+      })
       .map_err(|_| WinFspError::MountThread)?;
     wake.wake_by_ref();
   }
-  // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
-  let control = unsafe { (*file_system).volume_handle };
   // What this owner's last batch filled; its first receive clears the whole buffer.
   let mut used = None;
   loop {
     if is_stopped(&stopped) {
       return Ok(());
     }
-    let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
-    let reported = transaction(
-      control,
-      TRANSACT_BATCH,
-      &[],
-      receiving.buffer_mut(),
-      &mut private.intents,
-    )?;
-    // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
-    if is_stopped(&stopped) {
-      return Ok(());
+    let receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
+    match inflight::settle::receive(receiving, &mut scratch, &mut edges, &mut response.0)? {
+      Some(filled) => used = Some(filled),
+      None => return Ok(()),
     }
-    used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
-    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
-    settle(
-      file_system,
-      &mut batch,
-      false,
-      confirmations,
-      wake,
-      &mut private,
-      bound,
-    )?;
   }
 }
 

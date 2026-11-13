@@ -39,7 +39,9 @@ use crate::host::{
   BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
 };
 use crate::ids::{Epoch, InodeNo, SnapshotId};
-use crate::inode::{BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, Witness};
+use crate::inode::{
+  BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, WindowsAttributes, Witness,
+};
 use crate::journal::Op;
 use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
 
@@ -197,6 +199,27 @@ pub struct Diverged {
   pub path: String,
   /// Why.
   pub kind: Divergence,
+}
+
+/// A walk of a volume's diverged set in progress (AC-1.10; §4.3 "Bounded work everywhere"): the directories still to
+/// judge and what was found so far, so a landing's plan steps the walk a directory a unit and never walks a large tree
+/// in one call. Over a snapshot (`Volume::diverged_walk_in`) its handles name frozen nodes; over the head they may go
+/// stale between units, and a stale one is passed over.
+#[derive(Debug)]
+pub struct DivergedWalk {
+  snapshot: Option<SnapshotId>,
+  stack: Vec<(String, Handle<DirNode>)>,
+  out: Vec<Diverged>,
+}
+
+impl DivergedWalk {
+  fn new(snapshot: Option<SnapshotId>, root: Handle<DirNode>) -> DivergedWalk {
+    DivergedWalk {
+      snapshot,
+      stack: vec![(String::new(), root)],
+      out: Vec::new(),
+    }
+  }
 }
 
 /// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
@@ -398,6 +421,11 @@ pub struct BasePlane {
   large_class_bytes: u64,
   /// Listings by directory inode number.
   pub(crate) listings: BTreeMap<InodeNo, Listing>,
+  /// The base directories a recovery could not reacquire as the ones the image recorded (§4.8's failure matrix): gone
+  /// from the disk, unreadable, or another directory at the path. Their untouched entries refuse `BaseUnavailable`
+  /// while the volume's own entries in them serve; each keeps its record, so the next image carries it and a later
+  /// recovery tries again. Disjoint from [`Self::listings`]; bounded by the image's directories.
+  pub(crate) unavailable: BTreeMap<InodeNo, UnavailableDir>,
   /// Witnesses by inode number, versioned by epoch so a snapshot reads its own (A-48).
   witnesses: Versioned<InodeNo, Witness>,
   /// Where on the disk each witness was taken: the base directory's inode number and the
@@ -444,6 +472,31 @@ pub struct BasePlane {
   stale_since: BTreeMap<InodeNo, u64>,
 }
 
+/// A base directory a recovery could not reacquire ([`BasePlane::unavailable`]): its recorded source and fingerprint,
+/// kept for the next image, and the errno its untouched entries are refused with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableDir {
+  pub(crate) source: Vec<String>,
+  pub(crate) fingerprint: Fingerprint,
+  pub(crate) errno: i32,
+}
+
+/// Format: the errno a base directory that is no longer the recorded one is refused with, `ENOENT` (2 on Linux and
+/// macOS, and Windows' `ERROR_FILE_NOT_FOUND`): the directory the image recorded is not there, whether removed or
+/// replaced by another at the path (§4.8, A-153).
+pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
+
+/// The errno a base directory recovery could not reopen is refused with: the host's own, or [`GONE_DIRECTORY_ERRNO`]
+/// when the host says only that it is not there as a directory.
+pub(crate) fn unavailable_errno(error: HostError) -> i32 {
+  match error {
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
+    HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
+      GONE_DIRECTORY_ERRNO
+    }
+  }
+}
+
 impl BasePlane {
   /// Queues `file`, forgotten by a reclaim with no host, to be closed when the next overlay borrow ends.
   pub(crate) fn queue_close(&mut self, file: HostFile) {
@@ -469,6 +522,7 @@ impl BasePlane {
       facts: config.facts,
       large_class_bytes: config.large_class_bytes,
       listings,
+      unavailable: BTreeMap::new(),
       witnesses: Versioned::default(),
       witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
@@ -500,6 +554,12 @@ impl BasePlane {
   /// The hint sequence now (see [`Overlay::take_stale_base_entries`]).
   pub fn hint_seq(&self) -> u64 {
     self.hint_seq
+  }
+
+  /// How many base directories a recovery could not reacquire, whose untouched entries refuse `BaseUnavailable`
+  /// ([`Self::unavailable`]).
+  pub fn unavailable_dirs(&self) -> usize {
+    self.unavailable.len()
   }
 
   /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
@@ -704,7 +764,7 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotDirectory => VfsError::NotDirectory,
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
-    HostError::Unavailable(errno) => VfsError::BaseUnavailable(errno),
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
   }
 }
 
@@ -759,91 +819,106 @@ impl Volume {
   }
 
   /// The diverged set (AC-1.10): witnessed, created, whiteouted and redirected entries, by
-  /// path, over the loaded nodes only (cost proportional to what the volume touched).
+  /// path, over the loaded nodes only (cost proportional to what the volume touched). [`DivergedWalk`] run to its end.
   pub fn diverged(&self, store: &Store) -> Vec<Diverged> {
-    let plane = self.base.as_ref();
-    self.diverged_from(
-      store,
-      self.root,
-      |no| plane.is_some_and(|b| b.is_witnessed(no)),
-      |no| {
-        matches!(
-          self.inode(store, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    )
+    let mut walk = self.diverged_walk();
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return diverged;
+      }
+    }
   }
 
   /// The diverged set as snapshot `id` froze it (A-48): its tree, its inode versions and the witnesses
-  /// it read, never the head's.
+  /// it read, never the head's. [`DivergedWalk`] run to its end.
   pub fn diverged_in(&self, store: &Store, id: SnapshotId) -> Result<Vec<Diverged>, VfsError> {
-    let (epoch, root) = self.snapshot_info(id)?;
-    let plane = self.base.as_ref();
-    Ok(self.diverged_from(
-      store,
-      root,
-      |no| plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
-      |no| {
-        matches!(
-          self.inode_in(store, id, no).map(|i| &i.body),
-          Ok(Body::Base(_) | Body::BaseLink(_))
-        )
-      },
-    ))
+    let mut walk = self.diverged_walk_in(id)?;
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return Ok(diverged);
+      }
+    }
   }
 
-  /// The diverged walk from `root`: `witnessed` and `is_base` answer for the tree walked (the head's or a
-  /// snapshot's).
-  fn diverged_from(
-    &self,
-    store: &Store,
-    root: Handle<DirNode>,
-    witnessed: impl Fn(InodeNo) -> bool,
-    is_base: impl Fn(InodeNo) -> bool,
-  ) -> Vec<Diverged> {
-    let mut out = Vec::new();
-    let mut stack = vec![(String::new(), root)];
-    while let Some((prefix, dir)) = stack.pop() {
-      let Ok(node) = store.dirs.get(dir) else {
-        continue;
+  /// A walk of the head's diverged set, stepped a directory a unit ([`Volume::diverged_unit`]). The head moves between
+  /// units, so a walk that must see one state walks a snapshot ([`Volume::diverged_walk_in`]).
+  pub fn diverged_walk(&self) -> DivergedWalk {
+    DivergedWalk::new(None, self.root)
+  }
+
+  /// A walk of snapshot `id`'s diverged set, stepped a directory a unit ([`Volume::diverged_unit`]).
+  pub fn diverged_walk_in(&self, id: SnapshotId) -> Result<DivergedWalk, VfsError> {
+    let (_, root) = self.snapshot_info(id)?;
+    Ok(DivergedWalk::new(Some(id), root))
+  }
+
+  /// One unit of `walk`: one directory's entries judged; the whole diverged set, sorted by path, once the last
+  /// directory is done. A directory gone meanwhile (a stale handle of a walk over the head) is passed over, as the
+  /// one-call walk passed it.
+  pub fn diverged_unit(&self, store: &Store, walk: &mut DivergedWalk) -> Option<Vec<Diverged>> {
+    let Some((prefix, dir)) = walk.stack.pop() else {
+      let mut out = std::mem::take(&mut walk.out);
+      out.sort_by(|a, b| a.path.cmp(&b.path));
+      return Some(out);
+    };
+    let plane = self.base.as_ref();
+    let epoch = walk
+      .snapshot
+      .and_then(|id| self.snapshot_info(id).ok())
+      .map(|(epoch, _)| epoch);
+    let witnessed = |no: InodeNo| match (walk.snapshot, epoch) {
+      (Some(_), Some(epoch)) => plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
+      (Some(_), None) => false,
+      (None, _) => plane.is_some_and(|b| b.is_witnessed(no)),
+    };
+    let is_base = |no: InodeNo| {
+      let body = match walk.snapshot {
+        Some(id) => self.inode_in(store, id, no).map(|i| &i.body),
+        None => self.inode(store, no).map(|i| &i.body),
       };
-      for e in node.iter(&store.blocks) {
-        let path = format!("{prefix}/{}", e.name);
-        match e.child {
-          Child::Whiteout => out.push(Diverged {
-            path,
-            kind: Divergence::Whiteout,
-          }),
-          Child::Dir(h) => {
-            if let Ok(child) = store.dirs.get(h) {
-              if let Some(kind) = directory_divergence(child) {
-                out.push(Diverged {
-                  path: path.clone(),
-                  kind,
-                });
-              }
-              stack.push((path, h));
+      matches!(body, Ok(Body::Base(_) | Body::BaseLink(_)))
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return None;
+    };
+    let mut found = Vec::new();
+    let mut deeper = Vec::new();
+    for e in node.iter(&store.blocks) {
+      let path = format!("{prefix}/{}", e.name);
+      match e.child {
+        Child::Whiteout => found.push(Diverged {
+          path,
+          kind: Divergence::Whiteout,
+        }),
+        Child::Dir(h) => {
+          if let Ok(child) = store.dirs.get(h) {
+            if let Some(kind) = directory_divergence(child) {
+              found.push(Diverged {
+                path: path.clone(),
+                kind,
+              });
             }
+            deeper.push((path, h));
           }
-          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-            if witnessed(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Witnessed,
-              });
-            } else if !is_base(no) {
-              out.push(Diverged {
-                path,
-                kind: Divergence::Created,
-              });
-            }
+        }
+        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+          if witnessed(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Witnessed,
+            });
+          } else if !is_base(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Created,
+            });
           }
         }
       }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    walk.out.extend(found);
+    walk.stack.extend(deeper);
+    None
   }
 
   /// The fingerprint of the base entry a whiteout at `dir/name` hides, recorded at the
@@ -991,6 +1066,45 @@ impl Volume {
   }
 }
 
+/// A pin in progress (§4.4 `pin`; [`Overlay::pin_unit`]): the directories still to list, by absolute path, and the
+/// files listed and not yet pinned, by inode number, so a walk stepped a slice at a time holds no handle between its
+/// slices. Its size is the walk's frontier: the subdirectories of the directories listed so far and the files of the
+/// last listing, never the tree.
+#[derive(Debug, Default)]
+pub struct PinWalk {
+  dirs: Vec<String>,
+  files: Vec<InodeNo>,
+  pinned: usize,
+}
+
+impl PinWalk {
+  /// A walk of the named subtrees, or of the whole base when none are named.
+  pub fn new(paths: Option<&[String]>) -> PinWalk {
+    let mut dirs: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
+    // Popped from the end: reversed, so the named subtrees are walked in the order named.
+    dirs.reverse();
+    PinWalk {
+      dirs,
+      files: Vec::new(),
+      pinned: 0,
+    }
+  }
+
+  /// The files pinned so far.
+  pub fn pinned(&self) -> usize {
+    self.pinned
+  }
+}
+
+/// The absolute path of `name` in the directory at `parent`.
+fn child_path(parent: &str, name: &str) -> String {
+  if parent.ends_with('/') {
+    format!("{parent}{name}")
+  } else {
+    format!("{parent}/{name}")
+  }
+}
+
 /// A volume borrowed together with its host: the base-aware verbs.
 pub struct Overlay<'a> {
   vol: &'a mut Volume,
@@ -1015,6 +1129,33 @@ impl Overlay<'_> {
   /// The volume.
   pub fn volume(&mut self) -> &mut Volume {
     self.vol
+  }
+
+  /// [`Volume::snapshot_is_complete`], judged with the host: a merged directory whose listing this daemon has not read
+  /// since a recovery (each is read again on first use, A-153) is read now from the host, uncached, so the snapshot is
+  /// judged by what its directories hold, not by a plane that has not listed them yet. Uncached, so a recovered
+  /// directory's first listing still renumbers its untouched entries where it is meant to (A-151). A directory recovery
+  /// could not reacquire refuses `BaseUnavailable`. Until 2026-11-08 a pinned overlay's snapshot was refused as a green's
+  /// base after any restart (`ConsistentBaseUnavailable`).
+  pub fn snapshot_is_complete(&mut self, store: &Store, id: SnapshotId) -> Result<bool, VfsError> {
+    let host = &mut *self.host;
+    let vol = &*self.vol;
+    vol.snapshot_is_complete_under(store, id, &mut |no| {
+      let Some(plane) = vol.base_plane() else {
+        return Ok(None);
+      };
+      if let Some(names) = plane.listed_names(no) {
+        return Ok(Some(names));
+      }
+      if let Some(gone) = plane.unavailable.get(&no) {
+        return Err(VfsError::BaseUnavailable(gone.errno));
+      }
+      let Some(listing) = plane.listings.get(&no) else {
+        return Ok(None);
+      };
+      let entries = host.list(listing.dir).map_err(host_refusal)?;
+      Ok(Some(entries.into_iter().map(|entry| entry.name).collect()))
+    })
   }
 
   fn plane(&mut self) -> Result<&mut BasePlane, VfsError> {
@@ -1044,6 +1185,9 @@ impl Overlay<'_> {
     let policy = self.vol.policy;
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
     let listing = plane
       .listings
       .get_mut(&dir_no)
@@ -1413,7 +1557,7 @@ impl Overlay<'_> {
     let inode = store.inodes.get_mut(handle)?;
     let changed = inode.adopt_observed(
       fp.size,
-      Some((fp.mode, fp.uid, fp.gid)),
+      Some((fp.mode, fp.uid, fp.gid, fp.windows)),
       fp.mtime_ns,
       fp.ctime_ns,
     );
@@ -1440,9 +1584,16 @@ impl Overlay<'_> {
     no: InodeNo,
   ) -> Result<crate::volume::Observed, VfsError> {
     self.follow_live_disk(store, no)?;
-    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`).
+    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`). A directory recovery could not
+    // reacquire keeps the count it was recovered with: it is the volume's own node, which holds its overlay entries and
+    // answers for itself, while only its untouched base entries refuse (§4.8's failure matrix).
     if let Body::Directory(dir) = self.vol.inode(store, no)?.body
       && store.dirs.get(dir)?.base == BaseDirState::Merged
+      && !self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|plane| plane.unavailable.contains_key(&no))
     {
       self.load_listing(store, dir)?;
     }
@@ -1541,6 +1692,8 @@ impl Overlay<'_> {
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        // The disk's Windows attribute bits, as an untouched base entry reports them (A-262).
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
@@ -1558,6 +1711,7 @@ impl Overlay<'_> {
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
@@ -1575,6 +1729,7 @@ impl Overlay<'_> {
         let mut inode = Inode::new(no, epoch, Kind::Dir, fp.mode, Body::Directory(child));
         inode.attrs.nlink = 2;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         let handle = store.inodes.insert(inode)?;
@@ -1608,11 +1763,13 @@ impl Overlay<'_> {
   }
 
   fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
-    self
-      .vol
-      .base
-      .as_ref()
-      .and_then(|b| b.listings.get(&dir_no))
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
+    plane
+      .listings
+      .get(&dir_no)
       .map(|l| l.dir)
       .ok_or(VfsError::NotOverlay)
   }
@@ -2245,6 +2402,18 @@ impl Overlay<'_> {
     self.vol.edit(store, no, at, delete_len, bytes)
   }
 
+  /// [`Volume::set_windows_attributes`] with a metadata-only copy-up (A-262): an untouched base file's bits are what
+  /// the disk reports until a caller sets its own.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_windows_attributes(store, no, attributes)
+  }
+
   /// `chmod` with a metadata-only copy-up.
   pub fn chmod(&mut self, store: &mut Store, no: InodeNo, mode: u32) -> Result<(), VfsError> {
     self.copy_up(store, no, CopyUp::Metadata)?;
@@ -2389,7 +2558,7 @@ impl Overlay<'_> {
       let inode = store.inodes.get_mut(handle)?;
       let changed = inode.adopt_observed(
         fp.size,
-        Some((fp.mode, fp.uid, fp.gid)),
+        Some((fp.mode, fp.uid, fp.gid, fp.windows)),
         fp.mtime_ns,
         fp.ctime_ns,
       );
@@ -3639,47 +3808,57 @@ impl Overlay<'_> {
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and
-  /// witness them; cost proportional to what is pinned, reported as the entry count.
+  /// witness them; cost proportional to what is pinned, reported as the entry count. The whole walk at once, by
+  /// [`Overlay::pin_unit`] to its end; a daemon steps the same walk a slice at a time instead (§4.3).
   pub fn pin(&mut self, store: &mut Store, paths: Option<&[String]>) -> Result<usize, VfsError> {
-    let roots: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
-    let mut pinned = 0usize;
-    for path in roots {
-      let located = self.resolve(store, &path)?;
-      let mut stack = vec![located];
-      while let Some(l) = stack.pop() {
-        match l.child {
-          Child::Dir(h) => {
-            let rows: Vec<(Kind, InodeNo, String)> = self
-              .readdir(store, h)?
-              .iter()
-              .map(|r| (r.kind, r.inode, r.name.to_owned()))
-              .collect();
-            let h = self.vol.head_dir(store, h)?;
-            for (kind, no, name) in rows {
-              let child = match kind {
-                Kind::Dir => match self.vol.lookup(store, h, &name)?.child {
-                  Child::Dir(d) => Child::Dir(d),
-                  other => other,
-                },
-                Kind::File => Child::File(no),
-                Kind::Symlink => Child::Symlink(no),
-                Kind::Fifo => Child::Fifo(no),
-                Kind::Socket => Child::Socket(no),
-              };
-              stack.push(Located { child, inode: no });
-            }
-          }
-          Child::File(no) => {
-            self.copy_up(store, no, CopyUp::Content)?;
-            let size = self.vol.inode(store, no)?.attrs.size;
-            self.pin_windows(store, no, 0, size)?;
-            pinned = pinned.saturating_add(1);
-          }
-          Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
-        }
+    let mut walk = PinWalk::new(paths);
+    loop {
+      if let Some(pinned) = self.pin_unit(store, &mut walk)? {
+        return Ok(pinned);
       }
     }
-    Ok(pinned)
+  }
+
+  /// One unit of a pin's walk: a file of a listed directory pinned (copied up whole and witnessed), else the next
+  /// directory listed (its files queued, its subdirectories queued by path). `Some(pinned)` once nothing is left. A
+  /// unit's work is one file or one listing, never a subtree, so a caller bounding its slices against the clock
+  /// overruns by one unit at most. The walk holds no handle between units: a directory is resolved again by its path
+  /// when its turn comes, so one copied on write by another verb between two slices is read as it now stands, and a
+  /// file by its inode number.
+  pub fn pin_unit(
+    &mut self,
+    store: &mut Store,
+    walk: &mut PinWalk,
+  ) -> Result<Option<usize>, VfsError> {
+    if let Some(no) = walk.files.pop() {
+      self.copy_up(store, no, CopyUp::Content)?;
+      let size = self.vol.inode(store, no)?.attrs.size;
+      self.pin_windows(store, no, 0, size)?;
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    let Some(path) = walk.dirs.pop() else {
+      return Ok(Some(walk.pinned));
+    };
+    match self.resolve(store, &path)?.child {
+      Child::Dir(handle) => {
+        let rows: Vec<(Kind, InodeNo, String)> = self
+          .readdir(store, handle)?
+          .iter()
+          .map(|row| (row.kind, row.inode, row.name.to_owned()))
+          .collect();
+        for (kind, no, name) in rows {
+          match kind {
+            Kind::Dir => walk.dirs.push(child_path(&path, &name)),
+            Kind::File => walk.files.push(no),
+            Kind::Symlink | Kind::Fifo | Kind::Socket => {}
+          }
+        }
+      }
+      Child::File(no) => walk.files.push(no),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+    }
+    Ok(None)
   }
 
   // ------------------------------------------------- metadata copy-ups and by-inode verbs

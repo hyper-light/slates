@@ -103,7 +103,7 @@ use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::{Demux, DemuxId};
-use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::endpoint::{Endpoint, EndpointError, HandshakeStall};
 use slates_transport::handshake::Identity;
 use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
@@ -651,16 +651,23 @@ pub(crate) fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
 /// death history across an election, rather than restarting the confirmation window each time leadership
 /// moves. A suspected member never accumulates (it is not `Dead`), so it can never be retired.
 fn update_council_death_watch(state: &mut ShardState) {
+  let now = futures::now_ns();
+  let started = *state.death_watch_started_ns.get_or_insert(now);
   let members: Vec<HostId> = state.council.configuration().members.clone();
   state
     .council_death_watch
     .retain(|host, _| members.contains(host));
+  let local = state.fleet.host();
   for member in members {
+    if member == local {
+      continue;
+    }
     let dead = state
       .fleet
       .membership()
       .state(member)
-      .is_some_and(|belief| belief.liveness == Liveness::Dead);
+      .is_some_and(|belief| belief.liveness == Liveness::Dead)
+      || unreached_since_start(state, member, now.saturating_sub(started));
     if dead {
       let count = state.council_death_watch.entry(member).or_insert(0);
       *count = count.saturating_add(1);
@@ -689,6 +696,178 @@ fn stable_dead_council_members(state: &ShardState) -> Vec<HostId> {
     .filter(|(_, count)| **count >= window)
     .map(|(host, _)| *host)
     .collect()
+}
+
+/// Whether this node, a membership horizon (`lease::horizon_ns`) after its death watch began, has never keyed
+/// `member` (no probe-plane epoch installed) and holds it alive in no view: its own evidence that `member` is gone.
+/// A node that restarted while `member` was down never hears from it, so its detector never holds it at all (it
+/// joins a member only once keyed), and without this it never voted the member dead: a restarted council leader then
+/// never retired it and no takeover began (`a_member_down_through_a_voters_restart_is_still_taken_over`, 2026-11-07).
+/// A live member slow to key may draw this vote too, but alone it is one of the `f + 1` a retirement needs.
+fn unreached_since_start(state: &ShardState, member: HostId, since_ns: u64) -> bool {
+  since_ns >= crate::lease::horizon_ns()
+    && !state.plane.keyed.contains_key(&member)
+    && state
+      .fleet
+      .membership()
+      .state(member)
+      .is_none_or(|belief| belief.liveness != Liveness::Alive)
+}
+
+/// The council members this leader may retire now (§4.8 "Promotion and takeover"): those at least `f + 1` voters
+/// hold dead, or every voter while the council has fewer than `f + 1` besides the member (`Quorum::committed_within`),
+/// this leader's own stable death watch ([`stable_dead_council_members`]) one of them and each other voter's fresh
+/// report ([`ShardState::death_reports`]) one more. A report is fresh within a membership horizon, and counts only at
+/// an incarnation at or above any this leader holds the member alive at, so a refutation cancels the reports below it.
+/// One voter's lone suspicion, the leader's own included, never retires a member while another voter could report;
+/// a forming council's sole voter, and the leader at `f = 0` (R8), retire on their own watch.
+pub(crate) fn confirmed_dead_council_members(state: &mut ShardState) -> Vec<HostId> {
+  let now = futures::now_ns();
+  let horizon = crate::lease::horizon_ns();
+  for reports in state.death_reports.values_mut() {
+    reports.retain(|_, (_, at)| now.saturating_sub(*at) <= horizon);
+  }
+  state.death_reports.retain(|_, reports| !reports.is_empty());
+  let own: Vec<HostId> = stable_dead_council_members(state);
+  let quorum = state.fleet.configuration().quorum;
+  let local = state.fleet.host();
+  let voters = state.council.voters();
+  let mut candidates: Vec<HostId> = own.clone();
+  for member in state.death_reports.keys() {
+    if !candidates.contains(member) {
+      candidates.push(*member);
+    }
+  }
+  candidates
+    .into_iter()
+    .filter(|member| {
+      let alive_at = state
+        .fleet
+        .membership()
+        .state(*member)
+        .filter(|belief| belief.liveness == Liveness::Alive)
+        .map(|belief| belief.incarnation);
+      let reported = state.death_reports.get(member).map_or(0, |reports| {
+        reports
+          .iter()
+          .filter(|(voter, (incarnation, _))| {
+            **voter != local
+              && voters.contains(voter)
+              && alive_at.is_none_or(|alive| *incarnation >= alive)
+          })
+          .count()
+      });
+      // `f + 1` of the voters that can vote on the member (itself excluded), or every one of them while the council
+      // has fewer, as a joint write needs every member of a cohort smaller than `f + 1`: a forming council's sole voter
+      // retires on its own view, since no other voter exists to report, and three voters at `f = 1` still need two.
+      let electorate = voters.iter().filter(|voter| *voter != member).count();
+      let votes = usize::from(own.contains(member)).saturating_add(reported);
+      quorum.committed_within(votes, electorate)
+    })
+    .collect()
+}
+
+/// This node's death votes as a report: each council member its stable death watch holds dead, with the incarnation
+/// its view holds it at (0 when it holds none). Format: per member, its id and that incarnation, 8 bytes each, little
+/// endian.
+fn death_report(state: &ShardState) -> Vec<u8> {
+  let mut out = Vec::new();
+  for member in stable_dead_council_members(state) {
+    let incarnation = state
+      .fleet
+      .membership()
+      .state(member)
+      .map_or(0, |belief| belief.incarnation);
+    out.extend_from_slice(&member.0.to_le_bytes());
+    out.extend_from_slice(&incarnation.to_le_bytes());
+  }
+  out
+}
+
+/// Format: one field of a report's entry, a little-endian `u64` (a member id or an incarnation).
+const DEATH_REPORT_FIELD_BYTES: usize = size_of::<u64>();
+
+/// Format: one report's entry, a member then its incarnation ([`DEATH_REPORT_FIELD_BYTES`] each).
+const DEATH_REPORT_ENTRY_BYTES: usize = 2 * DEATH_REPORT_FIELD_BYTES;
+
+/// Takes a voter's death report ([`death_report`]) on [`DEATH_STREAM`]: kept only from a voter of this region's
+/// council, only about current members, at most one entry per member, and answered empty. Malformed bytes are
+/// counted and dropped whole.
+fn serve_death_report(state: &mut ShardState, reporter: HostId, request: &[u8]) -> Vec<u8> {
+  if !same_region(state, reporter) || !state.council.voters().contains(&reporter) {
+    state.count(DEATH_REPORT_REFUSED, 1);
+    return Vec::new();
+  }
+  if !request.len().is_multiple_of(DEATH_REPORT_ENTRY_BYTES) {
+    state.count(DEATH_REPORT_REFUSED, 1);
+    return Vec::new();
+  }
+  let members = state.council.configuration().members.clone();
+  let now = futures::now_ns();
+  for entry in request.as_chunks::<DEATH_REPORT_ENTRY_BYTES>().0 {
+    let (member, incarnation) = entry.split_at(DEATH_REPORT_FIELD_BYTES);
+    let (Ok(member), Ok(incarnation)) = (
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(member),
+      <[u8; DEATH_REPORT_FIELD_BYTES]>::try_from(incarnation),
+    ) else {
+      continue;
+    };
+    let member = HostId(u64::from_le_bytes(member));
+    if !members.contains(&member) || member == reporter {
+      continue;
+    }
+    state
+      .death_reports
+      .entry(member)
+      .or_default()
+      .insert(reporter, (u64::from_le_bytes(incarnation), now));
+  }
+  state.count(DEATH_REPORT_TAKEN, 1);
+  Vec::new()
+}
+
+/// Counter: a death report taken from a voter.
+const DEATH_REPORT_TAKEN: &str = "fleet.council.death_report_taken";
+/// Counter: a death report refused (not a voter of this region's council, or malformed bytes).
+const DEATH_REPORT_REFUSED: &str = "fleet.council.death_report_refused";
+
+/// Format: the stream a voter's death report rides on a record session (§4.8 "Promotion and takeover"): a
+/// membership-path message, sent once a period by a voter that holds a council member dead, never per write
+/// (D-14). Distinct from every other stream the session multiplexes.
+const DEATH_STREAM: u64 = 24;
+
+/// Sends this voter's death report to the other voters ([`death_report`]), once a period while it holds any member
+/// dead: the leader among them counts it toward the `f + 1` a retirement needs.
+async fn send_death_report(others: &[HostId], budget: CommitBudget, in_flight: &mut Vec<Dispatch>) {
+  let Some(report) = state::with_state(|s| death_report(s)) else {
+    return;
+  };
+  if report.is_empty() {
+    return;
+  }
+  let sessions = take_sessions("fleet.lent_to.send_death_report", |host| {
+    others.contains(&host)
+  });
+  if sessions.is_empty() {
+    return;
+  }
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, report.clone(), endpoint))
+    .collect();
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, DEATH_STREAM, Priority::Metadata, budget).await;
+  let recovered: Vec<(HostId, Endpoint)> = replied
+    .into_iter()
+    .map(|(host, _, endpoint)| (host, endpoint))
+    .collect();
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Discard,
+  ));
+  return_sessions(recovered);
 }
 
 /// The regional council serves only its declared region. Root traffic spans all regions.
@@ -820,6 +999,20 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
+/// The budget a live-shipped entry's exchange runs under (A-200): a hard deadline of the daemon's liveness budget, past
+/// which a holder that has not answered is not a live one to wait for (its link is dropped and dialed afresh,
+/// `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply wakes the collector at once).
+/// Derived: `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS / POLL_PER_PERIOD`. Not the consensus round's budget: that is derived
+/// from the slowest path's tail, which a paused holder inflates, so one exchange to it held the holder's only session
+/// past a 40 s wait and the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a
+/// voter; each answers on its own.
+pub(crate) fn live_budget() -> CommitBudget {
+  CommitBudget::hard(
+    crate::daemon::LIVENESS_BUDGET_NS,
+    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+  )
+}
+
 /// The bound on one record-plane exchange: the measured control-plane round budget's full span, the bound every
 /// record-plane exchange runs under.
 pub(crate) fn record_exchange_budget_ns() -> u64 {
@@ -934,7 +1127,7 @@ pub async fn run_membership(transport: FleetTransport) {
   // `Daemon::council_timing` / `slates status` read the live values.
   let floor = ElectionTiming::floor();
   let round = consensus_budget(None);
-  eprintln!(
+  slates_machine::log_line!(
     "slates-server: fleet timing: election timeout = {} × max(broadcast RTT tail over the voters, heartbeat {} ns) = {} periods at the floor (span the same over the tail's spread: {} periods); round budget base = max(heartbeat, tail) = {} ns, stall = max({} periods, tail) = {} ns, extensions {} × {} ns; no path measured yet",
     slates_cluster::timing::ELECTION_MARGIN,
     HEARTBEAT_NS,
@@ -1047,14 +1240,15 @@ impl PeerDriver {
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
-/// The socket refusing ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
-/// rather than a mesh that silently never re-forms.
+/// Only the socket gone ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
+/// rather than a mesh that silently never re-forms; every other refused receive is counted by its kind
+/// ([`SERVE_RECEIVE_EARLIER_SEND`] and its siblings) and the loop reads on.
 async fn run_demux(demux: DemuxId) {
   if let Err(e) = demux.run().await {
     // Counted for `status`, and said once in the log with its reason: a node that silently stopped
     // accepting sessions on a plane is a mesh that never forms with nothing to read but a count.
     count_refusal(SERVE_REFUSED);
-    eprintln!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
+    slates_machine::log_line!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
   }
 }
 
@@ -1122,7 +1316,7 @@ pub(crate) async fn resolve_peer_address(
           // The first refusal of each kind is logged once, so an operator's first look at the daemon's log
           // names the cause; the counts in `status` carry the rest.
           if count_refusal(resolve_refusal(&e)) == 1 {
-            eprintln!("slates-server: fleet: resolving `{host}`: {e}");
+            slates_machine::log_line!("slates-server: fleet: resolving `{host}`: {e}");
           }
           return None;
         }
@@ -1140,7 +1334,10 @@ async fn client_for(
 ) -> Option<Endpoint> {
   let (address, plane) = address;
   let peer = resolve_peer_address(address, plane, certificate, resolver).await?;
-  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+  let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) else {
+    count_refusal(DIAL_SOCKET_REFUSED);
+    return None;
+  };
   let shape = fleet_shape();
   let Some(built) =
     identity.with(|identity| Endpoint::client(socket, peer, identity, certificate, name, shape))
@@ -1148,7 +1345,13 @@ async fn client_for(
     count_refusal(KEPT_UNREACHABLE);
     return None;
   };
-  built.ok()
+  match built {
+    Ok(endpoint) => Some(endpoint),
+    Err(_) => {
+      count_refusal(DIAL_CLIENT_REFUSED);
+      None
+    }
+  }
 }
 
 /// The connection shape every fleet session is built with: the fleet frame cap, the derived receive
@@ -1175,7 +1378,9 @@ fn resolve_refusal(error: &dns::DnsError) -> &'static str {
 /// `client` is driven one `establish` step **on its same socket** (kept for a retry on failure, so the
 /// peer's pinned `accept` completes rather than a fresh-port re-dial being ignored — the establishment
 /// fragility that flaked both the probe mesh's formation and the record plane's takeover under load), and a
-/// client that was consumed but whose session was then lost is rebuilt. Returns the updated `(client, session)`.
+/// client that was consumed but whose session was then lost is rebuilt, its handshake run in the same call. Built in
+/// one call and driven in the next, every redial waited a whole link period first: a median of 101 ms over 487 redials
+/// (diag-live-durability-50), on the way of every resumed peer's catch-up. Returns the updated `(client, session)`.
 async fn establish_session(
   client: Option<Endpoint>,
   session: Option<Endpoint>,
@@ -1189,6 +1394,10 @@ async fn establish_session(
   if session.is_some() {
     return (client, session);
   }
+  let client = match client {
+    Some(endpoint) => Some(endpoint),
+    None => client_for(identity, name, (address, plane), certificate, resolver).await,
+  };
   match client {
     Some(mut endpoint) => match endpoint.establish().await {
       Ok(()) => (None, Some(endpoint)),
@@ -1201,31 +1410,51 @@ async fn establish_session(
       // budget ran out was kept forever and, its flight being a local of that first call, never sent
       // another byte (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
       Err(EndpointError::NotReady)
-        if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
+        if keeps_its_socket(
+          endpoint.handshake_budgets_spent(),
+          endpoint.handshake_stall(),
+        ) =>
       {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         (Some(endpoint), None)
       }
       Err(EndpointError::NotReady) => {
+        count_refusal(dial_stall_counter(endpoint.handshake_stall()));
         // Counted, and said once: a dialer that keeps dialing afresh names the peer it cannot reach.
         if count_refusal(DIAL_REDIAL) == 1 {
-          eprintln!(
+          slates_machine::log_line!(
             "slates-server: fleet: no reply from {address} through {ESTABLISH_BUDGETS_BEFORE_REDIAL} handshake budgets; dialing afresh from a new port"
           );
         }
         (None, None)
       }
       Err(e) => {
+        count_refusal(dial_fault_counter(&e));
         if count_refusal(DIAL_FAULT) == 1 {
-          eprintln!("slates-server: fleet: the handshake to {address} faulted: {e:?}");
+          slates_machine::log_line!(
+            "slates-server: fleet: the handshake to {address} faulted: {e:?}"
+          );
         }
         (None, None)
       }
     },
-    None => (
-      client_for(identity, name, (address, plane), certificate, resolver).await,
-      None,
-    ),
+    None => (None, None),
   }
+}
+
+/// Whether a dialer whose `establish` ended `NotReady` retries on the same socket rather than dialing afresh. A peer
+/// that has not answered may still be booting or starved, so it gets [`ESTABLISH_BUDGETS_BEFORE_REDIAL`] budgets. A
+/// dialer past its confirmation has heard from its peer and is waiting on an end that gave up: another budget on this
+/// socket is another 22 s waiting on state that is gone, which is 44 s of a 41.9 s formation at load 170 (2026-11-08).
+fn keeps_its_socket(budgets_spent: u32, stall: Option<HandshakeStall>) -> bool {
+  !matches!(
+    stall,
+    Some(
+      HandshakeStall::ConfirmDeadline
+        | HandshakeStall::ConfirmSilence
+        | HandshakeStall::ConfirmGarbage
+    )
+  ) && budgets_spent < ESTABLISH_BUDGETS_BEFORE_REDIAL
 }
 
 /// Shape: the handshake budgets a dialer spends on one socket before it dials afresh from a new port. The
@@ -1262,7 +1491,7 @@ async fn serve_peer_records(
   driver: PeerDriver,
 ) {
   if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, "record");
+    count_accept_failure(&e, endpoint.handshake_stall(), "record");
     return;
   }
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
@@ -1297,6 +1526,7 @@ async fn serve_peer_records(
   // verb — never a guess from the bytes.
   let control = state::with_state(|s| s.shard).unwrap_or_default();
   let mut enrolled = false;
+  let mut forwards = crate::forward_lane::ServedForwards::new();
   loop {
     if !enrolled {
       enrolled = state::with_state(|state| {
@@ -1308,189 +1538,233 @@ async fn serve_peer_records(
       .flatten()
       .is_some();
     }
-    let served = endpoint
-      .serve_once_async(|stream, request| {
-        let certificate = certificate.clone();
-        async move {
-          if stream == crate::discovery::STREAM {
-            // Test support: a fault holds this reply after the request arrived (never reachable from the
-            // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
-            // stopped: the interrupted-discovery restart the replacement-voter regression forces.
-            while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
-              crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
-            }
-            let outcome =
-              state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
-            return match outcome {
-              Some(Ok((reply, peer))) => {
-                if let Some(peer) = peer {
-                  driver.start(peer);
-                }
-                reply
-              }
-              Some(Err(refusal)) => {
-                count_refusal(refusal.counter());
-                Vec::new()
-              }
-              None => Vec::new(),
-            };
+    // A forwarded verb runs on its own task (`crate::forward_lane::ServedForwards`), so one waiting on its owner shard
+    // holds no other request of this peer; every other request is served here, one at a time, as before.
+    let next =
+      match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
+        Ok(next) => next,
+        Err(EndpointError::PeerReset) => {
+          count_refusal(SERVE_PEER_RESET);
+          return;
+        }
+        Err(_) => return,
+      };
+    let (stream_id, stream, request) = match next {
+      crate::forward_lane::Next::Forwarded { stream_id, reply } => {
+        if endpoint.reply(stream_id, &reply).is_err() {
+          return;
+        }
+        continue;
+      }
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if kind == FORWARD_STREAM && enrolled => {
+        let served = forwards.spawn(stream_id, async move {
+          injected_serve_delay().await;
+          verbs::injected_forward_silence(&request).await;
+          verbs::serve_forward(control, peer_anchor, &request).await
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, &reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } => (stream_id, kind, request),
+    };
+    let reply = {
+      let certificate = certificate.clone();
+      async move {
+        if stream == crate::discovery::STREAM {
+          // Test support: a fault holds this reply after the request arrived (never reachable from the
+          // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
+          // stopped: the interrupted-discovery restart the replacement-voter regression forces.
+          while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
+            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
           }
-          if !enrolled {
-            count_refusal(ACCEPT_REFUSED);
-            return Vec::new();
-          }
-          match stream {
-            crate::member_task::PLANE_EPOCH_STREAM => plane_secret
-              .and_then(|secret| {
-                state::with_state(|s| {
-                  crate::member_task::accept_announcement(s, peer_anchor, &secret, &request)
-                })
-              })
-              .unwrap_or_default(),
-            RECORD_STREAM => Record::decode(&request)
-              .ok()
-              .and_then(|record| {
-                state::with_state(|s| {
-                  let peer_host = s
-                    .learned_members
-                    .get(&peer_anchor)
-                    .map_or(seed, |learned| learned.host);
-                  accept_held_record(s, local, peer_host, &record)
-                })
-              })
-              .unwrap_or_default(),
-            crate::mirror::MIRROR_PROMISE_STREAM => state::with_state(|s| {
-              let peer_host = s
-                .learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host);
-              crate::mirror::serve_promise(s, local, peer_host, &request)
-            })
-            .unwrap_or_default(),
-            crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
-              let peer_host = s
-                .learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host);
-              crate::mirror::serve(s, local, peer_host, &request)
-            })
-            .unwrap_or_default(),
-            crate::takeover::TAKEOVER_STREAM => state::with_state(|s| {
-              let peer_host = s
-                .learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host);
-              crate::takeover::serve_host_prepare(s, local, peer_host, &request)
-            })
-            .unwrap_or_default(),
-            stream if is_content_stream(stream) => state::with_state(|s| {
-              // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
-              // refuses every content placement — its offers and its chunks, since a complete stage
-              // acknowledges at the offer (AUD-29-55) — counted, so an owner's record is shown to wait on it.
-              if s.merge.fault.refuse_content_puts
-                && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
-              {
-                s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
-                return Vec::new();
+          let outcome =
+            state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
+          return match outcome {
+            Some(Ok((reply, peer))) => {
+              if let Some(peer) = peer {
+                driver.start(peer);
               }
-              // Authority for the object the request names is decided before any lookup (AUD-29-45),
-              // from the committed configuration and this holder's records — never from the content hash.
-              let peer_host = s
-                .learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host);
-              crate::content_holder::serve(
-                s,
-                local,
-                &request,
-                |regional, records, mirror, access, object| {
-                  content_authorized(regional, records, local, peer_host, access, object)
-                    || mirror.admits_put(peer_host, access, object)
-                },
-              )
-            })
-            .unwrap_or_default(),
-            // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
-            crate::merge_service::MERGE_RECORD_STREAM => Record::decode(&request)
-              .ok()
-              .and_then(|record| {
-                state::with_state(|s| {
-                  let peer_host = s
-                    .learned_members
-                    .get(&peer_anchor)
-                    .map_or(seed, |learned| learned.host);
-                  crate::merge_service::accept_merge_record(s, local, peer_host, &record)
-                })
-              })
-              .unwrap_or_default(),
-            CONFIG_STREAM => state::with_state(|s| {
-              serve_council(
-                s,
-                s.learned_members
-                  .get(&peer_anchor)
-                  .map_or(seed, |member| member.host),
-                &request,
-              )
-            })
-            .unwrap_or_default(),
-            CONFIG_FETCH_STREAM => {
-              state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
+              reply
             }
-            RECIPIENT_STREAM => {
-              state::with_state(|s| crate::seal_keys::node_recipient_public(s)).unwrap_or_default()
+            Some(Err(refusal)) => {
+              count_refusal(refusal.counter());
+              Vec::new()
             }
-            PAIR_KEY_STREAM => {
-              state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
-                .unwrap_or_default()
-            }
-            REPORT_STREAM => state::with_state(|s| {
-              let peer_host = s
-                .learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |member| member.host);
-              serve_council_report(s, peer_host, &request)
-            })
-            .unwrap_or_default(),
-            ROOT_STREAM => state::with_state(|s| {
-              serve_root(
-                s,
-                s.learned_members
-                  .get(&peer_anchor)
-                  .map_or(seed, |member| member.host),
-                &request,
-              )
-            })
-            .unwrap_or_default(),
-            ROOT_FETCH_STREAM => {
-              state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
-            }
-            FORWARD_STREAM => {
-              injected_serve_delay().await;
-              verbs::serve_forward(control, peer_anchor, &request).await
-            }
-            crate::owner_location::STREAM => {
-              injected_serve_delay().await;
-              state::with_state(
-                |state| match crate::owner_location::serve(state, &request) {
-                  Ok((reply, declined)) => {
-                    if let Some(declined) = declined {
-                      state.count(declined, 1);
-                    }
-                    reply
-                  }
-                  Err(error) => {
-                    state.count(error.counter(), 1);
-                    Vec::new()
-                  }
-                },
-              )
-              .unwrap_or_default()
-            }
-            _ => Vec::new(),
+            None => Vec::new(),
+          };
+        }
+        if !enrolled {
+          count_refusal(ACCEPT_REFUSED);
+          return Vec::new();
+        }
+        // Test support: a fault holds a live-state reply after its request arrived (never reachable from the wire),
+        // so a takeover's question to this node misses its budget while the probe plane still answers.
+        if stream == slates_cluster::live::LIVE_STATE_STREAM {
+          while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
+            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
           }
         }
-      })
-      .await;
+        match stream {
+          crate::member_task::PLANE_EPOCH_STREAM => plane_secret
+            .and_then(|secret| {
+              state::with_state(|s| {
+                crate::member_task::accept_announcement(s, peer_anchor, &secret, &request)
+              })
+            })
+            .unwrap_or_default(),
+          RECORD_STREAM => Record::decode(&request)
+            .ok()
+            .and_then(|record| {
+              state::with_state(|s| {
+                let peer_host = s
+                  .learned_members
+                  .get(&peer_anchor)
+                  .map_or(seed, |learned| learned.host);
+                accept_held_record(s, local, peer_host, &record)
+              })
+            })
+            .unwrap_or_default(),
+          crate::mirror::MIRROR_PROMISE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::mirror::serve_promise(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          slates_cluster::live::LIVE_ENTRY_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::live_ship::serve_entry(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::live_ship::serve_state(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::mirror::serve(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          crate::takeover::TAKEOVER_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::takeover::serve_host_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          stream if is_content_stream(stream) => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            serve_content_request(s, local, peer_host, stream, &request)
+          })
+          .unwrap_or_default(),
+          // A green's merge record with the inputs it names while this holder lacks them (§4.16 "Apply on holders",
+          // "Commit" in one exchange a version): the inputs are held, then the record recomputed and accepted.
+          crate::merge_service::MERGE_RECORD_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            serve_merge_shipment(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          CONFIG_STREAM => state::with_state(|s| {
+            serve_council(
+              s,
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host),
+              &request,
+            )
+          })
+          .unwrap_or_default(),
+          CONFIG_FETCH_STREAM => {
+            state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
+          }
+          RECIPIENT_STREAM => {
+            state::with_state(|s| crate::seal_keys::node_recipient_public(s)).unwrap_or_default()
+          }
+          PAIR_KEY_STREAM => state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
+            .unwrap_or_default(),
+          DEATH_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |member| member.host);
+            serve_death_report(s, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          REPORT_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |member| member.host);
+            serve_council_report(s, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          ROOT_STREAM => state::with_state(|s| {
+            serve_root(
+              s,
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host),
+              &request,
+            )
+          })
+          .unwrap_or_default(),
+          ROOT_FETCH_STREAM => {
+            state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
+          }
+          crate::owner_location::STREAM => {
+            injected_serve_delay().await;
+            state::with_state(
+              |state| match crate::owner_location::serve(state, &request) {
+                Ok((reply, declined)) => {
+                  if let Some(declined) = declined {
+                    state.count(declined, 1);
+                  }
+                  reply
+                }
+                Err(error) => {
+                  state.count(error.counter(), 1);
+                  Vec::new()
+                }
+              },
+            )
+            .unwrap_or_default()
+          }
+          _ => Vec::new(),
+        }
+      }
+    }
+    .await;
+    let served = endpoint.reply(stream_id, &reply);
     // The sender's state on the connection the peer dialed: where its forwards and reads come back from this node.
     let seen = crate::state::RecordLink::seen(peer_anchor, &endpoint);
     state::with_state(|s| s.served_sessions.insert(peer_anchor.0, seen));
@@ -1513,7 +1787,7 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
 /// authority only advances.
-fn reconcile_held_authority(state: &mut ShardState) {
+pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
@@ -1549,9 +1823,31 @@ pub(crate) fn accept_held_record(
     return Vec::new();
   }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
+    count_record_refusal(state, &error);
     return encode_refusal(&error);
   }
   hold_checked_record(state, local, peer_host, record)
+}
+
+/// The status count of held records accepted into their acceptor whose owner the routing view refused to track (not a
+/// member of the council's configuration), so no acknowledgement was given. Format: a refusal name in the daemon's
+/// status report.
+const RECORD_REFUSED_UNTRACKED: &str = "fleet.record.refused.untracked";
+
+/// Counts a held record this holder refused, by its register refusal kind (`fleet.record.refused.<kind>`), so a sender
+/// whose commit never places shows on the holder why: before these, a holder restarted warm refused a successor's
+/// adoption `ForeignGeneration` every period without a trace. Format: refusal names in the daemon's status report.
+fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
+  let kind = match error {
+    RegisterError::StaleEpoch { .. } => "fleet.record.refused.stale_epoch",
+    RegisterError::ConfigurationStale { .. } => "fleet.record.refused.configuration_stale",
+    RegisterError::Unsupported { .. } => "fleet.record.refused.unsupported",
+    RegisterError::MalformedRecord => "fleet.record.refused.malformed",
+    RegisterError::Unauthorized => "fleet.record.refused.unauthorized",
+    RegisterError::ForeignGeneration { .. } => "fleet.record.refused.foreign_generation",
+    RegisterError::ConflictingPosition => "fleet.record.refused.conflicting_position",
+  };
+  state.count(kind, 1);
 }
 
 /// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
@@ -1614,13 +1910,19 @@ pub(crate) fn hold_checked_record(
           }
           ack.encode()
         }
-        Err(error) => encode_refusal(&error),
+        Err(error) => {
+          state.count(RECORD_REFUSED_UNTRACKED, 1);
+          encode_refusal(&error)
+        }
       }
     }
     // A refusal the sender acts on rides back on the wire (a `ConfigurationStale` naming this node's newer
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
-    Err(error) => encode_refusal(&error),
+    Err(error) => {
+      count_record_refusal(state, &error);
+      encode_refusal(&error)
+    }
   }
 }
 
@@ -1637,10 +1939,76 @@ fn after_held_record(state: &mut ShardState, record: &Record) {
   }
   if let Some(value) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value) {
     crate::tombstone::on_held(state, record.object, value);
+    // A destroyed volume's live log goes with it (A-200): no owner ships to it again.
+    crate::live_ship::let_go(state, record.object);
   } else {
     // A newer head or ledger position may supersede content held for the object (AUD-29-43).
     crate::content_retention::retain_object(state, record.object);
   }
+}
+
+/// Serves one content request from `peer_host` on this holder (§4.10): the content plane's own stream, or a frame of
+/// a merge shipment that carries a record's inputs ([`serve_merge_shipment`]), through the one path.
+fn serve_content_request(
+  s: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  stream: u64,
+  request: &[u8],
+) -> Vec<u8> {
+  // A test's injected placement refusal (§4.16 placed-before-reference): a holder that refuses every content
+  // placement — its offers and its chunks, since a complete stage acknowledges at the offer (AUD-29-55) — counted,
+  // so an owner's record is shown to wait on it.
+  if s.merge.fault.refuse_content_puts
+    && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
+  {
+    s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
+    return Vec::new();
+  }
+  // Authority for the object the request names is decided before any lookup (AUD-29-45), from the committed
+  // configuration and this holder's records — never from the content hash.
+  crate::content_holder::serve(
+    s,
+    local,
+    request,
+    |regional, records, mirror, access, object| {
+      content_authorized(regional, records, local, peer_host, access, object)
+        || mirror.admits_put(peer_host, access, object)
+    },
+  )
+}
+
+/// Serves a merge shipment (§4.16 "Commit" in one exchange a version): its content frames — the offer of the record's
+/// inputs, then their chunks — through the content plane's own path, then the record. The record is accepted only if
+/// its inputs are held by then (`merge_service::accept_merge_record`), so a refused or partial placement answers no
+/// acknowledgement and the owner ships again; the content replies themselves are not the answer.
+fn serve_merge_shipment(
+  s: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Some(frames) = crate::merge_service::decode_shipment(request) else {
+    return Vec::new();
+  };
+  let Some((record, content)) = frames.split_first() else {
+    return Vec::new();
+  };
+  let Ok(record) = Record::decode(record) else {
+    return Vec::new();
+  };
+  if !content.is_empty() {
+    s.count(crate::merge_service::INPUTS_CARRIED, 1);
+  }
+  for (index, frame) in content.iter().enumerate() {
+    let stream = if index == 0 {
+      CONTENT_OFFER_STREAM
+    } else {
+      CONTENT_CHUNK_STREAM
+    };
+    let _ = serve_content_request(s, local, peer_host, stream, frame);
+  }
+  crate::merge_service::accept_merge_record(s, local, peer_host, &record)
 }
 
 /// Validates a record against both the transport principal and installed authority before any effect
@@ -1660,8 +2028,26 @@ pub(crate) fn content_authorized(
   access: slates_cluster::content::ContentAccess,
   object: ObjectId,
 ) -> bool {
+  content_authority(regional, records, local, peer, access, object).is_ok()
+}
+
+/// [`content_authorized`], with the counter naming why not: `peer` is not a member, the object's acting owner is
+/// unknown here, `peer` is not it, or (placing) this node is not among its candidates.
+/// Counter and reason: a placement refused because this node is not among the object's candidates in its own
+/// configuration, the sender being the acting owner ([`content_authority`]); a live holder the volume's record names
+/// admits the entry anyway (`live_ship::admitted`).
+pub(crate) const CONTENT_NOT_A_CANDIDATE: &str = "content.refused.not_a_candidate";
+
+pub(crate) fn content_authority(
+  regional: &slates_db::register::RegionalConfiguration,
+  records: &std::collections::BTreeMap<ObjectId, slates_db::register::Acceptor>,
+  local: HostId,
+  peer: HostId,
+  access: slates_cluster::content::ContentAccess,
+  object: ObjectId,
+) -> Result<(), &'static str> {
   if !regional.members.contains(&peer) {
-    return false;
+    return Err("content.refused.not_a_member");
   }
   let owner = records
     .get(&object)
@@ -1672,21 +2058,32 @@ pub(crate) fn content_authorized(
     regional.successor(owner, object)
   };
   let Some(acting) = acting else {
-    return false;
+    return Err("content.refused.no_acting_owner");
   };
   let candidates = regional
     .configuration_for(acting)
     .map(|configuration| configuration.place(object).candidates)
     .unwrap_or_default();
   match access {
-    slates_cluster::content::ContentAccess::Place => peer == acting && candidates.contains(&local),
+    slates_cluster::content::ContentAccess::Place if peer != acting => {
+      Err("content.refused.not_the_acting_owner")
+    }
+    slates_cluster::content::ContentAccess::Place if !candidates.contains(&local) => {
+      Err(CONTENT_NOT_A_CANDIDATE)
+    }
+    slates_cluster::content::ContentAccess::Place => Ok(()),
     slates_cluster::content::ContentAccess::Read => {
-      peer == acting
+      let allowed = peer == acting
         || candidates.contains(&peer)
         || regional
           .recovery_cohorts(owner, object)
           .iter()
-          .any(|cohort| cohort.contains(&peer))
+          .any(|cohort| cohort.contains(&peer));
+      if allowed {
+        Ok(())
+      } else {
+        Err("content.refused.not_a_reader")
+      }
     }
   }
 }
@@ -1779,21 +2176,8 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       }
       continue;
     }
-    // The catalog register first (AUD-29-17): what a successor serves the volume as, shipped at every
-    // catalog change. The head waits until the catalog's current version is committed, so an adopted head
-    // always meets an adopted catalog as new as the head's own volume.
-    let catalog = object.catalog();
-    let catalog_owed = owed_record(
-      state,
-      config,
-      (catalog, record.catalog_version),
-      crate::catalog::CatalogValue::of(record).to_record_bytes(),
-      local,
-    );
-    let catalog_committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-      head.sequence == record.catalog_version && head.placement.placed(config.quorum)
-    });
-    let catalog_ready = catalog_owed.is_none() || catalog_committed;
+    // The catalog register first (AUD-29-17): the head waits until the catalog's current version is committed.
+    let (catalog_owed, catalog_ready) = owed_catalog(state, config, record, local);
     heads.extend(catalog_owed);
     if !catalog_ready {
       continue;
@@ -1812,10 +2196,55 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
+  // A green's catalog register too (AUD-29-17): its access list is what a successor admits by, and the merge plane
+  // ships no record of the green before the register's current version is committed (`green_catalog_committed`).
+  for id in state.greens.keys() {
+    if let Some(record) = state.db.partition().volume(*id) {
+      heads.extend(owed_catalog(state, config, record, local).0);
+    }
+  }
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads
+}
+
+/// The catalog register of `record` (AUD-29-17) as this owner still owes it to some remote candidate, and whether
+/// its current version is ready to be built on: owed to nobody, or committed at the quorum. The register is what a
+/// successor serves the volume or green as — its owner, policy and access list — shipped at every catalog change,
+/// and a record that names the object's later state (a volume's head, a green's merge record) waits until it is
+/// ready, so an adopted record always meets an adopted catalog as new as its own object.
+fn owed_catalog(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  record: &VolumeRecord,
+  local: HostId,
+) -> (Option<Head>, bool) {
+  let catalog = ObjectId(record.id.bytes).catalog();
+  let owed = owed_record(
+    state,
+    config,
+    (catalog, record.catalog_version),
+    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    local,
+  );
+  let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
+    head.sequence == record.catalog_version && head.placed_under(config, catalog)
+  });
+  let ready = owed.is_none() || committed;
+  (owed, ready)
+}
+
+/// Whether the green `id`'s catalog register is ready for its merge records to ship (AUD-29-17; see [`owed_catalog`]):
+/// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
+/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
+/// stands for both registers (AUD-29-43). Read on the green's owner shard.
+pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .is_none_or(|record| owed_catalog(state, state.fleet.configuration(), record, local).1)
 }
 
 /// The stage of a destroyed volume's tombstone this owner still owes some candidate (AUD-29-43; see
@@ -3076,7 +3505,7 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let head = state.placed_heads.get(object)?;
-      if head.sequence != job.sequence || !head.placement.placed(quorum) {
+      if head.sequence != job.sequence || !head.placed_under(state.fleet.configuration(), *object) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();
@@ -3317,16 +3746,16 @@ async fn adopt_and_serve(
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
-  materialize_adopted_objects(origin, budget).await;
+  materialize_adopted_objects(origin, local, budget).await;
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
-async fn materialize_adopted_objects(origin: u16, budget: CommitBudget) {
+async fn materialize_adopted_objects(origin: u16, local: HostId, budget: CommitBudget) {
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, budget).await;
-  materialize_pending_greens(origin).await;
+  materialize_pending_greens(origin, local).await;
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -3401,61 +3830,196 @@ const TOMBSTONE_ADOPT_REFUSED: &str = "fleet.tombstone.adopt_refused";
 /// gathered on this control shard from the node's own accepted merge records and the inputs it holds
 /// (`merge_service::recover_green_inputs`), moved by value to the owner shard, and there re-recorded
 /// durably and replayed into a fresh engine whose head identity must equal the adopted record's
-/// (`verbs::materialize_taken_over_green`). A green whose inputs are not all held, or whose adopted
-/// version lies beyond this node's accepted prefix (the general ledger-prefix transfer, GAP-A9-7, is
-/// still owed), is counted and stays pending; a mismatch is fatal-and-loud for the green here.
-async fn materialize_pending_greens(origin: u16) {
+/// (`verbs::materialize_taken_over_green`). A green whose catalog is not adopted, whose inputs are not all held, or
+/// whose adopted version lies beyond this node's accepted prefix (the general ledger-prefix transfer, GAP-A9-7, is still
+/// owed) is counted and stays pending, as one the owner shard refused does.
+///
+/// **Bounded** (2026-11-09; the supervisor's order: a wait no branch can clear is an unbounded retry, which the rules
+/// forbid whatever caused it). Each pending green is attempted once a period; past [`green_takeover_attempts`] it is
+/// given up on ([`give_up_green`]): its owner shard records it unrecovered, naming what the last attempt waited on, so
+/// every verb on it answers `Refusal::NotRecovered { cause: TakeoverIncomplete }`, and this node claims it to lookups so
+/// a read from elsewhere meets that answer. Before, every branch retried each period without end: the green-share
+/// takeover test once waited out its 4,000-period budget so (GAPS 2026-11-09).
+async fn materialize_pending_greens(origin: u16, local: HostId) {
   let pending: Vec<(ObjectId, crate::merge_service::MergeRecordValue)> = state::with_state(|s| {
     s.pending_green_materializations
       .iter()
-      .map(|(object, adopted)| (*object, adopted.clone()))
+      .map(|(object, pending)| (*object, pending.merge.clone()))
       .collect()
   })
   .unwrap_or_default();
   for (object, adopted) in pending {
-    let recovery =
-      state::with_state(|s| crate::merge_service::recover_green_inputs(s, object, &adopted))
-        .flatten();
-    let Some(recovery) = recovery else {
-      count_refusal(GREEN_TAKEOVER_INCOMPLETE);
+    let Err(waited) = materialize_green(origin, object, &adopted).await else {
       continue;
     };
-    let id = DbVolumeId { bytes: object.0 };
-    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
-    // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
-    // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
-    // so the successor's record plane writes the green's next versions at the promotion epoch.
-    let Some((target, placed)) = state::with_state(|s| {
-      let target = s.shards.get(usize::from(partition)).copied()?;
-      let placed = s.placed_heads.get(&object).cloned()?;
-      Some((target, placed))
+    count_refusal(waited.counter());
+    let given_up = state::with_state(|s| {
+      let bound = green_takeover_attempts(s.config.failover_slo_ns);
+      let pending = s.pending_green_materializations.get_mut(&object)?;
+      pending.attempts = pending.attempts.saturating_add(1);
+      (pending.attempts >= bound).then_some(pending.attempts)
     })
-    .flatten() else {
-      continue;
-    };
-    let served = call_within(
+    .flatten();
+    if let Some(attempts) = given_up {
+      give_up_green(origin, local, object, waited, attempts).await;
+    }
+  }
+}
+
+/// What a taken-over green's materialization waited on when an attempt could not finish ([`materialize_green`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GreenWait {
+  /// Its catalog register, or that register's placement, is not adopted (AUD-29-17).
+  Catalog,
+  /// Its chain could not be gathered: an input not held, or the adopted version beyond this node's accepted prefix.
+  Chain,
+  /// No placement of its adopted record here, or no shard for the partition its id names.
+  Placement,
+  /// The owner shard refused the rebuilt green (a recomputed identity that does not match the adopted record's, or a
+  /// catalog refusal), or did not answer within the period.
+  Refused,
+}
+
+impl GreenWait {
+  /// The counter an attempt that waited so moves.
+  const fn counter(self) -> &'static str {
+    match self {
+      GreenWait::Catalog => GREEN_TAKEOVER_WAITS_CATALOG,
+      GreenWait::Chain => GREEN_TAKEOVER_INCOMPLETE,
+      GreenWait::Placement => GREEN_TAKEOVER_WAITS_PLACEMENT,
+      GreenWait::Refused => GREEN_TAKEOVER_REFUSED,
+    }
+  }
+
+  /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).
+  const fn named(self) -> &'static str {
+    match self {
+      GreenWait::Catalog => "catalog",
+      GreenWait::Chain => "chain",
+      GreenWait::Placement => "placement",
+      GreenWait::Refused => "refused",
+    }
+  }
+}
+
+/// Derived: the materialization attempts a taken-over green gets before it is given up on: the failover SLO's worth of
+/// the fleet's periods (`failover_slo_ns / HEARTBEAT_NS`, at least one), each one attempt. Counted in attempts, not wall
+/// time, so a loaded node whose periods run late is given its attempts all the same; the SLO is the operator's bound on
+/// how long a takeover may leave an object unserved (§4.8).
+fn green_takeover_attempts(failover_slo_ns: u64) -> u32 {
+  u32::try_from((failover_slo_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
+}
+
+/// One attempt to materialize the taken-over green `object` from its `adopted` merge record: `Ok` once it serves on
+/// its owner shard (and is no longer pending), else what it waited on.
+async fn materialize_green(
+  origin: u16,
+  object: ObjectId,
+  adopted: &crate::merge_service::MergeRecordValue,
+) -> Result<(), GreenWait> {
+  // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
+  // record before its current catalog is committed): the green's access list. Until it and its
+  // placement are adopted the materialization waits, as a volume's does (AUD-29-17).
+  let catalog = state::with_state(|s| {
+    let catalog = s.pending_catalogs.get(&object).cloned();
+    let placed = s.placed_heads.get(&object.catalog()).cloned();
+    catalog.zip(placed)
+  })
+  .flatten();
+  let Some(((catalog_sequence, catalog), catalog_placed)) = catalog else {
+    return Err(GreenWait::Catalog);
+  };
+  let recovery = state::with_state(|s| {
+    crate::merge_service::recover_green_inputs(s, object, adopted, (catalog_sequence, &catalog))
+  })
+  .flatten()
+  .ok_or(GreenWait::Chain)?;
+  let id = DbVolumeId { bytes: object.0 };
+  let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
+  // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
+  // so the successor's record plane writes the green's next versions at the promotion epoch.
+  let (target, placed) = state::with_state(|s| {
+    let target = s.shards.get(usize::from(partition)).copied()?;
+    let placed = s.placed_heads.get(&object).cloned()?;
+    Some((target, placed))
+  })
+  .flatten()
+  .ok_or(GreenWait::Placement)?;
+  let served = call_within(
+    origin,
+    target,
+    move |s| {
+      let served =
+        past_the_pressure_hold(s, |s| verbs::materialize_taken_over_green(s, id, recovery)).is_ok();
+      if served {
+        s.placed_heads.insert(object, placed);
+        s.placed_heads.insert(object.catalog(), catalog_placed);
+      }
+      served
+    },
+    HEARTBEAT_NS,
+  )
+  .await;
+  if served != Some(true) {
+    return Err(GreenWait::Refused);
+  }
+  state::with_state(|s| {
+    s.pending_green_materializations.remove(&object);
+    s.pending_catalogs.remove(&object);
+  });
+  Ok(())
+}
+
+/// Gives up on the taken-over green `object` after `attempts` that each `waited` ([`materialize_pending_greens`]): its
+/// owner shard records it unrecovered with that cause, so every verb on it answers `Refusal::NotRecovered`; this node
+/// stops attempting it and claims it to lookups as its owner (`local`), so a read from another node is routed here and
+/// meets the answer. Counted and logged. With no shard for its partition here nothing on this node can serve it or
+/// record it: it is dropped, counted and logged all the same, and its verbs answer as for any id this node does not
+/// own. An owner shard that does not answer the period leaves it pending, given up on again the next.
+async fn give_up_green(
+  origin: u16,
+  local: HostId,
+  object: ObjectId,
+  waited: GreenWait,
+  attempts: u32,
+) {
+  let id = DbVolumeId { bytes: object.0 };
+  let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  let target = state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten();
+  if let Some(target) = target {
+    let recorded = call_within(
       origin,
       target,
       move |s| {
-        let served =
-          past_the_pressure_hold(s, |s| verbs::materialize_taken_over_green(s, id, recovery))
-            .is_ok();
-        if served {
-          s.placed_heads.insert(object, placed);
-        }
-        served
+        s.unrecovered.insert(
+          id,
+          slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+            waited_on: waited.named().to_owned(),
+          },
+        );
       },
       HEARTBEAT_NS,
     )
-    .await;
-    state::with_state(|s| {
-      if served == Some(true) {
-        s.pending_green_materializations.remove(&object);
-      } else {
-        s.count(GREEN_TAKEOVER_REFUSED, 1);
-      }
-    });
+    .await
+    .is_some();
+    if !recorded {
+      // The owner shard did not answer this period: the green stays pending, given up on again next period.
+      return;
+    }
   }
+  state::with_state(|s| {
+    s.pending_green_materializations.remove(&object);
+    s.pending_catalogs.remove(&object);
+    crate::takeover::track_owner_on_every_shard(s, object, local);
+    s.count(GREEN_TAKEOVER_GIVEN_UP, 1);
+  });
+  slates_machine::log_line!(
+    "slates daemon: a taken-over green {} was not materialized after {attempts} attempts, one a period (the failover \
+     SLO's worth), the last waiting on its {}; every verb on it answers NotRecovered",
+    crate::verbs::hex_of(&object.0),
+    waited.named()
+  );
 }
 
 /// Waits out a test's injected serve delay (`Daemon::inject_serve_delay`) before a location answer or a forwarded
@@ -3517,12 +4081,24 @@ const MATERIALIZE_WAITS_CATALOG_PLACEMENT: &str = "fleet.materialize.waits.catal
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_WAITS_SHARD: &str = "fleet.materialize.waits.shard";
 
+/// A taken-over green whose catalog register (its access list) or that register's placement was not yet
+/// adopted this period; it stays pending and is retried.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_WAITS_CATALOG: &str = "merge.takeover_waits_catalog";
 /// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
 /// version beyond this node's accepted prefix); it stays pending and is retried.
 const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
 /// A taken-over green the owner shard refused to materialize (a recomputed identity that does not
 /// match the adopted record's, or a catalog refusal); it stays pending, counted.
 const GREEN_TAKEOVER_REFUSED: &str = "merge.takeover_refused";
+/// A taken-over green with no placement of its adopted record here, or no shard for its partition, this period; it
+/// stays pending and is retried. Before 2026-11-09 this branch was not counted at all.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_WAITS_PLACEMENT: &str = "merge.takeover_waits_placement";
+/// A taken-over green given up on past its attempts ([`green_takeover_attempts`]): every verb on it answers
+/// `NotRecovered { cause: TakeoverIncomplete }`. Zero is the healthy reading.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_GIVEN_UP: &str = "merge.takeover_given_up";
 
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
@@ -3589,7 +4165,38 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     }
     None => return,
   };
+  // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
+  // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
+  // records (A-240). A catalog that records none had a shipper that never shipped (it ships only once its holders are
+  // placed with the catalog, `live_ship::holders_placed`): no log exists, and the volume is served from its placed seal.
+  let live = if let Some(recorded) = catalog
+    .live_holders
+    .as_ref()
+    .filter(|_| catalog.live_shipped)
+  {
+    let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
+    let mut candidates = placed.placement.candidates.clone();
+    let current =
+      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
+    for host in current {
+      if !candidates.contains(&host) {
+        candidates.push(host);
+      }
+    }
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+      Ok(fetched) => fetched,
+      Err(waits) => {
+        count_refusal(waits);
+        return;
+      }
+    }
+  } else {
+    None
+  };
   let region = head.content_holders.clone();
+  // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
+  // remembered at it (`live_ship::note_rebuild`).
+  let adopted_head = live.as_ref().map(|fetched| fetched.head);
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -3621,6 +4228,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         }
         adopted
       });
+      // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
+      if let Some(fetched) = &live {
+        let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
+        past_the_pressure_hold(s, |s| {
+          verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
+        })
+        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        s.placed_heads.insert(object, placed);
+        s.placed_heads.insert(object.catalog(), catalog_placed);
+        return Ok(());
+      }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
       let opened = match archive {
         Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {
@@ -3645,6 +4263,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     HEARTBEAT_NS,
   )
   .await;
+  if let Some(adopted) = adopted_head {
+    match &served {
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
+      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      None => {}
+    }
+  }
   state::with_state(|s| match served {
     Some(Ok(())) => {
       s.pending_materializations.remove(&object);
@@ -3767,6 +4392,17 @@ fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refus
 /// because the socket refused — the node no longer accepts sessions on that plane.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
+/// The status refusal counts of the serve sockets' refused receives that did not end their loops, summed over the
+/// planes, one per kind (`slates_rt::error::ReceiveRefusal`; `DemuxCounters::receive_refused_earlier_send` and its
+/// siblings): an earlier send's report, the OS short of memory, anything else.
+/// Format: refusal names in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_EARLIER_SEND: &str = "fleet.serve.receive_refused.earlier_send";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_RESOURCES: &str = "fleet.serve.receive_refused.resources";
+/// See [`SERVE_RECEIVE_EARLIER_SEND`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_RECEIVE_OTHER: &str = "fleet.serve.receive_refused.other";
 
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
@@ -3783,6 +4419,16 @@ const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
+
+/// Counter: a borrowed record session returned reset by its peer (A-261, `EndpointError::PeerReset`: the peer restarted
+/// under the same identity and no longer holds it), its link dropped so the link task dials the new process.
+/// Format: a counter name in the daemon's status report.
+const LINK_PEER_RESET: &str = "fleet.link.peer_reset";
+
+/// Counter: a served record session its dialer reset (A-261: a process restarted onto the dialer's port, under its
+/// identity), its serve loop ended.
+/// Format: a counter name in the daemon's status report.
+const SERVE_PEER_RESET: &str = "fleet.serve.peer_reset";
 /// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
 /// record link to it (never established, or removed at its retirement), its session lent to a coordinator
 /// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a
@@ -3811,7 +4457,7 @@ const RESOLVE_IO: &str = "fleet.resolve.io";
 
 /// The status count of a forward that found its session held by the record link task itself (a discovery page or
 /// a dial), not lent through [`take_sessions`]: the holder named beside `fleet.forward.session_out`.
-const LENT_TO_LINK: &str = "fleet.lent_to.link";
+pub(crate) const LENT_TO_LINK: &str = "fleet.lent_to.link";
 
 /// The status refusal counts under which a dial task records a handshake that ran out its budgets with
 /// the peer silent (`fleet.dial.redial`: the socket is dropped and the next period dials afresh) and one
@@ -3821,6 +4467,53 @@ const LENT_TO_LINK: &str = "fleet.lent_to.link";
 /// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
 const DIAL_REDIAL: &str = "fleet.dial.redial";
 const DIAL_FAULT: &str = "fleet.dial.fault";
+/// A dial that could not bind its socket.
+const DIAL_SOCKET_REFUSED: &str = "fleet.dial.socket_refused";
+/// A dial whose client endpoint could not be built.
+const DIAL_CLIENT_REFUSED: &str = "fleet.dial.client_refused";
+
+/// The counter for a dial's handshake budget spent, by which of the handshake's bounds spent it
+/// (`slates_transport::endpoint::HandshakeStall`): a formation stalled on dials says here why they are not completing.
+fn dial_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.dial.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.dial.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.dial.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.dial.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.dial.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.dial.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.dial.stall.confirm_garbage",
+    None => "fleet.dial.stall.unnamed",
+  }
+}
+
+/// The counter for an accepted handshake that gave up, by the bound that ended it ([`dial_stall_counter`]'s kinds).
+fn accept_stall_counter(stall: Option<HandshakeStall>) -> &'static str {
+  match stall {
+    Some(HandshakeStall::Silence) => "fleet.accept.stall.silence",
+    Some(HandshakeStall::Repeats) => "fleet.accept.stall.repeats",
+    Some(HandshakeStall::Fragments) => "fleet.accept.stall.fragments",
+    Some(HandshakeStall::TurnCeiling) => "fleet.accept.stall.turn_ceiling",
+    Some(HandshakeStall::ConfirmDeadline) => "fleet.accept.stall.confirm_deadline",
+    Some(HandshakeStall::ConfirmSilence) => "fleet.accept.stall.confirm_silence",
+    Some(HandshakeStall::ConfirmGarbage) => "fleet.accept.stall.confirm_garbage",
+    None => "fleet.accept.stall.unnamed",
+  }
+}
+
+/// The counter for a dial's handshake that faulted, by the transport's typed reason.
+fn dial_fault_counter(error: &EndpointError) -> &'static str {
+  match error {
+    EndpointError::Handshake(_) => "fleet.dial.fault.handshake",
+    EndpointError::Tls(_) => "fleet.dial.fault.tls",
+    EndpointError::Io(_) => "fleet.dial.fault.io",
+    EndpointError::Closed => "fleet.dial.fault.closed",
+    EndpointError::Admission(_) => "fleet.dial.fault.admission",
+    EndpointError::PeerParameters(_) => "fleet.dial.fault.peer_parameters",
+    EndpointError::PeerClosed => "fleet.dial.fault.peer_closed",
+    _ => "fleet.dial.fault.other",
+  }
+}
 
 /// The status refusal count under which the serve side records an accepted session whose handshake did
 /// not complete (the dialer gave up, or its flight faulted); the log's first line says why.
@@ -3838,7 +4531,10 @@ const ACCEPT_PEER_CAPACITY: &str = "fleet.accept.peer_capacity";
 
 /// Classifies the transport's typed handshake result without hiding a real TLS or socket failure
 /// behind an expected replacement. Both serve planes use the same distinction.
-fn count_accept_failure(error: &EndpointError, plane: &str) {
+fn count_accept_failure(error: &EndpointError, stall: Option<HandshakeStall>, plane: &str) {
+  if matches!(error, EndpointError::NotReady) {
+    count_refusal(accept_stall_counter(stall));
+  }
   let counter = match error {
     EndpointError::Closed => ACCEPT_REPLACED,
     EndpointError::Admission(slates_transport::demux::SessionRefusal::PeerSessions) => {
@@ -3850,7 +4546,9 @@ fn count_accept_failure(error: &EndpointError, plane: &str) {
     _ => ACCEPT_HANDSHAKE_REFUSED,
   };
   if count_refusal(counter) == 1 {
-    eprintln!("slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}");
+    slates_machine::log_line!(
+      "slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}"
+    );
   }
 }
 
@@ -3863,6 +4561,59 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
     *count
   })
   .unwrap_or(0)
+}
+
+/// This node's **direct probe mesh** (§4.8): the members its membership holds alive that it keeps direct contact with
+/// ([`keeps_direct_contact_with`]), this node left out, and those of them with no formed probe session yet. Over the
+/// alive membership, not the council's configuration: from the bootstrap until the others are admitted the configuration
+/// names the bootstrapping node alone, so a mesh judged over it was formed over nothing, and a fleet test's formation
+/// wait could pass before any session existed (live-fixes, 2026-11-07, red in 38 s; status showed `in_contact=0
+/// probed=4` the same way, diag-live-fixes-32).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeMesh {
+  /// The peers held alive that this node keeps direct contact with.
+  pub(crate) in_contact: Vec<HostId>,
+  /// Those with no formed probe session.
+  pub(crate) unmeshed: Vec<HostId>,
+  /// Every member held alive, this node among them.
+  pub(crate) alive: Vec<HostId>,
+  /// Whether the membership knows any member but this node, alive, suspected or dead.
+  pub(crate) others_known: bool,
+}
+
+impl ProbeMesh {
+  /// Whether the mesh is up: every peer in contact has a formed probe session, and once the membership knows another
+  /// member at least one peer is in contact, so a fleet of several members never counts itself meshed over no peer
+  /// at all (its peers not reached yet, or all of them dead). A laptop, which knows no other member, is meshed (R8).
+  pub(crate) fn meshed(&self) -> bool {
+    self.unmeshed.is_empty() && (!self.others_known || !self.in_contact.is_empty())
+  }
+}
+
+/// This node's probe mesh as it stands ([`ProbeMesh`]).
+pub(crate) fn probe_mesh(state: &ShardState) -> ProbeMesh {
+  let host = state.fleet.host();
+  let membership = state.fleet.membership();
+  let alive = membership.alive();
+  let others_known = alive.iter().any(|member| *member != host)
+    || !membership.suspects().is_empty()
+    || !membership.dead().is_empty();
+  let in_contact: Vec<HostId> = alive
+    .iter()
+    .copied()
+    .filter(|peer| *peer != host && keeps_direct_contact_with(state, *peer))
+    .collect();
+  let unmeshed = in_contact
+    .iter()
+    .copied()
+    .filter(|peer| !state.formed_probe_peers.contains(peer))
+    .collect();
+  ProbeMesh {
+    in_contact,
+    unmeshed,
+    alive,
+    others_known,
+  }
 }
 
 /// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
@@ -3937,6 +4688,10 @@ enum DirectContact {
   /// dropped a member outside its neighbourhood, never announced the pair's epoch once formation's
   /// everyone-contacts-everyone window closed, and the member's probes to it went unanswered for 4,000 periods.
   AsVoter,
+  /// Believed dead, but it announced itself since over an authenticated session at the incarnation it died at: its
+  /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
+  /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
+  Returned,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -3949,6 +4704,27 @@ impl DirectContact {
   }
 }
 
+/// The contact kept with `peer`, which this node holds dead: see [`DirectContact`]'s first three dead variants.
+fn dead_contact(state: &ShardState, peer: HostId) -> DirectContact {
+  if is_unlearned_seed(state, peer) {
+    DirectContact::UnlearnedSeed
+  } else if returned_since_death(state, peer) {
+    DirectContact::Returned
+  } else {
+    DirectContact::BelievedDead
+  }
+}
+
+/// Whether `peer`, held dead here, has announced itself since at the incarnation it died at (`ShardState::returned_members`).
+fn returned_since_death(state: &ShardState, peer: HostId) -> bool {
+  let incarnation = state
+    .fleet
+    .membership()
+    .state(peer)
+    .map(|belief| belief.incarnation);
+  incarnation.is_some() && state.returned_members.get(&peer).copied() == incarnation
+}
+
 fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
   let believed_dead = state
     .fleet
@@ -3956,11 +4732,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .state(peer)
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
-    if is_unlearned_seed(state, peer) {
-      DirectContact::UnlearnedSeed
-    } else {
-      DirectContact::BelievedDead
-    }
+    dead_contact(state, peer)
   } else if !state.council.initialized() || !state.root.initialized() {
     DirectContact::Forming
   } else if !state.council.configuration().members.contains(&peer) {
@@ -4022,6 +4794,8 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
+  // Whether this link is idling because the peer is out of direct contact, so the idle is counted once on entering it.
+  let mut idling = false;
   // When the next discovery page is due, and the wait after it (see `next_discovery_wait`).
   let mut discovery_due: u64 = 0;
   let mut discovery_wait: u64 = HEARTBEAT_NS;
@@ -4038,8 +4812,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
     peer_host = refresh_record_identity(anchor, peer_host, &mut client, &mut discovery_cursor);
-    let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
-    if retired == Some(true) {
+    if out_of_contact(peer_host, &mut idling) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
@@ -4078,6 +4851,23 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
+
+/// Whether `peer` is out of this node's direct contact, so its record link idles; entering the idle is counted
+/// ([`LINK_OUT_OF_CONTACT`]), so a pair with no record session tells by design from a link that failed.
+fn out_of_contact(peer: HostId, idling: &mut bool) -> bool {
+  let out = state::with_state(|s| !keeps_direct_contact_with(s, peer)) == Some(true);
+  if out && !*idling {
+    count_refusal(LINK_OUT_OF_CONTACT);
+  }
+  *idling = out;
+  out
+}
+
+/// Counter: a record link that went idle because its peer is out of this node's direct contact (`keeps_direct_contact_with`:
+/// neither holds for the other, and neither votes nor is staged), counted on entering the idle. Two such members form
+/// no record session and no probe session by design (raft-chaos's five-node flow took such a pair for a stall: the two
+/// non-voters held 3 of 4 peers probed for a whole fleet wait, CI diag-live-fixes-30).
+const LINK_OUT_OF_CONTACT: &str = "fleet.link.out_of_contact";
 
 /// Counter: a discovery page sent over a record link (a settled roster's pages back off to one per horizon a peer).
 /// Format: a counter name in the daemon's status report.
@@ -4218,6 +5008,7 @@ async fn enroll_record_session(
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
     });
+    crate::live_ship::holder_reached(peer_host);
   }
 }
 
@@ -4382,6 +5173,7 @@ async fn exchange_discovery(
   let span_ns = consensus_budget(slowest_path_tail_ns()).max_deadline_ns();
   // Every page counted: the non-vacuity counter for the record link's discovery backoff (`next_discovery_wait`).
   count_refusal(DISCOVERY_PAGES);
+  let before = session.last_exchange();
   let exchanged = {
     let mut exchange =
       std::pin::pin!(session.request(crate::discovery::STREAM, Priority::Metadata, &request));
@@ -4416,10 +5208,9 @@ async fn exchange_discovery(
   let reply = match exchanged {
     Ok(reply) => reply,
     Err(fault) => {
-      // The request future was dropped mid-exchange: abandoned, so its frames do not ride a later flush.
-      if let Some(abandoned) = session.last_exchange() {
-        session.abandon(abandoned);
-      }
+      // The request future was dropped mid-exchange: abandoned, so its frames do not ride a later flush (only its own:
+      // a forward the lane left open on this session is not this page's).
+      session.abandon_begun_since(before);
       count_refusal(fault.counter());
       if matches!(fault, DiscoveryFault::Invalidated)
         && let Some(reason) =
@@ -4727,7 +5518,7 @@ const ROOT_FETCH_STREAM: u64 = 10;
 /// cannot serve locally is forwarded to the node that can (today the operator's `PromoteRegion` to the root
 /// leader; general volume-verb forwarding to a remotely-homed volume's owner is owed). The request is an
 /// encoded `RequestBody`, the reply an encoded `ReplyBody` ([`slates_ipc::protocol::encode_body`]).
-const FORWARD_STREAM: u64 = 11;
+pub(crate) const FORWARD_STREAM: u64 = 11;
 
 /// Format: the stream id a member's **report** to the council rides on a record session (§4.8 "Neighbourhood
 /// changes", "Promotion and takeover"): a settlement or a takeover confirmation the member makes about itself,
@@ -5386,6 +6177,21 @@ async fn drive_council_election(
 /// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
 /// successor's only cue, as it receives no records for the dead owner's objects). Equal in steady state, so a
 /// converged learner fetches nothing. Compared as sets; both include this node.
+/// Whether a member of this node's region has announced, on its probes, a configuration newer than the one this node's
+/// council holds (`AnswersGiven::announced_versions`): evidence that the council committed a change this learner has not
+/// fetched. A change that leaves the membership alone (a voter change, an owner's settlement) shows no divergence in
+/// the learner's own view, so before this a learner held version 12 while its region stood at 17, and reported its
+/// settlement 359 times for a generation the council had moved past (CI diag-live-fixes-21). Another region's members
+/// announce their own council's versions, another counter, so only this region's count.
+fn region_announces_newer_configuration(state: &ShardState) -> bool {
+  let own = state.council.configuration().version;
+  state
+    .answers_given
+    .announced_versions
+    .iter()
+    .any(|(peer, announced)| *announced > own && same_region(state, *peer))
+}
+
 fn membership_diverges_from_config(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<HostId> =
     state.fleet.membership().alive().into_iter().collect();
@@ -5418,7 +6224,8 @@ fn reconcile_council_membership(s: &mut ShardState) {
   // retiring it there is an irreversible consensus action on a revocable belief, and it drops a live
   // member — leaving a later loss's survivors short of a majority
   // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
-  let dead = stable_dead_council_members(s);
+  // And only once f + 1 voters hold it dead, this leader's watch one of them (§4.8 "Promotion and takeover").
+  let dead = confirmed_dead_council_members(s);
   s.council.reconcile_alive(&alive, &dead);
   // The voter set follows the committed membership (Raft §6, one joint change at a time): a voter taken
   // over leaves the consensus set — it stops counting toward every majority — and a member this node
@@ -5595,7 +6402,7 @@ async fn drive_config_council(
         due
       } else {
         s.council_learner_pace.reset();
-        membership_diverges_from_config(s)
+        membership_diverges_from_config(s) || region_announces_newer_configuration(s)
       }
     })
     .unwrap_or(false);
@@ -5639,12 +6446,33 @@ async fn drive_config_council(
     timer.reset();
     return;
   }
+  follow_council_period(
+    &others,
+    budget,
+    timer,
+    &timing,
+    (contact, local, rank),
+    in_flight,
+  )
+  .await;
+}
+
+/// One period as a council **follower** ([`drive_config_council`]): its election timer, and its death report to the
+/// leader, which retires a member only once f + 1 voters hold it dead.
+async fn follow_council_period(
+  others: &[HostId],
+  budget: CommitBudget,
+  timer: &mut ElectionTimer,
+  timing: &ElectionTiming,
+  (contact, local, rank): (u64, HostId, usize),
+  in_flight: &mut Vec<Dispatch>,
+) {
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
   // jittered timeout under this period's derived timing and campaigns there. Silent past the minimum
   // election timeout, it forgets its leader so the voter it yields to wins its pre-vote (thesis §4.2.3).
-  match timer.follower_period(contact, &timing, local, rank) {
+  match timer.follower_period(contact, timing, local, rank) {
     FollowerStep::Campaign => {
-      drive_council_election(&others, budget, in_flight).await;
+      drive_council_election(others, budget, in_flight).await;
       // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
       // makes this node leader next period; a lost one waits out the timer again.
       if let Some(contact) = state::with_state(|s| s.council.leader_contact()) {
@@ -5656,6 +6484,8 @@ async fn drive_config_council(
     }
     FollowerStep::Follow => {}
   }
+  // A voter's deaths reach the leader, which retires a member only once f + 1 voters hold it dead.
+  send_death_report(others, budget, in_flight).await;
 }
 
 /// Each alive region's **representative** host as this node sees it (§4.8, D-14): the lowest-id host of the
@@ -6407,6 +7237,11 @@ async fn run_record_plane(local: HostId) {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
     slates_rt::registry::with_current(|ctx| ctx.beat_progress());
+    // The merge record plane stamps each version with the period it first works it in, and judges its placement by
+    // it (`merge_service::PLACED_WITHIN_PERIOD`).
+    let _ = state::with_state(|s| {
+      s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+    });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
     // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers
@@ -6444,7 +7279,62 @@ async fn run_record_plane(local: HostId) {
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
     adopt_and_serve(origin, local, budget, &mut in_flight).await;
-    crate::daemon::pace(HEARTBEAT_NS).await;
+    pace_running_merges(
+      origin,
+      &shards,
+      local,
+      budget,
+      &mut owner_acceptor,
+      &mut in_flight,
+    )
+    .await;
+  }
+}
+
+/// Waits out the coordinator's period ([`HEARTBEAT_NS`]), running the merge record plane at once each time an owner
+/// shard nudges it (§4.16 "Commit"; `merge_service::nudge_record_plane`): a version enqueued, or an input or record of
+/// one newly acknowledged. A submit at `f > 0` is answered when its record commits, so its answer waits for the
+/// exchange rather than the period; the council, the root, the seals and the heads keep the period. The merge plane
+/// runs here, on the coordinator, because the owner's acceptor and the holders' sessions are the coordinator's.
+/// Before, each version's inputs were put at one period and its record shipped at the next: one submit at a time on an
+/// idle three-node fleet at `f = 1` took 208 to 647 ms (2026-11-06, the bug record of that day, "a submit at f = 1
+/// waited for the coordinator's period").
+async fn pace_running_merges(
+  origin: u16,
+  shards: &[u16],
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let period_ends = slates_rt::futures::now_ns().saturating_add(HEARTBEAT_NS);
+  loop {
+    let remaining = period_ends.saturating_sub(slates_rt::futures::now_ns());
+    if remaining == 0 {
+      return;
+    }
+    match slates_rt::futures::within(remaining, crate::merge_service::nudged()).await {
+      Ok(Some(())) => {
+        in_flight.retain_mut(|dispatch| !dispatch.settle());
+        for shard in shards.iter().copied() {
+          crate::merge_service::run_merge_period(
+            origin,
+            shard,
+            local,
+            budget,
+            owner_acceptor,
+            in_flight,
+          )
+          .await;
+        }
+      }
+      Ok(None) => return,
+      // The timer refused: the period's own pace counts and reports it, and the loop stops there as before.
+      Err(_) => {
+        crate::daemon::pace(remaining).await;
+        return;
+      }
+    }
   }
 }
 
@@ -6545,6 +7435,9 @@ async fn run_record_period(
   }
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
+  // Live volumes' entries a holder still lacks (A-200): writes ship at their barrier; this catches up a lost message or
+  // a holder that was away.
+  crate::live_ship::period(origin, shard).await;
   // Record durably each seal whose content and head have both placed.
   crate::xshard::run_on_counted(origin, shard, record_placed_seals);
   crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
@@ -6604,10 +7497,14 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
       .collect()
   })
   .unwrap_or_default();
+  // A pair is owed to a neighbour this shard has not delivered one to, or delivered one to another incarnation of: a
+  // node back at its anchor with fresh RAM holds none of the keys it was delivered, and one marked delivered by anchor
+  // alone was never delivered again, so the replacement could not open this node's heads as their successor (the same
+  // key again is accepted by a node that kept it, so a redelivery to a warm restart changes nothing).
   let owed: Vec<(HostId, u64)> = anchors
     .iter()
     .copied()
-    .filter(|(_, anchor)| !delivered.contains(anchor))
+    .filter(|(member, anchor)| delivered.get(anchor) != Some(member))
     .collect();
   // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
   let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
@@ -6659,8 +7556,10 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
         origin,
         shard,
         move |s| {
-          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1) {
-            s.pairs_delivered.insert(anchor);
+          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1)
+            || s.pairs_delivered.contains_key(&anchor)
+          {
+            s.pairs_delivered.insert(anchor, member);
           }
         },
         HEARTBEAT_NS,
@@ -6849,6 +7748,17 @@ async fn retire_shard_tombstones(
   for object in retired {
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
+    // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
+    // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
+    // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
+    // good, while the other survivor answered `NotFound` (6 of 6 runs, 2026-11-06, `crates/cli/tests/live_chaos.rs`:
+    // an unanswered destroy, then its owner's loss).
+    let _ = state::with_state(|s| {
+      for register in [object, object.catalog()] {
+        s.fleet.forget_object(register);
+        s.departed_owners.remove(&register);
+      }
+    });
   }
 }
 
@@ -6872,7 +7782,13 @@ async fn ship_head(
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
+  let catalog = head.object.is_catalog();
   if holders.is_empty() {
+    count_refusal(if catalog {
+      SHIP_CATALOG_NO_SESSION
+    } else {
+      SHIP_HEAD_NO_SESSION
+    });
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -6898,6 +7814,11 @@ async fn ship_head(
       }
     });
   }
+  count_refusal(ship_outcome_counter(
+    catalog,
+    &committed.outcome,
+    head.quorum,
+  ));
   let dispatch = Dispatch::new(
     taken,
     &committed.reusable,
@@ -6921,6 +7842,46 @@ async fn ship_head(
   });
   Some(dispatch)
 }
+
+/// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
+/// refused before anything was dispatched.
+fn ship_outcome_counter(
+  catalog: bool,
+  outcome: &Result<Placement, ClusterError>,
+  quorum: Quorum,
+) -> &'static str {
+  match (catalog, outcome) {
+    (true, Ok(placement)) if placement.placed(quorum) => SHIP_CATALOG_PLACED,
+    (false, Ok(placement)) if placement.placed(quorum) => SHIP_HEAD_PLACED,
+    (true, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_CATALOG_SHORT,
+    (false, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_HEAD_SHORT,
+    (true, Err(ClusterError::Uncertain { .. })) => SHIP_CATALOG_UNCERTAIN,
+    (false, Err(ClusterError::Uncertain { .. })) => SHIP_HEAD_UNCERTAIN,
+    (true, Err(_)) => SHIP_CATALOG_FAILED,
+    (false, Err(_)) => SHIP_HEAD_FAILED,
+  }
+}
+
+/// Counter: a volume's head (or tombstone) committed at `f + 1` by one ship.
+const SHIP_HEAD_PLACED: &str = "fleet.ship.head.placed";
+/// Counter: a head ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_HEAD_SHORT: &str = "fleet.ship.head.short";
+/// Counter: a head ship whose outcome is uncertain (the dispatch's budget ran out).
+const SHIP_HEAD_UNCERTAIN: &str = "fleet.ship.head.uncertain";
+/// Counter: a head ship refused by the runtime before anything was dispatched.
+const SHIP_HEAD_FAILED: &str = "fleet.ship.head.failed";
+/// Counter: a head owed to candidates none of which had a session to ride.
+const SHIP_HEAD_NO_SESSION: &str = "fleet.ship.head.no_session";
+/// Counter: a volume's catalog record committed at `f + 1` by one ship.
+const SHIP_CATALOG_PLACED: &str = "fleet.ship.catalog.placed";
+/// Counter: a catalog ship acknowledged by fewer than `f + 1` candidates.
+const SHIP_CATALOG_SHORT: &str = "fleet.ship.catalog.short";
+/// Counter: a catalog ship whose outcome is uncertain.
+const SHIP_CATALOG_UNCERTAIN: &str = "fleet.ship.catalog.uncertain";
+/// Counter: a catalog ship refused by the runtime before anything was dispatched.
+const SHIP_CATALOG_FAILED: &str = "fleet.ship.catalog.failed";
+/// Counter: a catalog owed to candidates none of which had a session to ride.
+const SHIP_CATALOG_NO_SESSION: &str = "fleet.ship.catalog.no_session";
 
 /// Merges an acknowledging set into the object's recorded placement at `sequence` — never overwriting it
 /// within a sequence: the union of every round's acknowledgements is the true region placement, since each
@@ -6959,11 +7920,25 @@ fn record_acks_in(
   entry.placement.candidates = placement.candidates.clone();
   entry.placement.joint = placement.joint.clone();
   entry.epoch = entry.epoch.max(epoch);
+  let mut moved = false;
   for host in placement.acked {
     if !entry.placement.acked.contains(&host) {
       entry.placement.acked.push(host);
+      moved = true;
     }
   }
+  // A placement that gained an acknowledgement moved a live volume's durability forward: its held replies wait on
+  // (`live_ship::DurableBound`).
+  if moved {
+    crate::live_ship::heard(state, object);
+  }
+  // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
+  // the last thing they waited for.
+  crate::live_ship::resolve(state, object.0);
+  // A destroy is answered once its tombstone is placed (`live_ship::defer_destroy`).
+  crate::live_ship::resolve_destroys(state, object.0);
+  // A live shipper waits for its holders' catalog to be placed before it ships (A-240).
+  crate::live_ship::catalog_placed(state, object);
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed
@@ -6996,12 +7971,20 @@ pub(crate) fn take_sessions(
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
 /// removed by its link task), a slot the link task re-established since (holding a newer session, or
 /// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
-/// never installed over a newer session.
+/// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
+/// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
+/// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
+        Some(link)
+          if link.endpoint.is_none() && link.borrowed == returned && endpoint.peer_reset() =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_PEER_RESET, 1);
+        }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
@@ -7057,60 +8040,73 @@ pub(crate) async fn forward_batch_over_leader_session(
   requests: &[Vec<u8>],
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
-  let began = futures::now_ns();
-  let mut missed = false;
-  loop {
-    let waited = futures::now_ns().saturating_sub(began);
-    if let Some((_, endpoint)) =
-      take_sessions("fleet.lent_to.forward_batch_over_leader_session", |host| {
-        host == peer
-      })
-      .pop()
-    {
-      // The wait for the session spends the budget for the first byte; every byte after renews it.
-      let (replies, endpoint) = slates_cluster::requests_within(
-        endpoint,
-        FORWARD_STREAM,
-        Priority::Metadata,
-        requests,
-        stall_ns.saturating_sub(waited),
-      )
-      .await;
-      return_sessions(vec![(peer, endpoint)]);
-      return Some(replies);
+  crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+}
+
+#[cfg(test)]
+mod dial_tests {
+  use super::{ESTABLISH_BUDGETS_BEFORE_REDIAL, HandshakeStall, keeps_its_socket};
+
+  /// §4.8 formation: a dialer past its confirmation redials at once; one whose peer has not answered keeps its socket
+  /// for the budgets a booting or starved peer may need. Do: ask for every stall at no budgets spent and at the limit.
+  /// Expect: a confirmation stall never keeps the socket; every other stall keeps it until the budgets are spent.
+  #[test]
+  fn a_dialer_past_its_confirmation_redials_at_once() {
+    for stall in [
+      HandshakeStall::ConfirmDeadline,
+      HandshakeStall::ConfirmSilence,
+      HandshakeStall::ConfirmGarbage,
+    ] {
+      assert!(!keeps_its_socket(1, Some(stall)), "{stall:?}");
     }
-    let first_miss = !missed;
-    missed = true;
-    let expired = waited >= stall_ns;
-    state::with_state(|s| {
-      if first_miss {
-        let link = s.record_sessions.get(&peer);
-        let missing = if link.is_some() {
-          "fleet.forward.session_out"
-        } else {
-          "fleet.forward.no_session"
-        };
-        // Who holds it: the borrower's own label (`take_sessions`), or the link task when nothing lent
-        // it (a discovery page or a dial), so a session that never comes back names its holder.
-        let holder = link.map(|link| link.lent_to.unwrap_or(LENT_TO_LINK));
-        s.count(missing, 1);
-        if let Some(holder) = holder {
-          s.count(holder, 1);
-        }
-      }
-      if expired {
-        s.count("fleet.forward.session_never_returned", 1);
-      }
-    });
-    if expired {
-      return None;
+    for stall in [
+      HandshakeStall::Silence,
+      HandshakeStall::Repeats,
+      HandshakeStall::Fragments,
+      HandshakeStall::TurnCeiling,
+    ] {
+      assert!(keeps_its_socket(1, Some(stall)), "{stall:?}");
+      assert!(
+        !keeps_its_socket(ESTABLISH_BUDGETS_BEFORE_REDIAL, Some(stall)),
+        "{stall:?}"
+      );
     }
-    if futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD)
-      .await
-      .is_err()
-    {
-      return None;
-    }
+  }
+}
+
+#[cfg(test)]
+mod probe_mesh_tests {
+  use super::{HostId, ProbeMesh};
+
+  /// §4.8, the mesh's predicate at its edges: do judge a laptop (no other member known), a fleet with every
+  /// in-contact peer probed, one with a peer unprobed, and a fleet of several with no peer in contact (none reached, or
+  /// all dead). Expect only the laptop and the fully probed fleet meshed.
+  #[test]
+  fn a_mesh_over_no_peer_is_meshed_only_on_a_laptop() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let mesh =
+      |in_contact: &[HostId], unmeshed: &[HostId], alive: &[HostId], others_known| ProbeMesh {
+        in_contact: in_contact.to_vec(),
+        unmeshed: unmeshed.to_vec(),
+        alive: alive.to_vec(),
+        others_known,
+      };
+    assert!(
+      mesh(&[], &[], &[a], false).meshed(),
+      "a laptop is meshed (R8)"
+    );
+    assert!(
+      mesh(&[b, c], &[], &[a, b, c], true).meshed(),
+      "every peer probed"
+    );
+    assert!(
+      !mesh(&[b, c], &[c], &[a, b, c], true).meshed(),
+      "c unprobed"
+    );
+    assert!(
+      !mesh(&[], &[], &[a], true).meshed(),
+      "a fleet of several with no peer in contact"
+    );
   }
 }
 
@@ -7291,6 +8287,70 @@ mod tests {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
     Endpoint::client(socket, peer, &identity, &der, "fleet", fleet_shape()).unwrap()
+  }
+
+  /// A record link's redial (A-200's rolling partition flow): do call [`establish_session`] once with no client, to a
+  /// port nothing is bound to. Expect the call that builds the endpoint to run its first handshake too, a budget spent
+  /// before it returns. Before, the build and the handshake were separate calls a link period apart: 100.3 ms at the
+  /// tenth percentile and 100.9 to 101.9 ms at the median over 487 redials (diag-live-durability-50), on the path of every
+  /// resumed peer's catch-up.
+  #[test]
+  fn a_redial_starts_its_handshake_in_the_call_that_builds_it() {
+    let config = slates_rt::runtime::RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 64,
+      timers_per_shard: 64,
+      ring_entries: 64,
+      step_budget_ns: 1_000_000_000,
+      timer_tick_ns: 100_000,
+      batch: 64,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    };
+    let mut sim = slates_rt::sim::SimRuntime::new(&config, 1).unwrap();
+    let shard = sim.shard_ids()[0];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    sim
+      .spawn_on(shard, async move {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["fleet".to_owned()])
+          .unwrap()
+          .self_signed(&key)
+          .unwrap();
+        let der = certificate.der().clone();
+        let identity = Identity::from_der(
+          der.clone(),
+          rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        );
+        let kept = slates_rt::registry::with_current(|context| context.keep(identity))
+          .unwrap()
+          .unwrap();
+        let address = NodeAddress::Ip(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
+        let (client, session) = establish_session(
+          None,
+          None,
+          kept,
+          "fleet",
+          (&address, crate::deploy::Plane::Record),
+          &der,
+          None,
+        )
+        .await;
+        let _ = result_tx.send((
+          client.map(|dial| dial.handshake_budgets_spent()),
+          session.is_some(),
+        ));
+      })
+      .unwrap();
+    sim.run_until_idle();
+    assert_eq!(
+      result_rx.try_recv().unwrap(),
+      (Some(1), false),
+      "the dial is kept with its first handshake budget spent (the peer is silent), no session"
+    );
   }
 
   /// AC-8.1 (§4.8 "Deployment", task #22; docs/bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md):

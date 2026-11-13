@@ -5,6 +5,8 @@
 //! The restart bound is derived, not a retry count: a daemon that has failed more times inside
 //! the recovery budget than that budget holds daemon starts is not recovering, and restarting
 //! it again is a busy loop; supervision then records `CrashLoop` in the segment and refuses.
+//! A failure is an exit before the daemon's start was done (`layout::SUP_SERVING`, which the
+//! daemon marks once it serves): an exit after it is a daemon that recovered, restarted at once.
 //! The supervisor is driven by its owner (the `slates anchor` command loop): `step` polls the
 //! child once and never blocks, so the owner interleaves it with heartbeat observation and its
 //! control channel.
@@ -23,6 +25,7 @@ mod windows;
 use slates_machine::{Derived, derived};
 
 use crate::error::AnchorError;
+use crate::layout::RegionKind;
 use crate::segment::AnchorSegment;
 
 /// Format: the environment variable carrying the anchor's process id to the daemon, so the
@@ -130,6 +133,10 @@ pub enum Stopping {
 /// The supervisor.
 pub struct Supervisor {
   segment: AnchorSegment,
+  /// The profile the anchor published before supervision began, published again before every start: a daemon
+  /// republishes the profile at its start, and one killed inside that left it unfinished, which refused every daemon
+  /// after it (`PublicationInProgress`; a crash loop under two spinners a core, an 18-core Mac, 2026-11-07).
+  profile: Option<Vec<u8>>,
   /// The path this process was started from: every daemon's `argv[0]`, so `ps` and `pgrep -f` show it as before, and
   /// where there is no link to the running image, the file each start is checked against (A-145).
   program: String,
@@ -174,8 +181,9 @@ pub struct Supervisor {
   /// Windows handles acknowledged into the anchor and handed only to its own successors (A-198).
   #[cfg(windows)]
   windows_handles: Option<windows::Hold>,
-  /// The hold refusals last written to the segment (`layout::SUP_HOLD_REFUSALS`), so a step writes only a change.
-  published_refusals: u64,
+  /// The hold refusals and refused log lines last written to the segment (`layout::SUP_HOLD_REFUSALS`,
+  /// `SUP_LOG_REFUSALS`), so a step writes only a change.
+  published_refusals: (u64, u64),
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
@@ -232,8 +240,10 @@ impl Supervisor {
       .to_string_lossy()
       .into_owned();
     let image = own_image::identity(&program)?;
+    let profile = segment.read_published(RegionKind::Profile)?;
     Ok(Supervisor {
       segment,
+      profile,
       program,
       image,
       args: args.to_vec(),
@@ -253,7 +263,7 @@ impl Supervisor {
       devices: None,
       #[cfg(windows)]
       windows_handles: None,
-      published_refusals: 0,
+      published_refusals: (0, 0),
     })
   }
 
@@ -366,15 +376,20 @@ impl Supervisor {
     self.handle_refusals()
   }
 
-  /// Writes [`Supervisor::hold_refusals`] to the segment when it moved since the last write. A segment whose
+  /// Writes [`Supervisor::hold_refusals`] and the log lines this process could not write
+  /// (`slates_machine::log::log_lines_refused`) to the segment when either moved since the last write. A segment whose
   /// supervision block cannot be reached is left as it is; the next step tries again.
-  fn publish_hold_refusals(&mut self) {
-    let refusals = self.hold_refusals();
+  fn publish_refusals(&mut self) {
+    let refusals = (
+      self.hold_refusals(),
+      slates_machine::log::log_lines_refused(),
+    );
     if refusals == self.published_refusals {
       return;
     }
     if let Ok(supervision) = self.segment.supervision() {
-      supervision.record_hold_refusals(refusals);
+      supervision.record_hold_refusals(refusals.0);
+      supervision.record_log_refusals(refusals.1);
       self.published_refusals = refusals;
     }
   }
@@ -586,6 +601,11 @@ impl Supervisor {
     #[cfg(unix)]
     env.extend(self.device_env());
     env.extend(self.environment.iter().cloned());
+    // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
+    // before the next reads it. No daemon runs now, so nothing else writes it.
+    if let Some(profile) = &self.profile {
+      self.segment.publish(RegionKind::Profile, profile)?;
+    }
     let child = self.spawn_child(env)?;
     let restart = self.segment.supervision()?.generation() > 0;
     self
@@ -640,7 +660,7 @@ impl Supervisor {
     self.drain_devices();
     #[cfg(windows)]
     self.drain_handles();
-    self.publish_hold_refusals();
+    self.publish_refusals();
     if let Some(retry_at_ns) = self.retry_at_ns {
       if now_ns < retry_at_ns {
         return Ok(Step::BackingOff { retry_at_ns });
@@ -672,6 +692,20 @@ impl Supervisor {
     };
     self.child = None;
     let exit_code = status.code();
+    // Only a daemon that exited before its start was done counts toward the bound: one that served had recovered, so
+    // restarting it is not a busy loop (the module's rule). Its own mark says so (`layout::SUP_SERVING`), not its first
+    // beat, since a recovering daemon beats (its recovery runs in slices). Until 2026-11-09 every exit counted, and a
+    // daemon killed while serving more often than the window holds starts was backed off as a crash loop (the WinFsp
+    // drive test, backed off 16 s at its twentieth kill on both Windows runners).
+    if self.segment.supervision()?.serving_since().is_some() {
+      self.backoff_ns = self.policy.window_ns;
+      self.segment.supervision()?.record_exit(false);
+      self.start(now_ns)?;
+      return Ok(Step::Restarted {
+        exit_code,
+        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+      });
+    }
     self.restarts_at_ns.push_back(now_ns);
     while self
       .restarts_at_ns
@@ -969,7 +1003,7 @@ impl DeviceHold {
   fn refuse(&mut self, refusal: &crate::held::HoldRefusal) {
     self.refused = self.refused.saturating_add(1);
     if self.logged.first_sighting(refusal) {
-      eprintln!("slates anchor: a hold message was refused: {refusal}");
+      slates_machine::log_line!("slates anchor: a hold message was refused: {refusal}");
     }
   }
 }

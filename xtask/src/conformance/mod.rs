@@ -27,10 +27,12 @@ mod bench;
 mod container;
 mod fetch;
 mod hermeticity;
+mod live_fleet;
 mod mount;
 mod slates;
 mod suites;
 mod trace_process;
+mod winfstest;
 mod workloads;
 
 use std::path::{Path, PathBuf};
@@ -57,6 +59,7 @@ use slates_conformance::exerciser::{
 /// target directory and pjdfstest's scratch, well under a CI runner's RAM.
 const VOLUME_SIZE: &str = "512MiB";
 /// Shape: a `sudo -n true` probe's wait (it answers at once or refuses at once).
+#[cfg(unix)]
 const SUDO_PROBE: Duration = Duration::from_secs(5);
 
 /// The parsed command line.
@@ -70,6 +73,12 @@ pub(crate) struct Options {
   scratch: Option<PathBuf>,
   /// Keep the scratch directory.
   keep: bool,
+  /// Run each suite over a live-shipped volume on an `f = 1` fleet (A-200; `live_fleet.rs`), not one daemon's.
+  live_ship: bool,
+  /// `--read-only`: the suite's mount is a read attachment under a writable kernel mount, so each change reaches
+  /// slates and is answered as a read-only file system is (`EROFS`, slabs' change); its work directories are made through
+  /// a second, writable mount of the same volume. A diagnostic: the reviewed lists judge writable runs.
+  read_only: bool,
   /// `run`: the suite.
   suite: Option<Suite>,
   /// `run`: only this one of the host's transports (every one when absent).
@@ -78,6 +87,9 @@ pub(crate) struct Options {
   write: bool,
   /// `tally`: the kept `pjdfstest-output` directory to re-read.
   outputs: Option<PathBuf>,
+  /// `compare`: the plain run's directory and the live-shipped run's, each holding the `records` and `scratch` its
+  /// harness wrote (`--records DIR/records --scratch DIR/scratch --keep`).
+  compared: Option<(PathBuf, PathBuf)>,
   /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
   /// absent.
   privilege: Option<Privilege>,
@@ -131,7 +143,10 @@ fn number<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Resu
 /// Parses the arguments after `conformance`.
 pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
   let command = args.first().cloned().ok_or_else(|| {
-    Failure("conformance: a subcommand is needed: plan, run, all, matrix, tally, bench".to_owned())
+    Failure(
+      "conformance: a subcommand is needed: plan, run, all, matrix, tally, compare, bench"
+        .to_owned(),
+    )
   })?;
   let privilege = match value_after(args, "--privilege") {
     Some("root") => Some(Privilege::Root),
@@ -169,9 +184,14 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
       .map_or_else(|| root.join("docs/wip/conformance/records"), PathBuf::from),
     scratch: value_after(args, "--scratch").map(PathBuf::from),
     keep: args.iter().any(|a| a == "--keep"),
+    live_ship: args.iter().any(|a| a == "--live-ship"),
+    read_only: args.iter().any(|a| a == "--read-only"),
     suite,
     write: args.iter().any(|a| a == "--write"),
     outputs: value_after(args, "--outputs").map(PathBuf::from),
+    compared: value_after(args, "--plain")
+      .zip(value_after(args, "--live"))
+      .map(|(plain, live)| (PathBuf::from(plain), PathBuf::from(live))),
     privilege,
     rounds: number(args, "--rounds", bench::DEFAULT_ROUNDS)?,
     bounds: Bounds {
@@ -198,10 +218,131 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
     "all" => all(root, options),
     "matrix" => render_matrix(root, options),
     "tally" => tally(root, options),
+    "compare" => compare(options),
     "bench" => bench::run_bench(root, options, host_os()?),
     other => Err(Failure(format!(
-      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, bench"
+      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, compare, bench"
     ))),
+  }
+}
+
+/// The kept TAP outputs under a run's scratch, by transport and suite: pjdfstest's (`<a__b.t>.txt`) and winfstest's
+/// (`t_base_00.t.out`), each parsed as its judgement parses it.
+fn kept_cases(
+  scratch: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<slates_conformance::tap::TapCase>>, Failure> {
+  let runner = suites::this_user();
+  let mut kept = std::collections::BTreeMap::new();
+  let Ok(transports) = std::fs::read_dir(scratch) else {
+    return Ok(kept);
+  };
+  for transport in transports.filter_map(Result::ok) {
+    for (suite, extension) in [("pjdfstest-output", "txt"), ("winfstest-output", "out")] {
+      let dir = transport.path().join(suite);
+      let Ok(files) = std::fs::read_dir(&dir) else {
+        continue;
+      };
+      let mut cases = Vec::new();
+      for file in files.filter_map(Result::ok).map(|entry| entry.path()) {
+        if file.extension().is_none_or(|x| x != extension) {
+          continue;
+        }
+        let name = file
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or_default();
+        let relative = if extension == "txt" {
+          name.trim_end_matches(".txt").replace("__", "/")
+        } else {
+          name.trim_end_matches(".out").replacen('_', "/", 2)
+        };
+        let output = std::fs::read_to_string(&file)
+          .map_err(|e| Failure(format!("{}: {e}", file.display())))?;
+        cases.extend(slates_conformance::tap::parse_file(&relative, &output, &runner).cases);
+      }
+      kept.insert(
+        format!("{} {suite}", transport.file_name().to_string_lossy()),
+        cases,
+      );
+    }
+  }
+  Ok(kept)
+}
+
+/// The outcome of every record in a directory, by file name: what two runs' records must agree on.
+fn outcomes(
+  records: &Path,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Failure> {
+  let mut out = std::collections::BTreeMap::new();
+  for record in load_records(records)? {
+    let outcome = serde_json::to_value(&record.outcome).map_err(|e| Failure(e.to_string()))?;
+    out.insert(record.file_name(), outcome);
+  }
+  Ok(out)
+}
+
+/// `compare --plain DIR --live DIR`: the plain run and the live-shipped one, compared (A-200): every kept pjdfstest and
+/// winfstest case by its verdict's kind, and every record's outcome (fsx's and fsstress's verdicts, the suites' counts).
+/// Exits non-zero on any difference, naming each.
+fn compare(options: &Options) -> Result<(), Failure> {
+  let (plain, live) = options
+    .compared
+    .as_ref()
+    .ok_or_else(|| Failure("conformance compare: --plain DIR --live DIR are needed".to_owned()))?;
+  let mut differences = Vec::new();
+  let (plain_cases, live_cases) = (
+    kept_cases(&plain.join("scratch"))?,
+    kept_cases(&live.join("scratch"))?,
+  );
+  let mut suites: Vec<&String> = plain_cases.keys().chain(live_cases.keys()).collect();
+  suites.sort_unstable();
+  suites.dedup();
+  for suite in suites {
+    let (a, b) = (
+      plain_cases
+        .get(suite)
+        .map(Vec::as_slice)
+        .unwrap_or_default(),
+      live_cases.get(suite).map(Vec::as_slice).unwrap_or_default(),
+    );
+    let found = slates_conformance::differential::compare(a, b);
+    println!(
+      "compare: {suite}: {} cases plain, {} live, {} differing",
+      a.len(),
+      b.len(),
+      found.len()
+    );
+    differences.extend(found.into_iter().map(|d| format!("{suite} {d}")));
+  }
+  let (plain_records, live_records) = (
+    outcomes(&plain.join("records"))?,
+    outcomes(&live.join("records"))?,
+  );
+  let mut names: Vec<&String> = plain_records.keys().chain(live_records.keys()).collect();
+  names.sort_unstable();
+  names.dedup();
+  for name in names {
+    let (a, b) = (plain_records.get(name), live_records.get(name));
+    let same = a == b;
+    println!(
+      "compare: record {name}: {}",
+      if same { "the same outcome" } else { "DIFFERS" }
+    );
+    if !same {
+      differences.push(format!("record {name}: plain {a:?}, live {b:?}"));
+    }
+  }
+  if differences.is_empty() {
+    println!("compare: the live-shipped run conforms exactly as the plain one does");
+    Ok(())
+  } else {
+    for difference in &differences {
+      println!("compare: DIFFERENCE {difference}");
+    }
+    Err(Failure(format!(
+      "{} differences between the plain and the live-shipped run",
+      differences.len()
+    )))
   }
 }
 
@@ -299,17 +440,43 @@ fn host_facts(privilege: Privilege) -> Host {
         })
       })
       .unwrap_or_else(|| "Linux".to_owned()),
-    _ => std::env::consts::OS.to_owned(),
+    Ok(HostOs::Windows) => stdout_of("cmd", &["/c", "ver"]),
+    Err(_) => std::env::consts::OS.to_owned(),
   };
   Host {
     os,
-    kernel: stdout_of("uname", &["-sr"]),
-    arch: stdout_of("uname", &["-m"]),
+    kernel: kernel_name(),
+    arch: machine_name(),
     privilege,
   }
 }
 
+/// The kernel's name and release, as `uname -sr` prints them.
+#[cfg(unix)]
+fn kernel_name() -> String {
+  stdout_of("uname", &["-sr"])
+}
+
+/// The kernel's name and release on Windows: `ver`'s line names the NT kernel's version (`10.0.26100.6584`).
+#[cfg(windows)]
+fn kernel_name() -> String {
+  stdout_of("cmd", &["/c", "ver"])
+}
+
+/// The machine's architecture, as `uname -m` prints it.
+#[cfg(unix)]
+fn machine_name() -> String {
+  stdout_of("uname", &["-m"])
+}
+
+/// The machine's architecture on Windows: this process's own, which the lanes build natively (`x86_64`, `aarch64`).
+#[cfg(windows)]
+fn machine_name() -> String {
+  std::env::consts::ARCH.to_owned()
+}
+
 /// Whether `name` is an executable on the `PATH`.
+#[cfg(unix)]
 pub(crate) fn tool_on_path(name: &str) -> bool {
   Command::new("sh")
     .args(["-c", &format!("command -v {name}")])
@@ -318,12 +485,43 @@ pub(crate) fn tool_on_path(name: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Whether `name` is a file on the `PATH` (`where`, which finds a library such as WinFsp's DLL as well as a program).
+#[cfg(windows)]
+pub(crate) fn tool_on_path(name: &str) -> bool {
+  Command::new("where")
+    .arg("/q")
+    .arg(name)
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
 /// Whether this process is root.
-fn is_root() -> bool {
+#[cfg(unix)]
+pub(crate) fn is_root() -> bool {
   stdout_of("id", &["-u"]) == "0"
 }
 
+/// Whether this process runs elevated, Windows' counterpart of root: `net session` answers only an elevated
+/// administrator (GitHub's Windows runners run elevated; a developer's prompt usually does not).
+#[cfg(windows)]
+pub(crate) fn is_root() -> bool {
+  Command::new("net")
+    .arg("session")
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
+/// Windows has no `sudo -n` the harness may ask (Windows 11's `sudo` raises a consent prompt): no suite there asks
+/// for more than the runner's own rights.
+#[cfg(windows)]
+pub(crate) fn sudo_without_prompt() -> bool {
+  false
+}
+
 /// Whether `sudo -n` works without a prompt (the CI runners; never this laptop).
+#[cfg(unix)]
 pub(crate) fn sudo_without_prompt() -> bool {
   let Ok(mut child) = Command::new("sudo")
     .args(["-n", "true"])
@@ -355,6 +553,18 @@ const POLL: Duration = Duration::from_millis(20);
 pub(crate) fn pause() {
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(POLL);
+}
+
+/// A path as a C program's `open` takes it. On Windows, `canonicalize` answers the verbatim form (`\\?\C:\a\b`), which
+/// the C runtime's `open` refuses when a program appends `/name` to it (the WinFsp fsx port answered `Invalid argument`
+/// for its `-P` directory, diagnostics run 41982130174), so a verbatim drive path loses its prefix; elsewhere a path is
+/// already plain.
+pub(crate) fn plain_path(path: &Path) -> String {
+  let text = path.display().to_string();
+  match text.strip_prefix(r"\\?\") {
+    Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+    _ => text,
+  }
 }
 
 /// Today's civil date (UTC), for the record.
@@ -725,6 +935,7 @@ fn run_suite_on(
     Suite::Workloads if transport.is_container() => container::run_workloads(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,
     Suite::Hermeticity => hermeticity::run_hermeticity(&run)?,
+    Suite::Winfstest => winfstest::run_winfstest(&run)?,
     Suite::Pressure | Suite::Failure => {
       return Err(Failure(format!(
         "{} has no runnable form yet",
@@ -774,6 +985,7 @@ fn all(root: &Path, options: &Options) -> Result<(), Failure> {
     Suite::Fsx,
     Suite::Fsstress,
     Suite::Pjdfstest,
+    Suite::Winfstest,
     Suite::Workloads,
     Suite::Hermeticity,
   ] {
@@ -810,4 +1022,22 @@ fn render_matrix(root: &Path, options: &Options) -> Result<(), Failure> {
     print!("{rendered}");
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod plain_path_tests {
+  use super::plain_path;
+  use std::path::Path;
+
+  /// A verbatim drive path loses its prefix; a verbatim UNC path, a plain path and a Unix path are kept whole.
+  #[test]
+  fn a_verbatim_drive_path_becomes_plain_and_nothing_else_changes() {
+    assert_eq!(plain_path(Path::new(r"\\?\C:\a\b")), r"C:\a\b");
+    assert_eq!(
+      plain_path(Path::new(r"\\?\UNC\host\share")),
+      r"\\?\UNC\host\share"
+    );
+    assert_eq!(plain_path(Path::new(r"C:\a")), r"C:\a");
+    assert_eq!(plain_path(Path::new("/home/a")), "/home/a");
+  }
 }

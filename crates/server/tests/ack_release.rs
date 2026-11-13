@@ -31,6 +31,9 @@ const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: how long the other shard is held: one liveness budget. A reply that waited for it took at least that; one
 /// that did not comes in microseconds.
 const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: how often a hold that lasts until the client's answer looks whether it may end: a hundredth of the hold the
+/// other tests use, so it ends promptly once the answer is in.
+const HOLD_POLL: Duration = Duration::from_millis(10);
 /// Shape: the names tried while looking for one the other shard owns; with two shards a run that finds none in this
 /// many is a fault of the hash, not luck.
 const NAME_TRIES: usize = 64;
@@ -114,7 +117,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-ackrel-{name}-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", &format!("ackrel-{name}")),
     },
   )
   .unwrap();
@@ -192,6 +195,43 @@ fn hold(
   waiter
 }
 
+/// Holds the shard at `partition` until the test lowers `holding` (or the client's reply deadline passes): its thread
+/// runs nothing else meanwhile. Returns once the hold has begun, with the thread that waits for it to end. A scatter's
+/// part must be refused while its shard is held, and the part's wait for room ends by the scatter's own shard's clock,
+/// which on a busy machine runs late against any fixed hold: the scheduled CI run 42206043007 on ubuntu x86_64 tried
+/// the part once more after a one-second hold had ended, the drained channel took it, and the listing was answered in
+/// full. So the hold ends only once the client has its answer.
+///
+/// The hold's flags are its own: the scatter tests run in parallel, and with one flag shared among them the first test
+/// to be answered ended the others' holds (ten of ten rounds failed on CI's loaded Linux runners, diag `ack-1`). Returns
+/// the flag that ends the hold when lowered.
+fn hold_until_answered(
+  daemon: &Daemon,
+  partition: usize,
+) -> (std::thread::JoinHandle<()>, &'static AtomicBool) {
+  let held = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let holding = &*Box::leak(Box::new(AtomicBool::new(true)));
+  let shard = daemon.shards()[partition];
+  let observation = daemon
+    .observation(Some(shard), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
+      held.store(true, Ordering::Release);
+      let started = Instant::now();
+      while holding.load(Ordering::Acquire) && started.elapsed() < Duration::from_nanos(DEADLINE_NS)
+      {
+        let (_hold, rx) = std::sync::mpsc::channel::<()>();
+        let _ = rx.recv_timeout(HOLD_POLL);
+      }
+    })
+    .unwrap();
+  let waiter = std::thread::spawn(move || observation.wait().unwrap());
+  let started = Instant::now();
+  while !held.load(Ordering::Acquire) {
+    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    std::thread::yield_now();
+  }
+  (waiter, holding)
+}
+
 /// A-216, §4.9. Do: on a two-shard daemon, create a volume the other shard owns (its completion is recorded there),
 /// then hold that shard for a second and, inside the hold, acknowledge up to the create and retry the create's id; after
 /// the hold, create another volume there and retry the first create's id once more. Expect: the acknowledgement is
@@ -234,6 +274,7 @@ fn run_lagging() -> Lagging {
   let held_at = Instant::now();
   let (_, acknowledged) = client.call(&RequestBody::Acknowledge {
     up_to: created_id.sequence,
+    owed: Vec::new(),
   });
   let acknowledged_in = held_at.elapsed();
   let retried = client.call_as(created_id, &create(&first));
@@ -362,12 +403,16 @@ fn run_refused() -> RefusedRelease {
   let flooded = daemon.flood_control_channel_of(other).unwrap();
   let (_, acknowledged) = client.call(&RequestBody::Acknowledge {
     up_to: client.sequence,
+    owed: Vec::new(),
   });
   holding.join().unwrap();
   let counted = (before, release_refusals(&daemon));
   let (served, owed) = statuses_until_owed(&mut client, volume, slots * 6);
   let answered = client.sequence - 1;
-  let (_, released) = client.call(&RequestBody::Acknowledge { up_to: answered });
+  let (_, released) = client.call(&RequestBody::Acknowledge {
+    up_to: answered,
+    owed: Vec::new(),
+  });
   let (_, fresh) = client.call(&RequestBody::Status { volume });
   daemon.stop();
   RefusedRelease {
@@ -423,4 +468,132 @@ fn check_recovered(run: &RefusedRelease) {
     "served again once the next watermark released: {:?}",
     run.fresh
   );
+}
+
+/// What a scatter answered with its other shard held and that shard's control channel full, and how long it took.
+fn scattered_with_the_other_shard_full(
+  name: &str,
+  body: &RequestBody,
+) -> (usize, ReplyBody, Duration) {
+  let (daemon, instance) = daemon(name);
+  let mut client = Client::connect(&instance);
+  let other = 1 - serving(&daemon, client.client);
+  let (holding, hold_on) = hold_until_answered(&daemon, other);
+  let flooded = daemon.flood_control_channel_of(other).unwrap();
+  let started = Instant::now();
+  let (_, reply) = client.call(body);
+  let took = started.elapsed();
+  hold_on.store(false, Ordering::Release);
+  holding.join().unwrap();
+  let shard = usize::from(daemon.shards()[other].0);
+  daemon.stop();
+  assert!(flooded > 0, "the other shard's control channel was filled");
+  (shard, reply, took)
+}
+
+/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal. The other shard is held until
+/// the answer is in ([`hold_until_answered`]), so a part that waited however long on a busy shard still met a full
+/// channel; before, a fixed hold could end first, and the drained channel took the part. The
+/// part waits for room for half the liveness budget first, so the answer comes after that, and within the client's reply
+/// deadline. The answer's delivery is not held to the hold: on a busy shard it takes longer, and only the decision's
+/// moment is the design's (2026-11-06).
+fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Duration)) {
+  assert!(
+    matches!(reply, ReplyBody::Refused { refusal: Refusal::Overloaded { shard } } if usize::from(shard) == other),
+    "{verb} with the other shard's control channel full: {reply:?}"
+  );
+  assert!(
+    took >= HOLD / 2 && took < Duration::from_nanos(DEADLINE_NS),
+    "{verb} was answered in {took:?}: after its part waited half the liveness budget for room, within the client's reply \
+     deadline"
+  );
+}
+
+/// §4.14, A-216's sibling sweep. Do: on a two-shard daemon, hold the other shard and fill its control channel, then
+/// list the volumes. Expect: `Overloaded { shard }` naming the other shard, once its part has waited half the liveness
+/// budget for room and inside the hold. Before, the
+/// listing's part for that shard was settled through a nested state borrow that never ran, and the listing was never
+/// answered.
+#[test]
+fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "list",
+    scattered_with_the_other_shard_full("list-full", &RequestBody::List),
+  );
+}
+
+/// §4.8 grants, A-216's sibling sweep. Do: as the listing test, but ask for the grants. Expect: `Overloaded { shard }`,
+/// after the wait for room and inside the hold; before, never answered.
+#[test]
+fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "grants",
+    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants),
+  );
+}
+
+/// §4.14 `slates.status`, A-216's sibling sweep. Do: as the listing test, but ask for the daemon's status. Expect:
+/// `Overloaded { shard }`, after the wait for room and inside the hold; before, never answered.
+#[test]
+fn a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "status",
+    scattered_with_the_other_shard_full("status-full", &RequestBody::DaemonStatus),
+  );
+}
+
+/// Shape: how long the starver keeps the client's own shard busy at a time: twice the room wait's pause (10 ms), so each
+/// of the part's pauses runs late by more than it lasts.
+const STARVED_FOR: Duration = Duration::from_millis(20);
+
+/// §4.9, §4.14, the busy machine (Ada's rule: the normal case). Do: as `a_daemon_status_whose_part_cannot_be_sent_…`,
+/// with the client's own shard, where the status's part waits for room, kept busy 20 ms at a time back to back
+/// meanwhile. Expect: the typed refusal still comes after half the liveness budget and inside the hold. The part's wait
+/// for room is a span of time, so a shard whose every pause runs late still waits its budget and not much more. Before,
+/// it was 51 tries of a 10 ms pause each, and on a busy shard each try lasted a pause plus a busy poll: the wait ran past
+/// the hold, as it did once at load 62–68 on macOS (2026-11-06).
+#[test]
+fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
+  static STARVING: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon("status-starved");
+  let mut client = Client::connect(&instance);
+  let mine = serving(&daemon, client.client);
+  let other = 1 - mine;
+  let (holding, hold_on) = hold_until_answered(&daemon, other);
+  let flooded = daemon.flood_control_channel_of(other).unwrap();
+  STARVING.store(true, Ordering::Release);
+  let caller = std::thread::spawn(move || {
+    let started = Instant::now();
+    let (_, reply) = client.call(&RequestBody::DaemonStatus);
+    let took = started.elapsed();
+    STARVING.store(false, Ordering::Release);
+    (reply, took)
+  });
+  let shard_of_client = daemon.shards()[mine];
+  // Until the call ends, however it ends: a call that panics never lowers the flag.
+  while STARVING.load(Ordering::Acquire) && !caller.is_finished() {
+    let starved = daemon
+      .observation(
+        Some(shard_of_client),
+        OBSERVE_BUDGET_NS,
+        |_: &mut ShardState| {
+          // A busy poll of a fixed length: a spin, since a short sleep on macOS under a launchd job's timer policy
+          // comes back several times late (CLAUDE.md, the loop-responsiveness gotcha).
+          let began = Instant::now();
+          while began.elapsed() < STARVED_FOR {
+            std::hint::spin_loop();
+          }
+        },
+      )
+      .unwrap();
+    let _ = starved.wait();
+  }
+  let (reply, took) = caller.join().unwrap();
+  hold_on.store(false, Ordering::Release);
+  holding.join().unwrap();
+  let shard = usize::from(daemon.shards()[other].0);
+  daemon.stop();
+  assert!(flooded > 0, "the other shard's control channel was filled");
+  println!("status on a starved shard answered in {took:?}");
+  check_typed_refusal("status on a starved shard", (shard, reply, took));
 }

@@ -5,11 +5,13 @@
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version; changed for header, region or timestamp semantics. Version 3 uses
-/// one host-wide monotonic origin for supervision and retained deadlines; version 2 reset clocks
-/// per instance and cannot be recovered safely by a version-3 daemon. Version 4 (A-98) appends the
-/// content pool's owner words, so a version-3 segment is refused rather than read without them.
-pub const LAYOUT_VERSION: u32 = 4;
+/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
+/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
+/// (A-237), 6 a green's chain entries record what each version changed (A-257). An older segment is refused, never read
+/// under semantics it was not written with.
+pub const LAYOUT_VERSION: u32 = 6;
+/// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
+pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
 /// one, so partition 0 is distinct from "free".
 pub const POOL_WORD_BYTES: usize = 8;
@@ -117,6 +119,31 @@ pub const SEAL_ROOT_KEY_BYTES: usize = 32;
 /// Format: the byte offset inside the supervision block, the first cache line past the sealing root's record
 /// (136 + 16 + 32 = 184, so 192), so it shares no line with the root or with the heartbeat.
 pub const SUP_HOLD_REFUSALS: usize = 192;
+/// The anchor's **refused log lines** word (A-213): the log lines the anchor could not write over its life (its standard
+/// error closed, or a pipe whose reader went away), each counted and dropped (`slates_machine::log`), which the daemon
+/// reports as `anchor_log_lines_refused` in `slates status`. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the word after the hold refusals.
+pub const SUP_LOG_REFUSALS: usize = 200;
+/// The current daemon's **serving** word: when, in the heartbeat's host domain, it finished its start (recovery
+/// included) and began serving; zero until then, and zeroed at every start. An exit after it is a daemon that
+/// recovered, which the restart bound does not count (`supervise.rs`). Zero in a block an older daemon wrote, so every
+/// exit under it counts, as before.
+/// Format: the byte offset inside the supervision block, the word after the refused log lines.
+pub const SUP_SERVING: usize = 208;
+/// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
+/// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
+/// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon
+/// hold, still opens its session after a daemon restart: a client resuming under its id proves the key before its
+/// seat or its completion records are served, so a stranger that names a dead client's id gets neither. Unlike the
+/// issuer secret it is not minted at every start, since resumption crosses starts.
+/// Format: the byte offset inside the supervision block, the first cache line past the refusal and serving words (216,
+/// so 256).
+pub const SUP_SESSION_PRESENT: usize = 256;
+/// Format: the client session secret's offset, the word after its published word.
+pub const SUP_SESSION_SECRET: usize = 264;
+/// Format: the client session secret's width, a 256-bit random value, the width of the BLAKE3 key that derives each
+/// client's session key from it (BLAKE3 §2.3).
+pub const SESSION_SECRET_BYTES: usize = 32;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

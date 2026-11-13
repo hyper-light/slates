@@ -301,6 +301,10 @@ pub struct DaemonConfig {
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
   /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
   pub memcpy_bytes_per_second: u64,
+  /// Measured: the boot profile's base-page fault cost in nanoseconds, at least one: what an idle shard's pre-fault of
+  /// its reserve (A-214) slices by, as §4.2's pre-fault batch is `idle window / fault_ns`
+  /// ([`DaemonConfig::prefault_slice_pages`]).
+  pub page_fault_ns: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
   /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
@@ -637,6 +641,19 @@ impl DaemonConfig {
       ["memcpy", "rt.step_budget_ns"]
     );
     derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
+    let page_fault_ns: Derived<u64> = derived!(
+      profile.faults.base_ns.max(1),
+      "the profile's measured base-page fault cost (at least one)",
+      ["faults.base_ns"]
+    );
+    derivations.push(note("page_fault_ns", &page_fault_ns));
+    // The reserve an idle shard keeps pre-faulted (A-214): its bound is known at boot, its burst only at run time.
+    derivations.push(format!(
+      "prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = {}, the arena's free bytes): the \
+       free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors \
+       [\"reserve_per_shard\", \"content.allocated_bytes\"])",
+      reserve.get()
+    ));
     let codec = codec_policy(profile);
     derivations.push(format!(
       "codec = lz4 {}, zstd levels {:?}, byte worth {} scaled ns: the profile's measured codec points, a \
@@ -729,7 +746,7 @@ impl DaemonConfig {
       )
       .unwrap_or(usize::MAX)
       .max(1),
-      "metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR",
+      "metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR",
       ["reserve_per_shard", "vfs.directory_unit_bytes"]
     );
     derivations.push(note("max_dirs", &max_dirs));
@@ -886,6 +903,7 @@ impl DaemonConfig {
       rereplication_bytes_per_second: 0,
       blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
+      page_fault_ns: page_fault_ns.get(),
       codec,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
@@ -904,7 +922,76 @@ impl DaemonConfig {
       inode_reserve,
       derivations,
     }
+    .with_control_shard_noted()
   }
+
+  /// Derived: the control shard's task and timer capacities. The control shard runs every forward of every shard's
+  /// clients to another node (each a task there for its whole round), and its forward lane admits
+  /// [`forward_lane_bound`] of them, so its arena, its control channel (bounded by the same capacity) and its timers
+  /// hold that many beyond every shard's own share (`runtime.tasks_per_shard`, `runtime.timers_per_shard`). A lane
+  /// that admits work its shard's arena cannot run is the defect (the supervisor's order of 2026-11-07: the control
+  /// shard sized like the rest refused 117 spawns in fixtures' 1,000-client replica-kill rung, and its channel 10,198
+  /// to 10,298 forwards in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+  pub fn control_shard_capacity(&self) -> Derived<slates_rt::ShardCapacity> {
+    // The lane holds forwards to other nodes, so with no peers it admits none (R8: the formula's value, no mode): a
+    // laptop's control shard is sized like its other shards. Until 2026-11-08 a laptop's got the lane's bound too, a
+    // channel of 1,371,635 tasks on a Mac for forwards that cannot exist.
+    let peers = self.fleet.as_ref().map_or(0, |fleet| fleet.peers.len());
+    let lane = if peers == 0 {
+      0
+    } else {
+      forward_lane_bound(
+        self.clients_per_shard,
+        self.region.slots,
+        self.runtime.shards,
+      )
+      .get()
+    };
+    derived!(
+      slates_rt::ShardCapacity {
+        tasks: self.runtime.tasks_per_shard.saturating_add(lane),
+        timers: self.runtime.timers_per_shard.saturating_add(lane),
+      },
+      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers)",
+      [
+        "tasks_per_shard",
+        "timers_per_shard",
+        "clients_per_shard",
+        "region.slots",
+        "shards",
+        "fleet.peers"
+      ]
+    )
+  }
+
+  /// This configuration with its control shard's capacity in the boot log, in place of any earlier line for it (the
+  /// capacity follows `runtime`'s, which [`Self::with_fleet`] raises).
+  fn with_control_shard_noted(mut self) -> DaemonConfig {
+    let line = note("control_shard_capacity", &self.control_shard_capacity());
+    self
+      .derivations
+      .retain(|kept| !kept.starts_with("control_shard_capacity "));
+    self.derivations.push(line);
+    self
+  }
+}
+
+/// Derived: the forwards one forward lane may hold, queued and open together: every request this node's clients may
+/// hold in flight, `clients_per_shard × slots` on each of `shards` (`crate::forward_lane`). The control shard's
+/// capacity is sized from the same value ([`DaemonConfig::control_shard_capacity`]).
+pub(crate) fn forward_lane_bound(
+  clients_per_shard: usize,
+  slots: u32,
+  shards: u16,
+) -> Derived<usize> {
+  derived!(
+    clients_per_shard
+      .saturating_mul(usize::try_from(slots).unwrap_or(usize::MAX))
+      .saturating_mul(usize::from(shards.max(1)))
+      .max(1),
+    "clients_per_shard × slots × shards",
+    ["clients_per_shard", "region.slots", "shards"]
+  )
 }
 
 /// A fault injected into one shard's start (the boot tests): which partition, how it misbehaves, and for how long.
@@ -1136,6 +1223,33 @@ impl DaemonConfig {
     copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
   }
 
+  /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
+  /// over the measured base-page fault cost, `step_quantum_ns / page_fault_ns`, at least one (§4.2's pre-fault batch,
+  /// "idle window / fault_ns").
+  pub fn prefault_slice_pages(&self) -> usize {
+    usize::try_from(
+      self
+        .step_quantum_ns()
+        .checked_div(self.page_fault_ns.max(1))
+        .unwrap_or(0),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1)
+  }
+
+  /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate
+  /// (`memcpy_bytes_per_second × step_quantum_ns / 1e9`), at least one. A lower bound on what a quantum's work must
+  /// copy past: work that copies more bytes than this cannot finish within the quantum. An NFS connection's turn stops
+  /// taking records there (`crate::nfs`, `read_head`; A-204).
+  pub fn quantum_copy_bytes(&self) -> u64 {
+    self
+      .memcpy_bytes_per_second
+      .saturating_mul(self.step_quantum_ns())
+      .checked_div(NANOS_PER_SECOND)
+      .unwrap_or(0)
+      .max(1)
+  }
+
   /// [`DaemonConfig::copy_slice_bytes`] in whole host pages, at least one: the slice a DAX backing's fill, ingest or
   /// refill copies on the calling shard now (A-163), since a backing is stored and compared a page at a time.
   pub fn copy_slice_page_bytes(&self) -> u64 {
@@ -1279,7 +1393,7 @@ impl DaemonConfig {
       .timers_per_shard
       .saturating_add(fleet_tasks.get());
     self.fleet = Some(membership);
-    self
+    self.with_control_shard_noted()
   }
 }
 
@@ -1657,6 +1771,43 @@ mod tests {
         .any(|line| line.starts_with("fleet_tasks_per_shard")),
       "the boot log names the share with its input: {:?}",
       fleet.derivations
+    );
+  }
+
+  /// §4.3: with no peers a node's forward lane admits nothing, so a laptop's control shard is sized like its other
+  /// shards; a fleet node's holds the lane's bound beside its own share. Until 2026-11-08 a laptop's held the lane's
+  /// bound too, and `a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room` flooded 1,371,635 tasks onto
+  /// a Mac's control shard, past the second its answer may take.
+  #[test]
+  fn a_laptops_control_shard_holds_no_forward_lane() {
+    let profile = crate::daemon::test_profile();
+    let solo = DaemonConfig::derive(&profile, "control-solo", None);
+    let capacity = solo.control_shard_capacity().get();
+    assert_eq!(
+      (capacity.tasks, capacity.timers),
+      (solo.runtime.tasks_per_shard, solo.runtime.timers_per_shard),
+      "a node with no peers has no forwards to other nodes to hold"
+    );
+    let fleet = DaemonConfig::derive(&profile, "control-fleet", None).with_fleet(FleetMembership {
+      quorum: Quorum { f: 1 },
+      peers: vec![HostId(1), HostId(2)],
+      host: HostId(0),
+      origin_anchor: HostId(0),
+      domains: BTreeMap::new(),
+      regions: BTreeMap::new(),
+      durability: None,
+      region_mirrors: BTreeMap::new(),
+    });
+    let lane = forward_lane_bound(
+      fleet.clients_per_shard,
+      fleet.region.slots,
+      fleet.runtime.shards,
+    )
+    .get();
+    assert_eq!(
+      fleet.control_shard_capacity().get().tasks,
+      fleet.runtime.tasks_per_shard + lane,
+      "a fleet node's control shard holds every forward its lane admits"
     );
   }
 

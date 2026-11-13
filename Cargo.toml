@@ -64,6 +64,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_SystemInformation",
   "Win32_System_Memory",
   "Win32_System_Threading",
+  # Another process's threads, each one's CPU time read by the anchor's start judgment (`slates-machine`'s
+  # `process_clock`): a ToolHelp snapshot lists them.
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Power",
   "Win32_System_Performance",
   # This process's working set, the reading `slates-machine` gives the idle give-back's tests (`Facts::resident_now`).
@@ -90,6 +93,8 @@ windows-sys = { version = "0.60", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
+# The C compiler finder every build script uses; xtask finds MSVC's cl.exe with it for the Windows conformance suites.
+cc = "1.4"
 # AWS-LC, through its Rust binding aws-lc-rs: the one cryptographic library slates builds on (Ada, 2026-09-28; the
 # same library ../mantle and ../focal use). It provides the control-plane seal's AES-256-GCM (§4.10a §7), the key
 # schedule's HKDF-SHA-256 (RFC 5869, RFC 8446 §7.1 labelled form), SHA-256, and rustls' TLS 1.3 provider (D-15).

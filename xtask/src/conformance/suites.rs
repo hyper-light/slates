@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
+#[cfg(not(windows))]
+use slates_conformance::exerciser::judge_fsx;
+use slates_conformance::exerciser::{ExerciserVerdict, judge_fsstress};
 use slates_conformance::expected::{ExpectedFailures, judge};
 use slates_conformance::record::{Counts, ListDigest, Outcome, Privilege};
 pub(crate) use slates_conformance::tap::Runner;
@@ -45,7 +47,7 @@ fn run_capturing(program: &Path, args: &[String], cwd: &Path) -> Result<(bool, S
 }
 
 /// The outcome for counts: `RAN` unless the lane runs through an adapter or at reduced scope.
-fn outcome_for(
+pub(crate) fn outcome_for(
   run: &Run<'_>,
   suite: Suite,
   counts: Counts,
@@ -71,6 +73,18 @@ fn outcome_for(
   }
 }
 
+/// FreeBSD's fsx's verdict: its exit and its success line.
+#[cfg(not(windows))]
+fn fsx_verdict(success: bool, output: &str, _operations: u64) -> ExerciserVerdict {
+  judge_fsx(success, output)
+}
+
+/// The WinFsp port's verdict: its exit and its own success line, naming the operations asked for.
+#[cfg(windows)]
+fn fsx_verdict(success: bool, output: &str, operations: u64) -> ExerciserVerdict {
+  slates_conformance::exerciser::judge_winfsp_fsx(success, output, operations)
+}
+
 /// fsx over the mount.
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.shared("tools")?;
@@ -79,29 +93,63 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let work = session.workdir("fsx")?;
   let logs = run.scratch.fresh("fsx-logs")?;
   let bounds = run.bounds();
-  let args: Vec<String> = vec![
-    "-N".to_owned(),
-    bounds.fsx_operations.to_string(),
-    "-S".to_owned(),
-    bounds.fsx_seed.to_string(),
-    "-l".to_owned(),
-    bounds.fsx_file_length.to_string(),
-    "-q".to_owned(),
-    "-P".to_owned(),
-    logs.display().to_string(),
-    // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
-    // so an absolute fname would nest one absolute path under another.
-    "fsx.bin".to_owned(),
-  ];
-  let (success, output) = run_capturing(&built.binary, &args, &work)?;
-  let verdict = judge_fsx(success, &output);
+  let args = fsx_args(bounds, &logs);
+  let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
+  let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
+  // A run that failed is judged against the transport's reviewed list (A-209): one that failed its own verification by
+  // the operation it failed at, one its wall bound ended as unfinished. A listed failure is expected, any other is not,
+  // and a pass with a listed failure must strike it.
+  let (list, digest) = reviewed_list(
+    run.root,
+    format!(
+      "docs/wip/conformance/expected-failures/{}.fsx.txt",
+      run.transport.slug()
+    ),
+  )?;
+  let cases: Vec<TapCase> = if verdict.ok {
+    Vec::new()
+  } else {
+    let id = if ended {
+      slates_conformance::exerciser::fsx_stop_id(bounds.fsx_seed, &output)
+    } else {
+      slates_conformance::exerciser::fsx_unfinished_id(bounds.fsx_seed, bounds.fsx_operations)
+    };
+    let (file, number) = id.rsplit_once(':').unwrap_or((id.as_str(), "0"));
+    vec![TapCase {
+      id: slates_conformance::tap::TestId {
+        file: file.to_owned(),
+        number: number.parse().unwrap_or(0),
+      },
+      status: CaseStatus::Fail {
+        detail: verdict.detail.clone(),
+      },
+    }]
+  };
+  let judgement = judge(&list, &cases);
   let mut notes = vec![
     built.note,
     "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)".to_owned(),
+    judgement.describe(),
   ];
+  if !ended {
+    notes.push(format!(
+      "fsx was ended at its wall bound of {FSX_WALL_BOUND:?}"
+    ));
+  }
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
+    notes.push(keep_fsx_logs(
+      &logs,
+      &run.options.records,
+      run.transport.slug(),
+      bounds,
+    )?);
   }
+  let (alive, live_note) = session.alive_and_shipped();
+  if !alive {
+    notes.push("the daemon stopped answering, or a live-shipped run did not ship".to_owned());
+  }
+  notes.extend(live_note);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -122,13 +170,153 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       command_line(&built.binary, &args)
     ),
     bound: format!(
-      "{} operations, seed {}, file length {} bytes",
+      "{} operations, seed {}, file length {} bytes, {FSX_WALL_BOUND:?} a run",
       bounds.fsx_operations, bounds.fsx_seed, bounds.fsx_file_length
     ),
-    expected_failure_list: None,
+    expected_failure_list: Some(digest),
     notes,
-    ok: verdict.ok,
+    ok: judgement.acceptable() && alive,
   })
+}
+
+/// Derived: the wall bound of a whole fsx run: pjdfstest's per-file bound
+/// (`slates_conformance::pjdfstest::FILE_BOUND_SECONDS`, 300 s), about five times the slowest recorded fsx run of the
+/// default bounds (62.6 s, `native-linux-fuse` on arm64, diagnostics run 41975493604). A run still going then is ended
+/// and judged as unfinished (the WinFsp port's operations take seconds each over the drive, A-209).
+const FSX_WALL_BOUND: Duration = PJDFSTEST_FILE_BOUND;
+
+/// Runs a suite binary until it exits or `bound` passes, capturing both streams together; past the bound it is killed.
+/// Whether it succeeded, its output, and whether it ended by itself.
+/// fsx's arguments under `bounds`, its `-P` files in `logs`, run in the work directory.
+fn fsx_args(bounds: super::Bounds, logs: &Path) -> Vec<String> {
+  vec![
+    "-N".to_owned(),
+    bounds.fsx_operations.to_string(),
+    "-S".to_owned(),
+    bounds.fsx_seed.to_string(),
+    fetch::FSX_LENGTH_FLAG.to_owned(),
+    bounds.fsx_file_length.to_string(),
+    fetch::FSX_TRACE_FLAG.to_owned(),
+    "-P".to_owned(),
+    super::plain_path(logs),
+    // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
+    // so an absolute fname would nest one absolute path under another.
+    FSX_FILE.to_owned(),
+  ]
+}
+
+/// Format: the file fsx exercises, named relative to its work directory.
+const FSX_FILE: &str = "fsx.bin";
+
+/// Shape: the longest line fsx writes a run's `.fsxlog` (its output, an operation's replay at most: `NNNNN(NNN mod 256):
+/// MAPWRITE 0x… thru 0x… (0x… bytes) …`, under a hundred bytes), with room.
+const FSX_LOG_LINE_BYTES: u64 = 128;
+
+/// Keeps a failed fsx run's `-P` files, its `.fsxlog` (what it printed) and `.fsxgood` (the content it expected), beside
+/// its record in `<records>/<transport>.fsx-logs/`, so the artifact that carries the records carries them: CI run
+/// 42395077767 left them in the runner's scratch. Each is bounded by the run: at most the file length (`.fsxgood` is
+/// one copy of the file) plus a [`FSX_LOG_LINE_BYTES`] line per operation; a file past that keeps its end. The note
+/// says where they are and how much was kept.
+fn keep_fsx_logs(
+  logs: &Path,
+  records: &Path,
+  transport: &str,
+  bounds: super::Bounds,
+) -> Result<String, Failure> {
+  let bound = bounds
+    .fsx_file_length
+    .saturating_add(bounds.fsx_operations.saturating_mul(FSX_LOG_LINE_BYTES));
+  let kept = records.join(format!("{transport}.fsx-logs"));
+  super::create_dir(&kept)?;
+  let mut said = Vec::new();
+  #[allow(clippy::disallowed_methods)] // the development tool reads its own scratch.
+  let entries = std::fs::read_dir(logs).map_err(|e| Failure(format!("{}: {e}", logs.display())))?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let Some(name) = path.file_name() else {
+      continue;
+    };
+    #[allow(clippy::disallowed_methods)] // the development tool reads its own scratch.
+    let Ok(bytes) = std::fs::read(&path) else {
+      continue;
+    };
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let skip = usize::try_from(length.saturating_sub(bound)).unwrap_or(usize::MAX);
+    let tail = bytes.get(skip..).unwrap_or_default();
+    super::write_file(&kept.join(name), tail)?;
+    said.push(format!(
+      "{} ({} of {length} bytes)",
+      name.to_string_lossy(),
+      tail.len()
+    ));
+  }
+  said.sort();
+  Ok(format!(
+    "fsx's -P files kept beside the record, each bounded to {bound} bytes, in {}: {}",
+    kept
+      .file_name()
+      .map(|name| name.to_string_lossy().into_owned())
+      .unwrap_or_default(),
+    said.join(", ")
+  ))
+}
+
+fn run_bounded(
+  program: &Path,
+  args: &[String],
+  cwd: &Path,
+  bound: Duration,
+) -> Result<(bool, String, bool), Failure> {
+  let mut child = Command::new(program)
+    .args(args)
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| Failure(format!("running {}: {e}", program.display())))?;
+  let stdout = drain_stream(child.stdout.take())?;
+  let stderr = drain_stream(child.stderr.take())?;
+  let started = Instant::now();
+  let (success, ended) = loop {
+    if let Some(status) = child.try_wait()? {
+      break (status.success(), true);
+    }
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      let _ = child.wait();
+      break (false, false);
+    }
+    pause();
+  };
+  let mut text = joined_stream(stdout)?;
+  text.push_str(&joined_stream(stderr)?);
+  Ok((success, text, ended))
+}
+
+/// A child's stream read to its end on a thread the caller joins.
+fn drain_stream<R: std::io::Read + Send + 'static>(
+  stream: Option<R>,
+) -> Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>, Failure> {
+  let mut stream = stream.ok_or_else(|| Failure("a suite stream was not piped".to_owned()))?;
+  std::thread::Builder::new()
+    .name("suite-stream".to_owned())
+    .spawn(move || {
+      let mut bytes = Vec::new();
+      stream.read_to_end(&mut bytes).map(|_| bytes)
+    })
+    .map_err(|e| Failure(format!("starting a suite stream's reader: {e}")))
+}
+
+/// The text a drained stream read; the child has ended, so the reader reaches the end.
+fn joined_stream(
+  drain: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<String, Failure> {
+  let bytes = drain
+    .join()
+    .map_err(|_| Failure("a suite stream's reader panicked".to_owned()))?
+    .map_err(|e| Failure(format!("reading a suite stream: {e}")))?;
+  Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// fsstress over the mount.
@@ -159,7 +347,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     output.as_bytes(),
   )?;
   let verdict = judge_fsstress(success, &output);
-  let alive = session.daemon_alive();
+  let (alive, live_note) = session.alive_and_shipped();
   let ok = verdict.ok && alive;
   let mut notes = vec![
     built.built.note,
@@ -174,6 +362,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       session.anchor_log_tail()
     ));
   }
+  notes.extend(live_note);
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
@@ -320,7 +509,7 @@ fn shape_lines(cases: &[TapCase]) -> (String, Vec<String>) {
 }
 
 /// The failures by shape as one note.
-fn shape_note(cases: &[TapCase]) -> String {
+pub(crate) fn shape_note(cases: &[TapCase]) -> String {
   let (heading, rows) = shape_lines(cases);
   format!("{heading}: {}", rows.join("; "))
 }
@@ -405,17 +594,17 @@ pub(crate) fn tally_outputs(
 }
 
 /// The aggregate counts of the parsed files.
-struct Tally {
-  files: u32,
-  cases: Vec<TapCase>,
-  passed: u32,
-  failed: u32,
-  needs_root: u32,
-  todo: u32,
-  incomplete: Vec<String>,
+pub(crate) struct Tally {
+  pub(crate) files: u32,
+  pub(crate) cases: Vec<TapCase>,
+  pub(crate) passed: u32,
+  pub(crate) failed: u32,
+  pub(crate) needs_root: u32,
+  pub(crate) todo: u32,
+  pub(crate) incomplete: Vec<String>,
 }
 
-fn tally(parsed: &[TapFile]) -> Tally {
+pub(crate) fn tally(parsed: &[TapFile]) -> Tally {
   let mut out = Tally {
     files: u32::try_from(parsed.len()).unwrap_or(u32::MAX),
     cases: Vec::new(),
@@ -464,6 +653,15 @@ fn expected_list(
       Privilege::Unprivileged => ".unprivileged",
     }
   );
+  reviewed_list(root, relative)
+}
+
+/// The reviewed list at `relative` (from the workspace root), or an empty one when no file exists yet, with the
+/// digest a record carries.
+pub(crate) fn reviewed_list(
+  root: &Path,
+  relative: String,
+) -> Result<(ExpectedFailures, ListDigest), Failure> {
   let text = std::fs::read_to_string(root.join(&relative)).unwrap_or_default();
   let list = ExpectedFailures::parse(&text).map_err(|e| Failure(format!("{relative}: {e}")))?;
   let digest = ListDigest {
@@ -489,6 +687,18 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let session = Session::open(run, "pjdfstest", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("pjd")?;
   let (as_root, runner) = pjdfstest_runner(run.root_available, this_user());
+  let probe = if run.options.read_only {
+    // The Linux lane named FUSE mounts the daemon's export with NFSv3 (`slates::LINUX_NFS_OPTIONS`).
+    let nfs3 = run.transport == Transport::NativeLinuxFuse;
+    Some(read_only_probe(
+      &session,
+      &work,
+      &tree.binary,
+      (as_root, nfs3),
+    )?)
+  } else {
+    None
+  };
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
   // its own message before it is listed as expected.
@@ -511,7 +721,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     }
     parsed.push(parse_file(&relative, &output, &runner));
   }
-  let alive = session.daemon_alive();
+  let (alive, live_note) = session.alive_and_shipped();
   let daemon_note = (!alive).then(|| {
     format!(
       "the daemon stopped answering during the run; anchor log tail:\n{}",
@@ -528,7 +738,9 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     tree.binary.display()
   );
   let mut notes = vec![tree.note];
+  notes.extend(probe);
   notes.extend(daemon_note);
+  notes.extend(live_note);
   notes.extend(size_note);
   judged_pjdfstest(
     run,
@@ -542,6 +754,146 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       notes,
     },
   )
+}
+
+/// Format: pjdfstest's read-only cases, the files of its suite that expect `EROFS`, each one call of its helper over the
+/// probe's tree (`ro/`: the file `f`, the directory `d`, the symlink `l`, made through the writable mount). Upstream they
+/// run on FreeBSD alone, which can make a read-only file system for them (`mdconfig`, then `mount -ur`); a read
+/// attachment is one here. Every name a call makes is new, since Linux answers `EEXIST` before `EROFS` for one that
+/// exists, and BSD's `chflags` and `lchmod` are left out.
+const READ_ONLY_PROBE: &[(&str, &[&str])] = &[
+  ("open/14.t", &["open", "ro/f", "O_WRONLY"]),
+  ("open/14.t", &["open", "ro/f", "O_RDWR"]),
+  ("open/14.t", &["open", "ro/f", "O_RDONLY,O_TRUNC"]),
+  ("open/15.t", &["open", "ro/new", "O_RDONLY,O_CREAT", "0644"]),
+  ("mkdir/09.t", &["mkdir", "ro/newdir", "0755"]),
+  ("rmdir/14.t", &["rmdir", "ro/d"]),
+  ("unlink/12.t", &["unlink", "ro/f"]),
+  ("link/16.t", &["link", "ro/f", "ro/f2"]),
+  ("rename/16.t", &["rename", "ro/f", "ro/f3"]),
+  ("symlink/10.t", &["symlink", "test", "ro/newlink"]),
+  ("mkfifo/08.t", &["mkfifo", "ro/fifo", "0644"]),
+  ("truncate/10.t", &["truncate", "ro/f", "1234"]),
+  ("chmod/09.t", &["chmod", "ro/f", "0600"]),
+  ("chown/09.t", &["chown", "ro/f", "65533", "65533"]),
+];
+
+/// Format: what each of [`READ_ONLY_PROBE`]'s calls must answer.
+const READ_ONLY_ANSWER: &str = "EROFS";
+/// Format: the probe's file whose calls open an existing file, the only calls NFSv3 cannot answer [`READ_ONLY_ANSWER`].
+const OPEN_OF_A_FILE: &str = "open/14.t";
+/// Format: the probe's file whose call truncates an existing file by its path.
+const TRUNCATE_OF_A_FILE: &str = "truncate/10.t";
+/// Format: what a call the Linux client decides from ACCESS answers through a read attachment, at the protocol's limit.
+/// The server withholds the write rights in ACCESS, as knfsd does for a read-only export, and the client turns a right
+/// it was not granted into `EACCES` before any request reaches the server: an open of an existing file over NFSv3,
+/// which has no OPEN, and a truncate by path over either version, which asks for write without an open. A server cannot
+/// answer ACCESS with an error instead, since the client asks every right in one call and caches the answer, so its
+/// reads and lookups would fail too. Every change that reaches the server still answers [`READ_ONLY_ANSWER`] (the
+/// supervisor's decision, 2026-11-08 and 2026-11-09, from slabs' reading; recorded as A-269).
+const ACCESS_LIMIT: &str = "EACCES";
+/// Format: where [`ACCESS_LIMIT`] comes from, as the probe's note names it: the Linux client's ACCESS check and its
+/// permission hook, and knfsd's answer for a read-only export.
+const ACCESS_LIMIT_SOURCE: &str = "A-269; the client decides from ACCESS: Linux v6.8 fs/nfs/dir.c nfs_do_access 3219-3221, \
+  nfs_permission 3286-3288; knfsd answers a read-only export so: fs/nfsd/vfs.c v7.4-rc1 nfsd_permission ~2871, \
+  nfsd_access ~855";
+
+/// How the read-only probe judges one call's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+  /// It answered [`READ_ONLY_ANSWER`].
+  ReadOnly,
+  /// A call the client decides from ACCESS answered [`ACCESS_LIMIT`], the most the protocol can say.
+  AccessLimit,
+  /// Anything else: a miss.
+  Missed,
+}
+
+/// Whether the Linux client decides pjdfstest's `file`'s call from ACCESS before asking the server: a truncate by path
+/// over either version, and an open of an existing file over NFSv3 (`nfs3`); over NFSv4 an open is the server's OPEN.
+fn decided_by_access(file: &str, nfs3: bool) -> bool {
+  file == TRUNCATE_OF_A_FILE || (nfs3 && file == OPEN_OF_A_FILE)
+}
+
+/// The verdict on the probe's call from pjdfstest's `file` that answered `answer`, over NFSv3 when `nfs3`.
+fn probe_verdict(file: &str, answer: &str, nfs3: bool) -> ProbeVerdict {
+  if answer == READ_ONLY_ANSWER {
+    ProbeVerdict::ReadOnly
+  } else if answer == ACCESS_LIMIT && decided_by_access(file, nfs3) {
+    ProbeVerdict::AccessLimit
+  } else {
+    ProbeVerdict::Missed
+  }
+}
+
+/// Runs [`READ_ONLY_PROBE`] in `work`, under the session's read-only mount, over a tree made first through its writable
+/// one, with pjdfstest's helper `helper` (as root when `as_root`, so no ownership check refuses first): the note that
+/// says how many calls answered [`READ_ONLY_ANSWER`], how many the client decides from ACCESS met the protocol's limit
+/// (`nfs3` names NFSv3, [`ACCESS_LIMIT`]), and what each other one answered.
+fn read_only_probe(
+  session: &Session,
+  work: &Path,
+  helper: &Path,
+  (as_root, nfs3): (bool, bool),
+) -> Result<String, Failure> {
+  let writable = session
+    .writable(work)
+    .ok_or_else(|| Failure("the read-only probe needs the session's writable mount".to_owned()))?
+    .join("ro");
+  super::create_dir(&writable.join("d"))?;
+  super::write_file(&writable.join("f"), b"the read-only probe's file\n")?;
+  #[cfg(unix)]
+  std::os::unix::fs::symlink("f", writable.join("l"))
+    .map_err(|e| Failure(format!("the probe's symlink: {e}")))?;
+  for made in ["f", "d", "l"] {
+    super::slates::visible(&work.join("ro").join(made))?;
+  }
+  let mut others = Vec::new();
+  let mut at_limit = 0usize;
+  for (file, call) in READ_ONLY_PROBE {
+    let mut command = if as_root {
+      let mut sudo = Command::new("sudo");
+      sudo.arg("-n").arg(helper);
+      sudo
+    } else {
+      Command::new(helper)
+    };
+    let output = command.args(*call).current_dir(work).output()?;
+    let answer = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .last()
+      .unwrap_or_default()
+      .trim()
+      .to_owned();
+    match probe_verdict(file, &answer, nfs3) {
+      ProbeVerdict::ReadOnly => {}
+      ProbeVerdict::AccessLimit => at_limit = at_limit.saturating_add(1),
+      ProbeVerdict::Missed => {
+        others.push(format!("{file} `{}` answered {answer:?}", call.join(" ")))
+      }
+    }
+  }
+  let note = format!(
+    "read-only probe, pjdfstest's {READ_ONLY_ANSWER} cases over a read attachment: {} of {} answered \
+     {READ_ONLY_ANSWER}{}{}",
+    READ_ONLY_PROBE
+      .len()
+      .saturating_sub(others.len())
+      .saturating_sub(at_limit),
+    READ_ONLY_PROBE.len(),
+    if at_limit == 0 {
+      String::new()
+    } else {
+      format!("; {at_limit} answered {ACCESS_LIMIT}, the protocol's limit ({ACCESS_LIMIT_SOURCE})")
+    },
+    if others.is_empty() {
+      String::new()
+    } else {
+      format!("; the others: {}", others.join("; "))
+    }
+  );
+  eprintln!("conformance: {note}");
+  Ok(note)
 }
 
 /// What a pjdfstest run did, for [`judged_pjdfstest`].
@@ -639,6 +991,130 @@ pub(crate) fn judged_pjdfstest(
 
 #[cfg(test)]
 mod tests {
+
+  /// The read-only probe's judgement (the supervisor's decision, 2026-11-09). Do: judge `EROFS`; `EACCES` from an NFSv3
+  /// open of an existing file, from the same open over NFSv4, from a path truncate over each version, and from an NFSv3
+  /// create; and an open answering success. Expect: `EROFS` is read-only everywhere; `EACCES` is the protocol's limit for
+  /// the calls the client decides from ACCESS (v3's open, either version's truncate) and a miss for the rest (v4's open is
+  /// the server's OPEN; a create reaches the server); success is a miss.
+  #[test]
+  fn the_read_only_probe_counts_the_access_limit_apart_from_a_miss() {
+    use super::{ProbeVerdict, probe_verdict};
+    assert_eq!(
+      probe_verdict("open/14.t", "EROFS", true),
+      ProbeVerdict::ReadOnly
+    );
+    assert_eq!(
+      probe_verdict("mkdir/09.t", "EROFS", false),
+      ProbeVerdict::ReadOnly
+    );
+    assert_eq!(
+      probe_verdict("open/14.t", "EACCES", true),
+      ProbeVerdict::AccessLimit
+    );
+    assert_eq!(
+      probe_verdict("open/14.t", "EACCES", false),
+      ProbeVerdict::Missed
+    );
+    assert_eq!(
+      probe_verdict("truncate/10.t", "EACCES", true),
+      ProbeVerdict::AccessLimit
+    );
+    assert_eq!(
+      probe_verdict("truncate/10.t", "EACCES", false),
+      ProbeVerdict::AccessLimit
+    );
+    assert_eq!(
+      probe_verdict("open/15.t", "EACCES", true),
+      ProbeVerdict::Missed
+    );
+    assert_eq!(probe_verdict("open/14.t", "0", true), ProbeVerdict::Missed);
+  }
+
+  /// CI run 42395077767's record of a failed fsx run held replay lines only, and its `-P` files stayed in the runner's
+  /// scratch. Do: build the pinned fsx, run it with the harness's own arguments on a plain directory of the build
+  /// output while another thread overwrites its file in place (never truncating: a truncation under a mapped read
+  /// kills fsx with SIGBUS before it reports), and judge and keep the run as `run_fsx` does. Expect fsx to fail, the
+  /// record's note to hold its failure line (`BAD DATA`), and its `.fsxlog` and `.fsxgood` beside the records. Skips
+  /// loudly without `SLATES_TEST_FSX`: it fetches fsx's pinned source and needs a C compiler.
+  #[cfg(not(windows))]
+  #[test]
+  #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+  fn a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record() {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    if std::env::var_os("SLATES_TEST_FSX").is_none() {
+      eprintln!("SKIP: set SLATES_TEST_FSX=1 to build the pinned fsx and force its failure");
+      return;
+    }
+    /// The test's directory in the build output, removed when dropped.
+    struct Removed(PathBuf);
+    impl Drop for Removed {
+      fn drop(&mut self) {
+        crate::conformance::remove_tree(&self.0);
+      }
+    }
+    /// Lowers the writer's stop flag however the run ends, so a failed run never leaves the scope waiting on it.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+      fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+      }
+    }
+    let dir = Removed(
+      crate::conformance::build_output(&format!("fsx-forced-{}", std::process::id())).unwrap(),
+    );
+    let [tools, work, logs, records] =
+      ["tools", "work", "logs", "records"].map(|name| dir.0.join(name));
+    for path in [&tools, &work, &logs, &records] {
+      crate::conformance::create_dir(path).unwrap();
+    }
+    let built = fetch::build_fsx(&tools).unwrap();
+    let bounds = crate::conformance::Bounds::default();
+    let stop = AtomicBool::new(false);
+    let target = work.join(FSX_FILE);
+    let (success, output, _ended) = std::thread::scope(|scope| {
+      let _stop = Stop(&stop);
+      scope.spawn(|| {
+        let mut at = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+          if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target) {
+            let _ = file.write_all_at(&[0xff; 64], at % 4096);
+          }
+          at = at.wrapping_add(64);
+          std::thread::yield_now();
+        }
+      });
+      run_bounded(
+        &built.binary,
+        &fsx_args(bounds, &logs),
+        &work,
+        FSX_WALL_BOUND,
+      )
+      .unwrap()
+    });
+    let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
+    assert!(
+      !verdict.ok,
+      "fsx failed with its file overwritten: {output}"
+    );
+    let note = format!("fsx output tail: {}", verdict.detail);
+    assert!(
+      note.contains("BAD DATA"),
+      "the note holds fsx's failure line: {note}"
+    );
+    let kept = keep_fsx_logs(&logs, &records, "forced", bounds).unwrap();
+    eprintln!("{note}\n{kept}");
+    for name in ["fsx.bin.fsxlog", "fsx.bin.fsxgood"] {
+      let length = std::fs::metadata(records.join("forced.fsx-logs").join(name))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+      assert!(length > 0, "{name} beside the records: {kept}");
+    }
+  }
   use super::{CaseStatus, Runner, parse_file, pjdfstest_runner};
 
   /// AC-3.1: request the root-capable lane from an unprivileged process. The simulated child

@@ -73,7 +73,7 @@ const ONE_UNIT: u64 = 1;
 /// Runs `unit` — one unit of a phase, `Some` once the phase is whole — until the phase is whole or the slice's time is
 /// spent: [`crate::config::DaemonConfig::copy_slice_ns`], half the live step quantum, as a granted landing's slice. The
 /// clock is read after every unit, so a slice overruns its budget by its last unit at most.
-fn sliced<T>(
+pub(crate) fn sliced<T>(
   state: &mut ShardState,
   mut unit: impl FnMut(&mut ShardState) -> Result<Option<T>, Refusal>,
 ) -> Result<Option<T>, Refusal> {
@@ -92,7 +92,8 @@ fn sliced<T>(
   }
 }
 
-/// The image builds and merges running on this shard (§4.6, A-160).
+/// The image builds and merges running on this shard (§4.6, A-160), and the green checkouts, which defer the same way
+/// (§4.16 A-201, `crate::checkout`).
 #[derive(Default)]
 pub(crate) struct ImageState {
   /// The requests a build or merge runs for, by origin, client and sequence, with where its reply goes: the newest
@@ -143,7 +144,9 @@ fn unreachable() -> Refusal {
 }
 
 /// Runs `step` on the shard's state, or refuses when the state is unreachable.
-fn with<R>(step: impl FnOnce(&mut ShardState) -> Result<R, Refusal>) -> Result<R, Refusal> {
+pub(crate) fn with<R>(
+  step: impl FnOnce(&mut ShardState) -> Result<R, Refusal>,
+) -> Result<R, Refusal> {
   match crate::state::with_state(step) {
     Some(result) => result,
     None => {
@@ -161,7 +164,7 @@ fn deferred() -> ReplyBody {
 
 /// Defers the current request's reply to `task`, spawned as an owned task of this shard: the request becomes
 /// in flight, so a retry joins it. `Overloaded` when the shard's task arena is full.
-fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> ReplyBody {
+pub(crate) fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> ReplyBody {
   let Some((origin, id)) = state.current_request else {
     return refused(Refusal::Unsupported {
       feature: "an image verb outside a recorded request".to_owned(),
@@ -183,49 +186,86 @@ fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> Re
 
 /// Commits a task's outcome as one atom — its effects (`produce`), the publication they need, and the request's
 /// completion record — and returns the reply with where it goes.
-fn complete(
+pub(crate) fn complete(
   state: &mut ShardState,
-  (origin, id): (u64, RequestId),
+  request: (u64, RequestId),
   produce: impl FnOnce(&mut ShardState) -> ReplyBody,
 ) -> (ReplyBody, Option<ReplyRoute>) {
-  let route = state
+  let route = take_route(state, request);
+  let (reply, _) = commit_outcome(state, request, None, produce);
+  (reply, route)
+}
+
+/// Commits a task's outcome that changed `volume` as [`complete`] does, except on a live-shipped volume (A-200): there
+/// the effects commit now, but the completion is recorded and the reply delivered only once the volume's log is durable
+/// on `f` candidates where the outcome's publication put it, by the deferral a recorded verb on such a volume takes
+/// (`crate::live_ship::defer`, answered by `crate::live_ship::resolve`): `None` then. A refusal, or an outcome on a
+/// volume that need not wait, is completed at once, as [`complete`] completes it.
+pub(crate) fn complete_once_durable(
+  state: &mut ShardState,
+  request: (u64, RequestId),
+  volume: DbVolumeId,
+  produce: impl FnOnce(&mut ShardState) -> ReplyBody,
+) -> Option<(ReplyBody, Option<ReplyRoute>)> {
+  let route = take_route(state, request);
+  match commit_outcome(state, request, Some(volume), produce) {
+    (reply, Some(target)) => {
+      crate::live_ship::defer(state, (volume, target), request, route, reply)
+        .map(|refusal| (refusal, route))
+    }
+    (reply, None) => Some((reply, route)),
+  }
+}
+
+/// Where the reply of in-flight `request` goes, taken: it is answered once, from here.
+fn take_route(state: &mut ShardState, (origin, id): (u64, RequestId)) -> Option<ReplyRoute> {
+  state
     .image
     .in_flight
     .remove(&(origin, id.client, id.sequence))
-    .flatten();
+    .flatten()
+}
+
+/// One transaction: the outcome's effects (`produce`) and, unless the reply must wait for `live`'s durability, the
+/// request's completion record. The reply, and the log position it waits for when it does.
+fn commit_outcome(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  live: Option<DbVolumeId>,
+  produce: impl FnOnce(&mut ShardState) -> ReplyBody,
+) -> (ReplyBody, Option<u64>) {
   state.db.begin();
   let reply = produce(state);
-  let recorded = crate::verbs::record_completion(state, origin, id, reply);
-  let reply = match state.db.commit(&mut state.segment) {
-    Ok(_) => recorded,
+  let target = live
+    .filter(|_| !matches!(reply, ReplyBody::Refused { .. }))
+    .and_then(|volume| crate::live_ship::durable_target(state, volume));
+  let reply = if target.is_some() {
+    reply
+  } else {
+    crate::verbs::record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (reply, target),
     Err(e) => {
       // Nothing of the outcome is durable: counted, never recorded as the completion, so a retry runs again. The new
       // volume, whose record rolled back, is torn down with every other effect the rollback left unrecorded.
       let refusal = refusal_of_db(&e);
       state.count(crate::verbs::refusal_name(&refusal), 1);
       crate::verbs::reconcile_unpublished_effects(state);
-      refused(refusal)
+      (refused(refusal), None)
     }
-  };
-  (reply, route)
+  }
 }
 
 /// Hands a task's reply to where its request waits, on its client's shard. A request with no route (a forward from
 /// another node) reads its completion record instead.
-fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<ReplyRoute>) {
+pub(crate) fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<ReplyRoute>) {
   let Some(route) = route else {
     return;
   };
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      crate::state::deliver(route.client_index, route.request, reply, true);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(
-    route.shard,
-    slates_rt::control::Control::Spawn(Box::new(delivery)),
-  )
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
   .is_err()
   {
     state.count(REPLY_UNDELIVERED, 1);
@@ -234,7 +274,7 @@ fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<ReplyRoute>) 
 
 /// Publishes the shard so the new volume's image precedes its completion (§4.8, AUD-05), as `dispatch` does for a
 /// create; refused when the publication did not capture it.
-fn publish_new_volume(state: &mut ShardState, id: DbVolumeId) -> Result<(), Refusal> {
+pub(crate) fn publish_new_volume(state: &mut ShardState, id: DbVolumeId) -> Result<(), Refusal> {
   match crate::verbs::publish_shard(state) {
     Ok(published) if !published.captured(id) && !published.destroying(id) => {
       Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete))
@@ -297,10 +337,9 @@ pub(crate) fn build_verb(
   if !rights_of(&record, principal).write {
     return forbidden("image_build");
   }
-  if let Some(existing) = state.db.partition().volume_by_name(&name) {
-    return refused(Refusal::AlreadyExists {
-      existing: wire_id(existing.id),
-    });
+  // The name as its own partition holds it too: a volume another partition made under an alias there (A-236).
+  if let Some(existing) = crate::verbs::name_held(state, &name) {
+    return refused(Refusal::AlreadyExists { existing });
   }
   if matches!(record.base, BaseRecord::Path { .. }) {
     return refused(refusal_of_image(ImageError::OverHostDirectory));
@@ -322,6 +361,10 @@ pub(crate) fn build_verb(
       feature: "an image verb outside a recorded request".to_owned(),
     });
   };
+  let (alias, image) = match name_alias(state, &name) {
+    Ok(minted) => minted,
+    Err(refusal) => return refused(refusal),
+  };
   let job = BuildJob {
     request,
     principal: principal.clone(),
@@ -336,9 +379,9 @@ pub(crate) fn build_verb(
     builder: None,
     admitted: None,
     file: InodeNo(0),
-    image: None,
+    image,
   };
-  defer(state, run_build(job))
+  defer(state, run_build(job, alias))
 }
 
 /// A build between its slices: what it holds, released by [`BuildJob::release`] on a refusal or by its drop.
@@ -428,7 +471,11 @@ impl BuildJob {
   /// the image's length, which costs nothing until written. The image's identity is the image volume's id, with the
   /// host's wall time as its creation.
   fn prepare(&mut self, state: &mut ShardState, tree: SnapshotTree) -> Result<(), Refusal> {
-    let id = fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+    // The id its name's alias already names (A-236), or one minted here.
+    let id = match self.image {
+      Some(id) => id,
+      None => fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?,
+    };
     let SnapshotTree { tree, inodes } = tree;
     let identity = Identity {
       uuid: id.bytes,
@@ -523,6 +570,8 @@ impl BuildJob {
         names: slates_db::catalog::NamePolicy::Exact,
         require_locked: self.record.policy.require_locked,
         role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
       },
       base: BaseRecord::Image {
         volume: self.source,
@@ -592,11 +641,15 @@ impl BuildJob {
 
 /// Builds the image a slice at a time; then commits its volume, or the refusal, as one atom and delivers the reply;
 /// then releases what the build made, in slices.
-async fn run_build(mut job: BuildJob) {
-  let outcome = build_steps(&mut job).await;
+async fn run_build(mut job: BuildJob, alias: Option<NameAlias>) {
+  let reserved = reserve(alias.as_ref()).await;
+  let outcome = match &reserved {
+    Ok(()) => build_steps(&mut job).await,
+    Err(refusal) => Err(refusal.clone()),
+  };
   let request = job.request;
-  let delivered = crate::state::with_state(|s| {
-    let (reply, route) = complete(s, request, |s| {
+  let completed = crate::state::with_state(|s| {
+    complete(s, request, |s| {
       match outcome.and_then(|written| job.publish(s, written)) {
         Ok(reply) => reply,
         Err(refusal) => {
@@ -604,15 +657,118 @@ async fn run_build(mut job: BuildJob) {
           refused(refusal)
         }
       }
-    });
-    deliver(s, reply, route);
+    })
   });
+  let delivered = match completed {
+    Some((reply, route)) => {
+      settle(
+        alias,
+        reserved,
+        matches!(reply, ReplyBody::ImageBuilt { .. }),
+      )
+      .await;
+      crate::state::with_state(|s| deliver(s, reply, route))
+    }
+    None => None,
+  };
   if delivered.is_none() {
     // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
     // succeeds it, runs the verb again; the job's drop frees what it made.
     return;
   }
   shed_in_slices(|| job.shed()).await;
+}
+
+/// A volume an image verb makes under a name another partition holds (A-236, `slates_db::alias::CLONE_STEPS`): the
+/// volume lives here beside its source, for copy-on-write, and the name's partition holds an alias of it, reserved
+/// before the volume is made and confirmed (or released) before the reply, as a clone's is.
+struct NameAlias {
+  /// This shard, which asks.
+  this: u16,
+  /// The name's shard.
+  name_shard: u16,
+  /// The name.
+  name: String,
+  /// The volume's id, minted before the reservation names it.
+  id: DbVolumeId,
+}
+
+/// The alias an image verb's `name` needs and the id it names, or neither when the name is this partition's (`None`,
+/// `None`). Refused when the name's partition has no shard here or the volume ids are spent.
+fn name_alias(
+  state: &mut ShardState,
+  name: &str,
+) -> Result<(Option<NameAlias>, Option<DbVolumeId>), Refusal> {
+  let name_partition = crate::verbs::owner_of_name(name, state.shards.len());
+  if name_partition == state.partition {
+    return Ok((None, None));
+  }
+  let name_shard =
+    crate::verbs::shard_of_partition(state, name_partition).ok_or(Refusal::NotFound)?;
+  let id = fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+  Ok((
+    Some(NameAlias {
+      this: state.shard,
+      name_shard,
+      name: name.to_owned(),
+      id,
+    }),
+    Some(id),
+  ))
+}
+
+/// Reserves `alias` at its name's partition: the name held there from now, resolving nothing until confirmed. `Ok` for
+/// a verb whose name is its own partition's.
+async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
+  let Some(alias) = alias else {
+    return Ok(());
+  };
+  let reservation = slates_db::Op::NameAliasReserved {
+    record: slates_db::catalog::NameAliasRecord {
+      name: alias.name.clone(),
+      volume: alias.id,
+      confirmed: false,
+    },
+  };
+  crate::xshard::call_within(
+    alias.this,
+    alias.name_shard,
+    move |s| crate::verbs::alias_step(s, &reservation),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .unwrap_or_else(|| {
+    Err(Refusal::Unpublished {
+      reason: "the name's shard did not answer its reservation".to_owned(),
+    })
+  })
+}
+
+/// Confirms a reserved `alias` when its volume was made (`made`), else releases it; nothing for a verb whose name is its
+/// own partition's or whose reservation was refused. A step the name's shard does not take is counted, and the next
+/// recovery's to settle.
+async fn settle(alias: Option<NameAlias>, reserved: Result<(), Refusal>, made: bool) {
+  let Some(alias) = alias else {
+    return;
+  };
+  if reserved.is_err() {
+    return;
+  }
+  let step = if made {
+    slates_db::Op::NameAliasConfirmed { name: alias.name }
+  } else {
+    slates_db::Op::NameAliasReleased { name: alias.name }
+  };
+  let settled = crate::xshard::call_within(
+    alias.this,
+    alias.name_shard,
+    move |s| crate::verbs::alias_step(s, &step),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  if !matches!(settled, Some(Ok(()))) {
+    let _ = crate::state::with_state(|s| s.count(crate::verbs::ALIAS_STEP_UNTAKEN, 1));
+  }
 }
 
 /// Releases what a finished build or merge made a piece a unit, in slices after its reply: its trees go back to the
@@ -687,10 +843,9 @@ pub(crate) fn merge_verb(
   if !rights_of(&base_record, principal).write {
     return forbidden("image_merge");
   }
-  if let Some(existing) = state.db.partition().volume_by_name(&name) {
-    return refused(Refusal::AlreadyExists {
-      existing: wire_id(existing.id),
-    });
+  // The name as its own partition holds it too: a volume another partition made under an alias there (A-236).
+  if let Some(existing) = crate::verbs::name_held(state, &name) {
+    return refused(Refusal::AlreadyExists { existing });
   }
   if !state.by_id.contains_key(&base) {
     return refused(Refusal::NotFound);
@@ -700,9 +855,14 @@ pub(crate) fn merge_verb(
       feature: "an image verb outside a recorded request".to_owned(),
     });
   };
+  let (alias, id) = match name_alias(state, &name) {
+    Ok(minted) => minted,
+    Err(refusal) => return refused(refusal),
+  };
   let job = MergeJob {
     request,
     principal: principal.clone(),
+    id,
     image: record.id,
     base,
     base_record,
@@ -721,13 +881,15 @@ pub(crate) fn merge_verb(
     image_walk: None,
     merge: None,
   };
-  defer(state, run_merge(job))
+  defer(state, run_merge(job, alias))
 }
 
 /// A merge between its slices: what it holds, released by [`MergeJob::release`] on a refusal or by its drop.
 struct MergeJob {
   request: (u64, RequestId),
   principal: Principal,
+  /// The merged volume's id, when its name's alias names it already (A-236); minted at its publication otherwise.
+  id: Option<DbVolumeId>,
   /// The image volume.
   image: DbVolumeId,
   /// The volume the image was built from, and its record.
@@ -928,14 +1090,25 @@ impl MergeJob {
   fn publish(&mut self, state: &mut ShardState, report: MergeReport) -> Result<ReplyBody, Refusal> {
     let clone = self.clone.take().ok_or_else(unreachable)?;
     let origin = self.origin.take().ok_or_else(unreachable)?;
-    let id = crate::verbs::publish_clone(
-      state,
-      &self.principal,
-      origin,
-      &self.base_record,
-      (self.snapshot, &self.name),
-      clone,
-    )?;
+    let id = match self.id {
+      Some(id) => crate::verbs::publish_clone_as(
+        state,
+        &self.principal,
+        origin,
+        &self.base_record,
+        (self.snapshot, &self.name),
+        clone,
+        id,
+      )?,
+      None => crate::verbs::publish_clone(
+        state,
+        &self.principal,
+        origin,
+        &self.base_record,
+        (self.snapshot, &self.name),
+        clone,
+      )?,
+    };
     publish_new_volume(state, id)?;
     Ok(ReplyBody::ImageMerged {
       id: wire_id(id),
@@ -999,11 +1172,15 @@ const IMAGE_SNAPSHOT_KEPT: &str = "image.snapshot_kept";
 
 /// Merges the image a slice at a time; then commits the clone, or the refusal, as one atom and delivers the reply; then
 /// releases what the merge made, in slices.
-async fn run_merge(mut job: MergeJob) {
-  let outcome = merge_steps(&mut job).await;
+async fn run_merge(mut job: MergeJob, alias: Option<NameAlias>) {
+  let reserved = reserve(alias.as_ref()).await;
+  let outcome = match &reserved {
+    Ok(()) => merge_steps(&mut job).await,
+    Err(refusal) => Err(refusal.clone()),
+  };
   let request = job.request;
-  let delivered = crate::state::with_state(|s| {
-    let (reply, route) = complete(s, request, |s| {
+  let completed = crate::state::with_state(|s| {
+    let completed = complete(s, request, |s| {
       match outcome.and_then(|report| job.publish(s, report)) {
         Ok(reply) => reply,
         Err(refusal) => {
@@ -1013,8 +1190,20 @@ async fn run_merge(mut job: MergeJob) {
       }
     });
     job.drop_image_snapshot(s);
-    deliver(s, reply, route);
+    completed
   });
+  let delivered = match completed {
+    Some((reply, route)) => {
+      settle(
+        alias,
+        reserved,
+        matches!(reply, ReplyBody::ImageMerged { .. }),
+      )
+      .await;
+      crate::state::with_state(|s| deliver(s, reply, route))
+    }
+    None => None,
+  };
   if delivered.is_none() {
     // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
     // succeeds it, runs the verb again; the job's drop frees what it made.

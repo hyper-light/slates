@@ -8,7 +8,7 @@
 //! journal record. A refusal leaves nothing changed (T-1.1, T-1.9). The executable model in the
 //! tests is the specification this file must equal on every generated history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::task::Waker;
 
 use slates_machine::{Derived, derived};
@@ -20,7 +20,8 @@ use slates_mem::{Handle, Slab};
 use crate::clock::Clock;
 use crate::content::{ChunkStore, Extent, ExtentSrc, OpenExtent, inline_bytes};
 use crate::dir::{BaseDirState, Child, DirNode};
-use crate::dirtree::{DirBlock, Retired};
+use crate::dirblocks::{BlockRef, BlockStore};
+use crate::dirtree::Retired;
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
 use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind};
@@ -81,11 +82,11 @@ pub fn inode_unit_bytes() -> usize {
 }
 
 /// The metadata bytes one directory costs at its bound (§4.2 metadata dimension): a directory
-/// node and one block of entries (every directory past the cut-over holds at least one), each at
-/// its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
+/// node and one block of entries at the smallest class (every directory past the cut-over holds at
+/// least one, and the median real directory's is that class, A-203), each at its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
 /// its metadata class over this unit.
 pub fn directory_unit_bytes() -> usize {
-  Slab::<DirNode>::slot_bytes().saturating_add(Slab::<DirBlock>::slot_bytes())
+  Slab::<DirNode>::slot_bytes().saturating_add(BlockStore::unit_bytes())
 }
 
 /// The metadata bytes one chunk record costs (§4.2 metadata dimension): a chunk slab slot.
@@ -98,7 +99,7 @@ pub struct Store {
   /// Directory nodes.
   pub dirs: Slab<DirNode>,
   /// The blocks of the indexed directories (§4.5, `dirtree`).
-  pub blocks: Slab<DirBlock>,
+  pub blocks: BlockStore,
   /// Inode versions.
   pub inodes: Slab<Inode>,
   /// Inode-table nodes.
@@ -178,7 +179,8 @@ pub struct StoreConfig {
   pub max_inodes: usize,
   /// Chunks the shard may hold.
   pub max_chunks: usize,
-  /// Directory blocks the shard may hold.
+  /// Directory blocks the shard may hold. The block store's pages are bounded at this many blocks of the smallest
+  /// class, and a page for every class beside them (A-203, [`BlockStore::max_pages`]).
   pub max_dir_blocks: usize,
   /// The small-directory cut-over (entries).
   pub dir_cutover: usize,
@@ -197,7 +199,7 @@ impl Store {
     let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
     Self {
       dirs: Slab::new(segment, config.max_dirs),
-      blocks: Slab::new(
+      blocks: BlockStore::new(
         block_segment_slots(config.page).get(),
         config.max_dir_blocks,
       ),
@@ -464,6 +466,18 @@ pub struct Volume {
   /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
   /// at the reclaim, any surplus returned then). Bounded by open-unlinked files.
   pub(crate) orphans: BTreeMap<InodeNo, u64>,
+  /// The mounts that survived a takeover and may hold handles no publication counted (U10, the supervisor's option 2):
+  /// a handle a dead daemon issued after its last publication is unknown to its successor, so a file made before the
+  /// takeover that leaves the namespace with no reference this daemon knows is kept, not reclaimed, until the last of
+  /// these mounts ends ([`Volume::sweep_attachment`]). Bounded by the volume's attachments; empty outside a takeover.
+  pub(crate) takeover_holders: BTreeSet<u64>,
+  /// The first inode number not issued when the first of [`Volume::takeover_holders`] was named: a file below it may be
+  /// held by a handle the successor never counted; one at or past it was made since, and its handles are all counted.
+  pub(crate) takeover_below: InodeNo,
+  /// The orphans kept for [`Volume::takeover_holders`]: still charged to the volume, counted in its status
+  /// ([`Volume::takeover_kept`]), reclaimed when the last holder ends. Bounded by the volume's quota, which their content
+  /// stays charged to.
+  pub(crate) takeover_kept: BTreeSet<InodeNo>,
   /// What changed since this volume was last published (A-68): the inodes and directory entries a barrier's delta
   /// carries (`crate::recover`), cleared once the publication commits.
   pub(crate) dirty: crate::delta::Dirty,
@@ -574,6 +588,8 @@ pub struct Observed {
   pub attrs: Attrs,
   /// The change counter: it moves on every change to the object and never repeats.
   pub change: u64,
+  /// The Windows attribute bits kept beside the mode (A-262).
+  pub windows: crate::inode::WindowsAttributes,
 }
 
 /// A `readdir` row.
@@ -702,6 +718,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -783,6 +802,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
@@ -883,6 +905,9 @@ impl Volume {
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
+      takeover_holders: BTreeSet::new(),
+      takeover_below: InodeNo(0),
+      takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -1022,6 +1047,34 @@ impl Volume {
     })
   }
 
+  /// Every directory block the volume holds, once each, with its size and the size of the class that fits its live
+  /// bytes (A-203): the blocks its head and its snapshots reach and those its snapshots' deadlists keep. For a store
+  /// that serves this volume alone it is everything the block store must hold, which the volume oracle compares.
+  pub fn directory_blocks(&self, store: &Store) -> Vec<(BlockRef, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut held = Vec::new();
+    let roots = std::iter::once(self.root).chain(self.snapshots.iter().map(|(_, snap)| snap.root));
+    for root in roots {
+      let mut dirs = Vec::new();
+      let mut blocks = Vec::new();
+      collect_dirs(store, root, None, &mut dirs, &mut blocks);
+      held.extend(blocks.into_iter().map(|(block, _)| block));
+    }
+    for (_, snap) in self.snapshots.iter() {
+      held.extend(snap.deadlist.items().iter().filter_map(|dead| match dead {
+        Dead::DirBlock(block, _) => Some(*block),
+        _ => None,
+      }));
+    }
+    held
+      .into_iter()
+      .filter(|block| seen.insert(block.words()))
+      .filter_map(|block| {
+        crate::dirtree::block_size(&store.blocks, block).map(|(size, fitted)| (block, size, fitted))
+      })
+      .collect()
+  }
+
   /// Looks a name up in a directory.
   pub fn lookup(
     &self,
@@ -1059,6 +1112,7 @@ impl Volume {
       kind: inode.kind,
       attrs: inode.attrs,
       change: inode.version,
+      windows: inode.windows,
     })
   }
 
@@ -1518,11 +1572,7 @@ impl Volume {
           return Err(VfsError::BaseDrift);
         }
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
-        let unpinned = off < b.base_len
-          && !b.pinned.iter().any(|e| {
-            e.off <= off
-              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
-          });
+        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -1661,6 +1711,9 @@ impl Volume {
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
+    if kind == Kind::File {
+      inode.windows = crate::inode::WindowsAttributes::new_file();
+    }
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     let child = match kind {
@@ -2609,6 +2662,35 @@ impl Volume {
     Ok(())
   }
 
+  /// The Windows attribute bits kept beside inode `no`'s mode (A-262; [`crate::inode::WindowsAttributes`]).
+  pub fn windows_attributes(
+    &self,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode(store, no)?.windows)
+  }
+
+  /// Sets the Windows attribute bits kept beside the mode (A-262; [`crate::inode::WindowsAttributes`]), as a
+  /// `SetFileAttributes` or a create's attributes ask. Copy-on-write; the change time advances, as NTFS advances it.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    self.namespace_inode(store, no)?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.windows = attributes;
+    inode.stamp_change(now);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
+    Ok(())
+  }
+
   /// Sets the owner uid and gid (a `chown`), so a bridge honors a `setattr` of ownership instead
   /// of ignoring it (§4.6 "never acknowledge an ignored setattr field"). Copy-on-write; the
   /// change time advances, as POSIX requires for an attribute change.
@@ -2830,11 +2912,7 @@ impl Volume {
         if b.lost {
           return Err(VfsError::BaseDrift);
         }
-        let unpinned = off < b.base_len
-          && !b.pinned.iter().any(|e| {
-            e.off <= off
-              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
-          });
+        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -3341,14 +3419,40 @@ impl Volume {
     crate::derive::derive(self, store, base)
   }
 
-  /// The op log records after a snapshot (the deriver's input).
+  /// The op log records after a snapshot (the deriver's input), every one of them: when retention has dropped any
+  /// record after the snapshot's sequence, what it recorded is unknown, so the read is refused
+  /// [`VfsError::JournalIncomplete`] rather than handing back part of the work as all of it (§4.16).
   pub fn records_since(&self, id: SnapshotId) -> Result<Vec<crate::journal::OpRecord>, VfsError> {
     let snap = self
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
     let seq = snap.seq;
+    let needed = seq.saturating_add(1);
+    let oldest = self.journal.oldest_seq();
+    if oldest > needed {
+      return Err(VfsError::JournalIncomplete { needed, oldest });
+    }
     Ok(self.journal.since(seq).cloned().collect())
+  }
+
+  /// Whether the head is exactly snapshot `id`'s state: every op-log record after the snapshot's sequence is a
+  /// snapshot's own record (a snapshot journals itself after taking its sequence), and none of them was dropped (§4.16
+  /// A-201: a green's head is checked out into the volume it was created from only then). A dropped record answers
+  /// `false`, since what it recorded is unknown.
+  pub fn unchanged_since(&self, id: SnapshotId) -> Result<bool, VfsError> {
+    let snap = self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    let held = self.journal.oldest_seq() <= snap.seq.saturating_add(1);
+    Ok(
+      held
+        && self
+          .journal
+          .since(snap.seq)
+          .all(|record| matches!(record.op, Op::Snapshot)),
+    )
   }
 
   /// Releases one clone's pin on a snapshot. The owner of both volumes (the shard, §4.5) calls
@@ -3720,6 +3824,12 @@ impl Volume {
     Ok(no)
   }
 
+  /// The first inode number this volume has not issued: every number it can issue from now on is at or past it, so a
+  /// number below it names an inode made before now (A-231: the files a client may have cached before a takeover).
+  pub fn issued_below(&self) -> InodeNo {
+    InodeNo::compose(self.prefix, self.next_counter)
+  }
+
   /// The counter a publication records for this volume (A-150): its counter plus the store's reserve, never below the
   /// ceiling a committed publication already recorded. A successor starts there, past every number this volume can
   /// hand out before its next publication commits.
@@ -3901,7 +4011,7 @@ impl Volume {
       return full(store.tries.max_slots());
     }
     if store.blocks.room() < needs.blocks {
-      return full(store.blocks.max_slots());
+      return Err(VfsError::Memory(store.blocks.refusal()));
     }
     if needs.retained > 0 {
       let over_allowance = self.retention_allowance != u64::MAX
@@ -5094,11 +5204,15 @@ impl Volume {
     // At zero links the inode has left the namespace. If a transport still holds it open (a
     // reference), keep its content and table entry alive as an orphan and reclaim at the last
     // `unreference` (POSIX unlink-while-open); otherwise reclaim now.
-    if self.references.get(&no).is_some_and(|count| *count > 0) {
+    if self.references.get(&no).is_some_and(|count| *count > 0) || self.keeps_for_takeover(no) {
       // The reclaim waits for the last close, which cannot refuse: the retention the operation
-      // secured for this content rides with the orphan record until then.
+      // secured for this content rides with the orphan record until then. A file a mount that survived a takeover may
+      // hold through a handle no publication counted waits for that mount's end instead (U10).
       let secured = std::mem::take(&mut self.retention_prepaid);
       self.orphans.insert(no, secured);
+      if !self.references.get(&no).is_some_and(|count| *count > 0) {
+        self.takeover_kept.insert(no);
+      }
       Ok(())
     } else {
       self.reclaim_inode(store, no)
@@ -5176,6 +5290,18 @@ impl Volume {
   /// unmount). Never drops below zero. Reclaims the inode if this brings the count to zero and it
   /// is an orphan, at this terminal step.
   pub fn unreference_n(&mut self, store: &mut Store, no: InodeNo, n: u64) -> Result<(), VfsError> {
+    self.unreference_by(store, no, n, None)
+  }
+
+  /// [`Volume::unreference_n`], with the owner that is known to hold nothing of `no` any more (`let_go`: a `FORGET`'s
+  /// sender), which a file is never kept for (U10).
+  fn unreference_by(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    n: u64,
+    let_go: Option<RefOwner>,
+  ) -> Result<(), VfsError> {
     let remaining = match self.references.get_mut(&no) {
       Some(count) => {
         let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*count);
@@ -5188,7 +5314,14 @@ impl Volume {
       }
       None => 0,
     };
-    if remaining == 0 && self.orphans.contains_key(&no) {
+    if remaining == 0
+      && self.orphans.contains_key(&no)
+      && self.keeps_for_takeover_besides(no, let_go)
+    {
+      // A file a mount that survived a takeover may still hold through a handle no publication counted: kept until that
+      // mount ends (U10).
+      self.takeover_kept.insert(no);
+    } else if remaining == 0 && self.orphans.contains_key(&no) {
       // Reclaim only if the inode is still unlinked. A re-link — a future `LINK` /
       // `linkat(AT_EMPTY_PATH)` on the still-open inode — revives it with a name, and it must not
       // be reclaimed then. No operation can re-link a nameless orphan today, so this guards that
@@ -5265,7 +5398,9 @@ impl Volume {
       return Ok(());
     }
     self.debit_attachment(attachment, no, drop);
-    self.unreference_n(store, no, u64::from(drop))
+    // A `FORGET` comes only once the kernel holds nothing of the inode, no handle included (a handle holds a lookup), so
+    // the mount that sent it is not one that may hold the file through a handle no publication counted (U10).
+    self.unreference_by(store, no, u64::from(drop), Some(attachment))
   }
 
   /// Sweeps every reference `attachment` holds in one bounded batch at its teardown (an unmount or a
@@ -5293,15 +5428,76 @@ impl Volume {
     self
       .committed_opens
       .retain(|(owner, _), _| *owner != attachment);
-    let Some(owned) = self.attachment_refs.remove(&attachment) else {
-      return Ok(());
-    };
-    for (no, count) in owned {
-      self.dirty.reference(attachment, no);
-      // Drop exactly this owner's count from the global; other owners' references keep the inode
-      // alive if they hold it. A reclamation failure is retained by the orphan record, as in
-      // `unreference_n`.
-      self.unreference_n(store, no, u64::from(count))?;
+    if let Some(owned) = self.attachment_refs.remove(&attachment) {
+      for (no, count) in owned {
+        self.dirty.reference(attachment, no);
+        // Drop exactly this owner's count from the global; other owners' references keep the inode
+        // alive if they hold it. A reclamation failure is retained by the orphan record, as in
+        // `unreference_n`.
+        self.unreference_n(store, no, u64::from(count))?;
+      }
+    }
+    if let RefOwner::Attachment(id) = attachment {
+      self.end_takeover_holder(store, id)?;
+    }
+    Ok(())
+  }
+
+  /// `attachment` has ended: if it was a mount that survived a takeover, it can hold no handle any more, and with the
+  /// last such mount the files kept for them are reclaimed (U10). Called from the attachment's end as well as its sweep,
+  /// since Linux sends `FUSE_DESTROY`, which is what sweeps a mount, only to fuseblk and virtio-fs mounts: an ordinary
+  /// mount just disconnects, and its kept files stayed charged after its unmount.
+  pub fn end_takeover_holder(
+    &mut self,
+    store: &mut Store,
+    attachment: u64,
+  ) -> Result<(), VfsError> {
+    if self.takeover_holders.remove(&attachment) && self.takeover_holders.is_empty() {
+      self.release_takeover_kept(store)?;
+    }
+    Ok(())
+  }
+
+  /// Names `attachment`, a mount that survived a takeover, as one that may hold handles no publication counted (U10):
+  /// from here a file made before the takeover that leaves the namespace unheld is kept until the last such mount ends.
+  /// The first one named fixes the bound: the inode numbers issued before it.
+  pub fn hold_detached_for(&mut self, attachment: u64) {
+    if self.takeover_holders.is_empty() {
+      self.takeover_below = self.issued_below();
+    }
+    self.takeover_holders.insert(attachment);
+  }
+
+  /// Whether a file of number `no` that leaves the namespace unheld is kept (U10): a mount that survived a takeover may
+  /// hold it through a handle no publication counted, which only a file made before the takeover can be.
+  fn keeps_for_takeover(&self, no: InodeNo) -> bool {
+    self.keeps_for_takeover_besides(no, None)
+  }
+
+  /// [`Volume::keeps_for_takeover`], leaving out `let_go`, a mount known to hold nothing of `no` (its `FORGET` came):
+  /// another mount that survived the takeover may still hold it, and only then is it kept. On adacachy2 and CI's Linux
+  /// runners, a file the kernel had let go before the daemon died, its `FORGET` replayed by the successor, stayed kept
+  /// until the mount ended (`the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`).
+  fn keeps_for_takeover_besides(&self, no: InodeNo, let_go: Option<RefOwner>) -> bool {
+    no < self.takeover_below
+      && self
+        .takeover_holders
+        .iter()
+        .any(|holder| let_go != Some(RefOwner::Attachment(*holder)))
+  }
+
+  /// The orphans kept for mounts that survived a takeover (U10): what `slates status` reports.
+  pub fn takeover_kept(&self) -> usize {
+    self.takeover_kept.len()
+  }
+
+  /// Reclaims every orphan kept for the mounts that survived a takeover, once the last of them has ended (U10): each one
+  /// still unlinked and held by no reference this daemon knows.
+  fn release_takeover_kept(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    for no in std::mem::take(&mut self.takeover_kept) {
+      if !self.references.contains_key(&no) {
+        self.unreference_n(store, no, 0)?;
+      }
     }
     Ok(())
   }
@@ -5320,7 +5516,7 @@ impl Volume {
   /// Each recorded attachment holding references, with its share by inode and how many of those references are open
   /// handles, in owner and inode order: what the recovery image carries, so a surviving attachment's kernel references
   /// and opens are given back to it after a restart (A-61, A-152). An owner this process alone knows is left out: its
-  /// references die with the process.
+  /// references die with the process. So are NFSv4 state's holds (A-260), whose record is the partition's journal.
   pub(crate) fn attachment_references(&self) -> Vec<crate::recover::AttachmentReferences> {
     self
       .attachment_refs
@@ -5337,7 +5533,7 @@ impl Volume {
             })
             .collect(),
         }),
-        RefOwner::Process(_) => None,
+        RefOwner::Process(_) | RefOwner::NfsState(_) => None,
       })
       .collect()
   }
@@ -5354,18 +5550,27 @@ impl Volume {
   }
 
   /// Settles references after a recovery (A-61): every recorded attachment whose record did not survive
-  /// (`survives` answers false for its id) gives its share back, and every orphan then left with no reference is
-  /// reclaimed — its last holder died with the process. Returns the owners swept and the orphans reclaimed.
+  /// (`survives` answers false for its id) gives its share back, as do NFSv4 state's holds made through one (A-260),
+  /// and every orphan then left with no reference is reclaimed — its last holder died with the process — except while
+  /// a mount in `held_mounts`, one that survived the takeover holding a kernel's handles, may still hold it through a
+  /// handle no publication counted (U10): those are named first ([`Volume::hold_detached_for`]). Returns the owners
+  /// swept and the orphans reclaimed.
   pub fn settle_recovered_references(
     &mut self,
     store: &mut Store,
     survives: impl Fn(u64) -> bool,
+    held_mounts: &[u64],
   ) -> Result<(usize, usize), VfsError> {
+    for &mount in held_mounts {
+      self.hold_detached_for(mount);
+    }
     let gone: Vec<RefOwner> = self
       .attachment_refs
       .keys()
       .filter(|owner| match owner {
-        RefOwner::Attachment(id) => !survives(*id),
+        // NFSv4 state's holds were taken again from the partition's journal before this settle (A-260): they stay
+        // while their attachment's record does.
+        RefOwner::Attachment(id) | RefOwner::NfsState(id) => !survives(*id),
         RefOwner::Process(_) => true,
       })
       .copied()
@@ -6726,6 +6931,22 @@ pub(crate) fn overlapping(extents: &[Extent], start: u64, end: u64) -> &[Extent]
   rest.get(..count).unwrap_or_default()
 }
 
+/// Whether `extents` (ascending by offset and non-overlapping, as every body holds them) together cover the whole
+/// file range `[start, end)` with no gap. A pinned base file is held as several extents (a large-class file is pinned
+/// a window at a time), so a read is served from them when their union covers it; until 2026-11-04 a read needed a
+/// single extent covering the whole range, and every read across an extent boundary of a pinned large file was
+/// refused `BaseUnavailable` (a green's origin walk over the Linux kernel's `kernel/` directory met it first).
+pub(crate) fn covers(extents: &[Extent], start: u64, end: u64) -> bool {
+  let mut reached = start;
+  for e in overlapping(extents, start, end) {
+    if e.off > reached {
+      return false;
+    }
+    reached = reached.max(e.off.saturating_add(e.len));
+  }
+  reached >= end
+}
+
 /// The chunks a cut of `body` to `len` releases or clips: those of the extents reaching past `len`.
 fn truncated_chunks(
   body: &Body,
@@ -6910,7 +7131,7 @@ fn collect_dirs(
   root: Handle<DirNode>,
   since: Option<Epoch>,
   out: &mut Vec<Handle<DirNode>>,
-  blocks: &mut Vec<(Handle<DirBlock>, Epoch)>,
+  blocks: &mut Vec<(BlockRef, Epoch)>,
 ) {
   let mut stack = vec![root];
   while let Some(d) = stack.pop() {
@@ -6947,11 +7168,11 @@ fn block_segment_slots(page: usize) -> Derived<usize> {
   derived!(
     page
       .saturating_mul(BLOCK_SEGMENT_PAGES)
-      .checked_div(size_of::<DirBlock>())
+      .checked_div(BlockStore::page_slot_bytes())
       .unwrap_or(0)
       .max(1),
-    "page × 64 / size_of::<DirBlock>()",
-    ["machine page", "size_of::<DirBlock>()"]
+    "page × 64 / size_of::<Slot<dirblocks::Page>>()",
+    ["machine page", "BlockStore::page_slot_bytes()"]
   )
 }
 

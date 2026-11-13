@@ -7,6 +7,8 @@
 #![allow(clippy::indexing_slicing)]
 #![allow(dead_code)]
 
+pub(crate) mod generated;
+
 use slates_merge::engine::Increment;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 
@@ -145,6 +147,25 @@ impl Build {
       path: path_idx,
       at: u64::from(name_idx),
       len: value.len() as u64,
+      src,
+    });
+    self
+  }
+
+  pub(crate) fn special(
+    &mut self,
+    path: &str,
+    node: slates_merge::special::SpecialNode,
+  ) -> &mut Build {
+    let path_idx = self.idx(path);
+    let bytes = node.encode();
+    let src = self.stash(&bytes);
+    self.doc.ops.push(Op {
+      kind: OpKind::Mknod,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: bytes.len() as u64,
       src,
     });
     self

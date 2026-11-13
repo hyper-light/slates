@@ -33,16 +33,16 @@ const NO_CORE_BYTES: u64 = 0;
 
 /// The paired arm, and it is weaker than the Unix one — which is the point of saying so here.
 ///
-/// `RLIMIT_CORE = 0` has no unprivileged equivalent on Windows. A crash dump is written by Windows Error
-/// Reporting, and turning that off for a process is a registry setting an administrator makes, which R10
-/// refuses to require; `WerRegisterExcludedMemoryBlock` excludes named regions rather than the process, and
-/// the daemon's content arena is not a fixed set of regions it could name up front. So on Windows this
-/// hardening is **absent**: a crash can write the daemon's RAM, tenant content included, to a dump file.
+/// `RLIMIT_CORE = 0` has no unprivileged equivalent on Windows. A crash dump is written by Windows Error Reporting, and
+/// turning that off for a process is a registry setting an administrator makes, which R10 refuses to require. WER's
+/// region exclusion (`WerRegisterExcludedMemoryBlock`) was measured and set aside (A-239): an administrator's `LocalDumps`
+/// full dump carried every region registered, and WER's own report could not be produced to measure. So on Windows this
+/// hardening is **absent** where an administrator has set full dumps, and the daemon says so: it reads that setting
+/// (`slates_server::local_dumps`), logs it once, and reports `dumps_local_full` in `slates status`. Under WER's defaults a
+/// crash kept nothing locally (measured, GAPS `8a-win-dumps`).
 ///
-/// It returns `Ok` rather than refusing because refusing would stop the daemon starting on Windows at all,
-/// which is a bigger hole than the one it would be guarding. Recorded for Ada in `docs/wip/GAPS.md`
-/// (`8a-win-dumps`) rather than left as an implication of a `cfg`. Found 2026-10-20, when `slates-cli` was
-/// compiled for Windows for the first time.
+/// It returns `Ok` rather than refusing because refusing would stop the daemon starting on Windows at all, over a setting
+/// only an administrator can change.
 #[cfg(not(unix))]
 pub(crate) fn exclude_from_dumps() -> Result<(), Failure> {
   Ok(())
@@ -97,7 +97,9 @@ fn refused(setting: &str, e: rustix::io::Errno) -> Failure {
   ))
 }
 
-#[cfg(test)]
+// Unix only: Windows has no core-size limit to set, and `exclude_from_dumps` is a recorded no-op there (GAPS,
+// `8a-win-dumps`). Ungated, this test kept the `slates` binary's tests from compiling on Windows.
+#[cfg(all(test, unix))]
 mod tests {
   use super::*;
 

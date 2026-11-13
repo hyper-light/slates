@@ -63,6 +63,10 @@ pub struct CatalogValue {
   pub require_locked: bool,
   /// The principals granted rights beyond the owner.
   pub access: Vec<AccessEntry>,
+  /// Whether the volume is live-shipped (A-200), so a successor keeps shipping it. Appended.
+  pub live_shipped: bool,
+  /// The live shipper's committed holder set (A-240): the hosts a takeover's phase one counts reports from. Appended.
+  pub live_holders: Option<slates_db::catalog::LiveHolders>,
 }
 
 impl CatalogValue {
@@ -75,6 +79,8 @@ impl CatalogValue {
       owner: record.owner.clone(),
       require_locked: record.policy.require_locked,
       access: record.access.clone(),
+      live_shipped: record.policy.live_shipped,
+      live_holders: record.policy.live_holders.clone(),
     }
   }
 
@@ -101,16 +107,24 @@ mod tests {
       name: "catalogued".to_owned(),
       size: SizeClass::Bounded { limit: 1 << 20 },
       names: NamePolicy::Exact,
-      owner: Principal::Uid { uid: 501 },
+      owner: Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      },
       require_locked: true,
       access: vec![AccessEntry {
-        principal: Principal::Uid { uid: 502 },
+        principal: Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 502,
+        },
         rights: Rights {
           read: true,
           write: false,
           admin: false,
         },
       }],
+      live_shipped: false,
+      live_holders: None,
     }
   }
 

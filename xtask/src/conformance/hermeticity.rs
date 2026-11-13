@@ -319,9 +319,7 @@ fn keep_slates_events(
 ) -> Result<Filtered, Failure> {
   use std::io::Read;
   let mut events = events;
-  let flags = rustix::fs::fcntl_getfl(&events).map_err(std::io::Error::from)?;
-  rustix::fs::fcntl_setfl(&events, flags | rustix::fs::OFlags::NONBLOCK)
-    .map_err(std::io::Error::from)?;
+  set_nonblocking(&events)?;
   let mut stream = Stream::default();
   let mut chunk = vec![0u8; STREAM_CHUNK];
   // Bytes still to drain once the tracer has stopped: `None` until then.
@@ -365,10 +363,38 @@ fn keep_slates_events(
   Ok(stream.filtered)
 }
 
+/// Makes the tracer's stream answer `WouldBlock` rather than wait, so the filter sees the stop.
+#[cfg(unix)]
+fn set_nonblocking(events: &std::process::ChildStdout) -> Result<(), Failure> {
+  let flags = rustix::fs::fcntl_getfl(events).map_err(std::io::Error::from)?;
+  rustix::fs::fcntl_setfl(events, flags | rustix::fs::OFlags::NONBLOCK)
+    .map_err(std::io::Error::from)?;
+  Ok(())
+}
+
+/// Windows has no stream tracer (the capability table's hermeticity cell is owed there), so a stream is refused.
+#[cfg(windows)]
+fn set_nonblocking(_events: &std::process::ChildStdout) -> Result<(), Failure> {
+  Err(Failure(
+    "the hermeticity tracer's stream has no Windows form: no ETW filesystem-write tracer is wired"
+      .to_owned(),
+  ))
+}
+
+/// Windows has no stream tracer; [`set_nonblocking`] refuses the stream before a wait is asked.
+#[cfg(windows)]
+fn wait_readable(_events: &std::process::ChildStdout) -> Result<(), Failure> {
+  Err(Failure(
+    "the hermeticity tracer's stream has no Windows form: no ETW filesystem-write tracer is wired"
+      .to_owned(),
+  ))
+}
+
 /// Waits until the tracer's stream is readable, or one stop-check interval has passed: the filter wakes
 /// the moment an event arrives, as a blocking read does, and still sees the stop. Sleeping on an empty
 /// pipe instead let the filter fall behind a machine-wide stream (CI run 36663502686: twelve readiness
 /// probes where two had sufficed, then nothing of the lifecycle kept, and the drain marker never seen).
+#[cfg(unix)]
 fn wait_readable(events: &std::process::ChildStdout) -> Result<(), Failure> {
   let mut ready = [rustix::event::PollFd::new(
     events,
@@ -385,6 +411,7 @@ fn wait_readable(events: &std::process::ChildStdout) -> Result<(), Failure> {
 }
 
 /// Shape: how often an idle filter looks for the stop, in nanoseconds: the harness's poll pause (20 ms).
+#[cfg(unix)]
 const STOP_CHECK_NS: i64 = 20_000_000;
 
 /// Shape: one read of the tracer's stream: 64 KiB, the default pipe buffer on Linux (pipe(7): sixteen
@@ -1089,6 +1116,7 @@ mod tests {
 
   /// Shape: how long the stop may take in the held-stream history: the tracer's own exit bound
   /// ([`MOUNT_WAIT`]) twice over, far past a stop that does not wait on the stream's end.
+  #[cfg(unix)]
   const STOP_BOUND: std::time::Duration = MOUNT_WAIT.saturating_mul(2);
 
   /// Signals the fixture's process group directly (the tests run no privileged tracer).

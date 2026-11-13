@@ -3,16 +3,15 @@
 //! on a cadence derived from measured replay throughput and the recovery budget").
 //!
 //! [`Db`] is one partition's writer: `mutate` runs the guard, appends the record, applies it,
-//! and when the bytes appended since the last snapshot would take longer to replay than the
-//! recovery budget, publishes the partition into the alternate snapshot slot and trims the
-//! log behind it. [`recover`] is the other direction: the newest valid snapshot slot, then the
-//! records after its sequence, with the torn tail cut off and the replay throughput measured
-//! (the policy's anchor).
+//! and once the log since the last snapshot has taken the recovery budget's worth of measured
+//! replay work and is at least the last snapshot's size (A-243), publishes the partition into
+//! the alternate snapshot slot and trims the log behind it. [`recover`] is the other direction:
+//! the newest valid snapshot slot, then the records after its sequence, with the torn tail cut
+//! off and the replay timed (the recovered tail's starting work).
 
 use std::time::Instant;
 
 use slates_anchor::{AnchorError, AnchorSegment, RegionKind};
-use slates_machine::{Derived, derived};
 use slates_wire::Wire;
 
 use crate::error::DbError;
@@ -27,27 +26,55 @@ pub const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
 /// Format: nanoseconds per microsecond.
 const NS_PER_US: u64 = 1_000;
 
-/// When to snapshot.
+/// A fixed snapshot cadence a caller pins ([`Db::set_policy`]): the model tests drive snapshots at a chosen rate, and
+/// a bench that measures the whole log sets none. A partition no caller pinned follows [`snapshot_due`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotPolicy {
   /// Snapshot once this many log bytes were appended since the last one.
   pub bytes_between_snapshots: u64,
 }
 
-impl SnapshotPolicy {
-  /// Derived: the bytes the measured replay throughput covers inside the recovery budget; a
-  /// replay of the log tail then never exceeds the budget. Unknown throughput (no replay yet)
-  /// means one byte per microsecond, so the first snapshot comes early and measures.
-  pub fn derive(recovery_budget_ns: u64, replay_bytes_per_us: u64) -> Derived<SnapshotPolicy> {
-    let budget_us = recovery_budget_ns / NS_PER_US;
-    derived!(
-      SnapshotPolicy {
-        bytes_between_snapshots: budget_us.saturating_mul(replay_bytes_per_us.max(1)),
-      },
-      "bytes_between_snapshots = (recovery_budget_ns / 1000) * replay_bytes_per_us",
-      ["recovery_budget_ns", "replay_bytes_per_us"]
-    )
-  }
+/// The log since the last snapshot, as the commits measured it (A-243).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tail {
+  /// Its bytes.
+  pub bytes: u64,
+  /// The replay work its commits measured, nanoseconds: each record's append (encode, checksum, copy into the ring,
+  /// the mirror of a replay's read, checksum and decode) and its apply. After a recovery it starts at that recovery's
+  /// own time, the snapshot's decode included.
+  pub replay_ns: u64,
+}
+
+/// Whether a partition snapshots now (A-243): once its tail took at least the recovery budget's replay work, and is at
+/// least the last snapshot's size. The first condition bounds recovery by the budget with the tail's own work, measured
+/// rather than extrapolated: a rate measured on one stretch of log extrapolated to the next misjudged it whenever the
+/// records changed size (large green increments at 442 bytes a microsecond, small records after them at 12). The
+/// second is the doubling rule, so a snapshot comes only once the log has absorbed what it costs and snapshot work
+/// stays within about twice the log written, whatever the partition's size. Recovery is then at most the snapshot's
+/// decode plus the larger of the budget and the replay of a snapshot's size of tail.
+pub fn snapshot_due(tail: Tail, floor_bytes: u64, recovery_budget_ns: u64) -> bool {
+  tail.replay_ns >= recovery_budget_ns && tail.bytes >= floor_bytes
+}
+
+/// A partition database's running figures (A-243): what its snapshots cost against the log they absorb, and the
+/// cadence they follow. Surfaced per shard in `slates status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DbStats {
+  /// Snapshots taken since recovery.
+  pub snapshots: u64,
+  /// The bytes they wrote.
+  pub snapshot_bytes_written: u64,
+  /// The longest one took, encode and publish, nanoseconds: it runs on the committing shard's turn, so a late beat
+  /// can be matched to it.
+  pub snapshot_ns_max: u64,
+  /// The log bytes appended since recovery.
+  pub log_bytes_appended: u64,
+  /// The log since the last snapshot and the replay work its commits measured.
+  pub tail: Tail,
+  /// The recovery budget the tail's work is held to, nanoseconds.
+  pub recovery_budget_ns: u64,
+  /// The floor: the last snapshot's size, which the tail must reach before the next one.
+  pub snapshot_floor_bytes: u64,
 }
 
 /// What recovery found.
@@ -89,10 +116,23 @@ pub struct Db {
   index: u16,
   log: LogRing,
   next_seq: u64,
-  policy: SnapshotPolicy,
+  /// The cadence a caller pinned ([`Db::set_policy`]); with none, [`snapshot_due`] decides.
+  pinned: Option<SnapshotPolicy>,
   since_snapshot_bytes: u64,
   next_slot: u8,
   snapshots_taken: u64,
+  /// The running figures ([`DbStats`]).
+  stats: DbStats,
+  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append
+  /// (encode, checksum, copy into the ring), the mirror of the replay's read, checksum and decode, and its apply; never
+  /// a wait outside them. Timing the apply alone made a replay look 16 to 21 times faster than it was (raft, A-243).
+  /// After a recovery it starts at the recovery's own time, so it errs early.
+  replay_work_ns_since_snapshot: u64,
+  /// The recovery budget the tail's work is held to: [`RECOVERY_BUDGET_NS`] unless the operator set one
+  /// ([`Db::set_recovery_budget`]; GAPS §5).
+  recovery_budget_ns: u64,
+  /// The last snapshot's size (the recovered one's after a boot, zero with none): the doubling rule's floor.
+  snapshot_floor_bytes: u64,
   /// Operations applied since `begin`, waiting to go into one record at `commit`.
   pending: Option<Vec<Op>>,
   /// The clock the last mutation ran at: the time a partition re-derived on a rolled-back
@@ -123,29 +163,39 @@ impl std::fmt::Debug for Db {
     f.debug_struct("Db")
       .field("index", &self.index)
       .field("next_seq", &self.next_seq)
-      .field("policy", &self.policy)
+      .field("pinned", &self.pinned)
       .finish()
   }
 }
 
-/// The newest valid snapshot slot of a partition.
+/// The newest valid snapshot slot of a partition: of the slots that decode, the one with the highest sequence (the
+/// lower slot on a tie). A snapshot's sequence is its encoding's first field, so the slots are ordered by it before
+/// either is decoded, the newer is decoded first, and the older only when the newer does not decode. Until 2026-11-07
+/// both were decoded whole and the older dropped: of a 1,001-volume partition's 184-218 ms snapshot read on this Mac,
+/// one decode was waste, and the read is the longest step of a shard's recovery (§2.6 boot step 2).
 fn newest_snapshot(
   segment: &AnchorSegment,
   index: u16,
-) -> Result<Option<(u8, PartitionSnapshot)>, DbError> {
-  let mut best: Option<(u8, PartitionSnapshot)> = None;
+) -> Result<Option<(u8, PartitionSnapshot, u64)>, DbError> {
+  let mut slots: Vec<(u64, u8, Vec<u8>)> = Vec::new();
   for slot in 0..2u8 {
     let Ok(Some(bytes)) = segment.read_published(RegionKind::Snapshot(index, slot)) else {
       continue;
     };
-    let Ok(snapshot) = PartitionSnapshot::from_bytes(&bytes) else {
+    let Ok(seq) = u64::decode(&mut bytes.as_slice()) else {
       continue;
     };
-    if best.as_ref().is_none_or(|(_, b)| snapshot.seq > b.seq) {
-      best = Some((slot, snapshot));
+    slots.push((seq, slot, bytes));
+  }
+  // Newest first; the sort is stable, so on a tie the lower slot stays first, as before.
+  slots.sort_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
+  for (_, slot, bytes) in slots {
+    if let Ok(snapshot) = PartitionSnapshot::from_bytes(&bytes) {
+      let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      return Ok(Some((slot, snapshot, size)));
     }
   }
-  Ok(best)
+  Ok(None)
 }
 
 /// Recovers partition `index` from the segment: the newest valid snapshot, then the records
@@ -161,6 +211,7 @@ pub fn recover(
   let DerivedPartition {
     partition,
     snapshot,
+    snapshot_bytes,
     from_seq,
     replayed,
     records,
@@ -177,16 +228,19 @@ pub fn recover(
     torn: replayed.torn,
     next_seq: replayed.next_seq.max(from_seq),
   };
-  let policy = SnapshotPolicy::derive(RECOVERY_BUDGET_NS, recovered.replay_bytes_per_us()).get();
   let db = Db {
     partition,
     index,
     log,
     next_seq: recovered.next_seq,
-    policy,
+    pinned: None,
     since_snapshot_bytes: replayed.bytes,
     next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
+    stats: DbStats::default(),
+    replay_work_ns_since_snapshot: replay_ns,
+    recovery_budget_ns: RECOVERY_BUDGET_NS,
+    snapshot_floor_bytes: snapshot_bytes,
     pending: None,
     last_now_ns: now_ns,
     rollbacks: 0,
@@ -203,6 +257,8 @@ struct DerivedPartition {
   partition: Partition,
   /// The snapshot slot and sequence the derivation started from, if any.
   snapshot: Option<(u8, u64)>,
+  /// That snapshot's encoded size (zero with none).
+  snapshot_bytes: u64,
   /// The first sequence replayed from the log.
   from_seq: u64,
   replayed: Replayed,
@@ -220,16 +276,17 @@ fn derive_partition(
   caps: PartitionCaps,
   now_ns: u64,
 ) -> Result<DerivedPartition, DbError> {
-  let (mut partition, snapshot, from_seq) = match newest_snapshot(segment, index)? {
-    Some((slot, snapshot)) => {
+  let (mut partition, snapshot, snapshot_bytes, from_seq) = match newest_snapshot(segment, index)? {
+    Some((slot, snapshot, size)) => {
       let seq = snapshot.seq;
       (
         Partition::from_snapshot(&snapshot, caps, now_ns)?,
         Some((slot, seq)),
+        size,
         seq.saturating_add(1),
       )
     }
-    None => (Partition::new(caps, now_ns), None, 0),
+    None => (Partition::new(caps, now_ns), None, 0, 0),
   };
   let replayed = log.replay(segment, from_seq)?;
   let mut records = 0u64;
@@ -242,6 +299,7 @@ fn derive_partition(
   Ok(DerivedPartition {
     partition,
     snapshot,
+    snapshot_bytes,
     from_seq,
     replayed,
     records,
@@ -264,19 +322,69 @@ impl Db {
     self.next_seq
   }
 
-  /// The policy.
-  pub fn policy(&self) -> SnapshotPolicy {
-    self.policy
+  /// Pins a fixed cadence: the snapshots after it come every `policy.bytes_between_snapshots` of log, whatever the
+  /// measured work (a model test that drives snapshots at a chosen rate; a bench that wants none).
+  pub fn set_policy(&mut self, policy: SnapshotPolicy) {
+    self.pinned = Some(policy);
   }
 
-  /// Sets the policy (the caller re-derives it after a measured replay).
-  pub fn set_policy(&mut self, policy: SnapshotPolicy) {
-    self.policy = policy;
+  /// Sets the recovery budget the tail's measured replay work is held to (an operator input, GAPS §5).
+  pub fn set_recovery_budget(&mut self, recovery_budget_ns: u64) {
+    self.recovery_budget_ns = recovery_budget_ns;
   }
 
   /// Snapshots taken since recovery.
   pub fn snapshots_taken(&self) -> u64 {
     self.snapshots_taken
+  }
+
+  /// The running figures: snapshots and their bytes and longest duration, the log appended, the tail and its measured
+  /// replay work, the budget and the floor.
+  pub fn stats(&self) -> DbStats {
+    DbStats {
+      tail: self.tail(),
+      recovery_budget_ns: self.recovery_budget_ns,
+      snapshot_floor_bytes: self.snapshot_floor_bytes,
+      ..self.stats
+    }
+  }
+
+  /// The log since the last snapshot and its measured replay work.
+  fn tail(&self) -> Tail {
+    Tail {
+      bytes: self.since_snapshot_bytes,
+      replay_ns: self.replay_work_ns_since_snapshot,
+    }
+  }
+
+  /// Adds the time since `started` to the tail's replay work (A-243). The time decides nothing inside an apply; the
+  /// commit consults it after the append ([`maintain`](Self::maintain)).
+  fn charge_replay_work(&mut self, started: Instant) {
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(elapsed);
+  }
+
+  /// Applies `op` inside a transaction, timing it as replay work: its record is appended at the commit, so the apply
+  /// and the append are timed apart.
+  fn apply_timed(&mut self, op: &Op) -> Result<(), DbError> {
+    let started = Instant::now();
+    let applied = self.partition.apply(op);
+    self.charge_replay_work(started);
+    applied
+  }
+
+  /// Appends a transaction's record at its commit, timing it as replay work: the encode, checksum and copy a replay
+  /// mirrors with its read, checksum and decode (A-243). A refused append's time counts too, so the measure errs early.
+  fn append_timed(
+    &mut self,
+    segment: &mut AnchorSegment,
+    seq: u64,
+    entry: &LogEntry,
+  ) -> Result<u64, DbError> {
+    let started = Instant::now();
+    let appended = self.log.append(segment, seq, entry);
+    self.charge_replay_work(started);
+    appended
   }
 
   /// Guard, append, apply: the mutation is durable in the segment when this returns; a reply
@@ -289,28 +397,37 @@ impl Db {
   ) -> Result<u64, DbError> {
     self.partition.check(op, now_ns)?;
     self.last_now_ns = now_ns;
-    if let Some(pending) = self.pending.as_mut() {
+    if self.pending.is_some() {
       // Inside a transaction: applied now (later operations see it), logged at the commit.
-      self.partition.apply(op)?;
-      pending.push(op.clone());
+      self.apply_timed(op)?;
+      if let Some(pending) = self.pending.as_mut() {
+        pending.push(op.clone());
+      }
       return Ok(self.next_seq);
     }
     let seq = self.next_seq;
     let entry = LogEntry {
       ops: vec![op.clone()],
     };
+    // One clock pair over the append and the apply, adjacent here: the work a replay repeats for this record (A-243).
+    let mut started = Instant::now();
     let bytes = match self.log.append(segment, seq, &entry) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
-        // A full ring: the snapshot releases everything before it, then the append retries.
+        // A full ring: the snapshot releases everything before it, then the append retries; the snapshot's own time is
+        // not replay work.
         self.snapshot(segment)?;
+        started = Instant::now();
         self.log.append(segment, seq, &entry)?
       }
       Err(e) => return Err(e),
     };
-    self.partition.apply(op)?;
+    let applied = self.partition.apply(op);
+    self.charge_replay_work(started);
+    applied?;
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
   }
@@ -356,7 +473,7 @@ impl Db {
     {
       Err(DbError::Anchor(AnchorError::PublicationInProgress))
     } else {
-      self.log.append(segment, seq, &entry)
+      self.append_timed(segment, seq, &entry)
     };
     let bytes = match appended {
       Ok(bytes) => bytes,
@@ -376,6 +493,7 @@ impl Db {
     };
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))
   }
@@ -418,7 +536,15 @@ impl Db {
   /// snapshot failure is a rollback — durability degrades into typed refusals, never into a
   /// record the segment does not hold.
   fn maintain(&mut self, segment: &mut AnchorSegment) {
-    if self.since_snapshot_bytes < self.policy.bytes_between_snapshots {
+    let due = match self.pinned {
+      Some(policy) => self.since_snapshot_bytes >= policy.bytes_between_snapshots,
+      None => snapshot_due(
+        self.tail(),
+        self.snapshot_floor_bytes,
+        self.recovery_budget_ns,
+      ),
+    };
+    if !due {
       return;
     }
     if self.snapshot_or_fault(segment).is_err() {
@@ -460,18 +586,28 @@ impl Db {
     self.pending.is_some()
   }
 
-  /// Publishes the partition into the alternate snapshot slot and trims the log behind it.
+  /// Publishes the partition into the alternate snapshot slot and releases the log behind it.
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
+    let started = Instant::now();
     let snapshot = self.partition.to_snapshot(seq);
-    segment.publish(
-      RegionKind::Snapshot(self.index, self.next_slot),
-      &snapshot.to_bytes(),
-    )?;
-    self.log.trim(segment, self.next_seq)?;
+    let bytes = snapshot.to_bytes();
+    segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
+    let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // The next snapshot's floor (A-243): the tail must reach this one's size first.
+    self.snapshot_floor_bytes = snapshot_bytes;
+    self.log.release_all(segment, self.next_seq)?;
     self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
+    self.replay_work_ns_since_snapshot = 0;
     self.snapshots_taken = self.snapshots_taken.saturating_add(1);
+    self.stats.snapshots = self.snapshots_taken;
+    self.stats.snapshot_ns_max = self.stats.snapshot_ns_max.max(elapsed);
+    self.stats.snapshot_bytes_written = self
+      .stats
+      .snapshot_bytes_written
+      .saturating_add(snapshot_bytes);
     Ok(())
   }
 

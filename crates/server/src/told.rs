@@ -271,13 +271,10 @@ async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
     state::deliver(route.client_index, route.request, reply, true);
     return;
   }
-  let delivery = slates_rt::task::SpawnRequest::new(
-    Box::pin(async move {
-      state::deliver(route.client_index, route.request, reply, true);
-    }),
-    None,
-  );
-  crate::xshard::send_back(route.shard, delivery).await;
+  crate::xshard::send_reply_home(route.shard, move || {
+    state::deliver(route.client_index, route.request, reply, true);
+  })
+  .await;
 }
 
 /// One writer's wait: ready once every FUSE mount of the owed volume has been told; parked in the shard's
@@ -329,8 +326,22 @@ fn park(s: &mut ShardState, owed: Owed, id: Option<u64>, waker: &Waker) -> Optio
   Some(id)
 }
 
+/// Parks `waker` on `volume`'s FUSE mounts under `id` (a fresh id when `None`), to be woken whenever one of them is told
+/// further or ends ([`wake`]): the id it waits under. A wait for something else of the mounts than a record told (a
+/// revoked mount's end, `crate::fuse::revoked_mounts_ended`), which removes itself with [`unpark`] when dropped.
+#[cfg(target_os = "linux")]
+pub(crate) fn park_on(s: &mut ShardState, volume: VolumeId, id: Option<u64>, waker: &Waker) -> u64 {
+  let id = id.unwrap_or_else(|| s.told_waiters.take_id());
+  s.told_waiters
+    .parked
+    .entry(volume)
+    .or_default()
+    .insert(id, waker.clone());
+  id
+}
+
 /// Removes wait `id` from `volume`'s parked writers, and the volume's entry once none is left.
-fn unpark(s: &mut ShardState, volume: VolumeId, id: u64) {
+pub(crate) fn unpark(s: &mut ShardState, volume: VolumeId, id: u64) {
   if let Some(parked) = s.told_waiters.parked.get_mut(&volume) {
     parked.remove(&id);
     if parked.is_empty() {

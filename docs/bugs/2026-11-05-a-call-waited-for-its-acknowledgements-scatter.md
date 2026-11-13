@@ -30,6 +30,15 @@ every `ack_every` waited for the slowest shard. On an idle daemon whose other sh
 of them, and so the single-client provisioning p99 sat at many times its p50 (jupiter: p50 20 µs, p99 80–650 µs). A
 shard busy past the reply deadline made an unrelated call fail.
 
+## Correction (2026-11-05, later the same day)
+
+The macOS arms below were one binary: built from `git archive` copies into one shared target dir, cargo rebuilt nothing
+after the first (main c0c8d28c), since the archives' files carry their commits' old times. So the macOS stall counted
+against a6c3bc16 here was main's, and so was the instrumented bench's caught pause. a6c3bc16's own record is 1 stall in
+9 runs on jupiter, where each arm has its own target dir. Main stalled 1 of its 4 parked forms on macOS. The
+`Stalled` under load fits a defect of main's found later: a scatter whose part's spawn a full control channel refuses
+never answers (recorded with A-216).
+
 ## Edits, then reverted
 
 a6c3bc16 made `Client::call` send a due acknowledgement with `begin_ack_if_due`, as the async path does. Its reply
@@ -61,7 +70,8 @@ What later runs showed (macOS arm64, 2026-11-05 16:00–16:57 UTC):
   - Alone, it never stalled: 2,000 creates, twice.
   - After a prelude of 64 concurrent clients, each dropped with an acknowledgement still in flight, it stalled in 1
     run of 10: 3 creates, numbers 1,713, 1,715 and 1,716.
-- **The one stall caught with the bench instrumented** (the a6c3bc16 tree, a stall reported instead of aborted) was
+- **The one stall caught with the bench instrumented** (a stall reported instead of aborted; its client library was
+  main's, as the correction above says) was
   not in the parked form. All 64 clients of the 64-client form's second run stalled at once, at their 7th to 10th
   create, each after about 1.767 s. The daemon answered nobody for that long, right after 64 clients were dropped
   and 64 others connected. So the stall is a whole-daemon pause after client churn, and the parked form only met it.

@@ -23,6 +23,9 @@ pub enum VfsError {
   NoAttribute,
   /// `EPERM` (a hard link to a directory).
   NotPermitted,
+  /// `EROFS`: the file system is read-only to this caller, an attachment that may read but not write, or a snapshot's
+  /// view. Refused at the first change it asks for, an open for writing included, as POSIX's read-only file system is.
+  ReadOnly,
   /// `EACCES`: a symlink whose target leaves the volume, followed by a caller who does not own it (A-107, Linux's
   /// `protected_symlinks` rule applied at the volume's edge).
   LinkProtected,
@@ -111,6 +114,15 @@ pub enum VfsError {
     /// The generation that could not close.
     generation: u64,
   },
+  /// The journal no longer holds every record since the point a reader asked from (§4.16): retention dropped the
+  /// oldest of them, so what they recorded is unknown. An ops document derived from what is left would describe part of
+  /// the work as all of it, so the derivation refuses instead.
+  JournalIncomplete {
+    /// The first sequence the reader needed: the one after its snapshot's.
+    needed: u64,
+    /// The oldest sequence the journal still holds.
+    oldest: u64,
+  },
 }
 
 impl VfsError {
@@ -136,6 +148,7 @@ impl VfsError {
       Self::Invalid => "EINVAL",
       Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
+      Self::ReadOnly => "EROFS",
       Self::LinkProtected => "EACCES",
       Self::SpecialFileOperation => "EOPNOTSUPP",
       Self::InvalidName => "EINVAL",
@@ -146,9 +159,11 @@ impl VfsError {
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
       Self::Destroying | Self::Archived | Self::Pinned | Self::DaxMapped => "EBUSY",
-      Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete | Self::Integrity => {
-        "EIO"
-      }
+      Self::BaseUnavailable(_)
+      | Self::BaseDrift
+      | Self::RecoveryIncomplete
+      | Self::Integrity
+      | Self::JournalIncomplete { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
       Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",

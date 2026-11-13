@@ -46,6 +46,23 @@ fn on_sim() -> bool {
   registry::with_current(|ctx| ctx.driver_is_sim()).unwrap_or(false)
 }
 
+/// Refuses a readiness wait on a driver that cannot watch the socket: one handle names an OS descriptor on a real
+/// driver and a fabric port on the simulation's, so an OS socket awaited on the simulation driver waited on the fabric
+/// port of its descriptor's number, where nothing arrives (its task woken only by its timers), and a fabric port
+/// awaited on a real driver would watch the descriptor of its number. Off a shard the wait itself refuses
+/// (`NotOnShardThread`).
+fn on_its_driver(sim: bool) -> Result<(), RtError> {
+  match registry::with_current(|ctx| ctx.driver_is_sim()) {
+    Some(true) if !sim => Err(RtError::BadConfig {
+      what: "an OS socket awaited on the simulation driver (bind it on a simulation shard)",
+    }),
+    Some(false) if sim => Err(RtError::BadConfig {
+      what: "a simulation fabric port awaited on a real driver",
+    }),
+    _ => Ok(()),
+  }
+}
+
 impl UdpSocket {
   /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
   /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
@@ -171,16 +188,18 @@ impl UdpSocket {
   /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
   /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
   pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    crate::readiness::writable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    let (raw, sim) = self.handle();
+    async move {
+      on_its_driver(sim)?;
+      crate::readiness::writable(raw).await
+    }
   }
 
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
   /// byte count and the sender's address. The loop of [`UdpSocket::readable`] and
   /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
-  /// shared by a shard's readers) drives those two itself.
+  /// shared by a shard's readers) drives those two itself. A refused receive is handed to the caller, which reads on
+  /// past every kind but [`crate::error::ReceiveRefusal::SocketGone`] (§4.10a).
   pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
     loop {
       if let Some(received) = self.try_recv_from(buf)? {
@@ -195,15 +214,26 @@ impl UdpSocket {
   /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
   /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
   pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
-    readable(match &self.inner {
-      Inner::Real { socket } => socket.raw_id(),
-      Inner::Sim { port } => i32::from(*port),
-    })
+    let (raw, sim) = self.handle();
+    async move {
+      on_its_driver(sim)?;
+      readable(raw).await
+    }
+  }
+
+  /// The handle a readiness wait names, and whether it is a fabric port.
+  fn handle(&self) -> (i32, bool) {
+    match &self.inner {
+      Inner::Real { socket } => (socket.raw_id(), false),
+      Inner::Sim { port } => (i32::from(*port), true),
+    }
   }
 
   /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
   /// when nothing is waiting. A datagram longer than `buf` is truncated to it (size `buf` to the largest
-  /// datagram the caller reads).
+  /// datagram the caller reads). A refused receive is handed to the caller as it is; a loop over this ends
+  /// only on [`crate::error::ReceiveRefusal::SocketGone`] and reads past every other kind
+  /// ([`RtError::receive_refusal`]; §4.10a).
   pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddrV4)>, RtError> {
     match &self.inner {
       Inner::Real { socket } => loop {
@@ -213,13 +243,18 @@ impl UdpSocket {
           Io::Interrupted => {}
         }
       },
-      Inner::Sim { port } => Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
-        let n = bytes.len().min(buf.len());
-        if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
-          into.copy_from_slice(from_bytes);
+      Inner::Sim { port } => {
+        if let Some(refusal) = crate::sim::sim_udp_take_refusal(*port) {
+          return Err(refusal);
         }
-        (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
-      })),
+        Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
+          let n = bytes.len().min(buf.len());
+          if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
+            into.copy_from_slice(from_bytes);
+          }
+          (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
+        }))
+      }
     }
   }
 }

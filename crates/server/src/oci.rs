@@ -24,18 +24,15 @@ pub(crate) struct Binding {
   pub entry: OciBinding,
   /// The source mount point the kernel's table vouches for (a `slates:/<name>` mount exactly there).
   pub mount_point: String,
-  /// The attachment the source mount's table entry names (a Linux FUSE mount's `slates:<attachment>`), which
-  /// the parent record must be; `None` where the table names the volume instead (macOS).
-  pub attachment: Option<u64>,
 }
 
 impl Binding {
   /// The source mount's attachment, found in the daemon's own records: the host mount of this volume,
   /// for this principal, bound (`BindMount`) to exactly the mount point the kernel's table vouches for
   /// (§4.6 A-34: the table carries no capability, so the binding is proven by the record, not by a
-  /// secret read back from the table) — and, where the table names an attachment (a Linux FUSE mount's
-  /// `slates:<attachment>`; AUD-29-64), that very attachment, live: a stale, foreign or replaced source names
-  /// an attachment the record does not hold at this point for this volume and principal. A stale or foreign source cannot create an orphan binding, and a
+  /// secret read back from the table). A Linux FUSE source was already held to this daemon's own mounts when it was
+  /// verified ([`bind`], A-227), so a foreign or replaced mount at the point is no source. A stale or foreign source
+  /// cannot create an orphan binding, and a
   /// bind cannot promise rights the source does not carry. The parent must present the version the bind asks
   /// for — the head (`None`) or exactly `snapshot` (AUD-29-76) — so a recorded bind never claims one while the
   /// container sees the other.
@@ -52,7 +49,6 @@ impl Binding {
       .into_iter()
       .find(|parent| {
         matches!(parent.consumer, Consumer::Bridge)
-          && self.attachment.is_none_or(|named| parent.id == named)
           && parent.principal == *principal
           && parent.snapshot == snapshot
           && parent.form.mount_point() == Some(self.mount_point.as_str())
@@ -145,6 +141,14 @@ pub(crate) fn bind(
   // (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`). Asking after the pure checks keeps each
   // refusal the precise one — a path that is no mount point is `NotAMountPoint`, not a failed identity read —
   // and a kernel that cannot name a mount uniquely refuses rather than record evidence no check can use.
+  // A Linux FUSE source is this daemon's own mount, by its table id (A-227): its source names only some daemon's tag.
+  if kind == slates_bridge_oci::verify::HostMountKind::Fuse
+    && !slates_base::own_mounts::is_recorded(verified.table_id)
+  {
+    return Err(chosen(HostPathReason::NotThisVolume {
+      source: verified.source.clone(),
+    }));
+  }
   let identity = mount_identity_at(source)
     .map_err(|e| chosen(HostPathReason::MountTableUnavailable { errno: e.errno() }))?;
   let verified = VerifiedHostMount {
@@ -162,7 +166,6 @@ pub(crate) fn bind(
   }
   Ok(Binding {
     mount_point: verified.mount_point.clone(),
-    attachment: verified.attachment,
     entry: OciBinding {
       source: entry.source.clone(),
       destination: entry.destination.clone(),
@@ -219,8 +222,14 @@ mod tests {
     green_chain_bytes: 1,
   };
   /// Shape: the mounting user and another.
-  const OWNER: Principal = Principal::Uid { uid: 1000 };
-  const STRANGER: Principal = Principal::Uid { uid: 1001 };
+  const OWNER: Principal = Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1000,
+  };
+  const STRANGER: Principal = Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1001,
+  };
   /// Shape: the FUSE mount's attachment id, and an id no record holds.
   const MOUNTED: u64 = 7;
   const UNKNOWN: u64 = 9;
@@ -238,6 +247,8 @@ mod tests {
         names: NamePolicy::Exact,
         require_locked: false,
         role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId { value: 0 },
@@ -287,7 +298,7 @@ mod tests {
     partition
   }
 
-  fn binding(mount_point: &str, attachment: Option<u64>) -> Binding {
+  fn binding(mount_point: &str) -> Binding {
     Binding {
       entry: OciBinding {
         source: mount_point.to_owned(),
@@ -297,7 +308,7 @@ mod tests {
         options: vec![],
         evidence: slates_ipc::protocol::HostMountEvidence {
           fstype: "fuse.slates".to_owned(),
-          mount_source: format!("slates:{:016x}", attachment.unwrap_or(0)),
+          mount_source: "slates:00000000000000ab".to_owned(),
           names_volume: true,
           mount_id: 0,
           mount_device: 0,
@@ -305,22 +316,19 @@ mod tests {
         },
       },
       mount_point: mount_point.to_owned(),
-      attachment,
     }
   }
 
-  /// AUD-29-64 (the bind's source authority). Do: hold bind recipes to the daemon's records — the mount's
-  /// own attachment at its point for its principal; an attachment the table names but no record holds (stale
-  /// or foreign); the right attachment at another point; the right one for another principal; and a source
-  /// naming no attachment (macOS's loopback form) at the mount's point. Expect: only the live record at its
-  /// own point for its own principal binds (as the mount's consumer); every other is refused `Forbidden`; the
-  /// form with no attachment named still finds the record by its point.
+  /// AUD-29-64, A-227 (the bind's source authority). Do: hold bind recipes to the daemon's records — a source at the
+  /// mount's point for its principal, at another point, and for another principal. Expect: only the live record at
+  /// its own point for its own principal binds (as the mount's consumer); every other is refused `Forbidden`. (A FUSE
+  /// source no mount of this daemon's holds is refused before this, at `bind`, by its table id.)
   #[test]
-  fn a_bind_source_binds_only_as_the_live_attachment_its_table_entry_names() {
+  fn a_bind_source_binds_only_as_the_live_attachment_at_its_point() {
     let partition = partition();
     let volume = volume().id;
     assert_eq!(
-      binding(POINT, Some(MOUNTED)).consumer(&partition, volume, &OWNER, None),
+      binding(POINT).consumer(&partition, volume, &OWNER, None),
       Ok((
         Consumer::Mount {
           attachment: MOUNTED
@@ -328,30 +336,16 @@ mod tests {
         true
       ))
     );
-    for (bad, principal) in [
-      (binding(POINT, Some(UNKNOWN)), &OWNER),
-      (binding(ELSEWHERE, Some(MOUNTED)), &OWNER),
-      (binding(POINT, Some(MOUNTED)), &STRANGER),
-    ] {
+    for (bad, principal) in [(binding(ELSEWHERE), &OWNER), (binding(POINT), &STRANGER)] {
       assert!(
         matches!(
           bad.consumer(&partition, volume, principal, None),
           Err(Refusal::Forbidden { .. })
         ),
-        "{:?} at {} for {principal:?}",
-        bad.attachment,
+        "at {} for {principal:?}",
         bad.mount_point
       );
     }
-    assert_eq!(
-      binding(POINT, None).consumer(&partition, volume, &OWNER, None),
-      Ok((
-        Consumer::Mount {
-          attachment: MOUNTED
-        },
-        true
-      ))
-    );
   }
 
   /// AUD-29-67 (a container reaches a Linux source as its own ids), as it stands since 2026-10-20. Do: record
@@ -394,7 +388,7 @@ mod tests {
       })
       .unwrap();
     assert_eq!(
-      binding(POINT, Some(MOUNTED)).consumer(&partition, volume.id, &OWNER, None),
+      binding(POINT).consumer(&partition, volume.id, &OWNER, None),
       Ok((
         Consumer::Mount {
           attachment: MOUNTED
@@ -435,7 +429,7 @@ mod tests {
         },
       })
       .unwrap();
-    let mut read_only = binding(ELSEWHERE, None);
+    let mut read_only = binding(ELSEWHERE);
     read_only.entry.read_only = true;
     assert_eq!(
       read_only.consumer(&partition, volume, &OWNER, Some(pinned)),
@@ -451,7 +445,7 @@ mod tests {
       Err(Refusal::Forbidden { .. })
     ));
     assert!(matches!(
-      binding(POINT, None).consumer(&partition, volume, &OWNER, Some(pinned)),
+      binding(POINT).consumer(&partition, volume, &OWNER, Some(pinned)),
       Err(Refusal::Forbidden { .. })
     ));
   }
@@ -464,7 +458,7 @@ mod tests {
     /// §4.6 A-9 under chaos, over the reporting behaviour that replaced the `MountNotShared` refusal on
     /// 2026-10-20. The hand-written attacks beside this drive four shapes; this drives the whole space of
     /// them at once — a mount that is shared or not, under this principal or another, at this path or
-    /// elsewhere, named by the right attachment or a wrong one, for the head or a snapshot.
+    /// elsewhere, for the head or a snapshot.
     ///
     /// Expect, for every generated case:
     ///
@@ -481,7 +475,6 @@ mod tests {
       shared in any::<bool>(),
       other_principal in any::<bool>(),
       elsewhere in any::<bool>(),
-      name_wrong_attachment in any::<bool>(),
       read_only in any::<bool>(),
       write_rights in any::<bool>(),
       ask_snapshot in any::<bool>(),
@@ -497,7 +490,7 @@ mod tests {
       } else {
         AttachForm::FuseMount { path: POINT.to_owned() }
       };
-      let principal = if other_principal { Principal::Uid { uid: 1001 } } else { OWNER };
+      let principal = if other_principal { Principal::Uid { host: slates_db::HostId(0), uid: 1001 } } else { OWNER };
       let snapshot = record_snapshot.then_some(SnapshotId { value: 1 });
       partition
         .apply(&Op::AttachmentAdded {
@@ -515,15 +508,13 @@ mod tests {
         .unwrap();
 
       let at = if elsewhere { ELSEWHERE } else { POINT };
-      let named = if name_wrong_attachment { Some(UNKNOWN) } else { Some(MOUNTED) };
       let asked = ask_snapshot.then_some(SnapshotId { value: 1 });
-      let mut binding = binding(at, named);
+      let mut binding = binding(at);
       binding.entry.read_only = read_only;
       let got = binding.consumer(&partition, volume.id, &OWNER, asked);
 
       // The oracle: what the record says the answer must be, derived here rather than copied from the code.
       let allowed = !elsewhere
-        && !name_wrong_attachment
         && !other_principal
         && asked == snapshot
         && (read_only || write_rights);

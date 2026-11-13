@@ -15,7 +15,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use slates_anchor::AnchorSegment;
 use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId};
+use slates_ipc::HeldRendezvous;
+use slates_ipc::protocol::{ReplyBody, RequestBody};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
@@ -189,6 +192,9 @@ fn a_call_is_never_held_behind_the_periodic_acknowledgement() {
   let sent_while_held = held_at.elapsed() < HOLD;
   holder.join().unwrap().unwrap();
   let took = acknowledging_call.expect("the client acknowledged within half the hold");
+  eprintln!(
+    "the call that sent the acknowledgement took {took:?}, against a {HOLD:?} hold of the other shard"
+  );
   assert!(
     sent_while_held,
     "the acknowledgement went out while the other shard was held"
@@ -198,4 +204,241 @@ fn a_call_is_never_held_behind_the_periodic_acknowledgement() {
     "the call that sent the acknowledgement took {took:?}, against a {HOLD:?} hold of the other shard"
   );
   daemon.stop();
+}
+
+/// Raised by the held shard of [`an_acknowledgement_never_covers_a_request_still_awaited`] when its hold begins.
+static HELD_AWAITED: AtomicBool = AtomicBool::new(false);
+/// Shape: the command ring's slots in [`an_acknowledgement_never_covers_a_request_still_awaited`]: the smallest
+/// supported ring, so the periodic acknowledgement is due after two replies (`slots / 2`) and three requests fit in
+/// flight at once.
+const SMALL_RING_SLOTS: u32 = 4;
+
+/// A create of `name` (1 MiB scratch).
+fn create_body(name: &str) -> RequestBody {
+  RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }
+}
+
+/// A name whose create the shard at `partition` of two owns, so its completion is recorded there.
+fn name_owned_by(partition: usize, tag: &str) -> String {
+  (0..PLACEMENT_TRIES)
+    .map(|n| format!("{tag}-{n}"))
+    .find(|name| usize::from(slates_server::verbs::owner_of_name(name, 2)) == partition)
+    .expect("a name the partition owns")
+}
+
+/// Waits for `word`'s reply, taking it (a refusal is the client's typed error).
+fn take_reply(client: &mut Client, word: u64) -> Result<ReplyBody, ClientError> {
+  let started = Instant::now();
+  loop {
+    match client.poll_reply_word(word) {
+      Ok(Some(reply)) => return Ok(reply),
+      Ok(None) => {}
+      Err(error) => return Err(error),
+    }
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(10),
+      "a reply to {word:#x}"
+    );
+    std::thread::yield_now();
+  }
+}
+
+/// A daemon over the played anchor's segment and rendezvous, so a second one recovers the first one's records.
+fn daemon_over(
+  profile: &MachineProfile,
+  config: &DaemonConfig,
+  (segment, rendezvous): (&AnchorSegment, &HeldRendezvous),
+) -> Daemon {
+  let (handoff, len) = segment.handoff().unwrap();
+  let content = segment.content_handoff().unwrap();
+  let daemon = Daemon::start(
+    profile,
+    config.clone(),
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+      rendezvous: rendezvous.adoption(),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  daemon
+}
+
+/// §4.9 "Exactly-once", AC-2.3. Do: on a two-shard daemon under a played anchor, with a ring small enough that the
+/// periodic acknowledgement is due after two replies, hold the shard that does not serve the client; begin a create
+/// that shard owns (its reply waits for the hold), then two creates the client's own shard owns, take their two
+/// replies and let the client send the acknowledgement it finds due; end the hold without taking the first create's
+/// reply; restart the daemon over the same anchor, reconnect under the client's id and resend the first create under
+/// its own id. Expect: the resend is answered with the create's own reply, the volume another client lists under its
+/// name, never `DuplicateRequest`. A client with several requests in flight (any async caller, the multiplexing load
+/// harness) acknowledges only below the lowest one it still awaits: an acknowledgement covering a request whose reply
+/// has not come releases the completion record its retry needs, so the restart turns an applied create into a refusal
+/// (and on the fleet, a deferred submit's acceptance into `DuplicateRequest`).
+#[test]
+fn an_acknowledgement_never_covers_a_request_still_awaited() {
+  let profile = profile();
+  let instance = format!("ack-awaited-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(2));
+  config.region.slots = SMALL_RING_SLOTS;
+  let segment = AnchorSegment::create(
+    &format!("slates-seg-ack-awaited-{}", std::process::id()),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &format!("slates-con-ack-awaited-{}", std::process::id()),
+    config.content_bytes(),
+  )
+  .unwrap();
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
+  let first = daemon_over(&profile, &config, (&segment, &rendezvous));
+  let started = Instant::now();
+  let mut client = connect_within(&instance, started);
+  let (awaited, applied) = acknowledge_past_a_held_create(&first, &mut client, started);
+  first.stop();
+  let second = daemon_over(&profile, &config, (&segment, &rendezvous));
+  let reply = resend_after_restart(&mut client, awaited, started);
+  eprintln!(
+    "acknowledged up to {}, the awaited create's resend answered {reply:?}",
+    client.acknowledged()
+  );
+  assert_eq!(
+    reply,
+    Ok(ReplyBody::Created { id: applied }),
+    "the resend of a request still awaited meets its own completion record"
+  );
+  drop(client);
+  second.stop();
+}
+
+/// A client of `instance`, retrying while the daemon comes up.
+fn connect_within(instance: &str, started: Instant) -> Client {
+  loop {
+    match Client::connect(instance, deadlines()) {
+      Ok(client) => return client,
+      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+        if started.elapsed() < HOLD.saturating_mul(10) =>
+      {
+        std::thread::yield_now();
+      }
+      Err(e) => panic!("{e}"),
+    }
+  }
+}
+
+/// Holds the shard that does not serve `client`, begins a create it owns, takes two own-shard creates' replies and
+/// sends the acknowledgement the client finds due; once the hold ends and another client sees the held create applied,
+/// returns the held create's word (its reply never taken) and the volume it made.
+fn acknowledge_past_a_held_create(
+  daemon: &Daemon,
+  client: &mut Client,
+  started: Instant,
+) -> (u64, VolumeId) {
+  let mine = serving_shard(daemon, client.client_id());
+  let other_index = 1 - mine;
+  let hold = daemon
+    .observation(
+      daemon.shards().get(other_index).copied(),
+      OBSERVE_BUDGET_NS,
+      move |_: &mut ShardState| {
+        HELD_AWAITED.store(true, Ordering::Release);
+        // The held shard's thread does nothing else for the hold: the create it owns waits.
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(HOLD);
+      },
+    )
+    .unwrap();
+  let holder = std::thread::spawn(move || hold.wait());
+  while !HELD_AWAITED.load(Ordering::Acquire) {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(10),
+      "the hold began"
+    );
+    std::thread::yield_now();
+  }
+  let awaited_name = name_owned_by(other_index, "awaited");
+  let awaited = client.begin(&create_body(&awaited_name)).unwrap().word();
+  for tag in ["mine-a", "mine-b"] {
+    let word = client
+      .begin(&create_body(&name_owned_by(mine, tag)))
+      .unwrap()
+      .word();
+    assert!(
+      matches!(take_reply(client, word), Ok(ReplyBody::Created { .. })),
+      "the own shard's create is answered inside the hold"
+    );
+    client.begin_ack_if_due().unwrap();
+  }
+  holder.join().unwrap().unwrap();
+  (
+    awaited,
+    listed_volume(&daemon_instance(daemon), &awaited_name, started),
+  )
+}
+
+/// The instance a daemon serves.
+fn daemon_instance(daemon: &Daemon) -> String {
+  daemon.instance().to_owned()
+}
+
+/// The id of the volume named `name`, once another client of `instance` lists it; then one more listing, so every
+/// shard has served what was sent before it (a scatter reaches each), the acknowledgement's release too.
+fn listed_volume(instance: &str, name: &str, started: Instant) -> VolumeId {
+  let mut observer = Client::connect(instance, deadlines()).unwrap();
+  let id = loop {
+    if let Some(volume) = observer
+      .list()
+      .unwrap()
+      .into_iter()
+      .find(|volume| volume.name == name)
+    {
+      break volume.id;
+    }
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(10),
+      "the held create is applied"
+    );
+  };
+  observer.list().unwrap();
+  id
+}
+
+/// Reconnects `client` under its id to the restarted daemon and resends `awaited` under its own id: its reply.
+fn resend_after_restart(
+  client: &mut Client,
+  awaited: u64,
+  started: Instant,
+) -> Result<ReplyBody, ClientError> {
+  while !client
+    .try_reconnect()
+    .unwrap_or_else(|e| panic!("reconnect: {e}"))
+  {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(20),
+      "the client reconnects"
+    );
+    std::thread::yield_now();
+  }
+  while !client
+    .resend_awaited(awaited)
+    .unwrap_or_else(|e| panic!("resend: {e}"))
+  {
+    assert!(
+      started.elapsed() < HOLD.saturating_mul(20),
+      "the resend goes"
+    );
+    std::thread::yield_now();
+  }
+  take_reply(client, awaited)
 }

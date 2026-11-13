@@ -39,6 +39,7 @@ use crate::allocate::{Allocation, Begun};
 use crate::bridge::{Bridge, KernelChange, reply_error};
 use crate::coherence::{
   KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritableOpens,
+  WritebackVerdict,
 };
 use crate::dispatch;
 use crate::error::FuseError;
@@ -300,7 +301,9 @@ struct Notifier {
   rounds: Option<std::sync::mpsc::SyncSender<Round>>,
   /// Each round's outcome.
   outcomes: std::sync::mpsc::Receiver<Outcome>,
-  thread: Option<std::thread::JoinHandle<()>>,
+  /// Joined on the mount's shard when the notifier drops, which is marked as waiting on it meanwhile: the join waits out
+  /// the round in flight (A-228's transitive wait).
+  thread: Option<slates_rt::registry::WaitedThread<()>>,
   /// The round out, if one is: where the cursor stood before it, to put it back if the kernel refuses the write.
   out: Option<Option<slates_bridge_core::InvalidationCursor>>,
 }
@@ -312,9 +315,9 @@ impl Notifier {
   fn start(device: OwnedFd, wake: Option<ChangeNotifier>) -> Result<Notifier, ChannelError> {
     let (rounds, inbox) = std::sync::mpsc::sync_channel::<Round>(1);
     let (send, outcomes) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::Builder::new()
-      .name("slates-fuse-notify".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-fuse-notify".to_owned()),
+      move || {
         // Until the owner closes the round channel: each round written whole, its outcome sent and the loop woken.
         while let Ok(messages) = inbox.recv() {
           // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
@@ -326,11 +329,12 @@ impl Notifier {
             let _ = wake.notify();
           }
         }
-      })
-      .map_err(|e| ChannelError::Device {
-        call: "notify-thread",
-        code: e.raw_os_error(),
-      })?;
+      },
+    )
+    .map_err(|e| ChannelError::Device {
+      call: "notify-thread",
+      code: e.raw_os_error(),
+    })?;
     Ok(Notifier {
       rounds: Some(rounds),
       outcomes,
@@ -388,7 +392,7 @@ impl Drop for Notifier {
     if let Some(thread) = self.thread.take()
       && thread.join().is_err()
     {
-      eprintln!("slates-bridge-fuse: a notify thread panicked");
+      slates_machine::log_line!("slates-bridge-fuse: a notify thread panicked");
     }
   }
 }
@@ -470,6 +474,18 @@ impl ChangeSignal {
   pub fn raw_signal(&self) -> std::os::fd::RawFd {
     use std::os::fd::AsRawFd;
     self.fd.as_raw_fd()
+  }
+
+  /// Signals this signal itself, from its owner's thread: the owner's loop wakes as it does for a change (a revoked
+  /// mount, woken to drop its kernel's cache, AUD-29-84). A counter already at its ceiling is already signalled.
+  pub fn signal(&self) -> Result<(), ChannelError> {
+    match rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {
+      Ok(_) | Err(rustix::io::Errno::AGAIN) => Ok(()),
+      Err(e) => Err(ChannelError::Device {
+        call: "notify",
+        code: Some(e.raw_os_error()),
+      }),
+    }
   }
 
   /// Takes the pending signals (the counter, in one read); a counter already at zero is nothing. An owner awaiting
@@ -600,6 +616,11 @@ pub struct ServeState {
   /// entry it still serves. Counted so a mount losing coherence is visible instead of silent (CLAUDE.md #9); read and
   /// cleared by the owner that reports it.
   entry_invalidations_refused: u64,
+  /// The lookups the kernel gave back (each `FORGET`'s node and count) since its owner last took them, when the owner
+  /// logs them ([`ServeState::logs_forgets`]): a `FORGET` takes no reply and is never resent, so the server logs each
+  /// beside the writes it logs, for a successor to give back. Taken every turn, so it holds one request's `FORGET`s at
+  /// most; `None` for an owner that does not log them, which collects nothing.
+  forgotten: Option<Vec<(u64, u64)>>,
   /// The journal records this mount's own requests made: the bytes they wrote are fresh in its kernel, so a later cache
   /// write-back is not held stale there (the dirty-page write-back rule, [`dispatch_request`]).
   own: OwnRecords,
@@ -636,9 +657,18 @@ pub struct ServeState {
   /// Inode invalidations sent in takeover rounds, since this was last read: the non-vacuity count of the bytes and
   /// attributes half of A-158. Read and cleared by the owner that reports it.
   takeover_invalidated: u64,
-  /// Bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched, since
-  /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
-  writeback_bytes_kept_back: u64,
+  /// Cache write-backs refused `EIO` because a byte another path changed after the kernel's copy was fetched differed
+  /// from the file's (A-248), since this was last read: the rule's non-vacuity count. Read and cleared by the owner
+  /// that reports it.
+  writeback_conflicts: u64,
+  /// Cache write-backs applied whole over stale bytes that equal the file's bytes now, since this was last read. Read
+  /// and cleared by the owner that reports it.
+  writeback_identical: u64,
+  /// The bytes of each file a refused cache write-back carried, its kernel's copy of which no invalidation may ever name
+  /// ([`serve_writeback`]): owed as an inode invalidation at the next round after the reply. One covering range a file,
+  /// so at most one entry for each file its kernel holds open for writing (a write-back holds its file open until it is
+  /// answered); a wider range only drops more cached pages, which are fetched again.
+  refused_writebacks: std::collections::BTreeMap<u64, std::ops::Range<u64>>,
   /// Cache write-backs refused `EIO` because which of their bytes were stale could no longer be told (the file's states
   /// were lost, or the journal no longer held the records needed), since this was last read. Read and cleared by the
   /// owner that reports it.
@@ -652,6 +682,14 @@ pub struct ServeState {
   /// The bytes of the shard's metadata ledger admitted for this mount's byte states ([`make_room`]). Returned to the
   /// ledger by the mount's owner when the mount ends ([`ServeState::states_charged`]).
   states_charged: u64,
+  /// Where the round that drops a revoked mount's kernel cache stands ([`revoked_turn`]); `None` while the mount's
+  /// attachment admits its requests.
+  dropping: Option<Dropping>,
+  /// Inode invalidations sent by revoked mounts' rounds since this was last read: the non-vacuity count of AUD-29-84's
+  /// cache drop. Read and cleared by the owner that reports it.
+  revoked_invalidated: u64,
+  /// Requests refused while a revoked mount's round ran, since this was last read. Read and cleared by the owner.
+  revoked_refused: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -676,6 +714,7 @@ impl ServeState {
       notifier: None,
       notify_wake: None,
       entry_invalidations_refused: 0,
+      forgotten: None,
       own: OwnRecords::default(),
       writable: WritableOpens::default(),
       states: PageStates::default(),
@@ -688,11 +727,16 @@ impl ServeState {
       epochs_bumped: 0,
       epochs_unsupported: 0,
       takeover_invalidated: 0,
-      writeback_bytes_kept_back: 0,
+      writeback_conflicts: 0,
+      writeback_identical: 0,
+      refused_writebacks: std::collections::BTreeMap::new(),
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
       journal_overruns: 0,
       states_charged: 0,
+      dropping: None,
+      revoked_invalidated: 0,
+      revoked_refused: 0,
     }
   }
 
@@ -708,16 +752,43 @@ impl ServeState {
     self.states.take_lost_for_room()
   }
 
-  /// The bytes of cache write-backs kept back since this was last asked, and zero afterwards
+  /// The cache write-backs refused `EIO` as conflicts since this was last asked, and zero afterwards
   /// ([`dispatch_request`]).
-  pub fn take_writeback_bytes_kept_back(&mut self) -> u64 {
-    std::mem::take(&mut self.writeback_bytes_kept_back)
+  pub fn take_writeback_conflicts(&mut self) -> u64 {
+    std::mem::take(&mut self.writeback_conflicts)
+  }
+
+  /// The cache write-backs applied over stale bytes equal to the file's since this was last asked, and zero afterwards
+  /// ([`dispatch_request`]).
+  pub fn take_writeback_identical(&mut self) -> u64 {
+    std::mem::take(&mut self.writeback_identical)
+  }
+
+  /// Whether a refused cache write-back's pages are still owed an invalidation ([`serve_writeback`]): its owner runs a
+  /// round once the reply is written ([`redeliver_after_refusal`]).
+  pub fn owes_refused_writebacks(&self) -> bool {
+    !self.refused_writebacks.is_empty()
   }
 
   /// The cache write-backs refused `EIO` as unknown since this was last asked, and zero afterwards
   /// ([`dispatch_request`]).
   pub fn take_writebacks_unknown(&mut self) -> u64 {
     std::mem::take(&mut self.writebacks_unknown)
+  }
+
+  /// Whether this mount's attachment was found revoked and its kernel's cache is being dropped before it ends
+  /// ([`revoked_turn`]): its owner serves it without the volume's lease, since it answers nothing from the volume.
+  pub fn dropping(&self) -> bool {
+    self.dropping.is_some()
+  }
+
+  /// What revoked mounts' rounds did since this was last asked, and zero afterwards, as `(inodes invalidated, requests
+  /// refused)` ([`revoked_turn`]; AUD-29-84).
+  pub fn take_revoked_counts(&mut self) -> (u64, u64) {
+    (
+      std::mem::take(&mut self.revoked_invalidated),
+      std::mem::take(&mut self.revoked_refused),
+    )
   }
 
   /// The rounds that found this mount behind the journal's retention since this was last asked, and zero afterwards:
@@ -775,6 +846,21 @@ impl ServeState {
   /// serving names this mount has tried to invalidate.
   pub fn take_entry_invalidations_refused(&mut self) -> u64 {
     std::mem::take(&mut self.entry_invalidations_refused)
+  }
+
+  /// Collects the lookups each `FORGET` gives back, for an owner that logs them ([`Self::take_forgotten`]).
+  pub fn logs_forgets(&mut self) {
+    self.forgotten.get_or_insert_with(Vec::new);
+  }
+
+  /// The lookups the kernel gave back since this was last asked, each a node and a count, in the order served; empty
+  /// for an owner that does not log them.
+  pub fn take_forgotten(&mut self) -> Vec<(u64, u64)> {
+    self
+      .forgotten
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default()
   }
 
   /// Wakes this state's serve loop whenever a round of invalidations finishes being written (§4.6): the round runs
@@ -869,9 +955,9 @@ pub enum Step {
 /// whole service, so a barrier over the volume (§4.6 "Writeback and snapshot barrier") sees exactly
 /// the requests the seam may still be applying — one at a time here — and a loop that dies
 /// mid-request leaves that request counted, which a barrier reports as incomplete until the owner's
-/// failed-consumer cleanup. A revoked or epoch-fenced attachment ends the mount rather than serving
-/// under stale authority (§4.8; per-request revalidation). A device error other than a disconnect is
-/// returned to the caller.
+/// failed-consumer cleanup. A revoked or epoch-fenced attachment serves nothing under stale authority
+/// (§4.8; per-request revalidation): its kernel's cache is dropped while every request is refused, then the
+/// mount ends ([`revoked_turn`]; AUD-29-84). A device error other than a disconnect is returned to the caller.
 pub fn serve_step(
   channel: &mut FuseChannel,
   bridge: &mut dyn Bridge,
@@ -882,7 +968,10 @@ pub fn serve_step(
 ) -> Result<Step, ChannelError> {
   if wake == Wake::Change {
     let Ok(cx) = attachments.begin(attachment) else {
-      return Ok(Step::Ended);
+      return match revoked_turn(channel, state)? {
+        Revoked::Ended => Ok(Step::Ended),
+        Revoked::Dropping => Ok(Step::Change(Delivered::default())),
+      };
     };
     let delivered = deliver_owed(channel, bridge, &cx, state);
     attachments.end(attachment);
@@ -899,7 +988,18 @@ pub fn serve_step(
     return Ok(Step::Dropped);
   }
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Step::Ended);
+    let request = channel.take_request();
+    let opcode = Request::parse(&request)
+      .ok()
+      .and_then(|parsed| parsed.opcode);
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Step::Ended),
+      Revoked::Dropping => Ok(Step::Request {
+        opcode,
+        delivered: Delivered::default(),
+        error: REVOKED_ERRNO,
+      }),
+    };
   };
   // `dispatch` needs a mutable reply buffer separate from the request buffer the channel owns,
   // so the request is copied out (one memcpy of a small message; the io_uring path avoids it
@@ -1010,19 +1110,9 @@ fn deliver_owed(
   if let (false, Some(since)) = (delivered.gather_refused, before) {
     feed_states(bridge, cx, state, since.journal_seq);
   }
+  refused_writebacks_told(state, &mut messages);
   if !messages.is_empty() {
-    let notifier = match state.notifier.take() {
-      Some(notifier) => notifier,
-      None => {
-        let wake = match state.notify_wake.as_ref() {
-          Some(notifier) => Some(notifier.try_clone()?),
-          None => None,
-        };
-        Notifier::start(channel.device_clone()?, wake)?
-      }
-    };
-    let notifier = state.notifier.insert(notifier);
-    notifier.send(messages, before)?;
+    notifier_of(channel, state)?.send(messages, before)?;
     state.takeover_out = takeover.is_some();
   }
   if let Some(slice) = takeover {
@@ -1037,6 +1127,21 @@ fn deliver_owed(
     state.takeover_invalidated = state.takeover_invalidated.saturating_add(slice.invalidated);
   }
   Ok(delivered)
+}
+
+/// Moves what refused cache write-backs are owed ([`serve_writeback`]) onto a round's messages: each file's refused
+/// bytes, dropped from the kernel's cache.
+fn refused_writebacks_told(state: &mut ServeState, messages: &mut Round) {
+  for (ino, range) in std::mem::take(&mut state.refused_writebacks) {
+    let data = CachedBytes::Range {
+      at: range.start,
+      len: range.end.saturating_sub(range.start),
+    };
+    let invalidation = Invalidation::Inode { ino, data };
+    if let Some(told) = encode_invalidation(&invalidation, state.expire_only) {
+      messages.push(told);
+    }
+  }
 }
 
 /// Where a mount's takeover round stands (A-158; [`takeover_told`]).
@@ -1147,6 +1252,161 @@ fn takeover_told(
   }
 }
 
+/// Format: the errno a revoked mount answers each request while its kernel's cache is dropped ([`revoked_turn`]): the
+/// kernel's own answer once the mount has ended (A-102), so a process sees one answer through the whole revocation.
+pub const REVOKED_ERRNO: i32 = rustix::io::Errno::NOTCONN.raw_os_error();
+
+/// Where a revoked mount's round stands ([`revoked_turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dropping {
+  /// Slices remain: the next takes the nodes above `after` (`None`: the first, which carries the root).
+  Owed {
+    /// The last node a slice took.
+    after: Option<u64>,
+  },
+  /// The last slice is sent: the mount ends once no round is out.
+  Sent,
+}
+
+/// What a revoked mount's turn decided ([`revoked_turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Revoked {
+  /// The kernel's cache is still being dropped: the mount serves on, refusing every request.
+  Dropping,
+  /// Dropped, or the device refused a round: the mount ends.
+  Ended,
+}
+
+/// A turn of a mount whose attachment admits no more requests: a consumer's revocation, an expiry, a detach, a fenced
+/// epoch (§4.8, §4.13; AUD-29-84). Before the mount ends, its kernel drops the pages, attributes and listings of the
+/// root and of every node it references ([`KernelHolds`]), each by a `FUSE_NOTIFY_INVAL_INODE` of all its data.
+///
+/// **Why.** Ending the mount makes the kernel answer every request `ENOTCONN`, but a page already in its cache is read
+/// without a request. A descriptor opened before the revocation read the page after the one it had read, which the
+/// kernel's readahead had fetched and the process never asked for: 3 of 3 on adacachy2 (Linux 7.3, 2026-11-09;
+/// `a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read` in `crates/server/tests/fuse_mount.rs`).
+///
+/// **How.** The nodes are walked in order, a slice a round, each slice at most the owner's budget
+/// ([`ServeState::slices_within`]) and at least one node, as a takeover round is ([`takeover_told`]). Every round goes
+/// through the notify thread ([`Notifier`]): dropping a page waits for a `READ` that holds it, which this thread
+/// answers (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). So the mount keeps reading requests
+/// meanwhile and answers each [`REVOKED_ERRNO`] without reaching the volume ([`refuse_revoked`]). It ends only once no
+/// round is out, so dropping it never joins a notify thread still waiting in the kernel. A round the device refuses ends
+/// it at once: the kernel then holds the connection no longer, or refuses notifications for good.
+///
+/// **Bound.** One message a node the kernel references, which is at most the volume's inode allowance.
+fn revoked_turn(channel: &FuseChannel, state: &mut ServeState) -> Result<Revoked, ChannelError> {
+  let dropping = *state.dropping.get_or_insert(Dropping::Owed { after: None });
+  if let Some(notifier) = state.notifier.as_mut()
+    && notifier.busy()
+  {
+    let Some((outcome, _before)) = notifier.returned() else {
+      return Ok(Revoked::Dropping);
+    };
+    state.takeover_out = false;
+    match outcome {
+      Ok(refused) => {
+        state.entry_invalidations_refused = state
+          .entry_invalidations_refused
+          .saturating_add(u64::from(refused));
+      }
+      Err(_) => return Ok(Revoked::Ended),
+    }
+  }
+  let Dropping::Owed { after } = dropping else {
+    return Ok(Revoked::Ended);
+  };
+  let began = std::time::Instant::now();
+  let budget = std::time::Duration::from_nanos(state.slice_ns);
+  let expire_only = state.expire_only;
+  let mut messages: Round = Vec::new();
+  let invalidate = |ino: u64, messages: &mut Round| {
+    let invalidation = Invalidation::Inode {
+      ino,
+      data: CachedBytes::ALL,
+    };
+    encode_invalidation(&invalidation, expire_only).map(|message| messages.push(message))
+  };
+  // The kernel names the root node 1 whatever the volume's root inode is ([`addressed_to_the_kernel`]).
+  if after.is_none() {
+    let _ = invalidate(crate::bridge::FUSE_ROOT_ID, &mut messages);
+  }
+  let mut last = after;
+  let mut cut = false;
+  for ino in state.holds.nodes_after(after) {
+    last = Some(ino);
+    if ino != crate::bridge::FUSE_ROOT_ID {
+      let _ = invalidate(ino, &mut messages);
+    }
+    if began.elapsed() >= budget {
+      cut = true;
+      break;
+    }
+  }
+  let more = cut && state.holds.nodes_after(last).next().is_some();
+  state.dropping = Some(if more {
+    Dropping::Owed { after: last }
+  } else {
+    Dropping::Sent
+  });
+  if messages.is_empty() {
+    return Ok(if more {
+      Revoked::Dropping
+    } else {
+      Revoked::Ended
+    });
+  }
+  let sent = u64::try_from(messages.len()).unwrap_or(u64::MAX);
+  let before = state.coherence.cursor();
+  notifier_of(channel, state)?.send(messages, before)?;
+  state.revoked_invalidated = state.revoked_invalidated.saturating_add(sent);
+  Ok(Revoked::Dropping)
+}
+
+/// Answers `request`, read from a mount whose attachment admits no more requests, [`REVOKED_ERRNO`] without reaching
+/// the volume, then turns the mount's revoked round ([`revoked_turn`]). A request that takes no reply (a `FORGET`) is
+/// answered by nothing, and the lookups it gives back are taken off what the kernel holds, so the round skips them.
+fn refuse_revoked(
+  channel: &FuseChannel,
+  state: &mut ServeState,
+  request: &[u8],
+) -> Result<Revoked, ChannelError> {
+  let parsed = Request::parse(request).ok();
+  let opcode = parsed.as_ref().and_then(|parsed| parsed.opcode);
+  if crate::bridge::takes_reply(opcode) {
+    let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+    let n = ReplyHeader::write_error(unique, REVOKED_ERRNO, &mut state.reply)
+      .map_err(ChannelError::from)?;
+    match channel.write_reply(state.reply.get(..n).unwrap_or(&[])) {
+      Ok(_) => {}
+      Err(ChannelError::Disconnected) => return Ok(Revoked::Ended),
+      Err(e) => return Err(e),
+    }
+  } else {
+    note_delivered(request, 0, state);
+  }
+  state.revoked_refused = state.revoked_refused.saturating_add(1);
+  revoked_turn(channel, state)
+}
+
+/// The mount's notify thread, started with its first round ([`Notifier`]).
+fn notifier_of<'a>(
+  channel: &FuseChannel,
+  state: &'a mut ServeState,
+) -> Result<&'a mut Notifier, ChannelError> {
+  let notifier = match state.notifier.take() {
+    Some(notifier) => notifier,
+    None => {
+      let wake = match state.notify_wake.as_ref() {
+        Some(notifier) => Some(notifier.try_clone()?),
+        None => None,
+      };
+      Notifier::start(channel.device_clone()?, wake)?
+    }
+  };
+  Ok(state.notifier.insert(notifier))
+}
+
 /// The messages an `Everything` becomes (A-141): an attribute-and-data invalidation of every node the kernel references
 /// and of the root, and an entry invalidation of every name it holds — expire-only where the kernel took that, so a
 /// busy directory is revalidated rather than torn down
@@ -1209,22 +1469,24 @@ fn addressed_to_the_kernel(invalidation: &Invalidation, root: Option<u64>) -> In
 
 /// Dispatches one admitted request and notes the journal records it made as this mount's own. A **cache write-back**
 /// (a `WRITE` carrying [`crate::abi::WRITE_CACHE`]) goes by the dirty-page write-back rule ([`serve_writeback`]); any
-/// other request by the bridge's dispatch. Returns the reply's length and, for a write-back, the byte ranges it was
-/// kept back from, which its owner's log must leave out ([`Dispatched::written`]).
+/// other request by the bridge's dispatch. Returns the reply's length.
 ///
 /// **The rule** (§4.6 "Cache posture";
 /// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A page a process
 /// dirtied through a shared map stays in the kernel until the kernel writes it back, periodically, at `msync`, or while
 /// it launders the page inside one of this mount's own invalidations. That page is the kernel's copy from before every
 /// change it has not confirmed, so where another path changed the file since, its bytes are stale. Applied whole, it
-/// undid the later write (measured 2026-10-21: 4,095 of a page's 4,096 bytes reverted). Applied outside those ranges,
-/// the volume holds what one shared page cache would: the process's store, and the other path's newer bytes.
+/// undid the later write (measured 2026-10-21: 4,095 of a page's 4,096 bytes reverted). Since A-248 (Ada's decision of
+/// 2026-11-07, "Refuse, like NFS") such a write-back is refused whole, `EIO`, by the rule every transport shares
+/// ([`crate::coherence::judge_writeback`]): the other path's change survives, and the process learns at its `msync` or
+/// `fsync` that its store did not land. A-139 and A-140 applied it outside the stale bytes, which chose bytes between
+/// the store and the other path's change: an inferred merge (banned item 11).
 fn dispatch_request(
   request: &[u8],
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
-) -> (usize, Vec<std::ops::Range<u64>>) {
+) -> usize {
   adopt_restored(bridge, cx, state);
   let before = bridge.seen(cx).journal_seq;
   let started_at = *state.started_at.get_or_insert(before);
@@ -1236,9 +1498,9 @@ fn dispatch_request(
   }
   let served = match crate::bridge::cache_writeback(request) {
     Some(nodeid) => serve_writeback(request, nodeid, started_at, bridge, cx, state),
-    None => (dispatch(request, bridge, cx, &mut state.reply), Vec::new()),
+    None => dispatch(request, bridge, cx, &mut state.reply),
   };
-  note_opens_and_fetches(request, served.0, before, bridge, cx, state);
+  note_opens_and_fetches(request, served, before, bridge, cx, state);
   note_own_records(bridge, cx, state, before);
   served
 }
@@ -1442,9 +1704,15 @@ fn adopt_unseen_handle(
 fn note_delivered(request: &[u8], len: usize, state: &mut ServeState) {
   let reply = state.reply.get(..len).unwrap_or(&[]);
   let holds = &mut state.holds;
+  let forgotten = &mut state.forgotten;
   crate::bridge::kernel_changes(request, reply, &mut |change| match change {
     KernelChange::HandedOut { parent, name, node } => holds.handed_out(parent, name, node),
-    KernelChange::Forgot { node, count } => holds.forgot(node, count),
+    KernelChange::Forgot { node, count } => {
+      holds.forgot(node, count);
+      if let Some(forgotten) = forgotten.as_mut() {
+        forgotten.push((node, count));
+      }
+    }
     KernelChange::Unnamed { parent, name } => holds.unnamed(parent, name),
     KernelChange::Renamed { from, to, exchange } => holds.renamed(from, to, exchange),
   });
@@ -1570,10 +1838,18 @@ fn feed_states(
   state.states.consumed(bridge.seen(cx).journal_seq);
 }
 
-/// Serves a cache write-back of node `nodeid` by the dirty-page write-back rule ([`dispatch_request`]): applied whole
-/// when none of its bytes is stale, outside the stale ranges when some are, and refused `EIO` when which are stale can
-/// no longer be told — then neither applying (which may revert an acknowledged write) nor dropping (which would discard
-/// data the process synced) is safe, and the process is told at its next `fsync` or `msync`.
+/// Serves a cache write-back of node `nodeid` by the dirty-page write-back rule ([`dispatch_request`],
+/// [`crate::coherence::judge_writeback`]): applied whole when none of its stale bytes differs from the file's, refused
+/// `EIO` whole when one does, and refused too when which are stale can no longer be told. Then neither applying (which
+/// may revert an acknowledged write) nor dropping (which would discard data the process synced) is safe, and the
+/// process is told at its next `fsync` or `msync`. A refused write-back changes nothing, so its owner logs nothing.
+///
+/// **What it carried is owed an invalidation.** The kernel marks a written-back page clean whatever the answer, so a
+/// refused page stays cached holding bytes the volume does not. Another path's change drops the pages it touched, but
+/// Linux gathers contiguous dirty pages into one `WRITE`, and a page that shared a refused `WRITE` with a stale one
+/// was named by no change at all: it went on serving a store the volume had refused. So every byte a refused write-back
+/// carried is dropped from the kernel's cache by the next round, after the reply (the page is under write-back until
+/// then), and its next read fetches what the volume holds.
 fn serve_writeback(
   request: &[u8],
   nodeid: u64,
@@ -1581,38 +1857,70 @@ fn serve_writeback(
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
-) -> (usize, Vec<std::ops::Range<u64>>) {
-  let Some(stale) = stale_in_writeback(request, nodeid, started_at, bridge, cx, state) else {
-    state.writebacks_unknown = state.writebacks_unknown.saturating_add(1);
-    return (
-      crate::bridge::refuse_with_eio(request, &mut state.reply),
-      Vec::new(),
-    );
+) -> usize {
+  let parsed = Request::parse(request)
+    .ok()
+    .and_then(|parsed| crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok());
+  let carried = parsed.as_ref().map(|write| {
+    let len = u64::try_from(write.data.len()).unwrap_or(u64::MAX);
+    write.offset..write.offset.saturating_add(len)
+  });
+  let verdict = match parsed {
+    Some(write) => {
+      let stale = stale_in_writeback(&write, nodeid, started_at, bridge, cx, state);
+      let object = slates_bridge_core::ObjectId {
+        inode: nodeid,
+        generation: 0,
+      };
+      crate::coherence::judge_writeback(
+        stale.as_deref(),
+        write.offset,
+        write.data,
+        |at, len, out| {
+          slates_bridge_core::dax_backing::read_whole(bridge, cx, object, (at, len), out).is_ok()
+        },
+      )
+    }
+    None => WritebackVerdict::Unknown,
   };
-  if stale.is_empty() {
-    return (dispatch(request, bridge, cx, &mut state.reply), Vec::new());
+  match verdict {
+    WritebackVerdict::Apply => {}
+    WritebackVerdict::Identical => {
+      state.writeback_identical = state.writeback_identical.saturating_add(1);
+    }
+    WritebackVerdict::Conflict => {
+      state.writeback_conflicts = state.writeback_conflicts.saturating_add(1);
+    }
+    WritebackVerdict::Unknown => {
+      state.writebacks_unknown = state.writebacks_unknown.saturating_add(1);
+    }
   }
-  let (len, kept_back) =
-    crate::bridge::serve_cache_write(request, bridge, cx, &stale, &mut state.reply);
-  state.writeback_bytes_kept_back = state.writeback_bytes_kept_back.saturating_add(kept_back);
-  (len, stale)
+  if verdict.applies() {
+    return dispatch(request, bridge, cx, &mut state.reply);
+  }
+  if let Some(carried) = carried {
+    let owed = state
+      .refused_writebacks
+      .entry(nodeid)
+      .or_insert_with(|| carried.clone());
+    *owed = owed.start.min(carried.start)..owed.end.max(carried.end);
+  }
+  crate::bridge::refuse_with_eio(request, &mut state.reply)
 }
 
 /// The bytes of a cache write-back of node `nodeid` that are stale ([`PageStates::stale_after`]): the file's stale bytes
 /// within the write, with the records not yet consumed — those after the coherence cursor, a few — applied in order to a
 /// scratch copy. A file with no states (a mount restored across a daemon restart, whose opens predate this daemon) is
 /// judged as fresh at `started_at` against every record since. Ascending and disjoint. `None` when it cannot be told: the
-/// file's states were lost, the journal no longer holds the records needed, or the write-back cannot be read.
+/// file's states were lost, or the journal no longer holds the records needed.
 fn stale_in_writeback(
-  request: &[u8],
+  write: &crate::request::WriteIn<'_>,
   nodeid: u64,
   started_at: u64,
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &ServeState,
 ) -> Option<Vec<std::ops::Range<u64>>> {
-  let parsed = Request::parse(request).ok()?;
-  let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
   let end = write
     .offset
     .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
@@ -1675,7 +1983,7 @@ fn serve_request(
   state: &mut ServeState,
 ) -> Result<(Delivered, i32), ChannelError> {
   let delivered = deliver_owed(channel, bridge, cx, state)?;
-  let (n, _) = dispatch_request(request, bridge, cx, state);
+  let n = dispatch_request(request, bridge, cx, state);
   let reply = state.reply.get(..n).unwrap_or(&[]);
   let error = reply_error(reply);
   if n > 0 && channel.write_reply(reply)? == Sent::Unmatched {
@@ -1698,6 +2006,9 @@ fn serve_request(
     note_delivered(request, n, state);
   }
   state.coherence.served_own_request(bridge, cx, delivered);
+  if state.owes_refused_writebacks() {
+    deliver_owed(channel, bridge, cx, state)?;
+  }
   Ok((delivered, error))
 }
 
@@ -1719,9 +2030,6 @@ pub struct Dispatched {
   /// Where the kernel's cache stood just before the request was served: a refused reply rewinds to it, so the
   /// request's own applied change is delivered as an invalidation ([`redeliver_after_refusal`]).
   cursor_before: Option<slates_bridge_core::InvalidationCursor>,
-  /// For a cache write-back, the byte ranges it was not applied over (another path changed them after the kernel's copy
-  /// was fetched); empty for every other request. What it applied, and so what its owner logs, excludes them.
-  kept_back: Vec<std::ops::Range<u64>>,
 }
 
 impl Dispatched {
@@ -1735,23 +2043,16 @@ impl Dispatched {
     self.nodeid
   }
 
-  /// The parts of a `WRITE` that were applied, each as its offset and bytes, for the owner to log before the reply
-  /// (A-63); empty for any other request. A plain write is one part; a cache write-back is the parts outside what it
-  /// was kept back from ([`crate::bridge::unmasked_segments`]), so a recovery never replays bytes the volume refused.
-  pub fn written(&self) -> Vec<(u64, &[u8])> {
-    let Some(parsed) = Request::parse(&self.request).ok() else {
-      return Vec::new();
-    };
+  /// The `WRITE` the request made, as its offset and bytes, for the owner to log before a successful reply (A-63);
+  /// `None` for any other request. A cache write-back is applied whole or refused whole (A-248), so what was applied is
+  /// the whole write, and a refused one, answered with an error, is logged by no owner.
+  pub fn written(&self) -> Option<(u64, &[u8])> {
+    let parsed = Request::parse(&self.request).ok()?;
     if parsed.opcode != Some(Opcode::Write) {
-      return Vec::new();
+      return None;
     }
-    let Ok(write) = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body) else {
-      return Vec::new();
-    };
-    crate::bridge::unmasked_segments(write.offset, write.data.len(), &self.kept_back)
-      .into_iter()
-      .filter_map(|(at, range)| write.data.get(range).map(|bytes| (at, bytes)))
-      .collect()
+    let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
+    Some((write.offset, write.data))
   }
 
   /// The request's unique id, without the kernel's resend bit: what a recorded reply is matched by (A-61).
@@ -1793,6 +2094,10 @@ pub enum Turn {
   Replayed,
   /// A slice of a running allocation landed and more remains (A-108): the owner yields, then turns again.
   Continued,
+  /// The attachment admits no more requests and its kernel's cache is being dropped before the mount ends
+  /// ([`revoked_turn`]; AUD-29-84): the request read, if any, was answered [`REVOKED_ERRNO`] without reaching the
+  /// volume. The owner turns again when a request or the round's end wakes it.
+  Refused,
 }
 
 /// One non-blocking turn for an owner that makes a request's effect durable before answering (the daemon,
@@ -1828,7 +2133,11 @@ pub fn dispatch_ready(
     return Ok(Turn::Dropped);
   }
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Turn::Ended);
+    let request = channel.take_request();
+    return match refuse_revoked(channel, state, &request)? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
   };
   let request = channel.take_request();
   let parsed = Request::parse(&request).ok();
@@ -1875,14 +2184,13 @@ pub fn dispatch_ready(
           len,
           request,
           cursor_before,
-          kept_back: Vec::new(),
         }))
       }
     };
   }
   let dispatched = delivered.map(|delivered| {
     let cursor_before = state.coherence.cursor();
-    let (len, kept_back) = dispatch_request(&request, bridge, &cx, state);
+    let len = dispatch_request(&request, bridge, &cx, state);
     let error = state.reply.get(..len).map_or(0, reply_error);
     state.coherence.served_own_request(bridge, &cx, delivered);
     Dispatched {
@@ -1894,7 +2202,6 @@ pub fn dispatch_ready(
       len,
       request,
       cursor_before,
-      kept_back,
     }
   });
   attachments.end(attachment);
@@ -1914,7 +2221,11 @@ fn continue_allocation(
   slice_bytes: u64,
 ) -> Result<Turn, ChannelError> {
   let Ok(cx) = attachments.begin(attachment) else {
-    return Ok(Turn::Ended);
+    // The allocation's request is answered refused, as any other a revoked mount holds.
+    return match refuse_revoked(channel, state, allocation.request())? {
+      Revoked::Ended => Ok(Turn::Ended),
+      Revoked::Dropping => Ok(Turn::Refused),
+    };
   };
   let delivered = match deliver_owed(channel, bridge, &cx, state) {
     Ok(delivered) => delivered,
@@ -1944,7 +2255,6 @@ fn continue_allocation(
     len,
     request: allocation.into_request(),
     cursor_before,
-    kept_back: Vec::new(),
   }))
 }
 
@@ -1986,6 +2296,9 @@ pub fn send_reply(
 /// change is applied, not promised to survive), so without this the kernel kept what the failure implied — a
 /// `mkdir` answered `EIO` left a cached negative entry for a directory that exists. Called after the error reply,
 /// never before: an entry invalidation takes the directory's lock, which the waiting caller holds until its reply.
+///
+/// A request the dispatch itself refused changed nothing, so the cursor stays where it is and the round carries what a
+/// refused cache write-back is owed ([`serve_writeback`]).
 pub fn redeliver_after_refusal(
   channel: &FuseChannel,
   state: &mut ServeState,
@@ -1997,7 +2310,9 @@ pub fn redeliver_after_refusal(
   let Ok(cx) = attachments.begin(attachment) else {
     return Ok(Delivered::default());
   };
-  state.coherence.rewind(dispatched.cursor_before);
+  if dispatched.error == 0 {
+    state.coherence.rewind(dispatched.cursor_before);
+  }
   let delivered = deliver_owed(channel, bridge, &cx, state);
   attachments.end(attachment);
   delivered
@@ -2200,7 +2515,7 @@ mod tests {
   /// nothing — the second through the same notifier, whose thread would be gone had it been joined after the first.
   #[test]
   fn a_round_whose_write_blocks_does_not_hold_its_owner_and_the_next_reuses_its_thread() {
-    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let (reader, writer) = close_on_exec_pipe();
     let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
     let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
     for round in 1..=2 {
@@ -2219,12 +2534,30 @@ mod tests {
     }
   }
 
+  /// A pipe whose two ends are close-on-exec, so a child another test spawns while they are open does not keep a copy
+  /// past its `exec` and hold a dropped end alive (main 2e74a8af, `crates/cli/tests/cli.rs` `close_on_exec_pipe`). Linux
+  /// sets the flag in the same call (`pipe2`); elsewhere it is set at once after, the one window a concurrent fork can
+  /// still land in.
+  /// The notifier tests depend on it: a dropped reader must fail the notifier's waiting write (`EPIPE`).
+  fn close_on_exec_pipe() -> (OwnedFd, OwnedFd) {
+    #[cfg(target_os = "linux")]
+    let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let ends = {
+      let (reader, writer) = rustix::pipe::pipe().unwrap();
+      rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+      rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+      (reader, writer)
+    };
+    ends
+  }
+
   /// A-142: a notifier dropped with a round out ends its thread. Do: fill the device's pipe, hand the notifier a round,
   /// then drop the notifier while the write waits, the pipe's reader closing a moment later. Expect the drop to return:
   /// the write fails once the reader is gone, the thread finds the round channel closed and ends, and is joined.
   #[test]
   fn a_notifier_dropped_with_a_round_out_joins_its_thread() {
-    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let (reader, writer) = close_on_exec_pipe();
     let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
     let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
     fill(&refill);

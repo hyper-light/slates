@@ -75,6 +75,8 @@ impl Mock {
       atime: 0,
       mtime: self.mtime,
       ctime: self.ctime,
+      btime: self.ctime,
+      windows: 0,
       change: 0,
     }
   }
@@ -87,6 +89,10 @@ impl Bridge for Mock {
   // A mock with no volume issues no inode numbers, so it holds none unreserved (A-150).
   fn awaits_publication(&self) -> bool {
     false
+  }
+  // The mock's every context may change it, as its write verbs answer.
+  fn authorize_change(&self, _cx: &OpContext) -> Result<(), VfsError> {
+    Ok(())
   }
   fn lookup(
     &mut self,
@@ -114,6 +120,8 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        btime: 0,
+        windows: 0,
         change: 0,
       }),
       2 => Ok(self.file_attr()),
@@ -295,6 +303,8 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        btime: 0,
+        windows: 0,
         change: 0,
       },
       8,
@@ -433,7 +443,10 @@ fn test_cx() -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,

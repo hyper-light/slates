@@ -77,5 +77,15 @@ slates-conformance = { workspace = true }
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
 
+# The crash-dump test (`tests/dump_exclusion.rs`, A-239): the crashing child reads and clears the error mode it inherited
+# (`GetErrorMode`, `SetErrorMode`), since a mode with `SEM_NOGPFAULTERRORBOX` keeps Windows Error Reporting from its crash.
+[target.'cfg(unix)'.dev-dependencies]
+# The starved shard of `tests/liveness.rs` (A-228): `sched_setscheduler` and `sched_getcpu` on Linux, the QoS class on
+# macOS, which rustix does not have.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
+
 [lints]
 workspace = true

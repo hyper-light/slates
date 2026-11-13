@@ -30,7 +30,10 @@ fn context(view: View, rights: Rights) -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       view,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       rights,
     )
     .unwrap();
@@ -56,7 +59,10 @@ fn rw_cx_as(uid: u32) -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid,
+      },
       Rights {
         read: true,
         write: true,
@@ -78,7 +84,10 @@ fn two_rw_contexts() -> (OpContext, OpContext) {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       rights,
     )
     .unwrap();
@@ -86,7 +95,10 @@ fn two_rw_contexts() -> (OpContext, OpContext) {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       rights,
     )
     .unwrap();
@@ -134,6 +146,91 @@ fn volume(store: &mut Store) -> Volume {
     },
   )
   .unwrap()
+}
+
+/// A-262. Do: create a file and a directory through the bridge, then `setattr` the Win32 words `HIDDEN | SYSTEM` and
+/// `READONLY | HIDDEN | ARCHIVE` on the file and `READONLY | HIDDEN | DIRECTORY` on the directory. Expect: a new file
+/// reports `ARCHIVE` and a new directory nothing; the file keeps `HIDDEN | SYSTEM`, then `HIDDEN | ARCHIVE` with its
+/// `READONLY` dropped (a file's read-only state is its mode, which this change leaves alone); the directory keeps
+/// `READONLY | HIDDEN` and drops the directory bit; a fresh `getattr` reports what each reply did.
+#[test]
+fn setattr_keeps_the_windows_attribute_bits_for_each_kind() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (file, _fh) = bridge.create(oid(root), &cx, "file", 0o644, 0).unwrap();
+  let dir = bridge.mkdir(oid(root), &cx, "dir", 0o755).unwrap();
+  assert_eq!(
+    (file.windows, dir.windows),
+    (0x20, 0),
+    "a new file is archived, a new directory carries nothing"
+  );
+  let set = |bridge: &mut VolumeBridge<'_>, ino, word| {
+    bridge
+      .setattr(
+        oid(ino),
+        &cx,
+        SetAttr {
+          windows: Some(word),
+          ..SetAttr::default()
+        },
+      )
+      .unwrap()
+  };
+  assert_eq!(set(&mut bridge, file.ino, 0x2 | 0x4).windows, 0x2 | 0x4);
+  let file_after = set(&mut bridge, file.ino, 0x1 | 0x2 | 0x20);
+  assert_eq!(
+    (file_after.windows, file_after.mode & 0o777),
+    (0x2 | 0x20, 0o644),
+    "a file's READONLY is not a bit, and the bits leave its mode alone"
+  );
+  assert_eq!(
+    set(&mut bridge, dir.ino, 0x1 | 0x2 | 0x10).windows,
+    0x1 | 0x2
+  );
+  assert_eq!(
+    bridge.getattr(oid(file.ino), &cx).unwrap().windows,
+    0x2 | 0x20
+  );
+  assert_eq!(
+    bridge.getattr(oid(dir.ino), &cx).unwrap().windows,
+    0x1 | 0x2
+  );
+}
+
+/// A-259. Do: create a file through the bridge, then `setattr` only its birth time, as WinFsp's `SetFileTime` sets a
+/// creation time. Expect: the reply and a fresh `getattr` report the time set, the modification time left as it was,
+/// and a file made after it reporting its own birth time. Before, the bridge's attributes carried no birth time and its
+/// `setattr` passed none to the volume, so WinFsp reported the change time as every object's creation time.
+#[test]
+fn setattr_sets_and_reports_a_birth_time() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (made, _fh) = bridge.create(oid(root), &cx, "born", 0o644, 0).unwrap();
+  let changed = bridge
+    .setattr(
+      oid(made.ino),
+      &cx,
+      SetAttr {
+        btime: Some(333),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+  assert_eq!(changed.btime, 333, "the reply reports the birth time set");
+  let stat = bridge.getattr(oid(made.ino), &cx).unwrap();
+  assert_eq!(
+    (stat.btime, stat.mtime),
+    (333, made.mtime),
+    "the birth time stuck, and the modification time is as it was"
+  );
+  let (later, _fh) = bridge.create(oid(root), &cx, "later", 0o644, 0).unwrap();
+  assert_ne!(later.btime, 333, "another file keeps its own birth time");
 }
 
 /// A `setattr` of ownership and times takes effect and is reported, and a later single-field

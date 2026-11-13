@@ -388,7 +388,8 @@ fn fingerprint_of_handle(
       info.ftLastWriteTime.dwLowDateTime,
     ),
     ctime_ns: change_time,
-    mode: info.dwFileAttributes,
+    // NTFS keeps no POSIX mode: DrvFs's mapping, with the attribute bits apart (A-262).
+    mode: crate::windows_mode_and_bits(info.dwFileAttributes).0,
     // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
     uid: 0,
     gid: 0,
@@ -398,6 +399,7 @@ fn fingerprint_of_handle(
       info.ftCreationTime.dwHighDateTime,
       info.ftCreationTime.dwLowDateTime,
     ),
+    windows: crate::windows_mode_and_bits(info.dwFileAttributes).1,
   })
 }
 
@@ -415,11 +417,158 @@ fn unix_ns_of_ticks(ticks: i64) -> i64 {
     .saturating_mul(HUNDRED_NS)
 }
 
+/// Derived: the most name surrogates a root path's walk follows, Windows' own bound on reparse points in one path
+/// (Microsoft Learn, "Symbolic Links": 63; cited from memory, to verify): a path Windows would refuse is refused.
+const MAX_REPARSE_HOPS: usize = 63;
+
+/// Format: `ERROR_CANT_RESOLVE_FILENAME` (winerror.h), past the hop bound.
+const ERROR_CANT_RESOLVE_FILENAME: u32 = 1921;
+
+/// Format: the longest DOS device target `QueryDosDeviceW` is asked for, Windows' longest path in units.
+const DEVICE_UNITS: usize = 32_767;
+
+/// Refuses a base root on one of this daemon's own WinFsp volumes before any request reaches one (A-227, §4.6): the
+/// path's drive is named by `QueryDosDeviceW`, which asks the object manager and never the volume, and every directory
+/// along it is opened as itself, a name surrogate (a junction, a symbolic link, a mount point) followed by hand to the
+/// drive it lands on. Below the root nothing more is needed: every later open is relative and opens a reparse point as
+/// itself.
+fn check_root_volume(path: &Path) -> Result<(), HostError> {
+  let mut current = std::path::absolute(path).map_err(|e| refusal(&e))?;
+  for _ in 0..=MAX_REPARSE_HOPS {
+    match next_redirect(&current)? {
+      None => return Ok(()),
+      Some(next) => current = next,
+    }
+  }
+  Err(code_refusal(ERROR_CANT_RESOLVE_FILENAME))
+}
+
+/// Walks `path`'s directories (all but its last component) from its drive: refused when the drive is this daemon's own;
+/// the path a name surrogate along the way redirects to, with the rest appended; `None` when the walk reaches the last
+/// component without one. A path on no drive letter (a share, a device) names no volume this daemon mounts.
+fn next_redirect(path: &Path) -> Result<Option<std::path::PathBuf>, HostError> {
+  use std::path::{Component, Prefix};
+  let mut components = path.components();
+  let Some(Component::Prefix(prefix)) = components.next() else {
+    return Ok(None);
+  };
+  let drive = match prefix.kind() {
+    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => format!("{}:", char::from(letter)),
+    _ => return Ok(None),
+  };
+  if drive_is_own(&drive)? {
+    return Err(crate::own_mounts::refusal());
+  }
+  let mut names: Vec<String> = Vec::new();
+  for component in components {
+    match component {
+      Component::Normal(name) => names.push(name.to_string_lossy().into_owned()),
+      Component::ParentDir => {
+        names.pop();
+      }
+      _ => {}
+    }
+  }
+  let Some((_, directories)) = names.split_last() else {
+    return Ok(None);
+  };
+  let mut parent = open_drive_root(&drive)?;
+  for (at, name) in directories.iter().enumerate() {
+    let child = open_relative(
+      &parent,
+      name,
+      DIRECTORY_ACCESS,
+      nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
+    if redirects(&attribute_tag(&child)?) {
+      let target = std::path::PathBuf::from(String::from_utf16_lossy(&reparse_target(&child)?));
+      let mut next = if target.is_absolute() {
+        target
+      } else {
+        let mut here = std::path::PathBuf::from(format!("{drive}\\"));
+        here.extend(names.iter().take(at));
+        here.join(target)
+      };
+      next.extend(names.iter().skip(at.saturating_add(1)));
+      return Ok(Some(next));
+    }
+    parent = child;
+  }
+  Ok(None)
+}
+
+/// Whether `drive` (`X:`) names one of this daemon's own WinFsp volumes: its DOS device target, by the object manager.
+fn drive_is_own(drive: &str) -> Result<bool, HostError> {
+  let name: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+  let mut target = vec![0u16; DEVICE_UNITS];
+  let capacity = u32::try_from(target.len()).unwrap_or(u32::MAX);
+  // SAFETY: `name` is NUL-terminated and live for the call; `target` is a writable buffer of `capacity` units.
+  let written = unsafe {
+    windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW(
+      name.as_ptr(),
+      target.as_mut_ptr(),
+      capacity,
+    )
+  };
+  if written == 0 {
+    // A letter no device holds: no volume of this daemon's either.
+    return Ok(false);
+  }
+  Ok(crate::own_mounts::is_recorded(
+    crate::own_mounts::volume_id(&target),
+  ))
+}
+
+/// The root directory of `drive`, opened to walk from (a volume that is not this daemon's).
+fn open_drive_root(drive: &str) -> Result<OwnedHandle, HostError> {
+  // structural: allow — a read-only open of a drive's root to walk a base path; nothing is written (R1).
+  std::fs::OpenOptions::new()
+    .access_mode(DIRECTORY_ACCESS)
+    .share_mode(SHARE_ALL)
+    .custom_flags(BACKUP_SEMANTICS)
+    .open(format!("{drive}\\"))
+    .map(OwnedHandle::from)
+    .map_err(|e| refusal(&e))
+}
+
+/// What the name surrogate `link` (opened as itself) points at, as `link_target` reads it.
+fn reparse_target(link: &OwnedHandle) -> Result<Vec<u16>, HostError> {
+  let reparse_bytes = usize::try_from(MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+    .map_err(|_| code_refusal(ERROR_INVALID_DATA))?;
+  let mut buffer = aligned_words(reparse_bytes);
+  let length = byte_length(&buffer)?;
+  let mut returned = 0u32;
+  // SAFETY: `link` is the entry's own handle, opened without following it; `buffer` is writable, 8-byte aligned, of
+  // the length passed; `returned` is writable; no input buffer and no overlapped record (the handle is synchronous).
+  let ok = unsafe {
+    DeviceIoControl(
+      link.as_raw_handle().cast(),
+      FSCTL_GET_REPARSE_POINT,
+      std::ptr::null(),
+      0,
+      buffer.as_mut_ptr().cast(),
+      length,
+      &mut returned,
+      std::ptr::null_mut(),
+    )
+  };
+  if ok == 0 {
+    return Err(refusal(&std::io::Error::last_os_error()));
+  }
+  let bytes = filled_bytes(&buffer);
+  let returned = usize::try_from(returned).map_err(|_| code_refusal(ERROR_INVALID_DATA))?;
+  let filled = bytes
+    .get(..returned)
+    .ok_or(code_refusal(ERROR_INVALID_DATA))?;
+  link_target(filled).map_err(record_refusal)
+}
+
 impl OsHost {
   /// Opens a base directory: the one path this host ever resolves, opened as itself (a name surrogate at
   /// the root is refused, as on Unix with `O_NOFOLLOW`) and retained, so every later access is relative to
   /// it and a rename or replacement of the path changes nothing.
   pub fn open_root(path: &Path) -> Result<(Self, HostDir), HostError> {
+    check_root_volume(path)?;
     let open = |flags: u32| -> Result<OwnedHandle, HostError> {
       // structural: allow — a read-only open of the base directory; nothing is written (R1).
       std::fs::OpenOptions::new()
@@ -586,35 +735,7 @@ impl HostFs for OsHost {
       ENTRY_ACCESS,
       nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
     )?;
-    let reparse_bytes = usize::try_from(MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
-      .map_err(|_| code_refusal(ERROR_INVALID_DATA))?;
-    let mut buffer = aligned_words(reparse_bytes);
-    let length = byte_length(&buffer)?;
-    let mut returned = 0u32;
-    // SAFETY: `link` is the entry's own handle, opened without following it; `buffer` is writable, 8-byte
-    // aligned, of the length passed; `returned` is writable; no input buffer and no overlapped record (the
-    // handle is synchronous).
-    let ok = unsafe {
-      DeviceIoControl(
-        link.as_raw_handle().cast(),
-        FSCTL_GET_REPARSE_POINT,
-        std::ptr::null(),
-        0,
-        buffer.as_mut_ptr().cast(),
-        length,
-        &mut returned,
-        std::ptr::null_mut(),
-      )
-    };
-    if ok == 0 {
-      return Err(refusal(&std::io::Error::last_os_error()));
-    }
-    let bytes = filled_bytes(&buffer);
-    let returned = usize::try_from(returned).map_err(|_| code_refusal(ERROR_INVALID_DATA))?;
-    let filled = bytes
-      .get(..returned)
-      .ok_or(code_refusal(ERROR_INVALID_DATA))?;
-    let target = link_target(filled).map_err(record_refusal)?;
+    let target = reparse_target(&link)?;
     String::from_utf16(&target)
       .map(Into::into)
       .map_err(|_| code_refusal(ERROR_NO_UNICODE_TRANSLATION))

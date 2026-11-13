@@ -333,7 +333,9 @@ fn with_export<R>(
     .attachment(capability.0)
     .map(|record| (record.form.scope(), record.form.bound_uid()));
   let (scope, bound_uid) = form.unwrap_or((None, None));
-  let stranger = bound_uid.is_some_and(|bound| subject != Principal::Uid { uid: bound });
+  // An NFS subject is this node's own (`Requester::of`), so the uid alone tells the bound user.
+  let stranger =
+    bound_uid.is_some_and(|bound| !matches!(&subject, Principal::Uid { uid, .. } if *uid == bound));
   let ShardState {
     store,
     volumes,
@@ -534,7 +536,33 @@ fn barrier(
   reply: (AcceptStatus, Vec<u8>),
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
-  publication_reply(procedure, volume, outcome, reply)
+  let reply = publication_reply(procedure, volume, outcome, reply);
+  // A live-shipped volume's stable reply waits until `f` candidates hold the publication (A-200): noted here, waited
+  // for by the serve's task (`stable_once_durable`), never inside this synchronous step.
+  if let Some(volume) = volume {
+    let _ = state::with_state(|s| crate::live_ship::note_barrier(s, volume));
+  }
+  reply
+}
+
+/// The reply of a call whose barrier published a live-shipped volume, once that publication is durable on `f`
+/// candidates (A-200); answered `NFS3ERR_JUKEBOX` ("try again") when it is not within the wait, since a stable reply
+/// must not claim what the candidates do not hold. Any other call's reply as it is.
+async fn stable_once_durable(
+  procedure: u32,
+  served: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  let Some((volume, target)) = state::with_state(crate::live_ship::take_barrier).flatten() else {
+    return served;
+  };
+  if crate::live_ship::wait_durable(volume, target).await {
+    served
+  } else {
+    (
+      AcceptStatus::Success,
+      status_failure_reply(Nfsstat3::Jukebox, procedure),
+    )
+  }
 }
 
 /// The barrier's observable reply, separated from publication so refusal paths can be exercised
@@ -600,6 +628,15 @@ struct Requester {
   /// holds, and its READs and own changes keep that current (`crate::nfs_writeback`). `None` for an NFSv4 operation's
   /// call, which its own delegations keep coherent.
   connection: Option<u64>,
+  /// The connection was handed to this daemon by its anchor at its start, held for a daemon before it (A-231): its client
+  /// may hold pages fetched before the takeover, which its WRITEs are judged against conservatively.
+  inherited: bool,
+}
+
+/// This node's certificate anchor, the host an NFS caller's account belongs to (A-237); host 0, no node's anchor, off a
+/// shard, where no call is served.
+fn local_host() -> slates_db::HostId {
+  state::with_state(|s| s.origin_anchor).unwrap_or(slates_db::HostId(0))
 }
 
 impl Requester {
@@ -610,7 +647,10 @@ impl Requester {
   fn of(body: &[u8]) -> Requester {
     match auth_sys_identity(body) {
       Some(identity) => Requester {
-        subject: Principal::Uid { uid: identity.uid },
+        subject: Principal::Uid {
+          host: local_host(),
+          uid: identity.uid,
+        },
         groups: Some(identity.groups),
         capability: None,
         dialect: Dialect::LOOPBACK_NFS3,
@@ -618,6 +658,7 @@ impl Requester {
         call: None,
         held: None,
         connection: None,
+        inherited: false,
       },
       None => Requester::root(),
     }
@@ -628,7 +669,10 @@ impl Requester {
   /// credential would not.
   fn root() -> Requester {
     Requester {
-      subject: Principal::Uid { uid: 0 },
+      subject: Principal::Uid {
+        host: local_host(),
+        uid: 0,
+      },
       groups: None,
       capability: None,
       dialect: Dialect::LOOPBACK_NFS3,
@@ -636,6 +680,7 @@ impl Requester {
       call: None,
       held: None,
       connection: None,
+      inherited: false,
     }
   }
 
@@ -676,6 +721,61 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
     s.shards.get(usize::from(owner_partition)).copied()
   })
   .flatten()
+}
+
+/// [`route`], with a call that names a volume by its mount name (a root `LOOKUP`, a `MNT`, a `UMNT`) asked of the
+/// name's partition first (A-236): that partition holds the name, as a volume of its own or as an alias of a clone
+/// another partition holds beside its origin, and says which partition serves it.
+async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
+  let Some(name) = root_mount_name(program, procedure, args) else {
+    return route(program, procedure, args);
+  };
+  let (name_partition, name_shard, here) = state::with_state(|s| {
+    let partition = owner_of_name(&name, s.shards.len());
+    (
+      partition,
+      s.shards.get(usize::from(partition)).copied(),
+      partition == s.partition,
+    )
+  })?;
+  let served = if here {
+    state::with_state(|s| served_partition(s, &name))?
+  } else {
+    let name_shard = name_shard?;
+    crate::xshard::call_within(
+      this,
+      name_shard,
+      move |s| served_partition(s, &name),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    // Unanswered, the call goes to the name's own shard, as it did before aliases: a clone's name then misses there.
+    .unwrap_or(name_partition)
+  };
+  state::with_state(|s| {
+    if served == s.partition {
+      return None;
+    }
+    s.shards.get(usize::from(served)).copied()
+  })
+  .flatten()
+}
+
+/// The partition that serves the volume `name` names, as its name's partition (this one) holds it (A-236): this one
+/// when it holds a volume of that name or nothing for it (a lookup then misses here), the clone's when a confirmed
+/// alias names one. A reserved alias resolves nothing until confirmed, so a lookup of it misses here, by kind.
+fn served_partition(s: &mut ShardState, name: &str) -> u16 {
+  let partition = s.db.partition();
+  if partition.volume_by_name(name).is_none()
+    && let Some(volume) = partition
+      .name_alias(name)
+      .and_then(slates_db::alias::resolve)
+  {
+    return owner_of(slates_ipc::protocol::VolumeId {
+      bytes: volume.bytes,
+    });
+  }
+  s.partition
 }
 
 /// The shard for the partition that owns `name` (`owner_of_name` over `state.shards.len()`, the same
@@ -1073,7 +1173,9 @@ fn serve_local(
     let fetched = (program == NFS_PROGRAM && procedure == NFSPROC3_READ)
       .then(|| read_range(args, &result.1))
       .flatten();
+    let (held, inherited) = (requester.held.is_some(), requester.inherited);
     let _ = state::with_state_counted(|s| {
+      crate::nfs_writeback::note_connection(s, connection, held, inherited);
       crate::nfs_writeback::made(s, connection, volume, before);
       if let Some((ino, range)) = fetched {
         crate::nfs_writeback::fetched(s, connection, (volume, ino), range);
@@ -1106,10 +1208,12 @@ fn stale_write_back(
   let _count = reader.u32().ok()?;
   let _stable = reader.u32().ok()?;
   let data = reader.opaque(MAX_MESSAGE).ok()?;
+  let (held, inherited) = (requester.held.is_some(), requester.inherited);
   let verdict = state::with_state(|s| {
+    crate::nfs_writeback::note_connection(s, connection, held, inherited);
     crate::nfs_writeback::judge(s, connection, (handle.volume, handle.inode), at, data)
   })?;
-  if verdict == crate::nfs_writeback::Verdict::Apply {
+  if verdict.applies() {
     return None;
   }
   Some((AcceptStatus::Success, io_failure_reply(NFSPROC3_WRITE)?))
@@ -1231,7 +1335,9 @@ fn record_and_publish(
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
 /// (the same cross-shard spawn the client forward uses, §4.3), which spawns a task back on `origin`
 /// that hands the reply to this awaiting task. Returns a system error if the owner shard is gone. The
-/// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13).
+/// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13). The reply is
+/// waited for in the owner's own time (`xshard::task_in_shard_time`, R3 class A): a starved owner's reply is heard, a
+/// wedged one's given up after a window with no progress.
 #[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, who, its xid, program, procedure, args, port
 async fn serve_remote(
   owner: u16,
@@ -1245,11 +1351,12 @@ async fn serve_remote(
 ) -> (AcceptStatus, Vec<u8>) {
   // A task on the owner, not a closure, so the reply can wait there for the volume's FUSE mounts to be told of the
   // call's change (AC-3.3) without holding the owner's turn.
-  crate::xshard::task_within(
+  crate::xshard::task_in_shard_time(
     origin,
     owner,
     move || async move {
       let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
       }
@@ -1319,8 +1426,9 @@ impl VolumeSet for GatheredVolumeSet {
   }
 }
 
-/// Gathers every owner's entries under one liveness budget (§4.8 lookup). Any failed admission,
-/// missing reply or timeout refuses the entire listing. Calls own their registrations, so early return
+/// Gathers every owner's entries, each waited for in its owner's own time up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A; before, one wall second for them all, and a listing failed while a starved
+/// shard was still answering). Any failed admission, missing reply or owner given up refuses the entire listing. Calls own their registrations, so early return
 /// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
 async fn gather_all_entries(
   capability: Option<MountCapability>,
@@ -1334,7 +1442,6 @@ async fn gather_entries(
   shards: &[u16],
   capability: Option<MountCapability>,
 ) -> Option<Vec<(String, VolumeId)>> {
-  let deadline = futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   let calls = shards
     .iter()
     .map(|shard| {
@@ -1347,9 +1454,9 @@ async fn gather_entries(
     .collect::<Result<Vec<_>, _>>()
     .ok()?;
   let mut all = Vec::new();
+  // The calls run on their shards meanwhile, so the gather waits about as long as its slowest owner.
   for call in calls {
-    let remaining = deadline.saturating_sub(futures::now_ns());
-    all.extend(crate::xshard::within(call, remaining).await?);
+    all.extend(crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await?);
   }
   Some(all)
 }
@@ -1478,7 +1585,7 @@ async fn serve_v3(
   }
   let started = slates_machine::clock::monotonic_ns();
   let started_cpu = thread_cpu_ns();
-  let (forwarded, served) = match route(program, procedure, &args) {
+  let (forwarded, served) = match routed(this, program, procedure, &args).await {
     Some(owner) => (
       true,
       serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
@@ -1540,6 +1647,7 @@ async fn serve_local_held(
   loop {
     let seen = state::with_state(|s| s.store.recall_gate.refusals());
     let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.
     if let Some(owed) = owed {
@@ -1843,7 +1951,8 @@ fn with_v4_sessions<R>(
 }
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
-/// not be delivered or did not answer within the liveness budget (never a silent drop, banned item 9).
+/// not be delivered or did not answer while `to` was working, up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9).
 fn send_note(
   this: u16,
   to: u16,
@@ -1855,7 +1964,7 @@ fn send_note(
     return;
   };
   match futures::spawn(async move {
-    if crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+    if crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
       .await
       .is_none()
     {
@@ -1940,7 +2049,7 @@ impl compound::Backend for PurgeBackend {
       }) else {
         return status_word(Nfsstat4::Delay);
       };
-      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+      crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
         .await
         .unwrap_or_else(|| status_word(Nfsstat4::Delay))
     }
@@ -2098,7 +2207,7 @@ impl compound::Backend for RoutedBackend {
       }) else {
         return status_word(Nfsstat4::Delay);
       };
-      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+      crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
         .await
         .unwrap_or_else(|| status_word(Nfsstat4::Delay))
     }
@@ -2123,13 +2232,19 @@ impl compound::Backend for RoutedBackend {
     // A subject that is not a Unix user is no uid, and never root's: the bridge's convention for one
     // (`access::INVALID_UID`, which owns nothing). Every NFS requester is a uid today (`Requester::of`).
     match self.requester.subject {
-      Principal::Uid { uid } => uid,
+      Principal::Uid { uid, .. } => uid,
       _ => slates_bridge_nfs::access::INVALID_UID,
     }
   }
 
   fn now_ns(&self) -> u64 {
     futures::now_ns()
+  }
+
+  /// Every open and delegation the daemon records holds its file in the volume (A-260, `crate::nfs_state::hold`),
+  /// whichever shard owns the file, and the hold is taken again from the partition's records after a restart.
+  fn preserves_unlinked(&self) -> bool {
+    true
   }
 
   fn owns_file(&self, fh: &Nfsfh3) -> bool {
@@ -2395,7 +2510,7 @@ pub(crate) async fn reply_to_message(
   if keeps_states(&call) {
     footprint.note(route(call.program, call.procedure, call.args()).unwrap_or(this));
   }
-  reply_to(this, call, port, (None, footprint.connection())).await
+  reply_to(this, call, port, (None, footprint.connection(), false)).await
 }
 
 /// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
@@ -2408,7 +2523,7 @@ async fn reply_to(
   this: u16,
   mut call: Call,
   port: u16,
-  (held, connection): (Option<u64>, u64),
+  (held, connection, inherited): (Option<u64>, u64, bool),
 ) -> Vec<u8> {
   if call.program == NFS_PROGRAM && call.version == NFS_V4 {
     return reply_v4(this, call, port).await;
@@ -2427,6 +2542,7 @@ async fn reply_to(
     std::mem::replace(&mut call.requester, Requester::root()).with_capability(capability);
   requester.held = held;
   requester.connection = Some(connection);
+  requester.inherited = inherited;
   let (xid, program, version, procedure) = (call.xid, call.program, call.version, call.procedure);
   reply_for(
     this,
@@ -2601,7 +2717,9 @@ pub(crate) fn adopt_held(
       continue;
     }
     note(NFS_CONNECTIONS_ADOPTED);
-    spawn_connection(Connection::new(stream, port, Some(connection)));
+    let mut adopted = Connection::new(stream, port, Some(connection));
+    adopted.inherited = true;
+    spawn_connection(adopted);
   }
 }
 
@@ -2643,6 +2761,8 @@ struct Connection {
   carry: Option<(SessionId, DepartedSession)>,
   /// The connection's id while the anchor holds it.
   held: Option<u64>,
+  /// Handed to this daemon by its anchor at its start (A-231; `Requester::inherited`).
+  inherited: bool,
   /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
   #[cfg(unix)]
   wanted: usize,
@@ -2662,6 +2782,7 @@ impl Connection {
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
+      inherited: false,
       #[cfg(unix)]
       wanted: 0,
       #[cfg(windows)]
@@ -2788,7 +2909,7 @@ fn head(connection: &mut Connection) -> Head {
   if connection.inbox.ended && connection.inbox.held == 0 {
     return Head::Ended;
   }
-  read_head(connection.inbox.held())
+  read_head(connection.inbox.held(), turn_copy_budget())
 }
 
 /// Whether a connection waiting for the rest of a record will never get it, its client having closed: on Unix, asked
@@ -2858,21 +2979,50 @@ fn peek_head(stream: &TcpStream) -> Head {
     match stream.peek_now(&mut buffer) {
       Err(_) | Ok(Some(0)) => Head::Ended,
       Ok(None) => Head::Waiting(1),
-      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default()),
+      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default(), turn_copy_budget()),
     }
   })
 }
 
-/// The whole records at the head of `queued`, or how many bytes the first needs.
-fn read_head(queued: &[u8]) -> Head {
+/// Counter: turns that stopped taking records at their copy budget with more bytes queued behind ([`read_head`]), left
+/// unassembled for a later turn's peek: the budget's non-vacuity count (A-204).
+const TURN_LEFT_QUEUED: &str = "nfs.turn.left_queued";
+
+/// Derived: the record bytes one turn can reach on this shard now, [`DaemonConfig::quantum_copy_bytes`] (the bytes its
+/// step quantum copies at the measured memcpy rate); no bound off a shard. See [`read_head`].
+///
+/// [`DaemonConfig::quantum_copy_bytes`]: crate::config::DaemonConfig::quantum_copy_bytes
+fn turn_copy_budget() -> usize {
+  state::with_state(|s| s.config.quantum_copy_bytes()).map_or(usize::MAX, |bytes| {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+  })
+}
+
+/// The whole records at the head of `queued` that one turn can reach, or how many bytes the first needs (A-204).
+///
+/// A turn serves its records in order until its step quantum is spent ([`serve_turn`]), and serving a record copies
+/// its bytes at least once (a WRITE's data into the volume), so once the records taken hold more than `budget` bytes,
+/// the bytes the quantum copies, no later record is reached in this turn. Those are left queued, unassembled, and a
+/// later turn's peek takes them (counted, [`TURN_LEFT_QUEUED`]). The record that crosses the budget is taken, so a
+/// turn always has at least one. A record served faster than its bytes copy (a call refused unread) only ends its turn
+/// early. Before (VFS plan step 11, 2026-11-05), every whole record peeked was copied out, and a large WRITE's turn
+/// copied the WRITE queued behind it too, then dropped it: about 6% of a large write's throughput in process
+/// (`crates/cli/examples/nfs_large_write.rs`, BENCHMARKS).
+fn read_head(queued: &[u8], budget: usize) -> Head {
   let mut reader = RecordReader::default();
   let mut at = 0usize;
+  let mut taken = 0usize;
   let mut records = Vec::new();
   while let Some(rest) = queued.get(at..).filter(|rest| !rest.is_empty()) {
+    if taken >= budget {
+      note(TURN_LEFT_QUEUED);
+      break;
+    }
     match reader.read(rest) {
       Err(_) => return Head::Refused,
       Ok((Some(body), used)) => {
         at = at.saturating_add(used);
+        taken = taken.saturating_add(body.len());
         records.push(Inbound { body, end: at });
       }
       Ok((None, used)) => {
@@ -3034,7 +3184,7 @@ async fn serve_turn(
         this,
         call,
         connection.port,
-        (connection.held, connection.id),
+        (connection.held, connection.id, connection.inherited),
       )
       .await
     };
@@ -3303,6 +3453,7 @@ fn migrate(owner: u16, connection: Connection) {
     home,
     carry,
     held,
+    inherited,
     #[cfg(windows)]
     inbox,
     ..
@@ -3332,6 +3483,7 @@ fn migrate(owner: u16, connection: Connection) {
         home,
         carry: None,
         held,
+        inherited,
         #[cfg(unix)]
         wanted: 0,
         // The requests read here and not yet answered, the call that moved the connection among them, go with it.

@@ -20,16 +20,25 @@ pub struct SnapshotId {
   pub value: u64,
 }
 
-/// A principal, established at rendezvous (§4.13).
+/// A principal, established at rendezvous (§4.13). A host account means something only on its host (A-237): a uid, a
+/// SID and a consumer enrolled under an account each carry the host whose account it is, by that host's certificate
+/// anchor (`slates_server::deploy`'s blake3 of the node certificate, stable across the host's restarts, never the
+/// per-boot member id). So one uid on two hosts is two principals, a forwarded request is scoped by the authenticated
+/// session's anchor ([`Principal::rehosted`]), and an owner or access entry names (host, account). A certificate names
+/// itself on every host.
 #[derive(Wire, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Principal {
-  /// A Unix user.
+  /// A Unix user of a host.
   Uid {
+    /// The host whose user it is, by its certificate anchor.
+    host: crate::HostId,
     /// The uid.
     uid: u32,
   },
-  /// A Windows SID.
+  /// A Windows SID of a host.
   Sid {
+    /// The host whose account it is, by its certificate anchor.
+    host: crate::HostId,
     /// The SID text.
     sid: String,
   },
@@ -41,9 +50,10 @@ pub enum Principal {
   /// An **enrolled consumer** under a host account (§4.13 "Principals": "a trusted enrollment
   /// establishes `ConsumerId` and scoped rights for a workload under that account"): the workload
   /// bound its channel at rendezvous with the capability its enrollment minted, so two agents sharing a
-  /// uid are two principals here, each with only the rights an access list names for it. Appended for
-  /// append-only wire evolution.
+  /// uid are two principals here, each with only the rights an access list names for it.
   Consumer {
+    /// The host whose account the consumer was enrolled under, by its certificate anchor.
+    host: crate::HostId,
     /// The host account (uid) the consumer was enrolled under.
     account: u32,
     /// The consumer's id, minted at enrollment.
@@ -51,8 +61,8 @@ pub enum Principal {
   },
 }
 
-/// Format: the bit that marks a tenant id hashed from a principal with no numeric account (a SID, a certificate), so it
-/// never names the same tenant as a uid.
+/// Format: the bit that marks a tenant id hashed from a principal. Since A-237 every tenant is hashed (a host account
+/// with its host), and the bit stays so no hashed tenant is ever a bare uid.
 const HASHED_TENANT: u64 = 1 << 63;
 
 impl Principal {
@@ -60,22 +70,59 @@ impl Principal {
   /// account; a SID or a certificate by a namespaced hash of its identity, marked with the top bit so it never names the
   /// same tenant as a uid. Here, beside the records, so a volume's destroy can tell when its tenant has no volume left.
   pub fn tenant(&self) -> u64 {
-    let hashed = |kind: &[u8], identity: &[u8]| {
+    let hashed = |kind: &[u8], identity: &[&[u8]]| {
       let mut hasher = blake3::Hasher::new();
-      hasher.update(b"slates tenant v1");
+      hasher.update(b"slates tenant v2");
       hasher.update(kind);
-      hasher.update(identity);
+      for part in identity {
+        hasher.update(part);
+      }
       let mut word = [0u8; size_of::<u64>()];
       if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
         word.copy_from_slice(head);
       }
       u64::from_le_bytes(word) | HASHED_TENANT
     };
+    // A host account seals under its host as well (A-237): one uid on two hosts is two tenants.
     match self {
-      Principal::Uid { uid } => u64::from(*uid),
-      Principal::Consumer { account, .. } => u64::from(*account),
-      Principal::Sid { sid } => hashed(b"sid", sid.as_bytes()),
-      Principal::Certificate { hash } => hashed(b"certificate", hash),
+      Principal::Uid { host, uid } => hashed(b"uid", &[&host.0.to_le_bytes(), &uid.to_le_bytes()]),
+      Principal::Consumer { host, account, .. } => {
+        hashed(b"uid", &[&host.0.to_le_bytes(), &account.to_le_bytes()])
+      }
+      Principal::Sid { host, sid } => hashed(b"sid", &[&host.0.to_le_bytes(), sid.as_bytes()]),
+      Principal::Certificate { hash } => hashed(b"certificate", &[hash]),
+    }
+  }
+
+  /// The host whose account this principal is (A-237); `None` for a certificate, which names itself on every host.
+  pub fn host(&self) -> Option<crate::HostId> {
+    match self {
+      Principal::Uid { host, .. }
+      | Principal::Sid { host, .. }
+      | Principal::Consumer { host, .. } => Some(*host),
+      Principal::Certificate { .. } => None,
+    }
+  }
+
+  /// This principal as the host `host` authenticated it (A-237): a host account's host replaced by `host`, a
+  /// certificate as it is. The owner of a forwarded request scopes its principal by the session's authenticated
+  /// anchor this way, never by the host the origin's request names.
+  #[must_use]
+  pub fn rehosted(&self, host: crate::HostId) -> Principal {
+    match self {
+      Principal::Uid { uid, .. } => Principal::Uid { host, uid: *uid },
+      Principal::Sid { sid, .. } => Principal::Sid {
+        host,
+        sid: sid.clone(),
+      },
+      Principal::Consumer {
+        account, consumer, ..
+      } => Principal::Consumer {
+        host,
+        account: *account,
+        consumer: *consumer,
+      },
+      Principal::Certificate { hash } => Principal::Certificate { hash: *hash },
     }
   }
 
@@ -91,20 +138,27 @@ impl Principal {
     const KIND_CONSUMER: u8 = 4;
     let mut out = Vec::new();
     match self {
-      Principal::Uid { uid } => {
+      Principal::Uid { host, uid } => {
         out.push(KIND_UID);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(&uid.to_le_bytes());
       }
-      Principal::Sid { sid } => {
+      Principal::Sid { host, sid } => {
         out.push(KIND_SID);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(sid.as_bytes());
       }
       Principal::Certificate { hash } => {
         out.push(KIND_CERTIFICATE);
         out.extend_from_slice(hash);
       }
-      Principal::Consumer { account, consumer } => {
+      Principal::Consumer {
+        host,
+        account,
+        consumer,
+      } => {
         out.push(KIND_CONSUMER);
+        out.extend_from_slice(&host.0.to_le_bytes());
         out.extend_from_slice(&account.to_le_bytes());
         out.extend_from_slice(&consumer.to_le_bytes());
       }
@@ -210,6 +264,24 @@ pub struct PolicyRecord {
   pub require_locked: bool,
   /// The role.
   pub role: Role,
+  /// Whether the volume is live-shipped (§4.10, A-200): each of its publications is shipped to its candidates and a
+  /// barrier is answered only once the owner and `f` of them hold it. False at creation; set by `LiveShip`.
+  /// Appended.
+  pub live_shipped: bool,
+  /// The holder set the volume's live shipper ships to, under its epoch (A-240): committed at `f + 1` through the
+  /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
+  /// a durable entry is held by. `None` until a shipper commits one. Appended.
+  pub live_holders: Option<LiveHolders>,
+}
+
+/// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
+/// ids, fixed for the shipper's life.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveHolders {
+  /// The shipper's epoch.
+  pub epoch: u64,
+  /// The hosts it ships to.
+  pub holders: Vec<u64>,
 }
 
 /// What the volume sits on (§4.15).
@@ -384,6 +456,23 @@ pub enum Consumer {
   /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
   /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
   Guest,
+  /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
+  /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
+  /// ends at its term (D-16). Appended.
+  Remote {
+    /// The member id of the client's host.
+    host: u64,
+    /// The client's id on that host.
+    client: u32,
+  },
+  /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
+  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
+  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  Termed {
+    /// When its term lapses, on the shard's monotonic clock.
+    expires_ns: u64,
+  },
 }
 
 /// The form of an attachment. Append-only.
@@ -561,6 +650,17 @@ pub struct AttachmentRecord {
   /// are not consumer authority. Zero for an attachment that establishes no host mount (an SDK record form,
   /// a green pin), which the NFS edge never authorizes.
   pub token: [u8; 16],
+}
+
+/// A request that ran and waits for a version of a green to commit (§4.16 "Commit", A-252), as a snapshot carries it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AwaitingCompletion {
+  /// The sequence.
+  pub sequence: u32,
+  /// The green.
+  pub green: VolumeId,
+  /// The version it waits for.
+  pub version: u64,
 }
 
 /// A completion record (RIFL, §4.9). The idempotency key is **globally unique**: `origin` is the host whose
@@ -918,6 +1018,22 @@ pub struct NfsPurgeRecord {
   pub session: Option<[u8; 16]>,
 }
 
+/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-236): a clone
+/// lives beside its origin, for copy-on-write, while its name hashes elsewhere. The name's partition is where the name
+/// is looked up and where its uniqueness is decided, so it holds this alias, which points at the clone. An alias is
+/// reserved before the clone is made and confirmed after: a reserved one holds the name (a create of it is refused) but
+/// resolves nothing until confirmed, and a daemon's recovery confirms or releases every reserved one by asking the
+/// clone's partition whether the clone exists under this name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameAliasRecord {
+  /// The name.
+  pub name: String,
+  /// The volume it names, on the partition its id encodes.
+  pub volume: VolumeId,
+  /// Whether the clone was made and the alias confirmed; until then the alias holds the name and resolves nothing.
+  pub confirmed: bool,
+}
+
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
 /// seal.md §3.3).
 pub const SEAL_KEY_RECORD_BYTES: usize = 61;
@@ -964,6 +1080,18 @@ pub enum SealKeyOwner {
     host: u64,
     /// The owner's partition.
     partition: u16,
+  },
+  /// A pair key an earlier incarnation of `host` delivered for `partition` (A-92 piece 4b), kept on this node's control
+  /// shard while a head or live log this node holds is still sealed under it, so the volumes of a node that came back
+  /// with fresh RAM at the same anchor (its keys gone, a new pair made) can still be taken over: `key` is its id, which
+  /// a head's key entry names as its wrapping key. Appended.
+  PairRetired {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+    /// The retired key's id.
+    key: [u8; 16],
   },
 }
 

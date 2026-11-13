@@ -1167,6 +1167,67 @@ fn assert_listen_bounds(instance: &str, server: &mut McpServer) {
   assert!(opened > 0, "subscriptions open up to the bound");
 }
 
+/// The edge's bound on one request's arrival, as `slates mcp --http` derives it: the client's reply deadline.
+fn edge_deadline_ns() -> u64 {
+  Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get()
+  .reply_ns
+}
+
+/// Asserts what the edge's rule says of `stream`, a connection opened at `opened` whose request never finishes, now:
+/// open and unanswered while its deadline has not passed. Judged only then, since a slow machine can bring the check
+/// past the deadline, where the edge rightly closes it (the next check holds that).
+fn assert_held_open_inside_its_deadline(stream: &std::net::TcpStream, opened: Instant, what: &str) {
+  use std::io::Read;
+  let mut probe = [0u8; 1];
+  stream.set_nonblocking(true).unwrap();
+  let read = (&*stream).read(&mut probe);
+  let at = opened.elapsed();
+  stream.set_nonblocking(false).unwrap();
+  if at < Duration::from_nanos(edge_deadline_ns()) {
+    assert!(
+      matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+      "{what} is still open, unanswered, {at:?} after it opened: {read:?}"
+    );
+  } else {
+    eprintln!("{what}: past its deadline {at:?} after it opened, so not judged open here");
+  }
+}
+
+/// Asserts the edge ended `stream`, a connection opened at `opened` whose request never finished, once its deadline
+/// passed, answering nothing: the client reads its end (or a reset) and no byte, within [`HTTP_READ_WAIT`] of the
+/// deadline. A slow client holds a connection's slot no longer than a request may (the module's bound).
+fn assert_closed_unanswered_after_its_deadline(
+  stream: &std::net::TcpStream,
+  opened: Instant,
+  what: &str,
+) {
+  use std::io::Read;
+  let deadline = Duration::from_nanos(edge_deadline_ns());
+  let (_hold, rx) = std::sync::mpsc::channel::<()>();
+  let _ = rx.recv_timeout(deadline.saturating_sub(opened.elapsed()));
+  stream.set_read_timeout(Some(HTTP_READ_WAIT)).unwrap();
+  let mut seen = Vec::new();
+  let ended = (&*stream).read_to_end(&mut seen);
+  // Its end, or a reset: not a read still waiting when the bound ran out.
+  let closed = match &ended {
+    Ok(_) => true,
+    Err(error) => !matches!(
+      error.kind(),
+      std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ),
+  };
+  assert!(
+    closed && seen.is_empty(),
+    "{what} was ended past its {deadline:?} deadline, unanswered: {ended:?}, {:?} after it opened, read {:?}",
+    opened.elapsed(),
+    String::from_utf8_lossy(&seen)
+  );
+}
+
 /// Shape: the edge's bearer token in this test (the command mints one from the platform's secure random).
 const TEST_BEARER: [u8; slates_mcp::http::BEARER_BYTES] = [0x5c; slates_mcp::http::BEARER_BYTES];
 
@@ -1186,12 +1247,7 @@ fn start_http_edge(profile: &MachineProfile, instance: &str) -> u16 {
     let edge = slates_mcp::http::HttpEdge {
       port,
       bearer: TEST_BEARER,
-      deadline_ns: Deadlines::derive(
-        slates_server::daemon::LIVENESS_BUDGET_NS,
-        slates_db::replay::RECOVERY_BUDGET_NS,
-      )
-      .get()
-      .reply_ns,
+      deadline_ns: edge_deadline_ns(),
       connections: config.clients_per_shard,
     };
     port_tx.send(port).unwrap();
@@ -1279,7 +1335,7 @@ fn send_past_the_bound(
 /// `200` while the slow and idle connections are still open, and each unauthorized call refused (`403`,
 /// `421`, `401`) with no volume created.
 fn assert_http_transport(profile: &MachineProfile, instance: &str) {
-  use std::io::{Read, Write};
+  use std::io::Write;
   let port = start_http_edge(profile, instance);
   let token: String = TEST_BEARER
     .iter()
@@ -1327,6 +1383,7 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
       .as_bytes(),
     )
     .unwrap();
+  let opened = Instant::now();
   let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   let mut reset = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   reset.write_all(b"POST /mcp HTTP/1.1\r\nHo").unwrap();
@@ -1341,6 +1398,8 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     valid.starts_with("HTTP/1.1 200 OK"),
     "a valid client is served: {valid}"
   );
+  // The valid client was not held behind the slow one: served while that one was still open.
+  assert_held_open_inside_its_deadline(&slow, opened, "the slow connection");
   assert!(
     valid.contains("\"protocolVersion\":\"2025-11-25\""),
     "a legacy initialize is answered in the newest legacy revision: {valid}"
@@ -1350,14 +1409,12 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
   assert_listen_over_http(port, &ours, &token);
   assert_unauthorized_calls_have_no_effect(port, instance, &token);
 
-  // The slow and idle connections were still open throughout; the valid client was not held behind them.
-  let mut probe = [0u8; 1];
-  slow.set_nonblocking(true).unwrap();
-  assert!(
-    matches!(slow.read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-    "the slow connection is still open, unanswered"
-  );
-  drop(idle);
+  // The slow and idle connections hold their slots no longer than a request may: past the edge's deadline, each is
+  // ended unanswered. Before 2026-11-07 the test held the slow one open here, after the HTTP checks above, which take
+  // half the deadline on an idle machine (the listen check waits for a keep-alive comment); under load they took the
+  // rest, and the edge had closed it by its rule (1 of 4 runs at load ~14).
+  assert_closed_unanswered_after_its_deadline(&slow, opened, "the slow connection");
+  assert_closed_unanswered_after_its_deadline(&idle, opened, "the idle connection");
 }
 
 /// AUD-29-24: a volume-creating tool call from a foreign origin, under a rebound host name and without the

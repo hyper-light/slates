@@ -18,7 +18,7 @@ use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
 use slates_transport::connection::Priority;
 use slates_transport::demux::{Demux, DemuxCounters, DemuxId};
-use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::endpoint::{Endpoint, EndpointError, HandshakeStall};
 use slates_transport::handshake::Identity;
 use slates_transport::params::TransportParameters;
 
@@ -340,6 +340,232 @@ fn a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks() {
     "the shrunken path was found: {after_second} ({stats:?})"
   );
   assert!(stats.probes_lost > 0 && stats.probes_acked > 0, "{stats:?}");
+}
+
+/// The shape the fleet's sessions are built with (`slates_server::fleet`'s `FLEET_FRAME_CAP`): frames as large as a
+/// datagram carries, so a transfer's packets fill the path's size — what makes a lost one an above-floor loss.
+fn fleet_shape() -> slates_transport::connection::ConnectionShape {
+  let cap = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    cap,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(cap),
+  )
+}
+
+/// Shape: at most this many transfers find the path's size before the fault (each a few hundred packets; the search
+/// loses each too-large size `MAX_PROBES` times on its way down from the peer's limit).
+const FIND_TRANSFERS: usize = 16;
+
+/// Format: the request that tells the dead-path server the client is done.
+const END_MARKER: &[u8] = b"end";
+
+/// How long the path stays dead under a fault in the black-hole regressions.
+#[derive(Clone, Copy)]
+enum DeadFor {
+  /// Shape: two seconds, the rolling partition flow's stop of a candidate (`live_chaos`'s `PARTITION`): many
+  /// backed-off probe timeouts fire inside it with nothing acknowledged, as at a stopped peer.
+  Stopped,
+  /// Shape: four of the path's round trips (2 ms each here), under one probe timeout: a window's worth is lost
+  /// and declared by the acknowledgements after it (a loss pass), as a receiver's full buffer drops a burst.
+  Burst,
+}
+
+impl DeadFor {
+  /// The dead time, nanoseconds.
+  fn nanos(self) -> u64 {
+    match self {
+      DeadFor::Stopped => 2_000_000_000,
+      DeadFor::Burst => 8_000_000,
+    }
+  }
+}
+
+/// What the black-hole regressions observe: both transfers byte-exact, the confirmed size before the fault and after,
+/// the discovery counts after, and the datagrams the dead path dropped.
+struct DeadPathOutcome {
+  exact: bool,
+  before: Option<usize>,
+  after: Option<usize>,
+  stats: Option<slates_transport::pmtud::PathMtuStats>,
+  dropped: u64,
+}
+
+/// Two transfers over an Ethernet path (a window holds a dozen above-floor packets), the path dead for `dead` (losing
+/// every datagram, of every size) from just before the second, then restored.
+fn transfers_across_a_dead_path(dead: DeadFor) -> DeadPathOutcome {
+  let jumbo = slates_rt::sim::SimPath::in_order(1_000_000, 0).with_mtu(ETHERNET_MTU);
+  let lost = jumbo.with_loss(slates_rt::sim::SimLoss::random(slates_rt::sim::PPM));
+  let mut sim = SimRuntime::new(&config(), 11).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  slates_rt::sim::sim_udp_set_path(jumbo);
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  let (restore_tx, restore_rx) = channel::<u64>();
+  // The restorer: told how long the path stays dead, waits that long on the simulated clock, then restores it.
+  sim
+    .spawn_on(id, async move {
+      loop {
+        if let Ok(dead_ns) = restore_rx.try_recv() {
+          let _ = slates_rt::futures::sleep(dead_ns).await;
+          slates_rt::sim::sim_udp_set_path(jumbo);
+          return;
+        }
+        if slates_rt::futures::sleep(100_000).await.is_err() {
+          return;
+        }
+      }
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        fleet_shape(),
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      // Every request until the client's end marker: the finding transfers and the one across the dead path.
+      loop {
+        let (request, _kind, received) = server.next_request().await.unwrap();
+        server.reply(request, &digest(&received)).unwrap();
+        if received == END_MARKER {
+          break;
+        }
+      }
+      server.settle().await.unwrap();
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
+      let mut client = Endpoint::client(
+        socket,
+        peer,
+        &client_identity,
+        &server_cert,
+        NAME,
+        fleet_shape(),
+      )
+      .unwrap();
+      client.establish().await.unwrap();
+      let first: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
+      // Transfers until discovery has found the path (within its granularity), at most `FIND_TRANSFERS`.
+      let mut first_exact = true;
+      for _ in 0..FIND_TRANSFERS {
+        let reply = client
+          .request(STREAM_ID, Priority::Bulk, &first)
+          .await
+          .unwrap();
+        first_exact &= reply == digest(&first);
+        if client
+          .path_mtu()
+          .is_some_and(|mtu| ETHERNET_MTU - mtu <= slates_transport::pmtud::SEARCH_GRANULARITY)
+        {
+          break;
+        }
+      }
+      let before = client.path_mtu();
+      let dead_ns = dead.nanos();
+      let dropped_before = slates_rt::sim::sim_udp_stats().dropped_loss;
+      slates_rt::sim::sim_udp_set_path(lost);
+      let _ = restore_tx.send(dead_ns);
+      let second: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 241).unwrap_or(0))
+        .collect();
+      let second_reply = client
+        .request(STREAM_ID, Priority::Bulk, &second)
+        .await
+        .unwrap();
+      let _ = client
+        .request(STREAM_ID, Priority::Bulk, END_MARKER)
+        .await
+        .unwrap();
+      let _ = result_tx.send(DeadPathOutcome {
+        exact: first_exact && second_reply == digest(&second),
+        before,
+        after: client.path_mtu(),
+        stats: client.path_mtu_stats(),
+        dropped: slates_rt::sim::sim_udp_stats()
+          .dropped_loss
+          .saturating_sub(dropped_before),
+      });
+    })
+    .unwrap();
+  sim.run_until_idle();
+  result_rx.try_recv().unwrap()
+}
+
+/// §4.10a (RFC 8899 §4.3: a black hole is "excessive loss of data sent with a specific packet size"; §3 item 4: robust
+/// to probes "lost due to other reasons (including link transmission error, congestion)"): a peer that answers nothing for a
+/// while — stopped, as a SIGSTOPped daemon is — is a liveness event, not size evidence. Do: a transfer over a 1,500-byte
+/// path; the path then drops every datagram for two seconds (the rolling partition's stop) while a second transfer starts; then restored.
+/// Expect both transfers byte-exact and the confirmed size after it what it was before, with no black hole counted.
+/// Before, each probe timeout with full-size packets in flight counted as a loss of one, and three fell the session
+/// to the 1,200-byte floor: on loopback a resumed holder's session ran at the floor (live-durability, diag-42/43).
+/// Non-vacuous: the dead path dropped datagrams, and a size above the floor was found first.
+#[test]
+fn a_peer_silent_for_several_probe_timeouts_keeps_its_path_mtu() {
+  let outcome = transfers_across_a_dead_path(DeadFor::Stopped);
+  assert!(outcome.exact, "both transfers arrived byte-exact");
+  let before = outcome.before.unwrap();
+  assert!(
+    before > slates_transport::pmtud::BASE_PLPMTU
+      && ETHERNET_MTU - before <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the Ethernet path was found first: {before}"
+  );
+  assert!(outcome.dropped > 0, "the dead path dropped datagrams");
+  let stats = outcome.stats.unwrap();
+  assert_eq!(
+    (outcome.after, stats.black_holes),
+    (Some(before), 0),
+    "a silent peer is no black hole: the size it had, none counted ({stats:?}, {} dropped)",
+    outcome.dropped
+  );
+}
+
+/// §4.10a (RFC 8899 §4.3 and §3 item 4, as above): a burst that loses every size — a receiver's full buffer drops
+/// whatever arrives — is congestion, which the congestion controller answers, not a smaller path. Do: as the silent
+/// peer, but the path dead for four round trips (under one probe timeout), so the loss is declared by the acknowledgements after it. Expect
+/// the same: both byte-exact, the size kept, no black hole. Before, three full-size packets declared lost in a row fell
+/// the session to the floor whatever else was lost with them. Non-vacuous: at least `BLACK_HOLE_LOSSES` datagrams
+/// were dropped.
+#[test]
+fn a_burst_that_loses_every_size_keeps_the_path_mtu() {
+  let outcome = transfers_across_a_dead_path(DeadFor::Burst);
+  assert!(outcome.exact, "both transfers arrived byte-exact");
+  let before = outcome.before.unwrap();
+  assert!(
+    before > slates_transport::pmtud::BASE_PLPMTU
+      && ETHERNET_MTU - before <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the Ethernet path was found first: {before}"
+  );
+  assert!(
+    outcome.dropped >= u64::from(slates_transport::pmtud::BLACK_HOLE_LOSSES),
+    "the burst dropped a black hole's worth of datagrams: {}",
+    outcome.dropped
+  );
+  let stats = outcome.stats.unwrap();
+  assert_eq!(
+    (outcome.after, stats.black_holes),
+    (Some(before), 0),
+    "a burst lost at every size is no black hole: the size it had, none counted ({stats:?}, {} dropped)",
+    outcome.dropped
+  );
 }
 
 /// A request/reply exchange completes over a live session, the server producing its reply
@@ -1701,6 +1927,468 @@ async fn discard_queued(socket: &UdpSocket) -> usize {
     discarded += 1;
   }
   discarded
+}
+
+/// Shape: how many bursts the flood in [`stall_against_a_peer_that_never_joins`] sends at most, and how many datagrams
+/// each: together past the handshake's bound on datagrams that make no flight, which is under two thousand.
+const FLOOD_BURSTS: usize = 256;
+const FLOOD_BURST_DATAGRAMS: usize = 64;
+/// Shape: the flood's pause between bursts, a millisecond of the simulated clock.
+const FLOOD_PAUSE_NS: u64 = 1_000_000;
+
+/// What a handshake's `establish` reported when it gave up, kept apart from `Option` so the helper may assert freely.
+#[derive(Debug, PartialEq, Eq)]
+struct Reported(Option<HandshakeStall>);
+
+/// What ended one end's `establish`, with a bound peer that never takes part: `garbage`, it floods that end with
+/// datagrams that are no flight; otherwise it says nothing. `dialing`, the end under test is the client.
+fn stall_against_a_peer_that_never_joins(dialing: bool, garbage: bool) -> Reported {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let identity = self_signed(NAME);
+  let certificate = identity.certificate();
+  let (near_tx, near_rx) = channel();
+  let (far_tx, far_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (stall_tx, stall_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = near_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(far_rx).await);
+      let mut end = if dialing {
+        Endpoint::client(socket, peer, &identity, &certificate, NAME, shape()).unwrap()
+      } else {
+        Endpoint::server(
+          socket,
+          peer,
+          &identity,
+          std::slice::from_ref(&certificate),
+          shape(),
+        )
+        .unwrap()
+      };
+      let outcome = end.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = stall_tx.send(end.handshake_stall());
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = far_tx.send(socket.local_addr().unwrap().port());
+      let near = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(near_rx).await);
+      let stray = [0xFFu8; 64];
+      // A bounded flood: a burst, then a parked millisecond, so the end under test reads what was sent and the runtime's
+      // clock moves. The turn's bound on such datagrams is under two thousand, so this is well past it.
+      for _ in 0..FLOOD_BURSTS {
+        if !garbage || done_rx.try_recv().is_ok() {
+          break;
+        }
+        for _ in 0..FLOOD_BURST_DATAGRAMS {
+          let _ = socket.send_to(&stray, near);
+        }
+        slates_rt::futures::sleep(FLOOD_PAUSE_NS).await.unwrap();
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  Reported(stall_rx.try_recv().unwrap())
+}
+
+/// §4.8 formation: a handshake that gives up names the bound it reached, so a fleet whose dials keep failing says why
+/// (a 72 s formation at load 127-176, 2026-11-08, had only "no reply" to go on). Do: run `establish` on a dialer and on
+/// an accepted end whose peer never joins, once silent and once flooding datagrams that are no flight. Expect: the
+/// dialer and the accepted end report `Silence` against a silent peer, and the dialer `Fragments` against the flood.
+#[test]
+fn a_handshake_that_gives_up_names_the_bound_it_reached() {
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(true, false),
+    Reported(Some(HandshakeStall::Silence)),
+    "a dialer whose peer stays silent"
+  );
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(false, false),
+    Reported(Some(HandshakeStall::Silence)),
+    "an accepted end whose peer stays silent"
+  );
+  assert_eq!(
+    stall_against_a_peer_that_never_joins(true, true),
+    Reported(Some(HandshakeStall::Fragments)),
+    "a dialer flooded with datagrams that are no flight"
+  );
+}
+
+/// Shape: how many times [`accepted_end_replayed_at`] replays a dialer's flight: past the 32 retransmits the accepting
+/// end used to count them against.
+const REPLAYS_PAST_THE_OLD_COUNT: usize = 64;
+/// Shape: the gap between replays, a millisecond of the simulated clock.
+const REPLAY_GAP_NS: u64 = 1_000_000;
+/// Shape: the gap when a dialer keeps asking for the whole of a turn's deadline, a tenth of a simulated second.
+const LONG_REPLAY_GAP_NS: u64 = 100_000_000;
+/// Shape: how many of those long gaps cover the turn's deadline (about 22 s of simulated time) many times over.
+const LONG_REPLAYS: usize = 1_000;
+
+/// What ended an accepted end's `establish`, the peer replaying the dialer's first flight `replays` times `gap_ns`
+/// apart and then saying nothing, with the simulated time it took. Replays come from the real flight of a real dialer.
+fn accepted_end_replayed_at(replays: usize, gap_ns: u64) -> (Reported, u64) {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let identity = self_signed(NAME);
+  let certificate = identity.certificate();
+  let server_certificate = certificate.clone();
+  let dialer_identity = self_signed(NAME);
+  let roster = dialer_identity.certificate();
+  let (relay_tx, relay_rx) = channel();
+  let (accept_tx, accept_rx) = channel();
+  let (dialer_tx, dialer_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (result_tx, result_rx) = channel();
+  // The dialer: its only job is to produce a real first flight, sent to the relay.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        peer,
+        &dialer_identity,
+        &server_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let _ = within(FIRST_FLIGHT_NS, dialer.establish()).await;
+    })
+    .unwrap();
+  // The accepting end.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accept_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &identity,
+        std::slice::from_ref(&roster),
+        shape(),
+      )
+      .unwrap();
+      let began = slates_rt::futures::now_ns();
+      let outcome = server.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = result_tx.send((
+        server.handshake_stall(),
+        slates_rt::futures::now_ns().saturating_sub(began),
+      ));
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  // The relay: takes the dialer's first flight whole, then plays it at the accepting end again and again.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_tx.send(port);
+      let _ = dialer_tx.send(port);
+      let server = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(accept_rx).await);
+      let mut flight: Vec<Vec<u8>> = Vec::new();
+      let mut buffer = [0u8; 2048];
+      while let Some(Ok((length, _))) = within(FIRST_FLIGHT_NS, socket.recv_from(&mut buffer)).await
+      {
+        let datagram = buffer.get(..length).unwrap().to_vec();
+        if flight.contains(&datagram) {
+          break;
+        }
+        flight.push(datagram);
+      }
+      assert!(!flight.is_empty(), "the dialer sent its first flight");
+      for _ in 0..=replays {
+        if done_rx.try_recv().is_ok() {
+          return;
+        }
+        for datagram in &flight {
+          let _ = socket.send_to(datagram, server);
+        }
+        slates_rt::futures::sleep(gap_ns).await.unwrap();
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (stall, took) = result_rx.try_recv().unwrap();
+  (Reported(stall), took)
+}
+
+/// Shape: how long the relay waits for the dialer's first flight, a few simulated milliseconds.
+const FIRST_FLIGHT_NS: u64 = 5_000_000;
+
+/// §4.8 formation: an accepting end does not give up because a dialer resent a flight it has already answered. Replays
+/// are the dialer's own resends, which load makes frequent, so counting them ended handshakes with a live dialer within
+/// a second or two (`fleet.accept.stall.repeats`, a 41.9 s formation at load 170, 2026-11-08). Do: replay a real dialer's
+/// first flight, more times than the old bound, then fall silent. Expect: the end gives up on the silence, not on the
+/// repeats.
+#[test]
+fn an_accepted_handshake_is_not_given_up_for_a_dialers_repeats() {
+  let (stall, _) = accepted_end_replayed_at(REPLAYS_PAST_THE_OLD_COUNT, REPLAY_GAP_NS);
+  assert_eq!(stall, Reported(Some(HandshakeStall::Silence)));
+}
+
+/// R3, the same bound on the other side: a dialer that keeps resending for ever cannot hold an accepting end for ever.
+/// Do: replay the flight for far longer than a handshake's turn may last. Expect: it ends on the repeats, within the
+/// turn's derived deadline of `33 × initial probe timeout`, about 22 s, and not sooner than a good part of it.
+#[test]
+fn a_dialer_that_only_repeats_is_given_up_at_the_handshakes_deadline() {
+  let (stall, took) = accepted_end_replayed_at(LONG_REPLAYS, LONG_REPLAY_GAP_NS);
+  assert_eq!(stall, Reported(Some(HandshakeStall::Repeats)));
+  let seconds = took / 1_000_000_000;
+  assert!((20..=24).contains(&seconds), "gave up after {took} ns");
+}
+
+/// §4.8 formation: a dialer that finished its side of TLS and whose peer never confirms says so, which is what makes it
+/// redial at once (`fleet::keeps_its_socket`). The peer's half is gone in the field, after giving up on the dialer's
+/// repeats; here a relay carries both ends' first flights and then drops the dialer's. Do: handshake through it. Expect:
+/// the dialer's `establish` ends `NotReady` with a confirmation stall.
+#[test]
+fn a_dialer_whose_peer_never_confirms_reports_a_confirmation_stall() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let dialer_identity = self_signed(NAME);
+  let accepting_identity = self_signed(NAME);
+  let dialer_certificate = dialer_identity.certificate();
+  let accepting_certificate = accepting_identity.certificate();
+  let (relay_for_dialer_tx, relay_for_dialer_rx) = channel();
+  let (relay_for_accepting_tx, relay_for_accepting_rx) = channel();
+  let (dialer_port_tx, dialer_port_rx) = channel();
+  let (accepting_port_tx, accepting_port_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (stall_tx, stall_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = dialer_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        relay,
+        &dialer_identity,
+        &accepting_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let outcome = dialer.establish().await;
+      assert!(
+        matches!(outcome, Err(EndpointError::NotReady)),
+        "{outcome:?}"
+      );
+      let _ = stall_tx.send(dialer.handshake_stall());
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accepting_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_accepting_rx).await);
+      let mut accepting = Endpoint::server(
+        socket,
+        relay,
+        &accepting_identity,
+        std::slice::from_ref(&dialer_certificate),
+        shape(),
+      )
+      .unwrap();
+      let _ = accepting.establish().await;
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_for_dialer_tx.send(port);
+      let _ = relay_for_accepting_tx.send(port);
+      let dialer_port = recv_port(dialer_port_rx).await;
+      let accepting_port = recv_port(accepting_port_rx).await;
+      let dialer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dialer_port);
+      let accepting = SocketAddrV4::new(Ipv4Addr::LOCALHOST, accepting_port);
+      let mut answered = false;
+      let mut buffer = [0u8; 2048];
+      while done_rx.try_recv().is_err() {
+        let Some(Ok((length, from))) = within(FIRST_FLIGHT_NS, socket.recv_from(&mut buffer)).await
+        else {
+          continue;
+        };
+        let datagram = buffer.get(..length).unwrap();
+        if from == accepting {
+          answered = true;
+          let _ = socket.send_to(datagram, dialer);
+        } else if !answered {
+          let _ = socket.send_to(datagram, accepting);
+        }
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let stall = stall_rx.try_recv().unwrap();
+  assert!(
+    matches!(
+      stall,
+      Some(HandshakeStall::ConfirmDeadline | HandshakeStall::ConfirmSilence)
+    ),
+    "{stall:?}"
+  );
+}
+
+/// What a relay between a dialer and an accepting end does once the accepting end has answered.
+#[derive(Clone, Copy)]
+enum AfterAnswer {
+  /// Floods the accepting end with datagrams that make no flight, so it abandons, and passes what it sends.
+  FloodTheAcceptingEnd,
+  /// Drops what the accepting end sends, and sends the dialer closes nobody sealed.
+  ForgeClosesToTheDialer,
+}
+
+/// Shape: how many forged closes [`dial_through_relay`] sends, a simulated millisecond apart.
+const FORGED_CLOSES: usize = 64;
+
+/// A dialer's `establish` through a relay that passes the handshake until the accepting end answers and then does
+/// `after`. Its outcome, the simulated time it took, and the closes the accepting end sent.
+fn dial_through_relay(after: AfterAnswer) -> (String, u64, u64) {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = *sim.shard_ids().first().unwrap();
+  let dialer_identity = self_signed(NAME);
+  let accepting_identity = self_signed(NAME);
+  let dialer_certificate = dialer_identity.certificate();
+  let accepting_certificate = accepting_identity.certificate();
+  let (relay_for_dialer_tx, relay_for_dialer_rx) = channel();
+  let (relay_for_accepting_tx, relay_for_accepting_rx) = channel();
+  let (dialer_port_tx, dialer_port_rx) = channel();
+  let (accepting_port_tx, accepting_port_rx) = channel();
+  let (done_tx, done_rx) = channel::<()>();
+  let (dialer_tx, dialer_rx) = channel();
+  let (closes_tx, closes_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = dialer_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_dialer_rx).await);
+      let mut dialer = Endpoint::client(
+        socket,
+        relay,
+        &dialer_identity,
+        &accepting_certificate,
+        NAME,
+        shape(),
+      )
+      .unwrap();
+      let began = slates_rt::futures::now_ns();
+      let outcome = dialer.establish().await;
+      let took = slates_rt::futures::now_ns().saturating_sub(began);
+      let _ = dialer_tx.send((format!("{outcome:?}"), took));
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = accepting_port_tx.send(socket.local_addr().unwrap().port());
+      let relay = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(relay_for_accepting_rx).await);
+      let mut accepting = Endpoint::server(
+        socket,
+        relay,
+        &accepting_identity,
+        std::slice::from_ref(&dialer_certificate),
+        shape(),
+      )
+      .unwrap();
+      let _ = accepting.establish().await;
+      let _ = closes_tx.send(accepting.closes_sent());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let port = socket.local_addr().unwrap().port();
+      let _ = relay_for_dialer_tx.send(port);
+      let _ = relay_for_accepting_tx.send(port);
+      let dialer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(dialer_port_rx).await);
+      let accepting = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(accepting_port_rx).await);
+      let mut answered = false;
+      let mut forged = 0usize;
+      let mut buffer = [0u8; 2048];
+      while done_rx.try_recv().is_err() {
+        if answered {
+          match after {
+            AfterAnswer::FloodTheAcceptingEnd => {
+              for _ in 0..FLOOD_BURST_DATAGRAMS {
+                let _ = socket.send_to(&[0xFFu8; 64], accepting);
+              }
+            }
+            AfterAnswer::ForgeClosesToTheDialer if forged < FORGED_CLOSES => {
+              forged += 1;
+              let mut close = vec![0x82u8];
+              close.extend_from_slice(&u32::try_from(forged).unwrap().to_le_bytes());
+              close.extend_from_slice(&[0x01; 17]);
+              let _ = socket.send_to(&close, dialer);
+            }
+            AfterAnswer::ForgeClosesToTheDialer => {}
+          }
+        }
+        let Some(Ok((length, from))) = within(FLOOD_PAUSE_NS, socket.recv_from(&mut buffer)).await
+        else {
+          continue;
+        };
+        let datagram = buffer.get(..length).unwrap();
+        if from == accepting {
+          answered = true;
+          if matches!(after, AfterAnswer::FloodTheAcceptingEnd) {
+            let _ = socket.send_to(datagram, dialer);
+          }
+        } else if !answered {
+          let _ = socket.send_to(datagram, accepting);
+        }
+      }
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (outcome, took) = dialer_rx.try_recv().unwrap();
+  (outcome, took, closes_rx.try_recv().unwrap_or(0))
+}
+
+/// RFC 9000 §10.2.3: an accepting end that abandons its handshake says so in a close sealed under the Handshake keys,
+/// and its dialer ends at once instead of waiting out its 22 s deadline on a half that is gone (the second of the two
+/// waits in a 41.9 s formation at load 170, 2026-11-08). Do: let the accepting end answer, then flood it until it
+/// abandons. Expect: it sent one close, and the dialer's `establish` ended `PeerClosed` within a simulated second.
+#[test]
+fn a_dialer_hears_its_peer_abandon_the_handshake_within_a_round_trip() {
+  let (outcome, took, closes) = dial_through_relay(AfterAnswer::FloodTheAcceptingEnd);
+  assert_eq!(closes, 1, "the accepting end said it abandoned");
+  assert_eq!(outcome, "Err(PeerClosed)");
+  assert!(
+    took < 1_000_000_000,
+    "the dialer heard it at once, not at its deadline: {took} ns"
+  );
+}
+
+/// Hostile input on the same path: a close that no one sealed under the Handshake keys is ignored, so a stranger cannot
+/// cost a dialer its socket. Do: after the accepting end answers, drop everything it sends and send the dialer closes
+/// that are well formed in shape but not sealed. Expect: the dialer ends on its own deadline, never `PeerClosed`.
+#[test]
+fn a_dialer_ignores_a_close_no_one_sealed() {
+  let (outcome, took, _) = dial_through_relay(AfterAnswer::ForgeClosesToTheDialer);
+  assert_eq!(outcome, "Err(NotReady)");
+  assert!(
+    took > 1_000_000_000,
+    "it waited out its own deadline: {took} ns"
+  );
 }
 
 /// AC (§4.8 formation; RFC 9002 §6.2 the probe timeout retransmits the pending flight): a dialer whose

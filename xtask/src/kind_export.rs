@@ -240,6 +240,8 @@ fn mint(scratch: &Path) -> Result<std::path::PathBuf, Failure> {
   )?;
   // tlshd refuses a private key other users can read (measured 2026-10-01: "File …/client.key: expected mode
   // 600", then no key loaded); the bind mount carries the host file's mode into the node.
+  // The KIND lane runs on Linux alone; elsewhere the scratch key keeps its default mode and the lane is not run.
+  #[cfg(unix)]
   {
     use std::os::unix::fs::PermissionsExt;
     #[allow(clippy::disallowed_methods)] // the development tool's own scratch directory
@@ -258,6 +260,7 @@ fn mint(scratch: &Path) -> Result<std::path::PathBuf, Failure> {
 }
 
 /// Format: the private key's mode: owner read and write only, what tlshd requires of a key file.
+#[cfg(unix)]
 const PRIVATE_KEY_MODE: u32 = 0o600;
 /// Format: the characters per line of a PEM body (RFC 7468 §2: "exactly 64 characters" per full line).
 const PEM_LINE: usize = 64;
@@ -642,9 +645,11 @@ impl Lane {
   }
 
   /// Replaces `path` in volume `id` with `bytes` through `slates write` on pod 0, under a write attachment made for
-  /// it and ended after it. Each `slates` run is a client of its own whose attachments end when it exits, so one is
-  /// never kept across runs (an attachment kept across the map leg's pod start was gone by its detach, measured
-  /// 2026-10-25 on adacachy: `NotFound`).
+  /// it and ended after it. Each `slates` run is a client of its own. Since A-230 the attachment `slates attach` makes
+  /// is a CLI attachment: it outlives that run for a term (the failover SLO), and the `write` and the `detach` that name
+  /// it next each renew it, so the three runs no longer race the reaper. Before, the reaper ended it with the
+  /// attaching run, and a detach after a slow write answered `NotFound` (2026-10-27). One is still never kept across
+  /// the map leg's pod start, which can outlast a term (measured 2026-10-25 on adacachy).
   fn write_through_slates(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), Failure> {
     let pod = format!("{RELEASE}-0");
     let attached = self.verb(&pod, &["attach", id, "--write"])?;

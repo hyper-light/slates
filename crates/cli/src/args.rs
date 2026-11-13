@@ -31,13 +31,14 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
   submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
+  checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
   advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
   attach ID [--read | --write] [--snapshot N]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
-  detach ATTACHMENT [--json]
+  detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
   recovery-plan (root | region) [--join-group HASH] [--json]
   recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
@@ -346,6 +347,16 @@ pub(crate) enum Verb {
     /// The work volume.
     work: slates_client::VolumeId,
   },
+  /// Check a green's head out into the volume and snapshot it was created from, through the caller's write
+  /// attachment of that volume (§4.16 A-201); the volume then lands like any other.
+  Checkout {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The volume and snapshot the green was created from.
+    base: GreenBase,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+  },
   /// Await a durability scope (`volume placed`).
   Placed {
     /// The volume.
@@ -392,6 +403,9 @@ pub(crate) enum Verb {
   Detach {
     /// The attachment.
     attachment: u64,
+    /// `--volume ID`: the attachment's volume, which routes the detach to its owner when that is another host
+    /// (A-222).
+    volume: Option<slates_client::VolumeId>,
   },
   /// Read a base entry.
   ReadBase {
@@ -491,6 +505,13 @@ pub(crate) enum Verb {
     /// The rights; all off removes the entry.
     rights: Rights,
   },
+  /// Turn a volume's live shipping on, or off with `--off` (`live-ship ID [--off]`, A-200).
+  LiveShip {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// Whether it is live-shipped from now on.
+    live_shipped: bool,
+  },
 }
 
 /// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
@@ -498,13 +519,21 @@ pub(crate) enum Verb {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SharePrincipal {
   /// A host account.
-  Uid(u32),
+  Uid {
+    /// The uid.
+    uid: u32,
+    /// The host whose account it is, by its certificate anchor as `slates status` prints it, or this daemon's own
+    /// when none is given (A-237).
+    host: Option<u64>,
+  },
   /// An enrolled consumer.
   Consumer {
     /// The account, or the caller's own when none is given.
     account: Option<u32>,
     /// The consumer id.
     consumer: u64,
+    /// The host whose account the consumer was enrolled under, or this daemon's own when none is given (A-237).
+    host: Option<u64>,
   },
 }
 
@@ -1203,23 +1232,36 @@ fn account(text: &str) -> Result<u32, ParseError> {
   })
 }
 
-/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`.
+/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`, each optionally `@ANCHOR`: the host whose account it is, by the
+/// `anchor` `slates status` prints on that host (A-237; a uid means something only on its host). Without one, this
+/// daemon's own host.
 fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
   let bad = || ParseError::BadValue {
     what: "PRINCIPAL",
-    reason: format!("{text} (uid:N, consumer:N or consumer:ACCOUNT/N)"),
+    reason: format!(
+      "{text} (uid:N, consumer:N or consumer:ACCOUNT/N, each optionally @ANCHOR from `slates status`)"
+    ),
   };
   let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+  let (value, host) = match value.split_once('@') {
+    Some((value, anchor)) => (value, Some(number(anchor).map_err(|_| bad())?)),
+    None => (value, None),
+  };
   match kind {
-    "uid" => Ok(SharePrincipal::Uid(account(value).map_err(|_| bad())?)),
+    "uid" => Ok(SharePrincipal::Uid {
+      uid: account(value).map_err(|_| bad())?,
+      host,
+    }),
     "consumer" => match value.split_once('/') {
       Some((owner, consumer)) => Ok(SharePrincipal::Consumer {
         account: Some(account(owner).map_err(|_| bad())?),
         consumer: number(consumer).map_err(|_| bad())?,
+        host,
       }),
       None => Ok(SharePrincipal::Consumer {
         account: None,
         consumer: number(value).map_err(|_| bad())?,
+        host,
       }),
     },
     _ => Err(bad()),
@@ -1264,8 +1306,22 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["live-ship", id] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--off"],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::LiveShip {
+          volume: volume(id)?,
+          live_shipped: !taken.switch("--off"),
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
+    ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
     _ => Ok(None),
   }
 }
@@ -1530,7 +1586,8 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           source: source.to_owned(),
           destination: destination.to_owned(),
         },
-        (None, None) => slates_client::AttachRequest::Root,
+        // A CLI attachment outlives this process for a term, for later `slates` processes to name (A-230).
+        (None, None) => slates_client::AttachRequest::Termed,
         (Some(_), None) => return Err(ParseError::Missing("--oci-destination CONTAINER_PATH")),
         (None, Some(_)) => return Err(ParseError::Missing("--oci-source HOST_PATH")),
       };
@@ -1546,14 +1603,18 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     }
     ["attach"] => Err(ParseError::Missing("volume ID")),
     ["detach", attachment] => {
-      taken.only(&NONE)?;
+      taken.only(&Spec {
+        values: &["--volume"],
+        switches: &[],
+      })?;
       let attachment = attachment
         .parse::<u64>()
         .map_err(|e| ParseError::BadValue {
           what: "ATTACHMENT",
           reason: e.to_string(),
         })?;
-      Ok(client(&taken, Verb::Detach { attachment }))
+      let volume = taken.value("--volume").map(volume).transpose()?;
+      Ok(client(&taken, Verb::Detach { attachment, volume }))
     }
     ["detach"] => Err(ParseError::Missing("ATTACHMENT")),
     ["status", id] => {
@@ -1838,6 +1899,27 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         },
       ))
     }
+    ["checkout", green, base, attachment] => {
+      taken.only(&Spec {
+        values: &["--snapshot"],
+        switches: &[],
+      })?;
+      let Some(snap) = taken.value("--snapshot") else {
+        return Err(ParseError::Missing("--snapshot N"));
+      };
+      Ok(client(
+        &taken,
+        Verb::Checkout {
+          green: volume(green)?,
+          base: GreenBase {
+            volume: volume(base)?,
+            snapshot: snapshot(snap)?,
+          },
+          attachment: number(attachment)?,
+        },
+      ))
+    }
+    ["checkout", ..] => Err(ParseError::Missing("GREEN VOLUME ATTACHMENT --snapshot N")),
     [verb, rest @ ..]
       if matches!(
         *verb,
@@ -2193,7 +2275,7 @@ mod tests {
         volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
         snapshot: Some(slates_client::SnapshotId { value: 3 }),
         intent: Intent::Write,
-        form: slates_client::AttachRequest::Root,
+        form: slates_client::AttachRequest::Termed,
       }
     );
     assert_eq!(
@@ -2504,6 +2586,7 @@ mod tests {
         SharePrincipal::Consumer {
           account: None,
           consumer: 7,
+          host: None,
         },
         Rights {
           read: true,
@@ -2518,6 +2601,7 @@ mod tests {
         SharePrincipal::Consumer {
           account: Some(501),
           consumer: 7,
+          host: None,
         },
         Rights {
           read: false,
@@ -2528,7 +2612,13 @@ mod tests {
     );
     assert_eq!(
       client_verb(&format!("share {id} uid:501")),
-      share(SharePrincipal::Uid(501), Rights::default())
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: None
+        },
+        Rights::default()
+      )
     );
     assert!(matches!(
       parse(&args(&format!("share {id} nobody:1"))),
@@ -2538,6 +2628,44 @@ mod tests {
       })
     ));
     assert_eq!(parse(&args("revoke")), Err(ParseError::Missing("CONSUMER")));
+  }
+
+  /// A-237: a share names another host's account by the anchor that host's `slates status` prints (`@ANCHOR`), and
+  /// without one this daemon's own host.
+  #[test]
+  fn a_share_names_another_hosts_account_by_its_anchor() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let vid = parse_volume_id(id).unwrap();
+    let share = |principal: SharePrincipal, rights: Rights| Verb::Share {
+      volume: vid,
+      principal,
+      rights,
+    };
+    assert_eq!(
+      client_verb(&format!("share {id} uid:501@12345 --read")),
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: Some(12345)
+        },
+        Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:501/7@12345")),
+      share(
+        SharePrincipal::Consumer {
+          account: Some(501),
+          consumer: 7,
+          host: Some(12345),
+        },
+        Rights::default()
+      )
+    );
   }
 
   /// `run` splits at `--` with its switches before it; a missing `--` or an empty command is refused.

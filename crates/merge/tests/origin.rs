@@ -106,7 +106,7 @@ fn a_malformed_origin_is_refused_typed_at_every_cut() {
 /// with nothing changed after version 0.
 #[test]
 fn a_green_seeded_from_an_origin_holds_it_at_version_zero() {
-  let green = Green::with_origin(&fixed_origin());
+  let green = Green::with_origin(fixed_origin());
   assert_eq!(green.head(), 0, "the origin is not a delta");
   assert_eq!(green.content("README"), Some(b"hello\n".as_slice()));
   assert!(green.is_dir("src"));
@@ -122,7 +122,7 @@ fn a_green_seeded_from_an_origin_holds_it_at_version_zero() {
 /// moved.
 #[test]
 fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
-  let mut green = Green::with_origin(&fixed_origin());
+  let mut green = Green::with_origin(fixed_origin());
   let before = green.fast_path_hits();
   let outcome = green.submit(&Build::new().overwrite("README", 0, b"HELLO").at(1, 0));
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
@@ -151,19 +151,21 @@ fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
 /// encoding is caught across versions, not only within a run.
 #[test]
 fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
-  let origin_identity = Green::with_origin(&fixed_origin()).head_identity();
+  let origin_identity = Green::with_origin(fixed_origin()).head_identity();
   assert_eq!(
     hex(&origin_identity),
-    "1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8",
+    // A-202 (2026-11-05): the identity became a set hash over the green's entries; before it, the BLAKE3 of the
+    // tables in order, `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8`.
+    "d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146",
     "the head identity changed; regenerate the golden vector only for a deliberate format change"
   );
   assert_eq!(
-    Green::with_origin(&fixed_origin_reversed()).head_identity(),
+    Green::with_origin(fixed_origin_reversed()).head_identity(),
     origin_identity,
     "declaration order does not reach the identity"
   );
-  let mut one = Green::with_origin(&fixed_origin());
-  let mut two = Green::with_origin(&fixed_origin());
+  let mut one = Green::with_origin(fixed_origin());
+  let mut two = Green::with_origin(fixed_origin());
   let increment = Build::new().overwrite("README", 0, b"HELLO").at(1, 0);
   assert_eq!(one.submit(&increment), Outcome::Accepted { version: 1 });
   assert_eq!(two.submit(&increment), Outcome::Accepted { version: 1 });
@@ -173,7 +175,7 @@ fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
     origin_identity,
     "a version has its own identity"
   );
-  let mut other = Green::with_origin(&fixed_origin());
+  let mut other = Green::with_origin(fixed_origin());
   assert_eq!(
     other.submit(&Build::new().overwrite("README", 0, b"HELLo").at(1, 0)),
     Outcome::Accepted { version: 1 }
@@ -240,4 +242,70 @@ fn an_increments_evidence_round_trips_and_a_wild_count_is_refused() {
     Increment::decode(&padded),
     Err(DocDecodeError::TrailingBytes)
   );
+}
+
+/// §4.16, A-217 (an origin's identity taken in slices): the identity hashed a share at a time from any share size
+/// equals the BLAKE3 of the encoding, and equals [`Origin::identity`]; a cursor is refused for an origin not yet
+/// canonical, whose bytes as it stands are not the canonical ones. Do: hash the canonical fixed origin in shares of
+/// 1, 3, 17 and 64 bytes and in one share. Expect: one identity, the encoding's BLAKE3, pinned by a golden vector so the
+/// streamed writer cannot drift from the bytes a held origin's recorded identity was taken over. The decoder's grammar
+/// admits one byte string per origin, so the round trip in `an_origin_encodes_canonically_and_round_trips` holds the
+/// writer to the bytes every earlier encoder wrote.
+#[test]
+fn an_origins_identity_taken_in_shares_is_the_hash_of_its_encoding() {
+  let mut canonical = fixed_origin();
+  canonical.canonicalize();
+  let whole = *blake3::hash(&canonical.encode()).as_bytes();
+  for share in [1, 3, 17, 64, usize::MAX] {
+    let mut cursor = slates_merge::origin::IdentityCursor::new(&canonical).expect("canonical");
+    let mut steps = 0usize;
+    let identity = loop {
+      steps += 1;
+      if let Some(identity) = cursor.step(&canonical, share) {
+        break identity;
+      }
+    };
+    assert_eq!(identity, whole, "shares of {share} bytes ({steps} steps)");
+  }
+  assert_eq!(canonical.identity(), whole);
+  assert_eq!(fixed_origin().identity(), whole);
+  assert_eq!(fixed_origin_reversed().identity(), whole);
+  // `fixed_origin` declares its files out of order, so it is not canonical as it stands.
+  assert!(slates_merge::origin::IdentityCursor::new(&fixed_origin()).is_none());
+  assert_eq!(
+    hex(&whole),
+    "31913d4ffb4e02f7e66f52b386ba430358c93042e693b5888db20a8aac9ce042",
+    "the fixed origin's identity (golden vector)"
+  );
+}
+
+/// §4.16, §4.3 (a green seeded in shares): a green loaded from its origin a few bytes at a time is the green
+/// [`Green::with_origin`] seeds in one call. Do: load the fixed origin in shares of 1 and 16 bytes and whole. Expect:
+/// one head identity, version 0's files read back alike, and more than one step for the small shares (non-vacuity).
+#[test]
+fn a_green_seeded_in_shares_is_the_green_seeded_whole() {
+  let mut whole = Green::with_origin(fixed_origin());
+  for share in [1, 16] {
+    let mut load = slates_merge::engine::OriginLoad::new(fixed_origin());
+    let mut steps = 0usize;
+    let mut green = loop {
+      steps += 1;
+      if let Some(green) = load.step(share) {
+        break green;
+      }
+    };
+    assert!(steps > 1, "shares of {share} bytes took {steps} steps");
+    assert_eq!(
+      green.head_identity(),
+      whole.head_identity(),
+      "shares of {share} bytes"
+    );
+    for path in ["README", "src/lib.rs"] {
+      assert_eq!(
+        green.content_at(path, 0),
+        whole.content_at(path, 0),
+        "{path}"
+      );
+    }
+  }
 }

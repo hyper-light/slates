@@ -181,6 +181,7 @@ fn after_the_refusal(client: &mut Client, volume: VolumeId) -> [ReplyBody; 4] {
   let retried = client.call_as(answered_id, &RequestBody::Status { volume });
   let acknowledged = client.call(&RequestBody::Acknowledge {
     up_to: answered_id.sequence,
+    owed: Vec::new(),
   });
   let again = client.call_as(refused_id, &RequestBody::Status { volume });
   let fresh = client.call(&RequestBody::Status { volume });
@@ -211,7 +212,7 @@ fn daemon(name: &str) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -219,6 +220,41 @@ fn daemon(name: &str) -> (Daemon, String) {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
+}
+
+/// A-254, under A-176 and A-178's rule. Do: start a daemon that creates its own segment (run alone, with no anchor); start a
+/// second daemon for the same instance and segment name. Expect the second refused and the first's segment still there
+/// to attach by its handoff: a refused start leaves a running instance untouched. Before, on macOS, the second start
+/// created its segment before it asked who owned the instance, and that creation and its drop each unlinked the first's
+/// name (`shm_open` `ENOENT` at the attach). Linux's segment has no name, so there the attach holds either way.
+#[test]
+fn a_refused_second_daemon_leaves_the_live_ones_segment_in_place() {
+  let profile = common::machine_profile();
+  let name = format!("second-daemon-{}", std::process::id());
+  let instance = format!("srv-{name}");
+  let start = || {
+    Daemon::start(
+      &profile,
+      DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+      SegmentSource::Create {
+        name: format!("slates-seg-{name}"),
+      },
+    )
+  };
+  let first = start().unwrap();
+  let second = start();
+  assert!(
+    second.is_err(),
+    "a second daemon of a live instance is refused"
+  );
+  drop(second);
+  let (handoff, len) = first.segment().handoff().unwrap();
+  let attached = slates_anchor::AnchorSegment::attach(&handoff, len, &profile.facts.identity);
+  assert!(
+    attached.is_ok(),
+    "the live daemon's segment is still there: {:?}",
+    attached.err()
+  );
 }
 
 /// §4.8 "Lookup" (found 2026-10-10 by the CLI's anchor flow): a daemon with no other host has nobody to forward a
@@ -289,7 +325,7 @@ fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -364,7 +400,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -681,7 +717,7 @@ fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, Str
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -939,7 +975,10 @@ fn rifl_scenario() {
   };
   assert_eq!(volumes.len(), 1, "the retry did not execute again");
   assert!(matches!(
-    client.call(&RequestBody::Acknowledge { up_to: id.sequence }),
+    client.call(&RequestBody::Acknowledge {
+      up_to: id.sequence,
+      owed: Vec::new(),
+    }),
     ReplyBody::Acknowledged
   ));
   let stale = client.call_as(id, &scratch("once"));
@@ -1537,7 +1576,11 @@ fn a_read_only_consumer_cannot_grant_itself_more_rights(
 ) {
   let escalate = RequestBody::Share {
     volume: id,
-    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    principal: slates_ipc::protocol::Principal::Consumer {
+      host: common::this_host(),
+      account,
+      consumer,
+    },
     rights: slates_ipc::protocol::Rights {
       read: true,
       write: true,
@@ -1682,7 +1725,11 @@ fn the_consumer_holds_only_the_right_shared(
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: false,
@@ -1860,7 +1907,11 @@ fn a_consumer_with_a_shared_volume(
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
-      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
       rights: slates_ipc::protocol::Rights {
         read: true,
         write: true,
@@ -2042,7 +2093,7 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{name}"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
@@ -2257,7 +2308,7 @@ fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-telemetry-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "telemetry"),
     },
   )
   .unwrap();
@@ -2494,7 +2545,10 @@ fn overflow_telemetry(client: &mut Client, id: VolumeId, ring_capacity: usize) {
     };
     if count % ACK_EVERY == 0 {
       let up_to = client.sequence;
-      let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge { up_to }) else {
+      let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge {
+        up_to,
+        owed: Vec::new(),
+      }) else {
         panic!("acknowledge");
       };
     }
@@ -2705,6 +2759,110 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
     "the green's first version is the owner's, not the intruder's"
   );
   daemon.stop();
+}
+
+/// §4.13 access lists on a green (§4.16): an owner shares its green with another principal, which then reads
+/// it, works over it and lands its own increment, as a user on another fleet node reaches a green that node
+/// forwards to (the fs-server lab of 2026-11-04 met it first: `slates share GREEN uid:1000` on the green's
+/// node answered `NotFound`). Before the share the second principal is refused `Forbidden`; the share must
+/// answer `Shared`, and after it the principal's version read, file read, work, edit and submit all answer,
+/// the submit advancing the green to version 2 over the owner's version 1.
+#[test]
+fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
+  let (daemon, instance) = daemon("merge-share");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut sharer = Client::connect(&instance);
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  let proof = slates_server::landing::attest_proof(&capability, sharer.client);
+  assert!(matches!(
+    sharer.call(&RequestBody::Attest { consumer, proof }),
+    ReplyBody::Attested
+  ));
+  let (green, work) = owner_green_and_work(&mut owner);
+  assert!(matches!(
+    owner.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  assert_foreign_merge_refused(sharer.call(&RequestBody::Versions { green }));
+  share_green_for_reading(&mut owner, green, account, consumer);
+  the_sharer_reads_and_works_the_green(&mut sharer, green);
+  daemon.stop();
+}
+
+/// The owner shares `green` with the consumer for reading, and the share answers `Shared`.
+fn share_green_for_reading(owner: &mut Client, green: VolumeId, account: u32, consumer: u64) {
+  let shared = owner.call(&RequestBody::Share {
+    volume: green,
+    principal: slates_ipc::protocol::Principal::Consumer {
+      host: common::this_host(),
+      account,
+      consumer,
+    },
+    rights: slates_ipc::protocol::Rights {
+      read: true,
+      write: false,
+      admin: false,
+    },
+  });
+  assert_eq!(shared, ReplyBody::Shared, "the owner shares its green");
+}
+
+/// The principal a green was shared with reads its head and file, works over it and submits an increment the green
+/// accepts as version 2.
+fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
+  assert_eq!(
+    sharer.call(&RequestBody::Versions { green }),
+    ReplyBody::Versions { head: 1 }
+  );
+  assert_eq!(
+    sharer.call(&RequestBody::Read {
+      volume: green,
+      path: "f".to_owned(),
+      at: ReadAt::Head,
+    }),
+    ReplyBody::ReadBytes {
+      bytes: b"owned".to_vec()
+    }
+  );
+  let ReplyBody::WorkCreated { id: own, base } = sharer.call(&RequestBody::CreateWork {
+    green,
+    name: "shared-work".to_owned(),
+  }) else {
+    panic!("the principal the green is shared with creates a work over it");
+  };
+  assert_eq!(base, 1, "the work is based on the owner's version");
+  assert!(matches!(
+    sharer.call(&RequestBody::Edit {
+      work: own,
+      path: "g".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"theirs".to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+  let submitted = sharer.call(&RequestBody::Submit {
+    work: own,
+    evidence: Vec::new(),
+  });
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the shared principal's increment is accepted as version 2, got {submitted:?}"
+  );
 }
 
 /// The merge submit flow and the verdict (§4.16 Phase 6 Task 6): two agents create work volumes over
@@ -3315,7 +3473,7 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-metadata-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "metadata"),
     },
   )
   .unwrap();
@@ -4063,7 +4221,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-bound-{}", std::process::id()),
+      name: common::fixture_object("slates-seg", "bound"),
     },
   )
   .unwrap();
@@ -4111,7 +4269,7 @@ fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
       &profile,
       config.clone(),
       SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
+        name: common::fixture_object("slates-seg", &instance),
       },
     )
     .unwrap()
@@ -4160,14 +4318,14 @@ const RETENTION_FILE_BYTES: usize = 2 * 1024;
 /// Shape: how many small edits the writer submits over it.
 const RETENTION_EDITS: u64 = 6;
 
-/// AC (§4.2 all-cost admission, §4.16 "delta retention before folding"; AUD-16), by use: a green's
-/// retained history — the full copy each small edit to a large file supersedes — is **measured** and
-/// **charged** to the shard's budget as retention, balanced with the engine's own recount; while a
+/// AC (§4.2 all-cost admission, §4.16 "delta retention before folding" and "Splice"; AUD-16, W2), by use: a green's
+/// retained history — what each small edit to a large file changed, shared copy-on-write with the versions around it
+/// — is **measured** and **charged** to the shard's budget as retention, balanced with the engine's own recount; while a
 /// lagging work still names the old version the copies are kept for it (the fold floor is its base),
 /// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
 /// head, folds every copy away and credits the charge — so only the rejected-result cache remains
-/// charged. Non-vacuous: the history grew by one file copy per edit before the fold and is zero
-/// after it, and every observation has `charged == history + rejected`.
+/// charged. Non-vacuous: the history grew with the edits before the fold (by less than one copy of the file for all of
+/// them) and is zero after it, and every observation has `charged == history + rejected`.
 #[test]
 fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
   let (daemon, instance) = daemon("merge-retention");
@@ -4184,10 +4342,11 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
     submit_accepted(&mut client, writer, 2 + edit);
   }
   let retained = daemon.merge_retention(g).unwrap();
-  assert_eq!(
-    retained.history,
-    RETENTION_EDITS * RETENTION_FILE_BYTES as u64,
-    "each small edit retained a full copy of the superseded file for the lagging work (measured): {retained:?}"
+  assert!(
+    retained.history > 0 && retained.history < RETENTION_FILE_BYTES as u64,
+    "the small edits retained what they changed for the lagging work, less than one copy of the file for all \
+     of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
+    RETENTION_EDITS * RETENTION_FILE_BYTES as u64
   );
   assert_balanced(&retained, 0);
 
@@ -4269,7 +4428,7 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
     &profile,
     config,
     SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
+      name: common::fixture_object("slates-seg", &instance),
     },
   )
   .unwrap();
@@ -4294,10 +4453,12 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
 
 /// §4.2 (a work's charge), banned item 8: do create a work, edit it, then withhold the shard's whole admittable
 /// capacity (the memory-pressure hold) and edit again; expect the edit refused `BudgetExceeded` with the file
-/// unchanged, and a new work of the (now non-empty) green refused too (its seeded copy is charged). Release the
-/// hold; expect the edit to succeed.
-/// A work's content and journal live in the owner shard's memory, so they are charged like a volume's growth, never
-/// kept for free.
+/// unchanged. A new work of the (now non-empty) green holds nothing of its own (§4.16: a work is a delta over its
+/// base, `crates/server/src/work_files.rs`), so it is created under the hold; its first edit of the green's file
+/// copies the file into the work and is refused `BudgetExceeded`, its view of the file unchanged. Release the hold;
+/// expect both edits to succeed.
+/// What a work keeps (the files it changed and its journal) lives in the owner shard's memory, so it is charged like
+/// a volume's growth, never kept for free.
 #[test]
 fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them() {
   use slates_ipc::protocol::ReadAt;
@@ -4364,21 +4525,74 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
     },
     "the refused edit changed nothing"
   );
-  let second = client.call(&RequestBody::CreateWork {
+  let second = a_new_work_under_the_hold(&mut client, green);
+  daemon.inject_pressure_hold(0).unwrap();
+  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
+  the_new_works_edit_once_released(&mut client, second);
+  drop(client);
+  daemon.stop();
+}
+
+/// A one-byte insert at the start of `f.txt` in `work`.
+fn edit_first_byte(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
+  client.call(&RequestBody::Edit {
+    work,
+    path: "f.txt".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"x".to_vec(),
+  })
+}
+
+/// `f.txt` as `work` sees it.
+fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
+  client.call(&RequestBody::Read {
+    volume: work,
+    path: "f.txt".to_owned(),
+    at: slates_ipc::protocol::ReadAt::Head,
+  })
+}
+
+/// Under the pressure hold: a new work of `green` is created (it holds nothing of its own), and its first edit of the
+/// green's file, which copies the file into it, is refused `BudgetExceeded` with its view unchanged.
+fn a_new_work_under_the_hold(
+  client: &mut Client,
+  green: slates_ipc::protocol::VolumeId,
+) -> slates_ipc::protocol::VolumeId {
+  let ReplyBody::WorkCreated { id: second, .. } = client.call(&RequestBody::CreateWork {
     green,
     name: "charge-w2".to_owned(),
-  });
+  }) else {
+    panic!("a new work holds nothing of its own, so the hold does not refuse it")
+  };
+  let refused = edit_first_byte(client, second);
   assert!(
     matches!(
-      second,
+      refused,
       ReplyBody::Refused {
         refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
       }
     ),
-    "a new work's seeded copy is charged: {second:?}"
+    "the copy a first edit makes of the green's file is charged: {refused:?}"
   );
-  daemon.inject_pressure_hold(0).unwrap();
-  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
-  drop(client);
-  daemon.stop();
+  assert_eq!(
+    read_f(client, second),
+    ReplyBody::ReadBytes {
+      bytes: b"before".to_vec()
+    },
+    "the new work sees the green's file, unchanged by the refused edit"
+  );
+  second
+}
+
+/// Once the hold is released, the new work's edit splices the green's file.
+fn the_new_works_edit_once_released(client: &mut Client, second: slates_ipc::protocol::VolumeId) {
+  assert_eq!(edit_first_byte(client, second), ReplyBody::Edited);
+  assert_eq!(
+    read_f(client, second),
+    ReplyBody::ReadBytes {
+      bytes: b"xbefore".to_vec()
+    },
+    "the new work's edit spliced the green's file"
+  );
 }

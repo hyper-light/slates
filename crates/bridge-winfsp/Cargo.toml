@@ -12,6 +12,8 @@ description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the refusal taxo
 slates-vfs = { workspace = true }
 slates-bridge-core = { workspace = true }
 slates-mem = { workspace = true }
+# A join a shard waits on, marked so the watchdog reads it as the joined thread runs (A-228's transitive wait).
+slates-rt = { workspace = true }
 slates-wire = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -21,10 +23,15 @@ slates-wire = { workspace = true }
 # a purge's write (A-190).
 slates-machine = { workspace = true }
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices"] }
+# The purge client's process (A-190 moved out of the daemon, §4.6): its spawn into a kill-on-close job and its pipe.
+slates-ipc = { workspace = true }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the purge slot's interleaving model (A-249, AC-0.7).
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [target.'cfg(windows)'.dev-dependencies]
 slates-anchor = { workspace = true }
-slates-ipc = { workspace = true }
 slates-db = { workspace = true }
 
 [lints]

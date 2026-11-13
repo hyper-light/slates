@@ -1,10 +1,12 @@
 # The Python SDK's release lane (§2.4 "`slates` on PyPI"; docs/publish.md). On a pushed tag
 # `v<version>`: build the cp39-abi3 wheel of crates/sdk-python (one wheel per platform serves every
-# CPython >= 3.9) for manylinux and musllinux (x86_64, aarch64), macOS (x86_64, arm64) and Windows
-# (x64), plus the sdist, check every artifact's metadata, and publish to PyPI through TRUSTED
+# CPython >= 3.9) for the targets slates ships (A-210): manylinux and musllinux (x86_64, aarch64), macOS arm64 and
+# Windows (x64, arm64), each on a runner of its own platform, plus the sdist; check every artifact's metadata; and on
+# a tag publish to PyPI through TRUSTED
 # PUBLISHING — OIDC from the `pypi` environment's id-token; no API token anywhere. PyPI registers a
 # *pending* trusted publisher for a project that does not exist yet, so no maintainer upload ever
-# happens (the one-time registration is in docs/publish.md). workflow_dispatch is a build-only dry run.
+# happens (the one-time registration is in docs/publish.md). workflow_dispatch is a dry run: it builds and checks every
+# artifact and publishes nothing (the publish job runs on a tag only).
 #
 # The version is the workspace's: maturin reads it from the crate manifest (`dynamic = ["version"]`
 # in pyproject.toml), and the shared guard refuses a tag that does not name it.
@@ -38,12 +40,33 @@ jobs:
           - { name: musllinux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
           - { name: musllinux-aarch64, os: ubuntu-24.04-arm, manylinux: musllinux_1_2 }
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
-          - { name: windows-x64, os: windows-latest, target: x64 }
+          - { name: windows-x64, os: windows-2025, target: x64, nasm: true }
+          # Native arm64 Windows (windows-11-arm), an arm64 CPython, and clang-cl for AWS-LC, as release.yml builds it.
+          - { name: windows-arm64, os: windows-11-arm, target: aarch64, python_arch: arm64, clang_cl: true }
+    env:
+      # The extension links AWS-LC (slates-client's seal). Its Windows x86 assembly is built from its NASM source, never
+      # the prebuilt objects, as release.yml and CI build it (ignored elsewhere).
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Install NASM
+        if: ${{ matrix.nasm }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the extension links (arm64 Windows)
+        if: ${{ matrix.clang_cl }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          architecture: ${{ matrix.python_arch || '' }}
       - uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
@@ -73,10 +96,26 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  # Every run, the dry run too: PyPI's own metadata and README check over every artifact, so a refused artifact fails
+  # here, before any tag, and not halfway through an upload.
+  check:
+    name: every artifact passes twine check
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check every artifact's metadata
+        run: |
+          ls -l dist
+          pipx run twine check --strict dist/*
+
   publish:
     name: Publish slates to PyPI (trusted publishing)
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [wheels, sdist]
+    needs: [check]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

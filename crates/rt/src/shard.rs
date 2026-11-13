@@ -257,6 +257,9 @@ pub struct ShardInner {
   fired: Vec<u64>,
   completions: Vec<Completion>,
   pollers: Vec<Poller>,
+  /// Work the shard does in its idle time, a slice a call, before it parks ([`ShardContext::set_idle_work`]): `None`
+  /// when none is registered, and while a slice of it runs.
+  idle_work: Option<Box<dyn FnMut() -> bool>>,
   /// The consumer of the entry's foreign wake ring, claimed at build and held for the context's life (the
   /// ring's only consumer, AUD-29-33); `None` for a context with no entry.
   foreign: Option<slates_mem::mpsc::Consumer<'static>>,
@@ -268,6 +271,9 @@ pub struct ShardInner {
   /// Whether each slot is in `timer_waiters`, grown to the highest slot that waited (below the arena's
   /// capacity).
   timer_waiter_queued: Vec<bool>,
+  /// The task the shard runs alone while it lives ([`ShardContext::spawn_alone`]): until its future ends, each step
+  /// polls it and no other task, which stay queued in order. `None` when no task holds the shard.
+  alone: Option<Handle<TaskSlot>>,
 }
 
 impl ShardInner {
@@ -512,9 +518,11 @@ impl ShardContext {
         counters: Counters::default(),
         shutting_down: false,
         pollers: Vec::new(),
+        idle_work: None,
         foreign,
         timer_waiters: std::collections::VecDeque::new(),
         timer_waiter_queued: Vec::new(),
+        alone: None,
       }),
       kept: KeptValues::default(),
     }));
@@ -766,6 +774,33 @@ impl ShardContext {
   /// Admits a local future under `parent`, joinable.
   pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
     self.admit(future, parent, true)
+  }
+
+  /// Admits a local future, joinable, that the shard runs alone until its future ends: each step polls it and no other
+  /// task. Tasks queued before it, spawned or woken meanwhile stay queued in their order and run once it ends, as they
+  /// would behind one long poll. It may yield as often as it likes, and every yield ends a step, so the shard's
+  /// steps, its pulse and its inbox go on (what a watchdog judging steps sees). Refused [`RtError::ShardHeld`] while
+  /// another task holds the shard. A shard held by a task that waits on something other than itself does nothing
+  /// else until that comes.
+  pub fn spawn_alone(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
+    let held = self
+      .with_inner(|inner| live_alone(inner).map(|handle| handle.index()))
+      .ok_or(RtError::NotOnShardThread)?;
+    if let Some(slot) = held {
+      return Err(RtError::ShardHeld { slot });
+    }
+    let id = self.admit(future, None, true)?;
+    self
+      .with_inner(|inner| inner.alone = Some(handle_of(id)))
+      .ok_or(RtError::NotOnShardThread)?;
+    Ok(id)
+  }
+
+  /// Whether a task holds the shard alone now ([`Self::spawn_alone`]).
+  fn held_alone(&self) -> bool {
+    self
+      .with_inner(|inner| live_alone(inner).is_some())
+      .unwrap_or(false)
   }
 
   fn admit(
@@ -1123,6 +1158,11 @@ impl ShardContext {
       if self.spin_after_activity(outcome.next_deadline_ns) {
         continue;
       }
+      // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
+      // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
+      if self.idle_slice() {
+        continue;
+      }
       self.park(outcome.next_deadline_ns);
       last_wait_ns = self.now_ns();
     }
@@ -1267,7 +1307,7 @@ impl ShardContext {
       self.update_attribution(|tracker| tracker.step_began(|| self.account_now()));
     }
     let mut did_work = false;
-    let (drained, batch) = self
+    let (drained, batch, alone) = self
       .with_inner(|inner| {
         inner.counters.steps = inner.counters.steps.saturating_add(1);
         // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
@@ -1291,15 +1331,26 @@ impl ShardContext {
         work |= self.drain_inbound(inner);
         work |= self.expire_timers(inner);
         work |= self.wake_ready_pollers(inner);
-        (work, inner.config.batch)
+        (work, inner.config.batch, live_alone(inner))
       })
-      .unwrap_or((false, 1));
+      .unwrap_or((false, 1, None));
     did_work |= drained;
-    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`).
-    let ready = self.local.take_ready(batch.max(1));
-    for slot in &ready {
+    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`). A shard a task holds
+    // alone polls that task only, when it is ready ([`Self::spawn_alone`]).
+    let ready = match alone {
+      Some(holder) => self.local.take_slot(holder.index()),
+      None => self.local.take_ready(batch.max(1)),
+    };
+    for (polled, slot) in ready.iter().enumerate() {
       did_work = true;
       self.poll_slot(*slot);
+      // A task this poll ran began to hold the shard alone: the rest of the batch waits for it, in its order.
+      if alone.is_none() && self.held_alone() {
+        self
+          .local
+          .put_back(ready.get(polled.saturating_add(1)..).unwrap_or_default());
+        break;
+      }
     }
     self.local.finish_drain(ready);
     let (exit, next_deadline_ns) = self
@@ -1573,6 +1624,33 @@ impl ShardContext {
       }
     }
     any
+  }
+
+  /// Registers `work` as this shard's idle work (§4.2's pre-fault task on idle time; the daemon's reserve refill,
+  /// A-214), replacing any before it. When a step finds nothing to do and the idle spin has run out, the loop calls it
+  /// once, and looks for work again before it calls it next; `work` does a slice bounded by the shard's quantum and
+  /// says whether it did anything, and the shard parks once it says no. It runs outside every task, so it may not
+  /// await. Refused off the shard's thread.
+  pub fn set_idle_work(&self, work: Box<dyn FnMut() -> bool>) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.idle_work = Some(work))
+      .ok_or(RtError::NotOnShardThread)
+  }
+
+  /// One slice of the registered idle work: whether it did anything. The work is taken out of the shard's state while
+  /// it runs, so it may use the shard's other services without a nested borrow, and put back after unless it was
+  /// replaced meanwhile.
+  fn idle_slice(&self) -> bool {
+    let Some(mut work) = self.with_inner(|inner| inner.idle_work.take()).flatten() else {
+      return false;
+    };
+    let did = work();
+    self.with_inner(|inner| {
+      if inner.idle_work.is_none() {
+        inner.idle_work = Some(work);
+      }
+    });
+    did
   }
 
   /// Registers `task` as a poller with `ready`; the loop wakes it whenever `ready` says so.
@@ -1863,6 +1941,10 @@ fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcom
   let Some(handle) = handle_at(&inner.arena, slot) else {
     return;
   };
+  // A task that held the shard alone lets it go as its future ends, whether it completed or was cancelled.
+  if inner.alone == Some(handle) {
+    inner.alone = None;
+  }
   let (children, first_child) = match inner.arena.get_mut(handle) {
     Ok(task) => {
       task.state = State::Finishing;
@@ -1967,6 +2049,22 @@ fn release_finished(arena: &mut Slab<TaskSlot>) {
       let _ = arena.remove(handle);
     }
   }
+}
+
+/// The task holding the shard alone, if its future has not ended ([`ShardContext::spawn_alone`]). A hold whose task is
+/// gone without passing through [`finish`] (its slot freed or reused) is let go here, so a stale hold never starves the
+/// shard.
+fn live_alone(inner: &mut ShardInner) -> Option<Handle<TaskSlot>> {
+  let holder = inner.alone?;
+  let live = inner
+    .arena
+    .get(holder)
+    .is_ok_and(|task| !matches!(task.state, State::Finishing | State::Done));
+  if !live {
+    inner.alone = None;
+    return None;
+  }
+  Some(holder)
 }
 
 fn cancel_all(arena: &mut Slab<TaskSlot>, local: &LocalQueue) {

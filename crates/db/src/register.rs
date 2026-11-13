@@ -166,6 +166,15 @@ impl Quorum {
     acked >= self.commit()
   }
 
+  /// Whether `acked` acknowledgements from a joint write's cohort of `cohort` hosts satisfy that cohort (§4.8 "joint
+  /// writes"): `f + 1` of it, or every member when it has fewer than `f + 1`, and at least one. A cohort smaller than
+  /// the quorum is the one a bootstrap settles (the first node alone) while its neighbourhood grows to the region; it
+  /// could never give `f + 1`, so a record joined with it never committed and the change it waited on never settled
+  /// (the bug record of 2026-11-06). Every member of it is the most a takeover recovering through it could meet.
+  pub fn committed_within(self, acked: usize, cohort: usize) -> bool {
+    acked >= self.commit().min(cohort).max(1)
+  }
+
   /// Derived: the promises a takeover's phase one needs from a recovery cohort of `cohort` hosts before it
   /// adopts, so that its answers meet every record that could have committed there. A commit is `f + 1`
   /// acknowledgements of the cohort, so `cohort − f` promises meet every such set — `q1 + q2 > n`, the
@@ -174,8 +183,9 @@ impl Quorum {
   /// (`cohort = 2f + 1`) that is `f + 1`. A cohort a forming region fixed with fewer hosts needs fewer: a
   /// commit there is held by more of its hosts, so fewer answers meet it (two hosts at `f = 1` commit only with
   /// both, so either one's promise suffices); demanding `f + 1` there declared a record lost while its cohort's
-  /// survivor held it. A cohort of `f` or fewer hosts never committed anything, yet a round adopts only what a
-  /// promise reports, so it needs one.
+  /// survivor held it. A cohort of `f` or fewer hosts commits a joint write only with every one of its hosts
+  /// ([`Quorum::committed_within`]), so one promise meets it, and a round adopts only what a promise reports, so it
+  /// needs one.
   pub fn recovery(self, cohort: usize) -> usize {
     cohort
       .saturating_sub(usize::try_from(self.f).unwrap_or(usize::MAX))
@@ -298,7 +308,7 @@ impl Placement {
     self
       .joint
       .iter()
-      .all(|cohort| quorum.committed(distinct_acks_within(cohort, acked)))
+      .all(|cohort| quorum.committed_within(distinct_acks_within(cohort, acked), cohort.len()))
   }
 
   /// The single-cohort placement of `candidates` that nothing has acknowledged yet — the shape a dispatch to
@@ -1176,6 +1186,10 @@ pub struct HostPromise {
   pub next: Option<ObjectId>,
   /// The highest fence above the epoch on an object this holder could not promise, if any.
   pub fenced: Option<HostEpoch>,
+  /// How many objects this page's range holds a copy of that this holder could not promise for any other reason: such
+  /// a page is no answer for what it leaves out, so the asker does not count it as complete. Listing nothing means
+  /// holding nothing only when this is zero.
+  pub unpromised: u32,
 }
 
 /// Format: the fixed width of one [`HostPromise`] entry before its value: the object (16 bytes), the record's
@@ -1183,9 +1197,10 @@ pub struct HostPromise {
 pub const HOST_PROMISE_ENTRY_BYTES: usize = OBJECT_BYTES + 2 * size_of::<u64>() + size_of::<u32>();
 
 /// Format: the widest [`HostPromise`] header: holder, departed, epoch, generation (u64 LE each), the next
-/// page's presence byte and object, the fence's presence byte and epoch, and the entry count (u32 LE).
+/// page's presence byte and object, the fence's presence byte and epoch, the unpromised count and the entry count
+/// (u32 LE each).
 pub const HOST_PROMISE_HEADER_BYTES: usize =
-  4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
+  4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + 2 * size_of::<u32>();
 
 impl HostPromise {
   /// Whether this answers `prepare`: the same retired host, epoch and generation, so an answer to another
@@ -1218,6 +1233,7 @@ impl HostPromise {
         out.extend_from_slice(&fence.0.to_le_bytes());
       }
     }
+    out.extend_from_slice(&self.unpromised.to_le_bytes());
     let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for (object, accepted) in &self.entries {
@@ -1246,6 +1262,7 @@ impl HostPromise {
       FIELD_PRESENT => Some(HostEpoch(reader.word()?)),
       _ => return Err(RegisterError::MalformedRecord),
     };
+    let unpromised = reader.half()?;
     let count = usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
     if count > reader.remaining() / HOST_PROMISE_ENTRY_BYTES {
       return Err(RegisterError::MalformedRecord);
@@ -1276,6 +1293,7 @@ impl HostPromise {
       entries,
       next,
       fenced,
+      unpromised,
     })
   }
 }
@@ -1514,6 +1532,15 @@ impl Acceptor {
       .range((object, 0)..=(object, u64::MAX))
       .next_back()
       .map(|(&(_, sequence), (_, value))| (sequence, value.as_slice()))
+  }
+
+  /// The value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup, where
+  /// [`Acceptor::values`] walks every position the object holds.
+  pub fn value_at(&self, object: ObjectId, sequence: u64) -> Option<&[u8]> {
+    self
+      .accepted
+      .get(&(object, sequence))
+      .map(|(_, value)| value.as_slice())
   }
 
   /// Every accepted value of `object`, in sequence order (a ledger's whole history).
@@ -2104,10 +2131,14 @@ pub enum Lineage {
   },
   /// No survivor of the object's recovery cohorts was ranked: nothing can recover it.
   Lost,
-  /// A retirement in the object's line is no longer kept: its takeover is done — every survivor confirmed its
-  /// share, so the object was adopted elsewhere — or the retirement was dropped past the bound, beyond the
-  /// failures the region tolerates. A holder's copy of it is stale.
+  /// A retirement in the object's line is no longer kept because its takeover is done: every survivor confirmed its
+  /// share, and a survivor confirms only once every object it learned was adopted (A-272). A holder's copy is stale.
   Settled,
+  /// Nothing shows where the object went (A-272): a retirement in its line was dropped before every survivor
+  /// confirmed ([`RegionalConfiguration::dropped_unconfirmed`]), or its ranked successor is neither a member nor a kept
+  /// retirement. Not settled: absence is no evidence of adoption, and a holder keeps its copy. Owed (A-272 ii): kept
+  /// adoption records, and a round of the current members for such objects.
+  Unresolved,
 }
 
 /// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
@@ -2147,6 +2178,12 @@ pub struct RegionalConfiguration {
   /// An entry is assigned by the council leader after its phase one and dropped once its successor reports it serves
   /// the object ([`adopted`](RegionalConfiguration::adopted)), so it holds only adoptions in flight.
   pub adoptions: std::collections::BTreeMap<ObjectId, Adoption>,
+  /// The retired hosts whose takeover ended without every survivor's confirmation (A-272): a retirement dropped by
+  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) while a survivor still owed its share, or a host
+  /// retired with no settled neighbourhood to recover through. Their objects' lines are [`Lineage::Unresolved`], never
+  /// settled: nothing shows they were adopted, and a holder told settled reclaims its copy. In id order. It grows only
+  /// on a region losing more hosts than it tolerates, which a pruned retirement never records.
+  pub dropped_unconfirmed: Vec<HostId>,
 }
 
 /// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
@@ -2186,6 +2223,7 @@ impl RegionalConfiguration {
       settled: std::collections::BTreeMap::new(),
       retired: std::collections::BTreeMap::new(),
       adoptions: std::collections::BTreeMap::new(),
+      dropped_unconfirmed: Vec::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2356,6 +2394,9 @@ impl RegionalConfiguration {
           unconfirmed,
         },
       );
+    } else {
+      // Retired with no neighbourhood to recover through: nothing will confirm its objects adopted (A-272).
+      self.record_dropped_unconfirmed(member);
     }
     self.prune_retirements();
     self.bound_retirements();
@@ -2582,7 +2623,13 @@ impl RegionalConfiguration {
     let mut departed = owner;
     for _ in 0..=self.retired.len() {
       if !self.retired.contains_key(&departed) {
-        return Lineage::Settled;
+        // Settled only on evidence: a pruned retirement, every survivor having confirmed after adopting. One dropped
+        // unconfirmed proves nothing (A-272).
+        return if self.dropped_unconfirmed.contains(&departed) {
+          Lineage::Unresolved
+        } else {
+          Lineage::Settled
+        };
       }
       let Some(successor) = self.successor(departed, object) else {
         return Lineage::Lost;
@@ -2595,10 +2642,11 @@ impl RegionalConfiguration {
           successor,
         };
       } else {
-        return Lineage::Settled;
+        // A ranked successor neither a member nor a kept retirement: its absence is no evidence of adoption (A-272).
+        return Lineage::Unresolved;
       }
     }
-    Lineage::Settled
+    Lineage::Unresolved
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
@@ -2641,6 +2689,16 @@ impl RegionalConfiguration {
   /// oldest (by the version that retired it, the id breaking a tie) beyond it. A takeover whose retirement is
   /// dropped this way can no longer name its successors, so its objects stay unowned; a node sees the loss as a
   /// recovery owner that names a retirement no longer kept.
+  /// Records `host` among [`dropped_unconfirmed`](RegionalConfiguration::dropped_unconfirmed), in id order.
+  fn record_dropped_unconfirmed(&mut self, host: HostId) {
+    if let Err(position) = self
+      .dropped_unconfirmed
+      .binary_search_by_key(&host.0, |dropped| dropped.0)
+    {
+      self.dropped_unconfirmed.insert(position, host);
+    }
+  }
+
   fn bound_retirements(&mut self) {
     while self.retired.len() > self.retirement_bound() {
       let oldest = self
@@ -2650,7 +2708,18 @@ impl RegionalConfiguration {
         .map(|(host, _)| *host);
       match oldest {
         Some(host) => {
+          // Dropped before every survivor confirmed (one that retired first never did; its own retirement carried the
+          // takeover): recorded, so its line reads unresolved, never settled.
+          let unconfirmed = self.retired.get(&host).is_some_and(|retirement| {
+            !retirement
+              .survivors
+              .iter()
+              .all(|survivor| retirement.confirmed.contains(survivor))
+          });
           self.retired.remove(&host);
+          if unconfirmed {
+            self.record_dropped_unconfirmed(host);
+          }
         }
         None => break,
       }
@@ -2808,6 +2877,40 @@ impl RootConfiguration {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// §4.8 "joint writes" (the bug record of 2026-11-06). A bootstrap settles the first node's cohort as itself
+  /// alone, so while its neighbourhood grows to the region a record's placement joins that one-member cohort with the
+  /// new one. At `f = 1` a cohort of one can never give `f + 1` acknowledgements, so no record of an object placed in
+  /// that window ever committed. Do: judge the joint placement `[[a], [a, b, c]]` at `f = 1` against acknowledgement
+  /// sets. Expect it placed by `{a, b, c}` and `{a, b}` (all of the old cohort, `f + 1` of the new), and not by `{a}`
+  /// (one of the new) or `{b, c}` (none of the old).
+  #[test]
+  fn a_joint_placement_with_a_cohort_smaller_than_the_quorum_needs_every_member_of_it() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let placement = Placement {
+      candidates: vec![a, b, c],
+      acked: Vec::new(),
+      mirror_acked: None,
+      joint: vec![vec![a], vec![a, b, c]],
+    };
+    let quorum = Quorum { f: 1 };
+    assert!(
+      placement.placed_with(&[a, b, c], quorum),
+      "every candidate acknowledged"
+    );
+    assert!(
+      placement.placed_with(&[a, b], quorum),
+      "all of the old cohort and f + 1 of the new"
+    );
+    assert!(
+      !placement.placed_with(&[a], quorum),
+      "one of the new cohort"
+    );
+    assert!(
+      !placement.placed_with(&[b, c], quorum),
+      "none of the old cohort"
+    );
+  }
 
   /// docs/wip/mirroring.md decision 4. Do: assign a promoted object's adoption to a member and to a non-member, report
   /// it adopted by another member, then by its successor. Expect: only the member's assignment and only its own
@@ -4266,6 +4369,72 @@ mod tests {
     );
   }
 
+  /// A-272: an object whose ranked successor is neither a member nor a kept retirement is unresolved, never settled. Do
+  /// retire an owner, then its object's ranked successor (which carries the owner's takeover), then have the
+  /// successor's survivors confirm its share, so its retirement is pruned while the owner's is still kept. Expect the
+  /// object's lineage unresolved. Before, it answered Settled, and every holder told so reclaims its copy
+  /// (`takeover::resolve_held_objects`): the successor's absence was read as adoption.
+  #[test]
+  fn an_absent_ranked_successor_leaves_the_object_unresolved_not_settled() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    regional.take_over(first, scatter);
+    let object = (0..64u64)
+      .map(|index| ObjectId::new(first, index))
+      .find(|object| {
+        regional
+          .survivors_of(first)
+          .contains(&successor_of(&regional, first, *object))
+      })
+      .expect("an object of the first owner");
+    let carrier = successor_of(&regional, first, object);
+    regional.take_over(carrier, scatter);
+    for host in regional.survivors_of(carrier) {
+      regional.confirm(carrier, host);
+    }
+    assert!(
+      !regional.retired.contains_key(&carrier),
+      "the carrier's retirement was pruned on its survivors' confirmations"
+    );
+    assert!(
+      regional.retired.contains_key(&first),
+      "the first owner's is kept: its survivors have not all confirmed"
+    );
+    assert_eq!(
+      regional.lineage(first, object),
+      Lineage::Unresolved,
+      "the ranked successor is gone: nothing shows the object adopted"
+    );
+  }
+
+  /// A-272: a retirement the bound drops before every survivor confirmed leaves its objects unresolved. Do retire
+  /// hosts until the region keeps fewer retirements than it has, so the bound drops the oldest with no survivor having
+  /// confirmed. Expect it recorded as dropped unconfirmed and its object's lineage unresolved. Before, the dropped
+  /// retirement read Settled and its objects' holders reclaimed their copies.
+  #[test]
+  fn a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    let object = ObjectId::new(first, 3);
+    regional.take_over(first, scatter);
+    regional.take_over(HostId(2), scatter);
+    regional.take_over(HostId(3), scatter);
+    assert!(
+      !regional.retired.contains_key(&first),
+      "the bound dropped the oldest retirement"
+    );
+    assert_eq!(
+      regional.dropped_unconfirmed,
+      vec![first],
+      "recorded as dropped before its survivors confirmed"
+    );
+    assert_eq!(
+      regional.lineage(first, object),
+      Lineage::Unresolved,
+      "its object is unresolved, not settled"
+    );
+  }
+
   /// §4.8 "Promotion and takeover": once every survivor has confirmed its share the retirement is dropped, a
   /// holder's copy of one of its objects resolves as settled (stale), and the retired host may be admitted again
   /// — never before, while its retirement still ranks successors.
@@ -4411,6 +4580,7 @@ mod tests {
       ],
       next: Some(ObjectId::new(HostId(1), 8)),
       fenced: Some(HostEpoch(6)),
+      unpromised: 3,
     }
   }
 
@@ -4500,9 +4670,10 @@ mod tests {
       HostPrepare::decode(&flag),
       Err(RegisterError::MalformedRecord)
     );
-    // The entry count sits after the header words, the next page (presence byte and object) and the fence
-    // (presence byte and epoch); claim every count there is.
-    let count_at = 4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>();
+    // The entry count sits after the header words, the next page (presence byte and object), the fence (presence byte
+    // and epoch) and the unpromised count; claim every count there is.
+    let count_at =
+      4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
     let mut lying = answer.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(

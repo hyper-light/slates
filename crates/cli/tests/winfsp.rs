@@ -115,6 +115,11 @@ impl Drop for OwnedProcess {
 /// Starts `slates --instance INSTANCE anchor --quick --shards SHARDS`, waits for its daemon to serve and answer a
 /// streak of verbs, and bootstraps its consensus group.
 fn start_anchor(instance: &str) -> OwnedProcess {
+  start_anchor_of(instance, SHARDS)
+}
+
+/// [`start_anchor`] with `shards` shards.
+fn start_anchor_of(instance: &str, shards: &str) -> OwnedProcess {
   let mut child = slates()
     .args([
       "--instance",
@@ -122,7 +127,7 @@ fn start_anchor(instance: &str) -> OwnedProcess {
       "anchor",
       "--quick",
       "--shards",
-      SHARDS,
+      shards,
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -1282,8 +1287,10 @@ fn a_process_outside_the_anchor_cannot_take_either_holders_mount_handles() {
   );
 }
 
-/// A-198, Step 9.4. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
-/// the CLI's typed failure exit, the original daemon still serving, and the original drive still returning its file.
+/// A-198, Step 9.4; A-254. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
+/// the CLI's typed failure exit, refused at the instance's rendezvous before it creates anything (A-254: the owner is
+/// decided first), the original daemon still serving, and the original drive still returning its file. Before A-254
+/// the second daemon got as far as its segment and was refused there (`CreateFileMappingW`, the name a live section).
 #[test]
 fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
   if !live_mount_runs() {
@@ -1316,8 +1323,12 @@ fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
     "the foreign daemon must return the CLI's startup failure exit"
   );
   assert!(
-    error.contains("the name is already a live section") && error.contains("Some(183)"),
-    "the second daemon must reach and fail the existing-instance ownership check: {error}"
+    error.contains("a live process already holds instance") && error.contains("rendezvous"),
+    "the second daemon must be refused at the rendezvous, before it creates anything (A-254): {error}"
+  );
+  assert!(
+    !error.contains("CreateFileMappingW"),
+    "and never reach the segment, whose name the live daemon holds: {error}"
   );
   assert_eq!(daemon_pid(&fixture.instance), Some(owner));
   assert_eq!(
@@ -1709,4 +1720,454 @@ fn a_winfsp_folder_bound_into_a_process_isolated_container() {
   );
   let (code, _, err) = run(&instance, &["unmount", &drive]);
   assert_eq!(code, 0, "unmount: {err}");
+}
+
+/// Format: one shard, where a request the daemon sends its own drive waits on the shard that must answer it (A-227).
+const ONE_SHARD: &str = "1";
+
+/// Shape: how long a refusal of a base on the daemon's own drive may take to come back (A-227): the verb's own work and
+/// one round trip, far under a client's stall deadline.
+const OWN_MOUNT_ANSWER: Duration = Duration::from_secs(10);
+
+/// Runs a client verb as [`run`] does, but gives up after `limit`: `None` (the client killed and reaped) when it had not
+/// answered by then, for a verb that would wait on a daemon blocked on itself.
+fn run_within(instance: &str, args: &[&str], limit: Duration) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  while child.try_wait().unwrap().is_none() {
+    if started.elapsed() > limit {
+      child.kill().unwrap();
+      child.wait().unwrap();
+      return None;
+    }
+    pause();
+  }
+  let output = child.wait_with_output().unwrap();
+  Some((
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  ))
+}
+
+/// A-227, the base plane on Windows (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a
+/// one-shard daemon, mount a volume at a free drive, make a directory on it, and create a second volume with that
+/// directory as its base. Expect: refused at once (exit 1, `OwnMount`), nothing created, and the daemon still answering.
+/// Before A-227 the shard opened the base through its own drive and waited on the request only it could answer; a kill
+/// then could not end it (A-190's amendment).
+#[test]
+fn a_base_on_the_daemons_own_drive_is_refused_before_any_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownbase");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "outer", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  let base = format!("{drive}\\project");
+  let made = Command::new("cmd")
+    .args(["/C", "mkdir", &base])
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "mkdir {base}");
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a base on its own drive within {OWN_MOUNT_ANSWER:?}: it opened the base through \
+       its own drive and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a base on the daemon's own drive is refused: {err}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
+
+/// Runs `cmd /C` with `args`, asserting it succeeded: the Windows shell's own `mkdir`, `mklink` and `rmdir`, so the test
+/// makes its host directories and junctions without a file write of its own.
+fn cmd(args: &[&str]) {
+  let made = Command::new("cmd").arg("/C").args(args).output().unwrap();
+  assert!(
+    made.status.success(),
+    "cmd /C {}: {}{}",
+    args.join(" "),
+    String::from_utf8_lossy(&made.stdout),
+    String::from_utf8_lossy(&made.stderr)
+  );
+}
+
+/// A-227, recovery's reacquire on Windows (§4.6, §4.8): a base that a drive of the daemon's own came to cover is never
+/// entered when a successor reacquires it. Do: on a one-shard daemon, create a volume over `link\project`, where `link`
+/// is a junction to a directory holding `project`; mount a second volume at a drive, make `project` on it, and make
+/// `link` a directory symbolic link to the drive's root, so the base is now the drive's; kill the daemon. Expect: the successor serves the
+/// held drive again within the takeover bound (it learned the held volume as its own before any shard started, so its
+/// shard's reacquire refused the base rather than open it through the drive nobody served yet), the covered volume is
+/// not rebuilt, and the drive still lists `project`.
+#[test]
+fn a_base_a_held_drive_covers_is_not_reacquired_through_it() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownreacq");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let scratch = format!(
+    "{}\\ownreacq-{}",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  let real = format!("{scratch}\\real");
+  let link = format!("{scratch}\\link");
+  cmd(&["mkdir", &format!("{real}\\project")]);
+  cmd(&["mklink", "/J", &link, &real]);
+  let base = format!("{link}\\project");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "covered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let covered = value_of(&out, "id");
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "cover", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let cover = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &cover, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  cmd(&["mkdir", &format!("{drive}\\project")]);
+  // A junction names local volumes only, which a WinFsp drive is not to `mklink`; a directory symbolic link (a name
+  // surrogate too, followed by the same walk) names it.
+  cmd(&["rmdir", &link]);
+  cmd(&["mklink", "/D", &link, &root]);
+  let original = drive_target(&drive).unwrap();
+  let killed = daemon_pid(&instance).unwrap();
+  kill_daemon(killed);
+  wait_for_successor(&instance, &drive, &original, killed, 1);
+  let (code, out, err) = run(&instance, &["status", &covered]);
+  assert_ne!(
+    code, 0,
+    "the covered volume is not rebuilt through the drive: {out}"
+  );
+  eprintln!("WINFSP OWN REACQUIRE: the covered volume's status: exit {code}: {err}");
+  let listed = Command::new("cmd")
+    .args(["/C", "dir", "/B", &root])
+    .output()
+    .unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&listed.stdout).trim(),
+    "project",
+    "the held drive still serves"
+  );
+  cmd(&["rmdir", &link]);
+  // The drive's own attachment, detached by its id: `slates unmount` scans every volume's status for the drive and
+  // stops at the first refusal, which the covered volume, not rebuilt, now is (GAPS).
+  let (code, out, err) = run(&instance, &["status", &cover]);
+  assert_eq!(code, 0, "status: {err}");
+  let attachment = out
+    .lines()
+    .filter_map(|line| line.strip_prefix("mount: "))
+    .find_map(|line| line.split_once(" (attachment "))
+    .and_then(|(_, rest)| rest.strip_suffix(')'))
+    .expect("the cover's status names its drive's attachment")
+    .to_owned();
+  let (code, _, err) = run(&instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+}
+
+/// Changes the drive at `path`'s file in each of the ways a read-only file system refuses: an overwrite, a create
+/// beside it, a directory, a deletion. The Win32 errors, in that order.
+#[allow(clippy::disallowed_methods)]
+fn changes_through_drive(path: &str) -> [Option<i32>; 4] {
+  let beside = format!("{path}.new");
+  let dir = format!("{path}.dir");
+  [
+    std::fs::write(path, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::write(&beside, b"no")
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::create_dir(&dir)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+    std::fs::remove_file(path)
+      .err()
+      .and_then(|e| e.raw_os_error()),
+  ]
+}
+
+/// GAPS (2026-11-08): a read-only attachment is a read-only file system on every transport. WinFsp reports the volume
+/// read-only (`ReadOnlyVolume`) and a change that reaches the mount is answered `STATUS_MEDIA_WRITE_PROTECTED`, which
+/// Win32 names `ERROR_WRITE_PROTECT`. Do: mount a volume read-only; through the drive overwrite `file.bin`, create a file
+/// beside it, make a directory, delete `file.bin`. Expect each refused `ERROR_WRITE_PROTECT`, and `file.bin` reading its
+/// first bytes still.
+#[test]
+fn a_read_only_drive_refuses_every_change_as_write_protected() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("rodrive", b'A');
+  let write_protect = i32::try_from(windows_sys::Win32::Foundation::ERROR_WRITE_PROTECT).unwrap();
+  assert_eq!(
+    changes_through_drive(&fixture.file),
+    [Some(write_protect); 4],
+    "every change through the read-only drive is refused as write-protected"
+  );
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+}
+
+/// Shape: the WinFsp drives the unmount test mounts beside the volume recovery cannot rebuild, so the scan meets the
+/// refused volume whichever place the catalog's order gives it.
+const HEALTHY_DRIVES: usize = 2;
+
+/// Waits until a successor of `killed` has adopted `drives` held drives.
+fn wait_for_adoptions(instance: &str, killed: u32, drives: u64) {
+  let started = Instant::now();
+  while !(daemon_pid(instance).is_some_and(|pid| pid != killed)
+    && counter(instance, "winfsp.adopted") >= drives)
+  {
+    assert!(
+      started.elapsed() < WAIT_FOR,
+      "no successor adopted the {drives} held drives"
+    );
+    pause();
+  }
+}
+
+/// Bug (GAPS, A-227's sweep, 2026-11-06): Windows `slates unmount` asked each volume's status in turn and stopped at the
+/// first refusal, so one volume recovery could not rebuild kept every drive from being unmounted by its letter. Do:
+/// create a volume over a host directory and mount two more at drives; remove the directory and kill the daemon, so its
+/// successor serves both held drives and cannot rebuild the first volume. Expect: `slates unmount` of each drive
+/// succeeds and the drive goes, and each names the volume it could not ask on standard error with its refusal's kind,
+/// `NotRecovered`, the one its own status gives (naming the missing base).
+#[test]
+fn unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("unmountbad");
+  let _anchor = start_anchor(&instance);
+  let base = format!(
+    "{}\\unmountbad-{}\\base",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  cmd(&["mkdir", &base]);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "unrebuilt",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let unrebuilt = value_of(&out, "id");
+  let drives = mount_healthy_drives(&instance);
+  cmd(&["rmdir", &base]);
+  let killed = daemon_pid(&instance).unwrap();
+  kill_daemon(killed);
+  wait_for_adoptions(&instance, killed, u64::try_from(HEALTHY_DRIVES).unwrap());
+  let (code, _, err) = run(&instance, &["status", &unrebuilt]);
+  assert_ne!(
+    code, 0,
+    "recovery could not rebuild the volume whose base is gone"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "the listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  let kind = "NotRecovered";
+  for drive in &drives {
+    unmount_naming_the_unasked(&instance, drive, kind);
+  }
+}
+
+/// Creates [`HEALTHY_DRIVES`] volumes and mounts each at a free drive, ready, returning the drives.
+fn mount_healthy_drives(instance: &str) -> Vec<String> {
+  let mut drives = Vec::new();
+  for index in 0..HEALTHY_DRIVES {
+    let name = format!("healthy{index}");
+    let (code, out, err) = run(instance, &["volume", "create", &name, "--bounded", "64MiB"]);
+    assert_eq!(code, 0, "{err}");
+    let drive = free_drive_letter();
+    let (code, _, err) = run(instance, &["mount", &value_of(&out, "id"), &drive]);
+    assert_eq!(code, 0, "mount: {err}");
+    wait_ready(&format!("{drive}\\"));
+    drives.push(drive);
+  }
+  drives
+}
+
+/// `slates unmount` of the healthy `drive` succeeds, the drive goes, and standard error names the volume the scan could
+/// not ask (`unrebuilt`) by its refusal's `kind`.
+fn unmount_naming_the_unasked(instance: &str, drive: &str, kind: &str) {
+  let (code, _, err) = run(instance, &["unmount", drive]);
+  assert_eq!(
+    code, 0,
+    "the healthy drive {drive} is unmounted beside the unrebuilt volume: {err}"
+  );
+  assert!(
+    err.contains("volume unrebuilt") && err.contains(kind),
+    "the unmount of {drive} names the volume it could not ask, by its refusal ({kind}): {err}"
+  );
+  assert!(drive_goes(drive), "the drive {drive} goes");
+}
+
+/// Makes `base` on the runner's disk with an ordinary file, a read-only one and a hidden one, each through the Windows
+/// shell (`echo`, then `attrib`), so the test writes no file of its own.
+fn make_attribute_base(base: &str) {
+  cmd(&["mkdir", base]);
+  for name in ["plain.txt", "locked.txt", "hidden.txt"] {
+    cmd(&["echo", "from the disk", ">", &format!("{base}\\{name}")]);
+  }
+  cmd(&["attrib", "+R", &format!("{base}\\locked.txt")]);
+  cmd(&["attrib", "+H", &format!("{base}\\hidden.txt")]);
+}
+
+/// Through the drive at `drive`, over [`make_attribute_base`]'s files: each one's attributes, the ordinary file's append
+/// and delete, and the read-only file's refusals of both.
+#[allow(clippy::disallowed_methods)] // file calls through the drive under test
+fn assert_attributes_through(drive: &str) {
+  use std::io::Write;
+  use std::os::windows::fs::MetadataExt;
+  /// Format: `FILE_ATTRIBUTE_READONLY` and `FILE_ATTRIBUTE_HIDDEN`.
+  const READONLY: u32 = 0x1;
+  const HIDDEN: u32 = 0x2;
+  let path = |name: &str| format!("{drive}\\{name}");
+  let attributes = |name: &str| std::fs::metadata(path(name)).unwrap().file_attributes();
+  assert_eq!(
+    attributes("plain.txt") & (READONLY | HIDDEN),
+    0,
+    "an ordinary file is neither read-only nor hidden"
+  );
+  assert_eq!(
+    attributes("locked.txt") & READONLY,
+    READONLY,
+    "the read-only file reads read-only"
+  );
+  assert_eq!(
+    attributes("hidden.txt") & HIDDEN,
+    HIDDEN,
+    "the hidden file reads hidden"
+  );
+  std::fs::OpenOptions::new()
+    .append(true)
+    .open(path("plain.txt"))
+    .unwrap()
+    .write_all(b"appended through the drive\n")
+    .unwrap();
+  std::fs::remove_file(path("plain.txt")).unwrap();
+  let denied = Some(i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED).unwrap());
+  let opened = std::fs::OpenOptions::new()
+    .append(true)
+    .open(path("locked.txt"));
+  assert_eq!(
+    opened.unwrap_err().raw_os_error(),
+    denied,
+    "the read-only file refuses a write"
+  );
+  assert_eq!(
+    std::fs::remove_file(path("locked.txt"))
+      .unwrap_err()
+      .raw_os_error(),
+    denied,
+    "the read-only file refuses its delete"
+  );
+}
+
+/// A-262, the Windows base plane. Do: in a real directory on the runner's disk make an ordinary file, a read-only one
+/// (`attrib +R`) and a hidden one (`attrib +H`); create an overlay volume over the directory and mount it at a drive;
+/// through the drive read each file's attributes, append to the ordinary file and delete it, then try to append to and
+/// delete the read-only one. Expect: the ordinary file reports neither `READONLY` nor `HIDDEN`, takes the append and
+/// deletes; the read-only one reports `READONLY` and refuses both (`ERROR_ACCESS_DENIED`); the hidden one reports
+/// `HIDDEN`. Before, the Windows base reported each file's attribute word as its mode (`ARCHIVE`, `0x20`, as `0o040`),
+/// so the drive took an ordinary file for one its owner may not write.
+#[test]
+fn an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attributes() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("attrbase");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let base = format!(
+    "{}\\attrbase-{}",
+    env!("CARGO_TARGET_TMPDIR").replace('/', "\\"),
+    std::process::id()
+  );
+  make_attribute_base(&base);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "over",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "volume create --base: {err}");
+  let id = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  assert_attributes_through(&drive);
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+  cmd(&["attrib", "-R", &format!("{base}\\locked.txt")]);
+  cmd(&["rmdir", "/S", "/Q", &base]);
 }

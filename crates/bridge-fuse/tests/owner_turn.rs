@@ -160,7 +160,15 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     write: true,
   };
   let transport = attachments
-    .attach(VOLUME, View::Current, Principal::Uid { uid }, rights)
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid,
+      },
+      rights,
+    )
     .unwrap();
   attachments.set_coherence(transport, slates_bridge_core::CacheCoherence::Invalidated);
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
@@ -195,7 +203,7 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     )
     .unwrap()
     {
-      Turn::Idle | Turn::Dropped | Turn::Replayed => {}
+      Turn::Idle | Turn::Dropped | Turn::Replayed | Turn::Refused => {}
       Turn::Continued => tally.continued += 1,
       Turn::Ended => {
         // The test thread may already have failed and gone; then there is no one to tell.

@@ -77,9 +77,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
+/// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
+/// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 21;
+const IMAGE_VERSION: u16 = 24;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -358,6 +360,9 @@ pub struct InodeImage {
   /// The attribute inode holding a transport's working copy of this inode's attributes (the
   /// AppleDouble `._` bytes a client wrote, §4.6). Image version 6.
   pub sidecar: Option<u64>,
+  /// The Windows attribute bits kept beside the mode, at Windows' values (A-262,
+  /// [`crate::inode::WindowsAttributes`]). Image version 23.
+  pub windows: u16,
 }
 
 /// One extended attribute of an inode in an image: its name and the attribute inode (captured like
@@ -523,6 +528,9 @@ pub struct ShardImage {
   /// The NFSv3 replies a barrier published for connections the anchor holds and had not yet sent (A-128), in
   /// (connection, xid) order: the mutations of each held connection's turn in progress.
   pub nfs_replies: Vec<HeldNfsReply>,
+  /// The byte states of the connections the anchor holds (A-231), in (connection, volume) order: what each one's client
+  /// cache is as of, so a successor judges its write-backs as the daemon that published this would have.
+  pub nfs_states: Vec<HeldNfsStates>,
 }
 
 /// An NFSv3 reply published with the effect it answers (A-128): the anchor-held connection the request came on, the
@@ -538,6 +546,55 @@ pub struct HeldNfsReply {
   pub accepted: bool,
   /// The procedure's results.
   pub results: Vec<u8>,
+}
+
+/// A held NFSv3 connection's byte states for one volume (A-231; A-192's states): every file it tracks there, each range's
+/// journal point dropped, since a successor's journal begins again. A successor places every fetched byte before its
+/// own first record, so each change it makes or replays after this publication marks the bytes it touched stale.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldNfsStates {
+  /// The held connection's id.
+  pub connection: u64,
+  /// The volume's id bytes.
+  pub volume: [u8; 16],
+  /// Each tracked file's states, in inode order.
+  pub files: Vec<CarriedFile>,
+}
+
+/// One file's byte states as a publication carries them (A-231).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct CarriedFile {
+  /// The file's inode number.
+  pub ino: u64,
+  /// What the client holds can no longer be told: its write-backs are refused.
+  pub lost: bool,
+  /// Its ranges, ascending, disjoint and covering every byte; none when lost.
+  pub ranges: Vec<CarriedRange>,
+}
+
+/// One range of a carried file's states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct CarriedRange {
+  /// The first byte.
+  pub start: u64,
+  /// The byte after the last.
+  pub end: u64,
+  /// What the client's copy of these bytes is.
+  pub byte: CarriedByte,
+}
+
+/// What a client's copy of a carried byte is (A-231): never fetched, fetched and current, fetched and since changed by
+/// another path, or one of the last two that could not be told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub enum CarriedByte {
+  /// Never fetched: no change makes it stale.
+  Absent,
+  /// Fetched, and no other path changed it since.
+  Fresh,
+  /// Fetched, and another path changed it since.
+  Stale,
+  /// Fresh or stale, which could not be told.
+  Unknown,
 }
 
 /// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
@@ -577,16 +634,17 @@ impl ShardImage {
     slates_wire::codec::encode_len(volumes, out);
   }
 
-  /// Ends a streamed shard image: the held replicas, the replies, the call records and the held NFSv3 replies, as
-  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).with_nfs_replies(nfs)`'s
-  /// `encode` writes them after the volumes.
+  /// Ends a streamed shard image: the held replicas, the replies, the call records, the held NFSv3 replies and the held
+  /// connections' byte states, as `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls)
+  /// .with_nfs_replies(nfs).with_nfs_states(states)`'s `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
     held: &[u8],
-    (replies, calls, nfs_replies): (
+    (replies, calls, nfs_replies, nfs_states): (
       &mut Vec<HeldReply>,
       &mut Vec<HeldCall>,
       &mut Vec<HeldNfsReply>,
+      &mut Vec<HeldNfsStates>,
     ),
   ) {
     slates_wire::codec::encode_len(held.len(), out);
@@ -597,6 +655,8 @@ impl ShardImage {
     calls.encode(out);
     nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
     nfs_replies.encode(out);
+    nfs_states.sort_by_key(|states| (states.connection, states.volume));
+    nfs_states.encode(out);
   }
 
   /// A shard image of the given volumes, in key order, holding nothing for others.
@@ -610,6 +670,7 @@ impl ShardImage {
       replies: Vec::new(),
       calls: Vec::new(),
       nfs_replies: Vec::new(),
+      nfs_states: Vec::new(),
     }
   }
 
@@ -637,6 +698,12 @@ impl ShardImage {
       nfs_replies,
       ..self
     }
+  }
+
+  /// This image carrying `nfs_states`, the held connections' byte states (A-231), in (connection, volume) order.
+  pub fn with_nfs_states(self, mut nfs_states: Vec<HeldNfsStates>) -> ShardImage {
+    nfs_states.sort_by_key(|states| (states.connection, states.volume));
+    ShardImage { nfs_states, ..self }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
@@ -1652,6 +1719,7 @@ impl Volume {
         .as_deref()
         .and_then(crate::inode::XattrTable::sidecar)
         .map(|copy| copy.0),
+      windows: inode.windows.bits(),
     })
   }
 
@@ -1783,6 +1851,7 @@ impl Volume {
       .and_then(crate::inode::XattrTable::sidecar)
       .map(|copy| copy.0)
       .encode(out);
+    inode.windows.bits().encode(out);
     Ok(())
   }
 
@@ -2440,7 +2509,7 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let mut order: Vec<&SnapshotImage> = snapshots.to_vec();
     order.sort_by_key(|s| std::cmp::Reverse(s.epoch));
-    let mut claimed: HashSet<(Discriminant<Dead>, u32, u32)> = HashSet::new();
+    let mut claimed: HashSet<(Discriminant<Dead>, u64, u32)> = HashSet::new();
     // Every chunk the head reaches is the head's, even under a snapshot's diverged inode: the images name
     // chunks, so a diverged version and the head share every window the head did not rewrite (A-64), and the
     // live volume released only the rewritten ones onto the deadlist.
@@ -2764,13 +2833,14 @@ fn snapshot_slab_handle(r: SnapshotRef) -> Handle<Snapshot> {
 /// claims each object for exactly one snapshot's deadlist. The variant discriminant separates the
 /// five slabs (a `Dir` handle and an `Inode` handle can share an index); the born epoch is not part
 /// of the key, since a slab handle at its generation already identifies one object uniquely.
-fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u32, u32) {
+fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u64, u32) {
   let (index, generation) = match dead {
-    Dead::Dir(h, _) => (h.index(), h.generation()),
-    Dead::DirBlock(h, _) => (h.index(), h.generation()),
-    Dead::Inode(h, _) => (h.index(), h.generation()),
-    Dead::Trie(h, _) => (h.index(), h.generation()),
-    Dead::Chunk(h, _) => (h.index(), h.generation()),
+    Dead::Dir(h, _) => (u64::from(h.index()), h.generation()),
+    // A block's page handle and its slot word name it uniquely (A-203).
+    Dead::DirBlock(block, _) => block.words(),
+    Dead::Inode(h, _) => (u64::from(h.index()), h.generation()),
+    Dead::Trie(h, _) => (u64::from(h.index()), h.generation()),
+    Dead::Chunk(h, _) => (u64::from(h.index()), h.generation()),
   };
   (std::mem::discriminant(dead), index, generation)
 }
@@ -3266,6 +3336,7 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
     .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows);
 }
 
 fn child_for(

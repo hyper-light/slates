@@ -280,7 +280,7 @@ pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
     parse_engine_facts(&ask(runtime, &ENGINE_FACTS).map_err(|e| Failure::Refused(e.to_string()))?)
       .map_err(|e| Failure::Refused(e.to_string()))?;
   let profile = runtime_profile(endpoint, &facts);
-  println!(
+  slates_machine::out_line!(
     "profile: engine={:?} version={} endpoint={endpoint_text} rootless={} userns={}",
     profile.operating_system,
     profile.server_version,
@@ -289,9 +289,9 @@ pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
   );
   let tested =
     judge(&profile, Host::this()).map_err(|refusal| Failure::Refused(refusal.to_string()))?;
-  println!("evidence: {} ({})", tested.test, tested.description);
-  println!("identity: {}", identity_text(tested.identity));
-  println!("hard_links: {}", hard_link_text(tested.hard_links));
+  slates_machine::out_line!("evidence: {} ({})", tested.test, tested.description);
+  slates_machine::out_line!("identity: {}", identity_text(tested.identity));
+  slates_machine::out_line!("hard_links: {}", hard_link_text(tested.hard_links));
   Ok(())
 }
 

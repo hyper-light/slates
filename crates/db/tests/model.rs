@@ -27,7 +27,7 @@ use slates_db::catalog::{
   Rights, Role, SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::partition::PartitionCaps;
-use slates_db::replay::{SnapshotPolicy, recover};
+use slates_db::replay::{SnapshotPolicy, Tail, recover, snapshot_due};
 use slates_db::{Db, DbError, Op};
 use slates_machine::facts::Identity;
 use slates_wire::request::Seen;
@@ -280,7 +280,10 @@ fn vid(n: u64) -> VolumeId {
 }
 
 fn principal(n: u32) -> Principal {
-  Principal::Uid { uid: 1000 + n }
+  Principal::Uid {
+    host: slates_db::HostId(0),
+    uid: 1000 + n,
+  }
 }
 
 fn volume(n: u64, name: &str) -> VolumeRecord {
@@ -293,6 +296,8 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       names: NamePolicy::Exact,
       require_locked: false,
       role: Role::Plain,
+      live_shipped: false,
+      live_holders: None,
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -318,6 +323,7 @@ enum Step {
   State(usize, u8),
   Account(usize, u64, u64),
   Access(usize),
+  LiveShip(usize, bool),
   Destroy(usize),
   Snapshot(usize),
   Place(usize, usize),
@@ -328,7 +334,7 @@ enum Step {
   Attach(usize, u32),
   Detach(usize),
   Complete(u32, u32),
-  Acknowledge(u32, u32),
+  Acknowledge(u32, u32, Vec<u32>),
   Grant(usize),
   GrantState(usize, u8),
   LandingLease(u32, u64),
@@ -337,6 +343,8 @@ enum Step {
   Audit(u8),
   GreenAdvance(usize),
   GreenOriginate(usize),
+  /// A green's checkpoint (W3) at a version, which folds the increments up to it.
+  GreenCheckpoint(usize, u64),
   NfsOpen(u8, u8, u32),
   NfsOpenClear(usize),
   NfsLock(usize, u64, u64, bool),
@@ -374,6 +382,7 @@ fn step() -> impl Strategy<Value = Step> {
     2 => (0..8usize, 0..8u8).prop_map(|(v, s)| Step::State(v, s)),
     2 => (0..8usize, 0..1_000_000u64, 0..1_000_000u64).prop_map(|(v, r, u)| Step::Account(v, r, u)),
     1 => (0..8usize).prop_map(Step::Access),
+    1 => (0..8usize, proptest::bool::ANY).prop_map(|(v, on)| Step::LiveShip(v, on)),
     1 => (0..8usize).prop_map(Step::Destroy),
     2 => (0..8usize).prop_map(Step::Snapshot),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::Place(v, s)),
@@ -384,7 +393,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize, 0..3u32).prop_map(|(v, c)| Step::Attach(v, c)),
     1 => (0..8usize).prop_map(Step::Detach),
     2 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Complete(c, s)),
-    1 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Acknowledge(c, s)),
+    1 => (0..3u32, 0..16u32, proptest::collection::vec(0..16u32, 0..4)).prop_map(|(c, s, owed)| Step::Acknowledge(c, s, owed)),
     1 => (0..8usize).prop_map(Step::Grant),
     1 => (0..8usize, 0..4u8).prop_map(|(g, s)| Step::GrantState(g, s)),
     1 => (0..2u32, 1..100u64).prop_map(|(h, t)| Step::LandingLease(h, t)),
@@ -393,6 +402,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..7u8).prop_map(Step::Audit),
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
+    1 => (0..8usize, 0..6u64).prop_map(|(v, at)| Step::GreenCheckpoint(v, at)),
     2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
     1 => (0..8usize).prop_map(Step::NfsOpenClear),
     2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
@@ -510,6 +520,11 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       referenced_bytes: *r,
       unique_bytes: *u,
     },
+    // A-200: live shipping is part of the policy the recovered partition must equal.
+    Step::LiveShip(v, on) => Op::LiveShippingChanged {
+      id: vid(pick(&ids.live, *v)?),
+      live_shipped: *on,
+    },
     Step::Access(v) => Op::AccessChanged {
       id: vid(pick(&ids.live, *v)?),
       access: vec![slates_db::catalog::AccessEntry {
@@ -611,10 +626,11 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
       },
     },
-    Step::Acknowledge(c, s) => Op::CompletionsAcknowledged {
+    Step::Acknowledge(c, s, owed) => Op::CompletionsAcknowledged {
       origin: 0,
       client: *c,
       up_to: *s,
+      owed: owed.clone(),
     },
     step @ (Step::Grant(..)
     | Step::GrantState(..)
@@ -623,7 +639,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::LandingState(..)
     | Step::Audit(..)
     | Step::GreenAdvance(..)
-    | Step::GreenOriginate(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenOriginate(..)
+    | Step::GreenCheckpoint(..)) => return op_for_service(step, ids, now_ns),
     step @ (Step::NfsOpen(..)
     | Step::NfsOpenClear(..)
     | Step::NfsLock(..)
@@ -732,6 +749,13 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::GreenOriginate(v) => Op::GreenOriginated {
       green: vid(pick(&ids.live, *v)?),
       origin: (*v as u64).to_be_bytes().to_vec(),
+    },
+    // A checkpoint at a version the green's head may or may not reach: the partition refuses one at or below the
+    // checkpoint held or past the head, and the model checks a refused one was never recorded.
+    Step::GreenCheckpoint(v, at) => Op::GreenCheckpointed {
+      green: vid(pick(&ids.live, *v)?),
+      version: *at,
+      checkpoint: at.to_be_bytes().to_vec(),
     },
     _ => return None,
   })
@@ -950,6 +974,95 @@ fn note_applied(op: &Op, ids: &mut Ids) {
   }
 }
 
+/// When a generated history's database snapshots: a pinned byte cadence, or the measured trigger (A-243) with a
+/// recovery budget, whose snapshot points follow the clock and so differ between two runs of one history.
+#[derive(Clone, Copy, Debug)]
+enum Cadence {
+  Pinned(u64),
+  Measured(u64),
+}
+
+/// Sets `cadence` on a database just opened or recovered.
+fn hold_to(db: &mut Db, cadence: Cadence) {
+  match cadence {
+    Cadence::Pinned(bytes) => db.set_policy(SnapshotPolicy {
+      bytes_between_snapshots: bytes,
+    }),
+    Cadence::Measured(budget_ns) => db.set_recovery_budget(budget_ns),
+  }
+}
+
+/// A refusal where the history expects none, as the generated case's failure.
+fn failed(error: impl std::fmt::Debug) -> TestCaseError {
+  TestCaseError::fail(format!("{error:?}"))
+}
+
+/// Runs a generated history under `cadence`, crashing where it says: after every crash, and at the end, the recovered
+/// partition equals the live one whole; refused operations were never recorded. Each caller names its own segment:
+/// libtest runs the callers at once, and Windows refuses a second object of one name while the first is held (A-176).
+fn every_recovery_equals_the_live_partition_under(
+  segment_name: &str,
+  steps: &[Step],
+  cadence: Cadence,
+) -> Result<(), TestCaseError> {
+  let mut seg = segment(segment_name, LOG_BYTES);
+  let mut db = open(&mut seg);
+  hold_to(&mut db, cadence);
+  let mut ids = Ids::default();
+  let mut now_ns = 0u64;
+  let mut applied = 0usize;
+  for s in steps {
+    now_ns += 100;
+    if matches!(s, Step::Crash) {
+      let live = db.partition().to_snapshot(0);
+      let seq = db.next_seq();
+      drop(db);
+      let (recovered, stats) = recover(&mut seg, 0, caps(), now_ns).map_err(failed)?;
+      prop_assert_eq!(
+        recovered.partition().to_snapshot(0),
+        live,
+        "recovery differs from the live partition"
+      );
+      prop_assert_eq!(recovered.next_seq(), seq);
+      prop_assert!(!stats.torn, "a clean crash has no torn tail");
+      db = recovered;
+      hold_to(&mut db, cadence);
+      continue;
+    }
+    let Some(op) = op_for(s, &mut ids, now_ns) else {
+      continue;
+    };
+    match db.mutate(&mut seg, &op, now_ns) {
+      Ok(_) => {
+        note_applied(&op, &mut ids);
+        applied += 1;
+      }
+      Err(
+        DbError::NotFound
+        | DbError::AlreadyExists { .. }
+        | DbError::LeaseHeld { .. }
+        | DbError::StaleLease { .. }
+        | DbError::StaleCompletion { .. }
+        | DbError::Capacity { .. }
+        | DbError::CheckpointOutOfRange { .. },
+      ) => {}
+      Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
+    }
+    for expired in db.partition_mut().expired_leases(now_ns) {
+      db.mutate(&mut seg, &Op::LeaseReleased { volume: expired }, now_ns)
+        .map_err(failed)?;
+    }
+  }
+  let live = db.partition().to_snapshot(0);
+  let seq = db.next_seq();
+  drop(db);
+  let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).map_err(failed)?;
+  prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+  prop_assert_eq!(recovered.next_seq(), seq);
+  prop_assert!(usize::try_from(seq).map_err(failed)? >= applied);
+  Ok(())
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(60), ..ProptestConfig::default() }))]
 
@@ -958,46 +1071,15 @@ proptest! {
   /// recorded; the snapshot cadence and the log trim never lose a record.
   #[test]
   fn every_recovery_equals_the_live_partition(steps in proptest::collection::vec(step(), 1..250), snapshot_every in 1u64..20_000) {
-    let mut seg = segment("slates-db-model", LOG_BYTES);
-    let mut db = open(&mut seg);
-    db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
-    let mut ids = Ids::default();
-    let mut now_ns = 0u64;
-    let mut applied = 0usize;
-    for s in &steps {
-      now_ns += 100;
-      if matches!(s, Step::Crash) {
-        let live = db.partition().to_snapshot(0);
-        let seq = db.next_seq();
-        drop(db);
-        let (recovered, stats) = recover(&mut seg, 0, caps(), now_ns).unwrap();
-        prop_assert_eq!(recovered.partition().to_snapshot(0), live, "recovery differs from the live partition");
-        prop_assert_eq!(recovered.next_seq(), seq);
-        prop_assert!(!stats.torn, "a clean crash has no torn tail");
-        db = recovered;
-        db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
-        continue;
-      }
-      let Some(op) = op_for(s, &mut ids, now_ns) else { continue };
-      match db.mutate(&mut seg, &op, now_ns) {
-        Ok(_) => {
-          note_applied(&op, &mut ids);
-          applied += 1;
-        }
-        Err(DbError::NotFound | DbError::AlreadyExists { .. } | DbError::LeaseHeld { .. } | DbError::StaleLease { .. } | DbError::StaleCompletion { .. } | DbError::Capacity { .. }) => {}
-        Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
-      }
-      for expired in db.partition_mut().expired_leases(now_ns) {
-        db.mutate(&mut seg, &Op::LeaseReleased { volume: expired }, now_ns).unwrap();
-      }
-    }
-    let live = db.partition().to_snapshot(0);
-    let seq = db.next_seq();
-    drop(db);
-    let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).unwrap();
-    prop_assert_eq!(recovered.partition().to_snapshot(0), live);
-    prop_assert_eq!(recovered.next_seq(), seq);
-    prop_assert!(usize::try_from(seq).unwrap() >= applied);
+    every_recovery_equals_the_live_partition_under("slates-db-model-pinned", &steps, Cadence::Pinned(snapshot_every))?;
+  }
+
+  /// AC-2.3, A-243 (raft): the same under the measured trigger, a recovery budget of 0 to 200 µs, so snapshots fall
+  /// where the clock puts them (with a budget of 0, at every snapshot's size of log). Expect: every recovery equals the
+  /// live partition whole, wherever the snapshots fell.
+  #[test]
+  fn every_recovery_equals_the_live_partition_wherever_the_measured_trigger_snapshots(steps in proptest::collection::vec(step(), 1..250), budget_ns in 0u64..200_000) {
+    every_recovery_equals_the_live_partition_under("slates-db-model-measured", &steps, Cadence::Measured(budget_ns))?;
   }
 }
 
@@ -1284,6 +1366,7 @@ fn completions_are_exactly_once_across_recovery() {
       origin: 0,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )
@@ -1333,6 +1416,7 @@ fn completions_from_distinct_origins_do_not_collide() {
       origin: 1,
       client: 7,
       up_to: 3,
+      owed: Vec::new(),
     },
     0,
   )
@@ -1378,6 +1462,184 @@ fn snapshots_trim_the_log_and_recovery_restores_them_with_the_tail() {
   assert_eq!(recovered.next_seq(), 200);
 }
 
+/// Shape: the bytes of each increment the checkpoint tests advance a green by.
+const INCREMENT_BYTES: usize = 100;
+/// Shape: the bytes of each checkpoint they take: less than what it folds, so the fold returns budget.
+const CHECKPOINT_BYTES: usize = 40;
+/// Shape: the increments the checkpoint tests' merge budget holds.
+const BUDGET_INCREMENTS: usize = 5;
+
+/// The checkpoint tests' green.
+const CHECKPOINT_GREEN: u64 = 1;
+
+/// The checkpoint tests' caps: a merge budget of [`BUDGET_INCREMENTS`] increments.
+fn checkpoint_caps() -> PartitionCaps {
+  PartitionCaps {
+    green_chain_bytes: BUDGET_INCREMENTS * INCREMENT_BYTES,
+    ..caps()
+  }
+}
+
+/// The green's increment `n`.
+fn advance(n: u8) -> Op {
+  Op::GreenAdvanced {
+    green: vid(CHECKPOINT_GREEN),
+    increment: vec![n; INCREMENT_BYTES],
+  }
+}
+
+/// The green's checkpoint at `version`.
+fn checkpoint_at(version: u64) -> Op {
+  Op::GreenCheckpointed {
+    green: vid(CHECKPOINT_GREEN),
+    version,
+    checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+  }
+}
+
+/// W3, §4.16. Do: under a merge budget of five 100-byte increments, advance a green five versions and try a sixth;
+/// checkpoint it at version 3 with 40 bytes, then advance it until refused. Expect: the sixth is refused at the cap;
+/// after the checkpoint the chain holds only versions 4 and 5 and the head stays 5; exactly two more increments fit
+/// (the budget fell by the 300 bytes folded less the checkpoint's 40). Returns the database at head 7 and its segment.
+fn a_checkpoint_returns_what_it_folds() -> (AnchorSegment, Db) {
+  let green = vid(CHECKPOINT_GREEN);
+  let mut seg = segment("slates-db-checkpoint", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  let record = volume(CHECKPOINT_GREEN, "green");
+  db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+    .unwrap();
+  for n in 0..5u8 {
+    db.mutate(&mut seg, &advance(n), 0).unwrap();
+  }
+  let sixth = db.mutate(&mut seg, &advance(5), 0);
+  assert!(matches!(sixth, Err(DbError::Capacity { .. })), "{sixth:?}");
+  db.mutate(&mut seg, &checkpoint_at(3), 0).unwrap();
+  let partition = db.partition();
+  assert_eq!(
+    partition.green_chain(green),
+    &[vec![3; INCREMENT_BYTES], vec![4; INCREMENT_BYTES]]
+  );
+  assert_eq!(
+    partition.green_checkpoint(green),
+    Some((3, &[0xC0; CHECKPOINT_BYTES][..]))
+  );
+  assert_eq!(partition.green_head(green), 5);
+  db.mutate(&mut seg, &advance(5), 0).unwrap();
+  db.mutate(&mut seg, &advance(6), 0).unwrap();
+  let eighth = db.mutate(&mut seg, &advance(7), 0);
+  assert!(
+    matches!(eighth, Err(DbError::Capacity { .. })),
+    "{eighth:?}"
+  );
+  (seg, db)
+}
+
+/// Asks for checkpoints at the one held (3), below it, and past the head (7): each refused `CheckpointOutOfRange`,
+/// none recorded.
+fn checkpoints_out_of_range_are_refused(seg: &mut AnchorSegment, db: &mut Db) {
+  let seq = db.next_seq();
+  for version in [3, 2, 8] {
+    let refused = db.mutate(seg, &checkpoint_at(version), 0);
+    let expected = DbError::CheckpointOutOfRange {
+      version,
+      held: 3,
+      head: 7,
+    };
+    assert_eq!(
+      refused.err(),
+      Some(expected),
+      "a checkpoint at {version} is refused"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused checkpoint was recorded");
+}
+
+/// W3, §4.16. Do: the fold of [`a_checkpoint_returns_what_it_folds`]; then ask for checkpoints at 3, at 2 and past the
+/// head 7; recover; checkpoint at the head; snapshot and recover again. Expect: the three are refused
+/// `CheckpointOutOfRange`, never recorded; recovery from the log and from a snapshot holds the same checkpoint and
+/// chain; the checkpoint at the head leaves an empty chain, and a late origin is still refused.
+#[test]
+fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
+  let green = vid(CHECKPOINT_GREEN);
+  let (mut seg, mut db) = a_checkpoint_returns_what_it_folds();
+  checkpoints_out_of_range_are_refused(&mut seg, &mut db);
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().to_snapshot(0),
+    live,
+    "recovery holds the checkpoint and the chain after it"
+  );
+  db.mutate(&mut seg, &checkpoint_at(7), 0).unwrap();
+  assert!(db.partition().green_chain(green).is_empty());
+  assert_eq!(db.partition().green_head(green), 7);
+  let late = db.mutate(
+    &mut seg,
+    &Op::GreenOriginated {
+      green,
+      origin: vec![1],
+    },
+    0,
+  );
+  assert!(
+    matches!(late, Err(DbError::AlreadyExists { .. })),
+    "{late:?}"
+  );
+  db.snapshot(&mut seg).unwrap();
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (recovered, stats) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert!(stats.snapshot.is_some());
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    live,
+    "a snapshot carries the checkpoint"
+  );
+}
+
+/// §4.8 recovery, §2.6 boot step 2: recovery takes the newest snapshot slot that decodes. Do: take snapshots until both
+/// slots hold one, recover to learn which is newer, then publish into the newer slot bytes that begin with a higher
+/// sequence than either but do not decode, and recover again. Expect: the second recovery starts from the older
+/// slot, at its lower sequence, and recovers without a refusal; a slot whose sequence reads newest is never trusted
+/// for it alone.
+#[test]
+fn a_newest_snapshot_that_does_not_decode_leaves_recovery_the_older_one() {
+  let mut seg = segment("slates-db-snapshot-fallback", LOG_BYTES);
+  let mut db = open(&mut seg);
+  db.set_policy(SnapshotPolicy {
+    bytes_between_snapshots: 2_000,
+  });
+  for n in 0..200 {
+    db.mutate(
+      &mut seg,
+      &Op::VolumeCreated {
+        record: volume(n, &format!("v{n}")),
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert!(db.snapshots_taken() >= 2, "both slots hold a snapshot");
+  drop(db);
+  let (_, first) = recover(&mut seg, 0, caps(), 0).unwrap();
+  let (newer_slot, newer_seq) = first.snapshot.unwrap();
+  let older_slot = 1 - newer_slot;
+  let mut unreadable = u64::MAX.to_le_bytes().to_vec();
+  unreadable.extend_from_slice(b"not a partition snapshot");
+  seg
+    .publish(RegionKind::Snapshot(0, newer_slot), &unreadable)
+    .unwrap();
+  let (recovered, second) = recover(&mut seg, 0, caps(), 0).unwrap();
+  let (slot, seq) = second.snapshot.unwrap();
+  assert_eq!(slot, older_slot, "recovery fell back to the older slot");
+  assert!(
+    seq < newer_seq,
+    "at the older slot's sequence: {seq} against {newer_seq}"
+  );
+  assert!(recovered.partition().volume_count() > 0);
+}
+
 /// A ring too small for many records: the append snapshots and retries, never refuses.
 #[test]
 fn a_full_log_snapshots_and_retries() {
@@ -1403,18 +1665,25 @@ fn a_full_log_snapshots_and_retries() {
   assert_eq!(recovered.partition().to_snapshot(0), live);
 }
 
-/// The snapshot policy derives from the recovery budget and the measured replay throughput.
+/// A-243: the measured trigger needs both the budget's replay work and a snapshot's size of log. Work alone would
+/// re-encode a large partition for every budget's worth of small records, past the doubling bound; bytes alone is the
+/// extrapolation that let a tail of small records run past the budget.
 #[test]
-fn the_snapshot_policy_derives_from_the_budget_and_the_measured_replay() {
-  let p = SnapshotPolicy::derive(1_000_000_000, 700);
-  assert_eq!(p.value.bytes_between_snapshots, 700_000_000);
-  assert_eq!(
-    SnapshotPolicy::derive(1_000_000_000, 0)
-      .value
-      .bytes_between_snapshots,
-    1_000_000
+fn a_snapshot_is_due_only_once_the_tail_took_the_budget_and_reached_the_floor() {
+  let tail = |bytes, replay_ns| Tail { bytes, replay_ns };
+  assert!(snapshot_due(tail(4_096, 1_000), 4_096, 1_000));
+  assert!(
+    !snapshot_due(tail(4_095, 1_000_000), 4_096, 1_000),
+    "work without the floor's bytes"
   );
-  assert!(p.anchors.contains(&"replay_bytes_per_us"));
+  assert!(
+    !snapshot_due(tail(1 << 30, 999), 4_096, 1_000),
+    "bytes without the budget's work"
+  );
+  assert!(
+    snapshot_due(tail(0, 0), 0, 0),
+    "a zero budget and floor snapshot at every commit"
+  );
 }
 
 /// Shape: the snapshot interval of the rewind test — small, so the history crosses hundreds of snapshots.
@@ -1522,7 +1791,8 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   let mut segment = segment("slates-db-tenant-erase", LOG_BYTES);
   let mut db = open(&mut segment);
   let (first, other) = (principal(0), principal(1));
-  let (first_account, other_account) = (1000u64, 1001u64);
+  // Each tenant is its owner's, as sealing names it (A-237: a host account's tenant includes its host).
+  let (first_account, other_account) = (first.tenant(), other.tenant());
   for (n, owner) in [(1, &first), (2, &first), (3, &other)] {
     let record = VolumeRecord {
       owner: owner.clone(),
@@ -1559,4 +1829,256 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+// ---------------------------------------------------------------- acknowledgements that name owed ids
+
+/// One step of a client whose acknowledgements name the ids it still owes (§4.9), and of their delivery to the
+/// database, in any order, more than once, late.
+#[derive(Clone, Debug)]
+enum OwedStep {
+  /// The client issues its next id, owed until answered.
+  Issue,
+  /// The server records the completion of the client's `n`-th owed id, and the client takes the answer (no longer
+  /// owed).
+  Answer(usize),
+  /// The server records the completion of the `n`-th owed id, and the client holds it for a resend under it (still
+  /// owed: an `Overloaded` answer to a verb that ran).
+  Hold(usize),
+  /// The client releases its `n`-th owed id unanswered (gives the resend up).
+  Release(usize),
+  /// The server runs the client's `n`-th owed id and it waits for a version to commit (A-252): it stays owed, durable as
+  /// waiting until its completion replaces that.
+  Await(usize),
+  /// The client sends an acknowledgement of where it stands: every id issued, the owed ones named.
+  Acknowledge,
+  /// The `n`-th acknowledgement in flight is delivered, and stays in flight too when `again` (a duplicate).
+  Deliver(usize, bool),
+  /// The database is dropped and recovered.
+  Crash,
+}
+
+fn owed_step() -> impl Strategy<Value = OwedStep> {
+  prop_oneof![
+    3 => Just(OwedStep::Issue),
+    2 => (0..8usize).prop_map(OwedStep::Answer),
+    1 => (0..8usize).prop_map(OwedStep::Hold),
+    1 => (0..8usize).prop_map(OwedStep::Release),
+    1 => (0..8usize).prop_map(OwedStep::Await),
+    2 => Just(OwedStep::Acknowledge),
+    3 => (0..8usize, any::<bool>()).prop_map(|(n, again)| OwedStep::Deliver(n, again)),
+    1 => Just(OwedStep::Crash),
+  ]
+}
+
+/// Shape: the client of the owed-acknowledgement model.
+const OWING_CLIENT: u32 = 9;
+/// Shape: the green its waiting requests wait on.
+const OWED_GREEN: VolumeId = VolumeId { bytes: [5; 16] };
+
+/// The model client: its last issued id, the ids it owes, and the acknowledgements it sent not yet delivered.
+#[derive(Default)]
+struct OwingClient {
+  issued: u32,
+  owed: std::collections::BTreeSet<u32>,
+  recorded: std::collections::BTreeSet<u32>,
+  /// The ids waiting for a version, by that version (A-252).
+  awaiting: std::collections::BTreeMap<u32, u64>,
+  in_flight: Vec<(u32, Vec<u32>)>,
+}
+
+impl OwingClient {
+  /// The `n`-th owed id, wrapping.
+  fn nth_owed(&self, n: usize) -> Option<u32> {
+    let count = self.owed.len();
+    (count > 0)
+      .then(|| self.owed.iter().nth(n % count).copied())
+      .flatten()
+  }
+}
+
+/// Applies one step of the owed-acknowledgement model.
+fn owed_step_applied(
+  step: &OwedStep,
+  client: &mut OwingClient,
+  db: &mut Db,
+  seg: &mut AnchorSegment,
+) -> Result<(), TestCaseError> {
+  let record = |sequence: u32| Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: OWING_CLIENT,
+      sequence,
+      result: sequence.to_le_bytes().to_vec(),
+    },
+  };
+  match step {
+    OwedStep::Issue => {
+      client.issued += 1;
+      client.owed.insert(client.issued);
+    }
+    OwedStep::Answer(n) | OwedStep::Hold(n) => {
+      if let Some(sequence) = client.nth_owed(*n) {
+        if !client.recorded.contains(&sequence) {
+          db.mutate(seg, &record(sequence), 0).map_err(failed)?;
+          client.recorded.insert(sequence);
+        }
+        if matches!(step, OwedStep::Answer(_)) {
+          client.owed.remove(&sequence);
+        }
+      }
+    }
+    OwedStep::Await(n) => {
+      if let Some(sequence) = client.nth_owed(*n)
+        && !client.recorded.contains(&sequence)
+      {
+        let version = u64::from(sequence) + 100;
+        db.mutate(
+          seg,
+          &Op::CompletionAwaiting {
+            origin: 0,
+            client: OWING_CLIENT,
+            sequence,
+            green: OWED_GREEN,
+            version,
+          },
+          0,
+        )
+        .map_err(failed)?;
+        client.awaiting.insert(sequence, version);
+      }
+    }
+    OwedStep::Release(n) => {
+      if let Some(sequence) = client.nth_owed(*n) {
+        client.owed.remove(&sequence);
+      }
+    }
+    OwedStep::Acknowledge => client
+      .in_flight
+      .push((client.issued, client.owed.iter().copied().collect())),
+    OwedStep::Deliver(n, again) => {
+      let count = client.in_flight.len();
+      if count > 0 {
+        let (up_to, owed) = if *again {
+          client.in_flight[n % count].clone()
+        } else {
+          client.in_flight.remove(n % count)
+        };
+        let acknowledged = Op::CompletionsAcknowledged {
+          origin: 0,
+          client: OWING_CLIENT,
+          up_to,
+          owed,
+        };
+        db.mutate(seg, &acknowledged, 0).map_err(failed)?;
+      }
+    }
+    OwedStep::Crash => {}
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(120), ..ProptestConfig::default() }))]
+
+  /// §4.9, raft's check of the owed-id rule: a client issues ids, has some answered, holds some for a resend (the
+  /// server recorded them), releases some, and sends acknowledgements of where it stands, which reach the database in
+  /// any order, duplicated and late, with crashes between, under a small pinned snapshot cadence. Expect after every
+  /// step: no id the client still owes is released (`Seen::Acknowledged`), an owed id the server recorded is answered
+  /// from its record, and every recovery equals the live partition whole.
+  #[test]
+  fn no_owed_id_is_released_whatever_order_its_acknowledgements_arrive_in(steps in proptest::collection::vec(owed_step(), 1..200), snapshot_every in 64u64..4_096) {
+    let mut seg = segment("slates-db-owed", LOG_BYTES);
+    let mut db = open(&mut seg);
+    db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
+    let mut client = OwingClient::default();
+    for step in &steps {
+      owed_step_applied(step, &mut client, &mut db, &mut seg)?;
+      if matches!(step, OwedStep::Crash) {
+        let live = db.partition().to_snapshot(0);
+        drop(db);
+        db = recover(&mut seg, 0, caps(), 0).map_err(failed)?.0;
+        db.set_policy(SnapshotPolicy { bytes_between_snapshots: snapshot_every });
+        prop_assert_eq!(db.partition().to_snapshot(0), live, "recovery differs from the live partition");
+      }
+      for owed in &client.owed {
+        let seen = db.partition().completion(0, OWING_CLIENT, *owed);
+        prop_assert!(seen != Seen::Acknowledged, "owed id {} released after {:?}", owed, step);
+        if client.recorded.contains(owed) {
+          prop_assert_eq!(seen, Seen::Completed(owed.to_le_bytes().to_vec()), "owed id {} lost its record", owed);
+        } else if let Some(version) = client.awaiting.get(owed) {
+          // Never `New`: a request that ran and waits is never run again, across any recovery (A-252).
+          prop_assert_eq!(
+            seen,
+            Seen::Awaiting { object: OWED_GREEN.bytes, version: *version },
+            "owed id {} lost its wait", owed
+          );
+        }
+      }
+    }
+  }
+}
+
+/// §4.16 "Commit", A-252: a request's wait and the effect it waits on are one durable step. Do: in one transaction, a
+/// wait and a second operation; drop the database before the commit, recover; then the same and commit, recover. Expect:
+/// before the commit neither is there, the request `New` (it never ran as far as the log knows); after it the wait is
+/// there, and a completion recorded later replaces it through a further recovery.
+#[test]
+fn a_wait_and_its_transaction_are_one_durable_step() {
+  let mut seg = segment("slates-db-await-atomic", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let wait = Op::CompletionAwaiting {
+    origin: 0,
+    client: OWING_CLIENT,
+    sequence: 3,
+    green: OWED_GREEN,
+    version: 7,
+  };
+  let other = Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: OWING_CLIENT,
+      sequence: 1,
+      result: b"other".to_vec(),
+    },
+  };
+  db.begin();
+  db.mutate(&mut seg, &wait, 0).unwrap();
+  db.mutate(&mut seg, &other, 0).unwrap();
+  drop(db);
+  let (mut db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(db.partition().completion(0, OWING_CLIENT, 3), Seen::New);
+  assert_eq!(db.partition().completion(0, OWING_CLIENT, 1), Seen::New);
+  db.begin();
+  db.mutate(&mut seg, &wait, 0).unwrap();
+  db.mutate(&mut seg, &other, 0).unwrap();
+  db.commit(&mut seg).unwrap();
+  drop(db);
+  let (mut db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().completion(0, OWING_CLIENT, 3),
+    Seen::Awaiting {
+      object: OWED_GREEN.bytes,
+      version: 7
+    }
+  );
+  db.mutate(
+    &mut seg,
+    &Op::CompletionRecorded {
+      record: CompletionRecord {
+        origin: 0,
+        client: OWING_CLIENT,
+        sequence: 3,
+        result: b"seven".to_vec(),
+      },
+    },
+    0,
+  )
+  .unwrap();
+  drop(db);
+  let (db, ..) = recover(&mut seg, 0, caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().completion(0, OWING_CLIENT, 3),
+    Seen::Completed(b"seven".to_vec())
+  );
 }

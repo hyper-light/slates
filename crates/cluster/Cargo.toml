@@ -21,6 +21,8 @@ slates-wire = { workspace = true }
 slates-transport = { workspace = true }
 # the runtime: bounded-concurrency dispatch (spawn/cancel) and the commit deadline (sleep).
 slates-rt = { workspace = true }
+# The process's log lines, which cannot panic on a refused write (`slates_machine::log_line!`, A-213).
+slates-machine = { workspace = true }
 # the archive: the content plane's transfer unit and the holder's verified content store (§4.10).
 slates-archive = { workspace = true }
 # the shard memory a content hold stores in and is charged against (§4.2; AUD-29-43): its arena and budgets.

@@ -338,10 +338,29 @@ pub(crate) fn drain(fd: &OwnedFd) -> Result<Drained, SeamError> {
   }
 }
 
+/// A non-blocking pipe pair for a doorbell or a notification: close-on-exec ([`close_on_exec_pipe`]), since a loop
+/// that ends on the doorbell's hang-up (`EndReason::DoorbellHungUp`) waits for every holder of its write end to go.
 pub(crate) fn pipe() -> (OwnedFd, OwnedFd) {
-  let (read, write) = rustix::pipe::pipe().unwrap();
+  let (read, write) = close_on_exec_pipe();
   rustix::io::ioctl_fionbio(&read, true).unwrap();
   (read, write)
+}
+
+/// A pipe whose two ends are close-on-exec, so a child another test spawns while they are open does not keep a copy
+/// past its `exec` and hold a dropped end alive (main 2e74a8af, `crates/cli/tests/cli.rs` `close_on_exec_pipe`). Linux
+/// sets the flag in the same call (`pipe2`); elsewhere it is set at once after, the one window a concurrent fork can
+/// still land in.
+pub(crate) fn close_on_exec_pipe() -> (OwnedFd, OwnedFd) {
+  #[cfg(target_os = "linux")]
+  let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+  #[cfg(not(target_os = "linux"))]
+  let ends = {
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+    (reader, writer)
+  };
+  ends
 }
 
 // --- The FUSE requests a guest kernel sends. ---

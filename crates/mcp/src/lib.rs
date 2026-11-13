@@ -22,6 +22,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use serde_json::{Value, json};
@@ -30,8 +32,8 @@ use slates_client::{
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
   GreenBase, GroupReport, HostAnswer, Intent, KernelCache, Landing, LandingDegradation,
   LandingOutcome, LandingSummary, NamePolicy, OciBinding, ReadAt, ReadWritePolicy, Rebased,
-  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  RecoveryCause, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
+  Submitted, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,
 };
 
@@ -1486,7 +1488,24 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
     "referenced_bytes": v.referenced_bytes,
     "unique_bytes": v.unique_bytes,
     "overlay": v.overlay,
+    "not_recovered": v.not_recovered.as_ref().map(recovery_cause_kind),
   })
+}
+
+/// The kind of why recovery could not rebuild a volume (§4.8), as `volume list` and its JSON name it: the
+/// [`RecoveryCause`] variant's name. The whole cause, with its path or reason, is in the volume's `status` refusal.
+pub fn recovery_cause_kind(cause: &RecoveryCause) -> &'static str {
+  match cause {
+    RecoveryCause::NoImage => "NoImage",
+    RecoveryCause::BlocksUnclaimed => "BlocksUnclaimed",
+    RecoveryCause::BaseMissing { .. } => "BaseMissing",
+    RecoveryCause::BaseOnOwnMount { .. } => "BaseOnOwnMount",
+    RecoveryCause::BaseUnavailable { .. } => "BaseUnavailable",
+    RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
+    RecoveryCause::ImageRefused { .. } => "ImageRefused",
+    RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+    RecoveryCause::TakeoverIncomplete { .. } => "TakeoverIncomplete",
+  }
 }
 
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
@@ -1505,6 +1524,7 @@ pub fn status_json(r: &StatusReport) -> Value {
       .map(|mount| serde_json::json!({ "attachment": mount.attachment, "path": mount.path }))
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
+    "takeover_kept": r.takeover_kept,
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
@@ -1571,6 +1591,7 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::MountNotShared => "mount_not_shared",
     UnsupportedReason::DescriptorRouteNotBuilt => "descriptor_route_not_built",
     UnsupportedReason::WinFspNotInstalled => "winfsp_not_installed",
+    UnsupportedReason::OwnedByAnotherHost => "owned_by_another_host",
   }
 }
 
@@ -1969,11 +1990,13 @@ pub fn gather_daemon_status(
 /// text form's per-shard lines and this are one definition). A shard whose drain was not gathered
 /// carries `"telemetry": null`.
 pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
-  json!({
+  let mut report = json!({
     "pid": r.pid,
     "generation": r.generation,
     "restarts": r.restarts,
     "anchor_hold_refusals": r.anchor_hold_refusals,
+    "anchor_log_lines_refused": r.anchor_log_lines_refused,
+    "log_lines_refused": r.log_lines_refused,
     "heartbeat_age_ns": r.heartbeat_age_ns,
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,
@@ -2040,7 +2063,12 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
     },
-  })
+  });
+  // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
+  if let Some(fields) = report.as_object_mut() {
+    fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
+  }
+  report
 }
 
 /// The takeover block of the fleet status as JSON (§4.8): this node's settled and current neighbourhood

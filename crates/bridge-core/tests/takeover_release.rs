@@ -1,10 +1,12 @@
 //! Releases of handles a dead daemon issued, served by its successor (goal item 4 of 2026-10-22; A-61, A-148; AC-3.4).
 //! A FUSE mount the anchor holds across a daemon's death keeps the kernel's open handles; the successor recovers the
 //! volume from its image and serves those handles' releases from a fresh handle store, which never issued them. A
-//! release of one must give back the open reference it held, so an unlinked file is reclaimed once the kernel lets go of
-//! it, and must never give back a reference something else still needs. Each test runs the mount before the takeover,
-//! publishes (the image), rebuilds the volume and settles its references as recovery does, and serves the rest through
-//! the successor's bridge.
+//! release of one must give back the open reference it held, and must never give back a reference something else still
+//! needs. An unlinked file made before the takeover is kept until the surviving mount ends, since its kernel may hold a
+//! handle no publication counted (U10): each test asserts every reference given back, then the keep, then the reclaim
+//! at the mount's end. Each test runs the mount before the takeover, publishes (the image), rebuilds the volume and
+//! settles its references as recovery does, naming the mount as held, and serves the rest through the successor's
+//! bridge.
 
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -73,7 +75,10 @@ fn recorded_cx() -> OpContext {
     .attach(
       VolumeId { bytes: [0; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,
@@ -120,7 +125,7 @@ fn taken_over(old: &Store, image: &VolumeImage) -> (Store, Volume) {
   )
   .unwrap();
   recovered
-    .settle_recovered_references(&mut fresh, |id| id == RECORD)
+    .settle_recovered_references(&mut fresh, |id| id == RECORD, &[RECORD])
     .unwrap();
   (fresh, recovered)
 }
@@ -142,6 +147,46 @@ fn an_unlinked_open_file(vol: &mut Volume, store: &mut Store, more: usize) -> (u
   }
   bridge.unlink(oid(root), &cx, "f").unwrap();
   (attr.ino, handles)
+}
+
+/// After the kernel has let go of `f` on the mount that survived the takeover: its last reference went back with the
+/// kernel's `FORGET` (`what`), and a `FORGET` comes only once the kernel holds nothing of the inode, no handle included
+/// (a handle holds a lookup). So the file is reclaimed at once, not kept for the mount: U10 keeps a file only while a
+/// mount may hold it through a handle no publication counted, and the mount that forgot it cannot.
+fn reclaimed_at_the_forget(vol: &mut Volume, store: &mut Store, f: u64, what: &str) {
+  assert_eq!(
+    vol.takeover_kept(),
+    0,
+    "{what}: nothing kept for a mount that forgot the file"
+  );
+  let cx = recorded_cx();
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut bridge =
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, &mut handles, None);
+  assert!(bridge.getattr(oid(f), &cx).is_err(), "{what}: reclaimed");
+}
+
+/// After the kernel has let go of `f` on a mount that survived the takeover with no `FORGET` to say so (U10, the
+/// supervisor's option 2): every reference the successor knows was given back (`what`), so the file is kept only for
+/// that mount, counted; and it is reclaimed when the mount ends.
+fn kept_until_the_mount_ends(vol: &mut Volume, store: &mut Store, f: u64, what: &str) {
+  assert_eq!(
+    vol.takeover_kept(),
+    1,
+    "{what}: no reference left but the mount's keep"
+  );
+  vol
+    .sweep_attachment(store, slates_vfs::ids::RefOwner::Attachment(RECORD))
+    .unwrap();
+  assert_eq!(vol.takeover_kept(), 0, "nothing kept once the mount ended");
+  let cx = recorded_cx();
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut bridge =
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, &mut handles, None);
+  assert!(
+    bridge.getattr(oid(f), &cx).is_err(),
+    "reclaimed when the mount ends"
+  );
 }
 
 /// Whether file `ino` still reads its bytes through the successor's bridge.
@@ -179,9 +224,12 @@ fn a_release_of_a_handle_opened_before_a_takeover_gives_back_its_reference() {
     "the kernel's lookup still holds the file after its handle's release"
   );
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    bridge.getattr(oid(f), &cx).is_err(),
-    "reclaimed once the kernel lets go: the release gave back the open reference it held"
+  drop(bridge);
+  reclaimed_at_the_forget(
+    &mut recovered,
+    &mut after,
+    f,
+    "reclaimed once the kernel lets go: the release gave back the open reference it held",
   );
 }
 
@@ -218,10 +266,8 @@ fn a_release_after_a_takeover_never_gives_back_a_reference_another_handle_still_
     "a release repeated gives back nothing more"
   );
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    bridge.getattr(oid(f), &cx).is_err(),
-    "reclaimed at the forget"
-  );
+  drop(bridge);
+  reclaimed_at_the_forget(&mut recovered, &mut after, f, "reclaimed at the forget");
 }
 
 /// Goal item 4, the window between a publication and the death: a handle opened after the last publication left no
@@ -265,9 +311,12 @@ fn a_handle_opened_after_the_last_publication_gives_back_no_more_than_the_image_
     );
   }
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    bridge.getattr(oid(f), &cx).is_err(),
-    "reclaimed at the forget: nothing leaked, nothing given back twice"
+  drop(bridge);
+  reclaimed_at_the_forget(
+    &mut recovered,
+    &mut after,
+    f,
+    "reclaimed at the forget: nothing leaked, nothing given back twice",
   );
 }
 
@@ -304,9 +353,12 @@ fn a_reissued_handle_value_on_the_same_file_balances_across_the_takeover() {
   );
   bridge.release(oid(f), &cx, reissued).unwrap();
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    bridge.getattr(oid(f), &cx).is_err(),
-    "reclaimed at the forget: both opens given back"
+  drop(bridge);
+  reclaimed_at_the_forget(
+    &mut recovered,
+    &mut after,
+    f,
+    "reclaimed at the forget: both opens given back",
   );
 }
 
@@ -370,9 +422,12 @@ fn a_handle_released_after_the_last_publication_leaves_no_open_behind() {
     bridge.release(oid(f), &cx, *fh).unwrap();
   }
   bridge.forget(oid(f), &cx, 1);
-  assert!(
-    bridge.getattr(oid(f), &cx).is_err(),
-    "reclaimed at the forget: the release the dead daemon answered left no open behind"
+  drop(bridge);
+  reclaimed_at_the_forget(
+    &mut recovered,
+    &mut after,
+    f,
+    "reclaimed at the forget: the release the dead daemon answered left no open behind",
   );
 }
 
@@ -412,5 +467,196 @@ fn a_release_of_an_open_no_publication_counted_waits_for_nothing() {
   assert!(
     !bridge.awaits_publication(),
     "an open and release since the last publication wait for nothing"
+  );
+}
+
+/// Shape: a quota small enough that a restart loop reaches it in a few rounds.
+const SMALL_QUOTA: u64 = 1 << 16;
+/// Shape: the bytes each round's file holds: a sixteenth of the quota.
+const ROUND_BYTES: usize = 1 << 12;
+
+/// A volume of [`SMALL_QUOTA`].
+fn small_volume(store: &mut Store) -> Volume {
+  Volume::create(
+    store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: SMALL_QUOTA },
+      journal_bytes: JOURNAL_BYTES,
+      clock: Box::new(HostClock::default()),
+    },
+  )
+  .unwrap()
+}
+
+/// U10 (the supervisor's option 2): a handle a dead daemon issued after its last publication is unknown to its
+/// successor, which used to reclaim the file when it left the namespace, and the handle's next read was refused. Do:
+/// make `g`, close and forget it, publish; then, unpublished, look it up and open it again (the kernel's handle no image
+/// counts); take over; unlink `g` through the successor; make, close, forget and unlink `h` there too; then end the
+/// mount. Expect: `g` still readable after its unlink and counted kept; `h`, made after the takeover, reclaimed at once;
+/// and `g` reclaimed when the mount ends.
+#[test]
+fn a_file_a_handle_no_publication_counted_may_hold_is_kept_until_its_mount_ends() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = recorded_cx();
+  let g = {
+    let mut dead = slates_bridge_core::new_handle_store();
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut dead,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, fh) = bridge.create(oid(root), &cx, "g", 0o644, 0).unwrap();
+    bridge.write(oid(attr.ino), &cx, 0, BYTES).unwrap();
+    bridge.release(oid(attr.ino), &cx, fh).unwrap();
+    attr.ino
+  };
+  let image = vol.to_image(&store, None).unwrap();
+  {
+    let mut dead = slates_bridge_core::new_handle_store();
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut dead,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let found = bridge.lookup(oid(root), &cx, "g").unwrap();
+    bridge.reference(oid(found.ino), &cx).unwrap();
+    let _uncounted = bridge.open(oid(found.ino), &cx, 0).unwrap();
+  }
+  let (mut after, mut recovered) = taken_over(&store, &image);
+  let mut successor = slates_bridge_core::new_handle_store();
+  let h = {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut recovered,
+      &mut after,
+      &mut successor,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    bridge.unlink(oid(root), &cx, "g").unwrap();
+    assert!(
+      readable(&mut bridge, &cx, g),
+      "the file a handle no publication counted may hold is kept"
+    );
+    let (attr, fh) = bridge.create(oid(root), &cx, "h", 0o644, 0).unwrap();
+    bridge.release(oid(attr.ino), &cx, fh).unwrap();
+    bridge.forget(oid(attr.ino), &cx, 1);
+    bridge.unlink(oid(root), &cx, "h").unwrap();
+    assert!(
+      bridge.getattr(oid(attr.ino), &cx).is_err(),
+      "a file made after the takeover is reclaimed at once: its handles are all counted"
+    );
+    attr.ino
+  };
+  assert_ne!(g, h);
+  assert_eq!(recovered.takeover_kept(), 1, "the kept file is counted");
+  kept_until_the_mount_ends(&mut recovered, &mut after, g, "the unlinked file");
+}
+
+/// U10's bound (the supervisor's condition). Do: round after round, make a file of [`ROUND_BYTES`] on a volume of
+/// [`SMALL_QUOTA`] through the surviving mount, close and forget it, publish, take over and unlink it, so each takeover
+/// keeps one more file; stop at the first refusal. Expect: the loop refused `NoSpace` before the kept files' bytes
+/// passed the quota, the volume's bytes never past it; and once the mount ends, every kept file reclaimed and a write
+/// of the same size admitted again.
+#[test]
+fn a_restart_loop_cannot_grow_the_kept_files_past_the_quota() {
+  let mut store = store();
+  let mut vol = small_volume(&mut store);
+  let cx = recorded_cx();
+  let payload = vec![0x5Au8; ROUND_BYTES];
+  let mut refused = None;
+  let rounds = usize::try_from(SMALL_QUOTA).unwrap() / ROUND_BYTES * 2;
+  for round in 0..rounds {
+    let name = format!("round-{round}");
+    let made = {
+      let mut handles = slates_bridge_core::new_handle_store();
+      let mut bridge = VolumeBridge::attached(
+        VolumeId { bytes: [0; 16] },
+        &mut vol,
+        &mut store,
+        &mut handles,
+        None,
+      );
+      let root = bridge.root(&cx).unwrap();
+      bridge
+        .create(oid(root), &cx, &name, 0o644, 0)
+        .and_then(|(attr, fh)| {
+          let wrote = bridge.write(oid(attr.ino), &cx, 0, &payload);
+          bridge.release(oid(attr.ino), &cx, fh)?;
+          bridge.forget(oid(attr.ino), &cx, 1);
+          wrote.map(|_| ())
+        })
+    };
+    if let Err(error) = made {
+      refused = Some((round, error));
+      break;
+    }
+    assert!(
+      vol.accounting().referenced_bytes <= vol.capacity_bytes(),
+      "round {round}: the volume's bytes are within its quota"
+    );
+    let image = vol.to_image(&store, None).unwrap();
+    let (mut next_store, mut next) = taken_over(&store, &image);
+    {
+      let mut handles = slates_bridge_core::new_handle_store();
+      let mut bridge = VolumeBridge::attached(
+        VolumeId { bytes: [0; 16] },
+        &mut next,
+        &mut next_store,
+        &mut handles,
+        None,
+      );
+      let root = bridge.root(&cx).unwrap();
+      bridge.unlink(oid(root), &cx, &name).unwrap();
+    }
+    store = next_store;
+    vol = next;
+  }
+  let (round, error) = refused.expect("the restart loop met the quota");
+  eprintln!(
+    "refused at round {round} with {error:?}; {} files kept, {} of {} bytes",
+    vol.takeover_kept(),
+    vol.accounting().referenced_bytes,
+    vol.capacity_bytes()
+  );
+  assert_eq!(
+    error,
+    slates_vfs::VfsError::NoSpace,
+    "refused by the quota, typed"
+  );
+  assert!(
+    vol.takeover_kept() > 0,
+    "the files kept across the restarts were held"
+  );
+  vol
+    .sweep_attachment(&mut store, slates_vfs::ids::RefOwner::Attachment(RECORD))
+    .unwrap();
+  assert_eq!(
+    vol.takeover_kept(),
+    0,
+    "every kept file reclaimed when the mount ends"
+  );
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  );
+  let root = bridge.root(&cx).unwrap();
+  let (attr, _) = bridge.create(oid(root), &cx, "after", 0o644, 0).unwrap();
+  assert!(
+    bridge.write(oid(attr.ino), &cx, 0, &payload).is_ok(),
+    "a write of the same size is admitted once the kept files are gone"
   );
 }

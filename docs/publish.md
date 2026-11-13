@@ -15,9 +15,11 @@ proof recorded for this lane. The design is §2.4 and §4.12 of
   (`crates/sdk-python/pyproject.toml` says `dynamic = ["version"]`; a static copy there is refused).
 - npm needs a literal `version` in every `package.json`, so the Node copies are **derived**, never
   edited: `cargo xtask version --write` stamps the main package (`crates/sdk-node/package.json`),
-  the nine platform packages under `crates/sdk-node/npm/`, the nine `optionalDependencies` pins and
+  the seven platform packages under `crates/sdk-node/npm/`, the seven `optionalDependencies` pins and
   the platform READMEs from the workspace version and the main package's `name`, `napi.binaryName`
-  and `napi.targets`. `cargo xtask version` refuses any drift — including a platform package whose
+  and `napi.targets`. `napi.targets` must name exactly the targets slates ships (`xtask/src/targets.rs`: macOS
+  arm64, Linux x86_64 and arm64 with glibc and musl, Windows x86_64 and arm64). `cargo xtask version` refuses any
+  drift — a target that is not shipped, a shipped one missing, or a platform package whose
   `os`/`cpu`/`libc`/`main`/`files` would make npm pick the wrong binary — and runs inside
   `cargo xtask check`, in CI on every push, and as the first job of every tag lane
   (`.github/workflows/version-guard.yml`, `--expect-tag`: the tag must be `v` + the version).
@@ -31,10 +33,11 @@ proof recorded for this lane. The design is §2.4 and §4.12 of
 4. The tag starts three workflows, each beginning with the shared guard:
    - `release.yml` — the `slates` binary for seven targets, each smoke-tested on its own platform, attached
      with checksums and signed provenance to a **draft** release (below, "The binary release").
-   - `publish-python.yml` — wheels and sdist to PyPI.
-   - `publish-node.yml` — the addon for nine platforms and the ten packages to npm.
-5. `workflow_dispatch` on any of the three lanes is a build-only dry run: nothing is published
-   without a tag.
+   - `publish-python.yml` — wheels for the shipped targets and the sdist to PyPI.
+   - `publish-node.yml` — the addon for the seven shipped targets and the eight packages to npm.
+5. `workflow_dispatch` on any of the three lanes is a dry run: it builds every artifact and runs every
+   check (the npm lane assembles every platform package and refuses one without its binary; the PyPI lane
+   runs `twine check --strict` over every artifact), and nothing is published without a tag.
 6. Publish the binary release: check the draft (its seven binaries, `SHA256SUMS`,
    `slates-provenance.json`, `slates-attestation.sigstore.json`), then
    `gh release edit v0.2.0 --draft=false --latest` or "Publish release" on the draft. That is
@@ -69,6 +72,10 @@ installing it would do:
 5. A second client (`slates read`) reads the same bytes.
 6. The volume is destroyed.
 7. When the anchor is stopped, the daemon leaves with it.
+
+Every target is built twice, each copy on a runner of its own, and the release is refused unless the two copies are
+the same bytes (AC-9.5). The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
+PDB GUID from the content, not the clock.
 
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and
 each step's time. Two more checks run on some targets. The musl binaries must pass a staticness
@@ -109,8 +116,8 @@ through **trusted publishing** (OIDC from the `pypi` environment). No API token 
 `skip-existing` makes a re-run after a moved tag harmless.
 
 **`publish-node.yml`.** Builds `slates.<platform>.node` for every target in `package.json`
-`napi.targets` through the package's own `npm run build` (natively per platform; musl inside
-`node:24-alpine`; Windows arm64 and ia32 by MSVC's cross tools), collects the binaries with
+`napi.targets` through the package's own `npm run build` (natively, each on a runner of its own platform; musl
+inside `node:24-alpine`; Windows arm64 on `windows-11-arm` with clang-cl for AWS-LC), collects the binaries with
 `napi artifacts`, **refuses** to publish if any platform package lacks its binary (napi would
 otherwise skip it silently), then `npm publish --access public`: `prepublishOnly` runs
 `napi prepublish`, which publishes each platform package, and the main package follows. Publishing
@@ -128,24 +135,23 @@ pending publisher": PyPI project name `slates`, owner `hyper-light`, repository 
 `publish-python.yml`, environment `pypi`. The first tag run creates the project and its release.
 
 **npm — a stub publish creates each name, then the trusted publisher is attached.** npm can only
-attach a trusted publisher to a package that already exists (npm/cli#8544), so each of the ten
-names — `@hyper-light/slates` and `@hyper-light/slates-{darwin-arm64, darwin-x64, linux-x64-gnu,
-linux-arm64-gnu, linux-x64-musl, linux-arm64-musl, win32-x64-msvc, win32-arm64-msvc,
-win32-ia32-msvc}` — is created once at version `0.0.0` by a maintainer, exactly as vorpal's
+attach a trusted publisher to a package that already exists (npm/cli#8544), so each of the eight
+names — `@hyper-light/slates` and `@hyper-light/slates-{darwin-arm64, linux-x64-gnu, linux-arm64-gnu,
+linux-x64-musl, linux-arm64-musl, win32-x64-msvc, win32-arm64-msvc}` — is created once at version `0.0.0` by a maintainer, exactly as vorpal's
 packages were. The stubs are derived from the real manifests, so the reserved names are the
 published names:
 
 ```
 npm login                                     # a member of the hyper-light organization; npm >= 11.5.1
-cargo xtask npm-reserve --out "$OUT"          # ten directories: main/ and one per platform id
+cargo xtask npm-reserve --out "$OUT"          # eight directories: main/ and one per platform id
 for dir in "$OUT"/*/; do (cd "$dir" && npm publish --access public); done
-for name in @hyper-light/slates @hyper-light/slates-darwin-arm64 @hyper-light/slates-darwin-x64 \
+for name in @hyper-light/slates @hyper-light/slates-darwin-arm64 \
   @hyper-light/slates-linux-x64-gnu @hyper-light/slates-linux-arm64-gnu @hyper-light/slates-linux-x64-musl \
-  @hyper-light/slates-linux-arm64-musl @hyper-light/slates-win32-x64-msvc @hyper-light/slates-win32-arm64-msvc \
-  @hyper-light/slates-win32-ia32-msvc; do npm view "$name" version; done   # 0.0.0, ten times
+  @hyper-light/slates-linux-arm64-musl @hyper-light/slates-win32-x64-msvc \
+  @hyper-light/slates-win32-arm64-msvc; do npm view "$name" version; done   # 0.0.0, eight times
 ```
 
-Then, on npmjs.com, for each of the ten packages: Settings → Trusted publisher → GitHub Actions,
+Then, on npmjs.com, for each of the eight packages: Settings → Trusted publisher → GitHub Actions,
 organization `hyper-light`, repository `slates`, workflow `publish-node.yml`, environment `npm`.
 
 Status on 2026-09-14: the ten stubs are generated, packed and dry-run clean (see below); the
@@ -223,5 +229,4 @@ with its file, the stamping functions keeping every other byte).
 
 - The design's `abi3-py312` and `cp314t` (free-threaded) wheels: PyO3 0.22 cannot build
   free-threaded extensions; the wheel is `cp39-abi3`.
-- Windows arm64 and ia32 wheels (the Node lane ships those platforms).
 - The publish lanes have not yet run on a tag: the first run is Ada's, after the one-time setup.

@@ -83,21 +83,23 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
   match hyper_seal::lock_keys(slots) {
     Ok(()) => {}
     Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: sealing unavailable: this process's key region holds {held} keys, fewer than the {slots} \
          this daemon needs"
       );
       return RootState::Unavailable;
     }
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: sealing unavailable: a key region of {slots} keys could not be locked: {e}"
       );
       return RootState::Unavailable;
     }
   }
   if segment.protect_seal_page().is_err() {
-    eprintln!("slates-server: sealing unavailable: the anchor's key page could not be locked");
+    slates_machine::log_line!(
+      "slates-server: sealing unavailable: the anchor's key page could not be locked"
+    );
     return RootState::Unavailable;
   }
   if matches!(segment.seal_root(), Ok(Some(_))) {
@@ -111,7 +113,9 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
   if published {
     RootState::Minted
   } else {
-    eprintln!("slates-server: sealing unavailable: the root could not be made or published");
+    slates_machine::log_line!(
+      "slates-server: sealing unavailable: the root could not be made or published"
+    );
     RootState::Unavailable
   }
 }
@@ -396,21 +400,24 @@ pub fn pair_for_delivery(
 }
 
 /// A pair key an owner's shard `partition` on `host` delivered (A-92 piece 4b), on the control shard: unwrapped with this
-/// node's recipient and recorded under its root. A second delivery of the recorded key is accepted; another key for
-/// a recorded pair is refused, as the partition refuses a second record for an owner.
+/// node's recipient and recorded under its root. A second delivery of the recorded key is accepted. Another key from the
+/// same anchor and shard is a fresh boot there (its RAM, and every key it made, gone): it replaces the recorded one,
+/// which is kept as retired while a head or live log this node holds is still sealed under it, so the earlier
+/// incarnation's volumes can still be taken over; a retired key nothing held names any more is erased in the same
+/// transaction. Before 2026-11-07 the other key was refused for good: a node replaced with fresh RAM at its anchor had
+/// every pair refused by its survivors (789 of 793, CI diag-raft-chaos-three-25), its sealed entries never covered them,
+/// and its live writes waited for ever.
 pub fn accept_pair(
   state: &mut crate::state::ShardState,
   (host, partition): (u64, u16),
   id: [u8; 16],
   delivery: &[u8],
 ) -> Result<(), SealKeyError> {
-  let owner = slates_db::catalog::SealKeyOwner::PairReceived { host, partition };
-  if let Some(record) = state.db.partition().seal_key(&owner) {
-    return if record.id == id {
-      Ok(())
-    } else {
-      Err(SealKeyError::Record)
-    };
+  use slates_db::catalog::SealKeyOwner;
+  let owner = SealKeyOwner::PairReceived { host, partition };
+  let previous = state.db.partition().seal_key(&owner).cloned();
+  if previous.as_ref().is_some_and(|record| record.id == id) {
+    return Ok(());
   }
   let recipient = state
     .seal_recipient
@@ -419,7 +426,92 @@ pub fn accept_pair(
   let secret = recipient.unwrap(KeyId(id), delivery)?;
   let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
   let wrapped = root.wrap(&secret)?;
-  commit(state, record_of(owner, KeyId(id), &wrapped))
+  let still_sealed = sealed_under(state, host, partition);
+  let mut ops = Vec::new();
+  // The retired copy is recorded before the current key is destroyed, so a transaction cut short never loses a key a
+  // held record is sealed under.
+  if let Some(previous) = previous {
+    let retired = SealKeyOwner::PairRetired {
+      host,
+      partition,
+      key: previous.id,
+    };
+    if still_sealed.contains(&previous.id) && state.db.partition().seal_key(&retired).is_none() {
+      ops.push(slates_db::Op::SealKeySet {
+        record: slates_db::catalog::SealKeyRecord {
+          owner: retired,
+          id: previous.id,
+          record: previous.record,
+        },
+      });
+    }
+    ops.push(slates_db::Op::SealKeyDestroyed { owner });
+  }
+  ops.extend(
+    state
+      .db
+      .partition()
+      .seal_keys()
+      .filter(|record| {
+        matches!(record.owner, SealKeyOwner::PairRetired { host: from, partition: shard, key }
+          if from == host && shard == partition && !still_sealed.contains(&key))
+      })
+      .map(|record| slates_db::Op::SealKeyDestroyed {
+        owner: record.owner,
+      }),
+  );
+  ops.push(slates_db::Op::SealKeySet {
+    record: record_of(owner, KeyId(id), &wrapped),
+  });
+  commit_all(state, &ops)
+}
+
+/// The ids of the pair keys from `host`'s shard `partition` that something this node holds is sealed under for it: its
+/// own key entry in each held head's sealing ([`crate::head::HeadValue`]) and in each held live log's whole entry, by
+/// the wrapping key the entry names. What a retired pair key is kept for.
+fn sealed_under(
+  state: &crate::state::ShardState,
+  host: u64,
+  partition: u16,
+) -> std::collections::BTreeSet<[u8; 16]> {
+  let local = state.origin_anchor.0;
+  let named = |sealing: &crate::head::HeadSealing| {
+    (sealing.owner_anchor == host && sealing.partition == partition)
+      .then(|| sealing.keys.iter().find(|key| key.anchor == local))
+      .flatten()
+      .and_then(|key| hyper_seal::keys::Wrapped::decode(&key.wrapped).ok())
+      .map(|wrapped| wrapped.parent.0)
+  };
+  let heads = state.holder_records.iter().flat_map(|(object, acceptor)| {
+    acceptor
+      .values(*object)
+      .filter_map(crate::head::HeadValue::from_record_bytes)
+      .filter_map(|head| head.sealing)
+      .collect::<Vec<_>>()
+  });
+  heads
+    .chain(crate::live_ship::held_sealings(state))
+    .filter_map(|sealing| named(&sealing))
+    .collect()
+}
+
+/// Applies `ops` in order as one transaction, stopping at the first the partition refuses, and commits what applied: so
+/// they are ordered to keep every needed key at any cut. `Err` when one was refused or the commit failed.
+fn commit_all(
+  state: &mut crate::state::ShardState,
+  ops: &[slates_db::Op],
+) -> Result<(), SealKeyError> {
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  state.db.begin();
+  let applied = ops
+    .iter()
+    .all(|op| state.db.mutate(&mut state.segment, op, now).is_ok());
+  let committed = state.db.commit(&mut state.segment).is_ok();
+  if applied && committed {
+    Ok(())
+  } else {
+    Err(SealKeyError::Record)
+  }
 }
 
 /// The pair key recorded for `owner` here, unwrapped under the root: on an owner shard its key with a candidate, on a
@@ -492,7 +584,7 @@ pub fn head_sealing(
   let (lineage, secret) = recorded_lineage_secret(state, volume, tenant_of(owner))?;
   let keys: Vec<crate::head::HeadKey> = state
     .pairs_delivered
-    .iter()
+    .keys()
     .filter_map(|anchor| {
       let pair = pair_key(
         state,
@@ -540,17 +632,28 @@ pub fn successor_lineage(
     .keys
     .iter()
     .find(|key| key.anchor == state.origin_anchor.0)?;
-  let pair = pair_key(
-    state,
-    slates_db::catalog::SealKeyOwner::PairReceived {
+  let wrapped = hyper_seal::keys::Wrapped::decode(&own.wrapped).ok()?;
+  // The pair key the entry names: the owner's current one, or a retired one from an earlier incarnation at its anchor.
+  let current = slates_db::catalog::SealKeyOwner::PairReceived {
+    host: sealing.owner_anchor,
+    partition: sealing.partition,
+  };
+  let owner = if state
+    .db
+    .partition()
+    .seal_key(&current)
+    .is_some_and(|record| record.id == wrapped.parent.0)
+  {
+    current
+  } else {
+    slates_db::catalog::SealKeyOwner::PairRetired {
       host: sealing.owner_anchor,
       partition: sealing.partition,
-    },
-  )
-  .ok()?;
-  let secret = pair
-    .unwrap(&hyper_seal::keys::Wrapped::decode(&own.wrapped).ok()?)
-    .ok()?;
+      key: wrapped.parent.0,
+    }
+  };
+  let pair = pair_key(state, owner).ok()?;
+  let secret = pair.unwrap(&wrapped).ok()?;
   let root = state.seal_root.as_ref()?;
   Some((sealing.lineage, root.wrap(&secret).ok()?.encode().to_vec()))
 }

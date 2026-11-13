@@ -25,6 +25,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 /// The client-side completion bridge that gives an async SDK event loop a descriptor it can adopt as
@@ -46,6 +48,8 @@ pub mod handle_route;
 /// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A
 /// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
 /// transport does not reach it.
+#[cfg(target_os = "macos")]
+mod mach_claim;
 #[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;

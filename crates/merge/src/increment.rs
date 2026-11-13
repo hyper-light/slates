@@ -224,6 +224,31 @@ impl VolumeOp {
     }
   }
 
+  /// Every path this operation names: its path, a rename's two ends, and a hard link's target. A
+  /// symlink's target is a string the link holds, not a path the composition looks up, so it is not
+  /// named. What the deriver reads of a base is exactly these paths' entries (and the hard links
+  /// aimed at them), so a base restricted to them composes the same document ([`compose_volume`]).
+  pub fn names(&self) -> [Option<&str>; 2] {
+    match self {
+      VolumeOp::Overwrite { path, .. }
+      | VolumeOp::Extend { path, .. }
+      | VolumeOp::Truncate { path, .. }
+      | VolumeOp::Insert { path, .. }
+      | VolumeOp::Delete { path, .. }
+      | VolumeOp::Create { path }
+      | VolumeOp::Mknod { path, .. }
+      | VolumeOp::Unlink { path }
+      | VolumeOp::Mkdir { path }
+      | VolumeOp::Rmdir { path }
+      | VolumeOp::SetMode { path, .. }
+      | VolumeOp::Symlink { path, .. }
+      | VolumeOp::SetXattr { path, .. }
+      | VolumeOp::RemoveXattr { path, .. } => [Some(path), None],
+      VolumeOp::Rename { from, to } => [Some(from), Some(to)],
+      VolumeOp::Link { path, target } => [Some(path), Some(target)],
+    }
+  }
+
   /// Whether this is a directory operation (`Mkdir` or `Rmdir`).
   fn is_directory(&self) -> bool {
     matches!(self, VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. })
@@ -957,6 +982,24 @@ fn adds_content(kind: OpKind) -> bool {
 /// error. `base` gives the base content length of every path that existed at the increment's base
 /// version.
 pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, DeriveError> {
+  compose_volume_planned(base, journal).map(|(doc, _)| doc)
+}
+
+/// Where each run of an increment's post-state comes from: for the post-state offset (`src`) of each content op that
+/// adds bytes, the offset of those bytes in the work's file at the seal, under the op's path. The seal copies each run
+/// from there ([`compose_volume_planned`]).
+pub type PostStatePlan = std::collections::BTreeMap<u64, u64>;
+
+/// [`compose_volume`], with the plan the seal fills the post-state by (W2). The post-state is laid out compactly: each
+/// added run at the next offset, in the document's file order, then the xattr values and the special nodes, so an
+/// increment carries the bytes its ops add and nothing else. Until 2026-11-07 each edited file's whole final content
+/// was a region of it, zero-filled but for the runs (a 64-byte overwrite at offset 640 KiB carried 640 KiB), and the
+/// seal read each run at its op's offset in base coordinates rather than where the work's file holds it, so a run
+/// after an earlier length change in the same file merged zeros into the green (`green_post_state.rs`).
+pub fn compose_volume_planned(
+  base: &Base,
+  journal: &[VolumeOp],
+) -> Result<(OpsDoc, PostStatePlan), DeriveError> {
   let specials = crate::special::Composition::of(base, journal)?;
   check_no_file_directory_collision(base, journal)?;
   let directories = compose_directories(base, journal)?;
@@ -1008,9 +1051,14 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
   let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  let mut doc = seal(entities, directories, modes, symlinks, xattrs, hardlinks);
+  let mut plan = PostStatePlan::new();
+  let mut doc = seal(
+    entities,
+    (directories, modes, symlinks, xattrs, hardlinks),
+    &mut plan,
+  );
   specials.emit(&mut doc);
-  Ok(doc)
+  Ok((doc, plan))
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -1162,10 +1210,9 @@ struct Emission {
   source: Option<String>,
   /// Whether this file was created this increment (declares a `Create`).
   created: bool,
-  /// The composed content net ops (their `src` per-file until shifted into the region at emit).
+  /// The composed content net ops (their `src` the run's offset in the final file until laid into the post-state at
+  /// emit, [`push_content`]).
   ops: Vec<Op>,
-  /// The file's final content length (its post-state region size).
-  final_len: u64,
 }
 
 /// Emits the ops document from the sealed entity set. A surviving file that was created, renamed,
@@ -1182,7 +1229,7 @@ fn classify(entities: Vec<Entity>) -> (Vec<Emission>, Vec<String>) {
   for entity in entities {
     if entity.live {
       survivors.insert(entity.final_path.clone());
-      let (ops, final_len) = compose_content_sized(entity.base_len, &entity.content);
+      let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
       let created = entity.origin.is_none();
       let renamed = matches!(&entity.origin, Some(origin) if origin != &entity.final_path);
       if !created && !renamed && ops.is_empty() {
@@ -1194,7 +1241,6 @@ fn classify(entities: Vec<Entity>) -> (Vec<Emission>, Vec<String>) {
         source,
         created,
         ops,
-        final_len,
       });
     } else if let Some(origin) = entity.origin {
       gone.push(origin);
@@ -1325,13 +1371,19 @@ fn emit_namespace(
   }
 }
 
+/// The namespace emissions a seal lays out besides the files: directories, modes, symlinks, xattrs and hard links.
+type Namespace = (
+  Vec<DirectoryEmission>,
+  Vec<(String, u32)>,
+  Vec<SymlinkEmission>,
+  Vec<XattrEmission>,
+  Vec<LinkEmission>,
+);
+
 fn seal(
   entities: Vec<Entity>,
-  directories: Vec<DirectoryEmission>,
-  modes: Vec<(String, u32)>,
-  symlinks: Vec<SymlinkEmission>,
-  xattrs: Vec<XattrEmission>,
-  hardlinks: Vec<LinkEmission>,
+  (directories, modes, symlinks, xattrs, hardlinks): Namespace,
+  plan: &mut PostStatePlan,
 ) -> OpsDoc {
   let (mut emissions, removed) = classify(entities);
   let names = document_names(
@@ -1356,7 +1408,7 @@ fn seal(
       })
   };
 
-  // The emissions in sorted final-path order: this is the post-state region layout.
+  // The emissions in sorted final-path order: the post-state's runs follow it, each at the next offset.
   emissions.sort_by(|a, b| a.final_path.cmp(&b.final_path));
   let mut region_offset = 0u64;
   for emission in emissions {
@@ -1366,8 +1418,12 @@ fn seal(
     } else if emission.created {
       doc.ops.push(namespace_op(OpKind::Create, destination));
     }
-    push_content(&mut doc, emission.ops, destination, region_offset);
-    region_offset = region_offset.saturating_add(emission.final_len);
+    push_content(
+      &mut doc,
+      emission.ops,
+      destination,
+      (&mut region_offset, plan),
+    );
   }
   // Xattr values are laid out in the post-state after the file content, in sorted order.
   for xattr in xattrs {
@@ -1402,13 +1458,20 @@ fn seal(
   doc
 }
 
-/// Pushes a file's content ops into the document, setting their path index and shifting the
-/// source offset of content-adding ops into the file's post-state region.
-fn push_content(doc: &mut OpsDoc, ops: Vec<Op>, index: u16, region_offset: u64) {
+/// Pushes a file's content ops into the document, setting their path index and giving each content-adding op the
+/// next post-state offset at `cursor`, its offset in the work's file (the deriver's `src`) planned under it.
+fn push_content(
+  doc: &mut OpsDoc,
+  ops: Vec<Op>,
+  index: u16,
+  (cursor, plan): (&mut u64, &mut PostStatePlan),
+) {
   for mut op in ops {
     op.path = index;
     if adds_content(op.kind) {
-      op.src = op.src.saturating_add(region_offset);
+      plan.insert(*cursor, op.src);
+      op.src = *cursor;
+      *cursor = cursor.saturating_add(op.len);
     }
     doc.ops.push(op);
   }

@@ -34,7 +34,7 @@ use slates_bridge_virtiofs::admission::{
   AdmissionError, GuestAttachRequest, GuestTransport, ReclaimError, VmmSeam, admit,
 };
 use slates_bridge_virtiofs::capability::{TransportCapability, host_capability};
-use slates_bridge_virtiofs::device::DeviceConfig;
+use slates_bridge_virtiofs::device::{DeviceConfig, Durability};
 use slates_bridge_virtiofs::serve::{BridgeAccess, LoopError, ServeEnd, register, serve_loop};
 use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{Refusal, VolumeId};
@@ -282,7 +282,52 @@ impl BridgeAccess for ShardBridge {
   fn told_settled(&mut self, waited: u64, overdue: u64) {
     let _counted = state::with_state(|s| crate::told::count_settled(s, waited, overdue));
   }
+
+  /// The position the owner's barrier left the volume's live-shipped log needing (A-200,
+  /// `crate::live_ship::durable_target`); out of reach, nothing is owed, since nothing can be published either.
+  fn durable_owed(&mut self) -> Option<u64> {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::durable_target(s, volume)).flatten()
+  }
+
+  /// Asked of the owner (`crate::live_ship::durability`); out of reach, the owner's state is gone with the log, which
+  /// never becomes durable there.
+  fn durability(&mut self, target: u64) -> Durability {
+    let volume = self.volume;
+    match state::with_state(|s| crate::live_ship::durability(s, volume, target, None)) {
+      Some(crate::live_ship::Durability::Durable) => Durability::Durable,
+      Some(crate::live_ship::Durability::Pending) => Durability::Pending,
+      Some(crate::live_ship::Durability::Never) | None => Durability::Never,
+    }
+  }
+
+  /// The owner shard's wait on the volume's live log (`crate::live_ship::DurableWait`).
+  type Durable = crate::live_ship::DurableWait;
+
+  fn durable(&mut self, target: u64) -> crate::live_ship::DurableWait {
+    crate::live_ship::DurableWait::new(self.volume, target)
+  }
+
+  /// Every transport's bound on a durability claim (`crate::live_ship::durable_wait_ns`: the liveness budget).
+  fn durable_bound_ns(&mut self) -> u64 {
+    crate::live_ship::durable_wait_ns()
+  }
+
+  /// On the device's ledger (`virtiofs.live_fsync_waited`, `virtiofs.live_fsync_refused`).
+  fn durable_settled(&mut self, waited: u64, refused: u64) {
+    let _counted = state::with_state(|s| {
+      s.count(LIVE_FSYNC_WAITED, waited);
+      s.count(LIVE_FSYNC_REFUSED, refused);
+    });
+  }
 }
+
+/// Counter: a guest's `FSYNC` released once its live-shipped volume's log was durable where its barrier put it, having
+/// waited for it (A-200).
+const LIVE_FSYNC_WAITED: &str = "virtiofs.live_fsync_waited";
+/// Counter: a guest's `FSYNC` answered `EIO`: its live-shipped volume's log was not durable within the liveness budget,
+/// or never will be here.
+const LIVE_FSYNC_REFUSED: &str = "virtiofs.live_fsync_refused";
 
 /// Format: the refusal-ledger name of a refused device's terminal step whose sweep could not run.
 const RECLAIM_INCOMPLETE: &str = "virtiofs.reclaim_incomplete";
@@ -499,7 +544,8 @@ async fn serve_vhost_user_device(
 ) {
   use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
   let config = DeviceConfig::new(tag);
-  let mut seam = match VhostUserSeam::adopt(socket, &config) {
+  let host = crate::state::with_state(|s| s.origin_anchor).unwrap_or(slates_db::HostId(0));
+  let mut seam = match VhostUserSeam::adopt(socket, &config, host) {
     Ok(seam) => seam,
     Err(refused) => {
       (harness.on_end)(GuestDeviceOutcome::HandshakeRefused(Some(refused)));

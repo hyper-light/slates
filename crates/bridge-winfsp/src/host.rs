@@ -44,22 +44,14 @@ use std::os::windows::io::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
-use std::thread::JoinHandle;
 
 use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
-use windows_sys::Win32::Foundation::{
-  GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
-};
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::GetSecurityDescriptorLength;
-use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
-  FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
-};
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::ffi::{
   self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
@@ -71,7 +63,7 @@ use crate::held::{
 };
 use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
-use crate::purge::{Purge, PurgeOutcome, PurgeTarget, purge_through};
+use crate::purge::{Purge, PurgeOutcome};
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
 use slates_mem::SparseObject;
 
@@ -100,6 +92,8 @@ pub enum WinFspError {
   Capture(crate::inflight::Refusal),
   /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
   UnsupportedDll(crate::dll_version::UnsupportedVersion),
+  /// The purge-intent slot refused (`crate::purge_intents`).
+  Intent(crate::purge_slot::Refusal),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -107,6 +101,13 @@ pub enum WinFspError {
     /// Its original system error code.
     code: Option<i32>,
   },
+}
+
+impl From<crate::inflight::Refusal> for WinFspError {
+  /// A journal refusal ends the receive worker as a capture refusal (`crate::inflight::settle`).
+  fn from(refusal: crate::inflight::Refusal) -> Self {
+    Self::Capture(refusal)
+  }
 }
 
 impl std::fmt::Display for WinFspError {
@@ -121,6 +122,7 @@ impl std::fmt::Display for WinFspError {
       Self::MountThread => write!(f, "the mount thread could not run"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
+      Self::Intent(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
       Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
@@ -232,6 +234,8 @@ enum Op<T> {
   Create {
     path: String,
     is_dir: bool,
+    /// The Win32 attribute word the caller created with (A-262).
+    attributes: u32,
   },
   Read {
     object: T,
@@ -261,15 +265,49 @@ enum Op<T> {
   },
   Truncate {
     object: T,
+    /// The Win32 attribute word of the overwrite, and whether it supersedes the file's (A-262).
+    attributes: u32,
+    replace: bool,
   },
+  /// `MoveFileEx` and its kin: `replace` is WinFsp's `ReplaceIfExists`, the caller's `MOVEFILE_REPLACE_EXISTING`
+  /// (A-209: a move not asked to replace must refuse a taken name, `t/base/04.t`).
   Rename {
     from: String,
     to: String,
+    replace: bool,
+  },
+  /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
+  /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-209, `t/base/05.t`), and any other
+  /// allocation changes nothing the volume keeps.
+  SetAllocation {
+    object: T,
+    new_size: u64,
+  },
+  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification, change or
+  /// birth time (A-209 and A-259, `t/base/06.t`).
+  SetTimes {
+    object: T,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+    btime: Option<i64>,
+    /// The Win32 attribute word to give the object, or `None` for "as it is" (`INVALID_FILE_ATTRIBUTES`; A-262).
+    attributes: Option<u32>,
+  },
+  /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
+  /// deletion. A directory with any child refuses (A-209, `t/base/03.t`): the delete itself runs in Cleanup, which
+  /// answers the kernel nothing, so a refusal there reached no program.
+  CanDelete {
+    object: T,
   },
   /// `FlushFileBuffers` on a handle: the bridge's flush, then the publication that makes it durable.
   Flush {
     object: T,
   },
+  /// `FlushFileBuffers` on the volume (a null context): Windows has written every file's cached data back first, so
+  /// there is nothing to flush through the bridge, but the publication that makes it durable is owed as a handle's
+  /// flush owes it. Before 2026-11-05 it was answered success on WinFsp's thread with no publication at all.
+  FlushVolume,
   /// The last handle of a file object closed (`Cleanup`) after it changed the file: deletes the path when asked
   /// (a file's `unlink`, an empty directory's `rmdir`, decided by the resolved kind), and publishes.
   Cleanup {
@@ -295,8 +333,11 @@ impl<T> Op<T> {
         | Op::Create { .. }
         | Op::SetSize { .. }
         | Op::Truncate { .. }
+        | Op::SetTimes { .. }
+        | Op::SetAllocation { .. }
         | Op::Rename { .. }
         | Op::Flush { .. }
+        | Op::FlushVolume
         | Op::Cleanup { .. }
     )
   }
@@ -304,8 +345,12 @@ impl<T> Op<T> {
 
 /// The shard's reply to an [`Op`].
 enum Reply {
-  /// The last context visited by a cooperative name update, or None when all live contexts were visited.
-  RenamedName(Option<u64>),
+  /// A cooperative name update's turn: the context it renamed (None when no open was beneath the old name), and whether
+  /// any open is still beneath it, so the receiver asks for no turn only to learn that none is left.
+  RenamedName {
+    renamed: Option<u64>,
+    more: bool,
+  },
   Volume {
     total: u64,
     free: u64,
@@ -341,6 +386,9 @@ pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
   hint: u64,
+  /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
+  /// dead daemon already applied may be found done.
+  replayed: bool,
 }
 
 impl Request {
@@ -361,6 +409,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        flush: false,
       };
     }
     if let Op::Confirm { context } = &self.op {
@@ -371,6 +420,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        flush: false,
       };
     }
     self.serve_operation(bridge, cx, names, ledger)
@@ -394,12 +444,17 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    // A replayed Release (a Close) ends an open the dead daemon may already have ended: it served the Close, retired
+    // the open, and died before acknowledging it. Its open being gone is then the Close done, not a refusal. A Cleanup
+    // retires nothing, so a replayed Cleanup's stale context stays a refusal.
+    let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
+    let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
     let mut reply = match (bound, refused) {
@@ -407,8 +462,14 @@ impl Request {
       (Ok(op), None) => {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
       }
+      (Err(crate::opens::Refusal::Stale), _) if self.replayed && ends_open => {
+        slates_machine::log_line!(
+          "slates-winfsp: a replayed close found its open already ended: answered done"
+        );
+        Reply::Ok
+      }
       (Err(error), _) => {
-        eprintln!("slates-winfsp: context refused: {error}");
+        slates_machine::log_line!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
     };
@@ -420,6 +481,7 @@ impl Request {
       barrier,
       echo,
       restored_read,
+      flush,
     }
   }
 }
@@ -428,7 +490,7 @@ fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
   match ledger.confirmed(context) {
     Ok(()) => Reply::Ok,
     Err(error) => {
-      eprintln!("slates-winfsp: open confirmation refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open confirmation refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -441,7 +503,10 @@ fn rename_one_name(
   to: &str,
 ) -> Reply {
   let Some((context, inode)) = names.first_beneath(from) else {
-    return Reply::RenamedName(None);
+    return Reply::RenamedName {
+      renamed: None,
+      more: false,
+    };
   };
   let result = ledger
     .rename_name(context, from, to)
@@ -449,10 +514,13 @@ fn rename_one_name(
   match result {
     Ok(name) => {
       names.opened(context, inode, &name);
-      Reply::RenamedName(Some(context))
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: names.first_beneath(from).is_some(),
+      }
     }
     Err(error) => {
-      eprintln!("slates-winfsp: durable kernel rename refused: {error}");
+      slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -469,7 +537,7 @@ fn admission_refusal<C>(
     Op::Open { .. } | Op::PurgeOpen { .. } | Op::Create { .. } if !ledger.has_room() => {
       Some(VfsError::NoSpace)
     }
-    Op::Rename { from, to } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
+    Op::Rename { from, to, .. } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
     _ => None,
   }
 }
@@ -494,9 +562,9 @@ fn record_open_reply(
       Reply::Opened { context, info }
     }
     Err(error) => {
-      eprintln!("slates-winfsp: open record refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open record refused: {error}");
       if let Err(release) = bridge.release(object, cx, fh) {
-        eprintln!("slates-winfsp: refused open cleanup failed: {release}");
+        slates_machine::log_line!("slates-winfsp: refused open cleanup failed: {release}");
       }
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
@@ -514,7 +582,7 @@ fn finish_context_effects(
     match ledger.closed(context) {
       Ok(()) | Err(crate::opens::Refusal::Stale) => {}
       Err(error) => {
-        eprintln!("slates-winfsp: close record refused: {error}");
+        slates_machine::log_line!("slates-winfsp: close record refused: {error}");
         return Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32());
       }
     }
@@ -534,7 +602,15 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Open { path } => Op::Open { path },
     Op::PurgeResolve { object, ancestor } => Op::PurgeResolve { object, ancestor },
     Op::PurgeOpen { path, object } => Op::PurgeOpen { path, object },
-    Op::Create { path, is_dir } => Op::Create { path, is_dir },
+    Op::Create {
+      path,
+      is_dir,
+      attributes,
+    } => Op::Create {
+      path,
+      is_dir,
+      attributes,
+    },
     Op::Read {
       object,
       offset,
@@ -567,13 +643,42 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       object: ledger.get(object)?,
       new_size,
     },
-    Op::Truncate { object } => Op::Truncate {
+    Op::Truncate {
+      object,
+      attributes,
+      replace,
+    } => Op::Truncate {
+      object: ledger.get(object)?,
+      attributes,
+      replace,
+    },
+    Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::CanDelete { object } => Op::CanDelete {
       object: ledger.get(object)?,
     },
-    Op::Rename { from, to } => Op::Rename { from, to },
+    Op::SetAllocation { object, new_size } => Op::SetAllocation {
+      object: ledger.get(object)?,
+      new_size,
+    },
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+      btime,
+      attributes,
+    } => Op::SetTimes {
+      object: ledger.get(object)?,
+      atime,
+      mtime,
+      ctime,
+      btime,
+      attributes,
+    },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
     },
+    Op::FlushVolume => Op::FlushVolume,
     Op::Cleanup { object, delete } => Op::Cleanup {
       object: ledger.get(object)?,
       delete,
@@ -591,6 +696,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
+  /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
+  flush: bool,
 }
 
 impl Served {
@@ -611,6 +718,13 @@ impl Served {
     self.barrier
   }
 
+  /// Whether the reply tells its caller the data is durable: a flush that succeeded (`FlushFileBuffers` of a handle or
+  /// of the volume). On a live-shipped volume the shard holds it until `f` candidates hold what its barrier published
+  /// (§4.10, A-200), and answers [`Served::refuse_unpublished`]'s status if they do not.
+  pub fn claims_durability(&self) -> bool {
+    self.flush && !matches!(self.reply, Reply::Err(_))
+  }
+
   /// The publication was refused: the reply becomes `STATUS_UNEXPECTED_IO_ERROR`, the effect being in the volume but not
   /// durable, so the caller is told rather than promised survival.
   pub fn refuse_unpublished(&mut self) {
@@ -627,11 +741,11 @@ impl Served {
 /// kind, the size for both file and allocation size (page-granular), and the times as `FILETIME`.
 fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
   Ok(FileInfo {
-    file_attributes: file_attributes(attr.kind)?,
+    file_attributes: crate::node_attributes(attr)?,
     reparse_tag: 0,
     allocation_size: attr.size,
     file_size: attr.size,
-    creation_time: filetime_from_unix_ns(attr.ctime),
+    creation_time: filetime_from_unix_ns(attr.btime),
     last_access_time: filetime_from_unix_ns(attr.atime),
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
@@ -706,7 +820,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       let fh = bridge.open(object, cx, 0)?;
       object_reply(&attr, fh)?
     }
-    Op::Create { path, is_dir } => op_create(bridge, cx, &path, is_dir)?,
+    Op::Create {
+      path,
+      is_dir,
+      attributes,
+    } => op_create(bridge, cx, &path, (is_dir, attributes))?,
     Op::Read {
       object,
       offset,
@@ -767,7 +885,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       )?;
       object_reply(&attr, 0)?
     }
-    Op::Truncate { object } => {
+    Op::Truncate {
+      object,
+      attributes,
+      replace,
+    } => {
       let attr = bridge.setattr(
         object.object,
         cx,
@@ -776,13 +898,43 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
           ..SetAttr::default()
         },
       )?;
+      // An overwrite gives the file the caller's attributes and marks it archived (A-262).
+      let word = crate::overwritten_attributes(crate::node_attributes(&attr)?, attributes, replace);
+      let attr = bridge.setattr(object.object, cx, crate::attribute_changes(&attr, word))?;
       object_reply(&attr, 0)?
     }
-    Op::Rename { from, to } => op_rename(bridge, cx, &from, &to)?,
+    Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
+    Op::SetAllocation { object, new_size } => {
+      op_set_allocation(bridge, cx, object.object, new_size)?
+    }
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+      btime,
+      attributes,
+    } => op_set_times(
+      bridge,
+      cx,
+      object.object,
+      (
+        SetAttr {
+          atime,
+          mtime,
+          ctime,
+          btime,
+          ..SetAttr::default()
+        },
+        attributes,
+      ),
+    )?,
     Op::Flush { object } => {
       bridge.flush(object.object, cx, object.fh)?;
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
     }
+    Op::FlushVolume => Reply::Ok,
     Op::Cleanup { object, delete } => {
       if object.purge {
         Reply::Ok
@@ -822,20 +974,28 @@ fn op_create(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   path: &str,
-  is_dir: bool,
+  (is_dir, attributes): (bool, u32),
 ) -> Result<Reply, VfsError> {
   let (name, parent_id) = match split_parent(bridge, cx, path)? {
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
   };
-  if is_dir {
+  let (attr, fh) = if is_dir {
     let attr = bridge.mkdir(parent_id, cx, name, DEFAULT_DIR_MODE)?;
     let fh = bridge.opendir(ObjectId::new(attr.ino, attr.generation), cx)?;
-    object_reply(&attr, fh)
+    (attr, fh)
   } else {
-    let (attr, fh) = bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?;
-    object_reply(&attr, fh)
-  }
+    bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?
+  };
+  // The object takes the attributes it was created with (A-262): a file's `READONLY` becomes its mode, after the open
+  // that made it, whose handle keeps the write access it was granted, as on NTFS.
+  let word = crate::created_attributes(attributes, is_dir);
+  let attr = bridge.setattr(
+    ObjectId::new(attr.ino, attr.generation),
+    cx,
+    crate::attribute_changes(&attr, word),
+  )?;
+  object_reply(&attr, fh)
 }
 
 /// Renames `from` to `to` by resolving each path's parent and final name.
@@ -844,6 +1004,7 @@ fn op_rename(
   cx: &OpContext,
   from: &str,
   to: &str,
+  replace: bool,
 ) -> Result<Reply, VfsError> {
   let (from_name, old_parent) = match split_parent(bridge, cx, from)? {
     Ok(pair) => pair,
@@ -853,14 +1014,131 @@ fn op_rename(
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
   };
+  if replace && replaces_a_directory(bridge, cx, (old_parent, from_name), (new_parent, to_name))? {
+    return Err(VfsError::NotPermitted);
+  }
+  // Windows never replaces a read-only file (`ERROR_ACCESS_DENIED`, A-262, `t/base/04.t` case 10).
+  if replace
+    && let Ok(target) = bridge.lookup(new_parent, cx, to_name)
+    && crate::refuses_replacement(&target)
+  {
+    return Err(VfsError::NotPermitted);
+  }
   bridge.rename(
     old_parent,
     new_parent,
     cx,
     from_name,
     to_name,
-    RenameFlags::default(),
+    RenameFlags {
+      no_replace: !replace,
+      ..RenameFlags::default()
+    },
   )?;
+  Ok(Reply::Ok)
+}
+
+/// Whether a rename asked to replace would replace a directory other than its own source: Windows never does
+/// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` onto a directory answers `ERROR_ACCESS_DENIED`, WinFsp's memfs refuses
+/// it so; `t/base/04.t` case 26), where POSIX `rename` replaces an empty one. A name that resolves to the source itself (a
+/// rename of case alone) replaces nothing.
+fn replaces_a_directory(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  (old_parent, from_name): (ObjectId, &str),
+  (new_parent, to_name): (ObjectId, &str),
+) -> Result<bool, VfsError> {
+  let target = match bridge.lookup(new_parent, cx, to_name) {
+    Ok(target) => target,
+    Err(VfsError::NotFound) => return Ok(false),
+    Err(error) => return Err(error),
+  };
+  if !matches!(target.kind, Kind::Dir) {
+    return Ok(false);
+  }
+  let source = bridge.lookup(old_parent, cx, from_name)?;
+  Ok((source.ino, source.generation) != (target.ino, target.generation))
+}
+
+/// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it; any other
+/// leaves it as it is. The object's information either way.
+fn op_set_allocation(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  new_size: u64,
+) -> Result<Reply, VfsError> {
+  let attr = bridge.getattr(object, cx)?;
+  let attr = if new_size < attr.size {
+    bridge.setattr(
+      object,
+      cx,
+      SetAttr {
+        size: Some(new_size),
+        ..SetAttr::default()
+      },
+    )?
+  } else {
+    attr
+  };
+  object_reply(&attr, 0)
+}
+
+/// `SetBasicInfo`'s times applied (`times` carries only them); a call that sets none reads the object.
+fn op_set_times(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  (times, attributes): (SetAttr, Option<u32>),
+) -> Result<Reply, VfsError> {
+  // `SetFileAttributes` replaces the object's attribute word (A-262): a file's `READONLY` is its mode.
+  let times = match attributes {
+    Some(word) => {
+      let changes = crate::attribute_changes(&bridge.getattr(object, cx)?, word);
+      SetAttr {
+        mode: changes.mode,
+        windows: changes.windows,
+        ..times
+      }
+    }
+    None => times,
+  };
+  let attr = if times == SetAttr::default() {
+    bridge.getattr(object, cx)?
+  } else {
+    bridge.setattr(object, cx, times)?
+  };
+  object_reply(&attr, 0)
+}
+
+/// Format: the most entries `CanDelete` reads of a directory: its `.` and `..`, which the bridge's `readdir` lists
+/// first, and one child, which is enough to refuse.
+const DOTS_AND_ONE_CHILD: usize = 3;
+
+/// Whether `object` may be deleted: refused before Windows marks it for deletion when the attachment may not change the
+/// volume (`ReadOnly`, `STATUS_MEDIA_WRITE_PROTECTED`: the delete itself happens at the cleanup, which has no reply, so
+/// a refusal there was silent and `DeleteFile` reported success); a directory refuses `NotEmpty`
+/// (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child, read from the first few entries of its listing; any other
+/// object may.
+fn op_can_delete(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  fh: u64,
+) -> Result<Reply, VfsError> {
+  bridge.authorize_change(cx)?;
+  let attr = bridge.getattr(object, cx)?;
+  // A read-only file refuses its deletion (A-262, `t/base/01.t` case 13): Windows answers `ERROR_ACCESS_DENIED`.
+  if crate::refuses_replacement(&attr) {
+    return Ok(Reply::Err(crate::status_cannot_delete()));
+  }
+  if !matches!(attr.kind, Kind::Dir) {
+    return Ok(Reply::Ok);
+  }
+  let rows = bridge.readdir(object, cx, fh, 0, DOTS_AND_ONE_CHILD)?;
+  if rows.iter().any(|row| row.name != "." && row.name != "..") {
+    return Err(VfsError::NotEmpty);
+  }
   Ok(Reply::Ok)
 }
 
@@ -945,15 +1223,14 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
+      replayed: crate::dispatcher::replaying(),
     })
     .is_err()
   {
     return Reply::Err(crate::status_unsuccessful());
   }
   wake.wake_by_ref();
-  answer
-    .recv()
-    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
 }
 
 pub(crate) fn confirm_open(
@@ -994,8 +1271,11 @@ pub(crate) fn rename_open_names(
         to: to.to_owned(),
       },
     ) {
-      Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
+      Reply::RenamedName { more: false, .. } => return Ok(()),
+      Reply::RenamedName {
+        renamed: Some(context),
+        more: true,
+      } if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",
@@ -1172,7 +1452,7 @@ extern "C" fn create(
   file_name: Pwstr,
   create_options: u32,
   _granted_access: u32,
-  _file_attributes: u32,
+  file_attributes: u32,
   _security_descriptor: PSecurityDescriptor,
   _allocation_size: u64,
   p_context: *mut Pvoid,
@@ -1183,7 +1463,11 @@ extern "C" fn create(
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
   let is_dir = create_options & ffi::FILE_DIRECTORY_FILE != 0;
-  match handler.call(Op::Create { path, is_dir }) {
+  match handler.call(Op::Create {
+    path,
+    is_dir,
+    attributes: file_attributes,
+  }) {
     Reply::Opened { context, info } => finish_open(context, info, p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
@@ -1217,15 +1501,19 @@ extern "C" fn open_trampoline(
 extern "C" fn overwrite(
   fs: *mut FileSystem,
   context: Pvoid,
-  _file_attributes: u32,
-  _replace: Boolean,
+  file_attributes: u32,
+  replace: Boolean,
   _allocation_size: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  match handler.call(Op::Truncate { object }) {
+  match handler.call(Op::Truncate {
+    object,
+    attributes: file_attributes,
+    replace: replace != 0,
+  }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` handled by put_info.
       unsafe { put_info(p_info, info) };
@@ -1273,7 +1561,7 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
 
 fn report_terminal_reply(call: &'static str, reply: Reply) {
   if let Reply::Err(status) = reply {
-    eprintln!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
+    slates_machine::log_line!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
     crate::dispatcher::record_terminal_refusal(status);
   }
 }
@@ -1350,13 +1638,17 @@ extern "C" fn write(
 }
 
 extern "C" fn flush(fs: *mut FileSystem, context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
-  // A volume flush passes a null context: every publication already covers the whole shard, so there is nothing
-  // further to make durable than each handle's own flush does.
-  if context.is_null() {
-    return STATUS_SUCCESS.as_i32();
-  }
-  // SAFETY: our file system and a live open-file context.
+  // SAFETY: our file system, and a live open-file context when it is not null.
   let handler = unsafe { handler(fs) };
+  // A volume flush passes a null context: the shard publishes, as every handle's flush makes it, and answers once that
+  // is durable (on a live-shipped volume, once `f` candidates hold it).
+  if context.is_null() {
+    return match handler.call(Op::FlushVolume) {
+      Reply::Ok => STATUS_SUCCESS.as_i32(),
+      Reply::Err(status) => status,
+      _ => crate::status_unsuccessful(),
+    };
+  }
   match handler.call(Op::Flush {
     object: context_key(context),
   }) {
@@ -1392,19 +1684,26 @@ extern "C" fn get_file_info(
 extern "C" fn set_basic_info(
   fs: *mut FileSystem,
   context: Pvoid,
-  _file_attributes: u32,
-  _creation_time: u64,
-  _last_access_time: u64,
-  _last_write_time: u64,
-  _change_time: u64,
+  file_attributes: u32,
+  creation_time: u64,
+  last_access_time: u64,
+  last_write_time: u64,
+  change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // Times and attribute bits are accepted and reported from the current object (the volume keeps POSIX times, set
-  // through its own writes); the object's live info is returned so the caller sees what the volume holds.
+  // The attribute word, the creation, access, write and change times are applied (A-209, A-259, A-262), and the
+  // object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  match handler.call(Op::Info { object }) {
+  match handler.call(Op::SetTimes {
+    object,
+    atime: crate::unix_ns_from_filetime(last_access_time),
+    mtime: crate::unix_ns_from_filetime(last_write_time),
+    ctime: crate::unix_ns_from_filetime(change_time),
+    btime: crate::unix_ns_from_filetime(creation_time),
+    attributes: (file_attributes != crate::INVALID_FILE_ATTRIBUTES).then_some(file_attributes),
+  }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.
       unsafe { put_info(p_info, info) };
@@ -1425,9 +1724,10 @@ extern "C" fn set_file_size(
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  // Setting only the allocation size does not change the file size; report the current info unchanged.
+  // An allocation below the file's size truncates it, as WinFsp's `SetFileSize` contract says (an open with
+  // `TRUNCATE_EXISTING` arrives as an allocation of zero); any other allocation leaves the file as it is (A-209).
   let op = if set_allocation_size != 0 {
-    Op::Info { object }
+    Op::SetAllocation { object, new_size }
   } else {
     Op::SetSize { object, new_size }
   };
@@ -1442,11 +1742,18 @@ extern "C" fn set_file_size(
   }
 }
 
-extern "C" fn can_delete(_fs: *mut FileSystem, _context: Pvoid, _file_name: Pwstr) -> Ntstatus {
-  // The delete itself happens in Cleanup; here we only confirm deletability. An empty-directory check
-  // is enforced by the volume core's `rmdir` at delete time (NotEmpty → the mapped NTSTATUS), so this
-  // reports success and lets the real check run then.
-  STATUS_SUCCESS.as_i32()
+extern "C" fn can_delete(fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+  // The delete itself happens in Cleanup, which answers the kernel nothing, so the refusal a program must see (a
+  // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion.
+  // SAFETY: our file system and a live open-file context.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::CanDelete {
+    object: context_key(context),
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
 }
 
 extern "C" fn rename(
@@ -1454,7 +1761,7 @@ extern "C" fn rename(
   _context: Pvoid,
   file_name: Pwstr,
   new_file_name: Pwstr,
-  _replace: Boolean,
+  replace: Boolean,
 ) -> Ntstatus {
   // SAFETY: our file system; both names are paths.
   let handler = unsafe { handler(fs) };
@@ -1462,7 +1769,11 @@ extern "C" fn rename(
   let from = unsafe { wide_to_string(file_name) };
   // SAFETY: `new_file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let to = unsafe { wide_to_string(new_file_name) };
-  match handler.call(Op::Rename { from, to }) {
+  match handler.call(Op::Rename {
+    from,
+    to,
+    replace: replace != 0,
+  }) {
     Reply::Ok => STATUS_SUCCESS.as_i32(),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
@@ -1600,7 +1911,10 @@ struct Mounted {
   drive: Option<Drive>,
   record: Record,
   worker: Option<crate::dispatcher::Worker>,
-  purge_token: crate::purge_token::PurgeToken,
+  /// This mount's private marker, which the purge client's opens carry (`crate::purge_token`).
+  purge_marker: crate::purge_token::Marker,
+  /// The child process that makes the purges' opens: no daemon thread opens this volume (§4.6).
+  purge_client: crate::purge_client::Client,
   purge_intents: crate::purge_intents::Sender,
 }
 
@@ -1625,7 +1939,7 @@ impl Mounted {
     wake: Waker,
     inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
     purge_intents: crate::purge_intents::Sender,
-    private_opens: &mut crate::purge_intents::Intents,
+    private_opens: &crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
     let drive: [u16; 2] = mount_point
       .encode_utf16()
@@ -1643,7 +1957,7 @@ impl Mounted {
     }
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
-    let purge_token = crate::purge_token::PurgeToken::new()?;
+    let purge_marker = crate::purge_token::Marker::fresh()?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
@@ -1710,7 +2024,8 @@ impl Mounted {
         read_only,
       },
       worker: None,
-      purge_token,
+      purge_marker,
+      purge_client: crate::purge_client::Client::new(purge_marker),
       purge_intents,
     };
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
@@ -1802,158 +2117,38 @@ impl Mounted {
     }
   }
 
-  /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`): opens the
-  /// file through the drive unbuffered and writes the range, a piece at a time, from a zeroed buffer. WinFsp flushes and
-  /// purges each piece's range with `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the
-  /// write without applying it (its open carries the private restricting SID and expected file identity). Each piece is
-  /// then read back through Windows' cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to owe it again
-  /// (`crate::retry`). A missing or foreign private token never authorizes a purge write.
-  fn purge(&self, purges: &[Purge]) -> Result<Purged, WinFspError> {
+  /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`), through the
+  /// purge client, a child process (`crate::purge_client`): it opens the file through the drive unbuffered and writes the
+  /// range, a piece at a time, from a zeroed buffer. WinFsp flushes and purges each piece's range with
+  /// `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the write without applying it (its
+  /// open is the client's and carries the private restricting SID and expected file identity). Each piece is then read
+  /// back through Windows' cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to
+  /// owe it again (`crate::retry`). This thread only asks the child and reads its answer, so it holds no request on the
+  /// volume (§4.6, the rule of 2026-11-06). With no client program installed each purge is counted unavailable.
+  fn purge(&mut self, purges: &[Purge]) -> Result<Purged, WinFspError> {
     if purges.is_empty() {
       return Ok(Purged::default());
     }
     let piece = purge_piece();
-    let piece_bytes = usize::try_from(piece).unwrap_or(0);
-    let zeros = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
-    let mut aligned = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
-    let outcomes = purges
-      .iter()
-      .map(|purge| {
-        self.purge_intents.publish(Some(purge.clone()))?;
-        let outcome = self
-          .purge_token
-          .during(|| Ok(self.purge_one(purge, zeros.bytes(), &mut aligned, piece)));
-        self.purge_intents.publish(None)?;
-        outcome.map(|outcome| (purge.clone(), outcome))
-      })
-      .collect::<Result<_, _>>()?;
-    Ok(Purged {
-      outcomes,
-      unavailable: 0,
-    })
-  }
-
-  /// One file's purge (`crate::purge::purge_through`) through an unbuffered open of it, which writes the range and reads
-  /// it around Windows' cache, and a cached open made for the read through the cache.
-  fn purge_one(
-    &self,
-    purge: &Purge,
-    zeros: &[u8],
-    aligned: &mut AlignedBytes,
-    piece: u32,
-  ) -> PurgeOutcome {
-    let path = wide_nul(&format!("\\\\?\\{}{}", self.mount_point, purge.path));
-    let Some(unbuffered) = open_through_drive(
-      &path,
-      GENERIC_READ | GENERIC_WRITE,
-      FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
-    ) else {
-      return PurgeOutcome::Refused;
-    };
-    let mut file = DriveFile {
-      path: &path,
-      unbuffered,
-      cached: None,
-      zeros,
-      aligned,
-    };
-    purge_through(&mut file, purge, piece)
-  }
-}
-
-/// Opens the file at `path` (a NUL-terminated UTF-16 path through the drive) with `access` and `flags`, sharing it
-/// whole: its handle, or `None` when Windows refused the open.
-fn open_through_drive(path: &[u16], access: u32, flags: u32) -> Option<OwnedHandle> {
-  // SAFETY: `path` is a live NUL-terminated UTF-16 string for the call; no security attributes and no template.
-  let raw = unsafe {
-    CreateFileW(
-      path.as_ptr(),
-      access,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-      std::ptr::null(),
-      OPEN_EXISTING,
-      flags,
-      std::ptr::null_mut(),
-    )
-  };
-  if raw == INVALID_HANDLE_VALUE || raw.is_null() {
-    return None;
-  }
-  // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
-  Some(unsafe { OwnedHandle::from_raw_handle(raw) })
-}
-
-/// A file a purge works on through the drive ([`PurgeTarget`]): its unbuffered open, which writes the purge and reads
-/// around Windows' cache into a sector-aligned buffer, and a cached open for the read through the cache, made at the
-/// first such read.
-struct DriveFile<'p> {
-  path: &'p [u16],
-  unbuffered: OwnedHandle,
-  cached: Option<OwnedHandle>,
-  zeros: &'p [u8],
-  aligned: &'p mut AlignedBytes,
-}
-
-impl PurgeTarget for DriveFile<'_> {
-  fn write_zeros(&mut self, offset: u64, len: u32) -> bool {
-    write_zeros_at(&self.unbuffered, self.zeros, offset, len)
-  }
-
-  fn read_cached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
-    if self.cached.is_none() {
-      self.cached = open_through_drive(self.path, GENERIC_READ, FILE_ATTRIBUTE_NORMAL);
+    let mut purged = Purged::default();
+    for purge in purges {
+      let Some(client) = self.purge_client.ready()? else {
+        purged.unavailable = purged.unavailable.saturating_add(1);
+        continue;
+      };
+      self
+        .purge_intents
+        .publish(Some(&crate::purge_intents::Intent {
+          purge: purge.clone(),
+          client,
+        }))?;
+      let path = format!("\\\\?\\{}{}", self.mount_point, purge.path);
+      let outcome = self.purge_client.purge(&path, purge, piece);
+      self.purge_intents.publish(None)?;
+      purged.outcomes.push((purge.clone(), outcome));
     }
-    let Some(handle) = self.cached.as_ref() else {
-      return false;
-    };
-    out.clear();
-    out.resize(usize::try_from(len).unwrap_or(0), 0);
-    let Some(read) = read_at(handle, out, offset) else {
-      return false;
-    };
-    out.truncate(read);
-    true
+    Ok(purged)
   }
-
-  fn read_uncached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
-    let Some(buffer) = usize::try_from(len)
-      .ok()
-      .and_then(|len| self.aligned.bytes_mut().get_mut(..len))
-    else {
-      return false;
-    };
-    let Some(read) = read_at(&self.unbuffered, buffer, offset) else {
-      return false;
-    };
-    out.clear();
-    out.extend_from_slice(buffer.get(..read).unwrap_or_default());
-    true
-  }
-}
-
-/// Reads into `buffer` at `offset` through `handle`, synchronously: how many bytes were read, or `None` when Windows
-/// refused the read.
-fn read_at(handle: &OwnedHandle, buffer: &mut [u8], offset: u64) -> Option<usize> {
-  let len = u32::try_from(buffer.len()).ok()?;
-  let mut overlapped = OVERLAPPED::default();
-  overlapped.Anonymous.Anonymous.Offset = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(0);
-  overlapped.Anonymous.Anonymous.OffsetHigh = u32::try_from(offset >> u32::BITS).unwrap_or(0);
-  let mut read = 0u32;
-  // SAFETY: a live handle opened synchronously, a buffer of `len` writable bytes, and an OVERLAPPED on this frame that
-  // only names the offset (a synchronous handle completes the read before the call returns).
-  let done = unsafe {
-    ReadFile(
-      handle.as_raw_handle(),
-      buffer.as_mut_ptr(),
-      len,
-      &mut read,
-      &mut overlapped,
-    )
-  };
-  if done == 0 {
-    return None;
-  }
-  usize::try_from(read).ok()
 }
 
 /// Format: the bytes of a purge write's piece when the system names no allocation granularity: one sector.
@@ -1972,65 +2167,6 @@ fn purge_piece() -> u32 {
     .unwrap_or(PURGE_PIECE_FLOOR)
 }
 
-/// A buffer, zeroed when made, whose first byte lies at a multiple of the alignment an unbuffered transfer asks (a
-/// sector), found within a larger allocation, so no allocator call needs to be unsafe: a purge's zeros, and the bytes
-/// an unbuffered read lands in.
-struct AlignedBytes {
-  storage: Vec<u8>,
-  start: usize,
-  len: usize,
-}
-
-impl AlignedBytes {
-  /// `len` zeroed bytes aligned to `align`.
-  fn new(len: usize, align: usize) -> AlignedBytes {
-    let storage = vec![0u8; len.saturating_add(align)];
-    let start = storage.as_ptr().align_offset(align).min(align);
-    AlignedBytes {
-      storage,
-      start,
-      len,
-    }
-  }
-
-  /// The aligned bytes (empty if the allocation could not hold them).
-  fn bytes(&self) -> &[u8] {
-    self
-      .storage
-      .get(self.start..self.start.saturating_add(self.len))
-      .unwrap_or(&[])
-  }
-
-  /// The aligned bytes, to write into (empty if the allocation could not hold them).
-  fn bytes_mut(&mut self) -> &mut [u8] {
-    let end = self.start.saturating_add(self.len);
-    self.storage.get_mut(self.start..end).unwrap_or_default()
-  }
-}
-
-/// Writes `len` bytes of `zeros` at `offset` through `handle`, synchronously: whether the whole length was written.
-fn write_zeros_at(handle: &OwnedHandle, zeros: &[u8], offset: u64, len: u32) -> bool {
-  let Some(buffer) = usize::try_from(len).ok().and_then(|len| zeros.get(..len)) else {
-    return false;
-  };
-  let mut overlapped = OVERLAPPED::default();
-  overlapped.Anonymous.Anonymous.Offset = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(0);
-  overlapped.Anonymous.Anonymous.OffsetHigh = u32::try_from(offset >> u32::BITS).unwrap_or(0);
-  let mut written = 0u32;
-  // SAFETY: a live handle opened synchronously, a buffer of `len` bytes, and an OVERLAPPED on this frame that only
-  // names the offset (a synchronous handle completes the write before the call returns).
-  let done = unsafe {
-    WriteFile(
-      handle.as_raw_handle(),
-      buffer.as_ptr(),
-      len,
-      &mut written,
-      &mut overlapped,
-    )
-  };
-  done != 0 && written == len
-}
-
 impl Drop for Mounted {
   fn drop(&mut self) {
     if self.file_system.is_null() {
@@ -2042,7 +2178,7 @@ impl Drop for Mounted {
     if let Some(mut worker) = self.worker.take()
       && let Err(error) = worker.join()
     {
-      eprintln!("slates-winfsp: join receive worker: {error}");
+      slates_machine::log_line!("slates-winfsp: join receive worker: {error}");
     }
     // SAFETY: the only receive/operation worker has been joined, so no callback can reach the DLL object again.
     unsafe { (self.api.delete)(self.file_system) };
@@ -2067,8 +2203,9 @@ pub struct Purged {
   /// Windows' cache served bytes the host no longer holds, so Windows kept a page and the purge is owed again,
   /// `crate::retry`), or refused (its open, a write or a read back, as for a file renamed or removed since).
   pub outcomes: Vec<(Purge, PurgeOutcome)>,
-  /// Purges not made because WinFsp cannot name an open's process, so the host could not tell a purge's write from a
-  /// program's (`FspFileSystemOperationProcessIdF` absent).
+  /// Purges not made because no purge client could run: this process installed no client program
+  /// (`crate::purge_client::install`), so no process may make the purge's opens (no daemon thread opens its own volume,
+  /// §4.6).
   pub unavailable: u64,
 }
 
@@ -2111,8 +2248,15 @@ pub enum Outcome {
   Purged(Purged),
   /// The receive worker ended before the mount was intentionally stopped.
   Failed(WinFspError),
-  /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
-  Recovered(u64),
+  /// The receive journal was settled before any fresh receive: how many captured requests were answered, and how many
+  /// of those were a replayed Cleanup or Close the file system refused. The owner counts both; the taken-request
+  /// oracles require the first and the replayed-Close oracle requires the second to be zero.
+  Recovered {
+    /// Captured requests answered.
+    settled: u64,
+    /// Of those, the replayed Cleanups and Closes the file system refused.
+    refused: u64,
+  },
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -2122,7 +2266,9 @@ pub enum Outcome {
 pub struct MountThread {
   commands: Option<SyncSender<Command>>,
   outcomes: Receiver<Outcome>,
-  thread: Option<JoinHandle<()>>,
+  /// Joined on the mount's shard, which is marked as waiting on it meanwhile (A-228's transitive wait). Boxed: a mount
+  /// thread is handed back inside refusals, which stay small.
+  thread: Option<Box<slates_rt::registry::WaitedThread<()>>>,
 }
 
 impl MountThread {
@@ -2140,9 +2286,9 @@ impl MountThread {
     let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
     let (outcome_tx, outcomes) = sync_channel::<Outcome>(OUTCOME_BOUND);
     let mount_point = mount_point.to_owned();
-    let thread = std::thread::Builder::new()
-      .name("slates-winfsp".to_owned())
-      .spawn(move || {
+    let thread = slates_rt::registry::spawn_waited(
+      std::thread::Builder::new().name("slates-winfsp".to_owned()),
+      move || {
         run_mount(
           &mount_point,
           read_only,
@@ -2152,12 +2298,13 @@ impl MountThread {
           open_bound,
           inherited,
         );
-      })
-      .map_err(|_| WinFspError::MountThread)?;
+      },
+    )
+    .map_err(|_| WinFspError::MountThread)?;
     Ok(MountThread {
       commands: Some(commands),
       outcomes,
-      thread: Some(thread),
+      thread: Some(Box::new(thread)),
     })
   }
 
@@ -2222,13 +2369,15 @@ fn run_mount(
 ) {
   let report = |outcome: Outcome| {
     if outcomes.send(outcome).is_err() {
-      eprintln!("slates-winfsp: the mount's outcome receiver closed before its owner joined");
+      slates_machine::log_line!(
+        "slates-winfsp: the mount's outcome receiver closed before its owner joined"
+      );
     }
     wake.wake_by_ref();
   };
   let confirmations = requests.clone();
-  // Shape: the preceding purge's End and the next purge's Begin can be queued before a fresh kernel Create arrives.
-  let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
+  // The purge-intent slot: the mount thread publishes into it, and the receive worker reads it.
+  let (purge_intents, private_opens) = match crate::purge_intents::channel() {
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
@@ -2267,14 +2416,9 @@ fn run_mount(
       .memory()
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume()
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
+    let mut scratch = crate::inflight::Scratch::new().map_err(WinFspError::Capture)?;
+    let saved_open = crate::inflight::settle::saved_open(&mut captured, &mut scratch)
+      .map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;
@@ -2285,7 +2429,7 @@ fn run_mount(
       wake.clone(),
       inherited,
       purge_intents,
-      &mut private_opens,
+      &private_opens,
     )?;
     let value = ledger
       .memory()
@@ -2329,7 +2473,7 @@ fn run_mount(
       section,
     ))
   })();
-  let mounted = match prepared {
+  let mut mounted = match prepared {
     Ok((mut mounted, ready, section)) => {
       report(Outcome::Mounted(Ok(Box::new(ready))));
       match crate::dispatcher::Worker::start(
@@ -2339,7 +2483,7 @@ fn run_mount(
         outcomes.clone(),
         wake.clone(),
         confirmations,
-        crate::dispatcher::PrivateOpens::new(mounted.purge_token.marker(), private_opens),
+        crate::dispatcher::PrivateOpens::new(mounted.purge_marker, private_opens),
       ) {
         Ok(worker) => mounted.worker = Some(worker),
         Err(error) => {
@@ -2426,3 +2570,7 @@ fn write_wide(field: &mut [u16], s: &str) {
 #[cfg(test)]
 #[path = "../tests/support/host.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/support/transact.rs"]
+mod transact_bench;

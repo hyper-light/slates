@@ -27,6 +27,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod client;
@@ -35,8 +37,8 @@ pub mod error;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, Session, ShardsStream, StreamEnd, Submitted, VhostUserDevice,
-  defers_reply,
+  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
+  VhostUserDevice, defers_reply,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -48,15 +50,16 @@ pub use error::ClientError;
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
 pub use slates_ipc::protocol::{
   AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
-  CauseRecord, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
-  DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established, Filter, FleetReport,
-  GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence, HostPathReason,
-  IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache, LandingDegradation,
-  LandingDurability, LandingOutcome, LandingSummary, NamePolicy, OciBinding, PlacedState,
-  Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency, RetirementReport, Rights,
-  Scope, SessionReport, ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary,
-  SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint,
-  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  CauseRecord, CheckoutReport, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen,
+  DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established,
+  Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
+  HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
+  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, NamePolicy,
+  OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal,
+  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
+  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
+  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

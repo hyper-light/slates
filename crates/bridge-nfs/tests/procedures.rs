@@ -36,7 +36,10 @@ fn write_cx() -> OpContext {
     .attach(
       VolumeId { bytes: [0x11; 16] },
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,
@@ -110,7 +113,10 @@ fn mount_lookup_and_getattr_walk_the_export() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -166,7 +172,10 @@ fn a_foreign_or_malformed_handle_is_refused() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -214,7 +223,10 @@ fn a_missing_name_is_noent() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -251,7 +263,10 @@ fn the_post_mount_queries_answer_over_the_root() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -350,7 +365,10 @@ fn a_stale_generation_handle_is_refused() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -397,7 +415,10 @@ fn a_handle_to_a_reclaimed_inode_is_stale() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -459,7 +480,10 @@ fn a_handle_survives_copy_on_write_of_its_object() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -497,7 +521,10 @@ fn a_write_then_read_round_trips_over_the_export() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -583,7 +610,10 @@ fn a_write_count_that_lies_or_overruns_the_request_never_reads_out_of_bounds() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -661,7 +691,10 @@ fn a_commit_over_the_export_reports_the_write_stable() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -732,7 +765,10 @@ fn a_commit_of_the_host_root_is_a_no_op() {
   let set = OwnedVolumeSet::new(store);
   let mut multi = MultiExport::new(
     set,
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -782,7 +818,10 @@ fn a_write_through_a_read_only_export_is_refused() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: false,
@@ -809,8 +848,8 @@ fn a_write_through_a_read_only_export_is_refused() {
     .unwrap();
   assert_eq!(
     XdrReader::new(&wreply).u32().unwrap(),
-    Nfsstat3::Perm.wire(),
-    "a read-only export refuses WRITE before any effect"
+    Nfsstat3::Rofs.wire(),
+    "a read-only export refuses WRITE before any effect, as a read-only file system (NFS3ERR_ROFS)"
   );
 
   // A READ through the same export is allowed.
@@ -825,6 +864,28 @@ fn a_write_through_a_read_only_export_is_refused() {
     XdrReader::new(&rreply).u32().unwrap(),
     Nfsstat3::Ok.wire(),
     "but a read-only export can READ"
+  );
+
+  // GAPS (2026-11-08), found by conformance's read-only run: its ACCESS grants no change, which the superuser's
+  // exemption granted before, so the kernel refuses an NFSv3 open for writing (v3 has no OPEN, and the kernel decides
+  // the open from this reply alone); and the change check an NFSv4 OPEN for writing asks answers NFS3ERR_ROFS.
+  assert_eq!(
+    access_granted(&mut export, &file_fh, 0x1 | 0x4 | 0x8 | 0x10),
+    0x1,
+    "a read-only export's ACCESS grants READ and none of MODIFY, EXTEND or DELETE"
+  );
+  let mut cargs = XdrWriter::new();
+  file_fh.encode(&mut cargs);
+  let creply = export
+    .serve_nfs(
+      slates_bridge_nfs::procedures::extension::CHANGE_ALLOWED,
+      &mut XdrReader::new(cargs.as_slice()),
+    )
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&creply).u32().unwrap(),
+    Nfsstat3::Rofs.wire(),
+    "a read-only export's change check answers NFS3ERR_ROFS"
   );
 }
 
@@ -844,7 +905,10 @@ fn a_remove_over_the_export_unlinks_the_name() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -897,7 +961,10 @@ fn a_rmdir_over_the_export_removes_the_directory() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -945,7 +1012,10 @@ fn rmdir_refuses_dot_entries_and_preserves_the_directory() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -994,7 +1064,10 @@ fn a_rename_over_the_export_moves_the_entry() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1076,7 +1149,10 @@ fn a_setattr_to_a_colossal_size_is_a_sparse_hole_that_charges_no_quota() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1141,7 +1217,10 @@ fn a_setattr_over_the_export_chmods() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1204,7 +1283,10 @@ fn a_setattr_sets_client_and_server_times() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1263,7 +1345,10 @@ fn a_setattr_guard_mismatch_is_not_sync() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1335,7 +1420,10 @@ fn a_create_over_the_export_makes_a_file() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1393,7 +1481,10 @@ fn guarded_and_unchecked_create_differ_on_an_existing_name() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1454,7 +1545,10 @@ fn a_mkdir_over_the_export_makes_a_directory() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1506,7 +1600,10 @@ fn a_symlink_over_the_export_makes_a_link() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1570,7 +1667,10 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1635,7 +1735,10 @@ fn a_link_over_the_export_makes_a_second_name() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1719,48 +1822,111 @@ fn a_link_over_the_export_makes_a_second_name() {
   }
 }
 
-/// AC-3.10 / A-26: devices remain refused even when FIFO/socket names are supported.
-#[test]
-fn device_mknod_is_refused_badtype() {
-  let mut store = store();
-  let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
-  let mut export = Export::new(
-    &mut bridge,
+/// An export of a fresh volume to `uid`, read-write, over `bridge`.
+fn export_to<'a>(bridge: &'a mut VolumeBridge<'_>, uid: u32) -> Export<'a> {
+  Export::new(
+    bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid,
+    },
     Rights {
       read: true,
       write: true,
     },
   )
-  .unwrap();
-  let root_fh = root_handle(&mut export);
+  .unwrap()
+}
 
-  // MKNOD3args: the directory (diropargs3), then mknoddata3 — here a block device with specdata.
+/// The status of a MKNOD of `name` in the directory `dir` of `ftype3` (3 a block device, 4 a character one, 7 a FIFO),
+/// with no attributes set and, for a device, the major and minor 1 and 2.
+fn mknod_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str, ftype3: u32) -> u32 {
   let mut args = XdrWriter::new();
-  root_fh.encode(&mut args);
-  args.opaque("dev".as_bytes()); // name
-  args.u32(3); // ftype3 NF3BLK
-  args.bool(false); // sattr3 mode unset
-  args.bool(false); // uid
-  args.bool(false); // gid
-  args.bool(false); // size
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  args.u32(ftype3);
+  for _ in 0..4 {
+    args.bool(false); // sattr3: mode, uid, gid, size unset
+  }
   args.u32(0); // atime DONT_CHANGE
   args.u32(0); // mtime DONT_CHANGE
-  args.u32(1); // specdata3 major
-  args.u32(2); // specdata3 minor
+  if ftype3 == 3 || ftype3 == 4 {
+    args.u32(1); // specdata3 major
+    args.u32(2); // specdata3 minor
+  }
   let reply = export
     .serve_nfs(NFSPROC3_MKNOD, &mut XdrReader::new(args.as_slice()))
     .expect("MKNOD is answered, not PROC_UNAVAIL");
-  let mut r = XdrReader::new(&reply);
+  XdrReader::new(&reply).u32().unwrap()
+}
+
+/// The status of a LOOKUP of `name` in the directory `dir`.
+fn lookup_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> u32 {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  let reply = export
+    .serve_nfs(NFSPROC3_LOOKUP, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  XdrReader::new(&reply).u32().unwrap()
+}
+
+/// AC-3.10 / A-26, A-268. Do: MKNOD a block and a character device as root. Expect: `NFS3ERR_PERM`, which a client
+/// reports as `EPERM`, what `mknod(2)` answers for "the filesystem ... does not support the type of node requested",
+/// and no name made. Before, the answer was `NFS3ERR_BADTYPE`, which the Linux client turns into its internal
+/// `EBADTYPE`, errno 527, and every program printed "Unknown error 527".
+#[test]
+fn a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = export_to(&mut bridge, 0);
+  let root = root_handle(&mut export);
+  for (ftype3, name) in [(3, "block"), (4, "char")] {
+    assert_eq!(
+      mknod_status(&mut export, &root, name, ftype3),
+      Nfsstat3::Perm.wire(),
+      "a {name} device is refused EPERM"
+    );
+    assert_eq!(
+      lookup_status(&mut export, &root, name),
+      Nfsstat3::Noent.wire(),
+      "no {name} name is made"
+    );
+  }
+}
+
+/// A-268. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not write the root,
+/// MKNOD a device in it. Expect: `NFS3ERR_EXIST` for the taken name and `NFS3ERR_ACCES` for the directory, each before
+/// the device's own refusal, in the order Linux's `vfs_mknod` takes them (the lookup, then `may_create`, then the node
+/// type). An exclusive create over NFS skips the client's own lookup, so the server is the one that must say the name
+/// is taken.
+#[test]
+fn a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  {
+    let mut export = export_to(&mut bridge, 0);
+    let root = root_handle(&mut export);
+    assert_eq!(
+      mknod_status(&mut export, &root, "taken", 7),
+      Nfsstat3::Ok.wire()
+    );
+    assert_eq!(
+      mknod_status(&mut export, &root, "taken", 4),
+      Nfsstat3::Exist.wire(),
+      "a taken name is EEXIST before the device's EPERM"
+    );
+  }
+  let mut export = export_to(&mut bridge, 1000);
+  let root = root_handle(&mut export);
   assert_eq!(
-    r.u32().unwrap(),
-    Nfsstat3::Badtype.wire(),
-    "Device MKNOD is a typed BADTYPE refusal, not PROC_UNAVAIL"
+    mknod_status(&mut export, &root, "denied", 4),
+    Nfsstat3::Acces.wire(),
+    "an unwritable directory is EACCES before the device's EPERM"
   );
-  assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
-  PostOpAttr::decode(&mut r).unwrap(); // the directory's post-op attributes
 }
 
 /// AC-3.10 / A-26: create FIFO/socket names over the wire and observe their real types and mode.
@@ -1773,7 +1939,10 @@ fn mknod_creates_fifo_and_socket_names_with_their_real_types() {
   let mut export = Export::new(
     &mut bridge,
     id,
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1826,7 +1995,10 @@ fn truncated_mknod_has_no_namespace_effect() {
   let mut export = Export::new(
     &mut bridge,
     id,
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1878,7 +2050,10 @@ fn pathconf_reports_the_volume_limits() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1921,7 +2096,10 @@ fn pathconf_reflects_a_case_folding_volume() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -1986,7 +2164,10 @@ fn readdir_lists_entries_and_paginates() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -2061,7 +2242,10 @@ fn a_readdir_continuation_after_the_directory_changes_is_bad_cookie() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -2189,7 +2373,10 @@ fn a_listing_asked_for_four_gibibytes_is_capped_at_the_transfer_ceiling() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -2244,7 +2431,10 @@ fn readdirplus_lists_entries_with_attributes_and_handles() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -2305,7 +2495,10 @@ fn every_procedure_refuses_hostile_input_without_panicking() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -2377,7 +2570,10 @@ fn export_as(bridge: &mut dyn Bridge, uid: u32, gid: u32) -> Export<'_> {
   let mut export = Export::new(
     bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid,
+    },
     Rights {
       read: true,
       write: true,
@@ -3169,7 +3365,10 @@ fn an_exclusive_create_keeps_its_verifier_and_a_retry_finds_its_own_file() {
   let mut export = Export::new(
     &mut bridge,
     VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 0,
+    },
     Rights {
       read: true,
       write: true,
@@ -3260,7 +3459,10 @@ fn hostile_names_never_reach_outside_the_export_or_leave_an_entry() {
     let mut export = Export::new(
       &mut bridge,
       VolumeId { bytes: [0x11; 16] },
-      Principal::Uid { uid: 0 },
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
       Rights {
         read: true,
         write: true,

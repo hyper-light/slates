@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
-  AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
-  GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome, LandingSummary,
-  MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
-  SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
-  pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Established,
+  Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome,
+  LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights,
+  Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp, unpack,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -98,10 +98,21 @@ pub fn defers_reply(body: &RequestBody) -> bool {
   body.may_be_forwarded()
     || matches!(
       body,
-      RequestBody::Land { grant: Some(_), .. }
+      // A landing is planned in slices on the owner shard, as long as its tree takes, and a granted one runs in them
+      // (AUD-29-25; a presentation since 2026-11-08).
+      RequestBody::Land { .. }
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
+        // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
+        // (A-201).
+        | RequestBody::Checkout { .. }
+        // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
+        // (§4.4, §4.3).
+        | RequestBody::Pin { .. }
+        // A green over a base walks the base snapshot into its origin in slices on the owner shard, as long as the
+        // tree takes (§4.16 "Green creation"); a scratch green is answered at once.
+        | RequestBody::CreateGreen { base: Some(_), .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
@@ -130,15 +141,31 @@ pub fn defers_reply(body: &RequestBody) -> bool {
 /// ids already issued still reach their completion records.
 pub const LAST_SEQUENCE: u32 = u32::MAX - 1;
 
-/// What a client keeps to resume: its id and the next sequence it would use. A process that
-/// restarts with this retries what it had in flight and meets the completion record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a client keeps to resume: its id, the next sequence it would use, and the session key that proves the id is
+/// its own. A process that restarts with this retries what it had in flight and meets the completion record; one that
+/// names an id without its key is refused `SessionUnproven` (§4.9, `slates_server::session_key`). The key is a secret:
+/// keep a session where the process's other secrets are kept, never in a log (its `Debug` leaves the key out).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Session {
   /// The client id the daemon bound to this principal.
   pub client_id: u32,
   /// The next sequence.
   pub next_sequence: u32,
+  /// The session key the daemon issued with the id.
+  pub key: [u8; SESSION_KEY_BYTES],
 }
+
+impl std::fmt::Debug for Session {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Session")
+      .field("client_id", &self.client_id)
+      .field("next_sequence", &self.next_sequence)
+      .finish_non_exhaustive()
+  }
+}
+
+/// Format: a session key's width (`slates_ipc::region::SESSION_KEY_BYTES`).
+pub const SESSION_KEY_BYTES: usize = slates_ipc::region::SESSION_KEY_BYTES;
 
 /// What `attach_shards` returns (§4.6, the Shards route; A-161): the attachment, and the stream end to hand a Shards
 /// VMM, which reaches that attachment and nothing else.
@@ -251,6 +278,9 @@ pub struct Client {
   instance: String,
   end: ClientEnd,
   client_id: u32,
+  /// The session key that proves `client_id` is this client's (`Session::key`), written into every region it is
+  /// handed again under the id, before the first request there.
+  session_key: [u8; SESSION_KEY_BYTES],
   /// The last sequence used.
   sequence: u32,
   deadlines: Deadlines,
@@ -265,9 +295,9 @@ pub struct Client {
   /// acknowledgement costs one request in that many.
   ack_every: u32,
   /// The sequences answered `Unpublished` and not yet retried (AC-2.3; AUD-06): the daemon rolled
-  /// those verbs back and asked for a retry under the same id, so the acknowledgement watermark
-  /// stops below the lowest of them — an acknowledged sequence's record is released, and its retry
-  /// would be refused `DuplicateRequest` (the CI Linux lane's failure: a small ring acknowledged
+  /// those verbs back and asked for a retry under the same id, so the acknowledgement names them
+  /// owed — an acknowledged sequence's record is released, and its retry would be refused
+  /// `DuplicateRequest` (the CI Linux lane's failure: a small ring acknowledged
   /// between the refusal and the retry). A retry answered anything else releases the id. Numeric
   /// order: sequences wrap after 2^32 requests.
   unpublished: std::collections::BTreeSet<u32>,
@@ -277,6 +307,16 @@ pub struct Client {
   unpublished_cap: usize,
   /// Unpublished ids forgotten at the bound.
   unpublished_forgotten: u64,
+  /// The sequences an async caller was answered `Overloaded` or `OwnerUnreachable`, the refusals retryable under the
+  /// same id, with when (§4.9, §4.16 "Commit"): a forwarded submit whose acceptance outlived the owner's budget ran,
+  /// and its completion is recorded once the version commits, so its resend must meet that record. The acknowledgement
+  /// names each one held within the reconnect budget owed, the window in which a resend under the id is made, renewed
+  /// by each refusal; past it the id is released, so a caller that never resends cannot keep its record for good. Before 2026-11-06 the
+  /// next acknowledgement covered the refused id and its resend was refused `DuplicateRequest` (447 submits of
+  /// fixtures' 1,000-client `f = 1` rung). Bounded by `unpublished_cap`, the oldest forgotten and counted.
+  retry_held: std::collections::BTreeMap<u32, Instant>,
+  /// Ids released from `retry_held` at its bound or released by their caller unanswered.
+  retry_released: u64,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
@@ -943,7 +983,7 @@ impl Connecting {
       Ok(None) => Ok(None),
       Ok(Some(connected)) => {
         self.claim = None;
-        let mut client = Client::over(&self.instance, connected, 0, self.deadlines);
+        let mut client = Client::over(&self.instance, connected, 0, self.deadlines, None)?;
         // Bound on the first send, without waiting (`bind_without_waiting`).
         client.consumer = self.delivered.take();
         Ok(Some(client))
@@ -994,7 +1034,7 @@ impl Client {
     let delivered = delivered_capability()?;
     install_seal();
     let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
-    let mut client = Client::over(instance, connected, 0, deadlines);
+    let mut client = Client::over(instance, connected, 0, deadlines, None)?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
@@ -1036,21 +1076,38 @@ impl Client {
       connected,
       session.next_sequence.saturating_sub(1),
       deadlines,
-    );
+      Some(session.key),
+    )?;
     client.bind_delivered(delivered)?;
     Ok(client)
   }
 
-  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used).
-  fn over(instance: &str, connected: Connected, sequence: u32, deadlines: Deadlines) -> Client {
+  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used). `key` is the session key of an id
+  /// being resumed, written into the region to prove it; `None` for an id issued fresh, whose key the daemon wrote
+  /// there.
+  fn over(
+    instance: &str,
+    mut connected: Connected,
+    sequence: u32,
+    deadlines: Deadlines,
+    key: Option<[u8; SESSION_KEY_BYTES]>,
+  ) -> Result<Client, ClientError> {
     let client_id = connected.region.client_id();
+    let session_key = match key {
+      Some(key) => {
+        connected.region.set_session_key(&key)?;
+        key
+      }
+      None => connected.region.session_key()?,
+    };
     let end = ClientEnd::connected(connected);
     let ack_every = ack_every_of(&end);
     let unpublished_cap = end.region().cmd().slots().max(1);
-    Client {
+    Ok(Client {
       instance: instance.to_owned(),
       end,
       client_id,
+      session_key,
       sequence,
       deadlines,
       reconnects: 0,
@@ -1060,6 +1117,8 @@ impl Client {
       unpublished: std::collections::BTreeSet::new(),
       unpublished_cap,
       unpublished_forgotten: 0,
+      retry_held: std::collections::BTreeMap::new(),
+      retry_released: 0,
       pending: Vec::new(),
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
@@ -1072,7 +1131,7 @@ impl Client {
       bound: false,
       rebinds: 0,
       reconnecting: None,
-    }
+    })
   }
 
   /// Binds the channel to the delivered consumer, when there is one.
@@ -1124,6 +1183,7 @@ impl Client {
       client_id: self.client_id,
       // At most `LAST_SEQUENCE + 1 = u32::MAX`, the exhausted marker: exact, never a wrap.
       next_sequence: self.sequence.saturating_add(1),
+      key: self.session_key,
     }
   }
 
@@ -1158,6 +1218,12 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// The client's ring slots: the requests it may hold in flight, and half the completion records the daemon keeps
+  /// for it unacknowledged (§4.9; the server's `completion_bound` is twice this).
+  pub fn ring_slots(&self) -> usize {
+    self.end.region().cmd().slots()
+  }
+
   /// Parks a wake ended with no reply waiting, so the client parked again.
   pub fn unanswered_wakes(&self) -> u64 {
     self.end.unanswered_wakes()
@@ -1165,10 +1231,9 @@ impl Client {
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
-    // Every `ack_every` replies, the client acknowledges them first (one request), so the
-    // daemon's retained records stay bounded without the caller's help (§4.9) — up to the
-    // watermark, which an unpublished id not yet retried holds back.
-    let up_to = self.ack_watermark();
+    // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records
+    // stay bounded without the caller's help (§4.9): all of them but the ids it still owes.
+    let (up_to, _) = self.acknowledgement();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
@@ -1682,22 +1747,70 @@ impl Client {
     }
   }
 
-  /// The highest sequence the client may acknowledge now: everything it has received, unless a verb
-  /// answered `Unpublished` awaits its retry — then the sequence just below the lowest such id, so
-  /// the daemon keeps the ids above it new and the retry re-executes rather than meeting
-  /// `DuplicateRequest` (AC-2.3; AUD-06).
-  fn ack_watermark(&self) -> u32 {
-    self
+  /// What the client may acknowledge now (§4.9 "Exactly-once"; RIFL, Lee et al., SOSP 2015): every sequence it has
+  /// issued, except the ids it still owes, which the daemon keeps open.
+  /// - An id answered `Unpublished` and not yet retried (AC-2.3; AUD-06): the daemon rolled the verb back and asked for
+  ///   a retry under the same id, which must re-execute rather than meet `DuplicateRequest`.
+  /// - A request still awaited whose reply has not come: its completion record is what its resend after a lost
+  ///   channel meets, and what a deferred verb (a fleet forward, a submit awaiting its commit) records into when it
+  ///   ends (`an_acknowledgement_never_covers_a_request_still_awaited`). A reply already drained into `pending` is
+  ///   received, and its own poll answers from there first.
+  /// - An id answered `Overloaded` or `OwnerUnreachable` and held for a resend under it, within the reconnect budget
+  ///   (`retry_held`): the verb may have run, and its resend must meet its record.
+  ///
+  /// The owed ids are at most the ring's slots and the hold's cap. Before, the acknowledgement was the watermark below
+  /// the lowest owed id, so one held or slow request kept every later completion of its client, and the daemon's
+  /// bound refused the client's next requests `AcknowledgementOwed`
+  /// (`a_client_holding_a_submit_for_its_resend_is_served_past_its_completion_bound`).
+  fn acknowledgement(&self) -> (u32, Vec<u32>) {
+    let up_to = self.sequence;
+    let awaited = self
+      .awaited
+      .keys()
+      .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
+      .map(|word| RequestId::from_word(*word).sequence);
+    let held = self
+      .retry_held
+      .iter()
+      .filter(|(_, refused)| elapsed_ns(**refused) < self.deadlines.reconnect_ns)
+      .map(|(sequence, _)| *sequence);
+    let owed: std::collections::BTreeSet<u32> = self
       .unpublished
-      .first()
-      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1))
+      .iter()
+      .copied()
+      .chain(awaited)
+      .chain(held)
+      .filter(|sequence| *sequence <= up_to)
+      .collect();
+    (up_to, owed.into_iter().collect())
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
   /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
-  /// to a retried id releases it.
-  fn note_reply(&mut self, word: u64, body: &ReplyBody) {
+  /// to a retried id releases it. On the async path (`by_word`: a caller holding the id's word, which
+  /// [`Self::begin_again`] resends) an `Overloaded` or `OwnerUnreachable` refusal is held as well, within the
+  /// reconnect budget (`retry_held`).
+  fn note_reply(&mut self, word: u64, body: &ReplyBody, by_word: bool) {
     let sequence = RequestId::from_word(word).sequence;
+    let held_for_retry = by_word
+      && matches!(
+        body,
+        ReplyBody::Refused {
+          refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
+            | slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+        }
+      );
+    if held_for_retry {
+      if self.retry_held.len() >= self.unpublished_cap
+        && !self.retry_held.contains_key(&sequence)
+        && self.retry_held.pop_first().is_some()
+      {
+        self.retry_released = self.retry_released.saturating_add(1);
+      }
+      self.retry_held.insert(sequence, Instant::now());
+    } else {
+      self.retry_held.remove(&sequence);
+    }
     if matches!(
       body,
       ReplyBody::Refused {
@@ -1721,6 +1834,21 @@ impl Client {
     self.unpublished_forgotten
   }
 
+  /// Releases `word`, an id the caller was answered with a refusal retryable under it and will not send again: the
+  /// acknowledgement no longer names it owed, so the daemon releases its completion record.
+  pub fn release_retryable(&mut self, word: u64) {
+    let sequence = RequestId::from_word(word).sequence;
+    if self.retry_held.remove(&sequence).is_some() {
+      self.retry_released = self.retry_released.saturating_add(1);
+    }
+    self.unpublished.remove(&sequence);
+  }
+
+  /// Ids released from the hold for a resend under their own id unanswered: at its bound or by their caller.
+  pub fn retry_released(&self) -> u64 {
+    self.retry_released
+  }
+
   /// One request under the next sequence, without the automatic acknowledgement.
   fn call_plain(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     let id = self.fresh_id()?;
@@ -1740,7 +1868,7 @@ impl Client {
     loop {
       self.rebind_if_needed()?;
       if let Some(reply) = self.round_trip(id, body)? {
-        self.note_reply(id.word(), &reply);
+        self.note_reply(id.word(), &reply, false);
         return resolved(reply);
       }
     }
@@ -1871,6 +1999,27 @@ impl Client {
     Ok(id)
   }
 
+  /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`): the daemon answers from the
+  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement names such an id
+  /// owed from its refusal until this resend (within the reconnect budget for the first two;
+  /// [`Self::release_retryable`] releases one the caller gives up). The word is
+  /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
+  /// the ring has no slot (nothing was sent).
+  pub fn begin_again(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
+    if self.awaited.len() >= self.awaited_cap {
+      return Err(ClientError::TooManyOutstanding {
+        limit: self.awaited_cap,
+      });
+    }
+    self.bind_without_waiting()?;
+    if !self.try_send(RequestId::from_word(word), body)? {
+      return Ok(false);
+    }
+    self.awaited.insert(word, body.clone());
+    Ok(true)
+  }
+
   /// Sends `body` under the next sequence, owned by no caller: a protocol-only request whose reply is
   /// dropped on arrival (the periodic acknowledgement).
   fn begin_unawaited(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
@@ -1967,11 +2116,12 @@ impl Client {
     }
     match polled {
       Ok(None) => Ok(false),
-      Ok(Some(connected)) => {
+      Ok(Some(mut connected)) => {
         let assigned = connected.region.client_id();
         if assigned != self.client_id {
           return Err(ClientError::SessionTaken { assigned });
         }
+        connected.region.set_session_key(&self.session_key)?;
         self.end = ClientEnd::connected(connected);
         self.reconnects = self.reconnects.saturating_add(1);
         self.bound = false;
@@ -2040,6 +2190,20 @@ impl Client {
       .collect()
   }
 
+  /// Where this client's replies stand, for a caller diagnosing a stall: the replies the daemon published on the
+  /// completion ring that this client has not taken (`None` when the ring cannot be read), the replies taken and
+  /// held for a caller that has not asked for them, and the requests awaited. A stalled request whose reply is in
+  /// either of the first two was answered and not collected; one in neither was never answered.
+  pub fn reply_state(&self) -> (Option<u64>, usize, usize) {
+    let unread = self
+      .end
+      .region()
+      .cpl()
+      .depth(self.end.region().object())
+      .ok();
+    (unread, self.pending.len(), self.awaited.len())
+  }
+
   /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
   /// abandoned operation's) — the counter a test reads to see the drop path ran.
   pub fn unawaited_dropped(&self) -> u64 {
@@ -2059,14 +2223,14 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
-      self.note_reply(word, &body);
+      self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
         self.awaited.remove(&word);
-        self.note_reply(word, &body);
+        self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
       self.buffer(reply.request, body);
@@ -2112,7 +2276,7 @@ impl Client {
     // A chain step's reply is its chain's: filed under the public word the caller awaits.
     if let Some(public) = self.chain_steps.remove(&id_word) {
       self.awaited.remove(&id_word);
-      self.note_reply(id_word, &body);
+      self.note_reply(id_word, &body, false);
       if !self.pending.iter().any(|(held, _)| *held == public) {
         self.pending.push((public, body));
       }
@@ -2133,6 +2297,9 @@ impl Client {
     }
     if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
     {
+      // Held as soon as it is drained: a reply in `pending` counts as received, so an acknowledgement sent before
+      // its caller takes it must already stop below a refusal it will resend.
+      self.note_reply(id_word, &body, true);
       self.pending.push((id_word, body));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
@@ -2206,16 +2373,28 @@ impl Client {
   /// sync path, without a blocking round trip on the event loop. The acknowledged mark advances
   /// optimistically; a lost ack only means the daemon holds a little more until the next one.
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
-    let up_to = self.ack_watermark();
+    let (up_to, owed) = self.acknowledgement();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       // A full ring or a lost channel defers the acknowledgement to the next call that finds it due.
-      match self.begin_unawaited(&RequestBody::Acknowledge { up_to }) {
+      match self.begin_unawaited(&RequestBody::Acknowledge { up_to, owed }) {
         Ok(_) => self.acknowledged = self.acknowledged.max(up_to),
         Err(ClientError::RingFull | ClientError::ChannelLost) => {}
         Err(other) => return Err(other),
       }
     }
     Ok(())
+  }
+
+  /// The pause before sending again a request the daemon refused for now (`LeaseUnconfirmed`, `AcknowledgementOwed`,
+  /// or a refusal retryable under its id), after `previous_ns` (zero for the first): the reconnect pacing's rule
+  /// ([`next_pause_ns`]), starting at the daemon's published spin window and doubling to a tenth of the reconnect
+  /// budget, so a caller that resends at once into a refusal for now does not make the refusal (a lease starved of its
+  /// probes by the resends; 20,000 a second in fixtures' 1,000-client primary-kill rung, 2026-11-07).
+  pub fn retry_pause_ns(&self, previous_ns: u64) -> u64 {
+    if previous_ns == 0 {
+      return self.published_spin_ns().max(1);
+    }
+    next_pause_ns(previous_ns, self.deadlines.reconnect_ns)
   }
 
   /// The spin window the daemon published (nanoseconds): the async fast path spins this long taking
@@ -2773,15 +2952,7 @@ impl Client {
   /// found gone instead and the client reconnected (the caller binds and sends again).
   /// One attempt to put `body` under `id` on the command ring: `Ok(false)` when it has no slot.
   fn try_send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let index = self.end.next_request_index();
-    let slot = pack(
-      self.end.region_mut(),
-      Direction::Request,
-      index,
-      id.word(),
-      body,
-    )?;
-    match self.end.send(&slot) {
+    match self.end.send_message(id.word(), body) {
       Ok(()) => Ok(true),
       Err(IpcError::RingFull) => Ok(false),
       Err(e) => Err(ClientError::Ipc(e)),
@@ -2791,15 +2962,7 @@ impl Client {
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     let started = Instant::now();
     loop {
-      let index = self.end.next_request_index();
-      let slot = pack(
-        self.end.region_mut(),
-        Direction::Request,
-        index,
-        id.word(),
-        body,
-      )?;
-      match self.end.send(&slot) {
+      match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
           if elapsed_ns(started) < self.deadlines.reply_ns {
@@ -2857,11 +3020,12 @@ impl Client {
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
       match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
-        Ok(connected) => {
+        Ok(mut connected) => {
           let assigned = connected.region.client_id();
           if assigned != self.client_id {
             return Err(ClientError::SessionTaken { assigned });
           }
+          connected.region.set_session_key(&self.session_key)?;
           self.end = ClientEnd::connected(connected);
           self.reconnects = self.reconnects.saturating_add(1);
           self.bound = false;
@@ -3302,6 +3466,50 @@ impl Client {
     }
   }
 
+  /// Edits a work volume and submits it, in one request (§4.16, A-225): exactly [`Client::edit`] and then, when the
+  /// edit is accepted, [`Client::submit_with_evidence`], with one round trip in place of two. The daemon runs both in
+  /// one durable step under one completion record, so a retry, across a restart too, answers what the first attempt
+  /// did. An edit's refusal is returned as `edit` returns it, and nothing is submitted; otherwise the submit's verdict,
+  /// windows or refusal. Bytes too large for one request are staged on the work's owner first, as `edit` stages them.
+  pub fn edit_and_submit(
+    &mut self,
+    (work, path): (VolumeId, &str),
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+    evidence: &[[u8; 32]],
+  ) -> Result<Submitted, ClientError> {
+    let request = |insert| RequestBody::EditSubmit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len,
+      insert,
+      evidence: evidence.to_vec(),
+    };
+    let inline = request(slates_ipc::protocol::EditBytes::Inline {
+      bytes: bytes.to_vec(),
+    });
+    let request = if slates_ipc::protocol::fits(self.end.region(), &inline) {
+      inline
+    } else {
+      let token = self.stage(work, bytes)?;
+      request(slates_ipc::protocol::EditBytes::Staged { token })
+    };
+    match self.call(&request)? {
+      ReplyBody::Submitted {
+        version: Some(v), ..
+      } => Ok(Submitted::Accepted(v)),
+      ReplyBody::Submitted {
+        version: None,
+        conflicts,
+      } => Ok(Submitted::Conflict(conflicts)),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "edit_and_submit",
+      }),
+    }
+  }
+
   /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
   /// moving the work's base without committing to the green — the head version it now sits on, or the
   /// conflict windows to resolve first.
@@ -3383,6 +3591,25 @@ impl Client {
       _ => Err(ClientError::UnexpectedReply {
         verb: "image_merge",
       }),
+    }
+  }
+
+  /// Checks green `green`'s head out into the volume and snapshot it was created from, `base`, through the caller's
+  /// write `attachment` of that volume (§4.16 A-201): the version the volume now holds and what the checkout changed.
+  /// The volume then lands under a grant like any other. Waits for the checkout, which the daemon runs in slices.
+  pub fn checkout(
+    &mut self,
+    green: VolumeId,
+    base: GreenBase,
+    attachment: u64,
+  ) -> Result<(u64, CheckoutReport), ClientError> {
+    match self.call(&RequestBody::Checkout {
+      green,
+      base,
+      attachment,
+    })? {
+      ReplyBody::CheckedOut { version, report } => Ok((version, report)),
+      _ => Err(ClientError::UnexpectedReply { verb: "checkout" }),
     }
   }
 
@@ -3581,6 +3808,15 @@ impl Client {
     }
   }
 
+  /// Detaches an attachment of `volume`, routed by the volume (§4.10, A-222): the form for an attachment another
+  /// host's owner holds, which an attachment id alone cannot route to (it names its owner partition, not its host).
+  pub fn detach_of(&mut self, volume: VolumeId, attachment: u64) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DetachOf { volume, attachment })? {
+      ReplyBody::Detached => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "detach" }),
+    }
+  }
+
   /// Binds a host mount's attachment to the path the mount was established at (§4.4 `Binding →
   /// Bound`; GAP-A9-4): the record's form becomes the chosen path, which `status` then reports.
   /// Refused for an attachment that is not a host mount's, or another principal's.
@@ -3773,6 +4009,19 @@ impl Client {
     }
   }
 
+  /// Turns a volume's live shipping on or off (§4.10, A-200; `admin` on the volume is required): while on, each of its
+  /// publications is shipped to its candidates and a barrier answers once the owner and `f` of them hold it. Returns
+  /// the setting the daemon recorded.
+  pub fn live_ship(&mut self, volume: VolumeId, live_shipped: bool) -> Result<bool, ClientError> {
+    match self.call(&RequestBody::LiveShip {
+      volume,
+      live_shipped,
+    })? {
+      ReplyBody::LiveShippingSet { live_shipped } => Ok(live_shipped),
+      _ => Err(ClientError::UnexpectedReply { verb: "live-ship" }),
+    }
+  }
+
   /// The caller's grants.
   pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
     match self.call(&RequestBody::Grants)? {
@@ -3789,11 +4038,17 @@ impl Client {
     }
   }
 
-  /// Acknowledges every completion up to `up_to` (releases their records) — held below an
-  /// unpublished id awaiting its retry, whatever `up_to` asks (AC-2.3; AUD-06).
+  /// Acknowledges every completion up to `up_to` (releases their records) except the ids the client still owes
+  /// ([`Self::acknowledgement`]: an unpublished id awaiting its retry, a request still awaited, an id held for a
+  /// resend), whatever `up_to` asks (AC-2.3; AUD-06; §4.9).
   pub fn acknowledge(&mut self, up_to: u32) -> Result<(), ClientError> {
-    let up_to = up_to.min(self.ack_watermark());
-    match self.call_plain(&RequestBody::Acknowledge { up_to })? {
+    let (issued, owed) = self.acknowledgement();
+    let up_to = up_to.min(issued);
+    let owed = owed
+      .into_iter()
+      .filter(|sequence| *sequence <= up_to)
+      .collect();
+    match self.call_plain(&RequestBody::Acknowledge { up_to, owed })? {
       ReplyBody::Acknowledged => {
         self.acknowledged = self.acknowledged.max(up_to);
         Ok(())
@@ -3809,10 +4064,9 @@ impl Client {
     self.acknowledged
   }
 
-  /// Acknowledges everything this client has received so far — short of an unpublished id awaiting
-  /// its retry.
+  /// Acknowledges everything this client has received so far, except the ids it still owes.
   pub fn acknowledge_all(&mut self) -> Result<(), ClientError> {
-    let up_to = self.ack_watermark();
+    let (up_to, _) = self.acknowledgement();
     self.acknowledge(up_to)
   }
 

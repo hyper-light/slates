@@ -1314,6 +1314,7 @@ dependencies = [
  "blake3",
  "libc",
  "rustix",
+ "slates-bridge-oci",
  "slates-machine",
  "slates-mem",
  "slates-vfs",
@@ -1356,6 +1357,7 @@ dependencies = [
  "slates-db",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-test-seeds",
  "slates-vfs",
 ]
@@ -1406,12 +1408,14 @@ dependencies = [
 name = "slates-bridge-winfsp"
 version = "0.1.0"
 dependencies = [
+ "loom",
  "slates-anchor",
  "slates-bridge-core",
  "slates-db",
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",
@@ -1451,6 +1455,7 @@ name = "slates-client"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "proptest",
  "rustix",
  "slates-anchor",
  "slates-bridge-fuse",
@@ -1461,6 +1466,7 @@ dependencies = [
  "slates-mem",
  "slates-seal",
  "slates-server",
+ "slates-test-seeds",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",
@@ -1659,6 +1665,7 @@ dependencies = [
  "blake3",
  "hyper-datagram",
  "hyper-seal",
+ "libc",
  "proptest",
  "rcgen",
  "rustix",
@@ -2357,6 +2364,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "cc",
  "rcgen",
  "rustix",
  "serde",

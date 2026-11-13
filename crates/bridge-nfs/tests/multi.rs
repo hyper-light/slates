@@ -77,7 +77,15 @@ fn make_volume(store: &mut Store, prefix: u16) -> Volume {
 fn write_cx(volume: VolumeId) -> OpContext {
   let mut attachments = Attachments::new();
   let id = attachments
-    .attach(volume, View::Current, Principal::Uid { uid: 0 }, rights())
+    .attach(
+      volume,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
+      rights(),
+    )
     .unwrap();
   attachments.context(id).unwrap()
 }
@@ -206,7 +214,15 @@ fn spawn_two_volume_server() -> (u16, std::thread::JoinHandle<()>) {
     let mut set = OwnedVolumeSet::new(store);
     set.add("alpha", VOL_A, vol_a);
     set.add("beta", VOL_B, vol_b);
-    let mut multi = MultiExport::new(set, Principal::Uid { uid: 0 }, rights(), None);
+    let mut multi = MultiExport::new(
+      set,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 0,
+      },
+      rights(),
+      None,
+    );
     assert_eq!(multi.len(), 2);
 
     if let Ok((mut stream, _)) = listener.accept() {

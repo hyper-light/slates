@@ -37,6 +37,7 @@
 
 use crate::special::SpecialNode;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -166,6 +167,16 @@ pub enum Outcome {
     /// The conflicting windows.
     windows: Vec<ConflictWindow>,
   },
+  /// The increment's base is below the version the green's chain was checkpointed at
+  /// ([`Green::checkpoint`]): the deltas it would be mapped through are folded away, so it is never judged. No live
+  /// reader is below that version (the service checkpoints at the reachable floor), so a caller meets this only with a
+  /// base no longer anyone's; the service answers it `UnknownBase`.
+  BaseUnavailable {
+    /// The increment's base.
+    base: u64,
+    /// The oldest base the green still judges.
+    floor: u64,
+  },
 }
 
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
@@ -173,14 +184,17 @@ pub enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rebased {
   /// The work's pending operations all mapped cleanly onto the head. The work's base becomes
-  /// `version`, its full content becomes `files` (the head's content with the work's mapped edits
-  /// re-applied), and its declared operations are restated in head coordinates as `journal` (so the
-  /// next submit composes against the new base with no further mapping).
+  /// `version`, its content becomes the head's with `changed` over it (the files the work's mapped
+  /// edits leave different from the head's, and the head's files they remove), and its declared
+  /// operations are restated in head coordinates as `journal` (so the next submit composes against
+  /// the new base with no further mapping). O(what the work changed), never the head's other files
+  /// (the whole content was cloned and restated before 2026-11-05).
   Rebased {
     /// The head the work is now based on.
     version: u64,
-    /// The work's full content per path after the rebase (the head's files with the work's edits).
-    files: BTreeMap<String, Vec<u8>>,
+    /// Per path the work changed: its bytes after the rebase where they differ from the head's, or
+    /// `None` where the work removes a file the head holds.
+    changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
   },
@@ -189,12 +203,19 @@ pub enum Rebased {
     /// The conflicting windows.
     windows: Vec<ConflictWindow>,
   },
+  /// The work's base is below the version the green's chain was checkpointed at ([`Outcome::BaseUnavailable`]).
+  BaseUnavailable {
+    /// The work's base.
+    base: u64,
+    /// The oldest base the green still maps.
+    floor: u64,
+  },
 }
 
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
-type ContentHistory = BTreeMap<String, Vec<(u64, Option<Vec<u8>>)>>;
+type ContentHistory = BTreeMap<String, Vec<(u64, Option<crate::history::Value>)>>;
 
 /// A per-path value history for a namespace dimension: the value at each version the path changed,
 /// `None` marking a removal (mode, symlink target, hard-link target). Reconstructs a base version.
@@ -222,19 +243,205 @@ const IDENTITY_TAG_HARDLINK: &[u8] = b"L";
 const IDENTITY_TAG_XATTR: &[u8] = b"X";
 /// Format: IPC metadata has a separate identity domain from regular files and links.
 const IDENTITY_TAG_SPECIAL: &[u8] = b"I";
+/// A key of the green's state whose identity entry a commit changed (A-202): which dimension, and its path (and an
+/// attribute's name).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IdentityKey {
+  /// A file.
+  File(String),
+  /// A FIFO/socket inode.
+  Special(String),
+  /// A directory.
+  Dir(String),
+  /// A path's mode.
+  Mode(String),
+  /// A symlink.
+  Symlink(String),
+  /// A hard link.
+  Hardlink(String),
+  /// An extended attribute: its path and name.
+  Xattr(String, String),
+}
+
+/// A FIFO/socket inode's identity entry: its tag, path and canonical metadata.
+fn special_entry(path: &str, node: &SpecialNode) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_SPECIAL)
+    .field(path.as_bytes())
+    .field(&node.encode())
+}
+
+/// A file's identity entry: its tag, path and bytes.
+fn file_entry(path: &str, bytes: &[u8]) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_FILE)
+    .field(path.as_bytes())
+    .field(bytes)
+}
+
+/// A directory's identity entry: its tag and path.
+fn dir_entry(path: &str) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_DIR).field(path.as_bytes())
+}
+
+/// A mode's identity entry: its tag, path and the mode's four bytes.
+fn mode_entry(path: &str, mode: u32) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_MODE)
+    .field(path.as_bytes())
+    .fixed(&mode.to_le_bytes())
+}
+
+/// A symlink's or hard link's identity entry: its kind's tag, path and target.
+fn link_entry(tag: &[u8], path: &str, target: &str) -> crate::identity::Entry {
+  crate::identity::Entry::new(tag)
+    .field(path.as_bytes())
+    .field(target.as_bytes())
+}
+
+/// An extended attribute's identity entry: its tag, path, name and value.
+fn xattr_entry(path: &str, name: &str, value: &[u8]) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_XATTR)
+    .field(path.as_bytes())
+    .field(name.as_bytes())
+    .field(value)
+}
+
 /// Derived: a retained IPC metadata payload occupies its Rust value's size, including alignment
 /// padding. Anchor: the actual `SpecialNode` layout on the target, measured by `size_of`.
 const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 
+/// A green being seeded from its origin a share at a time (§4.16 "the origin version from a snapshot"; §4.3 "Bounded
+/// work everywhere"): the origin's entries are moved into the engine — each one's identity added, its value and its
+/// version-0 history set — until a share's bytes are in, so a kernel-sized origin (97,229 files) seeds over many of a
+/// shard's steps instead of one poll. The order entries go in does not reach the result: the identity is a set hash
+/// and every table is keyed. [`Green::with_origin`] is the load run to its end.
+#[derive(Debug)]
+pub struct OriginLoad {
+  green: Green,
+  origin: crate::origin::Origin,
+}
+
+impl OriginLoad {
+  /// A load of `origin`, canonicalized in place unless it already is (later declarations of a repeated key win, as
+  /// [`crate::origin::Origin::canonicalize`] keeps them); a walk of a snapshot gives a canonical one.
+  pub fn new(mut origin: crate::origin::Origin) -> OriginLoad {
+    if !origin.is_canonical() {
+      origin.canonicalize();
+    }
+    OriginLoad {
+      green: Green::default(),
+      origin,
+    }
+  }
+
+  /// Moves entries in until at least `budget_bytes` of their values and paths have gone in, or the origin is empty (an
+  /// entry is the unit, so a share overruns by at most one file); the seeded green once the last is in.
+  pub fn step(&mut self, budget_bytes: usize) -> Option<Green> {
+    let mut moved = 0usize;
+    while moved < budget_bytes {
+      match self.move_one() {
+        Some(bytes) => moved = moved.saturating_add(bytes),
+        None => return Some(std::mem::take(&mut self.green)),
+      }
+    }
+    None
+  }
+
+  /// Moves one entry of the origin into the green, the files first; the bytes it moved, `None` once the origin is
+  /// empty.
+  fn move_one(&mut self) -> Option<usize> {
+    let green = &mut self.green;
+    let origin = &mut self.origin;
+    if let Some((path, bytes)) = origin.files.pop() {
+      let moved = path.len().saturating_add(bytes.len());
+      green.identity.add(&file_entry(&path, &bytes));
+      green.content.insert(path.clone(), bytes.clone());
+      green.last_changed.insert(path.clone(), 0);
+      let value = crate::history::Value::whole(&mut green.chunks, &bytes);
+      green.push_content(path, 0, Some(value));
+      return Some(moved);
+    }
+    if let Some((path, node)) = origin.specials.pop() {
+      let moved = path.len();
+      green.identity.add(&special_entry(&path, &node));
+      green.specials.insert(path.clone(), node);
+      green.special_changed.insert(path.clone(), 0);
+      green.special_history.insert(path, vec![(0, Some(node))]);
+      return Some(moved);
+    }
+    if let Some(path) = origin.dirs.pop() {
+      let moved = path.len();
+      if green.dirs.insert(path.clone()) {
+        green.identity.add(&dir_entry(&path));
+      }
+      green.dir_history.insert(path, vec![(0, true)]);
+      return Some(moved);
+    }
+    if let Some((path, mode)) = origin.modes.pop() {
+      let moved = path.len();
+      green.identity.add(&mode_entry(&path, mode));
+      green.modes.insert(path.clone(), mode);
+      green.mode_changed.insert(path.clone(), 0);
+      green.mode_history.insert(path, vec![(0, Some(mode))]);
+      return Some(moved);
+    }
+    if let Some((path, target)) = origin.symlinks.pop() {
+      let moved = path.len().saturating_add(target.len());
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_SYMLINK, &path, &target));
+      green.symlinks.insert(path.clone(), target.clone());
+      green.symlink_changed.insert(path.clone(), 0);
+      green.symlink_history.insert(path, vec![(0, Some(target))]);
+      return Some(moved);
+    }
+    if let Some((path, target)) = origin.hardlinks.pop() {
+      let moved = path.len().saturating_add(target.len());
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
+      green.hardlinks.insert(path.clone(), target.clone());
+      green.hardlink_changed.insert(path.clone(), 0);
+      green.hardlink_history.insert(path, vec![(0, Some(target))]);
+      return Some(moved);
+    }
+    if let Some((path, name, value)) = origin.xattrs.pop() {
+      let moved = path
+        .len()
+        .saturating_add(name.len())
+        .saturating_add(value.len());
+      green.identity.add(&xattr_entry(&path, &name, &value));
+      let key = (path, name);
+      green.xattrs.insert(key.clone(), value.clone());
+      green.xattr_changed.insert(key.clone(), 0);
+      green.xattr_history.insert(key, vec![(0, Some(value))]);
+      return Some(moved);
+    }
+    None
+  }
+}
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
-/// base version can be reconstructed for a lagging work (the design's chain shares these histories
-/// copy-on-write; here they are full copies, the measured optimization owed). The content dimension's
-/// history holds the bytes; the namespace dimensions' histories hold presence or the value.
+/// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
+/// (`crate::history`, W2): each version of a file is pieces of shared immutable chunks, so a version costs the bytes it
+/// added, not the file; the namespace dimensions' histories hold presence or the value.
 #[derive(Debug, Default)]
 pub struct Green {
+  /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
+  /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
+  identity: crate::identity::SetHash,
+  /// The version `identity` is the set hash of.
+  identity_version: u64,
+  /// The keys whose entries any commit after `identity_version` changed: bounded by the keys the green's histories
+  /// hold, each once however often it changed.
+  identity_dirty: BTreeSet<IdentityKey>,
   content: BTreeMap<String, Vec<u8>>,
   content_history: ContentHistory,
+  /// The chunks the content history's values share (`crate::history`).
+  chunks: crate::history::Chunks,
+  /// The bytes every content history value's piece list costs, a running total.
+  history_lists: usize,
+  /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
+  /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: BTreeMap<String, SpecialNode>,
   special_history: ValueHistory<SpecialNode>,
   special_changed: BTreeMap<String, u64>,
@@ -248,7 +455,11 @@ pub struct Green {
   symlink_history: ValueHistory<String>,
   hardlink_history: ValueHistory<String>,
   xattr_history: XattrHistory,
+  /// The deltas of the versions after `deltas_from`, in order: `deltas[i]` is version `deltas_from + i + 1`'s.
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
+  /// The version the green was restored at from a checkpoint ([`Green::restore`]), 0 for a green built from its origin:
+  /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
+  deltas_from: u64,
   last_changed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
   symlink_changed: BTreeMap<String, u64>,
@@ -275,16 +486,19 @@ pub struct Green {
   /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
   /// bound's regression asserts.
   rejected_evicted: u64,
-  /// The bytes the content and IPC histories retain beyond the current values — every earlier value of every
-  /// path still held for reconstruction (`content_at`, `base_at`) — kept as a running total so the
-  /// service can charge it as retention without walking the histories.
-  history_bytes: usize,
+  history_current: usize,
+  /// The bytes the IPC (special node) history retains beyond the current values, a running total: with the content
+  /// history's chunks and lists less its current values, [`Green::history_bytes`].
+  special_history_bytes: usize,
   /// The version below which the histories have been **folded** (`fold_history_before`): values
   /// recorded before it survive only as the one entry in effect at it, so a version below the floor
   /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
   fast_path_hits: u64,
+  /// The deltas the verdict's position mapping consulted (`intervening`): the non-vacuity count that it reads only the
+  /// deltas that changed a path, never every delta since a base. A cell, as the deltas it counts are borrowed.
+  deltas_visited: std::cell::Cell<u64>,
 }
 
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
@@ -318,11 +532,36 @@ pub struct RetainedBytes {
   pub rejected: usize,
 }
 
+/// Every key of `history` whose value in effect at `at` was set after the origin (version 0): the key, that version and
+/// that value (`None`: removed), for a checkpoint at `at`.
+fn changed_at<K: Clone, V: Clone>(
+  history: &BTreeMap<K, Vec<(u64, Option<V>)>>,
+  at: u64,
+) -> Vec<crate::checkpoint::Changed<K, V>> {
+  history
+    .iter()
+    .filter_map(|(key, entries)| {
+      let (version, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
+      (*version > 0).then(|| crate::checkpoint::Changed {
+        key: key.clone(),
+        at: *version,
+        value: value.clone(),
+      })
+    })
+    .collect()
+}
+
+/// What a path's latest content value counts among the current values ([`Green::history_bytes`] leaves them out): its
+/// bytes and its piece list.
+fn current_bytes(value: &crate::history::Value) -> usize {
+  value.len().saturating_add(value.list_bytes())
+}
+
 /// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
 /// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
-/// unchanged. `cost` prices an entry's value; the sum over the dropped entries is returned (the
-/// bytes released). Entries are in version order, as the histories keep them.
-fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) -> usize) -> usize {
+/// unchanged. The dropped entries are returned, for the caller to release what they held. Entries are in version
+/// order, as the histories keep them.
+fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64) -> Vec<(u64, T)> {
   let below = history
     .iter()
     .take_while(|(version, _)| *version < floor)
@@ -338,16 +577,10 @@ fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) ->
     below.saturating_sub(1)
   };
   if drop == 0 {
-    return 0;
+    return Vec::new();
   }
   let drop = drop.min(history.len());
-  let dropped: usize = history
-    .iter()
-    .take(drop)
-    .map(|(_, value)| cost(value))
-    .sum();
-  history.drain(..drop);
-  dropped
+  history.drain(..drop).collect()
 }
 
 /// The value of a `(version, Option<value>)` history at `version`: the last entry recorded at or
@@ -398,7 +631,7 @@ fn touched_range(op: &Op) -> Range {
 }
 
 /// Whether an op kind carries content bytes (its `src` names post-state bytes).
-fn is_content(kind: OpKind) -> bool {
+pub(crate) fn is_content(kind: OpKind) -> bool {
   matches!(
     kind,
     OpKind::Overwrite | OpKind::Extend | OpKind::Truncate | OpKind::Insert | OpKind::Delete
@@ -465,6 +698,12 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   out
 }
 
+/// [`apply`], for the history's oracle (`crate::history`'s tests).
+#[cfg(test)]
+pub(crate) fn apply_for_tests(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
+  apply(base, ops, post_state)
+}
+
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
 fn push_slice(out: &mut Vec<u8>, from: &[u8], src: u64, len: u64) {
   out.extend_from_slice(span_bytes(from, src, len));
@@ -527,8 +766,9 @@ enum Effect {
   Special(String, SpecialNode),
   /// Remove an IPC inode.
   RemoveSpecial(String),
-  /// Set the file to these bytes, recording these ops (head coordinates) as its content delta.
-  SetContent(String, Vec<u8>, Vec<Op>),
+  /// Set the file to these bytes, recording these ops (head coordinates) as its content delta; the last field says how a
+  /// replay arrives at the same bytes (`crate::chain_entry`).
+  SetContent(String, Vec<u8>, Vec<Op>, ContentSource),
   /// Remove the file.
   RemoveContent(String),
   /// Create a directory.
@@ -551,6 +791,67 @@ enum Effect {
   RemoveXattr(String, String),
 }
 
+/// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
+#[derive(Clone, Debug)]
+enum ContentSource {
+  /// The effect's mapped ops, spliced into the file, from the increment's post-state.
+  Mapped,
+  /// These declared ops over nothing, from the increment's post-state.
+  Created(Vec<Op>),
+  /// The bytes another file holds at this version.
+  Copied(String),
+}
+
+impl Effect {
+  /// What a chain entry records of this effect: no file's bytes, only how to arrive at them from the increment.
+  fn applied(&self) -> crate::chain_entry::Applied {
+    use crate::chain_entry::Applied;
+    match self {
+      Effect::Special(path, node) => Applied::Special(path.clone(), *node),
+      Effect::RemoveSpecial(path) => Applied::RemoveSpecial(path.clone()),
+      Effect::SetContent(path, _, ops, ContentSource::Mapped) => {
+        Applied::Spliced(path.clone(), ops.clone())
+      }
+      Effect::SetContent(path, _, _, ContentSource::Created(declared)) => {
+        Applied::Created(path.clone(), declared.clone())
+      }
+      Effect::SetContent(path, _, _, ContentSource::Copied(from)) => Applied::Copied {
+        dst: path.clone(),
+        from: from.clone(),
+      },
+      Effect::RemoveContent(path) => Applied::RemoveContent(path.clone()),
+      Effect::MakeDir(path) => Applied::MakeDir(path.clone()),
+      Effect::RemoveDir(path) => Applied::RemoveDir(path.clone()),
+      Effect::Mode(path, mode) => Applied::Mode(path.clone(), *mode),
+      Effect::Symlink(path, target) => Applied::Symlink(path.clone(), target.clone()),
+      Effect::RemoveSymlink(path) => Applied::RemoveSymlink(path.clone()),
+      Effect::Hardlink(path, target) => Applied::Hardlink(path.clone(), target.clone()),
+      Effect::RemoveHardlink(path) => Applied::RemoveHardlink(path.clone()),
+      Effect::SetXattr(path, name, value) => {
+        Applied::SetXattr(path.clone(), name.clone(), value.clone())
+      }
+      Effect::RemoveXattr(path, name) => Applied::RemoveXattr(path.clone(), name.clone()),
+    }
+  }
+
+  /// The one key of the green's state this effect sets or removes (A-202).
+  fn identity_key(&self) -> IdentityKey {
+    match self {
+      Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
+      Effect::SetContent(path, ..) | Effect::RemoveContent(path) => IdentityKey::File(path.clone()),
+      Effect::MakeDir(path) | Effect::RemoveDir(path) => IdentityKey::Dir(path.clone()),
+      Effect::Mode(path, _) => IdentityKey::Mode(path.clone()),
+      Effect::Symlink(path, _) | Effect::RemoveSymlink(path) => IdentityKey::Symlink(path.clone()),
+      Effect::Hardlink(path, _) | Effect::RemoveHardlink(path) => {
+        IdentityKey::Hardlink(path.clone())
+      }
+      Effect::SetXattr(path, name, _) | Effect::RemoveXattr(path, name) => {
+        IdentityKey::Xattr(path.clone(), name.clone())
+      }
+    }
+  }
+}
+
 impl Green {
   /// An empty green volume at version 0.
   pub fn new() -> Green {
@@ -564,104 +865,347 @@ impl Green {
   /// the fast path (last changed at 0 ≤ base 0), and `base_at(0)` reconstructs it. The head stays
   /// 0: the origin is not a delta. Deterministic: the same origin seeds the same state, which is what
   /// lets a holder recompute version 0 from the placed origin bytes.
-  pub fn with_origin(origin: &crate::origin::Origin) -> Green {
-    let mut green = Green::default();
-    let mut canonical = origin.clone();
-    canonical.canonicalize();
-    for (path, node) in canonical.specials {
-      green.specials.insert(path.clone(), node);
-      green.special_changed.insert(path.clone(), 0);
-      green.special_history.insert(path, vec![(0, Some(node))]);
+  /// Takes the origin by value and moves its entries in, so seeding costs no copy of the origin (it cloned the whole
+  /// origin to canonicalize it before 2026-11-07); [`OriginLoad`] is the same seeding in shares.
+  pub fn with_origin(origin: crate::origin::Origin) -> Green {
+    let mut load = OriginLoad::new(origin);
+    loop {
+      if let Some(green) = load.step(usize::MAX) {
+        return green;
+      }
     }
-    for (path, bytes) in canonical.files {
-      green.content.insert(path.clone(), bytes.clone());
-      green.last_changed.insert(path.clone(), 0);
-      green.content_history.insert(path, vec![(0, Some(bytes))]);
+  }
+
+  /// The green's checkpoint at version `at` (§4.16; [`crate::checkpoint`]): every key whose value in effect at `at` was
+  /// set after the origin, with that version and value, and every increment accepted at or before `at`. `None` when
+  /// `at` is past the head or below the folded floor (its values are no longer reconstructible). With the origin it
+  /// restores ([`Green::restore`]) a green that answers as this one does for every version from `at` on.
+  pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
+    if at > self.head() || at < self.folded_below || at < self.deltas_from {
+      return None;
     }
-    for path in canonical.dirs {
-      green.dirs.insert(path.clone());
-      green.dir_history.insert(path, vec![(0, true)]);
+    let mut checkpoint = crate::checkpoint::Checkpoint {
+      version: at,
+      accepted: self
+        .accepted
+        .iter()
+        .filter(|(_, version)| **version <= at)
+        .map(|(id, version)| (*id, *version))
+        .collect(),
+      files: self.changed_content_at(at),
+      dirs: self
+        .dir_history
+        .iter()
+        .filter_map(|(path, history)| {
+          let (version, present) = history.iter().rev().find(|(v, _)| *v <= at)?;
+          (*version > 0).then(|| crate::checkpoint::Changed {
+            key: path.clone(),
+            at: *version,
+            value: present.then_some(()),
+          })
+        })
+        .collect(),
+      modes: changed_at(&self.mode_history, at),
+      symlinks: changed_at(&self.symlink_history, at),
+      hardlinks: changed_at(&self.hardlink_history, at),
+      specials: changed_at(&self.special_history, at),
+      xattrs: changed_at(&self.xattr_history, at),
+      head_check: None,
+    };
+    checkpoint.canonicalize();
+    Some(checkpoint)
+  }
+
+  /// A green restored from its `origin` and a `checkpoint` of it (§4.16, §4.8 recovery): the origin's state with every
+  /// key the checkpoint names set to its value there (its history one entry, its last change the checkpoint's), the
+  /// accepted identities restored, and the head at the checkpoint's version with no delta before it, so every later
+  /// increment replays onto it as onto the green the checkpoint was taken from, and a base below it is refused
+  /// ([`Outcome::BaseUnavailable`]). Deterministic: the same origin and checkpoint restore the same green.
+  pub fn restore(
+    origin: crate::origin::Origin,
+    checkpoint: &crate::checkpoint::Checkpoint,
+  ) -> Green {
+    let mut green = Green::with_origin(origin);
+    for changed in &checkpoint.files {
+      green.restore_file(changed);
     }
-    for (path, mode) in canonical.modes {
-      green.modes.insert(path.clone(), mode);
-      green.mode_changed.insert(path.clone(), 0);
-      green.mode_history.insert(path, vec![(0, Some(mode))]);
+    for changed in &checkpoint.dirs {
+      green.restore_dir(changed);
     }
-    for (path, target) in canonical.symlinks {
-      green.symlinks.insert(path.clone(), target.clone());
-      green.symlink_changed.insert(path.clone(), 0);
-      green.symlink_history.insert(path, vec![(0, Some(target))]);
+    for changed in &checkpoint.modes {
+      green.restore_mode(changed);
     }
-    for (path, target) in canonical.hardlinks {
-      green.hardlinks.insert(path.clone(), target.clone());
-      green.hardlink_changed.insert(path.clone(), 0);
-      green.hardlink_history.insert(path, vec![(0, Some(target))]);
+    for changed in &checkpoint.symlinks {
+      green.restore_link(IDENTITY_TAG_SYMLINK, changed);
     }
-    for (path, name, value) in canonical.xattrs {
-      let key = (path, name);
-      green.xattrs.insert(key.clone(), value.clone());
-      green.xattr_changed.insert(key.clone(), 0);
-      green.xattr_history.insert(key, vec![(0, Some(value))]);
+    for changed in &checkpoint.hardlinks {
+      green.restore_link(IDENTITY_TAG_HARDLINK, changed);
     }
+    for changed in &checkpoint.specials {
+      green.restore_special(changed);
+    }
+    for changed in &checkpoint.xattrs {
+      green.restore_xattr(changed);
+    }
+    green.accepted = checkpoint.accepted.iter().copied().collect();
+    green.deltas_from = checkpoint.version;
+    green.folded_below = checkpoint.version;
+    green.identity_version = checkpoint.version;
+    green.special_history_bytes = green.special_history_recounted();
     green
   }
 
-  /// The head version (the number of committed deltas).
+  fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
+    if let Some(old) = self.content.remove(&changed.key) {
+      self.identity.remove(&file_entry(&changed.key, &old));
+    }
+    if let Some(bytes) = &changed.value {
+      self.identity.add(&file_entry(&changed.key, bytes));
+      self.content.insert(changed.key.clone(), bytes.clone());
+    }
+    self.last_changed.insert(changed.key.clone(), changed.at);
+    self.clear_content_history(&changed.key);
+    let value = changed
+      .value
+      .as_ref()
+      .map(|bytes| crate::history::Value::whole(&mut self.chunks, bytes));
+    self.push_content(changed.key.clone(), changed.at, value);
+  }
+
+  fn restore_dir(&mut self, changed: &crate::checkpoint::Changed<String, ()>) {
+    if self.dirs.remove(&changed.key) {
+      self.identity.remove(&dir_entry(&changed.key));
+    }
+    if changed.value.is_some() {
+      self.identity.add(&dir_entry(&changed.key));
+      self.dirs.insert(changed.key.clone());
+    }
+    self.dir_history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.is_some())],
+    );
+  }
+
+  fn restore_mode(&mut self, changed: &crate::checkpoint::Changed<String, u32>) {
+    if let Some(old) = self.modes.remove(&changed.key) {
+      self.identity.remove(&mode_entry(&changed.key, old));
+    }
+    if let Some(mode) = changed.value {
+      self.identity.add(&mode_entry(&changed.key, mode));
+      self.modes.insert(changed.key.clone(), mode);
+    }
+    self.mode_changed.insert(changed.key.clone(), changed.at);
+    self
+      .mode_history
+      .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
+  }
+
+  fn restore_link(&mut self, tag: &[u8], changed: &crate::checkpoint::Changed<String, String>) {
+    let (map, changed_map, history) = if tag == IDENTITY_TAG_SYMLINK {
+      (
+        &mut self.symlinks,
+        &mut self.symlink_changed,
+        &mut self.symlink_history,
+      )
+    } else {
+      (
+        &mut self.hardlinks,
+        &mut self.hardlink_changed,
+        &mut self.hardlink_history,
+      )
+    };
+    if let Some(old) = map.remove(&changed.key) {
+      self.identity.remove(&link_entry(tag, &changed.key, &old));
+    }
+    if let Some(target) = &changed.value {
+      self.identity.add(&link_entry(tag, &changed.key, target));
+      map.insert(changed.key.clone(), target.clone());
+    }
+    changed_map.insert(changed.key.clone(), changed.at);
+    history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.clone())],
+    );
+  }
+
+  fn restore_special(&mut self, changed: &crate::checkpoint::Changed<String, SpecialNode>) {
+    if let Some(old) = self.specials.remove(&changed.key) {
+      self.identity.remove(&special_entry(&changed.key, &old));
+    }
+    if let Some(node) = changed.value {
+      self.identity.add(&special_entry(&changed.key, &node));
+      self.specials.insert(changed.key.clone(), node);
+    }
+    self.special_changed.insert(changed.key.clone(), changed.at);
+    self
+      .special_history
+      .insert(changed.key.clone(), vec![(changed.at, changed.value)]);
+  }
+
+  fn restore_xattr(&mut self, changed: &crate::checkpoint::Changed<(String, String), Vec<u8>>) {
+    let (path, name) = &changed.key;
+    if let Some(old) = self.xattrs.remove(&changed.key) {
+      self.identity.remove(&xattr_entry(path, name, &old));
+    }
+    if let Some(value) = &changed.value {
+      self.identity.add(&xattr_entry(path, name, value));
+      self.xattrs.insert(changed.key.clone(), value.clone());
+    }
+    self.xattr_changed.insert(changed.key.clone(), changed.at);
+    self.xattr_history.insert(
+      changed.key.clone(),
+      vec![(changed.at, changed.value.clone())],
+    );
+  }
+
+  /// The head version: the checkpoint's version, if restored from one, plus the deltas committed since.
   pub fn head(&self) -> u64 {
-    self.deltas.len() as u64
+    self.deltas_from.saturating_add(self.deltas.len() as u64)
+  }
+
+  /// The oldest base the green still judges and maps: the version it was restored at from a checkpoint, else 0.
+  pub fn mappable_from(&self) -> u64 {
+    self.deltas_from
   }
 
   /// The identity of the green's state at the head (§4.16 "the manifest identity": what a holder
   /// "recomputes … before serving the version" and "compares … with the record at every version",
-  /// D-27 "mismatch fatal-and-loud"): the BLAKE3 of a canonical encoding of every dimension — each
-  /// table in key order, every field length-prefixed and tagged by kind — so two engines that
+  /// D-27 "mismatch fatal-and-loud"): a hash of a canonical encoding of every entry of every
+  /// dimension — every field length-prefixed and tagged by kind — so two engines that
   /// applied the same increments to the same origin hash to the same identity, and a single
   /// differing byte anywhere (a file's content, a mode, a link target, an attribute) changes it.
-  /// Pure: a function of the state alone; it reads no clock and allocates only the hasher's
-  /// scratch. Cost is proportional to the state (it hashes every file), which is the laptop-honest
-  /// form; the design's incremental Merkle identity over shared extents is the measured refinement.
-  pub fn head_identity(&self) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    let field = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
-      hasher.update(&(bytes.len() as u64).to_le_bytes());
-      hasher.update(bytes);
-    };
+  /// A function of the state alone; it reads no clock. Since A-202 it is the set hash of every
+  /// entry (`crate::identity`), brought up to date here by the keys changed since it was last read,
+  /// so a read costs what changed since the last one, not what the green holds, and a commit pays
+  /// nothing for it; it equals [`Green::head_identity_from_scratch`] in every state (it hashed every
+  /// byte the green holds on each call before). Mutable only to keep that running sum.
+  pub fn head_identity(&mut self) -> [u8; 32] {
+    self.fold_identity();
+    self.identity.identity()
+  }
+
+  /// Brings the set hash from `identity_version` to the head: for each key a commit changed since, its entry at
+  /// `identity_version` (read from the histories, which hold every version at or above the fold floor, kept at or
+  /// below `identity_version` by [`Green::fold_history_before`]) is subtracted and its current entry added. O(the keys
+  /// changed since the identity was last read), each once however often it changed.
+  fn fold_identity(&mut self) {
+    let since = self.identity_version;
+    for key in std::mem::take(&mut self.identity_dirty) {
+      let (old, new) = self.entries_of(&key, since);
+      if let Some(old) = old {
+        self.identity.remove(&old);
+      }
+      if let Some(new) = new {
+        self.identity.add(&new);
+      }
+    }
+    self.identity_version = self.head();
+  }
+
+  /// `key`'s identity entry at version `since` and at the head (`None` where it was absent).
+  fn entries_of(
+    &self,
+    key: &IdentityKey,
+    since: u64,
+  ) -> (
+    Option<crate::identity::Entry>,
+    Option<crate::identity::Entry>,
+  ) {
+    let target_at =
+      |history: Option<&Vec<(u64, Option<String>)>>| history.and_then(|h| history_at(h, since));
+    match key {
+      IdentityKey::File(path) => (
+        self
+          .content_ref_at(path, since)
+          .map(|bytes| file_entry(path, &bytes)),
+        self.content.get(path).map(|bytes| file_entry(path, bytes)),
+      ),
+      IdentityKey::Special(path) => (
+        self
+          .special_history
+          .get(path)
+          .and_then(|h| history_at(h, since))
+          .map(|node| special_entry(path, &node)),
+        self
+          .specials
+          .get(path)
+          .map(|node| special_entry(path, node)),
+      ),
+      IdentityKey::Dir(path) => (
+        self
+          .dir_history
+          .get(path)
+          .is_some_and(|h| present_at(h, since))
+          .then(|| dir_entry(path)),
+        self.dirs.contains(path).then(|| dir_entry(path)),
+      ),
+      IdentityKey::Mode(path) => (
+        self
+          .mode_history
+          .get(path)
+          .and_then(|h| history_at(h, since))
+          .map(|mode| mode_entry(path, mode)),
+        self.modes.get(path).map(|mode| mode_entry(path, *mode)),
+      ),
+      IdentityKey::Symlink(path) => (
+        target_at(self.symlink_history.get(path))
+          .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, &target)),
+        self
+          .symlinks
+          .get(path)
+          .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target)),
+      ),
+      IdentityKey::Hardlink(path) => (
+        target_at(self.hardlink_history.get(path))
+          .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, &target)),
+        self
+          .hardlinks
+          .get(path)
+          .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, target)),
+      ),
+      IdentityKey::Xattr(path, name) => {
+        let key = (path.clone(), name.clone());
+        (
+          self
+            .xattr_history
+            .get(&key)
+            .and_then(|h| history_at(h, since))
+            .map(|value| xattr_entry(path, name, &value)),
+          self
+            .xattrs
+            .get(&key)
+            .map(|value| xattr_entry(path, name, value)),
+        )
+      }
+    }
+  }
+
+  /// [`Green::head_identity`] recounted from scratch over every current entry: the oracle the running set hash is
+  /// held equal to (`crates/merge/tests/identity.rs`), O(everything the green holds).
+  pub fn head_identity_from_scratch(&self) -> [u8; 32] {
+    let mut set = crate::identity::SetHash::default();
     for (path, node) in &self.specials {
-      hasher.update(IDENTITY_TAG_SPECIAL);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, &node.encode());
+      set.add(&special_entry(path, node));
     }
     for (path, bytes) in &self.content {
-      hasher.update(IDENTITY_TAG_FILE);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, bytes);
+      set.add(&file_entry(path, bytes));
     }
     for path in &self.dirs {
-      hasher.update(IDENTITY_TAG_DIR);
-      field(&mut hasher, path.as_bytes());
+      set.add(&dir_entry(path));
     }
     for (path, mode) in &self.modes {
-      hasher.update(IDENTITY_TAG_MODE);
-      field(&mut hasher, path.as_bytes());
-      hasher.update(&mode.to_le_bytes());
+      set.add(&mode_entry(path, *mode));
     }
     for (path, target) in &self.symlinks {
-      hasher.update(IDENTITY_TAG_SYMLINK);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, target.as_bytes());
+      set.add(&link_entry(IDENTITY_TAG_SYMLINK, path, target));
     }
     for (path, target) in &self.hardlinks {
-      hasher.update(IDENTITY_TAG_HARDLINK);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, target.as_bytes());
+      set.add(&link_entry(IDENTITY_TAG_HARDLINK, path, target));
     }
     for ((path, name), value) in &self.xattrs {
-      hasher.update(IDENTITY_TAG_XATTR);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, name.as_bytes());
-      field(&mut hasher, value);
+      set.add(&xattr_entry(path, name, value));
     }
-    *hasher.finalize().as_bytes()
+    set.identity()
   }
 
   /// The paths any dimension of which changed at a version in `(from, to]` (§4.16 "`advance` …
@@ -820,6 +1364,12 @@ impl Green {
     self.fast_path_hits
   }
 
+  /// The deltas the verdict's position mapping has consulted ([`Green::fast_path_hits`]'s companion): one per delta
+  /// that changed a path an increment touches since its base.
+  pub fn deltas_visited(&self) -> u64 {
+    self.deltas_visited.get()
+  }
+
   /// The green's state at an older `version` as a deriver [`Base`](crate::increment::Base), for a
   /// work whose base lagged behind an intervening submit. Files come from the content history (exact,
   /// renames and deletes included); directories and modes are replayed from the deltas up to the
@@ -838,8 +1388,8 @@ impl Green {
       .keys()
       .filter_map(|path| {
         self
-          .content_at(path, version)
-          .map(|bytes| (path.clone(), bytes.len() as u64))
+          .content_len_at(path, version)
+          .map(|len| (path.clone(), len as u64))
       })
       .collect();
     let dirs = self
@@ -889,39 +1439,371 @@ impl Green {
     }
   }
 
-  /// A file's bytes at `version`, reconstructed from its history — the latest recorded value at or
-  /// before `version`, or `None` when the file was absent then. What a version-pinned attachment
-  /// reads (§4.16 "Attachments and versions": a reader's view moves only by `advance`).
+  /// The base of `version` that composing `journal` reads (§4.16 "Composition at seal"): every
+  /// dimension's entry at each path the journal names
+  /// ([`VolumeOp::names`](crate::increment::VolumeOp::names)), and the hard links aimed at those
+  /// paths, as [`Green::base_at`] would give them. The deriver reads a base only at the paths its
+  /// journal names, so [`compose_volume`](crate::increment::compose_volume) over this base equals it
+  /// over the whole one (the oracle in `crates/merge/tests/base_for.rs`), and a submit's cost follows
+  /// what it changed rather than what the green holds: the whole base, every path's name cloned, was
+  /// built on every submit before (2026-11-04).
+  pub fn base_for(
+    &self,
+    version: u64,
+    journal: &[crate::increment::VolumeOp],
+  ) -> crate::increment::Base {
+    let named: BTreeSet<&str> = journal.iter().flat_map(|op| op.names()).flatten().collect();
+    let mut base = crate::increment::Base::of_files(Vec::new());
+    let at_head = version >= self.head();
+    for path in &named {
+      if at_head {
+        self.head_entries(path, &mut base);
+      } else {
+        self.entries_at(path, version, &mut base);
+      }
+    }
+    // A link named by the journal, or one aimed at a path it names (an unlink of a primary path is refused while
+    // aliases survive). Hard links are few, and no index by target exists yet.
+    let named_link = |link: &str, target: &str| named.contains(link) || named.contains(target);
+    if at_head {
+      for (link, target) in &self.hardlinks {
+        if named_link(link, target) {
+          base.hardlinks.push((link.clone(), target.clone()));
+        }
+      }
+    } else {
+      for (link, history) in &self.hardlink_history {
+        if let Some(target) = history_at(history, version)
+          && named_link(link, &target)
+        {
+          base.hardlinks.push((link.clone(), target));
+        }
+      }
+    }
+    base
+  }
+
+  /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
+  fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
+    if let Some(bytes) = self.content.get(path) {
+      base.files.push((path.to_owned(), bytes.len() as u64));
+    }
+    if let Some(node) = self.specials.get(path) {
+      base.specials.push((path.to_owned(), *node));
+    }
+    if self.dirs.contains(path) {
+      base.dirs.push(path.to_owned());
+    }
+    if let Some(mode) = self.modes.get(path) {
+      base.modes.push((path.to_owned(), *mode));
+    }
+    if let Some(target) = self.symlinks.get(path) {
+      base.symlinks.push((path.to_owned(), target.clone()));
+    }
+    let from = (path.to_owned(), String::new());
+    for ((attr_path, name), value) in self.xattrs.range(from..) {
+      if attr_path != path {
+        break;
+      }
+      base
+        .xattrs
+        .push((attr_path.clone(), name.clone(), value.clone()));
+    }
+  }
+
+  /// Every dimension's entry at `path` at the earlier `version` but hard links, from the histories, added to `base`
+  /// ([`Green::base_for`]).
+  fn entries_at(&self, path: &str, version: u64, base: &mut crate::increment::Base) {
+    if let Some(len) = self.content_len_at(path, version) {
+      base.files.push((path.to_owned(), len as u64));
+    }
+    if let Some(node) = self
+      .special_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.specials.push((path.to_owned(), node));
+    }
+    if self
+      .dir_history
+      .get(path)
+      .is_some_and(|history| present_at(history, version))
+    {
+      base.dirs.push(path.to_owned());
+    }
+    if let Some(mode) = self
+      .mode_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.modes.push((path.to_owned(), mode));
+    }
+    if let Some(target) = self
+      .symlink_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.symlinks.push((path.to_owned(), target));
+    }
+    let from = (path.to_owned(), String::new());
+    for ((attr_path, name), history) in self.xattr_history.range(from..) {
+      if attr_path != path {
+        break;
+      }
+      if let Some(value) = history_at(history, version) {
+        base.xattrs.push((attr_path.clone(), name.clone(), value));
+      }
+    }
+  }
+
+  /// A file's bytes at `version`, reconstructed from its history — the value in effect at `version`, or `None` when
+  /// the file was absent then. What a version-pinned attachment reads (§4.16 "Attachments and versions": a reader's
+  /// view moves only by `advance`).
   pub fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {
-    self.content_history.get(path).and_then(|history| {
-      history
-        .iter()
-        .rev()
-        .find(|(recorded, _)| *recorded <= version)
-        .and_then(|(_, bytes)| bytes.clone())
-    })
+    self.content_ref_at(path, version).map(Cow::into_owned)
   }
 
-  /// A file's bytes at `version`, borrowed ([`Green::content_at`] without the copy): what a paged read slices.
-  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<&[u8]> {
-    self.content_history.get(path).and_then(|history| {
-      history
-        .iter()
-        .rev()
-        .find(|(recorded, _)| *recorded <= version)
-        .and_then(|(_, bytes)| bytes.as_deref())
-    })
+  /// Every file at `version` with its bytes in path order: the head's files, or each path's value at an earlier
+  /// version. What a work based at `version` lists (its untouched files are the green's there). Borrowed where a
+  /// file is unchanged since `version`, copied out of the history where it changed after ([`Green::content_ref_at`]).
+  pub fn files_at(&self, version: u64) -> Vec<(&str, Cow<'_, [u8]>)> {
+    if version >= self.head() {
+      return self
+        .files()
+        .map(|(path, bytes)| (path, Cow::Borrowed(bytes)))
+        .collect();
+    }
+    self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_ref_at(path, version)
+          .map(|bytes| (path.as_str(), bytes))
+      })
+      .collect()
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`.
+  /// A file's bytes at `version` ([`Green::content_at`] without the copy where it can): borrowed from the head when
+  /// the file is unchanged since `version` (its value then is the current one), copied out of the history's chunks
+  /// when it changed after (W2: the history holds what each version changed, not a whole copy of the file to lend).
+  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
+    let history = self.content_history.get(path)?;
+    let index = history
+      .iter()
+      .rposition(|(recorded, _)| *recorded <= version)?;
+    let value = history.get(index)?.1.as_ref()?;
+    if index.saturating_add(1) == history.len() {
+      return self
+        .content
+        .get(path)
+        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+    }
+    Some(Cow::Owned(value.materialize(&self.chunks)))
+  }
+
+  /// A page of a file at `version`: its bytes in `[offset, offset + want)` (clamped to its length) and its length, or
+  /// `None` when it was absent then. Sliced from the head when the file is unchanged since `version`, and copied out of
+  /// only the history's pieces that hold the page when it changed after: a paged read never copies the whole file.
+  pub fn content_page_at(
+    &self,
+    path: &str,
+    version: u64,
+    (offset, want): (u64, u64),
+  ) -> Option<(Vec<u8>, u64)> {
+    let history = self.content_history.get(path)?;
+    let index = history
+      .iter()
+      .rposition(|(recorded, _)| *recorded <= version)?;
+    let value = history.get(index)?.1.as_ref()?;
+    let total = value.len();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
+    let end = usize::try_from(offset.saturating_add(want))
+      .unwrap_or(usize::MAX)
+      .min(total);
+    let page = if index.saturating_add(1) == history.len() {
+      self
+        .content
+        .get(path)
+        .and_then(|bytes| bytes.get(start..end))
+        .unwrap_or_default()
+        .to_vec()
+    } else {
+      value.read(&self.chunks, start, end)
+    };
+    Some((page, u64::try_from(total).unwrap_or(u64::MAX)))
+  }
+
+  /// Every file at `version` with its length, in path order: [`Green::files_at`] without the bytes.
+  pub fn file_lens_at(&self, version: u64) -> Vec<(&str, usize)> {
+    if version >= self.head() {
+      return self
+        .files()
+        .map(|(path, bytes)| (path, bytes.len()))
+        .collect();
+    }
+    self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_len_at(path, version)
+          .map(|len| (path.as_str(), len))
+      })
+      .collect()
+  }
+
+  /// A file's length at `version`, or `None` when it was absent then: read off the history, never copied.
+  pub fn content_len_at(&self, path: &str, version: u64) -> Option<usize> {
+    self
+      .content_history
+      .get(path)?
+      .iter()
+      .rev()
+      .find(|(recorded, _)| *recorded <= version)
+      .and_then(|(_, value)| value.as_ref().map(crate::history::Value::len))
+  }
+
+  /// Every file whose value in effect at `at` was set after the origin, with that version and its bytes: the
+  /// checkpoint's files ([`Green::checkpoint`]).
+  fn changed_content_at(&self, at: u64) -> Vec<crate::checkpoint::Changed<String, Vec<u8>>> {
+    self
+      .content_history
+      .iter()
+      .filter_map(|(path, entries)| {
+        let (version, value) = entries.iter().rev().find(|(v, _)| *v <= at)?;
+        (*version > 0).then(|| crate::checkpoint::Changed {
+          key: path.clone(),
+          at: *version,
+          value: value.as_ref().map(|value| value.materialize(&self.chunks)),
+        })
+      })
+      .collect()
+  }
+
+  /// Records `value` as `path`'s content at `version`, the running totals with it: the new latest value replaces the
+  /// previous one among the current values, and its list joins the history's.
+  fn push_content(&mut self, path: String, version: u64, value: Option<crate::history::Value>) {
+    let previous = self
+      .content_history
+      .get(&path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+      .map_or(0, current_bytes);
+    self.history_current = self.history_current.saturating_sub(previous);
+    if let Some(value) = &value {
+      self.history_lists = self.history_lists.saturating_add(value.list_bytes());
+      self.history_current = self.history_current.saturating_add(current_bytes(value));
+    }
+    self
+      .content_history
+      .entry(path)
+      .or_default()
+      .push((version, value));
+  }
+
+  /// The value `bytes` that `ops` make of `path`'s latest content (`crate::history::Value::spliced`), or `bytes`
+  /// whole for a path with none.
+  fn content_value(&mut self, path: &str, ops: &[Op], bytes: &[u8]) -> crate::history::Value {
+    let Green {
+      content_history,
+      chunks,
+      ..
+    } = self;
+    match content_history
+      .get(path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+    {
+      Some(latest) => latest.spliced(chunks, ops, bytes),
+      None => crate::history::Value::whole(chunks, bytes),
+    }
+  }
+
+  /// Drops `path`'s content history, its chunks released and the running totals with it.
+  fn clear_content_history(&mut self, path: &str) {
+    let Some(history) = self.content_history.remove(path) else {
+      return;
+    };
+    if let Some((_, Some(latest))) = history.last() {
+      self.history_current = self.history_current.saturating_sub(current_bytes(latest));
+    }
+    for (_, value) in history {
+      self.release_content(value);
+    }
+  }
+
+  /// Releases one content history value: its list leaves the running total and its chunks their references.
+  fn release_content(&mut self, value: Option<crate::history::Value>) {
+    if let Some(value) = value {
+      self.history_lists = self.history_lists.saturating_sub(value.list_bytes());
+      value.release(&mut self.chunks);
+    }
+  }
+
+  /// The bytes the content and IPC histories retain beyond the current values — every earlier value still held for
+  /// reconstruction (`content_at`, `base_at`) — read off running totals so the service charges retention without
+  /// walking the histories: the content history's chunks and piece lists, less the current values they also hold,
+  /// and the IPC history's earlier nodes.
+  fn history_bytes(&self) -> usize {
+    self
+      .chunks
+      .bytes()
+      .saturating_add(self.history_lists)
+      .saturating_sub(self.history_current)
+      .saturating_add(self.special_history_bytes)
+  }
+
+  /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
+  /// content history names after `base`, the only deltas that hold ops for it (a delta records a path's ops exactly
+  /// when the commit set its content, which pushes its history entry), so the walk costs the path's own changes since
+  /// the base. Walking every delta since the base cost the versions since it, whatever they changed: at 10,000 clients
+  /// over one green, whose works lag by thousands of versions, that walk on the green's owner shard was the rung's wall
+  /// (2026-11-07). A base below the fold, whose history entries may be gone, walks every delta as before.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
-    let base = usize::try_from(base).unwrap_or(usize::MAX);
+    if base < self.folded_below {
+      return self.intervening_walk(path, base);
+    }
+    let Some(history) = self.content_history.get(path) else {
+      return Vec::new();
+    };
+    let after = history.partition_point(|(version, _)| *version <= base);
+    let ops: Vec<&[Op]> = history
+      .get(after..)
+      .unwrap_or_default()
+      .iter()
+      .filter_map(|(version, _)| {
+        let index = version.checked_sub(self.deltas_from)?.checked_sub(1)?;
+        self
+          .deltas
+          .get(usize::try_from(index).ok()?)?
+          .get(path)
+          .map(Vec::as_slice)
+      })
+      .collect();
+    self.count_visited(history.len().saturating_sub(after));
+    ops
+  }
+
+  /// [`Green::intervening`] by walking every delta in `(base, head]`: for a base below the fold.
+  fn intervening_walk(&self, path: &str, base: u64) -> Vec<&[Op]> {
+    // `submit` and `rebase` refuse a base below `deltas_from`, so the skip is the base's own place in the deltas.
+    let skip = usize::try_from(base.saturating_sub(self.deltas_from)).unwrap_or(usize::MAX);
+    self.count_visited(self.deltas.len().saturating_sub(skip));
     self
       .deltas
       .iter()
-      .skip(base)
+      .skip(skip)
       .filter_map(|delta| delta.get(path).map(Vec::as_slice))
       .collect()
+  }
+
+  /// Adds `deltas` to the verdict's visited count.
+  fn count_visited(&self, deltas: usize) {
+    let deltas = u64::try_from(deltas).unwrap_or(u64::MAX);
+    self
+      .deltas_visited
+      .set(self.deltas_visited.get().saturating_add(deltas));
   }
 
   /// A whole-path namespace conflict window.
@@ -1059,7 +1941,12 @@ impl Green {
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
       let ops = vec![insert_whole(source.len() as u64)];
-      effects.push(Effect::SetContent(dst.to_owned(), source.clone(), ops));
+      effects.push(Effect::SetContent(
+        dst.to_owned(),
+        source.clone(),
+        ops,
+        ContentSource::Copied(from.to_owned()),
+      ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
       effects.push(Effect::Symlink(dst.to_owned(), target.clone()));
@@ -1072,7 +1959,12 @@ impl Green {
   }
 
   /// Merges a create at `path` with `bytes`.
-  fn merge_create(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Effect>, ConflictWindow> {
+  fn merge_create(
+    &self,
+    path: &str,
+    bytes: Vec<u8>,
+    declared: &[Op],
+  ) -> Result<Option<Effect>, ConflictWindow> {
     if self.occupied_by_nonfile(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1081,7 +1973,12 @@ impl Green {
       Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
       None => {
         let ops = vec![insert_whole(bytes.len() as u64)];
-        Ok(Some(Effect::SetContent(path.to_owned(), bytes, ops)))
+        Ok(Some(Effect::SetContent(
+          path.to_owned(),
+          bytes,
+          ops,
+          ContentSource::Created(declared.to_vec()),
+        )))
       }
     }
   }
@@ -1141,12 +2038,12 @@ impl Green {
     inc: &Increment,
     path: &str,
     ops: &[Op],
-  ) -> Result<Option<Effect>, ConflictWindow> {
+  ) -> Result<Option<Effect>, Vec<ConflictWindow>> {
     if !self.content.contains_key(path) {
       if self.occupied_by_nonfile(path) {
-        return Err(Green::window(path, MergeConflictClass::TypeChanged));
+        return Err(vec![Green::window(path, MergeConflictClass::TypeChanged)]);
       }
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
     }
     let base_changed = self.last_changed.get(path).copied().unwrap_or(0);
     let unchanged = base_changed <= inc.base;
@@ -1194,16 +2091,20 @@ impl Green {
       if agent_final == current {
         return Ok(None);
       }
-      return Err(ConflictWindow {
+      return Err(vec![ConflictWindow {
         path: path.to_owned(),
         range,
         class: MergeConflictClass::Overlap,
-      });
+      }]);
     }
 
     // Pass two: each overlapping overwrite must reproduce, byte for byte, what the intervening
     // change already placed at that span; a differing span is a byte-exact conflict. An identical
-    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`.
+    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`. Every differing span of
+    // the file is named (the reply is the windows the agent rebases against, §4.16), in the ops' order, which is the
+    // file's: until 2026-11-04 the first one ended the verdict, so an agent learned of a file's conflicts one rebase at
+    // a time.
+    let mut differing: Vec<ConflictWindow> = Vec::new();
     for op in &candidates {
       let span = touched_range(op);
       let head_start = match crate::map::map_range(&intervening, Range::new(span.start, 0)) {
@@ -1222,12 +2123,15 @@ impl Green {
       let end = start.saturating_add(agent_bytes.len());
       let identical = current.get(start..end) == Some(agent_bytes);
       if !identical {
-        return Err(ConflictWindow {
+        differing.push(ConflictWindow {
           path: path.to_owned(),
           range: span,
           class: MergeConflictClass::Overlap,
         });
       }
+    }
+    if !differing.is_empty() {
+      return Err(differing);
     }
 
     // Every op accepted. When only identical overlaps remained (nothing disjoint to apply), the
@@ -1238,7 +2142,12 @@ impl Green {
     let empty = Vec::new();
     let current = self.content.get(path).unwrap_or(&empty);
     let next = apply(current, &mapped, &inc.post_state);
-    Ok(Some(Effect::SetContent(path.to_owned(), next, mapped)))
+    Ok(Some(Effect::SetContent(
+      path.to_owned(),
+      next,
+      mapped,
+      ContentSource::Mapped,
+    )))
   }
 
   /// Merges a directory creation.
@@ -1471,8 +2380,8 @@ impl Green {
           0
         } else {
           self
-            .content_ref_at(edited, inc.base)
-            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .content_len_at(edited, inc.base)
+            .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
         };
         !fits_base(ops, base_len, post_len)
       })
@@ -1522,7 +2431,7 @@ impl Green {
     for path in &r.creates {
       let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
       let bytes = apply(&[], content, &inc.post_state);
-      record(effects, windows, self.merge_create(path, bytes));
+      record(effects, windows, self.merge_create(path, bytes, content));
     }
     for path in &r.unlinks {
       record(effects, windows, self.merge_unlink(path, inc.base));
@@ -1531,8 +2440,11 @@ impl Green {
       if r.creates.contains(path) || r.renames.contains_key(path) {
         continue; // content of a created or renamed-into file is handled with that effect
       }
-      let result = self.merge_content(inc, path, ops);
-      record(effects, windows, result);
+      match self.merge_content(inc, path, ops) {
+        Ok(Some(effect)) => effects.push(effect),
+        Ok(None) => {}
+        Err(mut found) => windows.append(&mut found),
+      }
     }
   }
 
@@ -1596,7 +2508,9 @@ impl Green {
   /// Keep the superseded IPC value for pinned readers before setting the new value.
   fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
     if self.specials.insert(path.clone(), node).is_some() {
-      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+      self.special_history_bytes = self
+        .special_history_bytes
+        .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
     self
@@ -1608,11 +2522,15 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
+    // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     if self.specials.remove(&path).is_some() {
-      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+      self.special_history_bytes = self
+        .special_history_bytes
+        .saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
     if self.modes.remove(&path).is_some() {
+      self.identity_dirty.insert(IdentityKey::Mode(path.clone()));
       self.mode_changed.insert(path.clone(), version);
       self
         .mode_history
@@ -1628,6 +2546,9 @@ impl Green {
       .collect();
     for key in attributes {
       self.xattrs.remove(&key);
+      self
+        .identity_dirty
+        .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
       self.xattr_changed.insert(key.clone(), version);
       self
         .xattr_history
@@ -1650,10 +2571,12 @@ impl Green {
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
     for effect in effects {
+      // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-202).
+      self.identity_dirty.insert(effect.identity_key());
       match effect {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
-        Effect::SetContent(path, bytes, ops) => set_content.push((path, bytes, ops)),
+        Effect::SetContent(path, bytes, ops, _) => set_content.push((path, bytes, ops)),
         Effect::RemoveContent(path) => removed_content.push(path),
         Effect::MakeDir(path) => {
           self.dirs.insert(path.clone());
@@ -1739,29 +2662,20 @@ impl Green {
       }
     }
     for path in removed_content {
-      // A removed file's last value stays in the history for reconstruction: retained, and charged.
-      if let Some(previous) = self.content.remove(&path) {
-        self.history_bytes = self.history_bytes.saturating_add(previous.len());
-      }
+      // A removed file's last value stays in the history for reconstruction: no longer a current value, so retained
+      // and charged (`history_bytes`).
+      self.content.remove(&path);
       self.last_changed.insert(path.clone(), version);
-      self
-        .content_history
-        .entry(path)
-        .or_default()
-        .push((version, None));
+      self.push_content(path, version, None);
     }
     for (path, bytes, ops) in set_content {
-      // The value this one supersedes becomes retained history: charged to the running total the
-      // service accounts for as retention (the current value is charged as content).
-      if let Some(previous) = self.content.insert(path.clone(), bytes.clone()) {
-        self.history_bytes = self.history_bytes.saturating_add(previous.len());
-      }
+      // The value this one supersedes stays in the history, sharing every run the new one kept (W2): what the
+      // history gains is the bytes the new value added, its piece list, and whatever the old one held that the new
+      // one does not, the retention charged to the running totals.
+      let value = self.content_value(&path, &ops, &bytes);
+      self.content.insert(path.clone(), bytes);
       self.last_changed.insert(path.clone(), version);
-      self
-        .content_history
-        .entry(path.clone())
-        .or_default()
-        .push((version, Some(bytes)));
+      self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
     }
     self.deltas.push(delta);
@@ -1773,27 +2687,122 @@ impl Green {
   /// windows are kept in the bounded rejected-result cache, from which a retry is answered while the
   /// entry survives and judged again once it was evicted.
   pub fn submit(&mut self, inc: &Increment) -> Outcome {
+    self.submit_resolved(inc).0
+  }
+
+  /// [`Green::submit`], and what its verdict resolved the increment to when it committed a new version: what the
+  /// durable chain records (`crate::chain_entry`). `None` beside every other outcome, an idempotent accept included,
+  /// whose version the chain already holds.
+  pub fn submit_resolved(
+    &mut self,
+    inc: &Increment,
+  ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     if let Some(version) = self.accepted.get(&inc.id) {
-      return Outcome::Accepted { version: *version };
+      return (Outcome::Accepted { version: *version }, None);
     }
     if let Some(windows) = self.rejected.get(&inc.id) {
-      return Outcome::Conflict {
-        windows: windows.clone(),
-      };
+      return (
+        Outcome::Conflict {
+          windows: windows.clone(),
+        },
+        None,
+      );
+    }
+    if inc.base < self.deltas_from {
+      return (
+        Outcome::BaseUnavailable {
+          base: inc.base,
+          floor: self.deltas_from,
+        },
+        None,
+      );
     }
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
+        let applied = effects.iter().map(Effect::applied).collect();
         // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
         let version = self.head().saturating_add(1);
         self.commit(effects, version);
         self.accepted.insert(inc.id, version);
-        Outcome::Accepted { version }
+        (Outcome::Accepted { version }, Some(applied))
       }
       Err(windows) => {
         self.retain_rejected(inc.id, &windows);
-        Outcome::Conflict { windows }
+        (Outcome::Conflict { windows }, None)
       }
+    }
+  }
+
+  /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
+  /// `crate::chain_entry`): nothing is judged, so what a checkpoint restored of the green below its version does not
+  /// matter. The state after it is a function of the entry and the state before: the same effects reach
+  /// [`Green::commit`] as reached it live, so the deltas, the histories and every last-changed index come out the same,
+  /// and the increment's identity is remembered, so a retry of it is answered its version. Returns the version; an
+  /// increment already accepted commits nothing and returns the version it was accepted as.
+  pub fn apply_recorded(
+    &mut self,
+    inc: &Increment,
+    applied: &[crate::chain_entry::Applied],
+  ) -> u64 {
+    // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
+    // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return *version;
+    }
+    let effects = applied
+      .iter()
+      .map(|effect| self.effect_of(effect, &inc.post_state))
+      .collect();
+    let version = self.head().saturating_add(1);
+    self.commit(effects, version);
+    self.accepted.insert(inc.id, version);
+    version
+  }
+
+  /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
+  fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
+    use crate::chain_entry::Applied;
+    match applied {
+      Applied::Special(path, node) => Effect::Special(path.clone(), *node),
+      Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
+      Applied::Spliced(path, ops) => {
+        let empty = Vec::new();
+        let current = self.content.get(path).unwrap_or(&empty);
+        Effect::SetContent(
+          path.clone(),
+          apply(current, ops, post_state),
+          ops.clone(),
+          ContentSource::Mapped,
+        )
+      }
+      Applied::Created(path, declared) => {
+        let bytes = apply(&[], declared, post_state);
+        let ops = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(
+          path.clone(),
+          bytes,
+          ops,
+          ContentSource::Created(declared.clone()),
+        )
+      }
+      Applied::Copied { dst, from } => {
+        let bytes = self.content.get(from).cloned().unwrap_or_default();
+        let ops = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(dst.clone(), bytes, ops, ContentSource::Copied(from.clone()))
+      }
+      Applied::RemoveContent(path) => Effect::RemoveContent(path.clone()),
+      Applied::MakeDir(path) => Effect::MakeDir(path.clone()),
+      Applied::RemoveDir(path) => Effect::RemoveDir(path.clone()),
+      Applied::Mode(path, mode) => Effect::Mode(path.clone(), *mode),
+      Applied::Symlink(path, target) => Effect::Symlink(path.clone(), target.clone()),
+      Applied::RemoveSymlink(path) => Effect::RemoveSymlink(path.clone()),
+      Applied::Hardlink(path, target) => Effect::Hardlink(path.clone(), target.clone()),
+      Applied::RemoveHardlink(path) => Effect::RemoveHardlink(path.clone()),
+      Applied::SetXattr(path, name, value) => {
+        Effect::SetXattr(path.clone(), name.clone(), value.clone())
+      }
+      Applied::RemoveXattr(path, name) => Effect::RemoveXattr(path.clone(), name.clone()),
     }
   }
 
@@ -1862,35 +2871,52 @@ impl Green {
     )
   }
 
-  /// The maximum old values this increment can retain. Admission charges the superseded values,
-  /// not the incoming payload: an unlink has no payload, and a one-byte overwrite can retain an
-  /// entire old file. Each path is counted once; rename sources and destinations both count.
+  /// The most this increment can add to the retained history ([`Green::retention_charge`]), charged before the
+  /// verdict (A-16): what the history would gain if every op were applied. Per path (W2: the history shares what a
+  /// version kept, `crate::history`):
+  /// - a content edit gains the bytes it adds, the bytes it deletes or truncates away (they leave the current value
+  ///   but stay in the history), and its piece list; or, when the list would outweigh the value and it is stored
+  ///   whole, the old value;
+  /// - a path replaced whole (created over, renamed onto, removed, or renamed away) keeps its old value and its list
+  ///   (a new value, whole, costs no more than it holds);
+  /// - an IPC node replaced or removed keeps the node.
+  ///
+  /// A post-state shorter than its ops declare is stored whole after the verdict (`crate::history::Value::spliced`);
+  /// the settle after it charges what that costs.
   pub fn history_reservation(&self, inc: &Increment) -> usize {
     if self.accepted.contains_key(&inc.id) {
       return 0;
     }
-    let mut paths = BTreeSet::new();
+    let mut edits: BTreeMap<&str, Vec<&Op>> = BTreeMap::new();
+    let mut replaced: BTreeSet<&str> = BTreeSet::new();
     for op in &inc.doc.ops {
-      if (is_content(op.kind)
-        || matches!(
-          op.kind,
-          OpKind::Create | OpKind::Unlink | OpKind::Rename | OpKind::Mknod
-        ))
-        && let Some(path) = inc.doc.paths.path(op.path)
-      {
-        paths.insert(path);
+      let Some(path) = inc.doc.paths.path(op.path) else {
+        continue;
+      };
+      if is_content(op.kind) {
+        edits.entry(path).or_default().push(op);
+      } else if matches!(
+        op.kind,
+        OpKind::Create | OpKind::Unlink | OpKind::Rename | OpKind::Mknod
+      ) {
+        replaced.insert(path);
       }
       if op.kind == OpKind::Rename
-        && let Some(path) = u16::try_from(op.src)
+        && let Some(source) = u16::try_from(op.src)
           .ok()
           .and_then(|index| inc.doc.paths.path(index))
       {
-        paths.insert(path);
+        replaced.insert(source);
       }
     }
-    paths.into_iter().fold(0usize, |total, path| {
+    let content: usize = edits
+      .iter()
+      .filter(|(path, _)| !replaced.contains(*path))
+      .map(|(path, ops)| self.edit_reservation(path, ops))
+      .sum();
+    replaced.into_iter().fold(content, |total, path| {
       total
-        .saturating_add(self.content.get(path).map_or(0, Vec::len))
+        .saturating_add(self.latest_bytes(path))
         .saturating_add(if self.specials.contains_key(path) {
           SPECIAL_NODE_BYTES
         } else {
@@ -1899,8 +2925,72 @@ impl Green {
     })
   }
 
-  /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): read off running
-  /// totals, never a walk.
+  /// [`Green::history_reservation`] for one path's content ops. The history gains the new value's chunk and list
+  /// less what the current value (bytes and list) grew by: the overwritten and the deleted or truncated bytes, and the
+  /// old value's list (the bytes an insert or extension adds are current). Stored whole, the old value and its list.
+  fn edit_reservation(&self, path: &str, ops: &[&Op]) -> usize {
+    let old = self.content.get(path).map_or(0, Vec::len);
+    let old_len = u64::try_from(old).unwrap_or(u64::MAX);
+    let (overwritten, removed, inserted) =
+      ops
+        .iter()
+        .fold((0u64, 0u64, 0u64), |(over, removed, ins), op| {
+          match op.kind {
+            OpKind::Overwrite => (over.saturating_add(op.len), removed, ins),
+            OpKind::Insert | OpKind::Extend => (over, removed, ins.saturating_add(op.len)),
+            OpKind::Delete => (over, removed.saturating_add(op.len), ins),
+            OpKind::Truncate => (
+              over,
+              removed.saturating_add(old_len.saturating_sub(op.at)),
+              ins,
+            ),
+            _ => (over, removed, ins),
+          }
+        });
+    let to_usize = |bytes: u64| usize::try_from(bytes).unwrap_or(usize::MAX);
+    let latest = self.latest_bytes(path);
+    let old_list = latest.saturating_sub(old);
+    let spliced = to_usize(overwritten)
+      .saturating_add(to_usize(removed))
+      .saturating_add(old_list);
+    // Stored whole when the new list would outweigh the new value: at most the old pieces, each op splitting one
+    // and adding one.
+    let list = old_list.saturating_add(
+      ops
+        .len()
+        .saturating_mul(2)
+        .saturating_add(1)
+        .saturating_mul(crate::history::PIECE_BYTES),
+    );
+    let next = old
+      .saturating_sub(to_usize(removed))
+      .saturating_add(to_usize(inserted));
+    if list > next {
+      latest.max(spliced)
+    } else {
+      spliced
+    }
+  }
+
+  /// What `path`'s latest content value counts among the current values: its bytes and its list (none for no value).
+  fn latest_bytes(&self, path: &str) -> usize {
+    self
+      .content_history
+      .get(path)
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+      .map_or(0, current_bytes)
+  }
+
+  /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
+  /// rejected-result cache's, both running totals, so the settle after every submit costs nothing that
+  /// follows the green's size. [`Green::retained_bytes`] also sums the current files, a report's figure.
+  pub fn retention_charge(&self) -> usize {
+    self.history_bytes().saturating_add(self.rejected_bytes)
+  }
+
+  /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): the history and
+  /// rejected figures read off running totals; the current files' figure is a walk of them.
   pub fn retained_bytes(&self) -> RetainedBytes {
     RetainedBytes {
       content: self
@@ -1909,16 +2999,39 @@ impl Green {
         .map(Vec::len)
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
-      history: self.history_bytes,
+      history: self.history_bytes(),
       rejected: self.rejected_bytes,
     }
   }
 
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
-  /// the running total is checked against (balanced accounting): every earlier value of every path,
-  /// the current value excluded.
+  /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
+  /// their piece lists, less the current values, and every earlier IPC node.
   pub fn history_bytes_recounted(&self) -> usize {
-    let special_bytes: usize = self
+    let values = || {
+      self
+        .content_history
+        .values()
+        .flat_map(|history| history.iter().filter_map(|(_, value)| value.as_ref()))
+    };
+    let current: usize = self
+      .content_history
+      .values()
+      .filter_map(|history| history.last())
+      .filter_map(|(_, value)| value.as_ref())
+      .map(current_bytes)
+      .sum();
+    self
+      .chunks
+      .referenced_bytes(values())
+      .saturating_add(values().map(crate::history::Value::list_bytes).sum())
+      .saturating_sub(current)
+      .saturating_add(self.special_history_recounted())
+  }
+
+  /// The IPC history's earlier nodes, recounted: every node but each path's latest.
+  fn special_history_recounted(&self) -> usize {
+    self
       .special_history
       .values()
       .map(|history| {
@@ -1930,21 +3043,7 @@ impl Green {
           .count()
           .saturating_mul(SPECIAL_NODE_BYTES)
       })
-      .sum();
-    special_bytes.saturating_add(
-      self
-        .content_history
-        .values()
-        .map(|history| {
-          history
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|(_, bytes)| bytes.as_ref().map_or(0, Vec::len))
-            .sum::<usize>()
-        })
-        .sum::<usize>(),
-    )
+      .sum()
   }
 
   /// The version below which the histories are folded.
@@ -1962,7 +3061,7 @@ impl Green {
   /// Returns the bytes released. A reachable floor at or below the current one is a no-op.
   pub fn fold_history_to_budget(&mut self, reachable_floor: u64, budget: usize) -> usize {
     let mut released = 0usize;
-    while self.history_bytes > budget && self.folded_below < reachable_floor {
+    while self.history_bytes() > budget && self.folded_below < reachable_floor {
       let next = self.folded_below.saturating_add(1);
       released = released.saturating_add(self.fold_history_before(next));
     }
@@ -1981,39 +3080,59 @@ impl Green {
     if floor <= self.folded_below {
       return 0;
     }
+    // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
+    // before the history below the floor goes (A-202).
+    if self.identity_version < floor {
+      self.fold_identity();
+    }
     self.folded_below = floor;
-    let mut released = 0usize;
-    for history in self.content_history.values_mut() {
-      released = released.saturating_add(fold_entries(history, floor, |bytes| {
-        bytes.as_ref().map_or(0, Vec::len)
-      }));
-    }
-    for history in self.special_history.values_mut() {
-      released = released.saturating_add(fold_entries(history, floor, |node| {
-        if node.is_some() {
-          SPECIAL_NODE_BYTES
-        } else {
-          0
-        }
-      }));
-    }
+    let before = self.history_bytes();
+    self.fold_content_before(floor);
+    self.fold_specials_before(floor);
     for history in self.mode_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.symlink_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.hardlink_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.xattr_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
     for history in self.dir_history.values_mut() {
-      fold_entries(history, floor, |_| 0);
+      fold_entries(history, floor);
     }
-    self.history_bytes = self.history_bytes.saturating_sub(released);
-    released
+    before.saturating_sub(self.history_bytes())
+  }
+
+  /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each
+  /// dropped value releases its chunks.
+  fn fold_content_before(&mut self, floor: u64) {
+    let mut dropped = Vec::new();
+    for history in self.content_history.values_mut() {
+      dropped.extend(fold_entries(history, floor));
+    }
+    for (_, value) in dropped {
+      self.release_content(value);
+    }
+  }
+
+  /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
+  fn fold_specials_before(&mut self, floor: u64) {
+    let mut specials = 0usize;
+    for history in self.special_history.values_mut() {
+      specials = specials.saturating_add(
+        fold_entries(history, floor)
+          .iter()
+          .filter(|(_, node)| node.is_some())
+          .count(),
+      );
+    }
+    self.special_history_bytes = self
+      .special_history_bytes
+      .saturating_sub(specials.saturating_mul(SPECIAL_NODE_BYTES));
   }
 
   /// Rebases a work's increment onto the green's head (§4.16 "Rebase, the only corrective path"):
@@ -2024,6 +3143,12 @@ impl Green {
   /// A conflict returns the windows and changes nothing; the agent resolves each window and rebases
   /// again. The green — content, deltas and counters — is left exactly as it was.
   pub fn rebase(&mut self, inc: &Increment) -> Rebased {
+    if inc.base < self.deltas_from {
+      return Rebased::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      };
+    }
     let to = self.head();
     let resolved = Green::resolve(inc);
     // The verdict shares `submit`'s decision but must not perturb the green; the only field `decide`
@@ -2037,13 +3162,13 @@ impl Green {
     }
   }
 
-  /// Restates the accepted effects of a clean rebase as the work's new full content and journal: the
-  /// content starts from the head's files and takes each effect; the journal is the effects as
-  /// declared operations in head coordinates (a content op keeps its mapped range, a file new to the
-  /// head is created first). The green is not touched.
+  /// Restates the accepted effects of a clean rebase as the work's changes over the head and its
+  /// journal: each content effect's file, kept only where it ends different from the head's; the
+  /// journal is the effects as declared operations in head coordinates (a content op keeps its mapped
+  /// range, a file new to the head is created first). The green is not touched.
   fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
     use crate::increment::VolumeOp;
-    let mut files = self.content.clone();
+    let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     for effect in effects {
       match effect {
@@ -2055,7 +3180,7 @@ impl Green {
           journal.push(VolumeOp::Mknod { path, node, mode });
         }
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
-        Effect::SetContent(path, bytes, ops) => {
+        Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
@@ -2064,11 +3189,11 @@ impl Green {
               journal.push(volume_op);
             }
           }
-          files.insert(path, bytes);
+          changed.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
           journal.push(VolumeOp::Unlink { path: path.clone() });
-          files.remove(&path);
+          changed.insert(path, None);
         }
         Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
         Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),
@@ -2084,9 +3209,12 @@ impl Green {
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
       }
     }
+    // Only what ends different from the head is the work's own: bytes equal to the head's, and the
+    // removal of a file the head does not hold, are no change.
+    changed.retain(|path, after| after.as_deref() != self.content.get(path).map(Vec::as_slice));
     Rebased::Rebased {
       version: to,
-      files,
+      changed,
       journal,
     }
   }

@@ -80,7 +80,7 @@ fn an_ipc_origin_preserves_metadata_and_changes_identity_with_kind_or_owner() {
     ..Origin::default()
   };
   let decoded = Origin::decode(&origin.encode()).unwrap();
-  let green = Green::with_origin(&decoded);
+  let mut green = Green::with_origin(decoded.clone());
   assert_eq!(green.special("pipe"), Some(node(SpecialKind::Fifo)));
   assert_eq!(green.content("pipe"), None);
   assert_eq!(green.current_base().specials, origin.specials);
@@ -98,7 +98,7 @@ fn an_ipc_origin_preserves_metadata_and_changes_identity_with_kind_or_owner() {
     assert_ne!(origin.identity(), different.identity());
     assert_ne!(
       green.head_identity(),
-      Green::with_origin(&different).head_identity()
+      Green::with_origin(different.clone()).head_identity()
     );
   }
 }
@@ -112,7 +112,7 @@ fn ipc_aliases_share_metadata_and_are_invalidated_with_their_inode() {
     modes: vec![("pipe".into(), 0o640)],
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   assert_eq!(green.mode("alias"), Some(0o640));
   let inc = increment(
     &green.current_base(),
@@ -135,7 +135,7 @@ fn an_ipc_metadata_change_conflicts_after_the_path_changes_kind() {
     modes: vec![("pipe".into(), 0o640)],
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   let pending = increment(
     &green.current_base(),
     0,
@@ -180,7 +180,7 @@ fn ipc_xattr_changes_cannot_follow_a_name_into_a_replacement_file() {
       xattrs: vec![("pipe".into(), "user.key".into(), b"old".to_vec())],
       ..Origin::default()
     };
-    let mut green = Green::with_origin(&origin);
+    let mut green = Green::with_origin(origin.clone());
     let mut pending = common::Build::new();
     if removing {
       pending.removexattr("pipe", "user.key");
@@ -329,7 +329,7 @@ fn short_edits_and_unlinks_reserve_the_values_they_supersede() {
     specials: vec![("pipe".into(), node(SpecialKind::Fifo))],
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   let mut build = common::Build::new();
   build.overwrite("big", 0, b"x");
   let edit = build.with_id([1; 32], 0);
@@ -406,13 +406,13 @@ fn an_ipc_creation_rebases_without_becoming_an_empty_file() {
   green.submit(&directory);
   let Rebased::Rebased {
     version,
-    files,
+    changed,
     journal,
   } = green.rebase(&pending)
   else {
     panic!("disjoint work rebases");
   };
-  assert!(files.is_empty());
+  assert!(changed.is_empty());
   let rebased = increment(&green.current_base(), version, &journal);
   assert_eq!(green.submit(&rebased), Outcome::Accepted { version: 2 });
   assert_eq!(green.special("pipe"), Some(node(SpecialKind::Fifo)));
@@ -489,7 +489,7 @@ fn ipc_names_preserve_other_namespace_references_when_paths_are_sorted() {
     specials: vec![("a".into(), node(SpecialKind::Fifo))],
     ..Origin::default()
   };
-  let mut green = Green::with_origin(&origin);
+  let mut green = Green::with_origin(origin.clone());
   let journal = [
     VolumeOp::Unlink { path: "a".into() },
     VolumeOp::Symlink {

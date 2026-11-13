@@ -5,6 +5,9 @@
 //! taken-read test; WinFsp v2.1 fsctl.h and sys/volume.c define these layouts and copy-before-processing order.
 
 pub mod capture;
+#[cfg(test)]
+mod oracle;
+pub mod settle;
 
 /// Format: the public FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN, in bytes (WinFsp v2.1 fsctl.h).
 pub const BATCH_BYTES: usize = 64 * 1024;
@@ -116,6 +119,32 @@ pub fn opened_context(response: &[u8]) -> Result<Option<(u64, u64)>, Refusal> {
   Ok(Some((hint, context)))
 }
 
+/// Finishes a DLL operation's response in a packet the receiver reuses: its status, and its size rounded up to the wire's
+/// alignment, with the padding that rounding adds cleared, so no byte of an earlier response is sent. Returns the length
+/// to send. The callback wrote everything up to its own size; the fixed part before it was cleared as the header.
+pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal> {
+  put(packet, STATUS_AT, &status.to_le_bytes())?;
+  let size = usize::from(read_u16(packet, SIZE_AT)?);
+  let aligned = size
+    .checked_next_multiple_of(ALIGNMENT)
+    .ok_or(Refusal::Length)?;
+  if !(RESPONSE_BASE..=RESPONSE_MAX).contains(&aligned) {
+    return Err(Refusal::Length);
+  }
+  packet
+    .get_mut(size..aligned)
+    .ok_or(Refusal::Length)?
+    .fill(0);
+  put(
+    packet,
+    SIZE_AT,
+    &u16::try_from(aligned)
+      .map_err(|_| Refusal::Length)?
+      .to_le_bytes(),
+  )?;
+  Ok(aligned)
+}
+
 /// One checked request in a retained batch. Its payload remains opaque unless a specific checked accessor reads it.
 pub struct Request<'a> {
   bytes: &'a [u8],
@@ -217,43 +246,107 @@ impl Request<'_> {
   }
 }
 
-/// Checks the complete bounded batch before returning any frame. A zeroed tail ends the batch; a malformed tail or
-/// repeated hint refuses it whole. The live receive owner must settle these frames before receiving any fresh one.
-pub fn requests(bytes: &[u8]) -> Result<Vec<Request<'_>>, Refusal> {
+/// Shape: the most frames one batch can hold, each at least a request's fixed part.
+const FRAMES_MAX: usize = BATCH_BYTES / REQUEST_BASE;
+
+/// Where one request sits in its batch's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+  at: usize,
+  length: usize,
+}
+
+impl Frame {
+  /// The checked request this frame names in `bytes`, the batch it was indexed from.
+  pub(crate) fn request<'b>(self, bytes: &'b [u8]) -> Result<Request<'b>, Refusal> {
+    let tail = bytes.get(self.at..).ok_or(Refusal::Length)?;
+    checked_request(tail, self.length).map(|(request, _)| request)
+  }
+
+  /// The request's hint, read without checking the rest again.
+  pub(crate) fn hint(self, bytes: &[u8]) -> Result<u64, Refusal> {
+    read_u64(bytes.get(self.at..).ok_or(Refusal::Length)?, HINT_AT)
+  }
+
+  /// The request's kind, read without checking the rest again.
+  pub(crate) fn kind(self, bytes: &[u8]) -> Result<u32, Refusal> {
+    read_u32(bytes.get(self.at..).ok_or(Refusal::Length)?, KIND_AT)
+  }
+}
+
+/// A receive owner's room for one batch's index: where each request sits, and their hints for the duplicate check. It is
+/// reserved for the most frames a batch can hold when the owner starts and kept across its batches, so taking a batch
+/// allocates nothing (audit step 7: each batch had made two allocations and a sort, 100 batches 200 calls,
+/// `tests/batch_allocations.rs`).
+#[derive(Debug)]
+pub struct Scratch {
+  pub(crate) frames: std::collections::VecDeque<Frame>,
+  hints: Vec<u64>,
+}
+
+impl Scratch {
+  /// Room for the largest batch, reserved once; refused `NoMemory` when the process has none.
+  pub fn new() -> Result<Self, Refusal> {
+    let mut frames = std::collections::VecDeque::new();
+    frames
+      .try_reserve_exact(FRAMES_MAX)
+      .map_err(|_| Refusal::NoMemory)?;
+    let mut hints = Vec::new();
+    hints
+      .try_reserve_exact(FRAMES_MAX)
+      .map_err(|_| Refusal::NoMemory)?;
+    Ok(Self { frames, hints })
+  }
+}
+
+/// Checks the complete bounded batch before any frame is taken, and indexes its frames into `scratch` in driver order. A
+/// zeroed tail ends the batch; a malformed tail or repeated hint refuses it whole. The live receive owner must settle
+/// these frames before receiving any fresh one.
+pub fn index(bytes: &[u8], scratch: &mut Scratch) -> Result<(), Refusal> {
+  scratch.frames.clear();
+  scratch.hints.clear();
   if bytes.len() > BATCH_BYTES || !bytes.len().is_multiple_of(ALIGNMENT) {
     return Err(Refusal::Length);
   }
-  let bound = bytes.len() / REQUEST_BASE;
-  let mut requests = Vec::new();
-  let mut hints = Vec::new();
-  requests
-    .try_reserve_exact(bound)
-    .map_err(|_| Refusal::NoMemory)?;
-  hints
-    .try_reserve_exact(bound)
-    .map_err(|_| Refusal::NoMemory)?;
   let mut at = 0usize;
   while at < bytes.len() {
     let tail = bytes.get(at..).ok_or(Refusal::Length)?;
     let length = usize::from(read_u16(tail, SIZE_AT)?);
     if length == 0 {
       if tail.iter().any(|byte| *byte != 0) {
+        scratch.frames.clear();
         return Err(Refusal::Tail);
       }
       break;
     }
-    let (request, stride) = checked_request(tail, length)?;
-    hints.push(request.hint);
-    requests.push(request);
+    let (request, stride) = match checked_request(tail, length) {
+      Ok(checked) => checked,
+      Err(refusal) => {
+        scratch.frames.clear();
+        return Err(refusal);
+      }
+    };
+    // Within the bound reserved for: a frame is at least REQUEST_BASE bytes of a batch of at most BATCH_BYTES.
+    if scratch.frames.len() >= FRAMES_MAX {
+      scratch.frames.clear();
+      return Err(Refusal::Length);
+    }
+    scratch.hints.push(request.hint);
+    scratch.frames.push_back(Frame { at, length });
     at = at.checked_add(stride).ok_or(Refusal::Length)?;
   }
-  // A kernel batch cannot contain one processing IRP twice. Sort a bounded index rather than changing request
-  // order: cleanup and close effects must still settle in the order the driver supplied them.
-  hints.sort_unstable();
-  if hints.windows(2).any(|pair| pair.first() == pair.last()) {
+  // A kernel batch cannot contain one processing IRP twice. Sort the hints' own buffer rather than the frames: cleanup
+  // and close effects must still settle in the order the driver supplied them.
+  scratch.hints.sort_unstable();
+  if scratch
+    .hints
+    .windows(2)
+    .any(|pair| pair.first() == pair.last())
+  {
+    scratch.frames.clear();
     return Err(Refusal::Hint);
   }
-  Ok(requests)
+  Ok(())
 }
 
 fn checked_request(tail: &[u8], length: usize) -> Result<(Request<'_>, usize), Refusal> {
@@ -408,6 +501,17 @@ mod tests {
     }
   }
   use super::*;
+
+  /// A batch's checked requests in driver order, through the index a receive owner takes.
+  fn requests(bytes: &[u8]) -> Result<Vec<Request<'_>>, Refusal> {
+    let mut scratch = Scratch::new()?;
+    index(bytes, &mut scratch)?;
+    scratch
+      .frames
+      .iter()
+      .map(|frame| frame.request(bytes))
+      .collect()
+  }
   use std::collections::BTreeMap;
 
   fn captured_reads(hints: &[u64]) -> Vec<u8> {
@@ -449,6 +553,31 @@ mod tests {
     );
     let hint = u64::from_le_bytes(response[8..16].try_into().unwrap());
     processing.remove(&hint)
+  }
+
+  /// A-215's prologue (step 7). Do: finish a response of 130 bytes in a packet still holding an earlier, longer
+  /// response's bytes. Expect: 136 bytes to send, its status and aligned size in the header, the six padding bytes zero,
+  /// and the callback's own bytes untouched; a size whose alignment passes the cap, or below the fixed part, is refused.
+  #[test]
+  fn a_reused_packet_sends_no_byte_of_an_earlier_response() {
+    let mut packet = vec![0xAB; RESPONSE_MAX];
+    packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&130u16.to_le_bytes());
+    assert_eq!(finish_response(&mut packet, -5), Ok(136));
+    assert_eq!(
+      u16::from_le_bytes([packet[SIZE_AT], packet[SIZE_AT + 1]]),
+      136
+    );
+    assert_eq!(
+      i32::from_le_bytes(packet[STATUS_AT..STATUS_AT + 4].try_into().unwrap()),
+      -5
+    );
+    assert!(packet[130..136].iter().all(|byte| *byte == 0));
+    assert!(packet[24..130].iter().all(|byte| *byte == 0xAB));
+    assert!(packet[136..].iter().all(|byte| *byte == 0xAB));
+    for size in [u16::try_from(RESPONSE_MAX).unwrap() + 1, 64, 0] {
+      packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&size.to_le_bytes());
+      assert_eq!(finish_response(&mut packet, 0), Err(Refusal::Length));
+    }
   }
 
   /// A-198 Step 9.4. Do: settle two captured reads. Expect: each original caller gets cancellation, and a request not

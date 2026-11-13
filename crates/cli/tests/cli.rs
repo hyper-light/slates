@@ -35,7 +35,7 @@ const POLL_MS: u64 = 20;
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
 /// Shape: shards for a direct-map test's daemon ([`start_one_shard_anchor`]).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const ONE_SHARD: &str = "1";
 /// Shape: exit code 3 — the daemon was unavailable (the client never reached it).
 const EXIT_UNAVAILABLE: i32 = 3;
@@ -45,26 +45,6 @@ const RESTART_RETRIES: u32 = 50;
 /// Shape: consecutive daemon responses `start_anchor` waits for, so the anchor's one startup restart
 /// (a heartbeat-lapse recovery) has settled before a test runs its verbs.
 const STABLE_STREAK: u32 = 10;
-/// Derived: the most `volume list` attempts a startup wait makes, **counted from the daemon's serving line**
-/// ([`await_serving`]), before it calls the daemon absent — the streak it needs, plus the refusals a single verb
-/// already tolerates while the daemon's one startup restart settles ([`RESTART_RETRIES`]). Both numbers are ones
-/// this file already states.
-///
-/// **Counted in attempts, not wall time, on purpose.** Each attempt is a whole CLI process: spawn, connect, list,
-/// exit. A contended host makes each attempt slower, not more numerous, so a wall bound over eleven of them
-/// measures the host. Twenty seconds was enough alone and not enough inside a full `cargo test --workspace`,
-/// where this failed on 2026-10-18 with exit 3 while passing by itself in well under a second. An absent daemon
-/// still ends the wait — it refuses every attempt — and so does one that flaps, which never reaches the streak.
-///
-/// **Slower, not more numerous, holds only once the daemon serves.** Until the daemon publishes its rendezvous a
-/// client is refused at once ("the daemon has not yet published its rendezvous object"); after that, a client of a
-/// live anchor waits out a restart instead (A-114). Counting from the spawn, the anchor's own boot spent the budget
-/// on a loaded host: on 2026-10-21, at load 25–110 on an 18-core Mac, twelve of fifteen starts failed. Measured
-/// beside them — an anchor started as this file starts it, polled as this file polls, each attempt's start compared
-/// with the anchor's greeting and the daemon's serving line — the greeting came 3.6–5.4 s after the spawn with
-/// 30–51 attempts already refused before it; in four rounds at load 67–78 every refusal came before the serving
-/// line, and none of the 39 attempts begun after it was refused.
-const START_ATTEMPTS: u32 = STABLE_STREAK.saturating_add(RESTART_RETRIES);
 
 fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
@@ -157,7 +137,7 @@ fn start_anchor_with_environment(
 /// handed to a client of any shard since A-188 (`crates/client/tests/client.rs`,
 /// `a_client_of_another_shard_maps_a_file_read_and_write`); before it, which shard a container's client landed on, its
 /// id's residue, decided whether it was handed one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_one_shard_anchor(instance: &str) -> AnchorProcess {
   start_anchor_of(instance, &[], ONE_SHARD)
 }
@@ -222,7 +202,7 @@ const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 /// Reads the anchor's stderr until the daemon says it serves — and, when `issuer` is asked on a platform that prints
 /// one ([`PRINTS_ISSUER_SURFACE`]), until the anchor has printed its issuer surface too — echoing every line to this
 /// process's stderr, where the anchor's output went before it was piped. Returns the issuer surface's exports when
-/// asked for and printed. The attempts a start counts begin after this ([`START_ATTEMPTS`] says why).
+/// asked for and printed. The waits for the daemon's answers begin after this ([`StartProgress`]).
 ///
 /// **The lines come from two processes, so they are taken in whichever order they arrive.** The anchor prints its
 /// greeting and its issuer surface; the daemon, a separate process, prints its serving line. Nothing orders a line of
@@ -268,18 +248,18 @@ fn echo_the_rest(mut stderr: impl std::io::Read + Send + 'static) -> std::thread
   })
 }
 
-/// Waits for [`STABLE_STREAK`] consecutive answers to `volume list` within [`START_ATTEMPTS`] attempts, then
-/// bootstraps the consensus group when `bootstrap` holds. Called once the daemon serves ([`await_serving`]).
+/// Waits for [`STABLE_STREAK`] consecutive answers to `volume list`, for as long as the instance's daemons make
+/// progress ([`StartProgress`]), then bootstraps the consensus group when `bootstrap` holds. Called once the daemon
+/// serves ([`await_serving`]).
 fn await_stable_daemon(instance: &str, bootstrap: bool) {
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
   // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
   // that restart has settled before returning — otherwise a test verb lands in the restart window and
   // gets exit 3 (no daemon). A restart resets the streak.
   let mut streak = 0u32;
-  let mut attempts = 0u32;
+  let mut progress = StartProgress::new();
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
-    attempts = attempts.saturating_add(1);
     streak = if code == 0 {
       streak.saturating_add(1)
     } else {
@@ -287,14 +267,13 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
     };
     if streak >= STABLE_STREAK {
       if bootstrap {
-        let (code, _, error) = run(instance, &["bootstrap", "root"]);
-        assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
+        bootstrap_through_stalls(instance, &mut progress);
       }
       return;
     }
-    assert!(
-      attempts < START_ATTEMPTS,
-      "the serving daemon answered {STABLE_STREAK} verbs in a row within {START_ATTEMPTS} attempts (last exit {code})"
+    progress.check(
+      instance,
+      &format!("{STABLE_STREAK} verbs in a row (last exit {code})"),
     );
     pause();
   }
@@ -566,8 +545,20 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
 /// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
 /// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
-/// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
+/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
+/// that bound.
+///
+/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
+/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
+/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
+/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
+/// failed the old bound of the window less a beat (900 ms).
+///
+/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
+/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
+/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
+/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -577,8 +568,21 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     return;
   }
   let instance = format!("cli-frozen-{}", std::process::id());
-  let anchor = start_anchor(&instance);
-  let frozen = daemon_pid(&instance).expect("the daemon answers");
+  let (mut anchor, mut stderr) = spawn_anchor(&instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  let (kills, killed) = std::sync::mpsc::channel::<String>();
+  anchor.drain = Some(std::thread::spawn(move || {
+    for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
+      eprintln!("{line}");
+      if line.contains(LAPSE_KILL_LINE) {
+        let _ = kills.send(line);
+      }
+    }
+  }));
+  await_stable_daemon(&instance, true);
+  let frozen = await_daemon(&instance, None, &[]);
+  // A kill of the starting daemon (the start's own recovery, `await_stable_daemon`) is not this one.
+  while killed.try_recv().is_ok() {}
   assert!(
     Command::new("kill")
       .args(["-STOP", &frozen.to_string()])
@@ -594,19 +598,311 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .status()
     .unwrap()
     .success();
+  let line = killed
+    .recv_timeout(START_WAIT)
+    .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  let (age, bound, window) = lapse_of(&line);
+  println!(
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+  );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert!(
-    replaced_after >= budget.saturating_sub(beat),
-    "not killed before its heartbeat lapsed: replaced after {replaced_after:?}"
+  assert_eq!(
+    window,
+    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget"
   );
   assert!(
-    replaced_after <= budget + START_WAIT,
-    "killed at the lapse and replaced: after {replaced_after:?}"
+    age >= bound && age >= window,
+    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
   );
+  // Killed at the lapse: within one more window of it. How soon the successor then answers is the machine's, and
+  // `await_daemon` judges it by the successor's progress.
+  assert!(
+    age <= bound + window,
+    "killed within a window of the lapse: the beat was {age:?} old against a {bound:?} bound ({line})"
+  );
+}
+
+/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
+
+/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
+/// W ms window …".
+fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+  let numbers: Vec<u64> = rest
+    .split(|c: char| !c.is_ascii_digit())
+    .filter(|word| !word.is_empty())
+    .take(3)
+    .map(|word| word.parse().unwrap())
+    .collect();
+  let [age, bound, window] = numbers[..] else {
+    panic!("the kill line names the age, the bound and the window: {line}");
+  };
+  (
+    Duration::from_millis(age),
+    Duration::from_millis(bound),
+    Duration::from_millis(window),
+  )
+}
+
+/// Shape: how long the starved-start test starves its successor: three of the anchor's start budgets
+/// (`RECOVERY_BUDGET_NS`), so a start judged by a fixed wall second is killed at least twice over.
+const STARVED_FOR: Duration = Duration::from_nanos(3 * slates_db::replay::RECOVERY_BUDGET_NS);
+/// Shape: one starvation period: a heartbeat, the cadence the daemon's liveness is read at.
+const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+/// Shape: the share of each period the starved successor may run: one sixty-fourth, about the share a start got on
+/// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
+/// profile read, 2026-11-07).
+const STARVED_RUNS_ONE_IN: u32 = 64;
+/// Format: the anchor's kill of a start (`crates/cli/src/anchor.rs`): "the starting daemon made no progress …" or "…
+/// ran … ms of CPU without beating …". Until 2026-11-07 it read "the daemon never beat inside the recovery budget";
+/// the test also holds the starved successor to be the one that answers, so a kill under any wording fails it.
+const START_KILL_LINE: &str = "slates anchor: the starting daemon";
+
+/// A busy machine never kills a starting daemon that is making progress (supervisor's order of 2026-11-07; GAPS, "A
+/// daemon's restart can exceed the anchor's fixed recovery budget"). Do: start an anchor, kill its daemon, and starve
+/// the successor from its first instruction: stopped (`SIGSTOP`) nine tenths of every heartbeat and run the tenth, for
+/// three of the anchor's start budgets, then let it run. Expect: the starved successor is the one that answers, and
+/// the anchor never killed a start. On this Mac at load >= 150 the anchor killed 153 of 153 starts, each 1.07-1.22 s
+/// after its spawn, after the start had used 16-18 ms of CPU: starved, not stuck.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)] // the test starves a process by a duty cycle of its own: the sleeps are its periods
+fn a_starved_start_that_makes_progress_is_not_killed() {
+  use rustix::process::{Pid, Signal, kill_process};
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the starved-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-starved-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], SHARDS);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let killed = await_daemon(&instance, None, &[]);
+  let successor = successor_of(&anchor, killed);
+  let pid = Pid::from_raw(i32::try_from(successor).unwrap()).unwrap();
+  let runs = STARVED_PERIOD / STARVED_RUNS_ONE_IN;
+  let starving = Instant::now();
+  while starving.elapsed() < STARVED_FOR {
+    if kill_process(pid, Signal::STOP).is_err() {
+      break;
+    }
+    std::thread::sleep(STARVED_PERIOD - runs);
+    let _ = kill_process(pid, Signal::CONT);
+    std::thread::sleep(runs);
+  }
+  let _ = kill_process(pid, Signal::CONT);
+  let answered = await_daemon(&instance, Some(killed), &[]);
+  let start_kills = lines
+    .try_iter()
+    .filter(|line| line.contains(START_KILL_LINE))
+    .count();
+  drop(anchor);
+  assert_eq!(
+    start_kills, 0,
+    "the anchor killed a starved start {start_kills} times"
+  );
+  assert_eq!(
+    answered, successor,
+    "the starved successor is the daemon that answers"
+  );
+}
+
+/// The other side of the starved-start rule: a start that makes no progress at all is still killed, as a start, within
+/// one more liveness window of its last progress. Do: start an anchor, kill its daemon, and stop the successor
+/// (`SIGSTOP`) for good from its first instruction. Expect: another daemon answers, the stopped one is gone, and the
+/// anchor's start-kill line says it made no progress for at least the window and less than two.
+#[cfg(unix)]
+#[test]
+fn a_stuck_start_is_killed_and_restarted() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the stuck-start flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-stuck-start-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], SHARDS);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  // Awaited, not asked once: a status that lands in the anchor's one startup restart is refused (seen once at load 29).
+  let killed = await_daemon(&instance, None, &[]);
+  // The successor is stopped as soon as the anchor names it, by signals sent from here, not by spawned `pgrep` and
+  // `kill` processes: at 240 runnable processes those were slow enough that a successor beat first, once in fifteen
+  // runs, and was then rightly killed at its heartbeat's lapse, not as a start (2026-11-07).
+  let pid = |raw: u32| rustix::process::Pid::from_raw(i32::try_from(raw).unwrap()).unwrap();
+  rustix::process::kill_process(pid(killed), rustix::process::Signal::KILL).unwrap();
+  let stuck = restarted_pid(&lines);
+  rustix::process::kill_process(pid(stuck), rustix::process::Signal::STOP).unwrap();
+  let answered = await_daemon(&instance, Some(stuck), &[]);
+  let stuck_alive = Command::new("kill")
+    .args(["-0", &stuck.to_string()])
+    .status()
+    .unwrap()
+    .success();
+  let kill_line = lines
+    .try_iter()
+    .find(|line| line.contains(START_KILL_LINE) && line.contains(STUCK_WORDS))
+    .unwrap_or_default();
+  drop(anchor);
+  assert_ne!(answered, stuck);
+  assert!(!stuck_alive, "the stuck start was killed");
+  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let still_for = kill_line
+    .split_once(STUCK_WORDS)
+    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+    .and_then(|ms| ms.parse().ok())
+    .map(Duration::from_millis);
+  assert!(
+    still_for.is_some_and(|still| still >= window && still < window * 2),
+    "killed as a start within a window of its last progress: {kill_line:?}"
+  );
+}
+
+/// The CPU the daemon of an anchor started with `shards` shards has run by the time it answers: what its start cost.
+#[cfg(unix)]
+fn start_cpu_ns(instance: &str, shards: usize) -> u64 {
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    instance,
+    &[],
+    &shards.to_string(),
+  );
+  await_serving(&mut stderr, instance, false);
+  let pid = await_daemon(instance, None, &[]);
+  let spent = slates_machine::process_clock::process_cpu(pid)
+    .map(|reading| reading.spent_ns)
+    .unwrap();
+  drop(anchor);
+  spent
+}
+
+/// A-228, §2.6 boot step 1: a start is judged by the watchdog's rule, one thread at a time, never by the sum of its threads.
+/// Do: measure what one shard adds to a start's CPU (a start of as many shards as the machine runs at once, less a start of
+/// one, over the shards between), then start an anchor with enough shards that their starts sum past three liveness
+/// windows. Expect: the daemon serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's
+/// summed CPU, held it to one window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio,
+/// though no thread came near a window.
+#[cfg(unix)]
+#[test]
+fn a_start_whose_shards_sum_past_a_window_comes_up() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the many-shard start: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let window = slates_server::daemon::LIVENESS_BUDGET_NS;
+  let at_once = std::thread::available_parallelism()
+    .map_or(2, usize::from)
+    .max(2);
+  let one = start_cpu_ns(&format!("cli-sum-one-{}", std::process::id()), 1);
+  let many = start_cpu_ns(&format!("cli-sum-many-{}", std::process::id()), at_once);
+  let per_shard = many.saturating_sub(one) / u64::try_from(at_once - 1).unwrap();
+  assert!(
+    per_shard > 0,
+    "a shard costs its start something: {one} ns, {many} ns"
+  );
+  let shards = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  eprintln!(
+    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {shards} shards sum past three windows"
+  );
+  let instance = format!("cli-sum-{}", std::process::id());
+  let (anchor, mut stderr) = spawn_anchor_from(
+    env!("CARGO_BIN_EXE_slates"),
+    &instance,
+    &[],
+    &shards.to_string(),
+  );
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut kills = Vec::new();
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = std::io::BufRead::read_line(&mut stderr, &mut line).unwrap();
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    // Looked for anywhere in a line: the anchor's and the daemon's lines share one pipe and can arrive glued.
+    if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
+      break;
+    }
+    if line.contains(START_KILL_LINE) {
+      kills.push(line.trim_end().to_owned());
+    }
+  }
+  let served = line.contains(&serving_line);
+  drop(anchor);
+  assert!(
+    kills.is_empty() && served,
+    "a start of {shards} shards: served {served}, the anchor's start kills {kills:?}"
+  );
+}
+
+/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+const RESTARTED_AS: &str = "restarted as pid ";
+
+/// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
+#[cfg(unix)]
+fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor said it restarted the daemon");
+    if let Some(after) = line.split(RESTARTED_AS).nth(1) {
+      return after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in the restart line {line:?}"));
+    }
+  }
+}
+
+/// Format: the anchor's words for a start that made no progress (`crates/cli/src/anchor.rs`, `start_stuck`), before
+/// the milliseconds.
+const STUCK_WORDS: &str = "made no progress for ";
+
+/// Kills the anchor's daemon `killed` (`SIGKILL`) and returns the pid of the successor the anchor starts, as soon as
+/// it exists: the anchor's child that is not `killed`.
+#[cfg(unix)]
+fn successor_of(anchor: &AnchorProcess, killed: u32) -> u32 {
+  let anchor_pid = anchor.child.id().to_string();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let started = Instant::now();
+  loop {
+    let out = Command::new("pgrep")
+      .args(["-P", &anchor_pid])
+      .output()
+      .unwrap();
+    let found = String::from_utf8_lossy(&out.stdout)
+      .split_whitespace()
+      .filter_map(|pid| pid.parse::<u32>().ok())
+      .find(|pid| *pid != killed);
+    if let Some(pid) = found {
+      return pid;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor started no successor"
+    );
+    std::thread::yield_now();
+  }
 }
 
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
@@ -657,7 +953,7 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
   anchor.drain = Some(forwarding);
   await_stable_daemon(&instance, true);
   link_and_later_replace(&link, Some(REPLACEMENT_SCRIPT));
-  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let killed = await_daemon(&instance, None, &[]);
   assert!(
     Command::new("kill")
       .args(["-9", &killed.to_string()])
@@ -666,6 +962,97 @@ fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_an
       .success()
   );
   expect_the_anchors_own_image(&instance, killed, &mut anchor, &lines);
+  drop(anchor);
+}
+
+/// A-254, under A-176 and A-178's rule. Do: start an anchor with its daemon and write a file through the SDK; run a second
+/// anchor for the same instance and let it be refused; kill the live anchor's daemon. Expect the second anchor to exit
+/// refused, the live anchor's next daemon to adopt its segment by name and serve, and the file to read back whole. A start
+/// that is refused must leave the running instance untouched: before, on macOS, the second anchor created its segment
+/// before it asked who owned the instance, and that creation and its drop each unlinked the live segment's name, so the
+/// next daemon found nothing to attach (`shm_open` `ENOENT`, a crash loop). Linux's segment has no name, so there the
+/// test holds either way.
+#[cfg(unix)]
+#[test]
+fn a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the refused second anchor: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  const BYTES: &[u8] =
+    b"the live anchor's volume keeps these bytes through a refused second anchor";
+  let instance = format!("cli-second-anchor-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let volume = volume_id_of(&value_of(&out, "id"));
+  let deadlines = || {
+    slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get()
+  };
+  let mut writer = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  writer
+    .fs_write((volume, attachment), "kept.txt", BYTES, FILE_MODE)
+    .unwrap();
+  drop(writer);
+  let mut second = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  // It measures the machine before it is refused, which a loaded host stretches: the file's widest wait for a process.
+  let began = Instant::now();
+  let mut refused = second.try_wait().unwrap();
+  while refused.is_none() && began.elapsed() < FLEET_WAIT {
+    pause();
+    refused = second.try_wait().unwrap();
+  }
+  let exited = refused.is_some();
+  if !exited {
+    let _ = second.kill();
+    let _ = second.wait();
+  }
+  assert!(
+    exited && refused.is_some_and(|status| !status.success()),
+    "the second anchor for a live instance was refused: {refused:?}"
+  );
+  let killed = daemon_pid(&instance).expect("the live anchor's daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  await_daemon(&instance, Some(killed), &[]);
+  let mut reader = slates_client::Client::connect(&instance, deadlines()).unwrap();
+  let read = reader
+    .read(volume, "kept.txt", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  assert_eq!(
+    read, BYTES,
+    "the file reads back whole through the next daemon"
+  );
   drop(anchor);
 }
 
@@ -866,6 +1253,44 @@ fn a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it() {
     &["volume", "create", "early", "--bounded", "4MiB"],
   );
   assert_eq!(code, 0, "after bootstrap the create succeeds: {err}");
+  drop(anchor);
+}
+
+/// Shape: how long `a_cli_attachment_outlives_the_process_that_made_it` waits between its verbs: past the reaper's
+/// silence (one liveness budget) and its next sweep (one more), which ended a CLI attachment before A-230 (GAPS
+/// 2026-10-23 and 2026-10-27, measured 3 of 3 with a 2.5 s pause).
+const PAST_THE_REAPER: Duration = Duration::from_millis(2_500);
+
+/// A-230 (§4.7; docs/cli.md's flow). Do: `slates attach --write` a volume, which exits; wait past the reaper's sweep;
+/// `slates write` a file under the attachment from a later process; wait again; `slates detach` it. Expect: the write
+/// and the detach succeed: a CLI attachment outlives the process that made it, for its term, renewed by each verb that
+/// names it. Before A-230 the reaper ended it with its client, about a second after `attach` exited, and the write was
+/// refused `NotFound`.
+#[test]
+fn a_cli_attachment_outlives_the_process_that_made_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the CLI attachment's term: set SLATES_TEST_CLI=1 to run it (a real anchor and daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-term-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let id = created_volume(&instance, "termed");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach: {err}");
+  let attachment = value_of(&out, "attachment");
+  #[allow(clippy::disallowed_methods)] // a test waiting out the reaper it checks
+  std::thread::sleep(PAST_THE_REAPER);
+  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.txt"], b"kept");
+  assert_eq!(
+    code, 0,
+    "a write under the attachment after its process exited: {err}"
+  );
+  #[allow(clippy::disallowed_methods)] // the same wait again, after the renewal
+  std::thread::sleep(PAST_THE_REAPER);
+  let (code, _, err) = run(&instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
   drop(anchor);
 }
 
@@ -2997,10 +3422,10 @@ fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart(
   assert_an_export_is_published_and_detached(&fleet, &instance, port);
 }
 
-/// Waits (bounded by the start wait) for a daemon other than `replaced` to answer at `instance`, and
-/// returns its pid; on every look before it answers, each of `held` must still be taken.
+/// Waits for a daemon other than `replaced` to answer at `instance`, and returns its pid, for as long as the instance's
+/// daemons make progress ([`StartProgress`]); on every look before it answers, each of `held` must still be taken.
 fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
-  let started = Instant::now();
+  let mut progress = StartProgress::new();
   loop {
     assert!(
       held.iter().all(|port| !port_is_free(*port)),
@@ -3009,12 +3434,112 @@ fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
     if let Some(pid) = daemon_pid(instance).filter(|pid| Some(*pid) != replaced) {
       return pid;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "a fleet daemon answered at {instance}"
-    );
+    progress.check(instance, "a daemon other than the one replaced answered");
     pause();
   }
+}
+
+/// Format: the client's words when a live daemon has not answered inside its reply deadline (`ClientError::Stalled`,
+/// `crates/client/src/error.rs`).
+const STALLED_WORDS: &str = "no reply within";
+
+/// Bootstraps the consensus group, waiting out a reply that stalls while the daemon progresses ([`StartProgress`]). At 8
+/// spinners a CPU (2026-11-07) `bootstrap root` was refused "no reply within 1000000000 ns" in five of fifteen runs: the
+/// client's reply deadline is a wall second against a daemon that was alive and starved (the client's deadlines are
+/// clients' A-232). A stalled bootstrap may still land, so after a stall the group being already initialized is the
+/// bootstrap done; any other refusal fails the test.
+fn bootstrap_through_stalls(instance: &str, progress: &mut StartProgress) {
+  let mut stalled = false;
+  loop {
+    let (code, _, error) = run(instance, &["bootstrap", "root"]);
+    if code == 0 {
+      return;
+    }
+    let squashed = error.to_ascii_lowercase().replace('_', "");
+    if stalled && squashed.contains("consensusalreadyinitialized") {
+      return;
+    }
+    assert!(
+      error.contains(STALLED_WORDS),
+      "explicit first-time bootstrap: {error}"
+    );
+    stalled = true;
+    progress.check(instance, "the bootstrap's reply");
+    pause();
+  }
+}
+
+/// Derived: the longest any wait for a daemon runs, however it progresses: the start wait at the slowest share of a
+/// CPU this suite holds a start to ([`STARVED_RUNS_ONE_IN`]). A guard against a daemon that runs and never answers;
+/// the wait is judged by [`StartProgress`] well before it.
+const START_CEILING: Duration = START_WAIT.saturating_mul(STARVED_RUNS_ONE_IN);
+
+/// A wait for a daemon judged as the anchor judges a start (§2.6 boot step 1): by the instance's daemon processes' own
+/// CPU progress (`slates_machine::process_clock`), not the wall. The wait fails once they made none for [`START_WAIT`]
+/// (none running, or each stopped), or at [`START_CEILING`]. On a machine at 8 spinners a CPU (2026-11-07) a successor
+/// served about 20 s after its predecessor's kill at roughly 1.5% of a CPU, and the 20 s wall wait failed four runs
+/// in nine of the frozen and starved tests while the anchor killed no start.
+///
+/// It replaced two bounds. The wall wait: twenty seconds was enough alone and not inside a full `cargo test
+/// --workspace` (2026-10-18). And `START_ATTEMPTS`, the streak's attempts counted from the serving line (2026-10-21:
+/// a contended host makes each attempt slower, not more numerous), which still ran out at 240 runnable processes when
+/// the first daemon's beat lapsed during the streak and its successor took the attempts' time to come up. A daemon
+/// that flaps now ends the wait at [`START_CEILING`], or as a crash loop in the anchor's log ([`await_serving`]).
+struct StartProgress {
+  /// The daemons and the sum of their progress counts at the last look that saw them move.
+  seen: Option<(Vec<u32>, u64)>,
+  moved_at: Instant,
+  began: Instant,
+}
+
+impl StartProgress {
+  fn new() -> StartProgress {
+    let now = Instant::now();
+    StartProgress {
+      seen: None,
+      moved_at: now,
+      began: now,
+    }
+  }
+
+  /// Ends the test, saying it waited for `what`, once the daemons made no progress for [`START_WAIT`] or the wait
+  /// reached [`START_CEILING`].
+  fn check(&mut self, instance: &str, what: &str) {
+    let pids = daemon_processes(instance);
+    let total = pids
+      .iter()
+      .filter_map(|pid| slates_machine::process_clock::process_cpu(*pid))
+      .fold(0u64, |sum, cpu| sum.wrapping_add(cpu.progress));
+    let now = Some((pids, total));
+    if now != self.seen {
+      self.seen = now;
+      self.moved_at = Instant::now();
+    }
+    assert!(
+      self.moved_at.elapsed() < START_WAIT,
+      "waited for {what} at {instance}: its daemons made no progress for {START_WAIT:?} ({:?})",
+      self.seen
+    );
+    assert!(
+      self.began.elapsed() < START_CEILING,
+      "waited for {what} at {instance} for {START_CEILING:?} while its daemons ran ({:?})",
+      self.seen
+    );
+  }
+}
+
+/// The pids of `instance`'s daemon processes: an anchor runs its daemon as `slates --instance NAME daemon …`.
+fn daemon_processes(instance: &str) -> Vec<u32> {
+  let out = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} daemon")])
+    .output()
+    .unwrap();
+  let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+    .split_whitespace()
+    .filter_map(|pid| pid.parse().ok())
+    .collect();
+  pids.sort_unstable();
+  pids
 }
 
 /// AC-8.1 (§4.8 "Deployment"; typed refusals): a daemon handed serve sockets that are not what its plan
@@ -3174,6 +3699,83 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
   }
 }
 
+/// Whether a status refusal line (`shard N refused <counter>: <count>`) is one forming a fleet may show: superseded link
+/// work, and the events of formation's ordinary work that the counter map carries beside refusals.
+fn formation_counter_allowed(line: &str) -> bool {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  let Some(counter) = line
+    .split_whitespace()
+    .nth(3)
+    .and_then(|counter| counter.strip_suffix(':'))
+  else {
+    return false;
+  };
+  [
+    "fleet.discovery.invalidated",
+    "fleet.link.stale_return",
+    "fleet.accept.replaced",
+    "fleet.fan.sent",
+    "fleet.fan.unchanged",
+    // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+    // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
+    // announcement pass's lent sessions and sends.
+    "fleet.discovery.pages",
+    "fleet.learner.fetches",
+    "fleet.learner.fetch_paced",
+    "fleet.plane.announce_lends",
+    "fleet.plane.announcements_sent",
+    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
+    // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
+    CONTENT_PURGED,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+    GIVE_BACK_LEFT,
+    // A record link dropped because its anchor's learned member became another incarnation
+    // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
+    // superseded link work — exactly what this assertion permits — and it is counted during formation
+    // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
+    "fleet.link.invalid.member_changed",
+  ]
+  .contains(&counter)
+}
+
+/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
+/// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
+/// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
+#[test]
+fn the_formation_check_allows_every_reap_tick_event() {
+  use slates_server::daemon::{
+    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
+    TICKS_SEALING,
+  };
+  for counter in [
+    CONTENT_PURGED,
+    GIVE_BACK_LEFT,
+    TICKS_SEALING,
+    TICKS_DEFERRED,
+    TICKS_BUSY,
+    TICKS_IDLE,
+    CONTENT_PREFAULTED,
+  ] {
+    let line = format!("shard 0 refused {counter}: 1");
+    assert!(
+      formation_counter_allowed(&line),
+      "the formation check allows {line:?}"
+    );
+  }
+}
+
 /// Every process derived the same fleet from the one manifest: the same three member ids (its own among
 /// them, distinct per node) and both peers probed.
 fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
@@ -3215,31 +3817,7 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
         .refusals
         .split(';')
         .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-          [
-            "fleet.discovery.invalidated:",
-            "fleet.link.stale_return:",
-            "fleet.accept.replaced:",
-            "fleet.fan.sent:",
-            "fleet.fan.unchanged:",
-            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
-            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
-            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
-            "fleet.discovery.pages:",
-            "fleet.learner.fetches:",
-            "fleet.learner.fetch_paced:",
-            "fleet.plane.announce_lends:",
-            "fleet.plane.announcements_sent:",
-            "content.purged_bytes:",
-            // A record link dropped because its anchor's learned member became another incarnation
-            // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
-            // superseded link work — exactly what this assertion permits — and it is counted during formation
-            // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
-            "fleet.link.invalid.member_changed:",
-          ]
-          .iter()
-          .any(|counter| line.split_whitespace().nth(3) == Some(counter))
-        }),
+        .all(formation_counter_allowed),
       "only superseded link work may end during formation: {views:?}"
     );
   }
@@ -3270,10 +3848,32 @@ fn write_payload_through(path: &str) {
   );
 }
 
+/// Shares `id` through `owner` with this test's account on each of `peers`, by the anchor `slates status` prints.
+fn share_with_peers(owner: &str, peers: &[String], id: &str) {
+  let account = rustix::process::getuid().as_raw();
+  for peer in peers {
+    let (code, status, err) = run(peer, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    let anchor = value_of(&status, "anchor");
+    let (code, _, err) = run(
+      owner,
+      &[
+        "share",
+        id,
+        &format!("uid:{account}@{anchor}"),
+        "--read",
+        "--write",
+        "--admin",
+      ],
+    );
+    assert_eq!(code, 0, "the share with {peer}: {err}");
+  }
+}
+
 /// Provisions the volume on the owner, writes the payload into it through a real kernel mount where
 /// `mount_nfs` exists (the mount is released before the owner dies, so no kernel client is left talking to
 /// a dead server), and seals it; returns the id and the snapshot.
-fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
+fn seal_on_owner(instance: &str, peers: &[String], mountable: bool) -> (String, String) {
   // The mesh forms before a fresh learner imports the bootstrapped groups. The explicit refusal
   // precedes any create effect, so only that refusal is retried, within the existing formation bound.
   let deadline = Instant::now() + FLEET_WAIT;
@@ -3298,6 +3898,8 @@ fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
     break out;
   };
   let id = value_of(&out, "id");
+  // The survivors' clients are other hosts' accounts (A-237): they reach this volume only through a share naming them.
+  share_with_peers(instance, peers, &id);
   if mountable {
     let mount_point = MountPoint {
       path: fresh_mount_point(),
@@ -3410,6 +4012,29 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   }
 }
 
+/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind
+/// (`AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`), never served from a copy that node holds: the mount
+/// would hand the client something of this host's for another host's volume. Where `mount_nfs` exists; elsewhere it
+/// skips loudly.
+fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
+  if !mountable {
+    eprintln!("mount_nfs is not on this host: skipping the bystander's refused mount");
+    return;
+  }
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(instance, &["mount", id, &mount_point.path]);
+  assert!(
+    code != 0 && err.contains("AttachmentUnsupported") && err.contains("OwnedByAnotherHost"),
+    "a node that does not own the volume refuses its mount by kind: exit {code}: {err}"
+  );
+  assert!(
+    !is_mounted(&mount_point.path),
+    "nothing was mounted at the refused path"
+  );
+}
+
 /// The payload written on the dead owner reads back through a real kernel mount of the successor's
 /// volume — where `mount_nfs` exists; elsewhere the read-back skips loudly.
 fn read_on_successor(instance: &str, id: &str, mountable: bool) {
@@ -3444,7 +4069,9 @@ fn read_on_successor(instance: &str, id: &str, mountable: bool) {
 /// is retired by both survivors (their `status` drops it), and the survivor rendezvous ranks first takes
 /// the volume over and serves it under its id — the file written on the dead owner reading back through a
 /// real kernel mount of the successor where `mount_nfs` exists (elsewhere that step skips loudly; the
-/// deployment proof stands). Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
+/// deployment proof stands), while the other survivor refuses a mount of it by kind (`OwnedByAnotherHost`). Under load
+/// on macOS CI (run 42206043007) the successor itself refused its mount so: the takeover had recorded the new owner on
+/// the control shard alone, and the shard serving the client still named the dead creator. Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
 /// spinning shards need the machine to themselves.
 #[test]
 fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death() {
@@ -3504,7 +4131,13 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
 
   // Placement across processes, then the owner's death as a crash would deal it.
   let mountable = mount_nfs_available();
-  let (id, snapshot) = seal_on_owner(&instances[owner], mountable);
+  let peers: Vec<String> = instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != owner)
+    .map(|(_, instance)| instance.clone())
+    .collect();
+  let (id, snapshot) = seal_on_owner(&instances[owner], &peers, mountable);
   wait_placed(&instances[owner], &id, &snapshot);
   let survivors: Vec<String> = instances
     .iter()
@@ -3519,9 +4152,182 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   assert_retired(&wait_fleet_views(&survivors, 2, 1), &owner_host);
   let successor = wait_successor(&survivors, &id);
   read_on_successor(&successor, &id, mountable);
+  let bystander = survivors
+    .iter()
+    .find(|instance| **instance != successor)
+    .unwrap();
+  mount_refused_by_kind(bystander, &id, mountable);
 
   drop(daemons);
   drop(scratch);
+}
+
+/// Each fleet node's merge, content and seal counters and its fleet view from `status --json`: what an unanswered submit
+/// in a fleet is waiting on (`a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits`).
+fn commit_counters(instances: &[String]) -> Vec<String> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status", "--json"]);
+      let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+      let named: Vec<String> = status["shards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(shard, report)| {
+          report["refusals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(move |refusal| {
+              let kind = refusal["kind"].as_str()?;
+              ["merge.", "fleet.content", "fleet.seal", "content.sealed"]
+                .iter()
+                .any(|prefix| kind.starts_with(prefix))
+                .then(|| format!("{shard}:{kind}={}", refusal["count"]))
+            })
+        })
+        .collect();
+      let fleet: Vec<String> = status["fleet"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| !value.is_object())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+      let council = &status["fleet"]["council"];
+      format!("{instance} {named:?} fleet {fleet:?} council {council}")
+    })
+    .collect()
+}
+
+/// Three daemon processes from one manifest at `f = 1`, formed and bootstrapped as the deployment flow is: the scratch,
+/// the processes, their instances and the index of the node the root was bootstrapped on.
+fn bootstrapped_fleet(prefix: &str) -> (ScratchDir, Vec<FleetProcess>, Vec<String>, usize) {
+  let pid = std::process::id();
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("{prefix}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<FleetProcess> = FLEET_NODES
+    .iter()
+    .zip(&instances)
+    .zip(&blocks)
+    .map(|((node, instance), held)| start_fleet_daemon(instance, &manifest, node, held))
+    .collect();
+  for instance in &instances {
+    wait_answers(instance);
+  }
+  let views = wait_fleet_views(
+    &instances,
+    FLEET_NODES.len(),
+    u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+  );
+  assert_formed(&views);
+  let bootstrap = views
+    .iter()
+    .enumerate()
+    .min_by_key(|(_, view)| view.as_ref().unwrap().host.parse::<u64>().unwrap())
+    .map(|(index, _)| index)
+    .unwrap();
+  let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
+  assert_eq!(
+    code, 0,
+    "one explicit bootstrap of the fresh fleet: {error}"
+  );
+  (scratch, daemons, instances, bootstrap)
+}
+
+/// A green on `owner`, made once its groups have formed: until then a green is refused `ConsensusNotInitialized`, typed,
+/// before any effect, so only that refusal is retried, within the fleet wait.
+fn green_once_groups_form(owner: &str) -> String {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let (code, out, err) = run(owner, &["green", "g"]);
+    if code == 0 {
+      break value_of(&out, "id");
+    }
+    assert!(
+      err.contains("ConsensusNotInitialized") && Instant::now() < deadline,
+      "create the green: {err}"
+    );
+    pause();
+  }
+}
+
+/// Runs `slates --instance INSTANCE ARGS…` with a deadline: `None` when it has not exited by then (it is killed and reaped,
+/// so a hung verb fails its test rather than the test hanging).
+fn run_within(instance: &str, args: &[&str], within: Duration) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let deadline = Instant::now() + within;
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    pause();
+  }
+  let out = child.wait_with_output().unwrap();
+  Some((
+    out.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&out.stdout).into_owned(),
+    String::from_utf8_lossy(&out.stderr).into_owned(),
+  ))
+}
+
+/// §4.16 "Commit" (AUD-11) across processes (found 2026-11-06 by the Linux load rungs on loadtest-scale's
+/// `load_scale.rs`: in a three-server fleet at `f = 1`, a submit to a green was never answered, with one client or
+/// three hundred, and even a CLI `submit` on the owner itself had not returned after 600 s; the owner counted
+/// `merge.inputs_unplaced` every period and `merge.acceptance_resolved` never). The same rule passes in-process with
+/// two or three nodes, one, two or seven shards, local or forwarded. Do: three daemon processes from one manifest at
+/// `f = 1`, formed and bootstrapped as the deployment flow is; on one node a green, a work over it and one edit; then
+/// `submit`. Expect it answered, accepted as version 1, within the fleet wait.
+#[test]
+fn a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the fleet submit: set SLATES_TEST_CLI=1 to run it (three daemons; needs the machine to itself)"
+    );
+    return;
+  }
+  let (scratch, daemons, instances, bootstrap) = bootstrapped_fleet("cli-commit");
+  let owner = &instances[bootstrap];
+  let green = green_once_groups_form(owner);
+  let (code, out, err) = run(owner, &["work", &green, "w"]);
+  assert_eq!(code, 0, "create the work: {err}");
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(owner, &["edit", &work, "f", "0", "0", "hello"]);
+  assert_eq!(code, 0, "declare the edit: {err}");
+  let submitted = run_within(owner, &["submit", &work], FLEET_WAIT);
+  // Each node's merge, content and seal counters as the wait ends, so an unanswered submit names where it waits.
+  let counters = commit_counters(&instances);
+  drop(daemons);
+  drop(scratch);
+  let (code, out, err) = submitted.unwrap_or_else(|| {
+    panic!("the submit was answered within the fleet wait; each node's counters {counters:?}")
+  });
+  assert_eq!(code, 0, "the submit was accepted: {err}");
+  assert_eq!(
+    value_of(&out, "accepted"),
+    "1",
+    "accepted as version 1: {out}"
+  );
 }
 
 // --- T-4.13: the OCI namespace handoff (§4.6 A-9; AC-4.11; RQ-20). ---
@@ -5201,35 +6007,26 @@ fn linux_fuse_mount_runs() -> bool {
   true
 }
 
-/// Whether a process can write **its own** user-namespace maps — which is what `slates exec` does today,
-/// and what neither host measured will allow. A loud skip otherwise.
+/// Whether this host lets the launcher bind at all: a loud skip where AppArmor confines unprivileged user
+/// namespaces, whose `unprivileged_userns` profile denies the namespace every capability, the mount one among them
+/// (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`, CI's runners; diagnostics run 42169647315).
+/// There the launcher's refusal is itself the test (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`).
 ///
-/// The first version of this gate asked whether unprivileged user namespaces are permitted at all. That was
-/// the wrong question and it never fired: `unshare -U true` succeeds on GitHub's `ubuntu-latest` *and* on the
-/// x86_64 box, and the launcher failed anyway with `open /proc/self/setgroups: code 13`. Measured on the box
-/// 2026-10-20, inside a fresh namespace with no maps written: `setgroups` reads `allow`, `uid_map` is empty,
-/// and writing either is **denied** — while `unshare --map-user`, where the *parent* writes the child's maps,
-/// works and lands uid 1000 inside. So the capability is there and the launcher asks for it the one way these
-/// kernels refuse.
-///
-/// That makes this a skip over a **defect**, not over a missing host feature, and it is recorded as one:
-/// `docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`. The gate exists so the lane reports the
-/// defect once, in the ledger, rather than as a red test on every run; when the launcher forks and has the
-/// parent write the maps, this gate goes away with it.
+/// This gate once asked whether `unshare -U sh -c 'echo deny > /proc/self/setgroups'` succeeds. That probe execs a
+/// shell, and an exec'd process in a namespace with no maps is refused its own `/proc/self` files on every kernel
+/// (Linux 6.12 in a container refuses it too, where the launcher's own in-process sequence binds), so the gate skipped
+/// everywhere and named a defect that was not the launcher's
+/// (`docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`).
 #[cfg(target_os = "linux")]
-fn a_process_can_write_its_own_userns_maps() -> bool {
-  let permitted = Command::new("unshare")
-    .args(["-U", "sh", "-c", "echo deny > /proc/self/setgroups"])
-    .output()
-    .map(|o| o.status.success())
-    .unwrap_or(false);
-  if !permitted {
+fn the_launcher_can_bind_here() -> bool {
+  let confined = apparmor_confines_user_namespaces();
+  if confined {
     eprintln!(
-      "SKIP: this host refuses a process writing its own user-namespace maps, which is how `slates exec` \
-       sets up today (docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md)"
+      "SKIP: this host's AppArmor confines unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), \
+       so `slates exec` cannot bind; its refusal is tested on its own"
     );
   }
-  permitted
+  !confined
 }
 
 /// `slates mount ID DIR` on Linux reports the mount point, and the kernel lists a `fuse.slates` mount there
@@ -6541,7 +7338,7 @@ const ROOT_ENV: &str = "SLATES_ROOT";
 #[cfg(target_os = "linux")]
 #[test]
 fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched() {
-  if !linux_fuse_mount_runs() || !a_process_can_write_its_own_userns_maps() {
+  if !linux_fuse_mount_runs() || !the_launcher_can_bind_here() {
     return;
   }
   let instance = format!("cli-exec-{}", std::process::id());
@@ -6607,6 +7404,65 @@ fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untou
     !still_mounted,
     "the launcher's bind propagated back to the host"
   );
+}
+
+/// Format: the sysctl through which Ubuntu's AppArmor confines every unprivileged user namespace to its
+/// `unprivileged_userns` profile, which denies the namespace every capability, the mount one among them.
+#[cfg(target_os = "linux")]
+const APPARMOR_USERNS_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// Whether this host's AppArmor confines unprivileged user namespaces (the sysctl reads 1).
+#[cfg(target_os = "linux")]
+fn apparmor_confines_user_namespaces() -> bool {
+  std::fs::read_to_string(APPARMOR_USERNS_SYSCTL).is_ok_and(|value| value.trim() == "1")
+}
+
+/// §4.6 "The launcher" (AC-3.5), with no daemon: a plain directory stands in for the daemon's root mount, since the
+/// launcher only binds `<root>/<volume>` onto the chosen path. Do: `slates exec --volume vol --at DIR -- sh -c 'cat
+/// DIR/marker'` with `SLATES_ROOT` at that directory. Expect, by what the host allows:
+/// - where AppArmor confines unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu
+///   24.04 and CI's runners), a refusal (exit 4) naming that setting, since the namespace gets no capability whoever
+///   writes its maps (diagnostics run 42169647315: `apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+///   capname="sys_admin"`) — not the bare `open /proc/self/setgroups: code 13` it answered before;
+/// - where user namespaces are refused outright, a refusal naming how to enable them;
+/// - elsewhere, the command reading the volume's marker through the bind, with the chosen path empty on the host after.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
+  let root = build_output_dir("slates-exec-root");
+  let at = build_output_dir("slates-exec-at");
+  shell(&format!(
+    "mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"
+  ));
+  let output = slates()
+    .args(["exec", "--volume", "vol", "--at", &at, "--", "sh", "-c"])
+    .arg(format!("cat {at}/marker"))
+    .env(ROOT_ENV, &root)
+    .output()
+    .unwrap();
+  let code = output.status.code().unwrap_or(-1);
+  let saw = String::from_utf8_lossy(&output.stdout).into_owned();
+  let err = String::from_utf8_lossy(&output.stderr).into_owned();
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  if apparmor_confines_user_namespaces() {
+    assert_eq!(code, 4, "a confined host refuses the launcher: {err}");
+    assert!(
+      err.contains("kernel.apparmor_restrict_unprivileged_userns"),
+      "the refusal names the setting that forbids it: {err}"
+    );
+  } else if err.contains("cannot create a user+mount namespace") {
+    eprintln!("SKIP: this host refuses unprivileged user namespaces outright: {err}");
+    assert_eq!(code, 4, "{err}");
+  } else {
+    assert_eq!(code, 0, "the launcher runs the command: {err}");
+    assert_eq!(
+      saw.trim(),
+      "through-the-bind",
+      "the command reads the volume through the bind"
+    );
+  }
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
@@ -6872,10 +7728,17 @@ impl MappedThroughAMount {
   /// that leave a map's stores unsynced are.
   #[cfg(any(target_os = "linux", target_os = "macos"))]
   fn sync_map(&mut self) {
-    // SAFETY: syncs exactly the live map made in `with_pages`.
-    let synced =
-      unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) };
+    let synced = self.try_sync_map();
     assert!(synced.is_ok(), "the map is flushed: {synced:?}");
+  }
+
+  /// Syncs the map, then its file: the first error either reports, as a program sees a refused write-back (A-248) at
+  /// its `msync` or its `fsync`.
+  #[allow(clippy::disallowed_methods)] // the test's own fsync of a file in a slates mount: RAM, not disk
+  fn try_sync_map(&mut self) -> Result<(), rustix::io::Errno> {
+    // SAFETY: syncs exactly the live map made in `with_pages`.
+    unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) }?;
+    rustix::fs::fsync(&self.file)
   }
 
   /// `map.bin` as slates itself holds it, read through the fixture's SDK client: no mount's cache in the way.
@@ -7242,17 +8105,18 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
   );
 }
 
-/// §4.6 cache posture, the mount route's dirty pages
-/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
-/// shared map leaves its page dirty in that mount's cache until the kernel writes it back — which is what a guest's DAX
-/// stores are on the host — and a write another path made meanwhile must not be undone by that write-back. Do: store a
-/// byte through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte
-/// the replacement's, in slates and in the map. Then store again, write other bytes of the same page through a second
-/// mount, sync. Expect both: the store and the second mount's bytes, as one shared page cache would hold them.
+/// §4.6 cache posture, the mount route's dirty pages (A-248, Ada's decision of 2026-11-07: "Refuse, like NFS";
+/// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
+/// shared map leaves its page dirty in that mount's cache until the kernel writes it back, which is what a guest's DAX
+/// stores are on the host, and a write another path made meanwhile must never be undone by that write-back. Since
+/// A-248 a write-back holding any stale byte that differs from the file is refused whole, `EIO`, which the program sees
+/// at its `msync` or `fsync`: never applied around the stale bytes, which was a merge (banned item 11). Do: store a byte
+/// through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte the
+/// replacement's and the sync refused. Then, once the map reads the replacement, store and sync (the control: applied
+/// whole). Then store again, write other bytes of the same page through a second mount, sync. Expect the file the
+/// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
-/// Linux only. On macOS an NFS v3 client cannot be told of the other write, and since A-192 the server refuses the dirty
-/// page's stale write-back: the replacement survives (the test after this one), but the store goes with the refusal,
-/// and keeping both, as the second half here does, would take a byte-level merge, which is banned.
+/// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
@@ -7264,29 +8128,43 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   let length = fixture.length;
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
-  fixture.sync_map();
+  let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
     "the later replacement survives the dirty page's write-back"
+  );
+  assert!(
+    stale_whole.is_err(),
+    "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
   );
   assert!(
     fixture.follows(b'S'),
     "the map reads the replacement within {WAIT_FOR:?}"
   );
   fixture.view()[10] = b'M';
-  let written = 100..200;
-  second.write_at(written.start, &vec![b'R'; written.len()]);
-  fixture.sync_map();
+  let fresh = fixture.try_sync_map();
   let mut expected = vec![b'S'; length];
   expected[10] = b'M';
+  assert!(
+    fresh.is_ok() && fixture.volume_bytes() == expected,
+    "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
+  );
+  fixture.view()[20] = b'N';
+  let written = 100..200;
+  second.write_at(written.start, &vec![b'R'; written.len()]);
+  let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
     fixture.volume_bytes() == expected,
-    "the store and the second mount's later bytes on the same page are both kept"
+    "the second mount's bytes are kept and the stale page's store is not applied around them"
+  );
+  assert!(
+    stale_part.is_err(),
+    "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
     fixture.follows_bytes(&expected),
-    "the map reads both within {WAIT_FOR:?}"
+    "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
 }
 
@@ -7789,6 +8667,74 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   drop(anchor);
 }
 
+/// The lookups the kernel gave back after its daemon's last publication are given back through the successor too (GAPS,
+/// A-154's sibling; A-61, A-63). Do: write a file through a mount and unlink it there, so the unlink's barrier publishes
+/// the unlinked file still held by the kernel's lookup; wait until the kernel's `FORGET` has let it go and the volume's
+/// `referenced_bytes` is back where it was before the file (no publication follows the `FORGET`); `SIGKILL` the daemon
+/// and wait for the anchor's successor. Expect `referenced_bytes` where it was before the file: the successor's lookup
+/// count of the file is the kernel's, zero. Before the fix the successor restored the lookup the image recorded, which
+/// the kernel never gives back again, and the file stayed referenced until the mount ended. Linux only, to a kernel that
+/// can resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-forget-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "forgets", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/forgotten.bin", mount.path);
+  #[allow(clippy::disallowed_methods)]
+  // the test's own file, written through the slates mount: RAM, not disk
+  std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let deadline = Instant::now() + WAIT_FOR;
+  while referenced() > before && Instant::now() < deadline {
+    pause();
+  }
+  assert_eq!(
+    referenced(),
+    before,
+    "the kernel's FORGET let the unlinked file go while the daemon ran"
+  );
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the successor's lookups of the file are the kernel's: the FORGET after the last publication stays given back"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
 /// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
 /// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
@@ -7869,7 +8815,8 @@ fn a_takeover_recovers_an_overlay_whose_base_directory_an_outsider_changed() {
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map
 /// and leave it unsynced; truncate the file to one page through a second mount; sync the map. Expect the file still one
-/// page long in slates, its bytes untouched. Linux only, as above.
+/// page long in slates, its bytes untouched, and the sync either clean, where the kernel dropped the cut page with the
+/// truncation, or `EIO`, where it wrote the page back and the write-back was refused (A-248). Linux only, as above.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
@@ -7881,7 +8828,11 @@ fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
   let page = fixture.page;
   fixture.view()[page + 10] = b'M';
   second.truncate(u64::try_from(page).unwrap());
-  fixture.sync_map();
+  let synced = fixture.try_sync_map();
+  assert!(
+    synced.is_ok() || synced == Err(rustix::io::Errno::IO),
+    "the sync is clean or refused EIO: {synced:?}"
+  );
   let held = fixture.volume_bytes();
   assert_eq!(
     held.len(),
@@ -8356,7 +9307,11 @@ fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
 /// [`THREE_WRITER_STEPS`] generated writes as the synced history does, but `msync` the map only at generated sync points.
 /// Expect after every write that the map reads the byte model (a store is its own at once, and the others' changes
 /// reach it as memory alone); and at every sync point, and at the end, that slates' own read and the second mount equal
-/// it too: no store lost, no later write undone. Linux only, as above.
+/// it too. A write by another path into a page holding unsynced stores puts them at risk (A-248), with every dirty page
+/// contiguous with it, which can share its `WRITE`: the map is synced there, its `EIO` allowed; every byte the other
+/// path wrote must be the other path's, every byte of a page at risk its latest value or an older one since the last
+/// settled state, every other byte exact; and the map and the second mount must then read what slates holds, which
+/// becomes the model. No later write is ever undone. Non-vacuous: some write-back was refused. Linux only, as above.
 #[cfg(target_os = "linux")]
 #[test]
 fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
@@ -8366,24 +9321,19 @@ fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
   let mut fixture = MappedThroughAMount::with_pages("mapdirtychaos", 0, THREE_WRITER_PAGES);
   let second = fixture.mount_again();
   let mut model = vec![0u8; fixture.length];
+  let mut settled = StoresAtRisk::new(&model);
   let mut state: u64 = 0x6a09_e667_f3bc_c908;
   let mut syncs = 0u32;
   for step in 0..=THREE_WRITER_STEPS {
     let last = step == THREE_WRITER_STEPS;
     if !last {
       let write = GeneratedWrite::next(&mut state, fixture.length);
-      match &write {
-        GeneratedWrite::Map { offset, bytes } => {
-          let end = offset + bytes.len();
-          fixture.view()[*offset..end].copy_from_slice(bytes);
-        }
-        GeneratedWrite::SecondMount { offset, bytes } => second.write_at(*offset, bytes),
-        GeneratedWrite::Sdk { bytes } => fixture.replace_with(bytes),
-      }
-      write.apply_to(&mut model);
-      assert!(
-        fixture.follows_bytes(&model),
-        "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+      one_generated_write(
+        &mut fixture,
+        &second,
+        step,
+        &write,
+        (&mut model, &mut settled),
       );
     }
     if last || xorshift(&mut state).is_multiple_of(3) {
@@ -8397,12 +9347,160 @@ fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
         second.follows(&model),
         "step {step}: after the sync, the second mount did not come to the model within {WAIT_FOR:?}"
       );
+      settled = StoresAtRisk::new(&model);
     }
   }
   assert!(
     syncs > 1,
     "the history reached sync points between writes, not only at its end"
   );
+  let refused = counter_of(&fixture.instance, "fuse.writeback_conflicts");
+  eprintln!("the map's write-backs refused as conflicts: {refused}");
+  assert!(
+    refused > 0,
+    "non-vacuous: another path wrote into a page holding unsynced stores"
+  );
+}
+
+/// One step of the unsynced history: makes `write`, settles what another path's write put at risk, and holds the map to
+/// the model.
+#[cfg(target_os = "linux")]
+fn one_generated_write(
+  fixture: &mut MappedThroughAMount,
+  second: &SecondMount,
+  step: u32,
+  write: &GeneratedWrite,
+  (model, settled): (&mut Vec<u8>, &mut StoresAtRisk),
+) {
+  let written = make_write(fixture, second, settled, write);
+  write.apply_to(model);
+  if let Some(range) = &written {
+    let at_risk = settled.at_risk(range, fixture.page);
+    if at_risk.is_empty() {
+      settled.written_over(range, model);
+    } else {
+      let what = format!("step {step}, {write:?}");
+      *model = settle_stores_at_risk(fixture, &what, range, &at_risk, model, settled);
+      *settled = StoresAtRisk::new(model);
+    }
+  }
+  assert!(
+    fixture.follows_bytes(model),
+    "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+  );
+}
+
+/// Makes one generated write; the bytes another path wrote, `None` for the map's own stores, which `settled` notes.
+#[cfg(target_os = "linux")]
+fn make_write(
+  fixture: &mut MappedThroughAMount,
+  second: &SecondMount,
+  settled: &mut StoresAtRisk,
+  write: &GeneratedWrite,
+) -> Option<std::ops::Range<usize>> {
+  match write {
+    GeneratedWrite::Map { offset, bytes } => {
+      let end = offset + bytes.len();
+      fixture.view()[*offset..end].copy_from_slice(bytes);
+      settled.stored(*offset, bytes, fixture.page);
+      None
+    }
+    GeneratedWrite::SecondMount { offset, bytes } => {
+      second.write_at(*offset, bytes);
+      Some(*offset..offset + bytes.len())
+    }
+    GeneratedWrite::Sdk { bytes } => {
+      fixture.replace_with(bytes);
+      Some(0..bytes.len())
+    }
+  }
+}
+
+/// Another path wrote `range` over pages holding unsynced stores: syncs the map, its `EIO` allowed, holds what slates
+/// then has to the write-back rule (A-248), and answers it, the model from here on.
+#[cfg(target_os = "linux")]
+fn settle_stores_at_risk(
+  fixture: &mut MappedThroughAMount,
+  what: &str,
+  range: &std::ops::Range<usize>,
+  at_risk: &std::collections::BTreeSet<usize>,
+  model: &[u8],
+  settled: &StoresAtRisk,
+) -> Vec<u8> {
+  let _refusal_is_an_outcome = fixture.try_sync_map();
+  let held = fixture.volume_bytes();
+  for (at, value) in held.iter().enumerate() {
+    let exact = range.contains(&at) || !at_risk.contains(&(at / fixture.page));
+    assert!(
+      *value == model[at] || (!exact && settled.may_hold(at, *value)),
+      "{what}: byte {at} holds {value}, which the write-back rule does not allow (latest {})",
+      model[at]
+    );
+  }
+  held
+}
+
+/// The map's unsynced stores a refused write-back can lose (A-248): each byte's value when its page was last settled and
+/// the stores since, and the dirty pages.
+#[cfg(target_os = "linux")]
+struct StoresAtRisk {
+  settled: Vec<u8>,
+  stores: Vec<Vec<u8>>,
+  dirty: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl StoresAtRisk {
+  /// Nothing unsynced, every byte as `model` has it.
+  fn new(model: &[u8]) -> StoresAtRisk {
+    StoresAtRisk {
+      settled: model.to_vec(),
+      stores: vec![Vec::new(); model.len()],
+      dirty: std::collections::BTreeSet::new(),
+    }
+  }
+
+  /// The map stored `bytes` at `offset`, unsynced.
+  fn stored(&mut self, offset: usize, bytes: &[u8], page: usize) {
+    for (at, value) in (offset..).zip(bytes) {
+      self.stores[at].push(*value);
+      self.dirty.insert(at / page);
+    }
+  }
+
+  /// The dirty pages another path's write of `range` puts at risk: those it touched, and the dirty pages contiguous with
+  /// them, which can share their `WRITE`.
+  fn at_risk(
+    &self,
+    range: &std::ops::Range<usize>,
+    page: usize,
+  ) -> std::collections::BTreeSet<usize> {
+    let last = range.end.saturating_sub(1) / page;
+    let mut at_risk = std::collections::BTreeSet::new();
+    for touched in (range.start / page..=last).filter(|touched| self.dirty.contains(touched)) {
+      let before = (0..touched)
+        .rev()
+        .take_while(|neighbour| self.dirty.contains(neighbour));
+      let after = (touched + 1..).take_while(|neighbour| self.dirty.contains(neighbour));
+      at_risk.insert(touched);
+      at_risk.extend(before);
+      at_risk.extend(after);
+    }
+    at_risk
+  }
+
+  /// Another path's write of `range`, into no dirty page, settled its bytes at `model`'s.
+  fn written_over(&mut self, range: &std::ops::Range<usize>, model: &[u8]) {
+    for at in range.clone() {
+      self.settled[at] = model[at];
+      self.stores[at].clear();
+    }
+  }
+
+  /// Whether byte `at` may hold `value` with its stores lost: its settled value or one of them.
+  fn may_hold(&self, at: usize, value: u8) -> bool {
+    self.settled[at] == value || self.stores[at].contains(&value)
+  }
 }
 
 /// `slates mount ID INNER --subtree /shared` mounts `shared` alone: it lists `g`, serves its bytes, and a write
@@ -10524,9 +11622,12 @@ const DERIVATION_LINES: usize = 512;
 #[test]
 fn a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates() {
   use std::io::{BufRead, BufReader};
-  let instance = "codec-derivation";
+  // The instance names the anchor's rendezvous and segment, so it carries this process's id: under a bare name, a
+  // second copy of the test on the machine found the instance owned and its anchor printed no derivation (1 of 6
+  // copies in 3 concurrent pairs; 2 of 2 alone passed).
+  let instance = format!("codec-derivation-{}", std::process::id());
   let child = slates()
-    .args(["--instance", instance, "anchor", "--shards", SHARDS])
+    .args(["--instance", &instance, "anchor", "--shards", SHARDS])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -10963,4 +12064,706 @@ fn the_binary_names_its_version() {
     .output()
     .unwrap();
   assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+}
+
+/// The panic rule (CLAUDE.md §2, item 6). Do: start the real anchor with its log piped, wait for its daemon to serve,
+/// close the log's reader, as `slates anchor 2>&1 >/dev/null | head -n 1` does once `head` has its line, then kill the
+/// daemon, so the anchor and its next daemon both write log lines into a pipe nobody reads. Expect: the anchor is still
+/// running, and a new daemon answers. Before, the anchor's next log line panicked on the broken pipe and the process
+/// aborted (exit 134), taking its daemon and every held mount with it.
+#[test]
+fn an_anchor_whose_log_reader_went_away_keeps_supervising() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the anchor with a closed log: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-closed-log-{}", std::process::id());
+  let (mut anchor, mut stderr) = spawn_anchor(&instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  // The log's only reader goes away: every later write to the anchor's stderr and its daemons' is refused `EPIPE`.
+  drop(stderr);
+  let alive_and_answering = |anchor: &mut AnchorProcess, unlike: Option<u32>| {
+    let started = Instant::now();
+    let mut streak = 0u32;
+    let mut answered = None;
+    while started.elapsed() < START_WAIT && streak < STABLE_STREAK {
+      if let Some(status) = anchor.child.try_wait().unwrap() {
+        panic!("the anchor ended after its log's reader went away: {status}");
+      }
+      answered = daemon_pid(&instance).filter(|pid| Some(*pid) != unlike);
+      streak = if answered.is_some() { streak + 1 } else { 0 };
+      pause();
+    }
+    answered.expect("a daemon answers a streak of verbs with its log's reader gone")
+  };
+  let killed = alive_and_answering(&mut anchor, None);
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let successor = alive_and_answering(&mut anchor, Some(killed));
+  assert_ne!(successor, killed, "a new daemon answers");
+  assert!(
+    anchor.child.try_wait().unwrap().is_none(),
+    "the anchor still supervises"
+  );
+}
+
+/// A pipe whose two ends are close-on-exec. `rustix::pipe::pipe` is a bare `pipe(2)`: a child another test spawns
+/// while the ends are open inherits them for its whole life, so a read end the test has dropped still has a reader and
+/// a write to it succeeds (main CI 42152000416, ubuntu-latest: exit 0 where 4 was due). Linux has `pipe2`; Apple has
+/// none, so `fcntl` marks both ends at once, as `slates-ipc`'s delivery pipe does.
+fn close_on_exec_pipe() -> (rustix::fd::OwnedFd, rustix::fd::OwnedFd) {
+  #[cfg(target_os = "linux")]
+  let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+  #[cfg(not(target_os = "linux"))]
+  let ends = {
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+    (reader, writer)
+  };
+  ends
+}
+
+/// Waits, within [`WAIT_FOR`], until no process holds the pipe's read end, which the write end reports as an error or a
+/// hang-up: a child forked by another test before the drop keeps a copy until its own `exec` closes it.
+fn wait_until_no_reader(writer: &rustix::fd::OwnedFd) {
+  let deadline = Instant::now() + WAIT_FOR;
+  loop {
+    let mut fds = [rustix::event::PollFd::new(
+      writer,
+      rustix::event::PollFlags::OUT,
+    )];
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout = rustix::time::Timespec::try_from(left).unwrap();
+    let _ = rustix::event::poll(&mut fds, Some(&timeout));
+    if fds[0]
+      .revents()
+      .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::HUP)
+    {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the pipe's read end is still held after {WAIT_FOR:?}"
+    );
+  }
+}
+
+/// The panic rule, for a command's output (A-213). Do: run `slates --help` with its standard output a pipe whose reader
+/// has already gone, as `slates status | head -n 1` leaves a command once `head` has its line. Expect: exit 4 (failed),
+/// with a line saying the output could not be written, not a panic.
+#[test]
+fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
+  let (reader, writer) = close_on_exec_pipe();
+  drop(reader);
+  wait_until_no_reader(&writer);
+  let output = slates()
+    .arg("--help")
+    .stdout(Stdio::from(writer))
+    .stderr(Stdio::piped())
+    .output()
+    .unwrap();
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(
+    output.status.code(),
+    Some(i32::from(4u8)),
+    "a failed exit, not a panic: {stderr}"
+  );
+  assert!(
+    stderr.contains("could not be written"),
+    "the failure says why: {stderr}"
+  );
+}
+
+/// Shape: how long a refusal of a path on the daemon's own mount may take to come back (A-227): the verb's own work and
+/// one round trip, far under a client's stall deadline, so a daemon waiting on its own mount fails here, not later.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OWN_MOUNT_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this host runs the own-mount tests (A-227): a real kernel mount the daemon serves, FUSE on Linux and the
+/// loopback NFS mount on macOS; skipped loudly otherwise.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_tests_run() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    linux_fuse_mount_runs()
+  }
+  #[cfg(target_os = "macos")]
+  {
+    if std::env::var_os("SLATES_TEST_CLI").is_none() {
+      eprintln!(
+        "skipping the own-mount flow: set SLATES_TEST_CLI=1 to run it (a real kernel mount)"
+      );
+      return false;
+    }
+    mount_nfs_available()
+  }
+}
+
+/// Mounts volume `id` at `path` the host's way, checked: FUSE on Linux, the loopback NFS mount on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn own_mount_and_check(instance: &str, id: &str, path: &str) {
+  #[cfg(target_os = "linux")]
+  fuse_mount_and_check(instance, id, path);
+  #[cfg(target_os = "macos")]
+  mount_and_check(instance, id, path);
+}
+
+/// A-227, the base plane (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard daemon,
+/// mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and create a second volume with that directory
+/// as its base. Expect: the create refused at once (exit 1, `OwnMount`), nothing created, and the daemon still
+/// answering. Before A-227 the shard opened the base through its own mount and waited on the request only it could
+/// answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownbase-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "outer", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a base on its own mount within {OWN_MOUNT_ANSWER:?}: it opened the base through \
+       its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a base on the daemon's own mount is refused: {err}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// A-227, a landing's target (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume (FUSE on Linux, NFS on macOS), make a directory in it, and present a landing of a second
+/// volume into that directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon
+/// still answering. Before A-227 the shard walked the target through its own mount and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownland-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let mounted = created("mounted");
+  let landed = created("landed");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &mounted, &mount.path);
+  let target = format!("{}/target", mount.path);
+  shell(&format!("mkdir {target}"));
+  let landing = ["land", &landed, &target, "--json"];
+  let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a landing target on its own mount within {OWN_MOUNT_ANSWER:?}: it walked the \
+       target through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a landing target on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    std::fs::read_dir(&target).unwrap().count(),
+    0,
+    "the target is untouched"
+  );
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// A-227, a FUSE mount point (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume through FUSE, make a directory in it, and mount a second volume at that directory. Expect:
+/// refused at once (exit 1, `OwnMount`), nothing mounted there, and the daemon still answering. Before A-227 the
+/// shard's mount-point check stat'ed the directory through its own mount and waited on itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ownpoint-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let outer = created("outer");
+  let inner = created("inner");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &outer, &mount.path);
+  let point = format!("{}/nested", mount.path);
+  shell(&format!("mkdir {point}"));
+  let nested = ["mount", &inner, &point];
+  let Some((code, out, err)) = run_within(&instance, &nested, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a mount point on its own mount within {OWN_MOUNT_ANSWER:?}: it stat'ed the point \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a mount point on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert!(mountinfo_at(&point).is_none(), "nothing is mounted there");
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// Format: the signal that ends the instance's daemon with its kernel mounts kept for a successor. macOS: `SIGTERM`, an
+/// orderly stop (the daemon drains and exits; the anchor holds the NFS mount's connections, A-113), since no daemon is
+/// killed under a macOS kernel mount. Linux: `SIGKILL`, since a daemon stopped in order ends its FUSE connections (its
+/// mounts then answer `ENOTCONN`) and the anchor holds a FUSE device only across a daemon that did not end it (A-61).
+#[cfg(target_os = "macos")]
+const KEEPING_SIGNAL: &str = "-TERM";
+#[cfg(target_os = "linux")]
+const KEEPING_SIGNAL: &str = "-KILL";
+
+/// Ends the instance's daemon with its kernel mounts kept ([`KEEPING_SIGNAL`]), returning its pid; the anchor starts a
+/// successor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn end_keeping_mounts(instance: &str) -> u32 {
+  let ended = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args([KEEPING_SIGNAL, &ended.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "{KEEPING_SIGNAL} sent"
+  );
+  ended
+}
+
+/// [`end_keeping_mounts`], then the anchor's successor's pid once it answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restart_keeping_mounts(instance: &str) -> u32 {
+  let ended = end_keeping_mounts(instance);
+  await_daemon(instance, Some(ended), &[])
+}
+
+/// A-227, a restart (§4.6: no daemon thread opens a path on a volume the daemon serves, its predecessor's mounts
+/// included). Do: on a one-shard daemon, mount a volume (FUSE on Linux, NFS on macOS) and make a directory in it; end
+/// the daemon with the mount kept ([`KEEPING_SIGNAL`]: an orderly stop on macOS) and wait for the anchor's successor;
+/// then create a second volume with that directory as its base. Expect: refused at once as the daemon's own mount (exit 1, `OwnMount`): the successor
+/// learned the mount it kept from its catalog before it served. Then the mount still serves, and the daemon answers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_on_a_mount_the_daemon_kept_across_a_restart_is_refused_by_kind() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownkept-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  restart_keeping_mounts(&instance);
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the successor did not answer a base on the mount it kept within {OWN_MOUNT_ANSWER:?}: it opened the base \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(code, 1, "a base on the kept mount is refused: {err}");
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// Shape: how long a successor may take to answer after a restart whose recovery meets a kept mount (A-227): its start
+/// and one refusal, the same bound as one answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const KEPT_RECOVERY_ANSWER: Duration = OWN_MOUNT_ANSWER;
+
+/// A-227, recovery's reacquire (§4.6, §4.8): a base that a mount of the daemon's own came to cover is never entered when
+/// a successor reacquires it. Do: on a one-shard daemon, create a volume over an empty directory `D/project`, then mount
+/// a second volume over `D` (FUSE on Linux, NFS on macOS) and make `project` in it, so `D/project` is now the mount's;
+/// end the daemon with the mount kept ([`KEEPING_SIGNAL`]). Expect: the successor answers within the bound, the first volume is
+/// not rebuilt and its log names the daemon's own mount, and the mount still serves. Before, the successor's one shard
+/// opened the base through the mount it had yet to serve again and waited on itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-ownreacq-{}", std::process::id());
+  let (mut anchor, mut stderr) =
+    spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), &instance, &[], ONE_SHARD);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let base = format!("{}/project", mount.path);
+  shell(&format!("mkdir {base}"));
+  let (code, _, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "covered",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "cover", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let cover = value_of(&out, "id");
+  own_mount_and_check(&instance, &cover, &mount.path);
+  shell(&format!("mkdir {base}"));
+  let stopped = end_keeping_mounts(&instance);
+  let started = Instant::now();
+  let mut log = Vec::new();
+  let refused = loop {
+    while let Ok(line) = lines.try_recv() {
+      log.push(line);
+    }
+    if let Some(line) = log
+      .iter()
+      .find(|line| line.contains("volume covered not rebuilt"))
+    {
+      break line.clone();
+    }
+    assert!(
+      started.elapsed() < START_WAIT + KEPT_RECOVERY_ANSWER,
+      "the successor never finished reacquiring the covered base: it opened it through the mount it kept and waits \
+       on itself"
+    );
+    pause();
+  };
+  assert!(
+    refused.contains("BaseOnOwnMount"),
+    "the covered base is refused as the daemon's own mount: {refused}"
+  );
+  let successor = await_daemon(&instance, Some(stopped), &[]);
+  assert_ne!(successor, stopped);
+  assert_eq!(
+    shell(&format!("ls {}", mount.path)).trim(),
+    "project",
+    "the kept mount still serves"
+  );
+  // The covered directory beneath the mount point, removed once the mount is gone, then the point itself.
+  let point = mount.path.clone();
+  drop(mount);
+  let _ = Command::new("rmdir").arg(&base).output();
+  let _ = Command::new("rmdir").arg(&point).output();
+}
+
+/// Bug (GAPS, A-153's "Open, found here"; 2026-11-07), by use through a real mount: a loaded base directory removed after
+/// the last publication made the successor refuse the whole overlay (`RecoveryIncomplete`). §4.8's failure matrix: the
+/// gone directory's untouched entries refuse `BaseUnavailable`, while overlay entries serve. Do: an overlay over a
+/// directory holding `src/lib.rs`, `src/mod.rs` and `top`, mounted (FUSE on Linux, NFS on macOS); list `src` and write
+/// `src/agent.rs` through the mount; remove `src` from the disk and end the daemon with the mount kept
+/// ([`KEEPING_SIGNAL`]); wait for the successor. Expect: through the mount `src/agent.rs` reads back, `src/lib.rs` and
+/// `src/mod.rs` fail to read, and `top` reads the disk; `slates read` refuses `src/lib.rs` as `BaseUnavailable`. Neither
+/// base file in `src` is read before the restart, so no kernel cache can answer for the daemon.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_overlay_whose_base_directory_was_removed_serves_its_own_files_through_a_kept_mount() {
+  if !own_mount_tests_run() {
+    return;
+  }
+  let instance = format!("cli-goneunder-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let base = ScratchDir {
+    path: build_output_dir("slates-goneunder"),
+  };
+  let src = format!("{}/src", base.path);
+  shell(&format!(
+    "mkdir {src} && printf base > {src}/lib.rs && printf base > {src}/mod.rs && printf top > {}/top",
+    base.path
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "goneunder",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base.path,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  own_mount_and_check(&instance, &id, &mount.path);
+  let listed = shell(&format!("ls {}/src", mount.path));
+  assert!(
+    listed.contains("lib.rs"),
+    "src is listed through the mount: {listed}"
+  );
+  shell(&format!(
+    "printf agent > {}/src/agent.rs && sync",
+    mount.path
+  ));
+  shell(&format!("rm -r {src}"));
+  let ended = end_keeping_mounts(&instance);
+  await_daemon(&instance, Some(ended), &[]);
+  assert_eq!(
+    shell(&format!("cat {}/src/agent.rs", mount.path)),
+    "agent",
+    "the overlay's own file reads back"
+  );
+  for name in ["lib.rs", "mod.rs"] {
+    let read = Command::new("cat")
+      .arg(format!("{}/src/{name}", mount.path))
+      .output()
+      .unwrap();
+    assert!(
+      !read.status.success(),
+      "src/{name}, an untouched entry of the gone directory, does not read: {}",
+      String::from_utf8_lossy(&read.stdout)
+    );
+  }
+  assert_eq!(shell(&format!("cat {}/top", mount.path)), "top");
+  let (code, _, err) = run(&instance, &["read", &id, "/src/lib.rs"]);
+  assert_ne!(code, 0);
+  assert!(
+    err.contains("BaseUnavailable"),
+    "the gone directory's base file is refused by kind: {err}"
+  );
+}
+
+/// Makes a volume named `name` over a host directory in `scratch`, removes the directory and restarts the daemon in
+/// order (`SIGTERM`, no kernel mount involved), so the successor holds the volume's record but could not rebuild it.
+/// Returns the volume's id and the removed base.
+#[cfg(unix)]
+fn an_unrecovered_volume(instance: &str, scratch: &ScratchDir, name: &str) -> (String, String) {
+  let base = format!("{}/{name}-base", scratch.path);
+  shell(&format!("mkdir {base}"));
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      name,
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("rmdir {base}"));
+  restart_in_order(instance);
+  (id, base)
+}
+
+/// Stops the instance's daemon with `SIGTERM` and waits for its successor.
+#[cfg(unix)]
+fn restart_in_order(instance: &str) {
+  let stopped = daemon_pid(instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-TERM", &stopped.to_string()])
+      .status()
+      .unwrap()
+      .success(),
+    "SIGTERM sent"
+  );
+  await_daemon(instance, Some(stopped), &[]);
+}
+
+/// `slates <verb...>` on the unrecovered volume is refused `NotRecovered`, by kind.
+#[cfg(unix)]
+fn refused_not_recovered(instance: &str, verb: &[&str]) {
+  let (code, out, err) = run(instance, verb);
+  assert_ne!(
+    code, 0,
+    "{verb:?} on a volume recovery could not rebuild: {out}"
+  );
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing"),
+    "{verb:?} is refused because recovery could not rebuild the volume, by kind: {err}"
+  );
+}
+
+/// Bug (2026-11-06, found by A-227's reacquire test): a volume recovery could not rebuild stays in the catalog, and
+/// `volume list` shows it, while `status` answered `NotFound`, as if it were not there. A listed volume answers its real
+/// state: the recovery refusal by kind. The sweep of 2026-11-08 (GAPS): `volume list` names why on the volume's line,
+/// and the verbs that would change it refuse typed, a share included, though a share touches only the catalog. Do:
+/// create a volume over a host directory, remove the directory, and restart the daemon in order (no kernel mount is
+/// involved). Expect: `volume list` shows the volume with `not_recovered=BaseMissing`; its `status`, a `volume snapshot`
+/// and a `share` are each refused `NotRecovered`, naming the missing base.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's status: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-unrecovered-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-unrecovered"),
+  };
+  let (id, base) = an_unrecovered_volume(&instance, &scratch, "unrecovered");
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line.contains(" unrecovered ") && line.ends_with(" not_recovered=BaseMissing")),
+    "the catalog lists the volume, naming why it was not rebuilt: {out}"
+  );
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseMissing") && err.contains(&base),
+    "a listed volume's status names why recovery could not rebuild it, by kind: {err}"
+  );
+  refused_not_recovered(&instance, &["volume", "snapshot", &id]);
+  refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
+/// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
+/// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
+/// in order, then `volume destroy` it. Expect: the destroy succeeds; `volume list` no longer names it and its `status`
+/// answers `NotFound`; its name can be given to a new volume; and after a second restart nothing is reported not
+/// rebuilt and the volume is still gone.
+#[cfg(unix)]
+#[test]
+fn a_volume_recovery_could_not_rebuild_is_destroyed_and_stays_gone() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrecovered volume's destroy: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-undestroyed-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-undestroyed"),
+  };
+  let (id, _) = an_unrecovered_volume(&instance, &scratch, "undestroyed");
+  let (code, out, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(
+    code, 0,
+    "a volume recovery could not rebuild is destroyed: {out}{err}"
+  );
+  assert_gone(&instance, &id);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "undestroyed", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "the destroyed volume's name is free: {err}");
+  restart_in_order(&instance);
+  assert_gone(&instance, &id);
+}
+
+/// `volume list` names no `undestroyed` volume recovery could not rebuild, and `status` of `id` answers `NotFound`.
+#[cfg(unix)]
+fn assert_gone(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.contains("not_recovered="),
+    "no volume is listed as not rebuilt: {out}"
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_ne!(code, 0, "the destroyed volume has no status: {out}");
+  assert!(
+    err.contains("NotFound"),
+    "the destroyed volume is not found: {err}"
+  );
 }

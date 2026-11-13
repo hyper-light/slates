@@ -45,11 +45,12 @@ impl slates_vfs::recover::ImageWrite for ObjectImage {
 use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
+use slates_vfs::inode::WindowsAttributes;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{
-  BodyImage, EntryImage, ImageOut, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage,
-  SharedSource, VolumeImage,
+  AttrsImage, BodyImage, EntryImage, ImageOut, InodeImage, KeyedImage, KindImage, PolicyImage,
+  ShardImage, SharedSource, VolumeImage,
 };
 use slates_vfs::volume::{Store, Volume, VolumeConfig};
 
@@ -1734,7 +1735,7 @@ fn a_surviving_attachments_references_are_restored_and_every_other_holders_relea
   )
   .unwrap();
   let settled = recovered
-    .settle_recovered_references(&mut fresh, |id| id == 42)
+    .settle_recovered_references(&mut fresh, |id| id == 42, &[])
     .unwrap();
   assert_eq!(
     settled,
@@ -2267,10 +2268,11 @@ fn stream_into(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
     &mut Vec<slates_vfs::recover::HeldNfsReply>,
+    &mut Vec<slates_vfs::recover::HeldNfsStates>,
   ),
 ) -> Result<usize, VfsError> {
   let mut stage = Vec::new();
@@ -2280,7 +2282,11 @@ fn stream_into(
     stream.buf().extend_from_slice(key);
     vol.encode_image_into(store, None, &mut stream)?;
   }
-  ShardImage::encode_finish(stream.buf(), held, (replies, calls, nfs_replies));
+  ShardImage::encode_finish(
+    stream.buf(),
+    held,
+    (replies, calls, nfs_replies, nfs_states),
+  );
   journal.finish_checkpoint(stream)
 }
 
@@ -2289,10 +2295,11 @@ fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  (replies, calls, nfs_replies): (
+  (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
     &[slates_vfs::recover::HeldNfsReply],
+    &[slates_vfs::recover::HeldNfsStates],
   ),
 ) -> ShardImage {
   ShardImage::new(
@@ -2308,6 +2315,7 @@ fn shard_of(
   .with_replies(replies.to_vec())
   .with_calls(calls.to_vec())
   .with_nfs_replies(nfs_replies.to_vec())
+  .with_nfs_states(nfs_states.to_vec())
 }
 
 /// The streamed checkpoint (2026-10-06; call records A-127). Do: stream a shard — the varied volumes plus one of 2,000
@@ -2343,7 +2351,37 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
       results: Vec::new(),
     },
   ];
-  let expected = shard_of(&store, &volumes, &held, (&replies, &calls, &nfs_replies));
+  // Two held connections' byte states (A-231), out of order, so the streamed encoder's sort is compared too.
+  let carried = |connection: u64, byte| slates_vfs::recover::HeldNfsStates {
+    connection,
+    volume: [u8::try_from(connection).unwrap(); 16],
+    files: vec![slates_vfs::recover::CarriedFile {
+      ino: 3,
+      lost: false,
+      ranges: vec![
+        slates_vfs::recover::CarriedRange {
+          start: 0,
+          end: 4096,
+          byte,
+        },
+        slates_vfs::recover::CarriedRange {
+          start: 4096,
+          end: u64::MAX,
+          byte: slates_vfs::recover::CarriedByte::Absent,
+        },
+      ],
+    }],
+  };
+  let mut nfs_states = vec![
+    carried(8, slates_vfs::recover::CarriedByte::Stale),
+    carried(2, slates_vfs::recover::CarriedByte::Fresh),
+  ];
+  let expected = shard_of(
+    &store,
+    &volumes,
+    &held,
+    (&replies, &calls, &nfs_replies, &nfs_states),
+  );
   let encoded = expected.to_content();
   assert!(
     encoded.len() > 2 * slates_vfs::recover::STREAM_STAGE_BYTES,
@@ -2358,7 +2396,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &store,
     &volumes,
     &held,
-    (&mut replies, &mut calls, &mut nfs_replies),
+    (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
   assert_eq!(frame, FRAME_BYTES + encoded.len(), "the frame's bytes");
@@ -2390,7 +2428,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
   let (volumes, _, _) = streamed_shard(&mut store);
   let mut small_sorted = varied_volumes(&mut store);
   small_sorted.sort_by_key(|(key, _)| *key);
-  let small_image = shard_of(&store, &small_sorted, &[], (&[], &[], &[]));
+  let small_image = shard_of(&store, &small_sorted, &[], (&[], &[], &[], &[]));
   let slot_bytes = small_image.to_content().len() + slates_vfs::recover::STREAM_STAGE_BYTES;
   let mut slots = vec![0u8; 2 * slot_bytes];
   let mut journal = slates_vfs::checkpoint_log::Journal::default();
@@ -2400,7 +2438,12 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &store,
     &small_sorted,
     &[],
-    (&mut Vec::new(), &mut Vec::new(), &mut Vec::new()),
+    (
+      &mut Vec::new(),
+      &mut Vec::new(),
+      &mut Vec::new(),
+      &mut Vec::new(),
+    ),
   )
   .unwrap();
 
@@ -2512,3 +2555,179 @@ fn a_writes_accounting_equals_a_recount_after_every_step() {
     );
   }
 }
+
+/// A-262. Do: create a file (the volume marks it `ARCHIVE`, as NTFS does), set `HIDDEN | SYSTEM` on a second and
+/// `READONLY | HIDDEN` on a directory, ask for a third file's `READONLY` (dropped: a file's read-only state is its
+/// mode), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
+/// carries each inode's bits at Windows' values, and the rebuilt volume reports the same bits.
+#[test]
+fn windows_attributes_survive_an_image_and_a_rebuild() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let archived = vol
+    .create_file_no(&mut store, root, "archived", 0o644)
+    .unwrap();
+  let hidden = vol
+    .create_file_no(&mut store, root, "hidden", 0o644)
+    .unwrap();
+  let readonly = vol
+    .create_file_no(&mut store, root, "readonly", 0o644)
+    .unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "dir", 0o755).unwrap();
+  let set = |bits: u32, kind| WindowsAttributes::kept(bits, kind);
+  let file = slates_vfs::inode::Kind::File;
+  vol
+    .set_windows_attributes(&mut store, hidden, set(0x2 | 0x4, file))
+    .unwrap();
+  vol
+    .set_windows_attributes(&mut store, readonly, set(0x1 | 0x20, file))
+    .unwrap();
+  vol
+    .set_windows_attributes(
+      &mut store,
+      dir,
+      set(0x1 | 0x2 | 0x10, slates_vfs::inode::Kind::Dir),
+    )
+    .unwrap();
+  let expected = [
+    (archived, 0x20),
+    (hidden, 0x2 | 0x4),
+    (readonly, 0x20),
+    (dir, 0x1 | 0x2),
+    (root, 0),
+  ];
+  let image = vol.to_image(&store, None).unwrap();
+  let image = VolumeImage::from_content(&image.to_content()).expect("the image decodes");
+  for (no, bits) in expected {
+    assert_eq!(
+      inode(&image, no).windows,
+      bits,
+      "the image carries {no:?}'s bits"
+    );
+  }
+  let mut fresh = common::surviving(&store);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let rebuilt = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  for (no, bits) in expected {
+    assert_eq!(
+      rebuilt.windows_attributes(&fresh, no).unwrap().bits(),
+      bits,
+      "the rebuilt volume keeps {no:?}'s bits"
+    );
+  }
+}
+
+/// A-262's golden vector: one file's inode image with `HIDDEN | ARCHIVE` kept, encoded as image version 23 writes it.
+/// The bits are the last two bytes, little-endian at Windows' own values (`22 00`), after the attribute-owner and
+/// sidecar options; a change to the layout fails it.
+#[test]
+fn an_inode_images_encoding_is_its_golden_vector() {
+  use slates_wire::Wire;
+  let image = InodeImage {
+    no: 2,
+    generation: 1,
+    born: 3,
+    kind: KindImage::File,
+    attrs: AttrsImage {
+      mode: 0o644,
+      uid: 501,
+      gid: 20,
+      nlink: 1,
+      size: 4,
+      atime: 10,
+      mtime: 11,
+      ctime: 12,
+      btime: 13,
+    },
+    version: 7,
+    home: None,
+    multi: false,
+    body: BodyImage::Inline {
+      bytes: b"data".to_vec(),
+    },
+    xattrs: Vec::new(),
+    attribute_of: None,
+    sidecar: None,
+    windows: 0x22,
+  };
+  let mut bytes = Vec::new();
+  image.encode(&mut bytes);
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(hex, GOLDEN_INODE_IMAGE, "the inode image's encoding");
+  let back = InodeImage::decode(&mut bytes.as_slice()).unwrap();
+  assert_eq!(back, image, "the golden decodes to the image it encodes");
+}
+
+/// Format: the golden encoding of [`an_inode_images_encoding_is_its_golden_vector`]'s inode image.
+const GOLDEN_INODE_IMAGE: &str = concat!(
+  "0200000000000000",                                                 // no
+  "01000000",                                                         // generation
+  "0300000000000000",                                                 // born
+  "00000000",                                                         // kind: File
+  "a4010000f50100001400000001000000", // mode 0o644, uid 501, gid 20, nlink 1
+  "0400000000000000",                 // size
+  "0a000000000000000b000000000000000c000000000000000d00000000000000", // atime, mtime, ctime, btime
+  "0700000000000000",                 // version
+  "0000",                             // home: None; multi: false
+  "020000000400000064617461",         // body: Inline, 4 bytes, "data"
+  "00000000",                         // xattrs: none
+  "0000",                             // attribute_of: None; sidecar: None
+  "2200",                             // windows: HIDDEN | ARCHIVE (image version 23, A-262)
+);
+
+/// A-262's golden vector for a base file's witness, as image version 24 writes it: its fingerprint now ends with the
+/// disk's Windows attribute bits (`HIDDEN | ARCHIVE`, `22 00`), after the birth time, and the content identity and the
+/// witness's own fields follow. A change to the layout fails it.
+#[test]
+fn a_witness_encoding_is_its_golden_vector() {
+  use slates_wire::Wire;
+  let witness = slates_vfs::inode::Witness {
+    fingerprint: slates_vfs::inode::Fingerprint {
+      dev: 1,
+      ino: 2,
+      size: 3,
+      mtime_ns: 4,
+      ctime_ns: 5,
+      mode: 0o100_644,
+      uid: 501,
+      gid: 20,
+      birth_ns: 6,
+      windows: 0x22,
+    },
+    identity: [0xab; 32],
+    witnessed_at: 7,
+    racy: false,
+  };
+  let mut bytes = Vec::new();
+  witness.encode(&mut bytes);
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  assert_eq!(hex, GOLDEN_WITNESS, "the witness's encoding");
+  let back = slates_vfs::inode::Witness::decode(&mut bytes.as_slice()).unwrap();
+  assert_eq!(
+    back, witness,
+    "the golden decodes to the witness it encodes"
+  );
+}
+
+/// Format: the golden encoding of [`a_witness_encoding_is_its_golden_vector`]'s witness.
+const GOLDEN_WITNESS: &str = concat!(
+  "0100000000000000",                                                 // dev
+  "0200000000000000",                                                 // ino
+  "0300000000000000",                                                 // size
+  "04000000000000000500000000000000",                                 // mtime, ctime
+  "a4810000f501000014000000", // mode 0o100644, uid 501, gid 20
+  "0600000000000000",         // birth time
+  "2200",                     // windows: HIDDEN | ARCHIVE (image version 24, A-262)
+  "abababababababababababababababababababababababababababababababab", // identity
+  "0700000000000000",         // witnessed at
+  "00",                       // racy: false
+);

@@ -2154,7 +2154,111 @@ cargo `target/release`, 64 copies each, every heap byte counted), heap bytes an 
 203–250, a 36-entry readdir 479–604 → 510–687, the create burst 1,663–1,697 → 1,765–1,818 ns a file, AC-1.8 destroy
 slices within budget either way, AC-1.5 352,335,998 → 383,350,910 B (the bench's 36-entry directories). Still owed: owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
 item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
-forms (Sweeney et al., USENIX 1996) without the global allocator.
+forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
+classes" above): AC-1.5 350,460,030 → 292,914,814 B.
+
+### The own-mount check on macOS (§4.6, A-227; 2026-11-06) — unresolved under load
+
+On macOS a crossing below a base is compared with the mount points of this daemon's own NFS mounts: with none recorded
+the check is one atomic load, and with one recorded it is the kernel's path of the parent (`F_GETPATH`) and a string
+comparison. `cargo build --release -p slates-base --example base_bench`, at `agents/slabs-siblings` after `ca5ba635`,
+whose last rows repeat the lookups with one mount recorded (`/dev`, which the directory does not lie on, so nothing is
+refused). The two arms run in one process, unrecorded first. The directory holds 810 files (alternating 4 KiB and
+128 KiB, made for the run). Apple M5 Max, 18 cores, macOS 26.4.1, shared with other agents' builds: 1-minute load 51
+to 54 (5-minute 71). Five runs; each run's median in ns:
+
+| row | none recorded | one recorded |
+|---|---|---|
+| list, per entry | 2,728, 2,317, 2,423, 2,484, 2,475 | 2,406, 2,730, 2,897, 2,645, 2,853 |
+| open and `fstat` a file | 31,542, 30,958, 32,666, 14,000, 16,041 | 35,542, 36,875, 27,333, 15,958, 34,708 |
+
+The load hides the difference. Each open's change, run by run, is +4.0, +5.9, −5.3, +2.0 and +18.7 µs, against opens
+that themselves range from 14.0 to 32.7 µs. A listing of files checks no entry, since only directories can be mount
+points, so the listings' +161 to +474 ns in four of five runs is the fixed order (the recorded arm runs second), not
+the check. Owed: the same rows at a quiet load. Linux's figures are in the section below.
+
+### The own-mount check on the base plane's lookups (§4.6, A-227; 2026-11-06, Linux)
+
+Every lookup below a base now opens the entry `O_PATH | O_NOFOLLOW` and reads its mount id from `/proc/self/fdinfo`
+before anything else touches it (A-227). Measured with `cargo build --release -p slates-base --example base_bench` at
+A = main `28359a75` and B = `agents/slabs-siblings` (the check, with each directory's mount id read once and a
+listing's file entries left unchecked), both over one directory of 810 files (alternating 4 KiB and 128 KiB, made for
+the run, since the bench's `target/debug/deps` is not under a kiln copy). adacachy (AMD Ryzen 9 9950X3D2, 32 threads,
+Linux 7.2.9-2-cachyos), loaded by other agents' CI builds: 1-minute load 62 to 85. Five rounds, A then B; each run's
+median in ns:
+
+| row | A (main) | B (the check) |
+|---|---|---|
+| list, per entry | 256, 270, 264, 258, 256 | 261, 261, 255, 254, 269 |
+| open and `fstat` a file | 501, 498, 503, 506, 498 | 1,764, 1,753, 1,753, 1,743, 1,774 |
+| `pread` 4 KiB | 85, 97, 86, 85, 83 | 86, 88, 87, 87, 86 |
+| fingerprint a directory | 89, 88, 88, 87, 88 | 88, 89, 88, 87, 88 |
+
+A checked open costs 1.25 µs more at the median (an `O_PATH` open and one fdinfo read), 3.5 times the open alone. A
+listing of files costs the same. A directory entry in a listing pays about the same as an open, which this directory
+(no subdirectories) does not show. The first form read the parent's mount id at every lookup and checked every listed
+entry: 2,699 to 2,983 ns a listed entry and 2,705 to 4,098 ns an open (five rounds each, load 78 to 107), and was
+replaced the same day.
+
+### Directory blocks in size classes (§4.5, AC-1.5, AC-1.8, A-203; 2026-11-05) — adopted
+
+Owed since "Directory blocks against real trees" below. A block is the smallest of 17 classes, 256 B to 4 KiB, four to
+a doubling, that holds its entries. Each class is a list of 64 KiB pages from one slab (`crates/vfs/src/dirblocks.rs`).
+A (1 KiB blocks): main at `21da6e57`. B (classes): `agents/slabs` at `0e16c44a`. Both are release builds of
+`cargo build --release -p slates-vfs --example vfs_bench --example tree_heap` (B's vfs_bench rebuilt at `0e16c44a`).
+Runs are interleaved A B A B…, each run's 1-minute load recorded before it. Apple M5 Max, 18 cores, 128 GB,
+macOS 26.4.1, shared with other agents' builds.
+
+Memory, which no load moves (every run returned the same bytes):
+- AC-1.5 at 10^6 files and 27,842 directories, 46 runs here: A 350,460,030 B in all 23 of its runs (budget
+  366,741,224); B 292,914,814 B in all 23 of its runs (budget 293,620,336). B's 23 include 13 runs of its first build
+  (before the fix below), which holds the same bytes. That is 16.4% less, and under the 4 KiB-block figure of
+  2026-10-05 (352,335,998). The measured directory (36 entries of 49-byte names, 2,644 bytes) is one 3,072-byte block,
+  where it was three 1 KiB leaves and an index. B's budget counts each slab's true slot bytes and the group
+  directories' blocks, which the old block term's slack had hidden.
+- Real trees (`tree_heap`, 64 copies each, every heap byte counted), heap bytes an entry A → B: npm 300 → 260, pip
+  336 → 275, cargo 386 → 293 (13 to 24% less). The 1 KiB block of A-101 had been 332 / 368 / 418 before the inode
+  shrank.
+
+Time, `vfs_bench` best of 10 a row per arm, at loads 11.3 to 21.9 (1-minute average before each run); all ten medians
+in ns, sorted:
+
+| row | A (1 KiB) | B (classes) |
+|---|---|---|
+| lookup one name in a 36-entry dir of a 10^3-file tree | 338 341 343 348 383 411 666 687 687 692 | 223 224 348 348 354 411 567 567 697 708 |
+| same, p99s | 349 354 354 354 421 655 697 708 708 708 | 229 229 354 359 369 421 578 583 708 4,792 |
+| lookup one name in a 36-entry dir of a 10^5-file tree | 343 348 359 395 401 406 562 567 687 692 | 213 354 364 364 401 406 406 665 703 708 |
+| readdir of a 36-entry dir (10^3) | 1,062 1,093 1,229 1,666 1,823 2,125 2,125 2,146 2,187 2,271 | 729 1,062 1,083 1,083 1,250 1,270 1,271 1,567 2,291 2,729 |
+| same, p99s | 2,198 3,042 3,937 4,770 5,000 5,812 6,042 6,833 13,416 14,354 | 2,208 3,000 3,167 3,271 3,459 3,875 4,291 6,562 7,125 17,354 |
+| readdir of a 36-entry dir (10^5) | 1,062 1,083 1,104 1,208 1,250 1,364 1,802 2,104 2,104 2,125 | 666 1,005 1,042 1,062 1,062 1,208 1,218 2,083 2,083 2,198 |
+| create and unlink in a 10^3-file tree | 3,916 3,958 3,958 4,000 4,500 7,584 7,833 7,959 8,000 8,000 | 2,375 2,416 3,875 3,875 3,959 4,625 6,208 6,250 7,213 13,083 |
+| same, p99s | 4,666 4,708 5,167 6,792 7,750 8,666 11,042 14,125 14,709 20,167 | 2,875 4,209 4,667 7,625 7,625 8,750 9,084 11,500 19,390 84,937 |
+| create and unlink in a 10^5-file tree | 3,875 3,916 3,917 4,459 4,583 4,958 6,458 6,542 7,750 7,792 | 2,292 3,791 3,792 3,792 4,291 4,375 4,375 7,375 7,417 7,541 |
+| create burst of 190,000 files, per file (each run's best of 3) | 2,323 2,941 3,268 3,600 3,797 4,502 4,520 4,710 5,744 6,466 | 2,966 3,472 3,609 4,045 4,194 4,248 4,369 5,006 5,915 6,287 |
+| insert and remove, raw tree of 2 | 197 203 205 208 231 234 276 395 403 523 | 247 247 250 255 260 283 481 486 499 520 |
+| insert and remove, raw tree of 8 | 200 200 200 203 231 231 260 395 399 403 | 156 252 255 257 296 359 507 510 520 536 |
+| insert and remove, raw tree of 32 | 351 354 364 369 442 494 708 729 734 750 | 171 177 276 281 286 312 317 562 588 932 |
+| insert and remove, raw tree of 128 | 364 375 380 395 427 494 742 744 750 750 | 323 323 497 541 552 625 1,041 1,041 1,062 1,104 |
+
+Every lookup, readdir and create row is at least as good at its best, and every B p50 and p99 is inside A's spread.
+The burst's best is 28% slower (2,323 → 2,966 ns). Its mid is even (4,150 → 4,221), and B's best is inside A's
+spread. The raw tree probe is 25 to 30% slower at 2 and 4 entries (197 → 247 and 197 → 260 ns), inside A's spread
+(to 523 and 395). That is the two-level reference (page, then slot) on a path of a few dozen instructions. From 8
+entries up it is faster. AC-1.8 (destroy slices) passed in all 23 B runs, no slice past budget. AC-1.3 (snapshot and
+clone independent of size) failed at this load on both arms in both 10-round sets, A 3 and 3 of 10, B 5 and 2 of 10
+(B's first build, then this one), and passed in the rest. Neither
+operation touches a block.
+
+Found on the way and fixed, red test first (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block has
+only a few dozen bytes of slack. So a create and unlink of one name, which left the removed name's bytes as a hole,
+compacted the whole block every few rounds. The first B build measured the raw insert and remove at 159 to 333 ns
+best of 13, against A's 119 to 125. The name written last is the lowest in the name area, and its removal now hands
+the bytes back at once.
+
+Not usable, and recorded so it is not repeated: the same binaries on adas-mac-studio-3.local (M4 Max) through
+`kiln run` ran at priority band 4 beside a CI job. `tree_heap` took 143 s of wall time on 3.5 s of CPU, and the
+vfs_bench create burst came out 180 to 280 µs a file on both arms. Only that run's AC-1.5 bytes, identical to the local
+ones, are kept.
 
 ### An idle daemon's cost, and the real workloads again under a TCP-exhausted Docker VM (2026-10-05, afternoon)
 
@@ -3832,6 +3936,204 @@ back. Every byte was identical. Load average 8–11 from other sessions.
 1, 4 and 16 workers. Reads rose a little (2.67–2.71 against 2.31–2.65 GB/s), too little to land on one run. So the
 write gap to nfsd is in slates' own write path, owed a profile. Two tests encode the 256 KiB size as a literal and
 would need deriving from the constant first (`rtmax is one arena chunk`; a listing sized to need two pages).
+
+### The large-file NFS write profiled: fresh content pages, sealing, and a turn's copies (VFS plan step 11; 2026-11-05)
+
+**The incumbent harness on today's main** (`docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` as recorded above, Linux
+release build of `76b450a1` from its own target volume, Apple M5 Max, Docker Desktop's 6.12.76-linuxkit kernel,
+2026-11-05 05:56Z, load 14–15, one run): the large 64 MiB write at 1, 4 and 16 workers, MiB/s.
+
+| target | 1 | 4 | 16 |
+|---|---|---|---|
+| slates | 852.7 | 957.0 | 808.0 |
+| kernel nfsd | 1,556.5 | 1,831.2 | 1,640.3 |
+| tmpfs | 1,670.1 | 1,709.9 | 1,635.7 |
+
+**Where the time goes.** Linux's own NFSv4.2 client on CI's runner, against slates (4 shards, unprivileged) and nfsd
+exporting a tmpfs, the daemon under `perf record -g` (frame pointers, kernel symbols) during a 1 GiB new-file write
+(`diag/nfs-write/prof.sh` on branch `diag-nfs-write-4`, run 41986870989, AMD EPYC 7763, 4 vCPU, load 1.3). Every
+sample was on one shard, the volume's. Of its samples:
+
+| cost | share |
+|---|---|
+| page faults on fresh content pages (`asm_exc_page_fault`; `shmem_fault` 23.2%; zeroing, `kernel_init_pages`, 3.1%) | 41.5% |
+| sealing at rest (AES-256-GCM, `_aesni_ctr32_ghash_6x` 13.6% self) | 21.0% |
+| the connection's peek and the copies out of it (`peek_head`; the kernel's copy 7.8%) | 12.4% |
+| everything else (the volume write's copy, dispatch, replies) | about 25% |
+
+- **Fresh against resident pages** (same script, run 41978355633, a faster runner): a 1 GiB write right after the
+  last one was removed, its freed pages still resident, ran 2,047–2,190 MiB/s (nfsd 2,148–2,218). After an idle
+  pause, once A-105's purge had given them back, 874–957 MiB/s, with 264,993 minor faults (one per 4 KiB page) and
+  1.03 s of daemon task clock per GiB against 0.41 s resident. The incumbent harness never deletes its large files, so
+  every large write is the fresh case. The runner's `shmem_enabled` is `never`, so each page is a 4 KiB fault.
+- **What a fresh page costs** (`diag/nfs-write/faults.py 512 5`, a shared memfd as the content arena maps it, run
+  41987962954, EPYC 7763, three runs, best of 5 each, all shown in the run):
+
+  | how the fresh pages are filled | MiB/s, best of each run |
+  |---|---|
+  | stores through the mapping (slates) | 1,293 / 1,303 / 1,305 |
+  | `MADV_POPULATE_WRITE` per 64 KiB, then stores | 1,221 / 1,227 / 1,236 |
+  | `MADV_POPULATE_WRITE` per 1 MiB, then stores | 1,265 / 1,269 / 1,268 |
+  | populated ahead by a second thread | 1,006 / 972 / 997 |
+  | `pwrite` into the memfd (the kernel's write path, as nfsd fills tmpfs) | 2,493 / 2,475 / 2,485 |
+  | resident pages | 14,052 / 13,820 / 13,981 |
+
+  Batching the populate does not help, and a second thread contends rather than helps. Only the kernel's write path,
+  which takes no fault and does not zero a page it overwrites whole, is cheaper, about 1.9×. A write syscall into the
+  content object is outside what R1's lint wall allows anywhere but `slates-land`.
+
+**Landed: a turn takes only the records its quantum can reach** (A-204, amending A-74). Every turn copied every whole
+record its peek found; a 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE behind it and dropped
+it. Now a turn stops taking records once their bytes exceed what its quantum copies at the measured memcpy rate.
+- In process (`cargo build --release -p slates-cli --example nfs_large_write`, new: an in-process daemon, one
+  connection flushing a 512 MiB new file as 16 pipelined 256 KiB UNSTABLE WRITEs and a COMMIT, NFSv3 and NFSv4.2
+  interleaved each round; kiln-a094a12d, Fedora 6.19 x86_64, load 18.5–21.6; three interleaved runs per arm, best of
+  seven rounds each):
+
+  | run | main v3 | change v3 | main v4.2 | change v4.2 |
+  |---|---|---|---|---|
+  | 1 | 1,768.0 | 1,974.7 | 1,643.7 | 1,780.3 |
+  | 2 | 1,882.6 | 1,969.4 | 1,748.4 | 1,863.8 |
+  | 3 | 1,865.8 | 2,067.6 | 1,798.6 | 1,983.6 |
+
+- Through Linux's NFSv4.2 client, the incumbent harness (`linux_vs_nfsd.sh 400 64`, as of main) in a privileged
+  container per run, arms built on one runner and alternated A, B three times (branch `diag-nfs-write-7`, run
+  41989095517, Intel Xeon Platinum 8573C, 4 vCPU, load 0.9–2.4). The large write, MiB/s at 1, 4 and 16 workers:
+
+  | run | main | change | nfsd (main's run / the change's) |
+  |---|---|---|---|
+  | 1 | 435.7 / 441.3 / 369.2 | 456.2 / 472.2 / 452.9 | 690–719 / 700–725 |
+  | 2 | 405.3 / 421.3 / 358.0 | 445.0 / 464.4 / 455.6 | 699–729 / 708–732 |
+  | 3 | 399.8 / 415.0 / 353.5 | 441.9 / 432.5 / 464.0 | 697–718 / 690–717 |
+
+  Best of nine: 441.3 → 472.2. The change beats main beyond the spread at 1 worker and at 16 (+26%), and the two
+  overlap at 4 (432.5 against 441.3). Write p99 at 16 workers did not get worse: create 4,664–5,154 → 4,636–4,804 µs,
+  overwrite 1,874–2,152 → 1,562–1,918 µs, append 1,687–2,320 → 1,574–1,943 µs. Every byte read back identical.
+
+- On the incumbent client itself (the 2026-10-08 harness: Apple M5 Max, Docker Desktop's 6.12.76-linuxkit, a
+  privileged `rust:1.98` container per run; Linux release builds from their own target volumes: main `76b450a1`, the
+  change `3a506310`; six rounds, each main then the change, 2026-11-05 08:19–08:24Z, load 23–38 from other
+  sessions). The large write, MiB/s at 1, 4 and 16 workers:
+
+  | round | main | change | nfsd in main's run | nfsd in the change's run |
+  |---|---|---|---|---|
+  | 1 | 794.9 / 813.8 / 919.7 | 887.6 / 963.1 / 859.4 | 1,680 / 1,607 / 1,769 | 1,680 / 1,671 / 1,718 |
+  | 2 | 604.2 / 723.6 / 684.6 | 883.9 / 874.8 / 759.0 | 1,277 / 1,340 / 1,312 | 1,375 / 868 / 1,781 |
+  | 3 | 854.2 / 929.2 / 832.4 | 885.5 / 984.7 / 837.8 | 1,565 / 1,688 / 1,831 | 1,544 / 1,543 / 1,197 |
+  | 4 | 873.3 / 979.3 / 790.4 | 963.1 / 1,007.8 / 931.3 | 1,550 / 1,692 / 1,990 | 1,623 / 1,824 / 1,848 |
+  | 5 | 913.7 / 1,019.0 / 821.0 | 970.5 / 990.9 / 910.5 | 1,411 / 1,743 / 1,742 | 1,506 / 1,749 / 1,738 |
+  | 6 | 717.6 / 851.8 / 920.2 | 848.9 / 885.4 / 412.1 | 1,223 / 1,379 / 1,530 | 1,432 / 1,415 / 1,439 |
+
+  - Medians 824.6 → 886.6, 890.5 → 973.9 and 826.7 → 848.6 at 1, 4 and 16 workers. The change led its round 6 of 6
+    times at 1 worker, 5 of 6 at 4 and 4 of 6 at 16.
+  - Best of eighteen: main 1,019.0, the change 1,007.8. Both clear step 11's 967 at this load, and the ranges
+    overlap, so on this machine the change does not beat main beyond the spread. CI's quieter runner (above) is
+    where it does.
+  - Write p99 at 16 workers, µs, rounds 1–5 (create / overwrite / append): main 3,409–4,285 / 1,361–2,335 /
+    1,490–2,648; the change 2,998–5,234 / 1,203–2,940 / 1,153–2,945. The ranges overlap with no direction. Round 6
+    of the change stalled machine-wide at load 38: slates' create p99 was 15,680 µs, and nfsd's in the same
+    container 14,538 µs against 4,892 in main's round 6.
+  - nfsd wrote 868–1,990 MiB/s across the twelve runs. The gap to it is still about 1.8× at the medians.
+
+**What remains of the gap.** On that runner nfsd writes 690–732 MiB/s and slates 432–472. The largest cost is the
+fresh-page fault on the anchor's shared content object (41.5%), which slates can only avoid on its write path by
+having pages resident before the write arrives, or by filling them through the kernel's write path; both are design
+decisions put to Ada (GAPS). Sealing at rest (21%) is condition 9's.
+
+### Landed: an idle shard keeps its last write burst's pages pre-faulted (A-214; VFS plan step 11; 2026-11-05)
+
+The fresh-page fault was 41.5% of the large write's samples (the entry below). A-214 keeps the free blocks the next
+allocations will take resident, as many bytes as the shard's last write burst grew its content by, and faults any that
+are not in the shard's idle moments (`crates/server/src/daemon.rs`, `refill_slice`).
+
+**The incumbent harness on the incumbent client.** `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64`, a privileged
+`rust:1.98` container per run, Apple M5 Max, Docker Desktop's 6.12.76-linuxkit, Linux release builds from their own
+target volumes. A is the branch before A-214, B is `d2adcf7d`. Six rounds, each A then B, 2026-11-05 16:23–16:28Z,
+load 6–10. The large 64 MiB write, MiB/s at 1, 4 and 16 workers:
+
+| round | A | B | nfsd in A's run | nfsd in B's run |
+|---|---|---|---|---|
+| 1 | 913.6 / 918.2 / 937.5 | 882.5 / 1,195.8 / 1,015.1 | 1,538 / 1,743 / 1,767 | 1,796 / 1,782 / 1,931 |
+| 2 | 1,018.7 / 935.0 / 921.7 | 919.8 / 1,166.7 / 1,020.8 | 1,790 / 1,458 / 1,820 | 1,779 / 1,724 / 1,831 |
+| 3 | 923.2 / 996.5 / 925.3 | 958.9 / 1,272.7 / 1,032.8 | 1,595 / 1,791 / 1,952 | 1,792 / 1,753 / 1,776 |
+| 4 | 951.3 / 1,033.9 / 890.8 | 970.4 / 1,281.1 / 1,286.0 | 1,555 / 1,760 / 1,872 | 1,791 / 1,817 / 2,077 |
+| 5 | 988.5 / 1,020.6 / 921.9 | 970.5 / 1,270.1 / 1,117.0 | 1,675 / 1,862 / 1,908 | 1,784 / 1,838 / 2,016 |
+| 6 | 956.6 / 1,017.7 / 922.5 | 962.7 / 1,219.7 / 1,107.7 | 1,674 / 1,821 / 2,030 | 1,709 / 1,867 / 2,081 |
+
+- Best of eighteen: B 1,286.0 MiB/s, A 1,033.9. Step 11 asks 967.
+- B beats A beyond the spread at 4 workers (B's lowest 1,166.7 against A's highest 1,033.9) and at 16 (1,015.1 against
+  937.5). At 1 worker the arms overlap: the harness's first large write follows no earlier burst, so there is nothing
+  to keep for it.
+- Write p99 at 16 workers, µs (create / overwrite / append): A 3,110–4,197 / 1,314–2,193 / 1,357–2,659; B 2,999–3,687 /
+  1,487–2,315 / 1,496–2,332. The ranges overlap with no direction: B's create p99 is lower in four rounds of six, its
+  overwrite higher in five.
+- nfsd wrote 1,458–2,081 MiB/s. The gap to it at 4 and 16 workers fell from about 1.8× to about 1.5×.
+- The volume's shard counted `content.prefaulted_bytes` 358,875,136 in every B run and nothing in A.
+
+**Through Linux's NFSv4.2 client on CI.** The same harness, both arms built on one runner and alternated A, B three
+times (branch `diag-nfs-write-12`, run 42064893088, AMD EPYC 9V45, 4 vCPU, Azure kernel 7.0, load 0.8–2.5). The large
+write, MiB/s at 1, 4 and 16 workers:
+
+| round | A | B | nfsd in A's run | nfsd in B's run |
+|---|---|---|---|---|
+| 1 | 624.4 / 626.0 / 602.3 | 625.0 / 1,064.1 / 1,037.7 | 963 / 980 / 973 | 973 / 1,040 / 1,002 |
+| 2 | 620.2 / 635.7 / 621.0 | 623.6 / 1,014.3 / 1,017.4 | 955 / 976 / 971 | 724 / 857 / 997 |
+| 3 | 622.3 / 637.1 / 641.0 | 622.4 / 1,002.9 / 1,011.5 | 917 / 989 / 992 | 945 / 974 / 982 |
+
+- At 4 and 16 workers B is 60–70% faster, beyond the spread (1,002.9–1,064.1 against 602.3–641.0), and level with
+  nfsd on this runner; at 1 worker the arms are even.
+- Write p99 at 16 workers, µs (create / overwrite / append): A 3,505–3,914 / 1,361–1,543 / 1,329–1,462; B 3,647–4,341 /
+  1,284–1,479 / 1,291–1,435. They overlap.
+- The tick-only first build was dead even on the same harness (run 42058939194: 531–556 against 534–551 MiB/s).
+
+**Re-landed after the revert (2026-11-05).** Main reverted A-214 (CI 42119714654: A-205's give-back on both Windows
+lanes, and the arena test under Miri). The re-landing (`c9b971aa`) ends a busy period on a free as well as an
+allocation, so a delete takes its reserve with it:
+- `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it` (Linux): before the write the content object held
+  12,288 bytes, with the file and its reserve 33,759,232, and after the delete 204,800 (16,793,600 before the fix);
+- A-205's give-back (diagnostics run 42129821506), deleted bytes that left the working set: windows-latest 92% in
+  1.61 s and 104%; windows-11-arm 110% in 1.13 s and 205% in 1.05 s (the reserve's pages go back with the files);
+- the incumbent harness on the M5 Max, main `f5396e3b` (A) against `c9b971aa` (B), six rounds each A then B,
+  2026-11-05 23:37–23:41Z, load 12–44 from other sessions, MiB/s at 1, 4 and 16 workers:
+
+  | round | A | B |
+  |---|---|---|
+  | 1 | 934.9 / 745.4 / 973.3 | 983.9 / 970.9 / 1,221.8 |
+  | 2 | 962.6 / 868.7 / 1,016.3 | 934.7 / 951.6 / 1,211.5 |
+  | 3 | 931.6 / 787.4 / 954.2 | 944.2 / 963.0 / 1,238.3 |
+  | 4 | 818.4 / 767.6 / 905.3 | 826.1 / 981.5 / 988.5 |
+  | 5 | 918.3 / 715.3 / 1,021.9 | 933.3 / 899.9 / 1,183.9 |
+  | 6 | 1,002.8 / 796.3 / 925.4 | 945.8 / 895.6 / 1,278.1 |
+
+  Best of eighteen: B 1,278.1, A 1,021.9; step 11 asks 967. Beyond the spread at 4 workers (B's lowest 895.6 against
+  A's highest 868.7); at 16 workers B led every round but one round's 988.5 sits under A's 1,021.9; at 1 worker the arms
+  overlap. Write p99 at 16 workers, µs (create / overwrite / append): A 2,621–4,590 / 1,394–2,989 / 1,238–3,415; B
+  2,831–3,962 / 1,731–3,359 / 1,647–3,607, overlapping at this load. nfsd wrote 1,428–1,817 MiB/s. The volume's shard
+  counted 358,875,136 bytes pre-faulted in every B run.
+
+**The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
+than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
+last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes
+unchanged (`a_deleted_files_memory_goes_back_to_the_os`). Measured:
+- `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`: a 16,777,200-byte burst left 16,711,680 bytes
+  pre-faulted at idle, and the content object grew 184,320 bytes during the next 16 MiB write, against 16,961,536
+  without A-214. Under the whole `recovery` suite in parallel, on a host whose shmem grants `MADV_HUGEPAGE`
+  (`shmem_enabled` advise; adacachy, load 43–50, 2026-11-06), what a write needs beyond the reserve arrives in whole
+  2 MiB pages: the next write grew the object 2,097,152–4,194,304 bytes in ten runs, against 18,874,368–20,971,520 for
+  the first burst, and 16,777,216 against 18,874,368 with the pre-fault stubbed out (three of three). So the test holds
+  the second burst under half of the first's growth, not under a quarter of the file, which 4,194,304 bytes broke on
+  ubuntu-24.04-arm (CI run 42323710064) and on adacachy;
+- in the harness, the volume's shard faulted 342 MiB in over a run of three 64 MiB rounds and their mixed phases.
+
+**How the refill finds idle time.** A first build refilled at the reap tick only. On the Mac the harness pauses slates
+for about a second between rounds, and the volume's shard reached no idle tick in a whole run (`content.ticks.idle`
+0, `.sealing` 2, `.busy` 1; the other shards 3 idle ticks each), so that build was no faster (six rounds 15:49–15:53Z:
+812.8–1,016.2 against 829.4–1,041.5 MiB/s). The refill is now the shard's idle work in the runtime
+(`ShardContext::set_idle_work`): a slice of `quantum / page_fault_ns` pages whenever a step finds nothing and the idle
+spin has run out. In process (`cargo build --release -p slates-cli --example nfs_large_write`, kept 64 MiB files over
+NFSv4.2 on fresh memory after a one-second pause, kiln-a094a12d, load 36–42, three interleaved runs), kept rounds 1–4
+ran 681–1,103 MiB/s at the tick-only build and 1,524–1,797 with the idle work in runs 2 and 3 (281–1,701 in run 1,
+under load spikes). The burst rounds did not slow: NFSv4.2 best 1,817 / 1,902 / 1,915 against 1,717 / 1,896 / 1,962.
 
 ### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
 
@@ -7242,6 +7544,120 @@ pages. The same commands, on adacachy (Linux 7.2.9, at load 90 to 218 from other
 - **The placing step now places two pages**, and took 264 to 579 µs, one sample each in debug builds. Not separated from
   the step's other work, as above.
 
+## A full edit and merge: the client's edit through the green's verdict (A-202; 2026-11-04 local, 2026-11-05 UTC)
+
+**The question.** Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs. One sample is
+what an agent pays to change a file and learn the green's verdict: the client's `edit` of its work volume (64 bytes
+of a 4 KiB file), then its `submit` through the server's verdict to the reply, over the real rendezvous and rings to
+an in-process daemon (client and server are one binary, `slates`, as they run). Forms: `accept` (the work's base is
+the head: the fast path), `ranged` (the base lags the head by another work's accept on the same file; a disjoint
+range is mapped and swept), `identical` (the lagging work writes the head's own bytes there), `conflict` (it writes
+different bytes there). Every answer is checked against a model of the green (the verdict, the head, the edited
+file read back) and a wrong one ends the run with exit 1 — the harness's first run found
+`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md` that way.
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4), shared with other agents' builds:
+load 5 to 11 through every run below, so these numbers are informational; the quiet runs are owed (kiln's Mac
+Studios were unreachable this day; CI runners next). Rust 1.98.1, release, daemon derived for the machine (5 shards),
+client spinning up to 1 ms for its reply.
+
+Command (each arm a saved release binary of `crates/client/examples/merge_bench.rs` at the tree named, folded into
+`edit_merge_bench.rs` on 2026-11-05 with the same forms and output; arms run
+interleaved A B A B A B; each run 3 × 1,000 samples per form and shape, a run stopping at 20 s with at least 200;
+the scripts `ab1.sh`..`ab3.sh` under the agent's scratch, their loop is the line below):
+
+```
+for round in 1 2 3; do for arm in A B; do uptime; ./merge_bench_$arm --quiet-only --files N.. --form F..; done; done
+```
+
+Total (edit + submit), p50 of each run's three runs' medians, then p99, per round:
+
+| Arm (what it adds) | Shape, form | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|---|
+| A: `3f5e8483` (the identity fix only) | 1,000 files, accept | 13.99 ms (p99 17.7 ms) | 14.82 ms (18.3 ms) | 13.93 ms (18.3 ms) |
+| B: the merge record's identities only for holders | 1,000 files, accept | 0.97 ms (1.59 ms) | 0.93 ms (1.63 ms) | 0.99 ms (3.06 ms) |
+| A | 10 files, accept | 209 µs (390 µs) | 210 µs (374 µs) | 117 µs (251 µs) |
+| B | 10 files, accept | 64 µs (174 µs) | 66 µs (316 µs) | 65 µs (178 µs) |
+| A | 1,000 files, conflict | 875 µs (59.8 ms) | 990 µs (58.9 ms) | 915 µs (55.5 ms) |
+| B | 1,000 files, conflict | 903 µs (1.61 ms) | 849 µs (1.12 ms) | 888 µs (1.75 ms) |
+| B | 10,000 files, conflict | 9.62 ms (15.4 ms) | 9.40 ms (16.8 ms) | 8.91 ms (16.1 ms) |
+| C: B + the restricted base, the retention totals | 10,000 files, conflict | 174 µs (715 µs) | 189 µs (2.76 ms) | 187 µs (1.22 ms) |
+| B | 1,000 files, accept | 921 µs (1.19 ms) | 906 µs (1.54 ms) | 907 µs (1.43 ms) |
+| C | 1,000 files, accept | 549 µs (921 µs) | 609 µs (1.49 ms) | 552 µs (902 µs) |
+| C (second A/B, against D) | 10,000 files, accept | 3.32 ms (32.0 ms) | 5.24 ms (8.10 ms) | 4.11 ms (6.69 ms) |
+| D: C + the work as a delta over its base | 10,000 files, accept | 57 µs (196 µs) | 58 µs (180 µs) | 60 µs (166 µs) |
+| C | 10,000 files, conflict | 170 µs (596 µs) | 172 µs (854 µs) | 177 µs (1.88 ms) |
+| D | 10,000 files, conflict | 57 µs (166 µs) | 56 µs (167 µs) | 58 µs (164 µs) |
+| C | 1,000 files, accept | 559 µs (5.44 ms) | 555 µs (907 µs) | 556 µs (945 µs) |
+| D | 1,000 files, accept | 59 µs (216 µs) | 59 µs (199 µs) | 61 µs (179 µs) |
+
+D's p999 at 1,000 and 10,000 files, accept and conflict, was 0.23 to 0.66 ms in every run (max 0.35 ms to 9.7 ms);
+C's and B's were 2 to 74 ms. D, every form, one run each (load 8.6): p50 51 to 69 µs at 10, 1,000 and 10,000 files
+(accept 59/63/60 µs, ranged 68/69/69 µs, identical 58/58/51 µs, conflict 55/58/68 µs), p99 152 to 364 µs, except
+conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the three A/B runs above.
+
+**100,000 files** (the development Mac, 2026-11-05 16:06 to 16:14 UTC, load 7 to 16, the A-202 tree, `edit_merge_bench
+--quiet-only --files 100000 --form accept --form conflict`, 3 × 1,000 samples): accept p50 60 µs, p99 199 µs, p999
+3.2 ms; conflict p50 48 µs, p99 153 µs, p999 0.30 ms. The same as at 10 files: a submit no longer reads what the green
+holds. This machine's derived partition budget holds a 400 MB green; CI's runner's does not (below).
+
+**Quiet Linux: CI's runners** (diag run 42052891076, 2026-11-05 15:20 to 15:36 UTC; jobs 127333404627, `ubuntu-24.04`
+x86_64, and 127333403962, `ubuntu-24.04-arm` aarch64; 4 cores each, the daemon derived 3 shards; load 1.1 to 1.6
+throughout). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new), interleaved, 3 × 1,000
+samples a run (the base's 10,000-file rows stopped at 20 s: 200 to 446 samples). Total p50 per round, base → new:
+
+| Runner, form | 10 files | 1,000 files | 10,000 files |
+|---|---|---|---|
+| x86_64 accept | 65.7, 56.6, 55.9 µs → 17.1, 17.1, 17.2 µs | 4.16, 4.01, 4.07 ms → 16.5, 16.4, 16.6 µs | 44.8, 45.1, 44.5 ms → 16.7, 16.1, 16.5 µs |
+| x86_64 conflict | 18.0, 18.0, 18.4 µs → 14.2, 14.4, 14.6 µs | 816, 817, 767 µs → 14.8, 14.5, 15.0 µs | 8.64, 8.61, 8.78 ms → 14.7, 14.6, 15.2 µs |
+| aarch64 accept | — | 6.58, 6.57, 6.56 ms → 13.7, 13.8, 13.7 µs | 66.4, 66.3, 66.1 ms → 13.9, 13.9, 13.8 µs |
+| aarch64 conflict | — | — | 6.37, 6.33, 6.39 ms → 12.1, 12.1, 12.1 µs |
+
+New, every form, one more run (load 1.1 to 1.4): x86_64 p50 14.4 to 20.9 µs and p99 60 to 98 µs at 10, 1,000, 10,000
+and 100,000 files; aarch64 accept p50 13.8 to 14.5 µs, p99 56 to 75 µs, the same at 100,000 files. Both under the
+preferred 50 µs at the median and the required 1 ms at p99. On x86_64 the growth forms (the clients agent's): edit p50
+4.5 µs, merge p50 10.3 µs, merge p99 51 µs. Some p99 and p999 rows reach 0.85 to 1.1 ms (x86_64 accept at 10 files, p99
+0.90 ms in three runs of four), and one `identical` run at 100,000 files has a 570 ms max: tails owed a look. The loaded
+form (one spinning thread per core, so the shards share four cores with four spinners) measured accept p50 4.1 ms on
+aarch64: the scheduler's timeslice, not the merge; both jobs were then cancelled at the workflow's 90-minute limit.
+
+**A quieter machine: CI's macOS runner** (diag run 42052891076, job 127333404829, `macos-26-arm64` image
+20261026.0455.2, 3 cores, the daemon derived 2 shards; load 1.6 to 2.2 for rounds 2 and 3, 8.1 at round 1's start;
+2026-11-05 15:23 to 15:43 UTC). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new),
+interleaved, 3 × 1,000 samples a run (at most 20 s a run: the base's 10,000-file rows stopped at 200 to 280). Total
+p50 per round, base → new:
+
+| Form | 10 files | 1,000 files | 10,000 files |
+|---|---|---|---|
+| accept | 194, 139, 289 µs → 83, 77, 148 µs | 7.30, 6.96, 8.75 ms → 86, 134, 150 µs | 72.5, 73.8, 72.0 ms → 100, 136, 137 µs |
+| ranged | 227, 136, 291 µs → 83, 128, 121 µs | 7.50, 8.18, 8.89 ms → 87, 133, 145 µs | 70.3, 79.4, 70.5 ms → 87, 129, 100 µs |
+| conflict | 109, 82, 139 µs → 60, 128, 128 µs | 993, 737, 734 µs → 69, 110, 130 µs | 4.20, 5.45, 4.73 ms → 115, 131, 65 µs |
+
+New, every form, one more run (15:43 UTC, load 1.7): p50 67 to 137 µs and p99 0.29 to 0.94 ms at 10, 1,000 and
+10,000 files. At 100,000 files of 4 KiB the seed's submit was refused `green_chains at capacity`: a green's durable
+chain lives in its partition's metadata budget, derived from the runner's memory (`crates/server/src/config.rs`), and
+a 400 MB seed exceeds it there; folding old chain entries (checkpointing) is owed in §4.16. The harness now reports such
+a shape as refused at capacity and goes on. Two shards and a spinning client on three cores leave no core spare, which
+is why this runner's medians sit above the development Mac's.
+
+**The head identity holders recompute (A-202; 2026-11-05 UTC, the same box).** The identity became a set hash over the
+green's entries (LtHash16). Kept up to date in every commit (G) against none (F), load 21 to 37, interleaved: accept at
+10 files 44, 60, 51 µs (F) against 78, 91, 101 µs (G), conflicts alike; measured-and-rejected, since only a holder
+reads it. Brought up to date when read (H, built), load 23 to 31: accept at 10 files 31, 53, 56 µs (F) against 62, 50,
+45 µs (H); at 1,000 files 59, 63, 48 µs against 60, 61, 44 µs; dead even. Isolated on that box under that load, a
+4 KiB BLAKE3 took 13 µs and a 2 KiB extendable output 15 µs (a temporary test, 20,000 each).
+
+**What decided it** (`sample` of the shard threads during a run): at 1,000 files, 113 of 120 submit samples were
+`Green::head_identity`, a BLAKE3 of every byte of the green, made for a merge record at `f = 0` and dropped (B); then,
+at 10,000 files, 64 of 88 were `reset_accepted_work`, the work's whole copy of the green made again after every
+accept (D), and the rest the deriver's whole base and the settle's sums (C). Each is O(what the green holds); after
+D a submit's cost follows what it changed.
+
+**What it means.** The required 1 ms holds at p99 at every shape measured on a loaded box; the preferred 50 µs does
+not yet: the median is 51 to 69 µs, of which the edit's round trip is about 17 µs and the submit's about 37 µs at one
+file (the fixed cost, measured before these changes, same box). Owed: the quiet and CI runs, 100,000 files, the
+two-machine path (fs-server's remote client), the head identity at `f > 0` in O(changed), and the fixed cost.
+
 ## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
 
 Before any optimization of the mounts (step 2 of the VFS and DAX plan), one harness measured slates' host mount beside
@@ -7857,6 +8273,99 @@ the discard calls replaced by a refusal in a diagnostics commit):
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
 
+## A rebase that costs what changed, and where a merge's tail goes (A-202 part 3; 2026-11-06 UTC)
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), shared with other agents' builds; the
+load average is given for every invocation. Rust 1.98.1, release; the daemon derived 5 shards; the client spins up to
+1 ms for a reply. Harness: `crates/client/examples/edit_merge_bench.rs` (its new `rebase` form: a lagging work's
+disjoint edit is rebased onto the head, timed in the submit's place, then submitted untimed; the rebased file and the
+head after the submit are checked against the model). Arms: R0 = main `2f343fcd` with the form, R1 = the fix; saved
+release binaries run interleaved R0 R1 × 3; each invocation 3 runs × 1,000 samples (a run stops at 20 s, at least 200).
+
+Command: `edit_merge_bench_$arm --form rebase --files 10 --files 1000 --files 10000` (quiet, then loaded: one spinning
+thread per core). Total (edit + rebase) p50 per round, then p99:
+
+| Arm, shape | quiet p50 (p99) | loaded p50 (p99) |
+|---|---|---|
+| R0, 10 files | 42, 53, 65 µs (0.15, 0.16, 0.56 ms) | 66, 83, 98 µs (7.9, 8.6, 10.0 ms) |
+| R1, 10 files | 45, 44, 45 µs (0.16, 0.18, 0.17 ms) | 57, 56, 55 µs (10.5, 10.9, 8.6 ms) |
+| R0, 1,000 files | 0.61, 1.16, 1.23 ms (1.2, 1.7, 2.1 ms) | 1.35, 1.33, 1.35 ms (39.6, 29.3, 51.3 ms) |
+| R1, 1,000 files | 44, 44, 45 µs (0.13, 0.19, 0.33 ms) | 97, 99, 95 µs (10.7, 11.8, 10.4 ms) |
+| R0, 10,000 files | 7.89, 12.35, 14.70 ms (14.1, 16.3, 19.7 ms) | 34.0, 31.9, 36.9 ms (101, 87, 99 ms) |
+| R1, 10,000 files | 45, 52, 45 µs (0.20, 0.21, 0.14 ms) | 87, 99, 114 µs (10.7, 11.0, 11.4 ms) |
+
+Loads at the rounds' starts: 8.5, 26.3, 26.6, 27.2, 29.4, 27.7. The first measurement of the form on R0 (17:53 UTC, load
+26 to 29) gave p50 74 µs, 1.25 ms and 19.1 ms at 10, 1,000 and 10,000 files: the regression the fix was made against.
+R1 is flat in the green's size quiet and loaded. Both arms' loaded p99 sits at 8.6 to 11.8 ms whatever the shape, which
+is not the rebase.
+
+**Where the time goes (§4.14 spans).** The harness now drains every shard's spans after each sample (a shard's span
+ring holds as many spans as a client region has slots, so every sample; 0 shed, 0 unmatched) and, for each timed call,
+splits the client's time into the ring span on the shard that read its slot (read to reply written), the shard ops of
+its verb and the merge verdict. What the client saw beyond the ring is its own time and the wake: the doorbell, the
+shard's wake from its park and the client's wake. `edit_merge_bench --quiet-only --files 10 --form accept`, 2026-11-06,
+load about 20: median samples: client 62 µs, ring 28 µs (shard ops 25 µs, verdict 4 µs), outside the ring 34 µs; samples
+at or above p99: client 506 µs, ring 41 µs, outside the ring 416 µs. The tail is waiting to be woken and served, not
+the merge.
+
+**Edit and submit in one request, across two machines (A-225, 2026-11-06 07:49 to 07:59 UTC).** A two-node fleet from
+one manifest (`f = 0`), each node `slates daemon --quick --shards 2 --fleet fleet.json --node N`. Server node:
+adas-macbook-pro-2 at 192.168.1.71. Client node: kiln-a094a12d at 192.168.1.72, load 6.2 to 10.0. Both are on Wi-Fi;
+ICMP RTT was 3.92/8.48/58.7 ms (min/avg/max) before and 3.83/5.33/7.41 ms after. Both nodes ran release builds of
+agents/perf-2 at `20c74c56`, the client's built in a capped `systemd-run --user` unit. The green: 100 files of 4 KiB,
+seeded on the server node and shared with the client's uid. The harness ran on the client machine, attached to its
+own node, so each request is forwarded over the fleet to the green's owner. That build's harness has an attached mode
+(`--instance NAME --green ID`) and a `ping` form (one forwarded `versions`), which main's harness does not have yet.
+Command: `edit_merge_bench --instance perf-cli --green ID --shards 2 --quiet-only --files 100 --form ping --form
+accept --form accept_one` (round 2 with the two accept forms in the other order). 3 runs × up to 1,000 samples; a run
+stops at 20 s:
+
+| round | ping p50 | accept (edit + submit) p50 | of which edit, submit | accept_one p50 |
+|---|---|---|---|---|
+| 1 | 6.13 ms | 14.1 ms | 6.88, 7.06 ms | 6.93 ms |
+| 2 | 7.74 ms | 18.6 ms | 8.67, 8.04 ms | 7.81 ms |
+| 3 | 7.66 ms | 14.8 ms | 7.07, 7.04 ms | 7.03 ms |
+
+One request is one forwarded round trip: `accept_one` costs a ping. The p99 is the link's: accept 138 to 158 ms,
+accept_one 70 to 132 ms.
+
+**The macOS paced tail was the recovery give-back (A-226, 2026-11-06, adas-macbook-pro-2).** Paced (`--pause-ns 2000000`,
+so each edit meets parked shards), a macOS edit and merge had a p99 of 5.7 to 21 ms, which a split of each call by the
+doorbell thread's stamps put between the doorbell's wake and the shard's read of the slot (17 to 31 ms in the p99
+samples). It was neither a missed nor a held wake. A temporary diagnostic stamped the
+doorbell's kick on each parked shard and logged, from the shard's own clock, every park whose kick-to-return passed
+1 ms. It also logged every poll over 1 ms with the thread's CPU across it and the polled future's type. One paced run
+(`--pause-ns 2000000 --files 10 --form accept`, 3 × 1,000 calls) had 12 late parks, 1.1 to 15 ms, each in a wait the
+kernel never slept (asked timeout 0): the host descheduled the thread. It had 57 long polls, 46 of them the reap loop
+at 18 to 42 ms with the thread on the CPU throughout (wall 42,068 µs, CPU 42,055 µs). Narrowed section by section,
+they were the idle give-back of the recovery memory no restart reads (A-117). At every publication it marked the whole
+stale slot and the whole log past the tail reusable, 18,325,143,552 bytes, 18 to 21 ms a call. A-226 gives back only
+what was written since the last give-back (`docs/bugs/2026-11-06-an-idle-shards-recovery-give-back-walked-18-gb-at-every-publication.md`).
+
+The same run, interleaved, 2026-11-06 05:16 to 06:05 UTC, adas-macbook-pro-2 at load 50 to 95. A = agents/perf-2
+`83803328`, B = A-226, each with the per-poll CPU log in a second build; paced (`--pause-ns 2000000`) and unpaced; 10,
+1,000 files; accept and conflict; 10 of 12 runs finished before the time limit. Reap-loop polls of 5 ms CPU or more
+in one paced run: A 46 (up to 48.5 ms), B 6, all at boot, a shard's first two give-backs, 12.1 to 42.7 ms. p99 in ms
+(accept f10, conflict f10, accept f1000, conflict f1000):
+
+| run | load | A | B |
+|---|---|---|---|
+| round 1, paced | 52–84 | 233.8, 33.7, 148.9, 39.2 | 21.7, 6.8, 29.2, 26.5 |
+| round 1, unpaced | 54–84 | 3.34, 1.87, 3.46, 3.99 | 0.77, 0.43, 2.16, 0.51 |
+| round 2, paced | 52–82 | 23.7, 20.7, 34.6, 12.3 | 7.1, 18.6, 93.8, 53.8 |
+| round 2, unpaced | 53–59 | 0.64, 1.37, 3.49, 1.44 | 1.62, 6.84, 2.88, 1.64 |
+| round 3, paced | 95 | 360.6, 178.8, 307.0, 142.3 | (stopped by the time limit) |
+| round 3, unpaced | 65–78 | 6.33, 0.94, 20.9, 32.3 | (not run) |
+
+At 3 to 5 runnable threads a core, both arms' tails are the host's: in B's run, every poll over 1 ms besides those 6
+had under 1 ms of CPU. So the table is informational; the CPU count is the measurement. Still owed: the boot's two
+whole give-backs a shard, to be sliced; the latency again on a quiet Mac.
+
+On CI (diag-perf-5, run 42173825162, 2026-11-06 06:25 to 06:56 UTC, base `83803328` against A-226 `cd582843`, interleaved
+× 3, 10 and 1,000 files): Windows x86_64's paced accept p99 went from 1.21 to 1.40 ms to 0.42 to 0.76 ms, and both
+builds keep a paced p999 and max of 20 to 34 ms there, a tail of its own. Windows arm64, and Linux under the controlled
+load and quiet, were even: Linux's give-back is a hole punch, and its loaded tail is the scheduler's.
+
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
 The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent
@@ -7913,6 +8422,10 @@ What it means:
   measured next (GAPS, the client's per-platform record).
 - The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
   owed; this laptop had no quiet window this day.
+- **Since 2026-11-05** (A-202) the growth a merge showed here is gone: a submit no longer clones, walks or hashes the
+  whole green (BENCHMARKS, "A full edit and merge"). The example now also holds the verdict forms of that section, and
+  its client spins up to 1 ms for a reply where these rows spun 50 µs, so rows from before and after that day are not
+  comparable at their tails.
 
 ## Replication latency: what a cross-node commit costs (§4.8, §4.10; 2026-11-04)
 
@@ -7960,7 +8473,233 @@ waited for: tails of 18–93 ms and one run that never finished. The bench now d
 waits parked.
 
 **Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
-period before this commit begins; and nothing replicates a file's writes per write yet (§4.10 live shipping is owed).
+period before this commit begins.
+
+### Live shipping over the transport (A-200; 2026-11-04)
+
+Same bench, same hardware, later the same evening: `live ship <n> B` rows, one live-shipped write at a time (a credit of
+one): `Shipper::append`, then `slates_cluster::live::ship` to both holders, which apply it through `serve_entry`,
+until it is durable (the owner and one holder hold it), at the daemon's 10 ms poll. Five runs at load average 21.0–21.2
+(`replication_bench 1000 0`), then three with eight spinning threads inside the same capped unit, which competes with
+the three shards for the unit's quota of eight cores (`replication_bench 1000 8`). Microseconds, p50 / p99 / p999 /
+max:
+
+| run | round trip | 64 B | 4 KiB | 64 KiB |
+|---|---|---|---|---|
+| 1 | 12.7 / 22.7 / 46.6 / 58.5 | 16.6 / 30.8 / 56.8 / 400.6 | 22.6 / 37.9 / 75.1 / 213.6 | 148.8 / 262.0 / 905.9 / 1,020.9 |
+| 2 | 12.3 / 56.8 / 466.2 / 1,059.7 | 18.0 / 31.4 / 307.7 / 496.5 | 23.0 / 48.9 / 181.3 / 594.8 | 142.9 / 292.2 / 1,076.8 / 1,197.6 |
+| 3 | 10.2 / 21.3 / 51.3 / 299.4 | 20.3 / 31.4 / 133.3 / 436.7 | 27.2 / 52.4 / 162.9 / 859.5 | 112.9 / 171.3 / 247.9 / 481.0 |
+| 4 | 10.0 / 18.6 / 36.0 / 56.3 | 18.3 / 32.5 / 44.9 / 51.4 | 26.1 / 71.8 / 109.5 / 722.2 | 108.4 / 160.5 / 1,188.2 / 1,362.4 |
+| 5 | 12.3 / 19.7 / 41.5 / 41.6 | 18.4 / 28.7 / 55.1 / 69.6 | 25.6 / 57.9 / 310.1 / 411.3 | 130.8 / 207.7 / 250.2 / 1,192.4 |
+| loaded 1 | 13.4 / 53.2 / 941.9 / 54,757.7 | 20.5 / 80.8 / 223.0 / 1,225.5 | 26.1 / 55.7 / 481.8 / 554.7 | 164.5 / 256.2 / 877.4 / 1,022.4 |
+| loaded 2 | 13.0 / 43.3 / 1,662.2 / 10,329.6 | 18.5 / 30.5 / 52.9 / 66.6 | 29.8 / 44.6 / 63.6 / 65.8 | 105.6 / 431.4 / 13,372.5 / 23,943.2 |
+| loaded 3 | 13.9 / 52.4 / 592.9 / 611.6 | 21.0 / 48.6 / 227.1 / 15,845.2 | 32.6 / 82.3 / 855.6 / 1,004.5 | 134.0 / 213.6 / 13,471.4 / 15,754.7 |
+
+With one holder dead (it handshakes and never answers again; `replication_bench 300 0 silent`, load average 33.6),
+writes go on through the other: 64 B 18.3 / 48.3 / 142.4 / 142.4, 4 KiB 24.5 / 46.2 / 55.1 / 55.1, 64 KiB
+155.8 / 797.9 / 3,767.9 / 3,767.9.
+
+**Reading.** A live-shipped write is durable on two hosts in about one and a half round trips: 17–20 µs at the median
+for a small write and 23–27 µs for a page, under 75 µs at p99, and every quiet p99 is under 1 ms (64 KiB: 160–292
+µs). The goal's 50 µs holds at the median up to a page and at p99 for small writes. Its 1 ms holds at p99 in every
+quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 ms), nor in the tails of the loaded runs, where the bare
+round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
+quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
+
+### What live shipping adds to a stable NFS write in the daemon (A-200; 2026-11-05)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 48–58 on 32
+threads (other agents' builds); the test and its three daemons in one `systemd-run --user` unit capped at a quarter of
+the cores. **Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 cargo test --release -p slates-cli
+--test live_fleet measure_what_live_shipping_adds_to_a_stable_nfs_write -- --nocapture`.
+
+**Setup.** Three `slates daemon --fleet` processes (release), `f = 1`. On the owner, two volumes: one plain, one
+live-shipped. A real NFS client over TCP sends each 4 KiB `FILE_SYNC` WRITEs, 400 at a time, alternating, five rounds:
+2,000 writes each after 50 warm-up writes. A plain volume's stable write is answered after the owner's own barrier; a
+live one also after a candidate holds it. Microseconds, p50 / p99 / p999 / max:
+
+| run | load | plain | live |
+|---|---|---|---|
+| holder by holder, 1 | 50.1 | 29.5 / 2,421.1 / 13,272.9 / 27,543.7 | 478.3 / 16,532.3 / 70,665.0 / 123,743.9 |
+| holder by holder, 2 | 48.3 | 16.3 / 53.6 / 276.9 / 475.2 | 123.0 / 289.7 / 1,595.1 / 86,281.5 |
+| holder by holder, 3 (final code) | 33.8 | 19.2 / 169.7 / 589.9 / 754.1 | 170.0 / 624.9 / 9,687.5 / 100,794.4 |
+| holder by holder, 4 (final code) | 39.8 | 19.2 / 179.4 / 620.5 / 1,985.5 | 140.3 / 570.7 / 94,688.9 / 100,338.1 |
+| one exchange (rejected), 1 | 57.7 | 27.1 / 566.4 / 1,458.1 / 1,700.3 | 211.2 / 9,005.4 / 73,765.5 / 113,386.8 |
+| one exchange (rejected), 2 | 56.7 | 19.7 / 697.7 / 3,357.1 / 10,075.1 | 126.6 / 12,397.5 / 105,191.1 / 168,764.4 |
+| one exchange (rejected), 3 | 57.9 | 17.9 / 540.0 / 2,720.9 / 7,479.3 | 144.8 / 12,743.5 / 126,181.3 / 203,813.4 |
+| one exchange (rejected), 4 | 57.3 | 19.4 / 497.4 / 9,200.3 / 88,282.1 | 93.4 / 2,329.5 / 18,972.4 / 78,599.0 |
+
+No write waited out its bound (`fleet.live.durable_late` 0) and the log ended durable at its head every time.
+
+**Measured and rejected: one exchange per message.** Sending an entry to all its holders in one exchange that returns at
+the first reply (so a write never waits for the second holder) starved the second holder: it never accepted an entry
+and stayed at nothing in six of nine process flows (416 sends that found no session to it), and its median gain could
+not be told from the load's swing. The per-holder sends are kept; the starvation's mechanism is not yet pinned down
+(GAPS).
+
+**Reading.** With the code kept, live shipping adds 121–151 µs to a stable 4 KiB write at the median at load 34–40, and
+the live p99 is 571–625 µs: under the goal's 1 ms at p99, not its 50 µs. The rare tail does not meet it: p999 9.7–95 ms
+and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 34–58 with the unit capped at eight
+cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
+encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
+about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
+Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+
+**The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
+printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
+
+1. *A send that found its holder's session lent was dropped.* Two in three sends of a run found the session out (to
+   the previous write's dispatch or a straggler): 2,724 sends with no session, all 2,724 unanswered. The write then
+   waited for whichever later dispatch carried its entry, at worst the period's re-ship. Fixed: the send waits for the
+   session one timer tick at a time, within the liveness budget (`live_ship::borrow_session`); `unanswered` went to 0.
+2. *A write the credit turned away waited for the period.* With two entries in flight, the next publication cannot be
+   an entry; it marks the volume as owing a whole record, which only the next write or the period appended: 270 of
+   2,285 publications turned away, and the last of a burst waited. Fixed: the reply that frees the credit appends the
+   owed whole record at once (`fold_into`, `owes_whole_within_credit`).
+
+adacachy as above, 2,000 writes each, p50 / p99 / p999 / max in µs, all runs shown in order:
+
+| code | load | plain | live | live writes over 50 ms |
+|---|---|---|---|---|
+| before both fixes | 39.7 | 16.1 / 789.4 / 3,304.2 / 6,835.8 | 113.2 / 3,498.5 / 96,777.8 / 276,392.8 | 5 |
+| send waits for the session | 28.1 | 13.6 / 45.5 / 65.3 / 78.1 | 118.1 / 347.8 / 41,511.3 / 85,701.9 | 2 |
+| send waits for the session | 28.1 | 12.7 / 43.7 / 55.2 / 72.5 | 113.1 / 267.6 / 45,636.2 / 86,772.6 | 1 |
+| send waits for the session | 27.8 | 12.5 / 47.3 / 156.8 / 248.6 | 111.6 / 368.3 / 1,461.6 / 46,654.3 | 0 |
+| send waits for the session | 27.6 | 13.5 / 45.4 / 73.1 / 271.9 | 111.4 / 285.8 / 46,488.9 / 88,590.2 | 2 |
+| both fixes | 29.6 | 15.4 / 62.5 / 81.2 / 106.2 | 127.4 / 397.5 / 1,266.2 / 1,869.1 | 0 |
+| both fixes | 29.6 | 14.5 / 58.7 / 129.1 / 256.4 | 117.0 / 262.8 / 481.1 / 806.5 | 0 |
+| both fixes | 29.3 | 16.5 / 59.4 / 80.3 / 249.3 | 130.5 / 264.4 / 882.0 / 1,840.3 | 0 |
+| both fixes, with the fence and destroy fixes | 8.0 | 12.4 / 53.2 / 106.8 / 887.0 | 102.5 / 216.7 / 436.0 / 465.4 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 17.7 / 59.8 / 83.2 / 168.7 | 112.0 / 223.4 / 449.5 / 760.6 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 14.2 / 57.3 / 64.7 / 127.2 | 114.4 / 249.2 / 1,150.0 / 1,424.1 | 0 |
+
+The unit was never throttled (`cpu.stat` `nr_throttled` 0 across a run), so the tail was not the cap's 100 ms quota
+period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 05:56) showed the same tail: live p50
+312.3, p99 754.4, p999 98,709.0, max 100,527.5 µs.
+
+**Reading.** With both fixes, live shipping adds 90–114 µs to a stable 4 KiB write at the median. The live p99 is
+217–398 µs, the p999 0.44–1.27 ms and the worst write 0.47–1.87 ms, at load 8–30, against 86–276 ms before: every write
+of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
+measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.
+
+**What a checkpoint shipped (A-200, AC-8.9; 2026-11-05).** The same command, release binaries built from main
+(00e5269c, arm A) and from this branch (arm B), run alternately A, B, four rounds, in one capped unit on adacachy at load
+21–23. The owner's counters per 2,050 writes, then microseconds (p50 / p99 / p999 / max):
+
+| round | arm | whole records | credit refusals | sends with no session | plain | live | added at p50 |
+|---|---|---|---|---|---|---|---|
+| 1 | A | (not counted on main) | 431 | 612 | 17.4 / 55.9 / 96.9 / 702.7 | 109.2 / 419.2 / 1,090.5 / 1,263.9 | 91.9 |
+| 1 | B | 1 | 0 | 6 | 10.8 / 17.0 / 35.5 / 1,075.8 | 105.9 / 240.4 / 678.4 / 848.0 | 95.1 |
+| 2 | A | (not counted on main) | 437 | 433 | 14.4 / 84.6 / 363.1 / 563.6 | 133.8 / 600.8 / 1,123.4 / 2,519.8 | 119.4 |
+| 2 | B | 1 | 0 | 4 | 11.5 / 22.2 / 39.4 / 144.7 | 113.3 / 323.1 / 672.8 / 876.0 | 101.8 |
+| 3 | A | (not counted on main) | 419 | 623 | 16.2 / 52.9 / 72.5 / 74.2 | 109.9 / 230.9 / 898.3 / 1,105.8 | 93.7 |
+| 3 | B | 1 | 0 | 3 | 13.9 / 32.2 / 465.7 / 998.0 | 147.7 / 1,391.7 / 3,931.0 / 4,357.0 | 133.8 |
+| 4 | A | (not counted on main) | 439 | 567 | 13.5 / 59.5 / 87.0 / 322.1 | 104.1 / 231.6 / 656.9 / 1,061.9 | 90.7 |
+| 4 | B | 1 | 0 | 7 | 11.2 / 19.5 / 64.6 / 203.1 | 108.6 / 267.2 / 779.6 / 910.4 | 97.5 |
+
+Main appended 2,305–2,395 records for 2,050 writes, the extra ones whole copies made after a credit refusal; the branch
+appends one per write and one whole record, the log's first. **Reading.** Dead even on latency: the added median is
+90.7–119.4 µs on main and 95.1–133.8 µs on the branch, and a dead-even A/B lands no latency claim. What changed is what
+ships: about 420 copies of the volume per 2,050 writes on main against one, which on this one-file volume cost little
+and on a large volume would copy all of it each time. Round 3's slow tail on the branch came with its plain writes
+slowed as well (p999 465.7 µs).
+
+
+### Measured and rejected: queueing the deltas the credit turns away (A-200; 2026-11-06)
+
+**Hardware:** this Mac (Apple arm64, 128 GiB), other agents' work running, load 40–63. **Command (the contract):**
+`SLATES_TEST_CLI=1 cargo test -p slates-cli --test live_chaos -- candidates_partitioned_in_turn --nocapture` (debug),
+each arm from its own worktree and target directory, the arms alternating, five pairs.
+
+A delta the credit (two entries not yet durable) turns away leaves the volume owing a whole record, which the next
+publication ships to every holder: 4.27 MB in one run, with writes queued behind it. The experiment queued such deltas
+in order, up to the last whole record's size, and appended them as the credit freed. Rolling partition, base
+(9afea76d) then queue (with the lanes' straggler wait), p50 / p99 / max write in ms, caught-up times in s:
+
+| pair | base | queue |
+|---|---|---|
+| 1 | pass, 688 writes, 2.0 / 189 / 501, 0.91 0.26 | pass, 482 writes, 1.8 / 210 / 880, 0.26 0.86 |
+| 2 | fail (one write ≥ 1 s), 573 writes, 2.2 / 299 / 1,176, 1.52 1.16 | fail (catch-up 2.99 s), 499 writes, 5.8 / 266 / 957 |
+| 3 | fail, 140 writes, 129 / 1,396 / 1,414, 1.58 none | fail, 193 writes, 78 / 816 / 1,095, 1.25 1.99 |
+| 4 | pass, 844 writes, 1.6 / 88 / 577, 0.30 0.34 | pass, 1,030 writes, 1.5 / 93 / 811, 0.44 0.66 |
+| 5 | pass, 1,075 writes, 1.5 / 89 / 611, 0.51 0.22 | fail (one write 2.3 s), 737 writes, 1.5 / 109 / 2,330 |
+
+Dead even (3 of 5 against 2 of 5, medians and tails overlapping), so it does not land; the patch is kept off the tree.
+
+### The council's voter change after a candidate's node is replaced (§4.8; 2026-11-09, diag-live-durability-71)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, main 80be552a. **Flow:**
+a three-node anchored fleet; one candidate's node is killed and a fresh one started in its place (a new member id),
+quiet or under the write stream. Every node's status is polled every 10 ms for `fleet_council_joint` and the voter
+ids. Joint closed means every node reports no joint configuration, with the new id seated and the old one gone. 8
+runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the kill.
+
+| arch, load | answered → joint entered | joint open (entered → closed everywhere) | kill → closed |
+|---|---|---|---|
+| x86, quiet | median 1.90 s, max 2.61 s | median 0.21 s, max 0.35 s | median 2.16 s, max 2.88 s |
+| x86, loaded | median 1.93 s, max 2.87 s | median 0.15 s, max 0.33 s | median 2.17 s, max 3.32 s |
+| arm, quiet | median 1.91 s, max 2.30 s | median 0.21 s, max 0.22 s | median 2.15 s, max 2.56 s |
+| arm, loaded | median 2.00 s, max 4.02 s | median 0.22 s, max 1.18 s | median 2.23 s, max 5.26 s |
+
+**Reading.** The joint follows the replacement's catch-up on the council log, about 0.2 s. The ~1.9 s before it opens
+is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
+dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
+that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
+for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+it in 6 of 6 x86 runs.
+
+### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
+
+**The change.** A lane's install exchange ends only on its reply or its deadline, and the deadline has no ceiling (up to
+77 s and 614 s measured, diag-live-durability-56). The watch ended it early once the owner kept no direct contact with
+the holder (`keeps_direct_contact_with`) and the session had acknowledged nothing for a silence. That silence was first
+a fixed liveness budget (1 s, `agents/live-durability-watch-2`), then the session's own persistent-congestion duration:
+three probe timeouts, each at least the initial 666 ms (`agents/live-durability-watch-3`). On the simulated fabric the
+fixed second cut a live holder whose acknowledgements a queue held back 1.1 to 2.0 s apart; the duration never did.
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release, the watch switched on or off
+in one binary.
+
+**diag-live-durability-65: a holder restarted mid-install** (watch-2's rule, 12 restarts and 10 rolling partitions a
+leg, at the budgets the code computes and at a 30 s floor on installs of 64 KiB or more):
+
+| leg | restarts over 1 s | catch-up median | worst | partitions passed | cuts |
+|---|---|---|---|---|---|
+| real, off, x86 | 1 of 12 | 31 ms | 3.87 s | 10 of 10 | 0 |
+| real, on, x86 | 0 of 12 | 24 ms | 0.05 s | 10 of 10 | 0 |
+| real, off, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| real, on, arm | 0 of 12 | 22 ms | 0.04 s | 10 of 10 | 0 |
+| floor, off, x86 | 4 of 12 | 894 ms | 7.01 s | 10 of 10 | 0 |
+| floor, on, x86 | 2 of 12 | 25 ms | 32.42 s | 10 of 10 | 1 |
+| floor, off, arm | 7 of 12 | 2,038 ms | 13.05 s | 10 of 10 | 0 |
+| floor, on, arm | 1 of 12 | 21 ms | 29.14 s | 10 of 10 | 0 |
+
+The watch's case does not occur in this flow: the restarted holder's successor answers under its id 3 to 27 ms after
+the kill, so the owner never loses contact, and no kept restart log shows a cut. diag-67 and -68 meant to stop a holder
+for good but armed the stop for any daemon, and the other candidate stopped itself: none of 96 runs reached the case.
+
+**diag-live-durability-70: a holder stopped on its install for 20 s, then resumed** (watch-3's rule, 30 s floor, the
+stop armed for the target alone, 12 runs a leg, 48 of 48 passed, every one stopped on its install). Catch-up is from the
+resume until the holder is within 50 entries of the owner's head; none = not within 50 s:
+
+| leg | the stopped holder's exchange | catch-up, each run (s) | median | not caught |
+|---|---|---|---|---|
+| off, x86 | held 20.1 s, then answered (the stale install) | 2.05 3.88 2.67 none 2.35 2.22 1.31 none 2.01 none none 2.06 | 2.14 s | 4 of 12 |
+| on, x86 | cut, median 2.12 s (12 of 12) | 1.88 2.04 2.86 none 27.73 11.06 none 1.86 2.16 none none 2.22 | 2.19 s | 4 of 12 |
+| off, arm | held 20.1 s, then answered | 3.68 none 6.40 1.84 33.83 6.20 3.32 6.40 4.09 2.01 1.29 2.35 | 3.68 s | 1 of 12 |
+| on, arm | cut, median 3.48 s (12 of 12) | 1.66 1.80 2.35 3.44 1.61 3.72 1.35 3.95 3.03 1.72 1.68 1.87 | 1.84 s | 0 of 12 |
+
+Mann–Whitney, off slower than on: x86 U = 68.5 of 144, z = −0.21, p ≈ 0.84 (even; 4 of 12 over 4 s or not caught
+off, 6 on); arm U = 111.5 of 144, z = 2.28, p ≈ 0.023 (6 of 12 off, 0 on), the two sets overlapping (on's worst
+3.95 s against off's median 3.68 s).
+
+**Reading.** The watch does what its rule says: the stopped holder's exchange was cut every time, a little past 2 s on
+x86 and later on arm, where the session's probe timeout is larger. On x86 catch-up after the resume is even, with the
+watch's tail worse (27.7 s against 3.88 s worst). On arm it is likely faster with the watch, but no mechanism is known:
+the freed lane leads to a holder that is stopped anyway, and answering the stale install on resume caught up in most
+runs as fast as a fresh image. **Held, not landed:** the decision waits on why arm's runs without the watch stall after
+the resume (GAPS). If it is the stale install answered late, the watch earns its place on arm; if it is the slow
+catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
+are that slow catch-up.
 
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
@@ -8188,8 +8927,10 @@ and 174,028 responses on arm64 (run 41977769822).
 **Measured and rejected, 2026-11-05: the shard's spin as the cause of the slower hops.** The hypothesis was that the
 receiver's longer gaps let the shard park, so those hops pay a wake. Run 41989038309 (`diag-winfsp-bench-8`) raised the
 receiver arm's spin prior sixteenfold; the estimate moves by 2^-19 to 2^-20 a wake, so the raise held for the run. Nothing
-moved: SetSize loaded 96.1 to 99.0 µs, Open quiet 18.3 to 17.8 µs, Release quiet 14.1 to 14.8 µs. The slower Open, Release
-and loaded SetSize hops are **measured and not explained**.
+moved: SetSize loaded 96.1 to 99.0 µs, Open quiet 18.3 to 17.8 µs, Release quiet 14.1 to 14.8 µs. (Corrected the same day:
+this entry first called the test fair. `spin_before_park_ns` is only 0.15–1.2 µs on these runners, so sixteenfold is a
+window of at most about 18 µs, a weak test. The rejection rests on the idle buckets below, where a shard idle long enough to
+park answers in about 7 µs.) The hops are explained in "The WinFsp receiver's hops explained" below.
 
 ### After A-212: `71cf09ac` against the fix
 
@@ -8395,3 +9136,2982 @@ What it means:
 - **Still red:** windows-11-arm's single-client p99 (green in 1 of 3 rounds) and jupiter's (80–252 µs). Windows'
   parked p50 is 154–700 µs. The periodic acknowledgement's scatter is the next lever on the single-client tail
   (GAPS). Sending it unawaited (a6c3bc16) stalled 2 of 4 parked forms, and it was reverted.
+
+## The WinFsp receiver's hops explained, and the reply spin (A-212; 2026-11-05)
+
+The slower hops above were timed stage by stage on both arms (diagnostics run 42047111024, `diag-winfsp-bench-9` over
+`diag-winfsp-bench-old-2`, arm64, 3 rounds a pass, quiet and loaded apart; instrumented, so for attribution only). p50, µs, DLL
+then receiver:
+
+| Stage | Quiet Release | Quiet Open | Quiet Flush | Loaded SetSize |
+|---|---|---|---|---|
+| Whole hop | 6.3, 15.7 | 12.2, 18.6 | 18.2, 19.4 | 29.1, 110.3 |
+| Queue, sent to taken | 2.6, 2.5 | 1.8, 1.9 | 2.4, 3.1 | 6.0, 20.6 |
+| Service | 0.6, 1.2 | 1.8, 2.7 | 0.2, 0.4 | 3.3, 3.8 |
+| Publish barrier | none, 1.4 | none, 1.1 | 3.6, 3.3 | 3.6, 5.0 |
+| Reply into its channel | 0.9, 4.0 | 3.9, 4.7 | 3.8, 4.7 | 6.2, 6.1 |
+| Reply sent to the thread having it | 1.0, 7.7 | 5.9, 10.3 | 9.7, 10.4 | 8.2, 9.2 |
+
+**Open and Release: the waiting thread parks.** A-198 made opens and closes publish, about 1 µs, and that stays: it is what
+makes them survive a kill. It costs more than itself because it pushes the reply past the spin inside `std`'s `recv`, so the
+thread parks and must be woken. Flush publishes on both arms and shows no jump. Run 42049771150 (`diag-winfsp-bench-10`, one
+run, instrumented) tested it: the same receiver on both arms, one spinning 20 µs on each reply before parking. Quiet: reply
+wake for an open 10.3 to 0.4 µs; hops for an open 18.4 to 8.0 µs, a release 15.3 to 7.8 µs, a flush 19.4 to 10.1 µs.
+
+**Kept: the reply spin.** `crates/bridge-winfsp/src/reply.rs`: the receive thread spins for as long as a wake costs and then
+parks, the 2-competitive rule the shards use (§4.3). The window is the median of 15 one-way wakes through the same kind of
+channel, timed on that thread as it starts, because the profile's `wake.mean_ns` is far below this wake's cost. It measured
+5.4–10.0 µs on arm64 and 3.8–11.3 µs on x86_64 across these runs, and each run's daemon logs its own.
+
+Diagnostics run 42052991563 (`diag-winfsp-bench-11`, new arm `3b7b6f55`, old arm `c0c8d28c`), 2026-11-05 15:32–16:20 UTC on arm64,
+15:30–15:53 UTC on x86_64, with the hardware and the command above but `OLD_NAME=parks NEW_NAME=spins`. Five runs each, none
+failed and no heartbeat lapsed. The live oracles ran first and passed on both: 73 of 73 bridge tests and 13 of 13 CLI mount
+tests. Each cell lists runs 1 to 5.
+
+Arm64:
+
+**quiet** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 238.6, 218.2, 245.6, 261.0, 235.9 | 240.9, 213.6, 234.9, 255.5, 222.3 | 0.98× | 365.8, 312.0, 398.3, 360.8, 494.6 | 530.0, 374.6, 354.2, 374.9, 335.6 |
+| write | 109.5, 102.3, 109.0, 112.4, 106.9 | 103.7, 97.0, 101.5, 102.3, 101.6 | 0.93× | 239.3, 221.7, 238.5, 244.9, 237.5 | 244.0, 235.8, 236.0, 241.3, 235.3 |
+| fsync | 143.0, 139.0, 143.0, 143.7, 140.8 | 129.6, 125.9, 125.6, 124.3, 129.5 | 0.88× | 194.8, 191.0, 200.0, 197.5, 196.9 | 199.4, 202.8, 198.8, 191.5, 198.6 |
+| close | 4429.0, 4061.2, 4476.6, 4666.2, 4315.2 | 4556.4, 4185.7, 4552.4, 4776.0, 4448.1 | 1.03× | 15211.3, 5992.1, 8592.3, 6663.5, 6960.9 | 7403.5, 6628.4, 6536.7, 6881.8, 6692.6 |
+| stat | 175.9, 184.5, 184.0, 188.2, 175.6 | 165.6, 160.1, 163.4, 165.5, 159.1 | 0.89× | 255.1, 269.3, 270.9, 269.5, 259.0 | 247.2, 240.2, 250.5, 248.7, 245.8 |
+| open | 4090.2, 3833.7, 4059.6, 4340.8, 3812.4 | 4363.0, 3841.0, 4232.5, 4421.1, 4106.5 | 1.04× | 5621.2, 5386.6, 5705.0, 5761.5, 5620.8 | 6011.4, 5547.0, 5917.2, 5815.3, 5922.5 |
+| read | 49.7, 47.1, 51.4, 56.3, 47.4 | 51.0, 44.3, 50.9, 57.4, 48.2 | 1.02× | 81.4, 75.3, 87.3, 83.4, 78.5 | 82.2, 79.6, 82.8, 85.9, 83.3 |
+| rename | 548.1, 533.7, 555.3, 553.0, 544.0 | 496.7, 474.7, 495.1, 498.4, 488.6 | 0.90× | 1337.9, 1337.0, 1380.1, 1390.4, 1370.6 | 1271.6, 1040.5, 1251.2, 1242.4, 1206.2 |
+| unlink | 316.6, 309.8, 313.9, 321.8, 310.3 | 297.2, 289.9, 300.7, 301.5, 298.6 | 0.95× | 559.5, 509.1, 550.7, 600.4, 545.4 | 558.3, 493.8, 522.6, 595.0, 566.8 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 4189.0, 1044.3, 16183.7, 6347.0, 1312.8 | 3104.5, 1886.6, 1041.5, 16125.8, 3824.2 | 17912.1, 17663.7, 17922.4, 17983.6, 17427.6 | 17933.7, 17647.5, 3460.7, 17925.6, 17909.7 |
+| write | 610.4, 559.6, 529.7, 731.4, 1072.3 | 758.2, 1057.1, 567.8, 547.3, 623.4 | 16260.2, 3588.1, 9782.4, 11734.3, 17147.8 | 3710.2, 5515.5, 4055.9, 17643.3, 6930.0 |
+| fsync | 480.2, 421.1, 641.8, 615.5, 544.3 | 920.3, 1133.6, 637.0, 600.5, 556.2 | 17388.0, 1058.7, 17537.6, 18934.7, 5243.4 | 17717.5, 3033.1, 12195.4, 17704.3, 17607.2 |
+| close | 17541.0, 17495.0, 18103.0, 17439.9, 19238.8 | 17493.4, 18279.5, 17496.4, 17884.9, 17476.1 | 23673.0, 20743.6, 23902.6, 37295.6, 22460.6 | 25218.5, 101153.0, 22199.4, 21587.6, 34376.6 |
+| stat | 746.9, 857.4, 618.3, 625.7, 658.8 | 570.8, 628.0, 592.5, 632.4, 622.9 | 21673.1, 16792.8, 4073.6, 5399.6, 18360.6 | 1089.9, 13492.3, 13851.8, 11916.8, 14628.0 |
+| open | 12035.7, 11457.7, 13601.1, 8994.2, 7992.8 | 11364.5, 7393.7, 22508.5, 8530.2, 11171.9 | 177545.9, 86904.5, 103337.8, 103808.3, 106847.9 | 104392.2, 118389.7, 111910.2, 107298.3, 107302.5 |
+| read | 147.2, 146.1, 157.5, 163.4, 132.5 | 152.5, 121.1, 156.6, 164.7, 162.6 | 988.0, 5446.1, 190.7, 1051.6, 177.5 | 320.7, 172.9, 199.6, 179.1, 1377.4 |
+| rename | 2179.8, 2384.6, 2080.4, 2253.3, 2877.8 | 3208.2, 2551.5, 2347.9, 2026.6, 2213.7 | 83597.8, 19568.4, 83693.2, 145303.4, 83890.8 | 84004.8, 63316.2, 21788.3, 145430.6, 83696.5 |
+| unlink | 3675.1, 3712.9, 1756.3, 1677.7, 1267.2 | 1774.2, 2506.9, 1962.3, 2307.7, 14302.2 | 124912.2, 166062.9, 126349.8, 124203.1, 63557.1 | 84325.5, 124948.4, 186141.8, 165252.1, 146413.8 |
+
+**contended** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 226.7, 247.2, 259.8, 265.7, 235.2 | 225.1, 242.4, 255.9, 262.1, 233.7 | 0.98× | 792.8, 965.8, 1001.0, 1866.3, 1016.5 | 858.2, 884.5, 1130.6, 991.3, 965.0 |
+| write | 206.2, 214.9, 219.0, 223.8, 206.6 | 211.6, 218.2, 223.2, 229.6, 215.0 | 1.02× | 2243.4, 732.3, 3165.4, 2282.7, 2122.9 | 5764.0, 6304.1, 10010.6, 10997.6, 6309.0 |
+| fsync | 126.2, 130.4, 132.4, 132.8, 126.2 | 124.0, 127.6, 126.3, 126.1, 124.2 | 0.97× | 287.4, 308.9, 295.7, 373.0, 368.5 | 375.9, 353.1, 342.8, 651.8, 294.6 |
+| close | 4827.4, 5201.2, 5339.7, 5488.2, 4907.7 | 5023.9, 5273.1, 5486.3, 5612.7, 5199.4 | 1.01× | 38134.4, 39747.5, 42998.8, 40845.4, 38139.8 | 39250.4, 39428.8, 40111.3, 39540.7, 39393.4 |
+| stat | 195.2, 192.0, 192.5, 195.1, 193.7 | 164.9, 167.7, 165.3, 165.1, 165.5 | 0.85× | 15304.9, 10533.1, 16478.9, 14361.4, 15236.2 | 13271.4, 3737.2, 713.7, 758.9, 6680.1 |
+| open | 3971.9, 4256.7, 4393.9, 4518.1, 4049.6 | 4174.0, 4318.4, 4494.0, 4597.7, 4332.8 | 1.02× | 37669.8, 39561.1, 40313.5, 41185.8, 35239.4 | 41123.0, 39830.4, 40832.2, 40466.5, 39411.0 |
+| read | 51.9, 57.8, 60.0, 62.1, 52.7 | 53.5, 56.8, 60.2, 63.0, 55.6 | 0.98× | 92.7, 104.1, 99.5, 100.8, 101.5 | 97.9, 96.6, 101.2, 100.4, 92.9 |
+| rename | 482.7, 489.2, 493.9, 497.3, 482.6 | 556.8, 563.6, 593.6, 610.1, 559.5 | 1.15× | 30673.2, 33373.3, 34070.4, 34393.4, 30634.7 | 35338.7, 36039.6, 37262.4, 38029.1, 35405.3 |
+| unlink | 342.2, 347.3, 350.9, 354.0, 343.5 | 345.1, 346.0, 361.3, 364.4, 348.0 | 1.00× | 23988.2, 28178.4, 27825.5, 27976.2, 26902.3 | 23903.2, 30201.8, 28795.8, 30126.4, 29426.9 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 33653.2, 34502.3, 34265.6, 35208.7, 41231.1 | 33277.3, 34480.5, 34102.7, 35483.3, 38958.2 | 62622.6, 49738.3, 50267.7, 52943.6, 59085.7 | 42626.3, 43056.6, 53605.5, 62120.0, 51213.0 |
+| write | 32516.6, 25870.1, 32427.6, 28934.5, 33375.3 | 33148.4, 36703.8, 33931.8, 34742.1, 33887.0 | 53400.8, 51935.4, 40625.5, 51122.1, 48720.6 | 61708.7, 102974.8, 58035.9, 59707.0, 52679.1 |
+| fsync | 33309.3, 28741.8, 37660.8, 32527.9, 32803.1 | 34050.3, 35046.6, 31597.4, 35232.7, 33736.2 | 60917.4, 60567.0, 55486.3, 59518.0, 56281.3 | 59323.6, 68563.0, 70941.6, 58127.9, 51518.1 |
+| close | 57555.0, 66997.8, 64921.1, 65572.0, 56607.8 | 60242.5, 55911.9, 61627.6, 61380.1, 60601.8 | 104117.6, 111977.3, 93040.9, 119879.3, 109277.9 | 246409.4, 87261.7, 82781.5, 91428.6, 92959.6 |
+| stat | 48814.6, 41633.2, 42263.6, 42999.7, 44677.5 | 37953.6, 42478.9, 43543.4, 40074.2, 48633.7 | 83520.7, 70959.3, 130311.3, 86592.3, 81901.5 | 68681.5, 108677.0, 54614.1, 53402.0, 115899.3 |
+| open | 71223.4, 100469.3, 86136.5, 111003.2, 71442.3 | 87665.2, 116303.3, 128703.8, 114683.8, 88842.2 | 201506.8, 258092.4, 253202.5, 320611.2, 225163.6 | 283324.5, 197364.0, 247095.4, 317913.7, 204291.4 |
+| read | 151.3, 169.5, 168.2, 190.1, 169.1 | 173.3, 181.0, 172.8, 177.9, 177.1 | 195.8, 237.8, 1157.3, 286.2, 1586.8 | 408.9, 1244.0, 321.1, 258.5, 1478.4 |
+| rename | 69014.5, 72579.7, 72997.5, 81170.3, 67221.4 | 76613.4, 67615.0, 84416.1, 81931.9, 67066.3 | 334448.9, 138948.6, 224232.4, 196450.4, 112390.5 | 154862.9, 129472.1, 151786.1, 173618.0, 349147.2 |
+| unlink | 103200.7, 118679.9, 111919.4, 130268.8, 105170.3 | 67870.5, 88886.6, 96351.7, 124224.6, 141837.4 | 281409.8, 325182.9, 432760.4, 549498.9, 405888.2 | 357307.2, 305416.7, 283301.9, 586184.7, 268253.8 |
+
+x86_64:
+
+**quiet** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 674.5, 643.8, 674.1, 647.0, 678.1 | 687.9, 687.4, 622.7, 642.7, 695.4 | 1.02× | 1455.0, 1263.0, 1212.6, 1239.0, 1210.0 | 1280.9, 1302.0, 1255.4, 1468.8, 1287.7 |
+| write | 65.5, 64.0, 69.7, 64.3, 71.0 | 80.1, 80.3, 57.5, 66.0, 87.4 | 1.22× | 316.0, 285.6, 270.9, 283.7, 289.1 | 289.0, 425.9, 313.0, 380.3, 402.4 |
+| fsync | 95.2, 91.2, 99.5, 91.6, 100.5 | 86.0, 83.2, 80.7, 89.8, 94.2 | 0.90× | 347.4, 189.5, 226.7, 212.6, 231.5 | 185.8, 218.5, 190.5, 365.5, 359.9 |
+| close | 41.2, 41.1, 41.7, 41.2, 45.7 | 42.0, 41.7, 41.0, 41.6, 41.8 | 1.01× | 339.7, 395.6, 373.4, 344.8, 372.0 | 373.8, 492.7, 449.0, 419.9, 434.6 |
+| stat | 166.4, 165.6, 173.1, 171.0, 172.5 | 164.9, 168.9, 163.1, 173.3, 183.8 | 0.99× | 394.7, 560.3, 596.2, 716.1, 518.9 | 481.1, 805.2, 864.0, 743.5, 277.6 |
+| open | 130.5, 113.6, 119.7, 112.7, 123.1 | 125.6, 130.3, 100.6, 106.5, 122.6 | 1.02× | 396.1, 197.5, 214.7, 191.8, 209.0 | 230.6, 200.4, 758.1, 215.1, 190.8 |
+| read | 9.6, 9.6, 9.7, 9.5, 9.6 | 31.7, 36.5, 9.1, 9.6, 11.2 | 1.17× | 185.9, 86.6, 97.3, 83.8, 98.6 | 132.2, 107.5, 72.3, 88.6, 108.2 |
+| rename | 352.5, 353.8, 369.7, 348.8, 372.2 | 377.5, 361.3, 326.1, 338.3, 401.3 | 1.02× | 561.4, 565.6, 575.7, 578.3, 619.7 | 784.1, 548.0, 539.7, 534.8, 608.1 |
+| unlink | 223.9, 223.4, 225.9, 222.4, 227.0 | 218.6, 204.5, 186.4, 202.9, 223.6 | 0.91× | 531.9, 582.7, 603.9, 550.4, 574.1 | 562.5, 584.8, 494.7, 516.6, 559.9 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 13356.6, 30120.1, 2939.3, 12608.0, 3004.3 | 5321.2, 5781.9, 8961.8, 15548.2, 15344.6 | 45417.0, 55754.4, 30622.1, 67613.9, 30542.6 | 30074.9, 33706.8, 36699.9, 30704.4, 56271.3 |
+| write | 700.1, 846.6, 827.1, 722.1, 669.3 | 666.7, 873.2, 851.6, 707.6, 707.9 | 33192.6, 32187.7, 30163.4, 29427.7, 16988.1 | 18096.9, 2108.3, 33285.8, 10636.3, 29232.8 |
+| fsync | 640.4, 881.5, 824.9, 768.5, 666.4 | 628.5, 874.8, 842.9, 721.0, 696.0 | 23732.9, 33288.3, 2705.5, 34951.5, 29416.9 | 29352.7, 29661.4, 17486.0, 29360.9, 25485.8 |
+| close | 622.4, 833.4, 791.5, 805.7, 663.0 | 615.8, 879.0, 812.8, 671.7, 678.5 | 1142.5, 4268.1, 862.3, 29250.5, 7333.4 | 1184.4, 968.3, 29372.5, 880.0, 29225.8 |
+| stat | 4994.4, 982.2, 1116.0, 931.5, 835.3 | 1471.1, 1962.4, 1014.8, 1022.0, 771.6 | 66395.2, 64011.7, 47989.4, 36543.8, 41596.3 | 34198.2, 43585.6, 29750.8, 32250.8, 35316.5 |
+| open | 1639.0, 580.1, 554.7, 1034.1, 538.5 | 560.9, 538.8, 6123.0, 911.4, 510.3 | 32909.7, 33073.0, 20102.5, 33266.5, 29469.6 | 29327.2, 29557.0, 18018.5, 29505.1, 18593.3 |
+| read | 383.8, 207.3, 169.2, 221.3, 174.2 | 307.7, 253.7, 177.8, 280.2, 160.4 | 31949.4, 33193.7, 701.0, 29577.1, 29247.9 | 29450.1, 893.9, 13322.8, 13296.6, 661.4 |
+| rename | 985.2, 993.4, 938.6, 978.9, 1097.8 | 1112.4, 935.5, 2266.5, 906.7, 1155.0 | 30085.7, 31108.2, 30089.2, 32044.3, 29817.9 | 29910.6, 30539.6, 33772.1, 31276.0, 29893.3 |
+| unlink | 716.8, 743.3, 829.3, 721.2, 1068.4 | 1132.0, 783.8, 645.7, 627.5, 778.3 | 29396.4, 29656.4, 30391.1, 15223.1, 29899.3 | 56050.4, 28374.7, 15864.5, 1769.1, 29538.4 |
+
+**contended** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 1142.4, 1011.5, 1013.2, 1002.5, 1005.0 | 1140.5, 1083.2, 933.8, 988.8, 970.3 | 0.98× | 132542.9, 60145.3, 64594.3, 64995.4, 65963.5 | 144887.9, 134030.1, 62089.8, 57914.5, 83397.5 |
+| write | 85.1, 83.4, 83.2, 81.9, 82.0 | 76.9, 73.3, 69.5, 80.0, 68.9 | 0.88× | 707.9, 213.5, 232.3, 204.7, 191.1 | 23852.6, 24725.4, 227.5, 206.7, 234.5 |
+| fsync | 126.7, 124.4, 124.6, 123.5, 124.5 | 112.8, 99.2, 96.4, 111.7, 96.6 | 0.80× | 10567.3, 231.8, 224.0, 229.5, 221.6 | 32530.6, 32663.6, 188.8, 209.4, 229.5 |
+| close | 62.8, 62.6, 62.3, 62.0, 62.3 | 52.9, 51.5, 50.7, 50.9, 50.5 | 0.82× | 116.5, 130.2, 117.7, 120.6, 119.9 | 460.4, 160.4, 107.8, 109.4, 113.8 |
+| stat | 254.2, 256.6, 253.7, 257.3, 256.4 | 213.8, 194.6, 197.5, 215.1, 195.2 | 0.77× | 482.5, 603.9, 499.5, 753.2, 598.2 | 517.5, 483.6, 519.1, 496.5, 354.6 |
+| open | 186.6, 186.5, 184.8, 185.2, 185.2 | 168.9, 153.3, 152.6, 170.0, 151.4 | 0.83× | 25358.3, 411.8, 344.0, 321.9, 358.5 | 32552.1, 32619.7, 375.3, 325.1, 293.1 |
+| read | 85.9, 85.6, 85.1, 84.5, 84.4 | 73.1, 71.7, 71.7, 82.0, 70.9 | 0.84× | 164.4, 186.5, 169.8, 147.7, 156.1 | 163.9, 166.7, 163.2, 145.2, 148.7 |
+| rename | 607.1, 618.8, 614.2, 611.7, 615.1 | 508.7, 473.6, 472.4, 541.5, 471.2 | 0.77× | 33141.5, 32962.2, 33311.0, 32680.9, 32959.0 | 32530.4, 31884.3, 32639.8, 32283.0, 31732.1 |
+| unlink | 334.3, 349.8, 340.0, 341.6, 343.0 | 308.0, 293.0, 309.2, 323.3, 297.9 | 0.90× | 1398.2, 1535.1, 1519.9, 1425.5, 1411.8 | 1432.0, 1352.7, 1538.0, 1409.3, 1829.7 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 202019.0, 135682.0, 152902.4, 146670.4, 162192.4 | 215805.3, 207993.7, 140531.0, 131876.9, 159574.7 | 286202.2, 167309.1, 250212.9, 200641.9, 274742.8 | 307580.2, 349299.5, 216986.1, 197292.2, 281372.3 |
+| write | 65442.7, 38832.8, 65430.8, 37983.0, 32082.5 | 65384.9, 66070.8, 41975.8, 58757.0, 52754.9 | 111277.7, 92208.4, 129669.5, 109576.1, 98643.3 | 113375.9, 114486.5, 77393.5, 101425.4, 127820.0 |
+| fsync | 65459.4, 47555.4, 67338.3, 65948.3, 61281.8 | 101275.8, 101038.2, 57538.3, 65620.9, 85981.9 | 144615.4, 111833.1, 164513.5, 147994.5, 151336.1 | 151807.8, 193422.8, 173768.1, 127457.6, 198650.6 |
+| close | 31660.8, 31686.8, 21439.5, 5397.6, 32453.7 | 65143.2, 63642.7, 19681.2, 861.1, 2683.9 | 100164.4, 72985.6, 109351.9, 145074.2, 123217.7 | 99611.7, 136796.4, 140439.5, 130932.3, 84310.2 |
+| stat | 97597.0, 74386.3, 89849.7, 82873.6, 66425.9 | 84672.1, 65845.0, 81421.9, 96403.8, 72990.7 | 131476.5, 170139.6, 163899.1, 113678.6, 130633.5 | 185765.2, 136493.8, 223103.4, 164111.2, 131812.8 |
+| open | 72490.2, 66472.3, 65619.9, 67255.1, 65587.2 | 83965.5, 93787.1, 60547.9, 68627.2, 63342.5 | 133495.6, 121439.5, 208519.0, 133906.6, 148766.7 | 127152.7, 142675.3, 122299.8, 124440.5, 121985.1 |
+| read | 32466.5, 52356.6, 25168.5, 50044.2, 32195.3 | 34111.1, 65313.3, 56948.2, 32739.9, 57271.5 | 121694.5, 145425.6, 122002.8, 129930.2, 91463.9 | 93075.2, 115716.6, 124358.0, 129185.2, 101306.3 |
+| rename | 113414.4, 106398.9, 100612.1, 101411.7, 97795.8 | 98943.1, 124871.5, 107962.5, 112872.9, 99236.4 | 171113.1, 160631.4, 164002.2, 227322.6, 196919.2 | 185062.4, 212279.1, 170469.6, 158470.0, 186204.2 |
+| unlink | 167817.8, 104222.5, 116133.5, 93632.4, 99062.0 | 97594.7, 97486.8, 97699.9, 105727.5, 97530.7 | 364734.0, 284941.7, 323851.5, 428197.3, 496870.5 | 184009.7, 249610.6, 209067.1, 481003.1, 205986.0 |
+
+**What it bought and cost.** Arm64 quiet p50: an fsync 139–144 to 124–130 µs (0.88×), a stat 176–188 to 159–166 µs (0.89×), a
+rename 534–555 to 475–498 µs (0.90×), a write 0.93×, an unlink 0.95×. x86_64 loaded p50, ranges apart: a rename 607–619 to
+471–542 µs (0.77×), a stat 254–257 to 195–215 µs (0.77×), an fsync 0.80×, a close 0.82×, an open 0.83×, a read 0.84×, a write
+0.88×, an unlink 0.90×. Costs, kept in view: **arm64's loaded rename rose 1.15×** (483–497 to 557–610 µs, ranges apart), and its
+loaded write p99 rose from 0.7–3.2 ms to 5.8–11.0 ms; x86_64's loaded fsync and open p99 reached 32 ms in two of five runs where
+parking's reached 10.6–25 ms in one. x86_64's quiet write and read are bimodal between runs (a read 9.1–11.2 µs in three and 32–37
+µs in two; parking's stayed at 9.5–9.7 µs), and their cause is not known. Arm64's loaded stat p99 fell from 10.5–16.5 ms to
+0.7–13.3 ms.
+
+**Loaded SetSize: the shard is preempted just after it answers.** Run 42049771150's idle buckets split the queue wait by how long
+the shard had been idle when the request was sent. Arm64 loaded p50: under 20 µs, 89 µs for SetSize; 50–200 µs, 6.9 µs. A shard
+long idle wakes fast; one that has just answered does not. Run 42059294312 (`diag-winfsp-bench-12`, arm64, one run of 3 rounds,
+instrumented) raised one arm's shard threads to `THREAD_PRIORITY_ABOVE_NORMAL`, the other's left normal, both with the spin:
+
+| Loaded, p50, µs | Normal | Above normal |
+|---|---|---|
+| SetSize hop | 67.6 | 15.7 |
+| SetSize queue | 40.9 | 4.8 |
+| Confirm hop | 32.7 | 5.2 |
+| Confirm queue | 28.0 | 1.9 |
+| Release hop | 18.7 | 7.5 |
+| A write | 238.2 | 100.2 |
+| A close | 8,070.8 | 4,399.8 |
+| A rename | 776.5 | 561.7 |
+
+That names the cause: SetSize is the first request after an open's Confirm, so on the receiver it lands in that window, which on
+the DLL arm it mostly missed. **It is not yet a measured gain:** the two arms share the machine, so the raised arm takes CPU from
+the other and this table flatters it. It needs arms run apart, and it is a whole-daemon change, so it has not been made.
+
+## Where the WinFsp receiver's time goes, and what each fix bought (audit step 7; 2026-11-05)
+
+A-212 left the receiver worse than WinFsp's DLL dispatcher (`71cf09ac`) beyond the spread at the p50, by about 20 µs a request.
+This section records the search for that time and each result, kept or rejected.
+
+**Verdict.**
+- **Kept:** the receive worker makes its two operation packets once for its life (`ba96d65d`). With it, every x86_64 quiet
+  call is within the DLL's spread at the p50.
+- **Not explained:** arm64 stays worse beyond the spread on quiet stat (1.32×), rename (1.21×), unlink (1.18×) and fsync
+  (1.07×), and on loaded write (2.10×). The traces put that time on the kernel's and the application's side of each of our
+  responses, not in the receiver's own work, the transaction mechanism or the mount's configuration.
+- **Rejected, each with its numbers below:** two receive workers, A-215's combined call (as a speed fix) and the batch
+  FSCTL's direct output as a cost.
+
+### Two receive workers: hypothesis rejected for create, stat and open
+
+**The hypothesis (the supervisor's, 2026-11-05).** One receive thread serialises the several IRPs a user operation makes,
+where the DLL serves them on two threads.
+
+**How it was measured.** Diagnostics runs 42086968194 (main `2972a702`), 42091919319 (main `698c64a2` with per-stage timing)
+and 42097182526 (A-215 against main, both staged); three runs each on both lanes. Every operation was traced on both arms,
+one source file (`trace.rs` on the `diag-winfsp-overlap-5` to `-9` branches):
+- the DLL arm around WinFsp's operation guard, before and after its lock;
+- the receiver around its operation call, and at each of its stages;
+- `mount_bench` naming each phase by opening an absent marker name.
+
+The timers cost time, so these runs attribute; they are not the record.
+
+**What it showed.**
+- **The DLL never runs two operations at once.** `71cf09ac` sets WinFsp's coarse guard, which takes one exclusive lock for
+  every operation (`src/dll/fsop.c:80-82`).
+- **Requests rarely arrive at the DLL while another is in service.** Arm64 quiet, run 1: 46 of 10,010 stat Creates, 1 of
+  10,000 open Creates, 1 of 10,000 create-phase Creates. x86_64 runs 1–3: 108–8,230 of 10,000 Creates in stat and open, varying by VM.
+- **Our receiver got 39,918 of its 39,999 arm64 stat-phase receives as one request.**
+- **Overlap exists only under rename and unlink:** arm64 quiet rename Cleanups 9,318 of 20,000, unlink Creates 2,127 of 10,000.
+
+So a second worker could serve only those two phases. It needs a crash proof that does not exist yet (GAPS); it was not built.
+
+**IRPs per operation** (arm64 quiet, either arm):
+- stat: Create, QueryVolumeInformation, Cleanup and Close, one each (Close 1.00 on the DLL arm, 1.22 on ours, the extra
+  lazy Closes of the create phase);
+- open: Create, Cleanup and Close (Read only when the cache misses);
+- rename: two Creates, a SetInformation, two Cleanups and two Closes;
+- unlink: Create, SetInformation, Cleanup and Close.
+
+**Per IRP, where the time goes** (p50, µs; arm64 run 1 of 42091919319, quiet):
+
+| phase | DLL service | DLL idle | our service | our idle | response call | receive wait | prologue |
+|---|---|---|---|---|---|---|---|
+| create | 28.7 | 81.9 | 26.6 | 98.3 | 11.3 | 77.8 | 3.3 |
+| open | 17.4 | 102.4 | 16.4 | 102.4 | 12.8 | 102.4 | 4.1 |
+| rename | 12.3 | 36.9 | 12.8 | 45.1 | 11.8 | 32.8 | 2.9 |
+| stat | 4.4 | 24.6 | 4.6 | 38.9 | 9.2 | 24.6 | 2.6 |
+| unlink | 20.5 | 36.9 | 13.3 | 53.2 | 11.3 | 38.9 | 2.9 |
+
+"Idle" is from one service's end to the next one's begin. Ours is the sum of the last three columns and about 1 µs of
+saving and acknowledging. The services are level, and our receive wait alone is about the DLL's whole idle.
+
+On x86_64 (runs 1–2 of 42091919319, quiet) our idle exceeded the DLL's by 0–6 µs. The response call (10.2–11.8 µs)
+overlapped the application's turnaround there, so our receive wait was shorter than the DLL's idle.
+
+In some x86_64 VM runs our Create and Close services were slower: in 42086968194 the stat Close p50 was 24.6, 18.4 and
+3.5 µs against 1.9–2.7 µs. That fits the reply spin missing, and goes to winfsp-bench (GAPS).
+
+### A-215's combined call: measured and rejected as a speed fix
+
+A-215 sends a batch's last response in the call that receives the next batch. It is crash-safe and proven (A-215, on
+branch `agents/winfsp-overlap-2`; its 40-kill oracle loses 0 and answers 0 wrongly on both lanes). Staged against main in
+run 42097182526, quiet stat, p50:
+
+| lane | main's response call | main's receive wait | A-215's combined call |
+|---|---|---|---|
+| arm64 | 9.2 µs | 26.6 µs | 34.8 µs |
+| x86_64 | 16.4 µs | 28.7 µs | 49.2 µs |
+
+The combined call costs what the two calls did. The response call's time is the kernel completing the IRP, which it pays
+in either form; merging the calls saves one system call, 1–2 µs an IRP on arm64 and nothing on x86_64. In the A/B below,
+A-215 with the prologue change was better than the prologue change alone on arm64 (quiet fsync 0.90×, rename 1.08× the
+DLL), but worse on x86_64 (quiet stat 1.18×, rename 1.20×, with four p99s worse beyond the spread). It does not win on both
+architectures, so it does not land. The earlier A/Bs are on branch `agents/winfsp-overlap-2`'s BENCHMARKS, "The WinFsp receiver with A-215".
+
+### The batch FSCTL's direct output: hypothesis rejected
+
+**The hypothesis.** The receiver's `FSP_FSCTL_TRANSACT_BATCH` is `METHOD_OUT_DIRECT`, so the I/O manager probes and locks
+the whole output buffer each call. The DLL's `FSP_FSCTL_TRANSACT` is `METHOD_BUFFERED` (`inc/winfsp/fsctl.h:100,104`).
+Direct output into the held section is required (A-198): a buffered output can lose requests the driver delivered, at a
+death.
+
+**The driver's minimums.**
+- A batch output under `FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN`, 64 KiB (`fsctl.h:142`), is refused with
+  `STATUS_BUFFER_TOO_SMALL` before any wait (`src/sys/volume.c:1028-1032`).
+- The single-request minimum is 16,320 bytes (`fsctl.h:143`).
+- WinFsp reads only the MDL's address (`volume.c:1147-1149`); the probe and lock are the I/O manager's (Microsoft,
+  "Buffer Descriptions for I/O Control Codes", `METHOD_OUT_DIRECT`).
+- So a smaller direct output is not available. The bench's batches never needed more: its largest receives fell in the
+  "4 or more" bucket of the traces, a few a phase.
+
+**The command.**
+
+```
+WINFSP_TEST_MOUNT=1 cargo +1.98.1 test --release -p slates-bridge-winfsp --lib -- --ignored --exact \
+  host::transact_bench::transact_cost --nocapture
+```
+
+`crates/bridge-winfsp/tests/support/transact.rs` mounts a real WinFsp volume with no file system behind it. Its own loop
+answers every request at once and sends each response in the call that receives the next request, as the DLL does. One
+client opens absent names, and the modes rotate each round. Diagnostics run 42114236343 (`diag-winfsp-overlap-15`, tree
+`a93faf64`), five runs on each runner.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. Five runs from 2026-11-05T21:38:13Z; each mode serves 10 timed rounds of 2,000 requests, after one untimed round. Each cell: the runs' values in order, µs.
+
+| mode | call p50 | call p99 | call p999 | call max | client open p50 | client open p99 |
+|---|---|---|---|---|---|---|
+| single-buffered-16320 | 22.2, 22.0, 21.9, 22.0, 21.7 | 45.5, 46.6, 47.9, 45.2, 44.0 | 87.8, 86.1, 90.0, 85.5, 86.0 | 129.3, 167.4, 195.4, 376.5, 158.0 | 21.3, 21.0, 21.0, 21.0, 20.8 | 52.4, 51.8, 52.4, 53.8, 50.6 |
+| batch-direct-64k-private | 22.9, 22.7, 22.6, 22.6, 22.4 | 48.3, 46.6, 48.4, 45.5, 44.7 | 84.3, 90.5, 77.4, 93.7, 75.9 | 214.9, 2186.3, 136.1, 1944.4, 1963.4 | 22.1, 21.7, 21.6, 21.6, 21.5 | 48.2, 45.9, 47.8, 46.4, 44.7 |
+| batch-direct-64k-section | 22.6, 22.5, 22.6, 22.5, 22.4 | 47.6, 45.8, 46.5, 47.0, 47.8 | 87.6, 94.4, 83.5, 93.0, 89.3 | 2111.9, 186.6, 179.8, 138.1, 139.2 | 21.8, 21.6, 21.6, 21.5, 21.5 | 49.1, 46.2, 46.5, 47.3, 47.5 |
+| batch-direct-128k-section | 24.1, 23.8, 23.9, 23.7, 23.8 | 49.3, 49.9, 52.5, 58.3, 53.8 | 88.8, 95.1, 95.8, 117.6, 86.3 | 247.5, 375.6, 208.5, 638.7, 1177.9 | 23.2, 22.8, 22.9, 22.8, 22.8 | 49.4, 49.5, 53.2, 56.5, 52.0 |
+| batch-direct-256k-section | 26.3, 25.7, 25.7, 25.5, 25.7 | 52.5, 55.0, 52.4, 54.5, 58.2 | 104.0, 96.8, 102.0, 112.6, 86.9 | 157.2, 187.8, 1177.2, 1038.6, 452.2 | 25.5, 24.7, 24.7, 24.5, 24.7 | 52.6, 54.9, 53.2, 53.5, 55.9 |
+
+Refused in every run: 10 of 10 calls with a batch output of 16,384 or 4,096 bytes returned Win32 error 122, the driver's `STATUS_BUFFER_TOO_SMALL`.
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. Five runs from 2026-11-05T21:38:16Z; each mode serves 10 timed rounds of 2,000 requests, after one untimed round. Each cell: the runs' values in order, µs.
+
+| mode | call p50 | call p99 | call p999 | call max | client open p50 | client open p99 |
+|---|---|---|---|---|---|---|
+| single-buffered-16320 | 50.6, 50.6, 49.8, 50.6, 50.3 | 97.0, 93.1, 88.8, 94.6, 92.8 | 133.3, 146.9, 137.1, 147.7, 126.0 | 454.0, 356.3, 617.9, 297.5, 591.0 | 49.7, 49.5, 48.8, 49.5, 49.3 | 99.7, 91.5, 93.0, 93.7, 92.4 |
+| batch-direct-64k-private | 50.2, 50.2, 49.8, 50.7, 50.2 | 92.3, 88.4, 90.1, 96.6, 94.2 | 127.8, 115.9, 125.8, 152.6, 130.9 | 1338.8, 1285.0, 674.1, 282.9, 250.6 | 49.3, 49.1, 48.8, 49.6, 49.1 | 92.1, 86.4, 90.5, 93.7, 91.4 |
+| batch-direct-64k-section | 50.3, 50.3, 49.8, 50.5, 50.3 | 90.7, 91.0, 93.9, 96.4, 92.4 | 127.2, 130.4, 141.3, 157.0, 127.9 | 279.5, 1091.0, 1156.9, 1282.9, 314.9 | 49.2, 49.1, 48.8, 49.3, 49.3 | 90.2, 89.0, 92.7, 95.2, 90.4 |
+| batch-direct-128k-section | 51.5, 51.3, 50.7, 51.3, 51.2 | 92.6, 95.4, 94.8, 95.7, 96.8 | 134.2, 132.6, 141.3, 185.0, 140.3 | 319.7, 406.6, 991.0, 970.4, 828.0 | 50.5, 50.3, 49.7, 50.1, 50.2 | 90.1, 93.6, 93.4, 92.4, 96.2 |
+| batch-direct-256k-section | 53.5, 52.5, 52.4, 52.6, 52.6 | 100.0, 95.0, 95.6, 99.6, 95.4 | 141.1, 130.1, 139.9, 165.5, 127.0 | 1373.2, 1430.2, 577.9, 1192.6, 317.2 | 52.6, 51.4, 51.4, 51.5, 51.5 | 96.2, 91.9, 93.6, 96.8, 91.9 |
+
+Refused in every run: 10 of 10 calls with a batch output of 16,384 or 4,096 bytes returned Win32 error 122, the driver's `STATUS_BUFFER_TOO_SMALL`.
+
+**Result.** At the driver's 64 KiB minimum, direct output costs about 0.5 µs a call more than the DLL's buffered call on
+arm64, and nothing measurable on x86_64. Each further 64 KiB adds about 1.2 µs on arm64 and 1 µs on x86_64. A private
+buffer and a pagefile section cost the same. So crash-safe receive costs at most about 0.5 µs an IRP.
+
+**What remains.** With this harness's "not found" answers, completion, the client's turnaround and the next delivery took
+about 22 µs a request on arm64, close to the DLL arm's whole idle in the mount (24.6 µs). With our real responses in the
+mount, they took 34–36 µs. The volume parameters of `71cf09ac` and main are the same but for an explicit transaction
+timeout. So the arm64 remainder is on the kernel's and the application's side of our responses: about 10 µs an IRP,
+measured and not explained.
+
+### Three arms against the DLL dispatcher (`71cf09ac`), five runs each
+
+The command is `windows-ab.sh` as in the sections above (`OLD_NAME=dll NEW_NAME=receiver RUNS=5 SPINNERS_PER_CPU=2`), after
+the live oracles: Windows clippy, the bridge suite and the CLI WinFsp suite, all passing on both lanes in each arm. Each arm
+ran on its own VMs, so arms are compared through their ratios to their own DLL arm. In two arms, x86_64 run 3 lost the
+DLL arm's drive under load: the anchor killed its daemon for a lapsed heartbeat (`os error 995`), and that run has a quiet
+pass only.
+
+**Arm 1: today's main (`698c64a2`).** Diagnostics run 42100630998 (`diag-winfsp-overlap-10`).
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:34:32Z; run 2 of 5 done, 2026-11-05T20:44:45Z; run 3 of 5 done, 2026-11-05T20:54:10Z; run 4 of 5 done, 2026-11-05T21:03:14Z; run 5 of 5 done, 2026-11-05T21:12:29Z.
+Wake-up probe, quiet: p50 24.3–26.4 µs, max 3.6–6.9 ms; pass 165–174 s.
+Wake-up probe, contended: p50 25.8–26.9 µs, max 50.6–76.9 ms; pass 349–424 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 197.5, 200.6, 215.4, 202.3, 198.7 | 220.6, 225.0, 232.8, 221.6, 211.1 | 1.10× | overlap | 308.4, 294.5, 319.1, 453.0, 321.6 | 319.5, 326.9, 337.7, 318.6, 317.9 | overlap |
+| write | 95.9, 95.8, 99.1, 95.7, 94.3 | 98.9, 99.4, 102.7, 100.6, 98.4 | 1.04× | overlap | 240.5, 227.0, 236.9, 228.9, 247.3 | 235.5, 249.0, 249.3, 238.4, 254.3 | overlap |
+| fsync | 109.7, 108.7, 113.5, 111.7, 111.6 | 122.0, 120.1, 122.4, 124.4, 120.2 | 1.09× | worse | 182.9, 174.3, 179.7, 167.6, 242.8 | 187.7, 187.3, 190.0, 190.4, 193.2 | overlap |
+| close | 4378.3, 4477.3, 4625.0, 4449.1, 4461.5 | 4612.2, 4565.0, 4713.7, 4754.3, 4592.8 | 1.03× | overlap | 6500.5, 6421.2, 7480.5, 14803.2, 13976.9 | 6248.6, 6052.1, 6407.4, 6273.4, 6118.0 | better |
+| stat | 117.0, 115.7, 119.0, 117.0, 117.6 | 160.7, 155.0, 160.4, 161.8, 160.9 | 1.37× | worse | 194.3, 194.3, 224.4, 194.9, 194.6 | 247.0, 294.8, 235.3, 264.6, 313.0 | worse |
+| open | 3850.5, 3922.8, 4074.8, 3938.5, 3927.5 | 4116.4, 4202.1, 4243.4, 4187.2, 4038.2 | 1.07× | overlap | 5200.7, 5340.2, 5538.7, 5463.1, 5240.9 | 5448.2, 6064.5, 5544.7, 5520.6, 6778.3 | overlap |
+| read | 40.1, 45.5, 46.1, 46.3, 46.6 | 48.6, 45.1, 48.3, 50.2, 45.3 | 1.05× | overlap | 63.2, 67.4, 78.7, 77.5, 72.8 | 71.7, 72.4, 72.7, 82.2, 68.3 | overlap |
+| rename | 382.8, 382.4, 390.2, 387.4, 386.3 | 473.8, 471.3, 485.7, 482.6, 473.8 | 1.23× | worse | 824.2, 826.0, 774.3, 846.6, 1125.7 | 1106.6, 1381.1, 1188.4, 1207.4, 1350.7 | overlap |
+| unlink | 242.8, 248.0, 249.0, 247.3, 245.3 | 287.5, 290.9, 286.6, 293.5, 290.6 | 1.18× | worse | 438.2, 420.6, 443.0, 440.1, 432.4 | 573.1, 499.3, 605.1, 536.2, 561.2 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1573.9, 987.9, 2023.1, 1618.9, 1864.4 | 799.2, 741.5, 1119.3, 963.1, 2231.0 | 13125.8, 6975.9, 4776.2, 10500.5, 16127.3 | 6954.5, 3957.1, 3761.0, 3627.1, 11678.4 |
+| write | 1064.4, 469.6, 526.1, 583.9, 824.3 | 543.3, 566.4, 575.3, 663.1, 704.2 | 4176.6, 7804.3, 6607.3, 2778.4, 9876.7 | 17595.3, 3217.2, 147864.4, 243128.1, 3593.6 |
+| fsync | 859.5, 383.5, 502.0, 463.6, 2987.8 | 505.4, 482.8, 414.2, 466.5, 429.2 | 17422.9, 17760.9, 3945.3, 3372.2, 122811.9 | 1507.0, 2576.7, 3245.9, 13022.0, 1778.6 |
+| close | 17539.6, 17576.2, 17889.2, 18273.9, 19012.8 | 8512.6, 8704.3, 8453.9, 8436.0, 10435.4 | 44417.8, 78333.2, 23876.9, 22286.1, 646877.7 | 23533.4, 33611.0, 89918.1, 16794.2, 23286.9 |
+| stat | 405.5, 378.2, 777.4, 283.1, 243.4 | 727.9, 707.7, 608.9, 615.2, 3040.0 | 9987.7, 3222.5, 3747.5, 778.6, 3789.5 | 13302.6, 14338.0, 11964.2, 16826.4, 8775.2 |
+| open | 6345.4, 7099.1, 7263.2, 6945.3, 7655.8 | 10649.5, 17553.3, 9329.2, 46696.9, 45984.8 | 10624.6, 280634.1, 9442.2, 10454.7, 85892.6 | 105308.1, 194749.7, 102611.5, 102812.5, 335580.8 |
+| read | 130.1, 114.0, 155.5, 138.4, 125.4 | 144.9, 148.8, 147.8, 153.5, 140.0 | 489.0, 160.2, 1194.3, 172.2, 160.7 | 177.6, 561.1, 180.1, 1343.2, 180.3 |
+| rename | 3061.8, 23814.2, 3529.8, 9689.1, 9399.0 | 2323.5, 6373.0, 2760.8, 2950.8, 3803.0 | 56813.0, 85192.7, 60275.9, 79611.2, 57834.4 | 42336.0, 40784.9, 63037.8, 83710.4, 62900.7 |
+| unlink | 904.5, 934.8, 730.4, 872.4, 769.1 | 21071.6, 1341.2, 2628.4, 4761.7, 3759.3 | 3453.6, 36322.8, 1882.3, 32756.2, 3378.7 | 185099.6, 125615.6, 145889.2, 165315.9, 164653.5 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 235.5, 237.5, 225.5, 223.4, 213.6 | 230.3, 253.0, 230.3, 226.6, 211.0 | 1.02× | overlap | 835.8, 842.8, 745.2, 813.1, 759.0 | 1279.4, 829.6, 918.7, 1183.6, 873.9 | overlap |
+| write | 98.8, 99.6, 98.2, 96.1, 95.8 | 208.1, 217.4, 207.2, 207.3, 200.4 | 2.11× | worse | 438.8, 424.0, 320.5, 597.0, 311.4 | 7477.9, 3699.3, 9306.3, 5350.7, 2555.7 | worse |
+| fsync | 130.3, 129.6, 125.8, 125.8, 122.7 | 115.6, 121.7, 116.1, 119.9, 111.3 | 0.92× | better | 353.6, 679.2, 332.4, 466.0, 326.2 | 352.3, 321.0, 363.1, 335.7, 379.2 | overlap |
+| close | 5213.3, 5218.4, 5034.7, 4981.1, 4892.6 | 5161.0, 5919.3, 5147.3, 5072.2, 4894.4 | 1.02× | overlap | 39495.2, 39526.8, 39807.5, 38762.3, 39459.0 | 38559.4, 39940.6, 38072.9, 39209.1, 38388.5 | overlap |
+| stat | 148.7, 147.9, 145.4, 145.4, 146.3 | 153.9, 152.6, 154.8, 153.1, 150.9 | 1.05× | worse | 18550.7, 28438.8, 24381.2, 28330.9, 22823.4 | 745.2, 709.2, 697.7, 1035.0, 1373.5 | better |
+| open | 4165.8, 4227.2, 4054.8, 3977.2, 3900.0 | 4305.5, 4550.1, 4289.4, 4161.9, 4124.9 | 1.06× | overlap | 37945.7, 37820.7, 38521.7, 35714.3, 37933.9 | 39884.2, 45435.1, 39646.7, 40492.4, 41148.8 | worse |
+| read | 53.6, 55.7, 51.6, 51.1, 47.9 | 54.3, 57.2, 54.8, 52.0, 50.2 | 1.05× | overlap | 88.1, 87.0, 87.2, 88.2, 80.2 | 87.0, 92.7, 89.9, 89.3, 86.1 | overlap |
+| rename | 446.7, 454.0, 445.9, 446.8, 436.5 | 541.3, 542.6, 537.6, 525.1, 510.8 | 1.20× | worse | 23064.5, 25345.5, 22367.3, 25496.2, 25255.2 | 35465.7, 35752.2, 37075.2, 36072.1, 35409.4 | worse |
+| unlink | 307.1, 307.6, 301.8, 302.0, 296.9 | 339.9, 345.1, 338.1, 331.3, 334.3 | 1.12× | worse | 37018.5, 34476.3, 29558.4, 33770.6, 37787.4 | 28521.9, 31561.2, 28874.3, 27211.8, 28622.1 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 32845.8, 33315.1, 27276.0, 33678.2, 34030.3 | 34378.0, 29691.9, 34006.8, 39176.9, 34141.9 | 50782.9, 46333.9, 46023.6, 55849.5, 50457.3 | 58122.1, 71819.4, 48351.7, 51959.9, 43501.3 |
+| write | 23507.9, 34361.3, 23510.3, 32594.9, 25924.0 | 33835.2, 26310.3, 35789.8, 29402.8, 32314.3 | 49809.2, 49804.3, 47439.9, 48963.0, 48726.4 | 66600.1, 44559.6, 50518.1, 40209.3, 81066.2 |
+| fsync | 36920.5, 39475.6, 37730.4, 39878.9, 45039.2 | 39170.1, 29672.2, 33257.3, 33377.6, 33872.8 | 56913.7, 70307.9, 54782.9, 61112.9, 84215.4 | 86260.8, 48442.3, 71858.8, 75839.5, 74535.6 |
+| close | 57719.2, 64831.4, 56737.4, 60523.1, 56478.6 | 61562.8, 55609.5, 55630.1, 57133.7, 56238.5 | 99888.9, 88051.7, 91560.0, 83602.2, 75280.2 | 102949.7, 77429.0, 82945.9, 73582.9, 79573.6 |
+| stat | 43589.8, 47152.4, 49971.8, 44172.5, 50519.8 | 40229.6, 46546.4, 40586.9, 41375.6, 38521.9 | 59444.1, 77845.4, 69755.4, 72596.3, 95248.0 | 62195.3, 153416.4, 61733.9, 119386.4, 78526.4 |
+| open | 58189.1, 58558.4, 62912.6, 59690.9, 65062.0 | 104225.7, 116178.5, 104462.5, 80881.9, 97217.5 | 96202.6, 95545.3, 143280.1, 109000.1, 83025.6 | 214588.9, 316583.0, 245758.1, 243331.0, 233880.9 |
+| read | 160.3, 165.2, 167.3, 163.0, 177.0 | 165.5, 180.9, 166.2, 164.5, 179.2 | 186.2, 193.0, 823.1, 341.7, 1091.9 | 336.6, 719.7, 293.2, 427.2, 755.5 |
+| rename | 69109.5, 68620.4, 71876.5, 71302.0, 71254.0 | 72273.1, 67215.3, 76387.9, 78930.7, 65046.9 | 168866.9, 160260.2, 155505.8, 161077.5, 147183.4 | 323079.6, 124919.6, 145983.6, 325524.6, 127731.5 |
+| unlink | 52263.7, 52842.2, 51358.7, 50694.9, 55809.4 | 101687.3, 126854.5, 119805.1, 115200.1, 127252.2 | 89140.5, 99981.6, 82879.0, 93136.7, 94443.9 | 365599.1, 448463.0, 402631.9, 348644.9, 344866.5 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:43:39Z; run 2 of 5 done, 2026-11-05T20:59:54Z; run 3 of 5 FAILED, 2026-11-05T21:02:46Z; run 4 of 5 done, 2026-11-05T21:19:53Z; run 5 of 5 done, 2026-11-05T21:34:41Z.
+Wake-up probe, quiet: p50 37.6–39.4 µs, max 0.3–2.3 ms; pass 59–73 s.
+Wake-up probe, contended: p50 37.6–38.8 µs, max 157.1–212.2 ms; pass 817–938 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 887.2, 915.8, 968.3, 940.7, 967.6 | 985.2, 944.5, 999.7, 1090.7, 931.1 | 1.05× | overlap | 1484.7, 1510.6, 1894.6, 1869.9, 1557.1 | 1578.9, 1543.3, 2649.6, 2754.4, 1508.5 | overlap |
+| write | 90.0, 94.6, 114.5, 100.2, 112.6 | 120.4, 128.1, 121.9, 88.8, 96.6 | 1.20× | overlap | 178.1, 197.7, 239.9, 176.8, 185.2 | 198.2, 195.9, 260.9, 1005.2, 190.5 | overlap |
+| fsync | 133.8, 131.2, 145.1, 159.3, 177.5 | 161.8, 143.9, 169.2, 136.4, 128.9 | 0.99× | overlap | 219.5, 213.9, 411.5, 254.7, 264.0 | 262.5, 246.2, 395.0, 305.0, 224.6 | overlap |
+| close | 61.5, 61.2, 61.6, 72.4, 93.4 | 69.7, 69.6, 72.3, 71.5, 68.9 | 1.13× | overlap | 131.9, 129.3, 204.9, 134.8, 143.2 | 161.7, 151.8, 217.0, 159.1, 143.0 | overlap |
+| stat | 255.5, 257.1, 323.9, 298.3, 342.4 | 319.0, 301.9, 320.4, 272.1, 275.0 | 1.01× | overlap | 378.6, 406.7, 529.8, 420.9, 442.2 | 440.6, 425.2, 469.6, 586.6, 389.3 | overlap |
+| open | 153.2, 184.4, 197.9, 187.0, 198.3 | 187.3, 200.3, 191.4, 176.7, 193.9 | 1.02× | overlap | 253.0, 278.4, 285.9, 280.8, 287.9 | 297.9, 315.6, 759.5, 1130.5, 284.5 | overlap |
+| read | 12.7, 13.0, 12.6, 13.3, 12.3 | 14.2, 14.4, 14.0, 14.2, 14.2 | 1.12× | worse | 120.2, 146.0, 141.9, 107.2, 20.3 | 21.0, 158.5, 30.1, 148.8, 148.3 | overlap |
+| rename | 549.3, 562.1, 681.2, 634.3, 707.8 | 710.4, 670.2, 711.2, 592.8, 597.1 | 1.06× | overlap | 819.6, 822.1, 1027.6, 939.7, 900.7 | 1067.8, 940.9, 2009.9, 1565.8, 854.2 | overlap |
+| unlink | 322.5, 322.8, 367.6, 386.5, 413.7 | 410.4, 378.4, 415.0, 352.6, 343.0 | 1.03× | overlap | 748.6, 745.0, 878.3, 618.3, 775.2 | 919.8, 876.3, 1169.9, 902.2, 832.7 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1880.2, 16712.8, 3700.8, 26067.8, 2110.4 | 4482.5, 2873.2, 11989.1, 121975.7, 9738.5 | 37932.1, 37851.7, 41391.9, 270573.6, 37659.1 | 38000.1, 38620.0, 37920.6, 347479.4, 38408.4 |
+| write | 737.3, 653.2, 1122.1, 782.5, 435.4 | 412.5, 518.4, 824.8, 1153.9, 482.4 | 36657.2, 36564.4, 29776.1, 282929.7, 2204.8 | 36495.3, 36604.5, 2051.5, 219007.0, 12491.8 |
+| fsync | 626.4, 569.9, 801.2, 745.2, 615.6 | 568.3, 490.5, 1534.2, 1909.9, 516.2 | 45577.0, 12481.9, 36557.8, 170791.5, 2016.5 | 1493.1, 40832.9, 31465.3, 235215.0, 36660.0 |
+| close | 634.9, 548.8, 407.4, 551.3, 447.7 | 388.5, 416.9, 718.2, 1021.0, 476.8 | 36466.0, 9957.7, 3834.2, 31870.8, 36569.7 | 849.9, 4920.7, 27720.6, 32414.3, 36416.6 |
+| stat | 502.4, 848.8, 2814.1, 1053.5, 993.1 | 889.8, 947.6, 1514.6, 1286.1, 843.2 | 37117.5, 37123.2, 31338.6, 231338.1, 36970.0 | 37126.8, 36892.4, 15574.9, 173709.3, 45148.8 |
+| open | 524.4, 849.7, 961.7, 810.0, 604.7 | 783.9, 1133.5, 2650.7, 3264.3, 791.4 | 36612.3, 36741.0, 36723.1, 296170.7, 36649.0 | 36650.4, 36583.8, 37186.0, 124074.9, 36567.8 |
+| read | 157.6, 210.1, 167.4, 142.3, 47.0 | 40.4, 198.8, 105.5, 1054.9, 221.3 | 36414.5, 755.4, 379.0, 5328.7, 63.7 | 72.0, 334.9, 216.4, 79316.7, 1363.5 |
+| rename | 1338.4, 1294.2, 2591.2, 37554.2, 1450.9 | 4441.1, 1474.3, 5674.0, 35067.3, 1351.8 | 37527.3, 37408.6, 37708.6, 388898.9, 37695.6 | 38358.2, 37929.0, 37053.0, 187912.6, 37620.8 |
+| unlink | 1013.1, 1062.6, 9379.2, 1841.2, 15590.2 | 22330.6, 22146.2, 11002.3, 3066.1, 1204.2 | 21016.9, 37041.9, 38326.5, 62797.2, 41432.5 | 73212.1, 36994.0, 80055.2, 318824.9, 36758.7 |
+
+**contended** (4 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1593.5, 1607.5, 1617.6, 1681.9 | 1670.1, 1651.8, 1578.7, 1586.4 | 1.02× | overlap | 229569.1, 242395.9, 247888.6, 237453.5 | 77669.5, 87374.5, 98779.4, 75670.4 | better |
+| write | 124.1, 125.2, 124.7, 124.7 | 128.4, 103.0, 103.0, 100.6 | 0.83× | overlap | 456.5, 462.9, 440.4, 24473.4 | 518.4, 482.8, 1095.9, 354.0 | overlap |
+| fsync | 190.2, 191.9, 190.3, 190.7 | 207.5, 156.9, 156.2, 155.8 | 0.82× | overlap | 321.0, 353.9, 340.7, 407.5 | 988.2, 426.2, 1130.7, 425.9 | worse |
+| close | 97.0, 97.7, 97.2, 97.0 | 83.0, 80.7, 80.8, 80.0 | 0.83× | better | 167.1, 180.2, 171.6, 163.1 | 200.8, 210.5, 300.1, 210.1 | worse |
+| stat | 365.6, 367.4, 362.5, 359.0 | 347.7, 297.2, 291.5, 298.3 | 0.82× | better | 125070.6, 130404.7, 110783.2, 114227.9 | 14006.3, 16766.0, 23748.2, 13867.9 | better |
+| open | 243.8, 241.6, 240.0, 241.1 | 252.4, 222.3, 218.2, 219.3 | 0.92× | overlap | 3740.2, 373.6, 388.5, 1278.1 | 3090.6, 1797.3, 1683.3, 1618.1 | overlap |
+| read | 126.1, 125.9, 125.0, 125.7 | 110.9, 107.1, 107.1, 106.0 | 0.85× | better | 222.9, 199.6, 208.2, 217.8 | 227.3, 245.8, 1039.3, 239.6 | worse |
+| rename | 845.0, 836.1, 831.8, 830.7 | 868.6, 725.5, 686.8, 717.6 | 0.87× | overlap | 61617.9, 61895.5, 56501.9, 66242.2 | 60828.6, 51872.8, 64596.8, 41981.0 | overlap |
+| unlink | 506.7, 496.2, 512.9, 498.9 | 487.0, 408.0, 400.4, 421.7 | 0.83× | better | 129363.1, 140666.4, 141839.1, 135034.7 | 32226.0, 32506.1, 32052.3, 32477.9 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 299627.5, 331916.8, 334547.4, 304894.4 | 160811.2, 150067.5, 159712.6, 163377.5 | 382581.8, 483130.8, 398834.6, 390650.3 | 218576.2, 185519.7, 229130.2, 251329.5 |
+| write | 64226.1, 64368.2, 61248.8, 86558.5 | 65681.0, 65055.2, 72592.8, 61648.1 | 172985.8, 145603.9, 119031.4, 131756.0 | 98680.4, 135897.9, 97909.6, 299933.9 |
+| fsync | 72242.5, 70743.2, 66266.9, 66391.4 | 66543.5, 68197.2, 77725.2, 66951.8 | 152957.4, 184845.4, 129848.6, 103985.1 | 99389.3, 109078.0, 121204.6, 198203.0 |
+| close | 56216.8, 41169.7, 37864.7, 31452.6 | 33413.7, 44371.5, 37891.5, 51107.3 | 141755.3, 73257.8, 113873.3, 101477.9 | 79912.6, 70974.5, 101316.1, 79002.2 |
+| stat | 179099.3, 179606.2, 172350.8, 175180.4 | 73100.1, 95548.4, 79515.8, 88513.4 | 233890.8, 229903.8, 339081.5, 261872.3 | 100059.9, 122927.7, 133101.8, 133543.6 |
+| open | 95447.2, 83301.5, 87731.3, 92093.7 | 66616.5, 65700.0, 66931.2, 64040.6 | 140160.9, 138057.8, 133740.1, 154363.1 | 123162.6, 119834.3, 138539.7, 82061.5 |
+| read | 79233.5, 65898.9, 97313.4, 72142.2 | 34249.7, 65954.3, 65835.2, 64882.4 | 127104.9, 157682.8, 263689.9, 188589.2 | 83816.3, 92754.1, 120931.5, 106591.7 |
+| rename | 152393.3, 158121.1, 142431.7, 162895.4 | 205733.4, 129706.9, 252939.4, 111646.1 | 250145.2, 216925.4, 247309.4, 218856.8 | 2102368.9, 1540170.9, 2152116.2, 1585550.6 |
+| unlink | 190931.3, 192993.0, 195487.8, 189041.1 | 1043341.3, 1185418.7, 956329.5, 639291.7 | 251278.8, 238682.6, 249533.9, 250151.9 | 2423882.2, 2974335.5, 1938139.4, 2117982.6 |
+
+**Arm 2: main with the worker's packets made once (`ba96d65d`), kept.** Diagnostics run 42100636103 (`diag-winfsp-overlap-11`).
+Each request had made a fresh 16 KiB working copy and a fresh 16 KiB response packet, and zero-filled that packet again:
+2.6–4.4 µs an IRP on arm64 and 1.7–2.0 µs on x86_64 (the prologue column above). WinFsp's own dispatcher clears only the
+response header (`src/dll/fs.c:303-305`).
+- **x86_64:** every quiet call within the DLL's spread at the p50, and its ratios below arm 1's (quiet write 0.96× against
+  1.20×, fsync 0.87× against 0.99×, stat 0.95× against 1.01×, rename 1.00× against 1.06×).
+- **arm64:** slightly better (stat 1.32× against 1.37×, rename 1.21× against 1.23×, loaded rename 1.13× against 1.20×), but
+  quiet read was 1.17× against 1.05×. Differences of a few percent between arms are within the noise of separate VMs.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:35:00Z; run 2 of 5 done, 2026-11-05T20:43:58Z; run 3 of 5 done, 2026-11-05T20:52:41Z; run 4 of 5 done, 2026-11-05T21:01:49Z; run 5 of 5 done, 2026-11-05T21:10:31Z.
+Wake-up probe, quiet: p50 23.6–25.4 µs, max 3.8–27.6 ms; pass 138–164 s.
+Wake-up probe, contended: p50 25.5–26.1 µs, max 71.5–82.3 ms; pass 349–416 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 210.6, 194.9, 191.3, 197.2, 194.7 | 235.9, 217.2, 206.9, 219.0, 219.9 | 1.12× | overlap | 424.0, 317.4, 336.1, 345.9, 373.5 | 428.3, 459.5, 337.4, 453.8, 439.7 | overlap |
+| write | 95.9, 91.4, 91.3, 92.1, 92.6 | 93.8, 94.2, 88.8, 93.7, 95.4 | 1.02× | overlap | 227.4, 209.1, 211.9, 213.8, 224.5 | 219.9, 258.8, 205.4, 230.8, 224.4 | overlap |
+| fsync | 112.2, 108.2, 108.2, 109.4, 110.6 | 115.3, 117.5, 114.0, 119.6, 121.2 | 1.07× | worse | 164.1, 159.7, 165.9, 170.7, 170.1 | 179.8, 219.3, 177.3, 182.6, 185.2 | worse |
+| close | 4341.4, 4114.4, 4063.1, 4145.1, 4108.7 | 4519.5, 4258.8, 4154.4, 4278.3, 4322.4 | 1.04× | overlap | 6071.5, 6083.7, 5995.0, 6215.1, 7629.0 | 6195.1, 6548.5, 5791.1, 5774.5, 5801.0 | overlap |
+| stat | 117.9, 116.9, 115.3, 115.8, 117.8 | 155.6, 173.8, 151.9, 153.4, 154.8 | 1.32× | worse | 196.1, 190.4, 209.6, 187.1, 195.6 | 242.9, 405.9, 225.1, 227.8, 238.4 | worse |
+| open | 4050.2, 3581.3, 1040.9, 3545.1, 3731.2 | 4132.5, 3928.9, 3667.4, 3909.9, 3996.9 | 1.10× | overlap | 5496.9, 5096.6, 5155.3, 5373.3, 5148.5 | 5718.7, 6159.0, 5510.4, 5305.8, 5400.1 | overlap |
+| read | 41.5, 37.7, 37.5, 38.1, 38.1 | 45.8, 44.4, 38.7, 43.7, 45.6 | 1.17× | overlap | 70.1, 65.0, 64.6, 70.2, 63.9 | 78.2, 78.1, 70.3, 65.7, 67.0 | overlap |
+| rename | 398.9, 390.4, 384.8, 387.3, 385.3 | 473.6, 472.8, 456.4, 468.6, 468.1 | 1.21× | worse | 737.0, 760.3, 841.6, 772.4, 840.0 | 945.4, 1051.5, 875.4, 890.2, 894.9 | worse |
+| unlink | 250.0, 244.4, 242.5, 244.6, 243.9 | 291.7, 291.0, 283.2, 284.3, 289.5 | 1.18× | worse | 419.5, 406.0, 401.9, 410.0, 427.2 | 465.6, 475.8, 478.0, 472.9, 481.6 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 16122.3, 2994.1, 919.2, 1295.7, 2701.1 | 969.2, 1078.4, 680.0, 774.8, 892.7 | 17926.0, 17942.1, 17655.4, 17932.5, 17938.6 | 3730.4, 2717.1, 3132.3, 3384.5, 3839.3 |
+| write | 1057.8, 1434.1, 1018.0, 676.9, 1580.5 | 481.1, 565.5, 416.9, 640.1, 501.4 | 17795.2, 17798.4, 17363.8, 17352.8, 17681.0 | 3163.2, 3389.7, 3159.2, 3163.1, 3889.2 |
+| fsync | 477.0, 473.8, 532.8, 462.4, 771.7 | 459.7, 568.2, 523.4, 489.9, 540.7 | 16047.2, 5226.3, 2411.2, 4555.7, 17207.5 | 939.4, 3774.4, 39953.0, 1626.7, 3323.1 |
+| close | 17365.2, 17600.1, 17500.9, 17583.7, 17616.7 | 7902.7, 10984.5, 7727.7, 7700.7, 8050.1 | 20103.1, 34207.1, 20847.3, 22366.5, 33490.6 | 10649.2, 57777.7, 16428.3, 16050.1, 42449.2 |
+| stat | 1085.6, 264.3, 431.4, 283.5, 360.5 | 658.5, 1298.9, 567.0, 574.7, 590.8 | 13780.4, 8515.1, 15059.8, 14689.5, 11412.0 | 12271.7, 3279.1, 4030.1, 1252.8, 7988.2 |
+| open | 7377.3, 6293.4, 7109.5, 11753.1, 6558.8 | 10972.8, 24463.8, 17019.0, 10730.1, 8309.0 | 12693.1, 14868.9, 12485.4, 52270.2, 15489.0 | 103248.3, 113599.4, 101964.6, 103089.6, 124570.7 |
+| read | 140.8, 123.1, 127.3, 132.0, 123.8 | 146.4, 142.3, 112.0, 116.2, 143.8 | 220.0, 176.2, 3440.8, 201.1, 171.0 | 174.6, 4231.4, 160.1, 185.0, 303.6 |
+| rename | 7710.0, 3478.0, 3684.0, 4938.8, 4039.2 | 3755.2, 2276.4, 3749.6, 2195.9, 3135.2 | 58464.8, 38049.3, 71134.4, 75573.6, 64101.0 | 63214.3, 16050.8, 21565.5, 20903.7, 15869.3 |
+| unlink | 1533.0, 678.7, 1122.0, 864.4, 1387.6 | 780.4, 1824.9, 771.3, 1288.7, 762.0 | 17102.3, 2067.8, 16023.2, 3363.2, 63209.6 | 13856.7, 185267.2, 144870.1, 184565.7, 4353.8 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 243.5, 224.9, 217.3, 232.6, 219.3 | 219.6, 219.4, 211.4, 230.4, 226.4 | 0.98× | overlap | 746.0, 800.0, 748.9, 1279.7, 847.8 | 807.9, 860.8, 748.7, 844.3, 796.4 | overlap |
+| write | 99.7, 96.6, 94.7, 98.0, 94.9 | 206.2, 203.1, 201.2, 206.9, 201.2 | 2.10× | worse | 565.5, 497.2, 332.0, 665.8, 494.9 | 4717.8, 1495.1, 2191.0, 7800.8, 697.8 | worse |
+| fsync | 134.2, 125.7, 123.7, 127.8, 121.4 | 110.2, 111.3, 111.4, 116.8, 118.1 | 0.89× | better | 351.6, 468.5, 330.2, 2770.9, 361.1 | 307.2, 334.3, 263.3, 348.8, 273.2 | overlap |
+| close | 6355.7, 5078.8, 4979.5, 5102.8, 4910.2 | 5072.0, 5049.1, 4950.4, 5229.8, 5115.2 | 1.00× | overlap | 40184.5, 39511.0, 38448.7, 39608.6, 38332.1 | 38033.7, 38255.9, 38906.8, 38877.0, 39421.8 | overlap |
+| stat | 148.3, 146.8, 145.8, 148.2, 148.9 | 149.9, 151.0, 150.5, 151.1, 151.3 | 1.02× | worse | 32108.6, 22208.7, 32120.4, 32219.8, 30209.2 | 2232.4, 648.0, 614.7, 639.1, 12602.9 | better |
+| open | 4321.2, 3979.5, 3996.6, 4100.5, 3899.6 | 4194.5, 4171.2, 4173.3, 4267.4, 4120.1 | 1.04× | overlap | 40843.2, 37322.2, 38502.8, 37474.5, 34732.1 | 38786.9, 39061.4, 39183.3, 39779.5, 39532.5 | overlap |
+| read | 54.5, 49.9, 49.7, 51.9, 48.9 | 52.5, 51.3, 50.7, 54.4, 50.4 | 1.03× | overlap | 87.8, 82.7, 82.9, 85.7, 82.3 | 86.2, 82.9, 84.4, 88.1, 84.0 | overlap |
+| rename | 448.5, 441.0, 447.2, 452.3, 443.3 | 506.7, 507.2, 501.6, 520.5, 510.2 | 1.13× | worse | 23527.7, 23467.0, 23036.1, 29257.3, 22923.1 | 36286.6, 36714.1, 35442.7, 36709.5, 34831.1 | worse |
+| unlink | 302.1, 299.8, 298.8, 303.2, 299.5 | 346.2, 336.7, 337.8, 336.5, 330.4 | 1.12× | worse | 33395.1, 35601.2, 35834.6, 35191.2, 37691.6 | 28465.3, 30720.9, 27896.7, 28585.3, 27225.0 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 24895.8, 32156.8, 24338.7, 51203.6, 30782.5 | 33687.7, 34611.8, 33404.7, 30803.8, 28312.7 | 44509.9, 47942.9, 90782.0, 290560.4, 49700.7 | 44019.9, 97227.4, 49008.0, 45165.5, 49564.1 |
+| write | 25449.5, 31161.8, 21669.0, 27217.4, 33995.3 | 29233.6, 33536.3, 34109.4, 32313.1, 27917.9 | 88238.0, 63385.9, 43770.2, 93879.3, 52133.8 | 52846.0, 57186.1, 51096.9, 253082.9, 39571.1 |
+| fsync | 40385.3, 37451.8, 37590.5, 54445.1, 40198.3 | 39583.3, 37814.7, 29789.7, 36718.5, 32932.7 | 53774.2, 64198.8, 65353.5, 82091.4, 72046.3 | 56386.9, 65895.1, 60126.2, 63584.7, 48765.9 |
+| close | 56367.5, 65000.4, 55591.3, 58313.0, 55507.7 | 54540.6, 56410.6, 56234.9, 55387.0, 67696.5 | 81265.7, 90362.2, 78242.2, 459549.5, 71906.3 | 73661.1, 91669.5, 84699.0, 66544.7, 328709.9 |
+| stat | 49035.7, 45463.3, 50176.7, 50707.3, 50744.8 | 42829.9, 39110.9, 39970.5, 40486.8, 46253.6 | 79695.1, 56840.9, 90319.6, 67309.7, 80356.0 | 135850.9, 98692.0, 114756.3, 85919.5, 84702.5 |
+| open | 81117.3, 69227.1, 69985.2, 65439.4, 57170.9 | 96239.5, 110093.3, 89379.4, 99036.3, 134906.2 | 147680.8, 334358.9, 156283.8, 91609.7, 116040.4 | 237865.2, 228582.2, 268848.2, 237025.7, 552191.4 |
+| read | 166.8, 156.4, 171.5, 169.4, 159.6 | 163.8, 156.0, 151.4, 166.4, 173.5 | 328.5, 186.3, 291.0, 204.2, 402.6 | 303.0, 189.5, 191.1, 779.3, 376.2 |
+| rename | 74828.9, 72551.0, 69576.4, 81006.0, 70220.1 | 71804.5, 74033.6, 69146.0, 71788.6, 73348.1 | 161623.1, 187448.1, 118356.0, 327946.5, 142227.3 | 259045.4, 149440.2, 244585.9, 283501.0, 163400.5 |
+| unlink | 50460.0, 55450.3, 53944.2, 50329.6, 58418.9 | 124978.5, 121553.7, 126358.8, 76361.0, 100073.8 | 88768.7, 110174.0, 83583.9, 86822.7, 88808.9 | 399400.8, 430273.4, 432506.5, 453179.8, 338752.2 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261103.298.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:45:13Z; run 2 of 5 done, 2026-11-05T21:03:08Z; run 3 of 5 done, 2026-11-05T21:18:24Z; run 4 of 5 done, 2026-11-05T21:35:28Z; run 5 of 5 done, 2026-11-05T21:51:50Z.
+Wake-up probe, quiet: p50 37.7–40.2 µs, max 0.4–1.2 ms; pass 58–80 s.
+Wake-up probe, contended: p50 39.1–41.8 µs, max 127.1–170.9 ms; pass 820–1000 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 957.6, 994.5, 998.0, 900.1, 972.8 | 917.8, 950.0, 1050.6, 944.9, 965.0 | 0.98× | overlap | 1558.8, 1623.8, 1964.6, 1532.4, 1579.0 | 1561.1, 1602.4, 1912.1, 1612.6, 1607.6 | overlap |
+| write | 114.9, 113.2, 103.4, 89.0, 113.5 | 89.7, 127.2, 108.5, 105.9, 118.2 | 0.96× | overlap | 197.6, 204.7, 201.5, 196.0, 179.0 | 208.1, 208.2, 191.9, 225.4, 212.2 | overlap |
+| fsync | 146.4, 173.5, 162.6, 132.6, 165.8 | 122.8, 141.6, 163.7, 128.1, 147.0 | 0.87× | overlap | 250.0, 276.9, 275.1, 235.9, 250.5 | 239.0, 255.8, 274.0, 264.4, 273.2 | overlap |
+| close | 62.4, 64.0, 84.3, 62.0, 62.8 | 66.6, 67.9, 74.2, 67.3, 67.6 | 1.08× | overlap | 137.4, 142.4, 148.5, 137.8, 138.7 | 163.4, 155.3, 159.5, 160.3, 169.4 | worse |
+| stat | 314.7, 341.1, 313.7, 256.2, 334.5 | 262.1, 302.5, 326.6, 280.1, 299.6 | 0.95× | overlap | 427.8, 498.7, 445.0, 391.7, 445.7 | 384.0, 437.5, 504.4, 538.5, 502.4 | overlap |
+| open | 193.0, 197.3, 200.5, 158.2, 191.0 | 185.2, 195.2, 201.5, 191.9, 184.4 | 0.99× | overlap | 309.9, 296.2, 317.7, 313.7, 292.0 | 288.5, 301.6, 345.2, 299.7, 378.9 | overlap |
+| read | 12.5, 12.8, 14.4, 13.2, 12.8 | 14.1, 14.1, 14.1, 14.3, 13.8 | 1.10× | overlap | 149.4, 28.0, 153.1, 129.0, 20.4 | 145.1, 38.7, 108.4, 151.4, 146.1 | overlap |
+| rename | 672.9, 716.5, 671.4, 555.8, 700.1 | 577.5, 673.1, 674.1, 633.7, 683.4 | 1.00× | overlap | 864.6, 1003.0, 947.1, 830.5, 907.3 | 854.4, 959.3, 1183.5, 946.9, 1013.7 | overlap |
+| unlink | 372.5, 387.5, 396.7, 322.3, 385.1 | 325.1, 377.1, 411.3, 354.7, 386.1 | 0.98× | overlap | 788.7, 712.1, 792.2, 817.6, 915.9 | 864.1, 1000.0, 758.0, 958.1, 952.2 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 4903.4, 9524.1, 115622.8, 2408.2, 2222.1 | 9861.4, 4642.2, 78698.5, 12917.4, 17134.2 | 37499.2, 42938.0, 499957.2, 38134.2, 38496.4 | 47163.5, 57148.8, 422565.3, 37727.3, 38958.6 |
+| write | 488.2, 493.1, 5130.0, 710.0, 399.1 | 692.7, 497.3, 453.3, 528.6, 422.1 | 36547.7, 8146.4, 286968.5, 36545.2, 36533.7 | 36348.4, 36386.0, 146370.4, 36455.4, 36606.2 |
+| fsync | 793.9, 546.7, 644.4, 741.2, 438.7 | 801.1, 535.5, 1069.8, 586.6, 562.1 | 37440.0, 23140.8, 124035.8, 12604.4, 36682.7 | 20032.2, 36595.5, 206014.7, 10167.1, 25970.4 |
+| close | 429.4, 422.0, 537.3, 669.2, 445.0 | 751.3, 510.4, 473.3, 430.0, 404.8 | 546.4, 528.9, 15428.7, 3951.4, 1150.2 | 10740.2, 36471.8, 188370.5, 14248.5, 36428.6 |
+| stat | 767.8, 764.3, 21159.9, 649.9, 1074.3 | 786.3, 866.1, 8745.3, 971.2, 927.9 | 37081.1, 8082.1, 316593.7, 15795.3, 37150.4 | 15942.0, 37081.6, 47361.0, 37113.2, 12361.4 |
+| open | 686.9, 808.1, 7922.6, 1047.1, 803.4 | 946.8, 801.4, 4709.1, 769.4, 783.3 | 36971.4, 36809.9, 207253.5, 36746.8, 6014.9 | 36543.2, 36966.4, 141687.8, 36828.4, 1236.9 |
+| read | 252.6, 48.7, 294.6, 227.4, 45.1 | 206.1, 158.1, 143.3, 220.0, 191.1 | 1330.3, 85.9, 205539.1, 36431.6, 77.5 | 8878.3, 192.2, 330.5, 1902.0, 339.9 |
+| rename | 1447.8, 1545.0, 59574.6, 1818.4, 1604.6 | 1638.9, 1524.8, 38884.1, 1697.2, 1492.7 | 37699.0, 37603.6, 474240.3, 37782.4, 37785.7 | 37642.1, 38522.9, 374840.1, 37920.1, 37513.5 |
+| unlink | 9040.8, 10786.3, 19238.4, 1030.1, 12712.7 | 1163.0, 5568.1, 2726.0, 1449.0, 13154.3 | 33505.6, 37121.8, 173974.7, 37019.6, 37233.9 | 37218.3, 37231.4, 44370.0, 32466.6, 38015.1 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1602.3, 1670.0, 1596.2, 1632.9, 1606.8 | 1606.6, 1650.3, 1638.0, 1604.6, 1609.9 | 1.00× | overlap | 236894.3, 240446.4, 255777.6, 235562.5, 240519.6 | 78717.7, 91408.3, 91153.6, 76962.9, 74152.2 | better |
+| write | 123.9, 123.9, 124.5, 124.7, 123.7 | 101.5, 103.5, 127.9, 100.9, 103.2 | 0.83× | overlap | 536.9, 31818.4, 480.8, 487.3, 1796.1 | 369.8, 685.7, 410.4, 541.9, 390.3 | overlap |
+| fsync | 188.5, 188.9, 188.1, 190.0, 188.5 | 152.7, 153.7, 203.0, 151.9, 177.7 | 0.82× | overlap | 352.6, 511.9, 386.3, 353.8, 355.9 | 367.0, 1680.8, 362.1, 363.2, 369.3 | overlap |
+| close | 95.7, 95.8, 95.6, 96.0, 96.1 | 78.5, 78.7, 80.9, 78.6, 78.9 | 0.82× | better | 168.0, 192.9, 171.6, 172.3, 160.4 | 203.5, 233.8, 210.8, 202.9, 196.2 | worse |
+| stat | 357.0, 359.6, 354.2, 361.8, 356.7 | 286.1, 289.2, 337.5, 293.2, 315.5 | 0.82× | better | 124172.9, 132537.5, 105859.9, 130174.0, 109798.6 | 14848.3, 17859.6, 22087.0, 12419.2, 16739.9 | better |
+| open | 241.7, 239.7, 240.2, 241.4, 240.2 | 219.1, 219.5, 247.5, 217.8, 244.8 | 0.91× | overlap | 515.5, 435.2, 420.8, 749.3, 462.9 | 996.5, 1979.2, 1181.3, 1735.7, 2298.9 | worse |
+| read | 124.4, 123.6, 124.8, 125.5, 124.6 | 105.3, 105.4, 109.0, 105.0, 106.0 | 0.85× | better | 220.7, 227.3, 225.4, 226.3, 210.1 | 285.7, 252.6, 236.7, 243.4, 241.9 | worse |
+| rename | 828.3, 829.0, 831.7, 826.6, 827.5 | 709.5, 710.9, 859.2, 713.0, 778.9 | 0.86× | overlap | 59160.7, 52379.7, 64588.8, 65437.7, 64764.2 | 61669.7, 52751.2, 59280.3, 45516.7, 45676.9 | overlap |
+| unlink | 523.5, 514.3, 491.7, 501.8, 508.6 | 407.5, 400.6, 476.0, 406.0, 475.5 | 0.80× | better | 148361.2, 141333.6, 142205.4, 136476.1, 148123.9 | 32543.7, 32248.4, 32505.3, 30988.5, 33106.6 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 326334.0, 340052.0, 336958.3, 325888.3, 329909.8 | 165854.7, 165936.3, 157050.6, 159240.5, 163706.6 | 393040.0, 399730.4, 381168.8, 375501.7, 410195.3 | 198770.1, 203067.1, 287009.6, 217973.0, 243282.9 |
+| write | 65502.5, 85481.9, 64325.3, 68041.7, 70839.4 | 63584.5, 46625.1, 49762.6, 64901.5, 50645.8 | 105243.8, 170609.7, 111865.1, 135302.6, 139015.3 | 98049.7, 89788.6, 126776.8, 99314.7, 71836.5 |
+| fsync | 67046.8, 74483.5, 74474.8, 73139.8, 68605.1 | 68297.3, 66219.8, 65624.9, 66926.1, 53413.8 | 143573.7, 122332.2, 140190.5, 134336.8, 118873.7 | 121886.3, 123950.2, 100325.6, 129274.4, 195908.5 |
+| close | 33448.0, 63452.5, 25227.5, 48203.6, 11972.9 | 37335.6, 36259.6, 50949.1, 43713.5, 33058.1 | 133980.2, 149545.7, 103128.6, 131819.6, 78390.8 | 71077.7, 107714.9, 81872.2, 106091.2, 96543.7 |
+| stat | 179202.7, 188289.9, 159226.2, 180254.2, 170596.6 | 73286.8, 91259.2, 71255.3, 79954.9, 72348.4 | 263830.0, 274069.1, 210659.5, 293350.2, 242377.1 | 113218.5, 200525.7, 100174.4, 132842.8, 149031.8 |
+| open | 99937.8, 93259.1, 94218.7, 87115.3, 99770.4 | 55884.5, 65540.2, 64450.1, 63622.9, 69019.2 | 162336.6, 150232.5, 147262.2, 196074.8, 152611.9 | 97006.2, 119643.9, 133534.9, 134289.0, 93694.8 |
+| read | 72163.5, 88894.1, 85547.5, 81766.8, 80294.0 | 72972.1, 64738.7, 64496.4, 66070.8, 56033.7 | 148600.1, 191494.9, 159292.9, 140642.7, 158829.1 | 121657.5, 133941.0, 102270.7, 99256.4, 95134.0 |
+| rename | 133951.1, 145203.2, 147829.0, 163187.3, 149191.5 | 253932.8, 145908.6, 139341.0, 131318.7, 116548.7 | 189412.6, 202075.7, 241164.6, 258379.6, 232331.3 | 1822579.8, 1680723.8, 1408385.7, 2005004.0, 1532222.3 |
+| unlink | 203384.4, 199961.8, 196182.0, 194731.4, 200621.7 | 968547.7, 963585.7, 1088520.5, 1230637.6, 1387385.9 | 301674.3, 236802.9, 248833.2, 255810.3, 337317.2 | 2060486.3, 2039853.5, 2369338.2, 2376297.1, 2516274.2 |
+
+**Arm 3: A-215 with the worker's packets made once (`ce0051a2`), rejected.** Diagnostics run 42100645436
+(`diag-winfsp-overlap-12`). Its 40-kill oracle: 0 lost, 0 wrong on both lanes; 9 kills on arm64 and 4 on x86_64 inside a
+combined call.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:33:34Z; run 2 of 5 done, 2026-11-05T20:42:53Z; run 3 of 5 done, 2026-11-05T20:52:44Z; run 4 of 5 done, 2026-11-05T21:00:53Z; run 5 of 5 done, 2026-11-05T21:10:30Z.
+Wake-up probe, quiet: p50 22.8–25.0 µs, max 3.9–7.5 ms; pass 129–185 s.
+Wake-up probe, contended: p50 25.5–27.3 µs, max 69.3–86.8 ms; pass 340–418 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 195.6, 197.2, 247.6, 175.5, 187.7 | 194.4, 215.5, 260.9, 182.1, 185.8 | 0.99× | overlap | 305.0, 333.7, 392.5, 402.4, 379.5 | 301.0, 360.6, 425.5, 270.8, 328.4 | overlap |
+| write | 95.7, 96.9, 110.1, 89.5, 92.1 | 95.8, 104.7, 113.7, 90.5, 97.3 | 1.02× | overlap | 224.0, 227.1, 246.7, 202.0, 220.2 | 226.3, 247.8, 256.0, 207.3, 222.3 | overlap |
+| fsync | 111.8, 113.9, 120.7, 107.7, 111.1 | 100.8, 107.4, 111.3, 100.2, 98.0 | 0.90× | overlap | 169.1, 183.4, 180.0, 169.9, 166.3 | 177.8, 209.8, 196.7, 169.7, 169.9 | overlap |
+| close | 4128.6, 4140.7, 4822.4, 3802.1, 3894.3 | 4249.0, 4424.8, 4973.8, 3921.6, 4195.3 | 1.03× | overlap | 6136.5, 6344.3, 7071.3, 6523.9, 5834.4 | 5745.9, 6021.4, 6939.0, 5290.9, 5971.6 | overlap |
+| stat | 118.6, 119.5, 123.3, 113.5, 119.4 | 150.0, 152.7, 159.8, 146.5, 142.7 | 1.26× | worse | 189.5, 205.0, 208.0, 187.4, 192.0 | 225.5, 229.0, 244.7, 210.8, 210.1 | worse |
+| open | 3685.1, 3820.2, 4570.8, 813.9, 1023.2 | 3877.5, 3983.2, 4755.0, 888.7, 3610.3 | 1.05× | overlap | 5137.5, 5532.1, 6054.1, 5670.0, 4955.0 | 5448.2, 5436.6, 6075.1, 4903.1, 5059.3 | overlap |
+| read | 42.2, 35.7, 55.3, 29.1, 31.3 | 43.0, 41.0, 60.4, 33.0, 34.8 | 1.15× | overlap | 73.3, 66.2, 86.7, 72.6, 58.4 | 73.2, 67.1, 88.2, 55.4, 63.5 | overlap |
+| rename | 392.7, 399.9, 431.2, 379.9, 388.6 | 422.0, 444.6, 449.0, 424.7, 416.4 | 1.08× | overlap | 809.9, 1515.6, 1350.7, 939.1, 830.2 | 870.1, 881.8, 902.2, 808.0, 882.7 | overlap |
+| unlink | 249.4, 254.8, 267.1, 242.4, 250.3 | 262.5, 262.3, 277.8, 251.6, 266.2 | 1.05× | overlap | 429.8, 518.1, 474.2, 404.1, 411.3 | 489.8, 481.3, 609.2, 498.2, 471.8 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1038.4, 2029.9, 2227.7, 727.8, 1062.8 | 710.5, 907.9, 1175.7, 781.6, 759.8 | 17915.2, 17908.6, 17924.8, 2499.5, 17896.0 | 1483.0, 6441.9, 103991.9, 5584.7, 3154.8 |
+| write | 1590.7, 898.6, 1146.3, 557.7, 920.3 | 542.5, 979.0, 1413.3, 521.7, 513.8 | 17743.9, 17792.5, 17638.1, 2995.5, 15931.6 | 3711.7, 8496.3, 303860.4, 5285.1, 3582.4 |
+| fsync | 649.9, 640.5, 457.5, 439.3, 485.6 | 417.4, 686.2, 628.9, 385.9, 588.4 | 15411.6, 63706.0, 3364.3, 17786.3, 17497.4 | 3079.0, 10967.7, 20776.7, 3687.5, 3277.6 |
+| close | 17867.3, 17845.4, 17603.7, 17626.7, 17541.9 | 8073.1, 8713.5, 8803.2, 7386.9, 7641.4 | 34874.3, 139299.5, 21965.7, 19557.3, 20362.7 | 11497.8, 23891.2, 31519.3, 22122.5, 12339.2 |
+| stat | 241.2, 266.8, 313.4, 320.5, 294.9 | 562.3, 619.8, 581.0, 581.1, 546.3 | 8250.4, 7323.2, 6184.5, 726.6, 13391.9 | 3719.1, 14809.0, 3109.2, 888.1, 627.2 |
+| open | 6561.0, 7854.9, 8115.2, 6680.4, 5844.6 | 10016.6, 11240.2, 11392.5, 10193.4, 8017.3 | 12413.0, 13053.2, 16682.9, 34776.5, 14834.0 | 102770.0, 126100.0, 88010.8, 86477.8, 87441.9 |
+| read | 130.6, 130.5, 169.0, 104.4, 105.5 | 137.2, 143.3, 170.8, 103.4, 120.0 | 3431.8, 1094.9, 201.2, 601.8, 161.9 | 4884.8, 859.1, 196.3, 159.1, 303.2 |
+| rename | 9658.5, 15358.6, 3766.7, 15915.9, 5763.3 | 5747.5, 3963.2, 3983.1, 2334.5, 4262.2 | 46816.8, 79947.7, 49760.3, 91215.4, 69068.1 | 44240.4, 30403.8, 45247.1, 33922.1, 50636.7 |
+| unlink | 914.7, 1942.3, 854.1, 1460.5, 764.3 | 1061.2, 1195.3, 20725.9, 1850.4, 748.6 | 19974.8, 91998.1, 21148.5, 61708.7, 50900.1 | 124355.5, 145148.8, 316485.1, 63388.8, 124365.2 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 215.2, 226.2, 225.1, 251.1, 220.1 | 219.3, 236.1, 231.5, 266.8, 234.0 | 1.04× | overlap | 780.7, 858.2, 812.6, 950.7, 747.3 | 863.4, 910.6, 889.6, 1202.0, 893.7 | overlap |
+| write | 103.9, 104.2, 107.3, 105.4, 104.6 | 203.9, 201.0, 204.7, 210.5, 203.8 | 1.95× | worse | 442.9, 1853.8, 405.0, 3926.6, 386.6 | 467.4, 662.1, 11658.8, 8487.8, 601.3 | overlap |
+| fsync | 115.4, 119.9, 120.5, 126.2, 118.6 | 119.3, 125.1, 125.0, 129.8, 125.0 | 1.04× | overlap | 394.7, 343.9, 359.7, 350.8, 820.4 | 301.5, 333.7, 308.3, 371.8, 321.4 | overlap |
+| close | 4874.3, 5154.4, 4950.4, 5332.4, 4879.5 | 4861.8, 5275.4, 5099.6, 5490.1, 5464.4 | 1.07× | overlap | 39280.3, 39283.7, 39495.0, 38255.4, 39682.3 | 37469.2, 38981.4, 38790.5, 38485.1, 39153.3 | overlap |
+| stat | 151.8, 149.1, 148.1, 150.3, 150.4 | 155.5, 157.7, 156.8, 158.3, 156.6 | 1.04× | worse | 32102.6, 30316.1, 22849.5, 24463.1, 33746.7 | 696.5, 3387.9, 8334.1, 9432.5, 3105.8 | better |
+| open | 4088.8, 4214.8, 4065.8, 4374.9, 3991.3 | 4116.8, 4405.1, 4306.2, 4577.6, 4527.7 | 1.08× | overlap | 38159.3, 37746.9, 38650.6, 30494.4, 37932.4 | 36327.0, 39563.8, 40098.5, 38453.1, 49017.5 | overlap |
+| read | 49.5, 51.1, 50.3, 59.0, 49.5 | 49.2, 52.7, 52.5, 60.1, 52.8 | 1.05× | overlap | 81.4, 96.1, 99.5, 93.1, 85.8 | 84.5, 86.0, 91.0, 106.1, 95.0 | overlap |
+| rename | 440.4, 450.2, 456.3, 466.8, 440.3 | 529.2, 550.5, 545.9, 569.3, 549.6 | 1.22× | worse | 22685.1, 22107.8, 22805.2, 25076.7, 26989.4 | 34835.0, 35424.7, 35789.8, 36162.5, 35973.2 | worse |
+| unlink | 314.1, 320.6, 316.7, 328.8, 315.1 | 360.8, 361.4, 363.2, 369.4, 363.6 | 1.15× | worse | 35780.5, 37282.8, 38790.3, 37841.3, 35195.7 | 30405.2, 27846.1, 29393.1, 26911.0, 28368.3 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 24338.6, 32197.0, 29448.7, 33991.0, 37585.6 | 34895.3, 28132.6, 37132.2, 35461.9, 32714.3 | 45706.5, 38765.1, 50123.3, 50310.2, 86667.0 | 63153.1, 52660.9, 79022.3, 48389.1, 182459.3 |
+| write | 23570.9, 32244.5, 30184.7, 32841.2, 29980.5 | 33904.1, 32852.3, 40133.9, 36226.1, 33281.9 | 49247.4, 42425.9, 52644.1, 56047.2, 65843.8 | 58683.6, 46098.1, 63999.4, 73873.0, 244623.8 |
+| fsync | 38462.1, 37999.6, 38197.5, 39923.5, 38665.6 | 37676.1, 33128.1, 38186.1, 33083.3, 34042.9 | 56682.2, 60135.3, 55835.8, 65648.5, 50932.5 | 66445.9, 61254.1, 55822.8, 60023.8, 62622.4 |
+| close | 58125.1, 57039.4, 55433.9, 55694.5, 60821.9 | 54377.6, 60192.8, 55563.5, 55612.8, 56722.7 | 90082.6, 85730.1, 72300.6, 74922.6, 99936.5 | 72444.1, 89386.3, 83479.9, 98993.8, 156607.3 |
+| stat | 52371.2, 47631.7, 44475.7, 48917.0, 50679.2 | 39376.0, 39789.5, 46583.9, 41116.4, 38201.7 | 74260.2, 68406.9, 68527.4, 94472.8, 64195.3 | 64304.4, 76045.1, 119294.3, 84283.6, 87558.3 |
+| open | 67426.9, 70525.2, 64037.1, 50654.3, 63766.1 | 90837.8, 96105.9, 128108.0, 93135.3, 119335.6 | 113081.3, 104136.7, 82505.0, 89363.2, 117271.6 | 251739.3, 231213.3, 296489.4, 370736.4, 215413.4 |
+| read | 151.1, 167.6, 176.2, 164.4, 170.2 | 158.6, 169.1, 164.1, 175.4, 183.0 | 202.2, 216.9, 223.7, 1073.1, 211.5 | 828.9, 936.4, 223.9, 245.9, 316.8 |
+| rename | 71979.5, 68337.8, 73570.1, 76340.7, 77682.7 | 67256.0, 87144.8, 71218.2, 80993.6, 71570.2 | 157447.5, 154344.1, 143169.5, 250949.3, 168637.2 | 121628.4, 157361.2, 251750.5, 113247.4, 221342.5 |
+| unlink | 50063.1, 52231.3, 59924.5, 55304.9, 54052.2 | 149806.4, 132870.2, 89550.7, 104092.8, 118981.5 | 92015.9, 96046.6, 128185.9, 95640.1, 115501.4 | 384433.4, 411666.5, 407133.9, 530075.4, 428521.8 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:43:01Z; run 2 of 5 done, 2026-11-05T21:01:11Z; run 3 of 5 FAILED, 2026-11-05T21:09:22Z; run 4 of 5 done, 2026-11-05T21:27:02Z; run 5 of 5 done, 2026-11-05T21:43:15Z.
+Wake-up probe, quiet: p50 37.4–38.7 µs, max 0.3–1.3 ms; pass 59–70 s.
+Wake-up probe, contended: p50 40.5–40.7 µs, max 149.4–160.0 ms; pass 811–1019 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 957.0, 903.5, 876.6, 929.2, 961.1 | 984.6, 951.0, 987.0, 986.0, 982.2 | 1.06× | overlap | 1567.7, 1497.2, 1535.9, 1794.2, 1636.5 | 1566.0, 1543.7, 1566.1, 1847.6, 1575.1 | overlap |
+| write | 111.6, 79.2, 83.1, 98.1, 111.1 | 115.7, 125.5, 114.7, 106.0, 113.2 | 1.17× | overlap | 182.9, 188.3, 188.8, 198.1, 195.4 | 191.9, 202.2, 188.5, 219.5, 190.8 | overlap |
+| fsync | 167.8, 129.6, 131.0, 154.1, 170.3 | 174.5, 135.9, 163.6, 139.6, 170.4 | 1.06× | overlap | 247.9, 217.8, 226.9, 260.5, 258.6 | 276.4, 265.2, 274.1, 256.7, 278.4 | overlap |
+| close | 62.4, 60.6, 60.6, 69.3, 62.4 | 79.2, 68.9, 69.6, 72.1, 71.7 | 1.15× | overlap | 135.9, 132.6, 129.8, 139.9, 143.8 | 171.0, 154.6, 157.8, 165.4, 170.1 | worse |
+| stat | 326.5, 252.8, 249.5, 277.3, 327.6 | 325.7, 334.3, 329.6, 288.6, 326.7 | 1.18× | overlap | 428.2, 399.2, 370.8, 441.2, 430.2 | 476.9, 451.9, 442.2, 448.7, 458.2 | worse |
+| open | 187.8, 184.6, 150.7, 181.1, 181.3 | 182.5, 193.2, 182.2, 208.1, 179.9 | 1.01× | overlap | 280.1, 288.3, 257.0, 316.9, 279.8 | 296.5, 280.0, 296.5, 327.5, 294.6 | overlap |
+| read | 12.4, 13.0, 12.5, 12.8, 12.5 | 12.1, 12.4, 12.4, 15.1, 12.3 | 0.99× | overlap | 136.6, 157.0, 119.9, 108.8, 19.8 | 18.1, 20.7, 20.4, 182.8, 19.6 | overlap |
+| rename | 685.8, 543.5, 543.8, 589.1, 683.9 | 714.1, 709.4, 713.8, 636.9, 708.5 | 1.20× | overlap | 899.0, 869.6, 782.7, 926.6, 920.1 | 993.8, 976.8, 950.1, 975.7, 960.7 | worse |
+| unlink | 376.5, 318.8, 317.2, 361.5, 377.7 | 408.2, 377.4, 394.1, 378.8, 411.0 | 1.09× | overlap | 832.3, 731.5, 738.5, 702.7, 854.4 | 923.3, 957.0, 906.7, 896.2, 955.1 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 2155.8, 2063.9, 17423.3, 44700.7, 8388.4 | 4165.4, 5680.7, 6737.9, 53135.8, 2377.1 | 38156.1, 38012.1, 60313.1, 241012.4, 38202.3 | 38253.2, 38311.6, 37923.5, 393964.0, 37736.4 |
+| write | 414.8, 662.0, 795.4, 1894.1, 459.9 | 524.4, 469.4, 400.7, 738.5, 466.8 | 10263.8, 36607.8, 36421.2, 111588.6, 1742.3 | 36524.3, 20369.5, 3284.9, 40905.7, 36356.3 |
+| fsync | 455.5, 750.5, 657.6, 634.0, 808.1 | 377.7, 710.0, 383.5, 751.3, 511.1 | 2005.9, 37008.3, 6398.2, 36758.8, 2516.4 | 1552.9, 36571.5, 2093.1, 36727.7, 2315.5 |
+| close | 430.4, 667.3, 685.2, 539.5, 453.7 | 391.6, 412.3, 427.4, 614.4, 443.4 | 2133.1, 36466.6, 1137.6, 47279.4, 36424.8 | 1084.8, 36489.1, 821.6, 282132.2, 40427.2 |
+| stat | 670.4, 537.3, 611.6, 1369.3, 768.9 | 1100.7, 861.4, 934.7, 1345.9, 917.1 | 37341.2, 36981.2, 1419.7, 314160.5, 36885.6 | 36934.2, 37001.8, 37308.5, 189446.1, 36721.2 |
+| open | 509.9, 559.7, 580.9, 1636.7, 510.9 | 720.7, 734.3, 717.6, 841.8, 718.5 | 36565.5, 7895.9, 36791.2, 340840.4, 36725.0 | 36796.3, 36818.4, 1278.0, 78199.4, 36502.7 |
+| read | 169.4, 227.6, 183.2, 165.2, 45.9 | 41.7, 46.9, 47.4, 399.5, 43.2 | 989.2, 36452.0, 11739.7, 36826.1, 78.3 | 90.6, 78.9, 64.3, 320465.0, 57.2 |
+| rename | 1406.5, 1537.6, 1340.9, 22763.0, 2159.6 | 1572.1, 2887.6, 1517.8, 37274.1, 1438.5 | 37119.2, 37687.6, 37628.2, 204694.7, 37366.7 | 37501.8, 37426.2, 38064.5, 219361.5, 37483.2 |
+| unlink | 10909.0, 1074.6, 1007.8, 2289.9, 10104.1 | 17902.4, 26613.2, 18293.9, 2083.4, 22393.1 | 39645.6, 37010.8, 37297.8, 249636.8, 18827.9 | 54631.0, 36909.5, 37158.8, 38142.1, 56579.7 |
+
+**contended** (4 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1646.4, 1654.6, 1642.8, 1619.2 | 1685.2, 1660.3, 1629.5, 1709.8 | 1.02× | overlap | 238327.3, 255664.2, 248822.1, 240489.5 | 85517.7, 98286.8, 91182.9, 98655.0 | better |
+| write | 122.4, 123.5, 122.7, 121.6 | 106.5, 103.3, 103.2, 128.2 | 0.87× | overlap | 8713.4, 35580.3, 530.8, 1409.0 | 6235.1, 27395.3, 13485.0, 27748.3 | overlap |
+| fsync | 187.3, 188.9, 187.6, 186.0 | 184.1, 157.4, 158.9, 190.9 | 0.98× | overlap | 426.9, 345.2, 328.0, 426.1 | 486.0, 659.6, 461.9, 5720.8 | worse |
+| close | 95.2, 95.1, 95.3, 95.2 | 82.8, 82.1, 82.3, 84.3 | 0.87× | better | 170.3, 166.7, 162.8, 159.5 | 207.7, 225.6, 216.5, 205.2 | worse |
+| stat | 353.8, 358.9, 354.4, 350.8 | 351.2, 316.7, 318.7, 354.0 | 0.99× | overlap | 120847.5, 128671.3, 132403.8, 108816.5 | 16267.4, 15661.4, 12456.6, 22745.6 | better |
+| open | 238.4, 238.2, 237.4, 236.6 | 252.9, 224.1, 225.4, 252.0 | 1.06× | overlap | 1130.6, 678.6, 707.4, 33521.5 | 1223.5, 423.2, 633.4, 529.9 | overlap |
+| read | 123.5, 123.7, 123.9, 123.7 | 109.7, 107.5, 107.9, 109.1 | 0.88× | better | 216.0, 218.7, 216.2, 209.9 | 250.0, 261.1, 270.3, 246.0 | worse |
+| rename | 824.7, 823.3, 821.1, 815.6 | 797.3, 748.0, 749.7, 859.3 | 0.97× | overlap | 62552.5, 64674.6, 58660.7, 58205.1 | 52356.4, 56118.8, 57800.7, 52363.9 | better |
+| unlink | 490.6, 502.2, 506.9, 499.2 | 489.6, 416.3, 428.4, 487.8 | 0.97× | better | 134877.8, 145574.4, 147955.2, 147754.9 | 29904.8, 32388.7, 30838.5, 29839.8 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 316658.0, 338616.1, 325705.8, 323954.3 | 167145.9, 156524.7, 165541.5, 163167.0 | 366020.0, 393016.3, 360946.0, 382153.3 | 206307.7, 198174.5, 867549.7, 251361.9 |
+| write | 75226.5, 104079.0, 65906.8, 85436.5 | 64325.9, 71478.0, 63175.9, 78348.9 | 150199.7, 170933.2, 165232.7, 267287.6 | 147922.4, 95995.2, 110797.6, 187655.1 |
+| fsync | 73255.5, 71574.9, 38831.5, 73028.7 | 67368.4, 68406.9, 66202.3, 65772.0 | 171967.7, 210906.4, 96918.2, 160189.2 | 100590.1, 127142.8, 103277.1, 118542.2 |
+| close | 42593.7, 47677.7, 16612.9, 1116.1 | 33193.1, 32608.6, 65196.6, 41505.7 | 103569.3, 107665.4, 126321.0, 127636.9 | 97373.5, 99315.6, 88714.6, 129677.7 |
+| stat | 186934.1, 190706.9, 197570.8, 179484.6 | 104034.7, 95083.4, 99901.5, 108346.9 | 255407.6, 297627.6, 261636.6, 248026.1 | 186982.1, 148433.4, 144536.1, 164562.2 |
+| open | 93496.5, 97163.7, 87687.0, 104743.2 | 64149.3, 55783.7, 65614.1, 74713.5 | 131826.1, 201478.4, 155551.6, 206378.5 | 103481.1, 97673.9, 131959.3, 93194.1 |
+| read | 98248.3, 73487.7, 68287.1, 71094.0 | 67588.9, 52545.0, 61635.3, 65622.7 | 159034.8, 112373.5, 110233.0, 123169.7 | 98917.5, 129667.9, 111620.0, 100404.0 |
+| rename | 163242.7, 144160.1, 160810.4, 140823.8 | 167786.6, 142781.0, 180111.8, 189345.1 | 200445.2, 276686.5, 231921.1, 184083.4 | 2049347.5, 1861342.0, 1861360.9, 2132690.5 |
+| unlink | 198068.0, 201280.4, 204592.2, 203027.1 | 1075555.8, 911056.9, 800678.0, 1164459.0 | 236019.4, 264453.9, 237513.9, 267162.8 | 2181978.9, 2385283.7, 2142098.5, 2146294.2 |
+
+**The remainder, per IRP, for Ada.** On x86_64 the receiver with arm 2 is within the DLL's spread at every quiet p50.
+- **What remains on x86_64:** quiet close's p99, and some loaded p99s (close, read, fsync).
+- **What remains on arm64:** about 10 µs an IRP at the p50, from quiet stat (1.32×) to loaded write (2.10×). It is not the
+  crash-safe receive: direct output at the minimum costs at most 0.5 µs an IRP.
+- **Where it is:** on the kernel's and the application's side of each of our responses, and not explained.
+
+
+## The acknowledgement answered once its own shard has released (A-216; R9; 2026-11-05)
+
+A-216 makes the daemon answer a client's periodic `Acknowledge` once the client's own shard has released its
+completion records, the other shards' releases running as tracked tasks. Before, the reply waited for every shard,
+and the synchronous client waits for that reply before its next request. Measured with `provision_bench`, release,
+main against A-216, interleaved round by round, three rounds. Each figure is one round's value, the median of the
+bench's own three runs. Every run is listed where the round's three disagree by more than a factor of two.
+
+Command, every arm: `cargo build --release --locked -p slates-client --example provision_bench` at the arm's
+commit, each arm built in its own target dir and the arms' binaries compared by MD5 before they run (the macOS
+correction in GAPS), then the binary.
+
+**The call itself** (`a_call_is_never_held_behind_the_periodic_acknowledgement`, macOS arm64, the other shard held
+for 1 s): the call that sent the acknowledgement took 263, 88 and 312 µs in three runs on A-216. On main it failed
+`Stalled` after the 1 s reply deadline.
+
+**jupiter** (AMD Ryzen AI MAX+ 395, 16 cores × 2 threads, Windows 11, 15 shards; the processor 5–12% busy before each
+run; 2026-11-05 18:24–18:27 UTC; main 8d7c6a10, A-216 93ee9f49, each in its own target dir):
+
+| row | main | A-216 |
+|---|---|---|
+| spinning 1-client p50 | 14.3 / 17.9 / 19.5 µs | 19.3 / 19.7 / 20.9 µs |
+| spinning 1-client p99 (R9: 50 µs) | 232.6 / 192.9 / 81.9 µs | 72.8 / 93.8 / 2,361 µs |
+| the nine runs behind that row | 6,350, 81.2, 232.6 / 1,776, 77.6, 192.9 / 760.1, 72.0, 81.9 µs | 601.1, 72.8, 70.2 / 1,070, 93.8, 64.9 / 3,801, 79.9, 2,361 µs |
+| spinning 8-client p99 | 163.5 / 112.6 / 147.7 µs | 160.7 / 237.4 / 720.8 µs |
+| parked p50 | 639 / 654 / 655 µs | 661 / 638 / 658 µs |
+| parked p99 | 12.8 / 14.3 / 14.4 ms | 6.1 / 4.9 / 3.1 ms |
+
+**macOS** (Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards; load 7.6–16.9 at the runs' starts, other agents' builds
+beside it; 2026-11-05 18:45–18:55 UTC; main 8d7c6a10 MD5 403787fa…, A-216 93ee9f49 MD5 c9173e8b…):
+
+| row | main | A-216 |
+|---|---|---|
+| spinning 1-client p50 | 25.3 / 75.6 / 29.2 µs | 66.5 / 75.0 / 59.4 µs |
+| spinning 1-client p99 (R9: 50 µs) | 5,825 / 191.6 / 179.7 µs | 197.1 / 219.2 / 101.9 µs |
+| spinning 8-client p99 | 6.85 / 1.01 / 8.88 ms | 1.05 / 0.63 / 0.38 ms |
+| parked p50 | 313 / 199 / 159 µs | 194 / 195 / 164 µs |
+| parked p99 | 63.1 / 62.8 / 36.2 ms | 39.4 / 51.5 / 39.2 ms |
+
+**CI** (diag run 42082464886, 2026-11-05 18:21–18:31 UTC, 4-vCPU GitHub VMs; main 8d7c6a10, A-216 93ee9f49, each in
+its own target dir). Single-client spinning p99, the bench's three runs for each round, then the round's median:
+
+| runner | main, rounds 1 / 2 / 3 | A-216, rounds 1 / 2 / 3 |
+|---|---|---|
+| windows-latest (x86_64) | [20.6, 28.3, 26.3] 26.3 · [18.2, 16.3, 20.3] 18.2 · [133.9, 107.5, 17.3] **107.5** µs | [17.8, 17.6, 18.5] 17.8 · [28.2, 22.3, 23.2] 23.2 · [17.7, 20.5, 22.4] 20.5 µs |
+| ubuntu-24.04-arm (Linux arm64) | [706.3, 30.8, 79.1] **79.1** · [130.5, 73.0, 75.7] **75.7** · [41.1, 29.6, 35.1] 35.1 µs | [126.7, 24.3, 27.1] 27.1 · [219.8, 23.0, 24.8] 24.8 · [75.2, 27.6, 25.2] 27.6 µs |
+| ubuntu-latest (Linux x86_64) | [26.6, 21.4, 16.6] 21.4 · [26.4, 16.5, 16.6] 16.6 · [28.3, 24.4, 16.8] 24.4 µs | [18.8, 24.6, 16.2] 18.8 · [27.3, 24.6, 23.7] 24.6 · [21.9, 16.6, 16.5] 16.6 µs |
+| windows-11-arm (Windows arm64) | [79.0, 97.0, 53.6] **79.0** · [64.2, 53.7, 39.2] **53.7** · [66.1, 49.1, 42.1] 49.1 µs | [49.6, 42.7, 41.5] 42.7 · [50.4, 42.0, 42.4] 42.4 · [87.3, 43.0, 41.4] 43.0 µs |
+
+Bold rounds fail R9's 50 µs. **With A-216, R9's single-client gate is green in every round on all four CI
+platforms**, where main failed five rounds of twelve, Linux arm64 and Windows arm64 among them. The single-client p50
+is unchanged within noise: 9.0–9.6 µs on Windows x86_64, 13.6–13.9 µs on Linux arm64, 9.3–13.9 µs on Linux x86_64,
+16.6–18.3 µs on Windows arm64.
+
+Main's first macOS round ran after its boot probe measured a 1.2 ms wake (the spin window it printed, 1,232,348 ns):
+a loaded machine, not the code.
+
+What it means:
+- **On CI, A-216 turns R9's single-client gate green on every platform and round** (above).
+- **R9's single-client gate stays red on jupiter and macOS in both arms.** On jupiter both arms' runs range from
+  65 µs to 6.4 ms: an outlier tail the acknowledgement does not explain (GAPS, open). On macOS the single-client
+  p50 is 60–75 µs in both arms, the create cost GAPS already records.
+- **A-216 cuts the parked tail on both:** jupiter's parked p99 falls 2.1–4.6×, macOS's 8-client p99 1.6–23×. A
+  parked or contended acknowledgement no longer waits on every other shard.
+
+### A-217: a green's origin as a reference, per-green memory (2026-11-05)
+
+`load_bench --tree <linux-v7.4-rc1>/fs --clients 1`, interleaved, the `d951cd1e` build (origin recorded as bytes) and
+the A-217 build, same machine, load 30 to 34, each under `systemd-run --user --scope -p MemoryMax=24G`:
+
+| Build | Peak RSS (KiB), runs 1 / 2 / 3 | CreateGreen (ns), runs 1 / 2 / 3 |
+|---|---|---|
+| `d951cd1e` | 549,520 / 580,976 / 580,692 | 444,059,916 / 455,703,907 / 415,498,814 |
+| A-217 | 233,492 / 225,776 / 227,092 | 236,561,436 / 164,216,222 / 157,915,124 |
+
+Best of three: 549,520 to 225,776 KiB (59 % less, about 7 times the tree's 48,376,238 bytes), CreateGreen 415 ms to
+158 ms. The oracle passed in all six runs.
+
+### The many-client load test on main's A-202 design, with A-207 and A-217 ported (2026-11-05)
+
+`load_bench --tree <linux-v7.4-rc1>/kernel --clients 10,100 --hot-files 80` (release, `systemd-run --user --scope -p
+MemoryMax=24G nice -n 5`), Intel Core i9-14900HX, 32 CPUs, load 30 to 35, branch `agents/loadtest-r1` over main
+`698c64a2`. Three runs, all shown; nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 60,684 / 107,206 / 51,806 | 328,299 / 406,470 / 238,005 | 910,762 / 427,513 / 693,569 | 30 accepted, 4 to 5 conflicts, 0 failures each |
+| 100 | 44,003,129 / 42,976,492 / 40,026,033 | 45,629,493 / 35,148,031 / 40,038,176 | 2,218,353 / 3,665,850 / 2,234,027 | 300 accepted, 223 to 238 conflicts, 0 failures each |
+
+At 100 clients every verb queues on the green's one owner shard, and every edit appends to the partition log (A-207),
+whose snapshots that brings. Every client's own file held its accepted rounds' records once each in all six levels.
+
+Chaos on the same tree: `chaos.sh` (below) at 10 clients × 200 rounds and 100 × 20, the daemon SIGKILLed 0.5,
+1.5, 2.5, 3.5 and 5 s into the run phase. Every run: 2,000 accepted, 0 oracle and 0 own-file failures, 0 refusals, no
+volume left unrebuilt and no green fenced (A-217's held origin walked again at every restart). Reconnected and resent:
+10, 10, 10, 8, 9 of 10 (the rest had finished) and 100 of 100 each; longest outage 1,358,102 to 43,168,971 ns at 10
+clients and 54,390,873 to 1,915,679,352 ns at 100.
+
+The chaos procedure, `chaos.sh <tree> <clients> <rounds> <tag> <delay> [harness arguments]` (kept in the agent's scratch,
+not the tree, since it is not Rust; every process it starts is killed by pid; the harness rides the restart by
+reconnecting under its client id and resending its request in flight under that request's id):
+
+```sh
+#!/bin/bash
+# Chaos run: an anchor supervising a daemon, the load harness against it, and the daemon SIGKILLed once the harness's
+# run phase has started. Usage: chaos.sh <tree> <clients> <rounds> <tag>. Everything this starts is killed by pid.
+set -u
+tree=$1; clients=$2; rounds=$3; tag=$4; delay=${5:-1}
+bin=$HOME/.cache/slates-agents-target-loadtest/release
+dir=$HOME/.cache/slates-agents-scratch/loadtest
+instance=lt-chaos-$tag-$$
+$bin/slates --instance $instance anchor --quick --shards 4 2> $dir/chaos-$tag-anchor.log &
+anchor=$!
+for try in $(seq 1 50); do $bin/slates --instance $instance volume list >/dev/null 2>&1 && break; sleep 0.2; done
+$bin/slates --instance $instance bootstrap root >> $dir/chaos-$tag-anchor.log 2>&1
+$bin/examples/load_bench --instance $instance --tree $tree --clients $clients --rounds $rounds "${@:6}" > $dir/chaos-$tag.log 2>&1 &
+bench=$!
+until grep -q '^level' $dir/chaos-$tag.log 2>/dev/null || ! kill -0 $bench 2>/dev/null; do sleep 0.2; done
+sleep $delay
+daemon=$(pgrep -P $anchor | head -1)
+echo "anchor=$anchor daemon=$daemon bench=$bench" > $dir/chaos-$tag.pids
+if [ -n "$daemon" ]; then kill -9 $daemon; echo "killed daemon $daemon at $(date +%T.%N)" >> $dir/chaos-$tag.pids; fi
+wait $bench; echo "bench exit $?" >> $dir/chaos-$tag.pids
+kill $anchor 2>/dev/null; sleep 1; kill -9 $anchor 2>/dev/null
+for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
+sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
+```
+
+### The many-client load test after the re-landing of A-207 and A-217, macOS (2026-11-06)
+
+`agents/reland-a207-1` at `827092dd` (A-217, the checkout by identity, A-207 over A-202's delta rebase), release.
+Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards (the harness's own daemon) or `--shards 4` (chaos under the anchor);
+load 31 to 53 from other agents' builds and runs; 2026-11-06 06:44 to 06:52 UTC. The tree is the kernel's `kernel/`
+(754 files, 16,321,721 bytes). main's harness cannot run on macOS: `tree_bytes` calls `du -sb`, and BSD `du` has no
+`-b`. So the harness binary was built with loadtest-scale's `tree_bytes` (`-sAk` x 1024 on macOS, on
+`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch. Two
+readings of main's harness (loadtest-scale):
+- Its oracle replays a whole copy of every touched file per version. That takes seconds at 10 and 100 clients and
+  does not scale to 1,000; the per-slot oracle is `c35c532f` on `agents/loadtest-scale-1`.
+- A refusal row is the harness's own error string, not a typed refusal.
+
+`load_bench --tree kernel --clients 10,100 --hot-files 80`, three runs, all shown. Nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 87,291 / 299,917 / 212,833 | 246,250 / 539,083 / 300,125 | 113,729,958 / 881,042 / 4,975,834 | 30 accepted, 5 conflicts, 0 failures each |
+| 100 | 28,640,208 / 28,857,875 / 25,886,958 | 38,721,417 / 61,656,459 / 38,997,667 | 54,042,000 / 1,719,875 / 1,027,083 | 300 accepted, 199 to 229 conflicts, 0 failures each |
+
+Every client's own file held its accepted rounds once each in all six levels.
+
+Chaos: the procedure above, 10 clients x 200 rounds and 100 x 20, the daemon SIGKILLed 0.5, 1.5, 2.5, 3.5 and 5 s
+into the run phase. No mount was live, so no kill landed under a kernel NFS mount.
+- **Nine of the ten runs:** 2,000 accepted, 0 oracle and 0 own-file failures, harness exit 0.
+  - Reconnected and resent: 10, 10, 10, 10 and 8 of 10 (the rest had finished), and 100 of 100 in each 100-client run.
+  - Longest outage: 7,105,042 to 150,410,292 ns at 10 clients and 65,804,250 to 357,513,750 ns at 100.
+- **One run failed: 100 clients, killed at 3.5 s.** The anchor killed three successors in a row ("the daemon never
+  beat inside the recovery budget"), and the fourth recovered. In each, shard 0's recovery (one green, at least 322
+  versions, 100 work logs) held its first beat. The one that finished logged shard 0 initialized in 936,422 µs. By then
+  every client had passed its reconnect budget (recovery plus liveness, 2 s) and was refused "the daemon did not come
+  back within the reconnect budget": 0 reconnects.
+  - The oracle then found 4 file failures and 1 own-file failure, all of one kind. Client `100000003`'s file holds its
+    round 6, but the harness never saw round 6 accepted: the daemon accepted the submit and the client gave up before
+    it could resend.
+  - So nothing acknowledged was lost. The run fails on the restart's time, not its content (GAPS, "A daemon's restart
+    can exceed the anchor's fixed recovery budget").
+- **The 10-client run killed at 0.5 s passed, after the anchor killed 7 successors** (never beat) and 1 running
+  daemon (heartbeat lapsed).
+
+Shard 0's recovery time in the other eight runs, the successor that served: 245,701 to 548,338 µs with 101 merge
+volumes, 269,660 to 366,273 µs with 9 to 11.
+
+**main on the same machine, interleaved, two configurations each (2026-11-06, `00e5269c` built with the same
+`tree_bytes`; four runs, then stopped):** main's harness aborted in setup in both of its runs. Each time
+`pin(overlay)` over the tree was refused `Stalled` after the client's 1 s reply deadline, and the anchor had already
+killed a starting daemon (never beat) and lapsed running ones (2 and 1). The branch's two runs aborted too: in one the
+anchor killed 5 starting daemons, some before they logged "serving"; in the other it lapsed 5. So at this load the
+anchor's fixed 1 s budgets kill daemons on main too, before any recovery. The comparison of restart cost did not
+complete.
+A pin over about 1 s answering `Stalled` is main's client behaviour. loadtest-scale is making Pin a deferred reply
+sliced on its owner shard, to land on `agents/loadtest-scale-1` as its own commit (not yet committed on 2026-11-06).
+
+### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
+
+**The question (the supervisor's).** Does completing our open cost the kernel more than the DLL's, or is the time on the
+application's side? Our open response differs from 71cf09ac's only in `UserContext2`: a ledger token where the DLL arm
+had a heap pointer. `file_info` is the same code, and so is the security descriptor, `O:BAG:BAD:P(A;;FA;;;WD)` from
+`get_security_by_name`.
+
+**The command.**
+
+```
+WINFSP_TEST_MOUNT=1 cargo +1.98.1 test --release -p slates-bridge-winfsp --lib -- --ignored --exact \
+  host::transact_bench::open_cost --nocapture
+```
+
+`open_cost` (`crates/bridge-winfsp/tests/support/transact.rs`) mounts a WinFsp volume this test answers itself. One client
+opens and closes a file in a loop: a Create answered as a 4,096-byte file granted what it asked, then a Cleanup and a Close
+answered done. Each serving pattern gets a fresh volume, and the patterns rotate:
+- one thread, each response sent in the call that receives the next request, the context a pointer (the DLL's form);
+- the same with the context a token (ours);
+- one thread, responses sent alone and then a receive (the receiver's form);
+- two threads each combining (the DLL's two dispatchers).
+
+Diagnostics run 42123092900 (`diag-winfsp-overlap-18`, tree `afc1f500`), five runs on each runner.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. Five runs from 2026-11-05T22:39:12Z, each pattern twice a run on a fresh volume, 10,000 timed open-and-closes each after 1,000 untimed. Each cell: the ten measurements in order, µs.
+
+| pattern | refused | client p50 | client p99 | client p999 | client max | call before Cleanup p50 | call before Close p50 |
+|---|---|---|---|---|---|---|---|
+| one-thread-combined-pointer | 0 | 711.8, 713.2, 705.2, 712.9, 711.1, 713.3, 700.9, 705.2, 714.7, 701.6 | 845.5, 819.7, 807.8, 818.1, 812.6, 818.1, 801.1, 808.1, 819.3, 800.4 | 1016.7, 959.1, 892.7, 892.9, 886.6, 880.5, 853.1, 875.2, 913.9, 876.6 | 1902.5, 1756.4, 1087.0, 1112.9, 1098.4, 1220.8, 1032.8, 3251.7, 2753.1, 1123.6 | 171.4, 170.0, 171.1, 171.2, 168.8, 173.5, 167.3, 170.2, 170.9, 167.0 | 39.8, 38.9, 39.7, 40.1, 38.8, 40.0, 38.6, 39.5, 39.2, 39.6 |
+| one-thread-combined-token | 0 | 709.1, 710.1, 688.2, 691.5, 722.1, 709.0, 724.5, 700.5, 722.8, 693.6 | 1200.6, 816.6, 782.5, 800.1, 841.1, 1300.9, 834.9, 817.6, 830.5, 784.7 | 1744.6, 958.8, 903.0, 1640.7, 993.7, 1701.1, 901.7, 1614.5, 929.4, 821.4 | 2034.4, 1194.4, 963.2, 2100.9, 2171.2, 1772.5, 1085.5, 1671.2, 1056.1, 1041.9 | 169.3, 170.7, 164.4, 166.2, 174.6, 171.7, 176.1, 168.7, 174.3, 166.0 | 40.8, 39.8, 38.3, 38.5, 40.5, 38.9, 40.4, 38.6, 40.6, 38.4 |
+| one-thread-separate-token | 0 | 724.5, 727.5, 699.9, 716.1, 722.3, 713.8, 724.1, 702.8, 721.2, 702.9 | 830.0, 833.4, 791.1, 815.5, 829.6, 834.8, 824.9, 792.0, 820.8, 819.4 | 958.3, 989.9, 931.1, 882.5, 945.3, 926.1, 879.5, 850.1, 870.7, 901.1 | 1129.3, 1743.3, 3254.6, 1152.0, 1483.7, 1361.7, 1179.6, 1043.5, 1049.1, 1127.0 | 163.8, 165.2, 160.8, 165.0, 164.8, 161.9, 161.9, 159.6, 163.2, 158.4 | 35.4, 34.8, 32.4, 33.5, 34.7, 33.8, 34.0, 33.8, 34.6, 33.5 |
+| two-threads-combined-pointer | 0 | 684.9, 677.7, 671.9, 679.3, 675.1, 688.2, 684.5, 680.4, 676.1, 686.1 | 836.2, 783.9, 766.1, 784.6, 768.1, 797.4, 802.2, 781.0, 766.0, 1074.9 | 1109.0, 893.7, 836.5, 896.6, 836.4, 858.4, 896.9, 831.6, 824.3, 1288.0 | 4059.4, 1088.9, 1119.3, 1307.4, 991.6, 1093.6, 1083.6, 1212.1, 1082.9, 3162.0 | 169.3, 167.6, 166.3, 167.5, 167.5, 170.5, 169.7, 169.2, 167.1, 170.7 | 38.3, 38.9, 38.0, 38.8, 38.3, 39.1, 38.9, 38.7, 38.5, 39.0 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 Intel64 Family 6 Model 207 Stepping 2, GenuineIntel; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. Five runs from 2026-11-05T22:39:02Z, each pattern twice a run on a fresh volume, 10,000 timed open-and-closes each after 1,000 untimed. Each cell: the ten measurements in order, µs.
+
+| pattern | refused | client p50 | client p99 | client p999 | client max | call before Cleanup p50 | call before Close p50 |
+|---|---|---|---|---|---|---|---|
+| one-thread-combined-pointer | 0 | 130.7, 128.9, 126.9, 124.3, 126.2, 130.7, 125.2, 125.1, 134.9, 127.7 | 226.8, 221.6, 223.4, 213.5, 217.7, 220.3, 217.3, 213.2, 216.6, 219.4 | 289.7, 299.0, 294.7, 278.3, 279.8, 291.0, 306.9, 271.4, 272.1, 284.3 | 1713.5, 332.7, 1621.9, 374.6, 351.0, 433.6, 446.8, 341.6, 305.6, 320.0 | 37.0, 36.9, 36.7, 36.1, 36.5, 37.0, 36.2, 36.3, 37.0, 36.8 | 34.7, 34.6, 34.5, 34.0, 34.3, 34.7, 34.1, 34.2, 34.8, 34.6 |
+| one-thread-combined-token | 0 | 125.2, 125.0, 124.0, 125.5, 126.1, 126.1, 126.1, 125.4, 128.5, 125.3 | 213.5, 209.4, 212.5, 210.0, 223.4, 210.6, 219.7, 219.7, 221.8, 213.0 | 265.3, 263.5, 294.4, 264.3, 318.6, 296.5, 289.2, 279.4, 294.2, 282.0 | 287.9, 335.4, 1097.5, 293.2, 1032.0, 398.8, 1137.8, 442.4, 1064.2, 318.4 | 36.2, 36.4, 36.2, 36.6, 36.7, 36.5, 36.5, 36.2, 36.9, 36.2 | 34.1, 34.2, 34.0, 34.4, 34.4, 34.3, 34.4, 34.0, 34.7, 34.1 |
+| one-thread-separate-token | 0 | 125.1, 125.1, 124.8, 124.2, 125.2, 125.8, 126.4, 125.1, 125.8, 131.2 | 207.6, 212.0, 211.2, 214.0, 218.9, 209.3, 211.6, 216.2, 209.1, 217.9 | 251.7, 297.2, 264.3, 279.6, 260.6, 279.6, 282.2, 289.3, 272.9, 281.6 | 331.3, 392.7, 519.9, 337.2, 327.1, 390.6, 322.5, 353.6, 312.6, 307.0 | 26.1, 26.3, 26.1, 26.0, 26.1, 26.3, 26.3, 26.3, 26.4, 26.8 | 24.0, 24.2, 23.9, 24.0, 24.1, 24.1, 24.2, 24.2, 24.3, 24.4 |
+| two-threads-combined-pointer | 0 | 148.5, 147.2, 147.2, 146.3, 149.3, 146.7, 147.6, 146.8, 146.9, 148.6 | 220.2, 220.4, 221.2, 218.8, 225.9, 220.1, 223.8, 219.2, 225.1, 222.3 | 268.4, 277.4, 268.9, 273.5, 296.8, 285.0, 307.4, 300.8, 325.4, 299.8 | 304.0, 358.0, 343.5, 392.3, 487.6, 330.6, 509.5, 407.0, 1239.8, 389.5 | 36.6, 36.6, 36.6, 36.5, 36.9, 36.4, 36.6, 36.5, 36.5, 36.7 | 33.8, 33.9, 33.9, 33.8, 34.1, 33.8, 33.9, 33.7, 33.8, 33.9 |
+
+**What it showed.**
+- **The response's shape costs nothing.** A pointer context and a token context overlap on both lanes (arm64 700.9–714.7
+  against 688.2–724.5 µs; x86_64 124.3–134.9 against 124.0–128.5 µs).
+- **The receiver's form costs what the DLL's single-thread form does** (arm64 699.9–727.5 µs; x86_64 124.2–131.2 µs).
+- **A second waiting thread is the difference, with opposite signs.**
+  - On arm64, two threads are faster: 671.9–688.2 µs against one thread's 700.9–714.7, about 25 µs an open-and-close, or 8–10
+    µs for each of its three IRPs. That is arm64's remainder against the DLL.
+  - On x86_64, two threads are slower: 146.3–149.3 µs against 124.3–134.9, about 7 µs an IRP.
+  - On both lanes the ranges do not overlap.
+
+The DLL serves with two threads, and the second waits in the kernel while the first is still finishing its call's
+completion. The tracer of runs 42086968194-42097182526 counted only requests that arrived during another's service, so it
+could not see this.
+
+**The per-IRP accounting (arm64, quiet, p50).**
+- Our receiver's service per IRP is level with the DLL's.
+- Crash-safe direct output costs at most 0.5 µs an IRP (the harness above).
+- Our response's shape costs nothing.
+- The single receiving thread forgoes the second waiter's 8–10 µs an IRP on arm64, which the DLL's two dispatchers get.
+  The same second thread costs about 7 µs an IRP on x86_64.
+
+A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
+second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
+a derivation the rules accept.
+
+### The load test over the network: a client node and a server node (2026-11-05)
+
+`SLATES_LOADTEST_TREE=<linux-v7.4-rc1>/kernel SLATES_LOADTEST_BENCH=<release load_bench> SLATES_LOADTEST_CLIENTS=<n>
+SLATES_LOADTEST_ARGS="--hot-files <0.8 n> --reply-patience 60" cargo test --release -p slates-cli --test load_fleet --
+--nocapture`: two `slates anchor --fleet` nodes from one manifest (f = 0, loopback), the green on the server node, the
+harness at the client node; same machine as above, load 22 to 45, one run each. Nanoseconds, p50:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Accepted / conflicts | Server RSS before → peak (KiB) | Client node RSS before → peak (KiB) | Refused |
+|---|---|---|---|---|---|---|---|
+| 100 | 509,673,093 | 96,438 | 277,486 | 300 / 20 | 102,124 → 244,528 | not recorded | none |
+| 300 | 1,709,859,756 | 69,688 | 185,272 | 900 / 45 | 121,096 → 484,900 | 30,180 → 59,828 | none |
+| 1,000 | 4,296,230,485 | 89,061 | 212,021 | 1,376 / 156 | 121,540 → 785,832 | 30,008 → 93,732 | 536 CreateWork, 7 Edit `OwnerUnreachable` |
+
+The oracle and every own file: 0 failures at each rung. A forwarded verb waits for the client node's one session to
+its server (GAPS), so the creates queue. With the server daemon SIGKILLed 1 s (100 clients) and 3 s (300) into the rung
+and restarted by its anchor, the client node's forwards stayed refused `OwnerUnreachable` (GAPS).
+
+## Raising the shard threads' priority, and where the receiver stands against the DLL (A-212; 2026-11-05)
+
+**Measured and not taken (2026-11-05).** A test of what would fix a loaded SetSize (a shard preempted just after it answers, above):
+no priority is raised on main. It wins on arm64 and costs x86_64's loaded p50s, so no amendment was made; whether A-218's spin
+removes the same preemption is to be checked before anyone changes a priority. It also gives the receiver with the reply spin against the DLL, each alone, with no other daemon on the machine.
+
+**The command.** Each arm runs alone, with a fresh daemon, and a cycle runs every arm once with the order rotating. The spinners
+are a separate normal-priority process that counts its sweeps. Its rate is taken for 10 s beside the idle daemon, then for the
+whole loaded pass. All of this is on the diagnostics branch `diag-winfsp-bench-13` (`5f63ee13`), and nothing of it is on main:
+`docs/wip/bench/fsbench/windows-arms.sh`, `mount_bench`'s `--burn-child` and the workflow.
+
+```
+ARMS="dll=old/slates.exe normal=new/slates.exe raised=raised/slates.exe" BENCH=new/mount_bench.exe CYCLES=5 \
+  SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-arms.sh
+```
+
+**The arms.** `dll` is `71cf09ac`. `normal` is `25097f21`: main at `8d7c6a10` plus the reply spin. `raised` is `dc31e45f`: the same
+with each shard thread at `THREAD_PRIORITY_ABOVE_NORMAL`, which needs no privilege. Main has moved since (A-209 changed
+`crates/bridge-winfsp/src/host.rs`), so these are not current main's numbers.
+
+**Hardware, date and load.** The runners and images of the entry above: Windows arm64 and x86_64, 4 vCPUs, 15 GiB, VMs on shared
+hosts. Diagnostics run 42080252187, 2026-11-05 18:17–19:35 UTC on arm64, 18:15–19:34 UTC on x86_64. Quiet: nothing added.
+Loaded (`contended`): two spinners a logical CPU, 8 in all. Workload: 10 rounds of 1,000 files per pass and run. 15 runs on each
+runner; one failed, the `dll` arm's run 3 on x86_64, whose daemon the anchor killed for a late heartbeat (its loaded pass is
+missing, its quiet pass shown). `raised` and `normal` lost no run and logged no lapse. Each cell lists runs in order.
+
+"Core-seconds lost" is the share of the process's rate lost, times the cores, times the pass's length: what the fixed workload
+took from the user's work in total. A faster daemon takes a larger share for less time, so the rate alone misleads either way.
+
+### Arm64
+
+failed runs: dll: none, lapses 0; normal: none, lapses 0; raised: none, lapses 0
+
+**quiet**, p50 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 220.9, 210.7, 217.4, 210.9, 191.5 | 246.2, 244.9, 213.6, 237.0, 219.2 | 241.5, 233.4, 227.9, 208.1, 213.3 | 0.96× | 1.12× | 1.08× |
+| write | 103.2, 101.7, 102.4, 101.4, 95.4 | 101.0, 103.7, 90.1, 98.2, 90.5 | 97.4, 97.8, 91.5, 90.1, 86.9 | 0.93× | 0.97× | 0.90× |
+| fsync | 115.1, 113.2, 115.4, 115.6, 109.0 | 126.7, 124.4, 115.1, 120.6, 117.0 | 118.5, 120.6, 115.1, 113.6, 111.6 | 0.95× | 1.05× | 1.00× |
+| close | 4717.5, 4572.7, 4706.6, 4565.0, 4351.0 | 4745.0, 4828.9, 4365.1, 4656.8, 4416.2 | 4818.9, 4609.7, 4599.9, 4286.9, 4355.4 | 0.99× | 1.02× | 1.01× |
+| stat | 119.0, 116.9, 121.5, 119.6, 120.1 | 170.5, 168.9, 161.3, 166.7, 162.5 | 165.1, 165.1, 161.4, 161.1, 159.7 | 0.97× | 1.39× | 1.35× |
+| open | 4437.0, 4353.5, 4374.1, 4377.7, 4195.4 | 4595.5, 4475.8, 4133.6, 4259.2, 4123.0 | 4646.9, 4405.3, 4426.8, 4003.6, 4144.9 | 1.03× | 0.97× | 1.01× |
+| read | 51.5, 46.1, 44.7, 49.9, 46.4 | 55.9, 54.5, 47.0, 49.5, 46.5 | 57.1, 51.7, 52.7, 44.0, 41.5 | 1.04× | 1.07× | 1.11× |
+| rename | 398.8, 395.4, 407.9, 403.3, 388.3 | 492.4, 500.7, 459.7, 488.2, 479.7 | 479.0, 477.9, 470.1, 464.9, 462.2 | 0.96× | 1.22× | 1.18× |
+| unlink | 258.3, 254.1, 263.1, 255.9, 248.3 | 304.2, 301.9, 292.6, 298.7, 296.8 | 278.7, 279.2, 280.5, 274.1, 275.8 | 0.93× | 1.17× | 1.09× |
+
+**quiet**, p99 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 328.1, 324.3, 901.6, 310.8, 309.9 | 346.2, 357.8, 340.0, 351.7, 306.9 | 328.3, 321.7, 321.3, 284.1, 303.9 | 0.93× | 1.07× | 0.99× |
+| write | 226.4, 209.0, 309.3, 221.2, 208.8 | 235.6, 233.7, 218.2, 231.4, 217.7 | 230.7, 233.0, 211.1, 208.1, 208.3 | 0.91× | 1.05× | 0.95× |
+| fsync | 176.7, 170.0, 231.4, 173.7, 157.9 | 211.9, 188.0, 185.4, 190.8, 182.2 | 201.5, 176.2, 177.4, 176.2, 162.3 | 0.94× | 1.08× | 1.01× |
+| close | 6404.8, 6180.9, 6878.2, 6120.4, 5867.3 | 6386.0, 6391.1, 5987.1, 6268.1, 5844.5 | 6432.1, 6118.6, 6242.6, 5611.4, 5821.1 | 0.98× | 1.01× | 0.99× |
+| stat | 199.4, 189.2, 199.2, 201.4, 195.5 | 250.2, 242.6, 237.4, 249.4, 241.3 | 244.6, 233.3, 265.0, 240.6, 224.5 | 0.99× | 1.22× | 1.21× |
+| open | 5824.1, 5476.9, 5718.6, 5971.1, 5432.0 | 5987.4, 5847.9, 5376.9, 5790.4, 5369.6 | 6440.0, 5632.3, 6133.7, 5106.8, 5593.4 | 0.97× | 1.01× | 0.98× |
+| read | 79.2, 66.6, 75.1, 82.3, 71.0 | 83.6, 79.1, 73.5, 80.1, 73.5 | 84.4, 74.9, 82.7, 67.5, 68.4 | 0.95× | 1.05× | 1.00× |
+| rename | 765.2, 810.9, 1169.6, 940.8, 1042.5 | 1082.8, 1215.6, 885.9, 1065.1, 1031.8 | 898.5, 847.7, 681.3, 617.0, 648.5 | 0.64× | 1.13× | 0.72× |
+| unlink | 421.0, 497.9, 425.9, 410.9, 416.5 | 574.4, 553.2, 469.5, 506.7, 525.8 | 477.8, 489.8, 459.4, 475.9, 462.6 | 0.91× | 1.25× | 1.13× |
+
+**quiet**, p999 and max per run, µs
+
+| op | p999 dll | p999 normal | p999 raised | max dll | max normal | max raised |
+|---|---|---|---|---|---|---|
+| create | 1031.2, 1015.9, 3290.8, 1023.9, 958.7 | 1090.8, 1051.1, 990.4, 1261.3, 1166.9 | 997.8, 963.7, 1003.2, 801.4, 918.4 | 3276.0, 4788.0, 6508.2, 3586.6, 4309.8 | 4182.8, 3975.5, 5830.7, 4157.6, 4743.0 | 3354.9, 5894.4, 3371.3, 4022.3, 6714.8 |
+| write | 524.5, 704.2, 2395.2, 722.8, 608.8 | 682.4, 660.4, 569.3, 610.2, 651.1 | 555.2, 522.4, 521.8, 415.9, 416.3 | 7902.5, 3473.6, 164271.1, 4823.5, 5901.9 | 3395.6, 148928.9, 1617.1, 2087.3, 7326.1 | 3570.8, 2749.8, 5616.3, 3361.6, 640.1 |
+| fsync | 583.6, 535.8, 2095.1, 566.4, 606.8 | 591.3, 611.2, 476.8, 919.7, 608.0 | 653.6, 412.9, 473.5, 512.3, 502.6 | 2807.5, 1185.3, 15595.0, 3896.9, 6332.3 | 1149.2, 2995.2, 3400.8, 3870.9, 3098.6 | 3409.9, 1758.2, 3631.8, 8250.7, 3704.4 |
+| close | 8788.5, 8090.8, 24496.7, 9006.1, 8405.5 | 8650.9, 8738.7, 8422.3, 8338.8, 7656.8 | 8495.4, 8539.3, 8280.9, 7962.5, 7991.6 | 18485.0, 39700.5, 264245.7, 13408.4, 17365.3 | 14400.3, 32773.3, 22415.3, 17103.6, 16672.4 | 13324.1, 19050.4, 12685.6, 12046.5, 13421.1 |
+| stat | 271.2, 257.9, 283.3, 283.0, 264.4 | 636.2, 716.2, 613.6, 594.8, 617.4 | 584.7, 554.5, 662.8, 575.5, 572.7 | 3642.9, 2325.6, 1562.2, 4178.7, 3267.4 | 3184.4, 2442.4, 3471.9, 1126.8, 1505.1 | 4590.5, 718.7, 2393.7, 2820.5, 3238.2 |
+| open | 7487.4, 8273.0, 9560.9, 7875.6, 7158.8 | 67272.4, 66225.3, 66581.8, 42673.6, 66562.3 | 46104.4, 41782.3, 62378.6, 65819.2, 45557.2 | 14080.3, 207135.7, 317489.1, 14562.3, 16144.6 | 133721.8, 115638.0, 110197.4, 144341.8, 152397.2 | 151412.2, 123708.9, 103038.1, 103008.7, 125146.3 |
+| read | 156.0, 143.5, 155.2, 158.9, 142.8 | 160.5, 158.8, 143.1, 152.3, 148.2 | 166.2, 149.8, 157.0, 134.6, 134.0 | 188.1, 175.9, 1247.7, 187.4, 174.7 | 178.9, 1226.5, 208.5, 195.3, 189.2 | 1244.4, 181.1, 2859.5, 231.0, 189.0 |
+| rename | 3887.7, 3617.1, 5915.9, 3672.4, 3385.9 | 3478.1, 2651.5, 2466.3, 3324.6, 2596.9 | 4656.8, 3811.0, 2152.7, 1072.4, 3646.5 | 86364.2, 55362.0, 68057.5, 62970.4, 69273.0 | 144867.9, 5937.2, 26318.2, 6857.3, 15200.2 | 103360.6, 13166.5, 19112.3, 20852.9, 15302.4 |
+| unlink | 841.9, 1721.5, 898.7, 991.3, 1834.8 | 3137.1, 62893.7, 858.2, 2615.5, 2931.2 | 804.2, 792.8, 749.8, 974.8, 762.4 | 61089.9, 4000.5, 56413.5, 3647.8, 6498.3 | 144684.4, 144485.3, 123718.2, 144667.7, 144080.8 | 144189.7, 123979.4, 124638.4, 3597.8, 144349.9 |
+
+**quiet**, a user thread's wake-up probe per run: p50 / p99 / max, µs
+
+- dll: 25.4 / 36.7 / 3786.2; 24.8 / 38.8 / 3554.6; 25.5 / 38.5 / 3457.3; 24.7 / 37.1 / 3707.7; 24.7 / 38.0 / 3662.6
+- normal: 26.0 / 40.4 / 4323.7; 27.2 / 41.1 / 3556.5; 25.4 / 37.7 / 3447.5; 26.6 / 39.6 / 3702.5; 25.9 / 37.9 / 4053.5
+- raised: 26.5 / 61.6 / 3609.4; 25.7 / 52.7 / 3978.5; 26.1 / 51.0 / 3814.5; 25.4 / 48.6 / 3887.7; 25.7 / 49.6 / 4492.9
+
+**contended**, p50 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 262.5, 238.5, 239.7, 244.5, 233.8 | 271.5, 255.8, 264.4, 234.6, 233.2 | 258.1, 262.6, 248.9, 214.0, 223.1 | 0.97× | 1.07× | 1.04× |
+| write | 105.0, 99.5, 98.9, 100.4, 96.7 | 230.5, 229.7, 234.9, 218.6, 217.9 | 99.7, 102.9, 97.0, 88.1, 90.9 | 0.42× | 2.31× | 0.97× |
+| fsync | 142.9, 135.9, 134.9, 137.3, 135.7 | 128.1, 125.6, 120.2, 121.5, 116.7 | 125.6, 133.6, 126.7, 114.6, 116.5 | 1.03× | 0.89× | 0.92× |
+| close | 6098.3, 5627.8, 5653.3, 5748.3, 5663.5 | 5989.7, 6020.0, 7143.8, 5734.0, 5551.9 | 5082.4, 5124.0, 4977.5, 4515.9, 4644.3 | 0.83× | 1.06× | 0.88× |
+| stat | 147.2, 146.5, 147.5, 148.9, 147.0 | 166.2, 163.2, 160.7, 162.2, 159.9 | 157.6, 158.9, 158.6, 153.7, 152.1 | 0.97× | 1.10× | 1.07× |
+| open | 4730.9, 4284.6, 4323.9, 4341.0, 4300.5 | 4630.9, 4560.6, 4921.1, 4334.4, 4357.4 | 4610.2, 4624.1, 4541.2, 4182.2, 4314.4 | 1.00× | 1.05× | 1.05× |
+| read | 66.9, 57.2, 57.1, 58.3, 55.4 | 65.0, 61.7, 64.8, 55.5, 57.1 | 58.8, 60.3, 57.4, 48.4, 50.9 | 0.93× | 1.08× | 1.00× |
+| rename | 472.0, 468.3, 457.4, 464.7, 457.5 | 563.3, 553.8, 548.0, 536.3, 543.9 | 520.4, 548.1, 516.2, 508.8, 512.7 | 0.94× | 1.18× | 1.11× |
+| unlink | 322.8, 320.0, 315.0, 317.4, 314.2 | 352.9, 350.2, 362.1, 343.0, 348.7 | 311.5, 320.5, 305.8, 289.2, 295.8 | 0.87× | 1.10× | 0.96× |
+
+**contended**, p99 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 1163.7, 1124.7, 1322.6, 1312.2, 1126.6 | 15806.8, 9854.5, 6180.4, 1299.4, 1379.7 | 1023.7, 952.6, 906.5, 436.8, 634.6 | 0.15× | 5.31× | 0.78× |
+| write | 14163.3, 6680.4, 6933.5, 7534.2, 7247.0 | 15383.6, 15760.2, 13798.8, 7865.0, 10291.5 | 309.7, 299.5, 238.1, 217.7, 248.3 | 0.02× | 1.90× | 0.03× |
+| fsync | 5216.7, 578.6, 7367.7, 2450.6, 4234.3 | 662.4, 1165.9, 489.7, 499.1, 512.7 | 253.1, 233.4, 275.5, 212.7, 209.3 | 0.46× | 0.12× | 0.06× |
+| close | 35942.4, 32437.5, 33517.6, 33982.0, 33573.0 | 35482.2, 34583.3, 37950.9, 37114.0, 32941.6 | 6806.4, 7257.1, 7029.6, 6449.6, 6786.0 | 0.19× | 1.06× | 0.20× |
+| stat | 30128.2, 32138.2, 32154.7, 30017.3, 26118.9 | 8119.2, 1277.9, 14263.6, 706.7, 2134.3 | 651.2, 705.8, 698.2, 345.7, 639.6 | 0.31× | 0.07× | 0.02× |
+| open | 37153.5, 26524.6, 28771.9, 30850.9, 30948.3 | 36834.3, 38902.4, 39303.9, 38757.6, 37750.0 | 26262.1, 25706.3, 25620.2, 25001.8, 25378.2 | 0.66× | 1.26× | 0.83× |
+| read | 97.7, 98.2, 89.9, 93.2, 92.8 | 96.8, 94.6, 97.3, 94.6, 89.1 | 91.5, 97.7, 86.2, 87.3, 92.0 | 0.97× | 1.02× | 0.98× |
+| rename | 23765.7, 24712.4, 23791.5, 23935.2, 23478.1 | 35594.7, 35534.9, 37342.1, 35459.7, 36507.3 | 23778.7, 23895.7, 25273.3, 23167.3, 24008.2 | 0.67× | 1.50× | 1.00× |
+| unlink | 35467.4, 37682.4, 35800.4, 37562.7, 31638.7 | 26911.7, 29625.2, 29478.9, 27005.7, 27830.5 | 19698.2, 19651.2, 18958.5, 19414.6, 19670.3 | 0.71× | 0.78× | 0.55× |
+
+**contended**, p999 and max per run, µs
+
+| op | p999 dll | p999 normal | p999 raised | max dll | max normal | max raised |
+|---|---|---|---|---|---|---|
+| create | 36073.8, 33629.3, 34179.2, 33820.6, 38160.1 | 36267.8, 36774.5, 38364.1, 34279.0, 37856.6 | 28210.3, 27910.1, 26564.2, 24024.9, 27564.5 | 47646.8, 48749.1, 43517.1, 42617.7, 52224.7 | 58196.2, 48415.6, 53196.6, 45119.0, 49333.0 | 40688.7, 50178.4, 58583.4, 51201.5, 41418.1 |
+| write | 32695.5, 31355.0, 26416.3, 32377.9, 33454.3 | 39182.1, 32790.8, 26628.2, 31753.7, 37649.2 | 25384.6, 24111.0, 22243.8, 22986.2, 22973.0 | 50441.8, 107629.9, 54931.8, 47558.2, 56058.8 | 51926.2, 39686.9, 41793.5, 81349.9, 58654.7 | 44023.3, 39688.1, 55405.6, 55576.6, 42986.7 |
+| fsync | 38665.4, 37799.3, 40569.9, 41162.9, 39154.2 | 39397.4, 38308.6, 33130.4, 39727.1, 34393.0 | 41247.0, 38714.7, 42194.5, 34126.8, 26939.0 | 55854.0, 55611.2, 61826.7, 56402.4, 63858.4 | 57769.0, 55820.2, 49669.0, 68885.5, 54708.3 | 73850.9, 82353.5, 85982.0, 115513.1, 44979.2 |
+| close | 51225.9, 52986.7, 65589.5, 55571.9, 61694.4 | 54136.8, 49262.9, 56797.4, 70620.0, 56354.6 | 29345.2, 33269.5, 28765.8, 28247.1, 30206.5 | 94337.0, 83820.5, 126012.2, 74852.2, 90663.7 | 104099.8, 120138.8, 124384.3, 153232.9, 88973.9 | 55312.6, 54676.3, 57989.0, 54261.8, 65616.8 |
+| stat | 46185.4, 46856.1, 48205.0, 44149.4, 42810.7 | 39411.7, 38368.4, 38981.5, 39596.3, 36578.8 | 45836.4, 43543.2, 42098.5, 28741.7, 27975.3 | 70573.9, 56621.0, 83267.0, 54184.5, 56919.4 | 63888.8, 57353.7, 82471.6, 102470.6, 50523.4 | 115770.0, 94264.3, 66626.4, 44687.4, 49112.0 |
+| open | 59335.3, 58081.5, 57695.8, 51543.5, 54250.1 | 79592.3, 131822.9, 141447.9, 120160.0, 116565.5 | 86773.9, 74525.4, 66723.8, 83735.8, 71528.3 | 105048.9, 84285.9, 89986.7, 101037.0, 112735.4 | 246194.1, 247888.6, 256002.9, 215263.2, 254489.7 | 150608.6, 141134.0, 132433.8, 128879.4, 115150.5 |
+| read | 182.3, 177.9, 161.2, 184.4, 164.4 | 173.9, 179.2, 185.9, 179.5, 165.8 | 154.0, 158.7, 156.9, 149.7, 160.8 | 265.7, 1373.3, 193.5, 569.7, 294.1 | 316.0, 691.0, 218.7, 328.0, 235.5 | 457.6, 194.3, 392.5, 1632.0, 302.6 |
+| rename | 70007.2, 69891.9, 67947.2, 72059.0, 72680.9 | 66734.5, 79001.1, 68068.1, 63744.1, 69526.5 | 51649.4, 67066.2, 65698.2, 69071.6, 66086.5 | 161027.5, 159183.4, 145362.4, 151279.6, 197558.5 | 115195.8, 107008.8, 126385.4, 236626.8, 119979.6 | 127033.6, 131744.4, 83883.2, 130610.6, 112894.9 |
+| unlink | 47468.2, 48533.8, 47577.2, 48204.5, 52386.4 | 82005.7, 99372.8, 168317.9, 115573.4, 126655.1 | 48069.1, 65332.2, 47371.7, 47876.9, 59390.0 | 70974.0, 86806.2, 76387.7, 86380.7, 135203.7 | 267289.8, 282370.5, 309754.1, 333173.0, 296791.1 | 160518.6, 144070.4, 164788.9, 146255.8, 184258.9 |
+
+**contended**, a user thread's wake-up probe per run: p50 / p99 / max, µs
+
+- dll: 31.2 / 46.8 / 55037.2; 30.6 / 46.7 / 62286.4; 30.8 / 47.3 / 48033.5; 30.4 / 46.9 / 45150.4; 29.6 / 44.6 / 57675.1
+- normal: 31.3 / 47.6 / 53953.5; 31.1 / 47.5 / 56819.2; 30.3 / 46.3 / 45346.6; 29.5 / 46.3 / 51496.2; 29.8 / 45.5 / 45431.1
+- raised: 31.8 / 55.3 / 60377.5; 32.1 / 55.5 / 44611.6; 30.5 / 52.7 / 63473.9; 28.0 / 49.5 / 55529.3; 29.6 / 52.1 / 64515.9
+
+**The user's CPU-bound process** (two spinners a core): rate alone, rate beside the workload (sweeps/s), share lost, pass wall (s), core-seconds lost to the workload
+
+| arm | run | alone | beside | lost | wall | core-seconds lost |
+|---|---|---|---|---|---|---|
+| dll | 1 | 79375 | 60754 | 23.5% | 223.4 | 209.7 |
+| dll | 2 | 79567 | 57380 | 27.9% | 178.9 | 199.5 |
+| dll | 3 | 79216 | 56952 | 28.1% | 179.7 | 202.0 |
+| dll | 4 | 80003 | 58834 | 26.5% | 193.2 | 204.4 |
+| dll | 5 | 79919 | 58793 | 26.4% | 187.8 | 198.6 |
+| **dll, median** | | | | 26.5% | 187.8 | 202.0 |
+| normal | 1 | 77481 | 58359 | 24.7% | 204.8 | 202.2 |
+| normal | 2 | 79075 | 60722 | 23.2% | 226.6 | 210.3 |
+| normal | 3 | 79441 | 63455 | 20.1% | 276.5 | 222.5 |
+| normal | 4 | 78957 | 60980 | 22.8% | 217.6 | 198.2 |
+| normal | 5 | 78493 | 58696 | 25.2% | 194.3 | 196.0 |
+| **normal, median** | | | | 23.2% | 217.6 | 202.2 |
+| raised | 1 | 79430 | 49376 | 37.8% | 137.8 | 208.5 |
+| raised | 2 | 79392 | 51233 | 35.5% | 140.0 | 198.6 |
+| raised | 3 | 79796 | 51576 | 35.4% | 135.2 | 191.3 |
+| raised | 4 | 79717 | 52375 | 34.3% | 124.7 | 171.1 |
+| raised | 5 | 79523 | 51704 | 35.0% | 129.0 | 180.6 |
+| **raised, median** | | | | 35.4% | 135.2 | 191.3 |
+
+### x86_64
+
+failed runs: dll: 3, lapses 1; normal: none, lapses 0; raised: none, lapses 0
+
+**quiet**, p50 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 638.9, 664.5, 660.1, 632.7, 637.7 | 671.2, 655.1, 674.4, 677.6, 670.0 | 690.7, 672.4, 682.3, 676.7, 683.9 | 1.02× | 1.05× | 1.07× |
+| write | 74.9, 75.2, 77.2, 62.1, 63.3 | 83.6, 60.7, 56.4, 83.2, 80.9 | 85.8, 71.8, 80.9, 83.5, 83.2 | 1.03× | 1.08× | 1.11× |
+| fsync | 92.0, 112.7, 113.5, 90.2, 90.6 | 81.6, 77.3, 76.5, 89.0, 81.0 | 91.3, 86.7, 98.2, 87.3, 87.8 | 1.08× | 0.88× | 0.95× |
+| close | 44.1, 54.0, 54.4, 44.0, 44.0 | 40.7, 40.4, 40.3, 41.4, 39.9 | 42.2, 41.3, 41.8, 41.0, 41.0 | 1.02× | 0.92× | 0.94× |
+| stat | 160.3, 181.9, 183.9, 145.2, 145.3 | 174.3, 155.0, 149.2, 178.8, 170.4 | 193.2, 170.3, 189.1, 179.8, 178.9 | 1.06× | 1.06× | 1.12× |
+| open | 96.2, 107.4, 108.9, 88.3, 91.6 | 122.0, 115.1, 101.9, 124.6, 119.5 | 121.8, 122.7, 124.0, 118.9, 120.6 | 1.02× | 1.24× | 1.27× |
+| read | 8.3, 9.0, 8.9, 8.3, 8.3 | 9.4, 9.3, 9.7, 9.6, 9.5 | 10.4, 9.5, 9.6, 9.4, 9.5 | 1.00× | 1.14× | 1.14× |
+| rename | 375.8, 411.2, 408.1, 311.2, 313.0 | 367.9, 323.3, 317.6, 381.9, 370.7 | 395.0, 348.6, 401.2, 385.6, 379.5 | 1.05× | 0.98× | 1.03× |
+| unlink | 203.2, 223.4, 223.7, 181.2, 183.2 | 201.4, 187.5, 186.7, 221.9, 197.3 | 225.6, 200.5, 229.0, 217.3, 213.0 | 1.10× | 0.97× | 1.07× |
+
+**quiet**, p99 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 1091.1, 1123.0, 1110.5, 1125.5, 1117.0 | 1181.6, 1208.8, 1822.7, 1230.8, 1233.4 | 1253.3, 1167.0, 1256.4, 1224.7, 1195.3 | 1.00× | 1.10× | 1.10× |
+| write | 432.4, 468.8, 476.5, 408.6, 488.5 | 368.8, 377.9, 405.4, 414.9, 338.8 | 366.8, 404.9, 410.4, 377.7, 384.2 | 1.02× | 0.81× | 0.82× |
+| fsync | 208.6, 216.6, 386.6, 286.5, 193.2 | 318.4, 179.2, 177.4, 302.8, 256.6 | 356.2, 355.7, 317.8, 204.8, 342.2 | 1.33× | 1.18× | 1.58× |
+| close | 359.9, 434.1, 420.9, 330.2, 352.2 | 408.5, 408.0, 422.7, 410.7, 358.0 | 434.5, 398.6, 472.6, 416.6, 394.6 | 1.02× | 1.14× | 1.16× |
+| stat | 236.7, 254.2, 256.4, 210.3, 219.5 | 708.3, 684.6, 223.0, 725.6, 681.0 | 731.4, 699.2, 733.9, 716.9, 710.1 | 1.05× | 2.89× | 3.03× |
+| open | 175.3, 173.5, 175.2, 158.0, 156.4 | 623.9, 615.8, 206.3, 604.8, 280.6 | 297.0, 641.4, 647.6, 565.7, 508.1 | 0.94× | 3.49× | 3.26× |
+| read | 89.7, 94.1, 93.1, 87.0, 87.6 | 103.9, 94.9, 78.1, 99.1, 102.0 | 101.6, 97.2, 97.7, 100.6, 101.4 | 1.02× | 1.10× | 1.12× |
+| rename | 554.6, 560.8, 661.3, 510.9, 531.4 | 969.2, 864.0, 836.5, 1013.2, 951.9 | 1009.1, 933.1, 1059.3, 1029.4, 946.6 | 1.06× | 1.72× | 1.82× |
+| unlink | 414.6, 445.2, 532.2, 387.2, 415.3 | 509.4, 530.9, 555.8, 744.5, 475.1 | 656.1, 508.1, 745.5, 746.1, 562.3 | 1.24× | 1.28× | 1.58× |
+
+**quiet**, p999 and max per run, µs
+
+| op | p999 dll | p999 normal | p999 raised | max dll | max normal | max raised |
+|---|---|---|---|---|---|---|
+| create | 1429.3, 1756.1, 1355.4, 1638.5, 1197.3 | 1686.8, 1645.7, 3918.4, 1678.8, 4089.6 | 1782.6, 1660.8, 1735.5, 1640.9, 1676.7 | 31507.8, 30128.7, 30862.0, 30115.5, 30039.8 | 36176.7, 62577.1, 139864.3, 35748.3, 33627.2 | 30063.6, 38318.5, 30956.8, 30058.3, 34879.8 |
+| write | 649.3, 691.0, 661.8, 642.6, 760.4 | 621.5, 615.9, 1004.4, 639.6, 591.1 | 634.5, 613.8, 627.3, 628.9, 628.2 | 15433.9, 5257.2, 2333.3, 3377.4, 3349.3 | 29119.8, 5948.6, 7934.0, 2481.5, 9057.3 | 29109.7, 29119.7, 29082.2, 14387.8, 2475.0 |
+| fsync | 643.2, 739.0, 711.7, 648.7, 662.6 | 632.4, 603.3, 1035.2, 673.6, 605.9 | 639.6, 625.8, 644.6, 637.7, 624.7 | 29175.1, 29219.1, 29215.3, 1327.1, 8840.7 | 4419.4, 4962.8, 20637.6, 29120.3, 5213.1 | 841.6, 29498.3, 29133.5, 29067.9, 29141.7 |
+| close | 609.7, 665.5, 648.4, 597.2, 695.5 | 594.8, 597.0, 961.1, 613.8, 609.5 | 630.4, 582.6, 621.9, 620.2, 610.4 | 29227.3, 3285.7, 29132.9, 2470.3, 1224.6 | 13723.9, 1435.4, 29617.1, 8497.8, 10060.4 | 782.8, 1038.8, 29066.4, 1426.5, 912.8 |
+| stat | 312.4, 556.2, 502.9, 294.7, 368.0 | 794.6, 937.0, 938.1, 1044.6, 766.6 | 818.3, 753.7, 956.2, 973.3, 782.4 | 14698.9, 22934.3, 16448.7, 1433.2, 42940.7 | 29448.1, 24610.6, 30117.9, 39392.8, 29281.7 | 36555.1, 29369.6, 36094.8, 33563.1, 30546.5 |
+| open | 422.9, 294.5, 242.8, 379.7, 225.4 | 736.9, 710.7, 1035.4, 791.1, 703.1 | 747.2, 731.0, 743.2, 701.7, 703.7 | 29222.7, 29250.6, 3546.5, 8725.5, 29225.5 | 38674.9, 29190.6, 7244.0, 29275.8, 23768.1 | 17732.4, 29149.4, 29215.7, 19202.4, 11430.3 |
+| read | 141.3, 149.4, 220.4, 124.2, 118.0 | 179.6, 147.1, 491.4, 139.0, 145.2 | 156.2, 147.7, 200.2, 136.2, 145.2 | 3551.8, 3522.3, 16378.2, 1263.8, 234.7 | 261.4, 658.7, 1237.1, 1924.1, 9555.6 | 284.3, 6039.1, 1147.5, 29073.6, 1755.3 |
+| rename | 8456.4, 1248.0, 1286.6, 1135.1, 1165.1 | 1171.3, 1084.0, 1317.6, 1204.5, 1331.5 | 1146.8, 1101.5, 1169.7, 1154.3, 1131.8 | 29907.5, 29749.4, 30862.9, 30081.5, 29608.6 | 30279.9, 33414.2, 17254.7, 29686.6, 30331.1 | 29612.3, 29678.0, 29674.5, 29775.9, 30228.0 |
+| unlink | 793.1, 852.0, 917.4, 774.6, 687.3 | 852.2, 828.4, 1090.6, 881.4, 670.2 | 913.1, 679.6, 7267.4, 1076.5, 886.6 | 19998.0, 15634.7, 28540.3, 29447.3, 29678.4 | 44977.1, 29238.8, 29607.8, 67204.2, 29474.1 | 49134.4, 59299.6, 72822.1, 47999.3, 38843.8 |
+
+**quiet**, a user thread's wake-up probe per run: p50 / p99 / max, µs
+
+- dll: 13.4 / 41.7 / 1269.2; 12.3 / 34.9 / 187.9; 12.2 / 37.9 / 408.1; 24.2 / 43.1 / 352.5; 20.6 / 40.3 / 271.5
+- normal: 25.3 / 44.1 / 929.1; 26.2 / 44.6 / 1599.0; 26.6 / 46.2 / 724.2; 24.0 / 45.0 / 734.5; 24.5 / 45.3 / 391.9
+- raised: 22.0 / 44.1 / 679.1; 22.6 / 42.8 / 172.3; 21.4 / 43.2 / 575.3; 22.6 / 42.4 / 226.1; 22.3 / 43.8 / 1715.0
+
+**contended**, p50 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 1143.3, 1166.9, 1113.1, 1130.5 | 1109.8, 1080.7, 1086.6, 1107.6, 1106.9 | 1149.6, 1132.0, 1135.7, 1124.2, 1130.9 | 1.02× | 0.97× | 0.99× |
+| write | 82.3, 82.7, 82.0, 81.9 | 72.8, 72.6, 73.0, 72.6, 72.8 | 107.1, 90.1, 105.3, 105.4, 106.0 | 1.45× | 0.88× | 1.28× |
+| fsync | 118.8, 120.0, 118.5, 118.9 | 106.1, 106.1, 106.2, 105.8, 105.6 | 132.2, 137.5, 123.5, 106.0, 108.2 | 1.16× | 0.89× | 1.04× |
+| close | 60.0, 60.4, 59.8, 60.0 | 56.1, 56.2, 55.5, 56.0, 56.0 | 56.6, 57.4, 57.0, 56.3, 56.6 | 1.01× | 0.93× | 0.94× |
+| stat | 214.7, 217.5, 208.7, 216.3 | 186.9, 188.3, 187.1, 187.7, 187.5 | 226.7, 222.7, 214.8, 192.5, 204.7 | 1.15× | 0.87× | 0.99× |
+| open | 157.1, 157.7, 156.4, 158.2 | 151.9, 152.1, 149.6, 151.9, 151.8 | 173.8, 197.8, 205.5, 172.5, 173.8 | 1.14× | 0.96× | 1.10× |
+| read | 84.1, 84.0, 84.4, 84.5 | 75.6, 75.6, 75.2, 75.6, 75.8 | 109.9, 88.8, 109.3, 93.7, 94.7 | 1.25× | 0.90× | 1.12× |
+| rename | 519.3, 524.3, 517.6, 535.2 | 475.0, 477.0, 447.1, 475.9, 475.1 | 535.4, 555.7, 595.1, 511.0, 514.6 | 1.13× | 0.91× | 1.02× |
+| unlink | 307.1, 315.1, 286.5, 306.8 | 270.6, 275.8, 262.8, 278.9, 283.2 | 298.3, 318.2, 327.8, 292.2, 297.0 | 1.08× | 0.90× | 0.97× |
+
+**contended**, p99 per run, µs
+
+| op | dll | normal | raised | raised/normal | normal/dll | raised/dll |
+|---|---|---|---|---|---|---|
+| create | 224175.2, 230870.7, 237509.0, 225976.5 | 66942.5, 61799.7, 82223.1, 66757.9, 66649.5 | 70398.1, 57562.7, 51604.6, 68297.1, 49714.4 | 0.86× | 0.29× | 0.25× |
+| write | 379.0, 15594.9, 330.9, 342.7 | 270.4, 268.8, 1007.8, 262.4, 268.8 | 209.3, 226.4, 194.7, 211.5, 231.0 | 0.79× | 0.71× | 0.56× |
+| fsync | 230.1, 373.5, 207.8, 233.6 | 248.1, 209.3, 1054.8, 247.1, 233.7 | 230.7, 208.5, 222.0, 210.5, 217.8 | 0.88× | 1.06× | 0.93× |
+| close | 111.1, 112.9, 108.5, 106.1 | 129.8, 135.6, 138.4, 125.2, 139.5 | 113.8, 117.1, 118.7, 110.5, 115.3 | 0.85× | 1.22× | 1.04× |
+| stat | 115577.4, 123080.0, 112461.7, 119500.7 | 552.2, 615.7, 1206.5, 925.0, 588.5 | 388.6, 371.4, 371.8, 360.1, 383.8 | 0.60× | 0.01× | 0.00× |
+| open | 272.2, 371.9, 296.0, 640.9 | 341.6, 418.5, 1087.9, 322.8, 327.8 | 312.8, 323.8, 349.5, 318.9, 297.3 | 0.93× | 0.92× | 0.86× |
+| read | 147.4, 153.1, 149.9, 150.4 | 159.9, 162.5, 268.7, 151.6, 155.2 | 168.9, 162.9, 167.2, 168.3, 168.9 | 1.05× | 1.06× | 1.12× |
+| rename | 32695.9, 33424.4, 38212.9, 34543.2 | 32350.8, 32321.5, 34312.2, 32290.5, 32329.1 | 38477.7, 36598.1, 36510.9, 39241.3, 36703.2 | 1.14× | 0.94× | 1.06× |
+| unlink | 122433.7, 123122.3, 109304.2, 125162.4 | 10905.3, 12554.4, 18001.3, 15958.0, 12163.4 | 1145.8, 1228.2, 1116.1, 1196.4, 1271.0 | 0.10× | 0.10× | 0.01× |
+
+**contended**, p999 and max per run, µs
+
+| op | p999 dll | p999 normal | p999 raised | max dll | max normal | max raised |
+|---|---|---|---|---|---|---|
+| create | 298633.6, 292415.6, 298578.0, 300797.5 | 135458.1, 156803.3, 133999.6, 144101.6, 134986.5 | 131276.4, 129818.8, 131887.2, 129797.6, 128112.8 | 388733.4, 393376.2, 385742.6, 395209.9 | 177317.6, 187684.6, 169863.2, 224859.6, 164365.9 | 175018.8, 141870.3, 163940.0, 156947.6, 163268.6 |
+| write | 54365.3, 79969.5, 59509.6, 46729.1 | 42122.8, 58429.2, 65120.6, 51939.7, 40451.9 | 42413.6, 41060.6, 45448.3, 43665.4, 46133.6 | 102978.6, 128429.7, 98291.9, 104047.2 | 97968.7, 97184.0, 92976.8, 66510.4, 85347.1 | 53618.1, 60123.5, 63723.2, 65463.9, 58592.3 |
+| fsync | 64236.0, 68035.5, 48754.8, 56003.1 | 65449.8, 64724.8, 58757.4, 64647.5, 60907.4 | 45873.0, 48675.7, 49235.5, 49961.0, 50118.1 | 117382.2, 138699.3, 88612.9, 119811.9 | 148265.1, 100505.1, 131463.0, 106798.8, 96811.4 | 116259.4, 97403.7, 98870.7, 87478.1, 95467.2 |
+| close | 42906.6, 24394.0, 54626.2, 15460.5 | 8730.8, 32569.5, 31796.4, 33019.5, 40751.7 | 38492.8, 34913.3, 40271.8, 36460.9, 33756.3 | 86121.4, 63961.9, 97172.2, 124117.0 | 85830.8, 94097.7, 98384.1, 65712.1, 128326.3 | 52983.1, 53515.0, 49503.2, 57359.7, 58796.9 |
+| stat | 153747.5, 167732.6, 162871.9, 167438.8 | 67343.1, 67697.6, 67253.0, 65715.0, 66251.9 | 58923.4, 48563.5, 69657.4, 55633.7, 54824.7 | 193322.0, 214840.9, 231091.0, 194906.9 | 129291.0, 99039.4, 100218.6, 99074.7, 131240.8 | 122717.0, 95364.7, 121225.9, 88582.7, 142717.8 |
+| open | 75481.6, 98206.2, 86007.8, 87217.1 | 57312.8, 62392.7, 56381.1, 49313.6, 61312.8 | 47619.9, 47441.4, 48821.3, 43822.9, 47691.9 | 148649.0, 121638.4, 118574.6, 148020.7 | 98735.5, 89099.8, 97058.2, 83735.6, 104616.7 | 69115.0, 67650.3, 56373.1, 49584.4, 60356.9 |
+| read | 75829.4, 67669.7, 69201.3, 75120.8 | 59424.5, 48542.8, 57155.2, 57834.8, 65257.2 | 42833.2, 35610.6, 40372.0, 46927.0, 40909.6 | 129195.4, 104255.6, 154476.6, 137558.9 | 98185.8, 73367.2, 99748.0, 99858.8, 135683.9 | 58294.7, 56150.7, 59299.7, 56231.4, 59354.2 |
+| rename | 125930.3, 105200.1, 121661.2, 117212.3 | 105732.7, 102742.8, 113020.7, 103677.6, 97840.8 | 97080.7, 92786.7, 96997.9, 121802.6, 111072.9 | 254510.3, 175175.2, 181443.9, 238063.9 | 131798.2, 136186.7, 172502.8, 132972.1, 158105.2 | 175627.9, 131835.4, 169913.5, 394690.9, 206524.7 |
+| unlink | 172930.8, 167234.9, 153512.8, 178308.0 | 119749.5, 129448.7, 590513.7, 112572.3, 101741.9 | 125228.9, 81646.3, 84691.2, 86594.9, 105611.0 | 244026.7, 223252.4, 196497.7, 214138.4 | 1120412.4, 1235036.7, 1693395.8, 1062744.9, 1226212.2 | 798278.9, 160178.0, 669646.7, 591229.0, 573457.1 |
+
+**contended**, a user thread's wake-up probe per run: p50 / p99 / max, µs
+
+- dll: 28.1 / 46.7 / 88686.2; 28.2 / 47.1 / 65828.4; 27.9 / 45.0 / 69760.9; 28.0 / 45.6 / 69753.5
+- normal: 29.9 / 48.2 / 60755.1; 30.3 / 48.9 / 63899.6; 29.9 / 48.3 / 60804.6; 29.8 / 49.7 / 60853.9; 29.7 / 48.0 / 55510.2
+- raised: 28.8 / 48.7 / 71306.3; 28.6 / 47.9 / 73240.1; 28.7 / 48.0 / 50849.9; 28.5 / 48.1 / 69736.9; 28.6 / 48.3 / 61681.8
+
+**The user's CPU-bound process** (two spinners a core): rate alone, rate beside the workload (sweeps/s), share lost, pass wall (s), core-seconds lost to the workload
+
+| arm | run | alone | beside | lost | wall | core-seconds lost |
+|---|---|---|---|---|---|---|
+| dll | 1 | 94493 | 91705 | 3.0% | 713.5 | 84.2 |
+| dll | 2 | 94600 | 92769 | 1.9% | 819.1 | 63.4 |
+| dll | 4 | 94673 | 88378 | 6.6% | 572.2 | 152.2 |
+| dll | 5 | 94276 | 89612 | 4.9% | 661.9 | 131.0 |
+| **dll, median** | | | | 4.9% | 713.5 | 131.0 |
+| normal | 1 | 94395 | 82529 | 12.6% | 82.5 | 41.5 |
+| normal | 2 | 94376 | 81359 | 13.8% | 75.6 | 41.7 |
+| normal | 3 | 94331 | 85186 | 9.7% | 120.1 | 46.6 |
+| normal | 4 | 94274 | 82770 | 12.2% | 84.4 | 41.2 |
+| normal | 5 | 94379 | 82711 | 12.4% | 83.4 | 41.3 |
+| **normal, median** | | | | 12.4% | 83.4 | 41.5 |
+| raised | 1 | 94195 | 80133 | 14.9% | 72.2 | 43.1 |
+| raised | 2 | 94214 | 78054 | 17.2% | 61.5 | 42.2 |
+| raised | 3 | 94278 | 79146 | 16.1% | 66.9 | 42.9 |
+| raised | 4 | 94141 | 79898 | 15.1% | 67.4 | 40.8 |
+| raised | 5 | 94349 | 79452 | 15.8% | 66.7 | 42.1 |
+| **raised, median** | | | | 15.8% | 66.9 | 42.2 |
+
+### What the numbers name
+
+**Raised against normal, arm64, loaded: a large gain.** A write's p50 falls from 218–235 µs to 88–103 µs (0.42×), level with the
+DLL's 97–105 µs, which closes the 2.3× gap. p99s: a write 7.9–15.8 ms to 0.22–0.31 ms, a close 32.9–38.0 ms to 6.4–7.3 ms, a stat
+0.7–14.3 ms to 0.35–0.71 ms, a rename 35.5–37.3 ms to 23.2–25.3 ms. The whole pass takes 125–140 s against 194–277 s. Quiet, it
+is 0.93–1.04× at the p50.
+
+**Raised against normal, x86_64, loaded: a mixed result.** Worse at the p50, ranges apart on most: a write 72.6–73.0 µs to
+90.1–107.1 µs (1.45×), a read 1.25×, an fsync 1.16×, a stat 1.15×, an open 1.14×, a rename 1.13×. Better in some tails: an unlink's
+p99 10.9–18.0 ms to 1.1–1.3 ms, a stat's 0.55–1.21 ms to 0.36–0.39 ms. Worse in another: a rename's p99 32.3–34.3 ms to 36.5–39.2
+ms. The pass takes 61.5–72.2 s against 75.6–120.1 s. Quiet is 1.00–1.10×. **Why its p50s rise is not known.**
+
+**The cost to the user's own work.** While the workload runs, the raised daemon takes a larger share of the CPU: arm64 lost 34.3–37.8%
+of the process's rate against 20.1–25.2%, and x86_64 14.9–17.2% against 9.7–13.8%. Over the fixed workload the total is about the
+same, because the pass ends sooner: arm64 171–208 core-seconds against 196–222, x86_64 40.8–43.1 against 41.2–46.6. A normal-priority
+thread's wake: on arm64 the probe's p99 rises from 45.5–47.6 µs to 49.5–55.5 µs loaded and from 37.7–41.1 µs to 48.6–61.6 µs quiet; its
+max stays 45–64 ms loaded; x86_64 shows no such rise. **Not measured:** a long shard slice, such as a large landing, above a
+user's work. This workload is small files, in slices of microseconds, so it cannot say how a raised shard behaves in a long one.
+
+**The receiver with the reply spin against the DLL, each alone (normal over dll).** Arm64 quiet p50: a stat 1.39×, a rename 1.22×, an
+unlink 1.17×, a create 1.12×, an fsync 1.05×, a write 0.97×. Arm64 loaded: a write 2.31×, a rename 1.18×, a stat and an unlink 1.10×, an
+fsync 0.89×. x86_64 quiet: an open 1.24×, a read 1.14×, a write 1.08×, a stat 1.06×, a rename 0.98×, an unlink 0.97×, a close 0.92×, an
+fsync 0.88×, ranges overlapping on most; its quiet p99s are worse (a stat 2.89×, an open 3.49×, a rename 1.72×). x86_64 loaded p50s
+are better than the DLL's on every call, 0.87–0.97×. x86_64's loaded tails are far better too: a create's p99 224–238 ms to 62–82 ms, a
+stat's 112–123 ms to 0.55–1.21 ms, an unlink's 109–125 ms to 10.9–18.0 ms, and the whole pass 572–819 s to 76–120 s, which also takes less
+from the user's work (63–152 core-seconds against 41–47). Arm64's core-seconds are level (199–210 against 196–222).
+
+So on arm64 the receiver remains worse beyond the spread on a stat, a rename and an unlink, quiet and loaded, and on a loaded write
+until SetSize is fixed. Run alone, an arm64 open's p50 is level with the DLL's, 4,123–4,596 µs against 4,195–4,437 µs: its earlier
+132–920 µs came only with another daemon on the machine.
+
+## The spin policy, measured and rejected (A-218; R9; macOS and CI; 2026-11-05)
+
+Every candidate below lost main's single-client, 8-client or parked p99 under load on at least one platform, so main's
+spin policy stays (the supervisor, 2026-11-05: p99 under load is the target, and a quiet-machine gain is not evidence).
+Measured and rejected, with every N. The commands are `provision_bench`'s and `rt_bench`'s release binaries, run with
+no arguments; each arm built in its own target dir, the MD5s compared before any run, the arms interleaved round by
+round. A temporary diagnostic edit, where one was used, was made identically in both trees and taken out after. "Busy"
+adds 18 spinning threads (one per core, a scratch load generator) to the host's own load. Every figure is the median of
+the bench's three runs unless a range is given. Main is a7804447 in every arm but option A's, which ran against b502cf96
+once main had moved.
+
+**What started it: macOS's zero-timeout poll sleeps.** On Apple M5 Max (18 cores), macOS 26.4.1 (25E253), the idle
+spin's driver poll was `kevent` with a zero timeout. Probes outside the tree, each form on a fresh queue, every return
+checked, 5,000 calls a round (20:11 UTC, load 6):
+
+| form | ns a call, rounds 1 / 2 / 3 | involuntary switches a call |
+|---|---|---|
+| `kevent`, zero timespec | 14,752 / 14,866 / 14,737 | 1.01 / 1.02 / 1.01 |
+| `kevent64`, zero timespec | 14,598 / 14,757 / 15,524 | 1.00 / 1.00 / 1.07 |
+| `kevent64`, `KEVENT_FLAG_IMMEDIATE` | 186 / 182 / 180 | 0.00 / 0.00 / 0.00 |
+
+XNU refuses mixing the two record formats on one queue (`EINVAL`), so a true spin needs every call on the queue moved
+to `kevent64`. With that change (`rt_bench`, five rounds, load 5.7–6.0), a cross-shard round trip between spinning
+shards fell from 7,792 / 7,667 / 8,000 / 6,375 / 7,000 ns to 625 / 666 / 625 / 666 / 625 ns; parking was unchanged.
+So main's macOS shards spin in naps of about 15 µs, each an involuntary switch. A requested short wait delivers about
+the request plus 4–6 µs: asked 1 µs, 2.7–9.4 µs at load 28 and 4.9–6.8 µs at load 5; asked 5 µs, 8.8–9.8 µs.
+
+**The true spin alone (`kevent64` everywhere), macOS.** At load 6–16 it won every row. Single-client p50
+75.4 / 67.5 / 68.5 → 19.8 / 20.8 / 22.0 µs; p99 157.8 / 166.7 / 170.8 → 97.1 / 134.5 / 167.2 µs; 8-client p99
+219.5 / 309.4 / 275.5 → 204.8 / 158.8 / 93.0 µs (20:19–20:22 UTC). At load 18–30 it lost every tail (21:07–21:11 UTC):
+
+| row | main | true spin | true spin, yielding after the competitive spin |
+|---|---|---|---|
+| single-client p50 | 82.0 / 71.5 / 73.6 µs | 21.1 / 12.9 / 13.5 µs | 12.5 / 12.8 / 12.7 µs |
+| single-client p99 | 183 / 190 / 176 µs | 115 / 926 / 751 µs | 442 / 262 / 252 µs |
+| 8-client p99 | 0.47 / 0.54 / 0.44 ms | 3.48 / 3.18 / 5.23 ms | 3.46 / 3.30 / 3.38 ms |
+| parked p99, after the 64-client form | 0.53 / 0.35 / 4.19 ms | 3.14 / 12.09 / 14.53 ms | 13.92 / 9.38 / 12.20 ms |
+
+The parked form alone on a fresh daemon was no worse (load 5–6: p99 1.48 / 0.43 / 0.95 / 0.85 ms against 2.33 / 0.66 /
+1.22 / 0.70 ms). After the oversubscribed 64-client form a true spinner's wake estimate read 29–55 µs, against main's
+4.6–14 µs. Freezing the estimate at the boot prior (load 20–34) left the single-client p99 at 576 / 419 / 402 µs against
+main's 190 / 183 / 181 µs; the parked p99 was 17.90 / 0.65 / 1.00 ms against 5.22 / 12.33 / 0.32 ms.
+
+**Rejected: the shard's own turn gaps** (end the spin at a turn gap longer than the boot idle window, back off for as long
+as the gap, learn no wake meanwhile; 21:17–21:43 UTC, load 13–35). A probe first: with a core free a spinner's longest
+gap between turns was 115–144 µs, and oversubscribed 9–26 gaps per 300 ms passed 500 µs, the longest 65–90 ms.
+
+quiet: (median of the bench's 3 runs; each round)
+| row | main | fix | turn-gap rule |
+|---|---|---|---|
+| spinning_1_p50 (µs) | 85.4 · 73.0 · 72.8 | 23.7 · 14.6 · 25.0 | 12.4 · 12.4 · 12.9 |
+| spinning_1_p99 (µs) | 167.3 · 180.4 · 177.3 | 519.9 · 656.6 · 140.1 | 830.6 · 448.0 · 549.9 |
+| spinning_8_p99 (µs) | 494.6 · 407.3 · 423.3 | 3.34 ms · 2.89 ms · 3.37 ms | 4.12 ms · 3.46 ms · 2.93 ms |
+| parked_1_p50 (µs) | 113.1 · 113.6 · 117.0 | 83.4 · 80.1 · 83.2 | 81.2 · 86.6 · 60.5 |
+| parked_1_p99 (µs) | 3.43 ms · 359.2 · 523.5 | 15.20 ms · 4.14 ms · 1.18 ms | 17.46 ms · 5.22 ms · 1.01 ms |
+
+busy: (median of the bench's 3 runs; each round)
+| row | main | fix | turn-gap rule |
+|---|---|---|---|
+| spinning_1_p50 (µs) | 29.9 · 33.0 · 87.0 | 14.2 · 15.2 · 19.6 | 16.6 · 15.2 · 15.0 |
+| spinning_1_p99 (µs) | 619.7 · 238.8 · 576.6 | 7.06 ms · 13.93 ms · 5.60 ms | 15.13 ms · 15.49 ms · 11.16 ms |
+| spinning_8_p99 (µs) | 20.04 ms · 13.20 ms · 4.13 ms | 45.28 ms · 58.80 ms · 58.07 ms | 44.86 ms · 46.27 ms · 42.85 ms |
+| parked_1_p50 (µs) | 100.2 · 111.2 · 94.0 | 76.8 · 92.3 · 63.9 | 77.0 · 77.8 · 80.0 |
+| parked_1_p99 (µs) | 63.09 ms · 61.04 ms · 14.90 ms | 11.09 ms · 16.85 ms · 13.22 ms | 13.50 ms · 18.07 ms · 18.10 ms |
+
+The spinner barely sees the harm: the thread that waits is the woken client or shard queued for a core, and macOS rarely
+preempts the spinner for it. A `sched_yield` does not reach a thread queued on another core either. Beside 9–36 pure
+spinners a parked thread's wake p99 was 0.08–6.5 ms, beside yielding ones 43–51 µs, but the yielding spinners' own round
+trip rose to 8–65 µs. macOS's CPU idle counters (`host_statistics`, `HOST_CPU_LOAD_INFO`) read 0.0 idle cores with no
+extra load and 5.8 with 36 extra spinners, so they cannot be the signal.
+
+**Rejected: shorter idle windows.** The window as 100, 10 and 1 times the wake estimate (ratio 1 is the competitive spin
+alone [A: Karlin, Manasse, McGeoch & Owicki 1994]); macOS, 21:44–22:06 UTC, quiet at load 11–30, busy at 24–43:
+
+
+quiet, rounds 1 · 2 (each the median of the bench's 3 runs)
+| row | main | ratio 100 (fix) | ratio 10 | ratio 1 |
+|---|---|---|---|---|
+| spinning_1_p50 | 89.1 µs · 75.4 µs | 13.6 µs · 13.8 µs | 19.1 µs · 36.0 µs | 23.6 µs · 26.6 µs |
+| spinning_1_p99 | 172.1 µs · 218.4 µs | 277.8 µs · 388.5 µs | 122.9 µs · 291.8 µs | 89.8 µs · 146.9 µs |
+| spinning_8_p50 | 144.0 µs · 158.0 µs | 14.0 µs · 14.4 µs | 15.1 µs · 18.3 µs | 145.6 µs · 198.8 µs |
+| spinning_8_p99 | 393.5 µs · 635.1 µs | 2.16 ms · 2.42 ms | 2.22 ms · 1.72 ms | 666.2 µs · 1.14 ms |
+| parked_1_p50 | 109.4 µs · 107.7 µs | 79.9 µs · 78.9 µs | 94.1 µs · 100.1 µs | 96.2 µs · 109.5 µs |
+| parked_1_p99 | 10.61 ms · 415.2 µs | 10.59 ms · 8.55 ms | 7.89 ms · 9.59 ms | 1.73 ms · 9.49 ms |
+
+busy, rounds 1 · 2 (each the median of the bench's 3 runs)
+| row | main | ratio 100 (fix) | ratio 10 | ratio 1 |
+|---|---|---|---|---|
+| spinning_1_p50 | 76.1 µs · 33.8 µs | 14.2 µs · 19.0 µs | 26.4 µs · 33.2 µs | 39.4 µs · 24.6 µs |
+| spinning_1_p99 | 1.28 ms · 449.8 µs | 1.19 ms · 4.60 ms | 334.1 µs · 290.8 µs | 171.7 µs · 232.6 µs |
+| spinning_8_p50 | 160.6 µs · 152.4 µs | 91.8 µs · 302.0 µs | 108.4 µs · 119.6 µs | 126.6 µs · 145.1 µs |
+| spinning_8_p99 | 7.16 ms · 10.54 ms | 48.99 ms · 169.59 ms | 53.40 ms · 20.12 ms | 7.91 ms · 9.65 ms |
+| parked_1_p50 | 137.4 µs · 140.9 µs | 96.2 µs · 5.25 ms | 79.4 µs · 133.5 µs | 113.8 µs · 113.8 µs |
+| parked_1_p99 | 25.15 ms · 43.00 ms | 16.98 ms · 60.11 ms | 15.80 ms · 47.85 ms | 41.04 ms · 24.10 ms |
+
+Four more rounds of main against ratio 1 (22:07–22:16 UTC), with rounds 1 and 2 above:
+
+
+quiet, rounds 1–6 (µs unless marked), main vs ratio 1; wins = rounds where ratio 1 ≤ main
+| row | main | ratio 1 | ratio 1 ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 89 · 75 · 56 · 62 · 59 · 60 | 24 · 27 · 40 · 34 · 17 · 22 | 6/6 |
+| spinning_1_p99 | 172 · 218 · 124 · 139 · 126 · 142 | 90 · 147 · 184 · 929 · 41 · 115 | 4/6 |
+| spinning_8_p50 | 144 · 158 · 129 · 146 · 133 · 132 | 146 · 199 · 99 · 42 · 24 · 32 | 4/6 |
+| spinning_8_p99 | 394 · 635 · 372 · 575 · 435 · 400 | 666 · 1.1ms · 2.0ms · 528 · 127 · 704 | 2/6 |
+| parked_1_p50 | 109 · 108 · 101 · 113 · 91 · 79 | 96 · 109 · 107 · 82 · 80 · 149 | 3/6 |
+| parked_1_p99 | 10.6ms · 415 · 2.7ms · 8.3ms · 456 · 451 | 1.7ms · 9.5ms · 20.8ms · 8.4ms · 1.5ms · 9.5ms | 1/6 |
+
+busy, rounds 1–6 (µs unless marked), main vs ratio 1; wins = rounds where ratio 1 ≤ main
+| row | main | ratio 1 | ratio 1 ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 76 · 34 · 77 · 72 · 75 · 73 | 39 · 25 · 26 · 24 · 19 · 26 | 6/6 |
+| spinning_1_p99 | 1.3ms · 450 · 581 · 430 · 450 · 445 | 172 · 233 · 108 · 118 · 97 · 169 | 6/6 |
+| spinning_8_p50 | 161 · 152 · 160 · 128 · 128 · 127 | 127 · 145 · 122 · 35 · 87 · 101 | 6/6 |
+| spinning_8_p99 | 7.2ms · 10.5ms · 5.6ms · 2.0ms · 1.0ms · 1.9ms | 7.9ms · 9.7ms · 8.9ms · 3.7ms · 1.4ms · 3.2ms | 1/6 |
+| parked_1_p50 | 137 · 141 · 121 · 76 · 96 · 99 | 114 · 114 · 118 · 85 · 84 · 93 | 5/6 |
+| parked_1_p99 | 25.1ms · 43.0ms · 30.2ms · 34.3ms · 22.3ms · 186.8ms | 41.0ms · 24.1ms · 35.8ms · 27.7ms · 13.9ms · 8.6ms | 4/6 |
+
+On CI (diag run of `diag-clients-8`, 2026-11-05 22:17–22:55 UTC, 4-vCPU runners, quiet and with one spin loop per CPU; the
+results pushed to `diag-results/clients-8-<os>` and read by `git fetch`). The kqueue change is macOS code, so on these
+platforms "the fix" is a second main arm. Ratio 1 against main:
+- **Linux arm64** (3 shards): quiet single-client p50 38.0 / 36.8 / 11.7 against 14.0 / 14.0 / 14.1 µs; p99
+  129.8 / 126.3 / 22.5 against 126.7 / 23.9 / 25.3 µs, R9 failing in two rounds of three (main one); quiet parked p99
+  104.6 / 114.4 / 110.6 against 75.4 / 76.9 / 79.3 µs.
+- **Linux x86_64**: quiet single-client p99 27.6 / 29.3 / 44.1 against 47.2 / 30.6 / 28.2 µs; quiet parked p99
+  149.9 / 95.1 / 94.9 against 88.3 / 80.0 / 124.1 µs.
+- **Windows x86_64**: quiet single-client p99 23.0 / 33.1 / 31.8 against 19.6 / 22.3 / 20.5 µs; busy 48.9 / 52.8 /
+  45.6 against 33.4 / 32.5 / 32.9 µs.
+- **Windows arm64**: quiet single-client p50 69.5 / 47.6 / 46.7 against 17.8 / 17.3 / 17.0 µs, p99 131.4 / 95.6 / 112.1
+  against 48.6 / 88.0 / 47.5 µs; busy p99 22.67 / 26.05 / 28.05 ms against 39.5 / 37.6 / 35.3 µs.
+
+Busy, Linux main's own true spin is in the milliseconds in every arm (8-client p99 4.5–7.5 ms), while Windows main's
+keeps the single-client p99 at 33–40 µs: only macOS's scheduler turned a true spin's loaded tail into milliseconds.
+
+**Rejected: a nap past the competitive spin** (option A: spin for one wake estimate with the immediate poll, then nap
+— a kernel wait of the boot wake mean, the shard not marked parked — while the shard's measured nap is shorter than its
+live wake estimate; the nap measured lazily by kickable probes; main b502cf96; 23:11–23:3x UTC, load 13–40):
+
+
+quiet, rounds 1–4, main b502cf96 vs A; k/4 = rounds where A ≤ main
+| row | main | A | A ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 79 · 94 · 95 · 75 | 18 · 17 · 17 · 18 | 4/4 |
+| spinning_1_p99 | 476 · 2.4ms · 2.7ms · 2.2ms | 708 · 1.7ms · 3.7ms · 410 | 2/4 |
+| spinning_8_p50 | 146 · 134 · 136 · 134 | 25 · 26 · 28 · 25 | 4/4 |
+| spinning_8_p99 | 2.5ms · 3.5ms · 5.0ms · 7.7ms | 3.3ms · 4.8ms · 7.3ms · 3.1ms | 1/4 |
+| parked_1_p50 | 106 · 184 · 180 · 145 | 100 · 146 · 149 · 144 | 4/4 |
+| parked_1_p99 | 17.1ms · 16.8ms · 19.1ms · 30.0ms | 11.1ms · 20.0ms · 18.7ms · 25.3ms | 3/4 |
+
+busy, rounds 1–4, main b502cf96 vs A; k/4 = rounds where A ≤ main
+| row | main | A | A ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 76 · 75 · 73 · 74 | 15 · 18 · 18 · 24 | 4/4 |
+| spinning_1_p99 | 729 · 557 · 539 · 576 | 3.1ms · 1.3ms · 1.2ms · 3.8ms | 0/4 |
+| spinning_8_p50 | 145 · 131 · 130 · 141 | 32 · 65 · 49 · 46 | 4/4 |
+| spinning_8_p99 | 3.0ms · 1.8ms · 2.6ms · 3.5ms | 18.5ms · 19.8ms · 19.4ms · 20.6ms | 0/4 |
+| parked_1_p50 | 81 · 126 · 84 · 75 | 196 · 77 · 84 · 96 | 1/4 |
+| parked_1_p99 | 17.2ms · 11.5ms · 47.9ms · 31.1ms | 41.7ms · 36.0ms · 60.3ms · 83.0ms | 0/4 |
+
+The shards' decision logs show why: under load a shard's measured nap and its wake estimate track each other to the
+nanosecond (nap 11,250 against wake 11,251 ns; 13,834 against 14,050; 27,125 against 27,264; 37,917 against 37,974), since
+once the host is oversubscribed both measure the same queueing for a core, and the comparison sits on the line. With the
+comparison forced to nap every time (busy round 1, main at 23:46 and the napping arm at 23:50 UTC), main's single-client, 8-client and parked p99 were 777.6 µs,
+3.46 ms and 20.3 ms, the napping arm's 821.5 µs, 15.10 ms and 24.4 ms, and the candidate was stopped there.
+
+What it means: main's macOS shards nap about 15 µs at every driver harvest, busy steps included. That is what keeps
+their tails under load within reach of the other platforms', and it is also what costs their p50 (main's 60–95 µs
+against a true spin's 13–22 µs at every load). No derived rule measured here keeps both, so the naps stay. The kqueue
+change is kept on record (`agents/clients-spin`, a75f9213), not landed.
+
+## Step 7's measured state: the one-worker receiver against the DLL, and A-219's second worker measured (audit step 7; 2026-11-05 and 06)
+
+**What this records.** It is the receiver as main serves it, one worker in the separate form (A-198, A-212, the packets made
+once), against WinFsp's DLL dispatcher at `71cf09ac`. It also records what A-219's second worker was measured to buy, and
+why A-219's runtime does not land.
+
+**Command.** Diagnostics run [42130583401](https://github.com/hyper-light/slates/actions/runs/42130583401)
+(`diag-winfsp-overlap-20`, commit `34d8a883`, `d6c3f01d` plus its workflow), on each runner:
+`OLD_SLATES=<71cf09ac>/slates.exe NEW_SLATES=<d6c3f01d>/slates.exe BENCH=mount_bench.exe OLD_NAME=dll NEW_NAME=receiver
+RUNS=5 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh`, release builds, `cargo build --release --locked`.
+Each run makes both daemons afresh, and the build started first alternates. One `mount_bench` process rounds over both
+drives, its first arm rotating each round. It times create, write, fsync, close, stat, open, read, rename and unlink, each
+10,000 calls, quiet and then with two spinners a logical CPU (8 on these 4-CPU runners).
+- The receiver arm, `d6c3f01d`, serves exactly as main's receiver does. Its first-mount probe derived one worker in every
+  daemon: 5 of 5 a lane (below).
+- GitHub's runners on 2026-11-05 (UTC 23:51 to 01:05):
+  - `windows-11-arm`: image win11-vs2026-arm64 20261101.203.1, 4 CPUs, ARMv8 Family 8 Model D49, Windows 10.0.26200.9725.
+  - `windows-latest`: image win25-vs2026 20261030.294.1, 4 CPUs, AMD Family 25 Model 17, Windows 10.0.26100.33674.
+  - WinFsp 2.1.25156 on both, nothing else running in the job.
+- Windows keeps no load average. Each phase's own wake-up probe, quiet: p50 22.1-24.5 µs (arm64), 32.9-33.5 µs (x86_64).
+- The verdict cell: within the spread when the receiver's median run is at or below the DLL's slowest run, at the p50 and
+  the p99.
+
+**arm64 (windows-11-arm)**: 5 runs done, 0 failed; arms dll, receiver.
+
+arm64 (windows-11-arm), quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | receiver | receiver vs dll |
+|---|---|---|---|---|
+| create | p50 | **181.1** (181.1 185.4 186.8 193.4 225.7) | **201.2** (201.2 211.3 211.9 214.9 252.2) | within |
+| create | p99 | **271.3** (271.3 316.9 321.4 340.8 361.0) | **331.6** (331.6 360.6 381.5 448.7 498.4) | **worse**: 381.5 > 361.0 |
+| create | p999 | **726.0** (726.0 1520.9 1707.9 2484.5 3539.6) | **724.0** (724.0 753.3 771.0 783.2 1100.9) |  |
+| create | max | **14105.9** (14105.9 17642.5 17677.6 17912.2 17947.0) | **3448.0** (3448.0 3537.8 3715.4 4559.7 4946.1) |  |
+| stat | p50 | **110.6** (110.6 112.4 112.9 114.5 117.1) | **144.4** (144.4 144.5 147.3 150.1 177.2) | **worse**: 147.3 > 117.1 |
+| stat | p99 | **179.9** (179.9 186.1 186.6 186.9 198.4) | **214.3** (214.3 221.3 230.4 247.6 255.8) | **worse**: 230.4 > 198.4 |
+| stat | p999 | **287.9** (287.9 291.6 298.9 429.2 465.7) | **543.4** (543.4 582.2 593.4 698.6 948.9) |  |
+| stat | max | **1094.8** (1094.8 1199.4 1649.6 10740.1 12357.1) | **660.4** (660.4 813.0 3725.3 3982.4 16421.0) |  |
+| read | p50 | **27.6** (27.6 40.8 42.1 44.0 51.4) | **38.9** (38.9 39.2 39.9 41.4 55.2) | within |
+| read | p99 | **60.8** (60.8 64.4 65.3 74.0 78.8) | **59.0** (59.0 59.4 64.5 65.8 83.0) | within |
+| read | p999 | **110.4** (110.4 116.0 116.5 125.6 153.4) | **109.1** (109.1 110.4 112.4 139.3 152.0) |  |
+| read | max | **159.7** (159.7 220.1 223.9 1744.1 3117.9) | **158.8** (158.8 173.1 188.6 1979.4 2086.1) |  |
+| write | p50 | **88.2** (88.2 91.1 93.7 93.8 102.0) | **88.3** (88.3 89.8 90.5 92.7 104.5) | within |
+| write | p99 | **199.9** (199.9 204.0 207.4 214.8 227.3) | **205.6** (205.6 214.6 218.4 229.4 237.4) | within |
+| write | p999 | **467.1** (467.1 555.5 1407.2 1635.8 2138.2) | **441.8** (441.8 489.0 555.0 579.1 624.8) |  |
+| write | max | **9028.7** (9028.7 17407.0 17617.4 17653.4 17748.1) | **1363.4** (1363.4 3312.8 3926.4 4614.2 6409.7) |  |
+| rename | p50 | **374.7** (374.7 377.5 379.5 384.0 398.6) | **440.3** (440.3 443.6 447.8 457.9 473.4) | **worse**: 447.8 > 398.6 |
+| rename | p99 | **683.7** (683.7 779.5 844.8 1130.9 1358.2) | **884.4** (884.4 888.9 919.4 975.3 1175.0) | within |
+| rename | p999 | **2300.8** (2300.8 2644.2 2659.0 4665.3 8103.4) | **2220.3** (2220.3 2461.3 2920.0 3733.7 5510.2) |  |
+| rename | max | **48335.9** (48335.9 60873.8 62131.1 62700.9 63566.1) | **14097.2** (14097.2 20596.0 22421.3 83250.7 83589.2) |  |
+| unlink | p50 | **236.8** (236.8 239.3 242.3 245.0 249.4) | **270.7** (270.7 275.1 280.7 281.2 291.5) | **worse**: 280.7 > 249.4 |
+| unlink | p99 | **403.3** (403.3 424.0 433.8 440.4 461.2) | **460.2** (460.2 501.4 502.2 502.4 534.0) | **worse**: 502.2 > 461.2 |
+| unlink | p999 | **604.4** (604.4 1171.5 1388.8 1976.3 2539.2) | **772.1** (772.1 1410.6 1940.2 2069.3 2454.6) |  |
+| unlink | max | **3300.3** (3300.3 15619.2 20658.1 65716.9 66312.5) | **3187.9** (3187.9 62682.1 103444.6 145145.9 148140.7) |  |
+| fsync | p50 | **104.4** (104.4 105.0 106.1 107.6 112.1) | **108.4** (108.4 108.6 109.7 112.5 125.2) | within |
+| fsync | p99 | **152.8** (152.8 154.7 164.1 166.3 169.0) | **173.0** (173.0 173.1 181.7 183.6 185.1) | **worse**: 181.7 > 169.0 |
+| fsync | p999 | **429.7** (429.7 452.6 485.9 502.0 585.9) | **404.0** (404.0 470.7 533.2 545.5 557.0) |  |
+| fsync | max | **2369.1** (2369.1 3759.9 17460.5 17471.3 17793.7) | **2562.3** (2562.3 3146.6 4124.3 4506.2 7264.5) |  |
+| open | p50 | **183.9** (183.9 1017.5 1038.8 3858.6 4350.8) | **3720.4** (3720.4 3737.4 3756.0 3792.0 4415.6) | within |
+| open | p99 | **5130.8** (5130.8 5152.4 5334.9 5358.0 5733.5) | **5068.0** (5068.0 5309.0 5392.5 5435.5 5829.2) | within |
+| open | p999 | **6518.6** (6518.6 6915.0 7131.9 7372.7 7678.0) | **8166.6** (8166.6 10449.3 12007.3 12976.5 45260.7) |  |
+| open | max | **9160.8** (9160.8 10184.7 15120.8 15868.3 173197.1) | **87049.2** (87049.2 103671.7 105862.6 107591.7 125029.4) |  |
+| close | p50 | **3803.0** (3803.0 3984.3 3993.0 4115.7 4614.6) | **4032.8** (4032.8 4093.6 4137.8 4153.2 4719.9) | within |
+| close | p99 | **5508.8** (5508.8 5769.8 5858.1 6940.8 7101.1) | **5646.5** (5646.5 5784.1 5791.1 6228.3 6574.7) | within |
+| close | p999 | **17473.0** (17473.0 17486.0 17541.9 17599.3 17860.1) | **7117.3** (7117.3 7224.9 7332.5 8007.8 8618.4) |  |
+| close | max | **20417.9** (20417.9 20941.2 21142.1 23923.3 34975.4) | **12994.0** (12994.0 17808.5 19817.1 23136.0 43407.3) |  |
+
+arm64 (windows-11-arm), loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | receiver | receiver vs dll |
+|---|---|---|---|---|
+| create | p50 | **213.7** (213.7 219.1 231.9 240.9 256.1) | **214.0** (214.0 215.6 242.6 249.2 250.8) | within |
+| create | p99 | **752.3** (752.3 790.5 818.5 866.7 1231.9) | **784.7** (784.7 819.3 1082.3 1166.7 1226.4) | within |
+| create | p999 | **25704.8** (25704.8 30286.3 30476.6 32460.1 40342.5) | **29198.4** (29198.4 33538.1 33860.4 35230.9 35977.7) |  |
+| create | max | **39813.3** (39813.3 60289.6 74388.9 85650.7 100207.3) | **42730.2** (42730.2 55705.1 55896.3 68807.2 78497.4) |  |
+| stat | p50 | **141.9** (141.9 144.3 145.0 145.5 146.5) | **148.6** (148.6 150.4 151.0 152.4 154.1) | **worse**: 151.0 > 146.5 |
+| stat | p99 | **22380.3** (22380.3 24108.2 25291.0 30284.5 32558.1) | **705.6** (705.6 708.8 3455.4 3573.7 5881.8) | within |
+| stat | p999 | **42176.1** (42176.1 46438.6 47563.4 47853.6 50191.2) | **37111.9** (37111.9 38073.2 38853.7 41887.2 43207.2) |  |
+| stat | max | **55967.2** (55967.2 61285.2 62252.1 73983.5 481821.9) | **47808.7** (47808.7 69074.2 70240.3 80542.0 82956.8) |  |
+| read | p50 | **48.6** (48.6 48.9 51.9 55.4 57.8) | **50.0** (50.0 50.7 56.1 56.8 57.3) | within |
+| read | p99 | **82.0** (82.0 89.0 89.7 92.7 94.5) | **84.3** (84.3 85.6 88.1 92.3 96.8) | within |
+| read | p999 | **167.7** (167.7 170.6 172.8 178.8 189.0) | **159.3** (159.3 167.4 173.2 174.1 174.5) |  |
+| read | max | **217.3** (217.3 217.9 229.3 341.9 527.5) | **210.5** (210.5 214.4 231.6 328.5 356.1) |  |
+| write | p50 | **93.8** (93.8 94.9 98.1 101.4 102.6) | **202.5** (202.5 204.4 212.0 214.1 215.5) | **worse**: 212.0 > 102.6 |
+| write | p99 | **352.4** (352.4 371.9 379.3 392.6 729.0) | **667.0** (667.0 1576.3 5753.1 9274.1 9864.9) | **worse**: 5753.1 > 729.0 |
+| write | p999 | **18638.3** (18638.3 19130.2 23546.6 25291.1 27264.9) | **27464.0** (27464.0 27899.0 33181.2 33924.7 37336.7) |  |
+| write | max | **43337.7** (43337.7 43961.7 51756.9 67630.7 135589.5) | **47434.1** (47434.1 47878.5 50854.1 51686.7 56038.0) |  |
+| rename | p50 | **436.2** (436.2 440.1 441.5 452.2 453.1) | **512.5** (512.5 512.5 524.6 529.0 543.7) | **worse**: 524.6 > 453.1 |
+| rename | p99 | **22291.1** (22291.1 22820.3 23824.1 25833.2 30918.7) | **35529.2** (35529.2 36021.4 36041.2 36079.9 36672.8) | **worse**: 36041.2 > 30918.7 |
+| rename | p999 | **62178.4** (62178.4 67791.7 72613.8 74602.9 79590.1) | **61425.8** (61425.8 65239.6 65659.3 68974.4 78616.3) |  |
+| rename | max | **140290.1** (140290.1 146101.4 175752.3 182429.5 213935.6) | **103785.1** (103785.1 106881.0 117347.0 127942.5 136444.1) |  |
+| unlink | p50 | **296.2** (296.2 299.1 302.3 305.3 309.1) | **334.9** (334.9 335.0 339.5 340.6 346.0) | **worse**: 339.5 > 309.1 |
+| unlink | p99 | **32248.3** (32248.3 33184.2 36100.3 37857.3 38145.1) | **25829.1** (25829.1 27383.4 27557.7 30222.9 31631.8) | within |
+| unlink | p999 | **50037.2** (50037.2 51467.1 52318.1 53454.3 59158.6) | **88173.0** (88173.0 96457.1 120425.7 122148.6 123787.4) |  |
+| unlink | max | **71408.5** (71408.5 79047.2 79621.2 99773.7 125581.7) | **267949.3** (267949.3 273930.2 328216.7 358021.9 361156.0) |  |
+| fsync | p50 | **118.3** (118.3 118.5 123.6 128.2 134.1) | **110.1** (110.1 110.8 113.6 118.0 122.9) | within |
+| fsync | p99 | **299.8** (299.8 322.8 325.1 405.0 467.8) | **258.2** (258.2 269.0 290.5 311.0 412.7) | within |
+| fsync | p999 | **35382.8** (35382.8 38489.0 39031.6 39603.9 39895.5) | **29509.8** (29509.8 33539.1 34963.4 37601.5 38783.7) |  |
+| fsync | max | **48769.8** (48769.8 59063.0 59963.0 89971.7 130052.6) | **65046.8** (65046.8 67100.1 68710.8 81924.7 269932.5) |  |
+| open | p50 | **3877.2** (3877.2 3893.6 4088.0 4210.2 4690.6) | **4084.5** (4084.5 4151.5 4372.8 4466.9 4544.5) | within |
+| open | p99 | **35554.8** (35554.8 37390.3 38629.1 38667.9 40880.6) | **39615.6** (39615.6 39805.5 40365.3 40492.0 43347.8) | within |
+| open | p999 | **54743.2** (54743.2 54786.5 58531.5 76802.7 78947.5) | **88411.4** (88411.4 98648.5 100845.2 101131.6 102305.5) |  |
+| open | max | **81075.6** (81075.6 96537.0 97068.9 112131.7 468131.1) | **205067.2** (205067.2 233098.8 256370.4 257355.9 273411.7) |  |
+| close | p50 | **4859.6** (4859.6 4874.0 5153.9 5199.2 7588.6) | **4988.9** (4988.9 5020.5 5345.5 5492.2 5871.5) | within |
+| close | p99 | **38645.1** (38645.1 39077.6 39700.9 41598.8 41871.4) | **38801.6** (38801.6 38995.5 39068.8 39246.0 41395.5) | within |
+| close | p999 | **53694.3** (53694.3 55680.5 56129.7 57621.4 72199.0) | **52976.7** (52976.7 55594.4 57455.3 58424.6 59667.3) |  |
+| close | max | **90986.6** (90986.6 91227.9 152497.6 289129.2 322206.8) | **79694.4** (79694.4 83146.9 87713.3 94755.8 136504.2) |  |
+
+**x86_64 (windows-latest)**: 4 runs done, 1 failed; arms dll, receiver.
+
+x86_64 (windows-latest), quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | receiver | receiver vs dll |
+|---|---|---|---|---|
+| create | p50 | **826.7** (826.7 849.3 861.9 864.0 867.9) | **877.3** (877.3 878.0 879.4 886.4 889.6) | **worse**: 879.4 > 867.9 |
+| create | p99 | **1476.5** (1476.5 1500.2 1513.0 1538.2 1655.3) | **1509.2** (1509.2 1523.1 1588.0 1636.9 1658.2) | within |
+| create | p999 | **3753.2** (3753.2 4044.7 4899.8 6212.9 39033.6) | **3443.1** (3443.1 5391.8 10971.5 16397.7 19192.8) |  |
+| create | max | **39093.4** (39093.4 39270.4 39370.7 39671.9 328994.1) | **41338.1** (41338.1 43773.2 48028.1 48916.9 219011.7) |  |
+| stat | p50 | **190.1** (190.1 202.7 209.6 243.2 249.5) | **194.6** (194.6 197.4 203.8 206.8 225.6) | within |
+| stat | p99 | **306.8** (306.8 348.6 352.1 353.1 380.9) | **314.5** (314.5 322.1 326.8 335.1 342.1) | within |
+| stat | p999 | **601.5** (601.5 668.7 780.3 994.3 1090.8) | **718.4** (718.4 749.6 752.8 779.7 904.4) |  |
+| stat | max | **26571.6** (26571.6 37993.7 38333.5 38545.3 78985.0) | **3652.0** (3652.0 37956.1 38259.2 42492.6 43674.0) |  |
+| read | p50 | **10.5** (10.5 10.8 10.9 10.9 11.0) | **11.5** (11.5 11.6 11.6 11.6 11.7) | **worse**: 11.6 > 11.0 |
+| read | p99 | **102.6** (102.6 114.5 115.0 120.4 121.3) | **119.4** (119.4 121.7 122.2 128.2 132.3) | **worse**: 122.2 > 121.3 |
+| read | p999 | **154.6** (154.6 161.4 173.0 188.9 193.3) | **151.0** (151.0 166.5 182.6 187.9 197.5) |  |
+| read | max | **1386.3** (1386.3 1386.9 1578.6 37598.6 38023.5) | **286.8** (286.8 433.5 545.3 1271.2 7557.7) |  |
+| write | p50 | **79.1** (79.1 81.7 93.3 95.1 95.3) | **72.6** (72.6 89.8 93.5 104.6 105.9) | within |
+| write | p99 | **212.9** (212.9 313.3 352.0 355.1 371.4) | **283.6** (283.6 299.2 303.2 325.7 355.5) | within |
+| write | p999 | **692.7** (692.7 737.2 824.9 923.3 1006.9) | **650.5** (650.5 779.2 842.3 854.4 1077.6) |  |
+| write | max | **7536.5** (7536.5 25205.1 37778.5 37933.0 126692.7) | **956.8** (956.8 13221.4 23916.3 37969.0 45327.8) |  |
+| rename | p50 | **416.3** (416.3 446.8 455.6 543.9 551.4) | **446.9** (446.9 450.1 460.9 500.3 510.0) | within |
+| rename | p99 | **701.6** (701.6 746.9 751.7 756.5 1149.1) | **746.8** (746.8 752.1 762.4 842.1 982.3) | within |
+| rename | p999 | **1369.1** (1369.1 1412.9 1784.3 1846.8 5366.7) | **1235.8** (1235.8 1373.8 1749.8 1780.6 13948.0) |  |
+| rename | max | **38435.8** (38435.8 38673.4 38711.8 39024.0 274891.8) | **38585.1** (38585.1 38792.2 38971.4 42737.3 315593.5) |  |
+| unlink | p50 | **240.2** (240.2 259.4 273.3 276.8 282.6) | **256.4** (256.4 279.7 280.9 290.9 295.1) | within |
+| unlink | p99 | **580.1** (580.1 704.6 708.4 714.3 715.2) | **752.9** (752.9 770.9 773.3 783.9 831.0) | **worse**: 773.3 > 715.2 |
+| unlink | p999 | **909.4** (909.4 953.6 1003.9 1592.4 2660.2) | **1027.2** (1027.2 1040.0 1046.7 1074.6 1167.1) |  |
+| unlink | max | **1491.0** (1491.0 38044.2 38319.4 38768.4 82124.9) | **38285.2** (38285.2 38544.7 38631.7 39119.9 318502.9) |  |
+| fsync | p50 | **118.1** (118.1 120.0 122.6 129.7 133.7) | **98.6** (98.6 100.7 101.8 109.8 121.5) | within |
+| fsync | p99 | **212.2** (212.2 216.2 225.3 228.1 234.5) | **204.9** (204.9 209.5 245.3 300.9 401.1) | **worse**: 245.3 > 234.5 |
+| fsync | p999 | **735.9** (735.9 749.3 755.5 903.9 1009.2) | **680.0** (680.0 822.2 889.8 920.7 921.3) |  |
+| fsync | max | **20395.3** (20395.3 37871.2 38142.8 39476.8 284810.4) | **14863.9** (14863.9 32993.7 37668.1 37967.7 38110.4) |  |
+| open | p50 | **122.2** (122.2 146.2 147.9 149.9 153.4) | **144.8** (144.8 149.7 149.8 151.6 152.0) | within |
+| open | p99 | **221.0** (221.0 234.8 239.7 240.0 262.5) | **245.0** (245.0 246.8 250.0 261.1 265.4) | within |
+| open | p999 | **351.7** (351.7 429.6 449.6 469.7 1728.8) | **660.2** (660.2 662.1 697.9 730.6 779.0) |  |
+| open | max | **851.2** (851.2 1011.8 38217.8 38311.5 154532.6) | **2620.8** (2620.8 29569.3 37813.6 37842.7 38164.8) |  |
+| close | p50 | **46.8** (46.8 47.2 47.2 47.5 53.0) | **50.9** (50.9 50.9 51.3 51.6 51.8) | within |
+| close | p99 | **125.2** (125.2 138.7 143.8 170.7 371.8) | **406.3** (406.3 410.6 444.8 486.9 516.8) | **worse**: 444.8 > 371.8 |
+| close | p999 | **620.9** (620.9 636.8 717.8 866.6 960.5) | **699.5** (699.5 758.8 832.4 882.6 915.6) |  |
+| close | max | **7014.1** (7014.1 8473.9 14927.1 21818.8 42608.0) | **5623.2** (5623.2 10827.6 24258.6 37607.2 47722.2) |  |
+
+x86_64 (windows-latest), loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | receiver | receiver vs dll |
+|---|---|---|---|---|
+| create | p50 | **1509.2** (1509.2 1534.8 1535.3 1563.9) | **1472.7** (1472.7 1475.2 1526.2 1554.0) | within |
+| create | p99 | **228040.9** (228040.9 228400.4 231298.7 250448.2) | **87095.7** (87095.7 90896.2 92816.1 97260.0) | within |
+| create | p999 | **296801.8** (296801.8 300163.7 312343.6 325508.6) | **144381.2** (144381.2 148348.4 164598.0 166109.2) |  |
+| create | max | **367257.8** (367257.8 381619.4 388432.0 421850.2) | **179151.2** (179151.2 186377.6 188864.0 242228.4) |  |
+| stat | p50 | **284.5** (284.5 290.4 290.7 294.4) | **239.3** (239.3 240.3 283.9 290.0) | within |
+| stat | p99 | **110734.4** (110734.4 119030.2 122759.4 125545.3) | **1411.4** (1411.4 1592.6 1901.3 11952.7) | within |
+| stat | p999 | **163013.0** (163013.0 168806.1 169792.3 185516.3) | **66212.7** (66212.7 67182.5 68109.9 82162.6) |  |
+| stat | max | **200062.3** (200062.3 214878.1 232276.4 250443.5) | **97814.9** (97814.9 121755.6 148605.9 153891.2) |  |
+| read | p50 | **108.8** (108.8 109.0 109.2 109.5) | **95.1** (95.1 95.2 118.0 119.6) | **worse**: 118.0 > 109.5 |
+| read | p99 | **206.3** (206.3 208.5 208.6 209.2) | **208.9** (208.9 217.3 220.3 239.1) | **worse**: 220.3 > 209.2 |
+| read | p999 | **65330.7** (65330.7 65689.2 66660.5 78426.2) | **40697.5** (40697.5 44541.3 60963.5 62276.9) |  |
+| read | max | **106758.8** (106758.8 115091.3 155227.9 184982.4) | **78253.1** (78253.1 97812.7 99579.8 130460.4) |  |
+| write | p50 | **109.6** (109.6 110.9 112.3 112.8) | **94.5** (94.5 95.6 114.1 118.1) | **worse**: 114.1 > 112.8 |
+| write | p99 | **514.3** (514.3 592.5 28575.7 34362.3) | **481.3** (481.3 524.8 986.7 22976.1) | within |
+| write | p999 | **64617.0** (64617.0 69867.1 74193.6 95932.2) | **55582.3** (55582.3 55997.3 64180.0 65475.2) |  |
+| write | max | **127627.5** (127627.5 141810.8 142715.7 156569.6) | **83634.8** (83634.8 98271.9 100871.3 154129.3) |  |
+| rename | p50 | **707.1** (707.1 708.7 708.9 711.3) | **611.3** (611.3 612.4 724.9 733.0) | **worse**: 724.9 > 711.3 |
+| rename | p99 | **43435.0** (43435.0 47882.7 53681.0 54255.8) | **45985.3** (45985.3 49808.7 50848.5 51797.7) | within |
+| rename | p999 | **131757.6** (131757.6 136103.9 138950.5 154178.0) | **172002.4** (172002.4 268450.8 460631.8 479853.8) |  |
+| rename | max | **172436.0** (172436.0 229375.6 246908.0 288457.2) | **1001657.2** (1001657.2 1330723.7 1494693.1 2068744.5) |  |
+| unlink | p50 | **422.4** (422.4 425.1 425.9 448.9) | **360.7** (360.7 390.4 410.2 412.5) | within |
+| unlink | p99 | **129010.6** (129010.6 130630.7 131405.9 144137.6) | **26495.0** (26495.0 28639.9 28782.6 32020.3) | within |
+| unlink | p999 | **175906.6** (175906.6 176436.6 176653.0 200434.2) | **440913.0** (440913.0 549516.6 676328.5 975346.2) |  |
+| unlink | max | **213535.2** (213535.2 214649.7 228484.9 259070.0) | **1582370.9** (1582370.9 1819918.8 2060538.1 2135309.4) |  |
+| fsync | p50 | **159.0** (159.0 160.5 162.3 162.3) | **138.3** (138.3 156.2 178.4 179.8) | **worse**: 178.4 > 162.3 |
+| fsync | p99 | **342.7** (342.7 366.3 388.1 405.8) | **543.3** (543.3 575.6 1109.1 14733.3) | **worse**: 1109.1 > 405.8 |
+| fsync | p999 | **51136.2** (51136.2 66963.6 67909.4 70977.4) | **61300.7** (61300.7 66795.9 67294.9 70757.5) |  |
+| fsync | max | **98783.4** (98783.4 136215.7 137115.0 190788.0) | **130513.6** (130513.6 136032.9 136594.9 151390.5) |  |
+| open | p50 | **206.8** (206.8 207.0 207.8 209.9) | **197.8** (197.8 216.8 221.4 226.6) | **worse**: 221.4 > 209.9 |
+| open | p99 | **368.4** (368.4 373.0 402.8 828.4) | **751.0** (751.0 1401.3 1505.4 1577.7) | **worse**: 1505.4 > 828.4 |
+| open | p999 | **69002.0** (69002.0 86935.5 88184.1 92142.4) | **63987.1** (63987.1 65330.7 65894.9 66247.7) |  |
+| open | max | **119285.3** (119285.3 134337.1 143888.5 203251.7) | **107106.0** (107106.0 109571.7 115945.0 119213.7) |  |
+| close | p50 | **79.2** (79.2 79.4 79.5 79.7) | **70.1** (70.1 70.6 72.1 72.3) | within |
+| close | p99 | **146.0** (146.0 153.4 171.7 172.8) | **159.1** (159.1 166.7 177.0 195.4) | **worse**: 177.0 > 172.8 |
+| close | p999 | **714.8** (714.8 34314.1 57231.1 57374.8) | **31792.0** (31792.0 32137.2 32453.4 47819.9) |  |
+| close | max | **72521.8** (72521.8 119571.1 124489.3 134304.5) | **69506.2** (69506.2 92931.4 98467.1 100317.7) |  |
+
+- **x86_64 run 3 failed in its DLL arm.** Under the spinners `71cf09ac`'s daemon missed heartbeats (gaps of 502-971 ms
+  against the 1,000 ms budget), and the anchor killed it, so a stat on its drive was aborted (os error 995). That run's
+  quiet phase is in the table; its contended phase is not. The other four ran whole.
+- **Verdict: Step 7's regression is not fixed.** Beyond the DLL's spread on arm64: quiet stat, rename and unlink at the
+  p50, with create, fsync, stat and unlink at the p99; loaded write (212.0 against at most 102.6 µs) and its p99, stat,
+  rename (both ranks) and unlink. On x86_64, 15 cells, most by a few percent: quiet create p50 (879.4 against at most
+  867.9 µs), read p50 and p99, and close, fsync and unlink p99; loaded read, write, rename, fsync and open p50, and fsync
+  (1,109.1 against 405.8 µs), open (1,505.4 against 828.4), read and close p99.
+
+**A-219's second worker: no win measured, in any form timed.**
+- **The first probe**, an absent-name open (one request, answered at once, the separate form), ran in every daemon of the
+  A/B above, release builds. Every round's median, µs, one waiting worker | two | the count derived | the probe's time:
+
+arm64:
+
+| one worker, five rounds | two workers, five rounds | count | ms |
+|---|---|---|---|
+| 22.9 22.0 22.4 21.8 21.9 | 21.6 21.0 22.7 21.4 23.2 | 1 | 58 |
+| 21.7 22.5 22.3 22.5 23.1 | 21.8 22.0 22.6 22.2 21.8 | 1 | 60 |
+| 22.5 22.9 22.8 22.5 23.1 | 22.3 22.7 22.9 22.4 22.4 | 1 | 60 |
+| 22.6 22.3 21.6 22.6 22.0 | 22.2 21.8 22.2 22.2 21.8 | 1 | 59 |
+| 21.8 22.2 22.6 23.5 22.8 | 23.0 22.5 23.1 22.5 21.4 | 1 | 60 |
+
+x86_64:
+
+| one worker, five rounds | two workers, five rounds | count | ms |
+|---|---|---|---|
+| 36.6 36.5 36.9 36.3 36.4 | 36.7 36.5 36.4 36.3 36.7 | 1 | 93 |
+| 37.0 37.0 37.1 37.2 36.9 | 37.2 36.8 37.2 37.2 36.8 | 1 | 93 |
+| 36.4 36.6 36.3 36.6 36.4 | 36.4 37.3 36.6 36.3 36.5 | 1 | 90 |
+| 47.0 46.6 46.2 49.9 46.6 | 46.4 46.6 46.0 46.1 46.2 | 1 | 116 |
+| 36.4 35.7 36.5 36.0 35.8 | 36.2 35.8 35.9 35.7 35.9 | 1 | 90 |
+
+- In the debug-built library and CLI test daemons of the same run, 35 processes a lane: arm64 one worker 53.6-81.8 µs,
+  two 57.6-83.0 µs, every process deriving one; x86_64 30.2-62.2 against 41.6-62.9 µs. One x86_64 process of 35 derived
+  two from a shift between that runner's two regimes of open time (near 42 and near 58 µs), not a win: four of its five
+  one-worker rounds fell in the slow mode and all five two-worker rounds in the fast one. So the rounds rose to nine.
+- On the mount's path that probe cost every process's first mount 58-116 ms in release (105-216 ms in the test builds),
+  against A-213's whole mount of 10-19 ms, so it moved to the second worker's own thread (`e070f31e`).
+- The open-and-close probe, and the second worker in A-215's combined form (the DLL's own shape), were never timed in a
+  daemon: the off-path probe made every kill oracle hang (next).
+
+**A daemon must never send I/O to a volume it serves itself (found 2026-11-06, runs 42134176889 and 42136220721).** The
+off-path probe's client thread opened its file through a volume served by the same process. A kill that lands while such
+an open is delivered leaves it in WinFsp's processing queue. That queue is never cancelled or expired
+(`FSP_IOQ_PROCESS_NO_CANCEL`; `FspIoqRemoveExpired` skips it, WinFsp v2.1 `src/sys/ioq.c:572-575`). Windows waits for a dying
+thread's cancelled IRPs and gives up only after 5 minutes (Microsoft Learn,
+[Canceling IRPs](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/canceling-irps): "If a canceled IRP is
+not completed within 5 minutes, the I/O manager considers the IRP timed out"). The volume's control handle closes only
+after every thread has exited. On both runners of both runs:
+- every killed role that was probing outlived the fixture's 10 s wait. Kills at 00:08:15.28 and 00:24:42.21 UTC each
+  panicked "the fixture must reap its child" at exactly +10.0 s, where the same taken-read test passed in run 42130583401;
+- the CLI mount suites then sat 75-90 minutes with no output until the cancel at 01:40 UTC;
+- no killed daemon was seen to exit, so the 5-minute bound itself is not observed here.
+So A-219's runtime (`e070f31e`, and `5b5f7ba1` over the combined call) stays off main.
+
+### The load test's quiet arm: 1,000 and 3,000 clients on one node (2026-11-06, agents/loadtest-scale)
+
+`rung.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60`, against a single-node `slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple
+silicon), release binaries of agents/loadtest-scale-1 at 6f7c5306, load 5.0 to 9.1, one run each. Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files. Milliseconds:
+
+| Clients | Connections | Kind | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|---|
+| 1,000 | 32 | CreateWork | 34.7 | 66.2 | 66.3 | 66.3 |
+| 1,000 | 32 | Edit | 62.3 | 160.8 | 201.5 | 242.0 |
+| 1,000 | 32 | SubmitAccepted | 66.0 | 204.8 | 229.4 | 242.0 |
+| 1,000 | 32 | SubmitConflict | 72.7 | 226.5 | 233.1 | 242.0 |
+| 1,000 | 32 | Rebase | 67.4 | 157.6 | 196.2 | 196.7 |
+| 3,000 | 94 | CreateWork | 400.0 | 423.2 | 424.2 | 424.5 |
+| 3,000 | 94 | Edit | 197.4 | 447.2 | 543.5 | 544.8 |
+| 3,000 | 94 | SubmitAccepted | 203.0 | 478.2 | 543.3 | 543.8 |
+| 3,000 | 94 | SubmitConflict | 205.7 | 428.5 | 543.3 | 544.6 |
+| 3,000 | 94 | Rebase | 210.3 | 478.5 | 543.9 | 544.8 |
+
+- **Correctness:** the oracle and every own file had 0 failures in both runs.
+- **Resolution:** the longest gap between two drains of a ring was 0.70 ms (1,000) and 3.12 ms (3,000).
+- **Throughput:** 95,867 operations in 10.7 s at 1,000 clients, about 8,960 a second, about 112 µs an operation. Every
+  operation of a green's works is served by the green's shard, since `CreateWork` places each work on the green's
+  partition. The harness keeps one request in flight per client, so a latency is about clients × service time
+  (Little's law): 1,000 × 112 µs ≈ 112 ms, and 3,000 triples it.
+- **Daemon peak RSS:** 14.3 GB (1,000) and 14.9 GB (3,000).
+- **The 3,000 rung's refusals:** 2,405 submits were refused `BudgetExceeded`, at the green's retention cap. A version
+  keeps the whole previous bytes of every file it overwrote, and the history folds only down to the oldest base a
+  live work holds. 3,766 versions were accepted.
+
+## Step 7's verdict: the receiver's regression fixed where it was not crash safety, and crash safety's price kept (audit step 7; R4; 2026-11-06 and 07)
+
+**The decision.** The WinFsp receiver (A-198) is slower than the DLL dispatcher it replaced (`71cf09ac`) on CI's arm64
+runner. The audit found and removed each cost on its request path that crash safety does not need. What remains is
+crash safety's own price: the receive journal, the open ledger, A-198's barriers and direct output, with a kernel share
+user-mode timing places no further. It is kept. R4 puts correctness first, and the DLL dispatcher's speed comes with
+A-198's crash defect, losing requests the driver delivered, so it is not restored (the supervisor's decision of
+2026-11-07; Ada is told the measured price and may overrule).
+
+**Fixed, each with its failing test first:**
+- A replayed Close whose open the dead daemon had ended was refused after a takeover (main `94c80351`;
+  `docs/bugs/2026-11-06-a-replayed-close-was-refused-after-takeover.md`).
+- A rename's durable name update spent a shard turn only to learn none was left: 2.27 turns a rename at 4.7 µs each on
+  arm64 (main `c1e9e83f`, `a_rename_with_one_open_name_takes_one_shard_turn`).
+- Each received batch made two system allocations, its requests and their hints (main `430efcee`,
+  `tests/batch_allocations.rs`: 100 batches, 200 calls before, 0 after).
+
+**Kept, and why:**
+- CanDelete's shard check: the baseline skips it and answers wrongly (below).
+- The journal, the ledger, A-198's barriers and direct output: crash safety (below, with the numbers).
+
+### The per-phase profile (arm64 and x86_64, quiet)
+
+**What it is.** Both arms carried one profiler (`crates/bridge-winfsp/src/phases.rs`, diagnostics branches only, never
+main): relaxed-atomic histograms per IRP kind and per shard operation, printed at the mount's end, timing each phase of a
+request's service. The receiver's phases: the delivery stamp, the journal's capture, the decode, the DLL operation, its
+callback, the response's save, the hand-off, the open's confirmation, a response sent alone, and its whole service
+between calls. The shard's phases: the round trip, the hop in, the serve, and the reply's way back. Then every interface
+callback, and the gap since the thread's last one. The send itself cannot be timed: it rides the call that waits for the
+next request, in both arms. mount_bench's quiet pass, five runs a runner. Runs: 42178889880 (`diag-winfsp-overlap-36`,
+both arms' phases, product and equal shard counts), 42185624364 (`-37`, the interface callbacks), 42188421107 (`-38`,
+the gaps between callbacks), 42190796283 (`-39`, the transaction's wait forms).
+
+**The shard side, arm64 (run 42178889880; median over runs of each run's p50, and of each run's mean, µs).** The round
+trip less the hop, the serve and the reply's way back is the publication barrier and the shard's scheduling.
+
+Shard side, per operation: median over runs of each run's p50 / mean, µs (dll → comb2).
+
+| op | n dll | n comb2 | round dll | round comb2 | hop_in dll | hop_in comb2 | serve dll | serve comb2 | to_answer dll | to_answer comb2 | mean round dll | mean round comb2 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| CanDelete | 0 | 11001 | nan | 2.5 | nan | 1.1 | nan | 0.4 | nan | 0.9 | nan | 5.5 |
+| Cleanup | 22001 | 22001 | 32.0 | 28.0 | 11.8 | 15.9 | 3.0 | 3.3 | 13.4 | 11.6 | 115.3 | 62.9 |
+| Confirm | 0 | 0 | nan | nan | nan | 1.8 | nan | 0.2 | nan | nan | nan | nan |
+| Create | 11001 | 11001 | 31.5 | 36.0 | 2.2 | 2.0 | 9.9 | 12.5 | 13.9 | 14.9 | 33.0 | 37.6 |
+| Flush | 11000 | 11000 | 16.1 | 8.1 | 2.2 | 2.3 | 0.3 | 0.6 | 9.2 | 1.2 | 17.9 | 10.7 |
+| Info | 22001 | 11001 | 3.9 | 3.5 | 2.0 | 2.0 | 0.4 | 0.4 | 1.1 | 0.9 | 4.8 | 7.1 |
+| Open | 55005 | 55004 | 8.3 | 7.2 | 1.9 | 1.8 | 2.0 | 3.0 | 4.1 | 1.0 | 9.8 | 15.6 |
+| Read | 10357 | 9672 | 38.0 | 47.0 | 13.3 | 18.4 | 4.5 | 4.8 | 21.5 | 21.4 | 39.9 | 72.6 |
+| Release | 65946 | 66005 | 5.2 | 8.7 | 2.5 | 3.2 | 0.9 | 1.4 | 1.1 | 1.2 | 22.9 | 39.2 |
+| Rename | 11000 | 11000 | 35.0 | 28.5 | 1.6 | 1.3 | 11.4 | 10.7 | 15.2 | 11.6 | 36.2 | 29.5 |
+| RenameName | 0 | 24942 | nan | 4.7 | nan | 1.5 | nan | 2.4 | nan | 0.9 | nan | 5.5 |
+| Resolve | 88014 | 88013 | 5.9 | 5.8 | 2.4 | 2.4 | 1.6 | 1.8 | 1.1 | 1.1 | 16.4 | 22.9 |
+| SetSize | 11000 | 11000 | 32.0 | 26.0 | 11.1 | 8.3 | 1.8 | 2.0 | 14.0 | 10.3 | 43.9 | 32.3 |
+| VolumeInfo | 11004 | 11003 | 4.5 | 4.3 | 1.8 | 1.9 | 1.3 | 1.4 | 1.1 | 0.9 | 5.0 | 5.1 |
+| Write | 11000 | 11000 | 21.5 | 21.5 | 3.8 | 3.8 | 5.2 | 7.1 | 11.6 | 8.8 | 24.0 | 22.4 |
+
+Receiver side (comb2), per IRP kind: median over runs of p50 / mean, µs.
+
+| kind | n | decode | operation | callback | record | hand_off | confirm_post | confirm_finish | send_alone | service | service − callback (means) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| irp1 | 66013 | 0.2 / 0.2 | 24.5 / 57.0 | 24.5 / 56.3 | 0.4 / 0.3 | 0.4 / 0.3 | 0.7 / 0.8 | 1.1 / 3.9 | 23.0 / 22.8 | 29.5 / 61.1 | 4.7 |
+| irp3 | 66005 | 0.2 / 0.2 | 1.1 / 22.5 | 0.4 / 21.6 | 0.3 / 0.3 | 0.4 / 0.3 | - | - | 15.8 / 49.4 | 4.8 / 26.0 | 4.4 |
+| irp4 | 66005 | 0.2 / 0.1 | 9.7 / 40.2 | 9.2 / 39.7 | 0.3 / 0.3 | 0.4 / 0.3 | - | - | 2.3 / 2.4 | 12.4 / 42.7 | 3.1 |
+| irp5 | 9672 | 0.3 / 0.2 | 50.5 / 75.8 | 49.5 / 74.7 | 0.8 / 0.8 | 0.6 / 0.5 | - | - | 10.0 / 11.0 | 56.5 / 98.4 | 23.7 |
+| irp6 | 11000 | 0.2 / 0.1 | 24.0 / 25.0 | 23.5 / 24.1 | 0.4 / 0.3 | 0.4 / 0.3 | - | - | 11.4 / 11.3 | 26.5 / 28.3 | 4.1 |
+| irp8 | 33001 | 0.2 / 0.2 | 25.5 / 29.4 | 25.5 / 28.7 | 0.4 / 0.3 | 0.3 / 0.3 | - | - | 11.7 / 11.8 | 34.0 / 39.9 | 11.1 |
+| irp11 | 11000 | 0.2 / 0.1 | 9.2 / 12.0 | 8.7 / 11.4 | 0.3 / 0.3 | 0.3 / 0.2 | - | - | - | 11.3 / 14.4 | 2.9 |
+| irp12 | 11003 | 0.2 / 0.1 | 5.0 / 5.8 | 4.8 / 5.5 | 0.3 / 0.2 | 0.3 / 0.2 | - | - | 13.1 / 12.9 | 7.7 / 8.6 | 3.1 |
+| irp31 | 2806 | - | - | - | - | - | - | - | - | 1.0 / 1.5 | nan |
+
+**Our interface callbacks and the gaps between them, arm64 (run 42188421107, p50 µs, every run).** `between` is the time
+from the thread's last callback's return to this one's entry: inside a Create, the DLL's own access check between the
+security lookup and the open; between requests, the transaction call, the kernel and the client.
+
+| callback | phase | dll p50, every run | comb2 p50, every run |
+|---|---|---|---|
+| get_security_by_name | interface | 7.4 7.7 8.0 8.0 8.1 | 6.9 |
+| get_security_by_name | between | 46.0 47.0 49.0 49.0 53.0 | 89.0 |
+| open | interface | 8.8 9.3 9.6 9.7 11.2 | 7.6 |
+| open | between | 0.5 0.5 0.5 0.5 0.5 | 0.6 |
+| create | interface | 31.0 33.0 33.0 33.0 34.0 | 21.0 |
+| create | between | 11.9 12.1 14.0 14.3 14.7 | 13.2 |
+| cleanup | interface | 0.4 0.4 0.4 0.4 0.4 | 0.3 |
+| cleanup | between | 66.0 68.0 70.0 73.0 76.0 | 80.0 |
+| close | interface | 5.9 5.9 6.0 6.2 6.7 | 7.9 |
+| close | between | 25.0 25.0 26.0 26.0 28.0 | 34.0 |
+| can_delete | interface | 0.3 0.3 0.3 0.3 0.3 | 2.6 |
+| can_delete | between | 0.2 0.2 0.2 0.2 0.2 | 0.2 |
+| rename | interface | 34.0 35.0 35.0 35.0 36.0 | 17.9 |
+| rename | between | 0.4 0.4 0.4 0.4 0.4 | 0.4 |
+| get_file_info | interface | 4.5 4.7 4.8 4.8 5.0 | 4.1 |
+| get_file_info | between | 63.0 66.0 67.0 67.0 67.0 | 82.0 |
+
+**The transaction's wait forms (run 42190796283).** WinFsp's own `FspFsctlTransact` passes no OVERLAPPED; the receiver
+waits on its event and its purge intents' event. The call never goes pending (WinFsp waits inside it), so neither wait
+runs, and the forms cost the same.
+
+**windows-11-arm** (run 42190796283), each cell every run in order, µs.
+
+| mode | call p50 | call p99 | client open p50 |
+|---|---|---|---|
+| single-buffered-16320 | 22.1, 22.0, 22.1, 21.9, 21.6 | 39.9, 39.6, 38.9, 40.3, 40.7 | 21.1, 21.0, 21.1, 20.9, 20.6 |
+| batch-direct-64k-private | 22.5, 22.5, 22.6, 22.5, 22.4 | 40.7, 40.6, 38.6, 41.5, 38.8 | 21.6, 21.5, 21.7, 21.5, 21.4 |
+| batch-direct-64k-section | 22.6, 22.5, 22.6, 22.5, 22.3 | 39.7, 40.7, 39.2, 39.9, 39.6 | 21.7, 21.6, 21.6, 21.6, 21.4 |
+| batch-direct-128k-section | 23.7, 23.7, 23.7, 23.7, 23.4 | 43.2, 44.9, 38.9, 45.8, 41.8 | 22.8, 22.8, 22.7, 22.7, 22.5 |
+| batch-direct-256k-section | 25.6, 25.6, 25.6, 25.5, 25.3 | 42.8, 53.3, 43.0, 44.6, 43.7 | 24.7, 24.6, 24.6, 24.6, 24.4 |
+| single-buffered-16320-handle-wait | 21.9, 22.1, 21.9, 21.7, 21.5 | 42.5, 40.3, 38.2, 38.2, 37.0 | 20.9, 21.1, 20.9, 20.8, 20.5 |
+| batch-direct-64k-section-handle-wait | 22.4, 22.4, 22.6, 22.5, 22.4 | 41.3, 40.1, 40.4, 38.8, 39.8 | 21.5, 21.4, 21.6, 21.5, 21.4 |
+| batch-direct-64k-section-two-event-wait | 22.5, 22.5, 22.6, 22.4, 22.3 | 39.2, 38.8, 39.6, 41.6, 37.7 | 21.5, 21.5, 21.7, 21.4, 21.3 |
+
+**windows-latest** (run 42190796283), each cell every run in order, µs.
+
+| mode | call p50 | call p99 | client open p50 |
+|---|---|---|---|
+| single-buffered-16320 | 29.8, 29.9, 29.6, 29.7, 29.8 | 54.8, 54.9, 51.5, 53.0, 53.6 | 29.5, 29.4, 29.1, 29.2, 29.4 |
+| batch-direct-64k-private | 29.3, 29.6, 29.4, 29.4, 29.6 | 51.0, 54.4, 80.2, 53.3, 53.8 | 28.9, 29.1, 28.9, 28.9, 29.1 |
+| batch-direct-64k-section | 29.6, 29.6, 29.3, 29.4, 29.5 | 53.0, 57.3, 56.6, 50.7, 52.6 | 29.2, 29.0, 28.9, 28.9, 29.0 |
+| batch-direct-128k-section | 30.2, 30.4, 30.2, 30.2, 30.2 | 53.9, 58.4, 55.6, 52.9, 52.7 | 29.8, 29.8, 29.7, 29.6, 29.7 |
+| batch-direct-256k-section | 31.6, 31.3, 31.3, 31.3, 31.4 | 181.2, 53.2, 54.7, 53.0, 56.0 | 31.2, 30.8, 30.8, 30.8, 30.9 |
+| single-buffered-16320-handle-wait | 29.6, 29.7, 29.6, 29.6, 29.6 | 51.4, 53.4, 52.0, 55.3, 52.4 | 29.2, 29.2, 29.1, 29.0, 29.2 |
+| batch-direct-64k-section-handle-wait | 29.3, 29.5, 29.3, 29.4, 29.4 | 51.1, 53.5, 50.9, 51.4, 53.2 | 28.9, 28.9, 28.8, 28.9, 28.9 |
+| batch-direct-64k-section-two-event-wait | 29.2, 29.6, 29.4, 29.4, 29.6 | 52.8, 55.7, 52.0, 50.7, 54.2 | 28.8, 29.0, 28.9, 28.9, 29.1 |
+
+**What the profile showed.**
+- Our interface callbacks are level with the DLL arm's or faster, but for a Close (the barrier and the ledger's write)
+  and a CanDelete (its shard trip).
+- The DLL's op function costs the same in both arms (the access check 0.5 µs in `dll`, 0.6 in `comb2`).
+- The receiver's own work is 3 to 4.5 µs a request (stamp 0.2, capture 1.2, decode 0.2, the copy into the working packet
+  0.5, the save 0.35, the hand-off 0.35; a Create's confirmation 0.7 and 1.1).
+- Between a Cleanup and its Close, which the kernel issues itself, `dll` took 25 to 28 µs and `comb2` 34, of which the
+  receiver's work is about 3.5: the rest, 3 to 5 µs a request, is inside the transaction call, not in its wait form.
+- On x86_64 at three shards each, `comb1`'s hop to the shard was 21 to 25 µs at the p50 for a Release, an Info, a
+  VolumeInfo and a SetSize against `dll`'s 2 to 3 (a parked shard woken); at its product count of one shard, it was not.
+- On x86_64 the builds' shard counts differ: `dll` (profile format 3) counts 4 logical CPUs less control, 3; main counts
+  2 physical cores of 2 threads less control, 1, as A-208 intends (the core facts: CPUs 0 and 1 are core 0, 2 and 3 core
+  2). Not a defect.
+- The reply's way back is bimodal (spun or parked): `comb2` spins on most replies (the reply spin, A-212), `dll` parks on
+  most, so a per-operation p50 mixes the two; the spin window's own measurement defect is in GAPS.
+
+### Step 7's verdict: the receiver after the profile's two fixes (audit step 7; 2026-11-07)
+
+**The question.** Is the WinFsp receiver within the DLL dispatcher's (`71cf09ac`) spread at the p50 and the p99 of every
+operation, quiet and loaded, on both of CI's Windows runners? It was measured after the per-phase profile (diagnostics runs
+42178889880 to 42190796283, below in this file's step 7 sections) had found and removed the two costs on the request path
+that crash safety does not need:
+- a rename's durable name update spent a shard turn only to learn none was left (`ea71f839`, red at 2 turns, green at 1,
+  run 42319726082's rename jobs on both runners);
+- each received batch was parsed into two fresh vectors (`792977e9`, `tests/batch_allocations.rs`: 100 batches, 200
+  allocations before, 0 after).
+
+**The command.** Each arm is its own anchor, daemon, volume and drive; one `mount_bench` rounds over all four, its first arm
+rotating, quiet and then loaded (two spinners a logical CPU), five runs a runner:
+
+```
+ARMS="dll=dll/slates.exe sep1=sep1/slates.exe comb1=comb1/slates.exe comb2=comb2/slates.exe" \
+  BENCH=mount_bench.exe RUNS=5 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh
+```
+
+**The arms.** `dll`: the DLL dispatcher, `71cf09ac`. `sep1`: main's one-worker form, main `d61c3be2` (A-228's liveness
+watchdog in). `comb1` and `comb2`: A-215's combined form with A-219's workers, the count fixed at one and two at build time
+(`SLATES_DIAG_RECEIVE_WORKERS`, diagnostics only), with no probe running: `ea71f839` in diagnostics run 42319726082
+(`diag-winfsp-overlap-40`, the rename fix) and `792977e9` in run 42331462575 (`diag-winfsp-overlap-41`, both fixes).
+
+**Hardware and date.** `windows-11-arm`: image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 Family 8 Model D49;
+Windows 10.0.26200.9725; WinFsp 2.1.25156. `windows-latest`: image win25-vs2026 20261103.298.1; 4 CPUs; AMD64 Family 26
+Model 2 Stepping 1, AuthenticAMD; Windows 10.0.26100.33674; WinFsp 2.1.25156. Both 4 logical CPUs and 15 GiB, shared VMs.
+Run 42319726082: 2026-11-07 00:57 to 02:52 UTC; run 42331462575: 03:09 to 05:07 UTC. Workload: 10 rounds of 1,000 files of
+4,096 B per arm and pass. Shards as each build derives them: 3 for every arm on arm64; on x86_64, 3 for `dll` and 1 for the
+others (2 physical cores of 2 threads each, A-208's rule; `dll` predates A-208 and counts 4 logical CPUs).
+
+**Failures.** Run 42331462575: none, and no heartbeat lapse. Run 42319726082: x86_64 run 3 failed, the anchor killing
+`comb2`'s daemon although A-228 is in it ("the daemon's heartbeat lapsed (1102 ms old, past 1073 ms ...)"); the bench
+stopped there, so that run's loaded phase is missing for every arm and its quiet phase is shown.
+
+**The verdict.** Cells worse than `dll` beyond its spread (an arm's median run slower than `dll`'s slowest), of 18 (nine
+operations, p50 and p99):
+
+| run | runner | arm | quiet | loaded |
+|---|---|---|---|---|
+| 42319726082 | windows-11-arm | comb2 | 8 | 7 |
+| 42319726082 | windows-11-arm | comb1 | 9 | 8 |
+| 42319726082 | windows-11-arm | sep1 | 12 | 8 |
+| 42319726082 | windows-latest | comb2 | 3 | 10 |
+| 42319726082 | windows-latest | comb1 | 3 | 5 |
+| 42319726082 | windows-latest | sep1 | 1 | 2 |
+| 42331462575 | windows-11-arm | comb2 | 11 | 8 |
+| 42331462575 | windows-11-arm | comb1 | 9 | 6 |
+| 42331462575 | windows-11-arm | sep1 | 13 | 6 |
+| 42331462575 | windows-latest | comb2 | 3 | 8 |
+| 42331462575 | windows-latest | comb1 | 4 | 4 |
+| 42331462575 | windows-latest | sep1 | 4 | 2 |
+
+No form is within `dll`'s spread on both runners, before or after the allocation fix.
+
+**The gaps within each run.** Each run's arms share a VM, so `comb2 − dll` within a run is the receiver's cost on that
+machine. Quiet and loaded p50s, µs, every run sorted:
+
+#### windows-11-arm, quiet
+
+| op | diag-40 | diag-41 |
+|---|---|---|
+| create | -9.9 -2.7 -0.6 +4.1 +9.4 (median -0.6) | -8.1 -4.4 -3.8 +4.3 +8.7 (median -3.8) |
+| write | -0.3 +1.7 +5.4 +8.2 +11.4 (median +5.4) | +0.5 +2.7 +4.1 +4.5 +7.2 (median +4.1) |
+| fsync | -19.0 -15.6 -13.7 -12.0 -11.2 (median -13.7) | -20.2 -17.9 -17.4 -15.9 -12.8 (median -17.4) |
+| close | -2501.3 -2340.9 -2335.5 -115.7 -65.6 (median -2335.5) | +7.0 +7.3 +27.3 +31.8 +34.7 (median +27.3) |
+| stat | +21.3 +21.9 +22.2 +22.4 +23.6 (median +22.2) | +15.9 +17.1 +17.7 +18.0 +18.7 (median +17.7) |
+| open | -2294.6 -246.1 -72.5 -61.5 +25.7 (median -72.5) | +15.5 +19.8 +29.9 +45.5 +635.4 (median +29.9) |
+| read | -3.3 -1.4 -0.5 +2.1 +2.2 (median -0.5) | -1.2 -1.0 +0.0 +0.2 +6.5 (median +0.0) |
+| rename | +29.1 +31.1 +38.4 +40.1 +44.3 (median +38.4) | +23.9 +27.4 +35.8 +36.8 +197.5 (median +35.8) |
+| unlink | +23.9 +25.1 +25.3 +25.4 +34.8 (median +25.3) | +29.5 +34.3 +35.4 +35.7 +67.4 (median +35.4) |
+
+#### windows-11-arm, contended
+
+| op | diag-40 | diag-41 |
+|---|---|---|
+| create | -6.5 -0.9 +1.8 +7.5 +8.3 (median +1.8) | -8.0 -1.8 -1.3 +1.0 +2.5 (median -1.3) |
+| write | +87.9 +88.7 +89.5 +94.6 +96.7 (median +89.5) | +70.5 +84.3 +84.5 +85.2 +87.1 (median +84.5) |
+| fsync | -10.7 -9.0 -6.9 -2.0 -0.3 (median -6.9) | -8.1 -6.5 -6.0 -4.8 -3.4 (median -6.0) |
+| close | -977.4 -496.2 -314.6 -160.7 -2.4 (median -314.6) | -351.1 -340.6 -250.3 -200.7 -127.8 (median -250.3) |
+| stat | +44.5 +45.5 +74.1 +97.7 +106.5 (median +74.1) | +45.9 +66.8 +91.3 +104.7 +298.2 (median +91.3) |
+| open | -180.2 +15.4 +196.9 +243.3 +286.9 (median +196.9) | -63.1 +44.9 +45.7 +57.9 +80.2 (median +45.7) |
+| read | -2.6 -1.0 +0.1 +1.8 +1.8 (median +0.1) | -1.1 -0.9 -0.1 +0.1 +0.8 (median -0.1) |
+| rename | +79.6 +80.5 +87.0 +99.0 +104.4 (median +87.0) | +55.4 +81.5 +85.4 +92.4 +98.5 (median +85.4) |
+| unlink | +45.0 +47.1 +48.1 +71.7 +84.6 (median +48.1) | +46.9 +49.6 +99.7 +132.1 +283.1 (median +99.7) |
+
+#### windows-latest, quiet
+
+| op | diag-40 | diag-41 |
+|---|---|---|
+| create | +2.0 +7.7 +18.0 +31.5 +40.6 (median +18.0) | -13.3 -9.3 +13.0 +16.0 +24.6 (median +13.0) |
+| write | -10.3 +1.8 +14.0 +14.8 +27.7 (median +14.0) | -14.7 -14.1 +2.4 +16.4 +19.7 (median +2.4) |
+| fsync | -9.4 +3.8 +4.5 +5.9 +8.4 (median +4.5) | -24.8 -13.5 +3.8 +4.2 +4.5 (median +3.8) |
+| close | +2.4 +2.6 +2.6 +3.1 +4.5 (median +2.6) | -4.3 +1.7 +2.3 +2.4 +2.4 (median +2.3) |
+| stat | +1.0 +15.1 +20.5 +25.2 +52.1 (median +20.5) | -17.6 -10.1 +17.1 +18.5 +25.4 (median +17.1) |
+| open | +3.6 +7.5 +10.6 +11.6 +13.5 (median +10.6) | -5.4 +5.4 +9.3 +10.4 +11.5 (median +9.3) |
+| read | -0.1 +0.0 +0.0 +0.0 +0.1 (median +0.0) | -0.1 -0.1 +0.0 +0.0 +0.3 (median +0.0) |
+| rename | -1.4 +15.0 +26.8 +37.7 +43.8 (median +26.8) | -46.7 -27.9 +26.7 +42.0 +57.1 (median +26.7) |
+| unlink | +16.9 +27.9 +33.8 +34.1 +74.7 (median +33.8) | -17.1 +1.4 +14.4 +30.7 +39.8 (median +14.4) |
+
+#### windows-latest, contended
+
+| op | diag-40 | diag-41 |
+|---|---|---|
+| create | +109.1 +129.9 +149.6 +380.5 (median +149.6) | +128.8 +133.9 +142.7 +156.2 +159.5 (median +142.7) |
+| write | -7.1 -7.0 -6.1 -3.7 (median -6.1) | -7.8 -7.2 -6.9 -6.8 -6.6 (median -6.9) |
+| fsync | -16.0 -12.1 -11.0 -8.4 (median -11.0) | -18.1 -17.6 -17.0 -16.2 -13.9 (median -17.0) |
+| close | +3.1 +3.1 +3.4 +4.9 (median +3.4) | +2.8 +2.8 +2.8 +2.9 +3.0 (median +2.8) |
+| stat | +1.7 +2.1 +10.2 +27.1 (median +10.2) | -9.2 +0.9 +17.5 +21.7 +28.1 (median +17.5) |
+| open | +14.0 +22.1 +23.3 +24.7 (median +23.3) | +9.2 +11.2 +16.2 +20.3 +21.9 (median +16.2) |
+| read | -6.1 -5.3 -4.9 -4.3 (median -4.9) | -7.6 -7.3 -7.3 -6.9 -6.8 (median -7.3) |
+| rename | +0.4 +2.0 +3.8 +5.0 (median +3.8) | -28.2 -16.2 -7.6 -2.0 +8.5 (median -7.6) |
+| unlink | +25.9 +29.1 +29.1 +36.5 (median +29.1) | -5.3 +22.0 +23.1 +27.8 +32.7 (median +23.1) |
+
+On arm64, quiet, the allocation fix moved a stat from +22.2 to +17.7 µs and a rename from +38.4 to +35.8. An unlink went
+from +25.3 to +35.4, which the fix cannot add (it removes allocations and nothing else changed). The two runs had different
+VMs (run 42319726082's `dll` had 3.5 ms close outliers this one does not), so a comparison across the runs cannot separate
+the fix from the machine.
+
+**Every run, all four arms (each cell: the best, then every run sorted, µs; the verdict is `comb2` against `dll`).**
+
+
+#### Run 42319726082, windows-11-arm
+
+**windows-11-arm, run 42319726082**: 5 runs done, 0 failed; arms dll, sep1, comb1, comb2.
+
+windows-11-arm, run 42319726082, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **181.9** (181.9 185.8 185.9 189.1 191.5) | **194.9** (194.9 195.0 199.7 203.6 215.2) | **169.2** (169.2 172.2 178.2 191.7 192.4) | **179.2** (179.2 179.2 189.9 190.9 195.3) | within |
+| create | p99 | **282.2** (282.2 282.3 423.4 429.7 443.2) | **284.3** (284.3 295.4 301.5 306.7 312.1) | **291.5** (291.5 300.3 322.7 327.0 399.7) | **277.6** (277.6 288.7 291.7 292.8 303.2) | within |
+| create | p999 | **660.5** (660.5 930.1 951.4 1116.6 1660.8) | **903.5** (903.5 943.3 965.5 978.0 2233.1) | **646.6** (646.6 751.0 909.2 976.3 16159.9) | **601.8** (601.8 880.3 1025.1 1054.0 1264.6) |  |
+| create | max | **3321.7** (3321.7 3893.3 6391.4 7651.0 16386.5) | **3839.6** (3839.6 3910.0 3991.5 17905.0 18175.7) | **2839.8** (2839.8 5817.7 7383.5 17897.0 17946.7) | **4033.9** (4033.9 17899.5 17922.2 17922.6 28880.7) |  |
+| stat | p50 | **110.8** (110.8 114.5 114.6 115.6 116.3) | **143.2** (143.2 144.4 145.9 147.0 147.5) | **144.3** (144.3 146.6 147.3 147.9 149.8) | **133.2** (133.2 136.4 136.8 137.6 139.2) | **worse**: 136.8 > 116.3 |
+| stat | p99 | **185.4** (185.4 187.3 188.2 190.1 200.1) | **214.8** (214.8 224.5 225.0 226.4 227.3) | **205.7** (205.7 211.8 217.0 218.4 229.4) | **221.2** (221.2 225.0 228.8 229.8 237.4) | **worse**: 228.8 > 200.1 |
+| stat | p999 | **243.5** (243.5 244.4 285.3 310.3 476.2) | **556.0** (556.0 571.5 595.0 596.4 612.0) | **532.9** (532.9 559.5 596.7 604.6 652.6) | **564.2** (564.2 565.0 587.4 613.3 1112.7) |  |
+| stat | max | **449.7** (449.7 1241.9 13194.1 13339.7 17914.4) | **10592.4** (10592.4 11838.2 12460.2 12698.6 12950.6) | **603.4** (603.4 3319.7 3432.1 12660.7 12906.1) | **4899.5** (4899.5 5296.3 8325.3 9554.8 10323.0) |  |
+| read | p50 | **33.0** (33.0 36.5 38.4 45.1 45.3) | **39.1** (39.1 40.0 43.5 44.1 44.7) | **35.9** (35.9 39.6 41.8 43.3 46.4) | **35.1** (35.1 36.0 40.6 41.8 43.9) | within |
+| read | p99 | **62.6** (62.6 68.3 69.2 70.1 70.4) | **60.1** (60.1 64.7 65.6 65.7 74.5) | **63.5** (63.5 65.6 66.2 70.7 76.4) | **60.6** (60.6 63.0 64.5 65.8 71.8) | within |
+| read | p999 | **102.4** (102.4 122.0 124.1 141.0 145.4) | **101.8** (101.8 118.3 137.4 142.3 150.4) | **115.0** (115.0 131.4 141.3 148.1 149.5) | **97.6** (97.6 112.0 126.0 127.6 141.8) |  |
+| read | max | **169.0** (169.0 178.2 178.3 181.0 213.2) | **183.1** (183.1 186.1 193.1 230.3 5205.1) | **177.7** (177.7 918.3 959.2 964.6 1390.2) | **178.3** (178.3 250.4 376.5 543.2 1241.9) |  |
+| write | p50 | **88.7** (88.7 89.3 90.8 92.1 92.4) | **99.1** (99.1 99.9 100.0 100.6 100.8) | **83.7** (83.7 91.9 95.1 95.8 100.2) | **90.5** (90.5 91.0 97.8 100.1 100.3) | **worse**: 97.8 > 92.4 |
+| write | p99 | **212.1** (212.1 214.9 216.8 218.1 218.8) | **214.6** (214.6 220.7 228.9 232.0 233.8) | **226.4** (226.4 227.6 329.7 354.4 411.7) | **222.2** (222.2 223.6 224.2 227.4 228.0) | **worse**: 224.2 > 218.8 |
+| write | p999 | **431.8** (431.8 464.6 481.9 486.4 1010.2) | **456.4** (456.4 459.3 468.9 488.5 542.0) | **503.1** (503.1 567.0 574.4 579.6 630.1) | **473.0** (473.0 494.7 509.9 571.4 1105.4) |  |
+| write | max | **3534.7** (3534.7 17301.2 17318.4 17832.1 17854.8) | **1439.7** (1439.7 2254.0 3071.7 3322.4 3520.1) | **9577.7** (9577.7 16978.7 17497.2 17560.9 17669.6) | **17377.2** (17377.2 17654.9 17659.2 17912.0 131783.7) |  |
+| rename | p50 | **372.5** (372.5 378.3 380.3 382.5 383.9) | **447.4** (447.4 448.2 456.0 456.6 462.8) | **385.8** (385.8 392.2 392.6 408.2 415.0) | **410.9** (410.9 411.4 411.6 418.4 428.2) | **worse**: 411.6 > 383.9 |
+| rename | p99 | **724.8** (724.8 727.1 737.2 745.7 801.7) | **853.9** (853.9 856.2 929.2 942.6 1163.2) | **812.9** (812.9 815.5 1035.3 1094.2 1337.5) | **787.5** (787.5 790.6 849.6 871.4 884.0) | **worse**: 849.6 > 801.7 |
+| rename | p999 | **1617.7** (1617.7 2047.8 3624.4 3909.0 4508.2) | **2416.3** (2416.3 3625.3 3628.6 3769.0 3780.4) | **4076.5** (4076.5 4163.1 4279.2 6399.0 16667.0) | **2541.5** (2541.5 3843.5 4076.1 4244.4 20858.6) |  |
+| rename | max | **6836.1** (6836.1 36377.5 40437.7 49779.0 51511.5) | **43432.2** (43432.2 62583.1 62697.1 67129.8 83901.3) | **45419.3** (45419.3 62517.4 83571.5 104100.1 109418.2) | **42412.9** (42412.9 62693.3 62832.6 63123.0 81556.6) |  |
+| unlink | p50 | **232.3** (232.3 238.0 239.1 240.4 241.0) | **272.9** (272.9 274.1 278.6 280.5 283.4) | **244.6** (244.6 244.9 246.1 258.7 261.0) | **263.4** (263.4 264.4 264.9 265.5 267.1) | **worse**: 264.9 > 241.0 |
+| unlink | p99 | **410.5** (410.5 426.3 437.2 441.1 465.7) | **460.9** (460.9 494.1 497.7 521.6 549.1) | **500.4** (500.4 505.7 548.9 593.6 609.1) | **500.2** (500.2 501.4 580.9 588.1 594.9) | **worse**: 580.9 > 465.7 |
+| unlink | p999 | **730.3** (730.3 754.0 805.4 873.5 1059.7) | **862.1** (862.1 1070.5 1336.1 1454.6 2144.6) | **797.3** (797.3 1019.2 1596.7 1728.1 1957.6) | **1328.8** (1328.8 3449.5 3920.8 4716.8 5256.0) |  |
+| unlink | max | **1891.2** (1891.2 13281.6 16658.7 16931.6 44400.9) | **15376.3** (15376.3 42083.3 68526.3 124958.8 125326.7) | **22528.3** (22528.3 42156.3 125242.1 187002.9 187543.2) | **15144.7** (15144.7 63213.0 83729.2 146062.5 165215.7) |  |
+| fsync | p50 | **105.9** (105.9 106.9 107.9 108.3 108.7) | **106.9** (106.9 109.8 110.3 112.0 112.8) | **85.8** (85.8 88.2 91.4 94.0 99.8) | **89.3** (89.3 93.1 94.2 94.7 94.9) | within |
+| fsync | p99 | **154.3** (154.3 154.5 158.3 161.5 167.8) | **168.5** (168.5 170.5 172.3 172.4 172.9) | **163.2** (163.2 165.5 329.1 357.5 425.2) | **163.2** (163.2 166.0 166.1 166.4 174.8) | within |
+| fsync | p999 | **364.6** (364.6 380.1 472.0 481.3 485.7) | **359.1** (359.1 440.5 443.4 470.1 520.6) | **376.6** (376.6 468.8 471.6 495.3 498.1) | **356.5** (356.5 442.2 450.8 530.1 633.8) |  |
+| fsync | max | **16215.7** (16215.7 17431.4 17476.1 17711.7 17747.0) | **1870.4** (1870.4 1991.2 3187.2 3330.3 9296.1) | **3582.2** (3582.2 3914.5 7090.4 16880.2 17718.7) | **3361.2** (3361.2 3658.3 4912.2 17014.9 17639.3) |  |
+| open | p50 | **924.8** (924.8 937.6 1078.1 1389.3 3429.4) | **925.7** (925.7 945.2 1091.8 3576.1 3815.4) | **539.8** (539.8 895.2 1017.2 1077.1 1477.3) | **876.1** (876.1 950.5 1005.6 1134.8 1143.2) | within |
+| open | p99 | **5061.2** (5061.2 5141.8 5172.7 5209.4 5366.5) | **5005.8** (5005.8 5208.8 5289.3 5315.6 5419.7) | **5181.4** (5181.4 5223.5 5322.5 5480.5 5769.8) | **5105.3** (5105.3 5109.7 5204.8 5271.7 5326.9) | within |
+| open | p999 | **5917.7** (5917.7 5955.9 6333.2 6585.4 6821.2) | **6923.4** (6923.4 7695.0 7888.5 8304.9 9358.8) | **6942.6** (6942.6 8191.8 11162.2 14576.8 25793.9) | **5762.5** (5762.5 7447.0 7457.1 7526.9 7958.0) |  |
+| open | max | **10064.1** (10064.1 10943.0 11142.1 13429.1 143782.8) | **45941.2** (45941.2 66350.4 83420.7 103973.1 108091.4) | **65113.0** (65113.0 67097.3 68393.2 84919.7 87846.2) | **45932.0** (45932.0 66553.1 66666.2 84051.8 105202.5) |  |
+| close | p50 | **1157.4** (1157.4 1199.9 3553.1 3592.7 3657.7) | **3899.0** (3899.0 4031.0 4222.4 4317.9 4319.2) | **1077.0** (1077.0 1142.3 1178.6 1336.7 1407.2) | **1041.7** (1041.7 1134.3 1156.4 1217.6 1251.8) | within |
+| close | p99 | **7511.8** (7511.8 16764.2 16771.0 16894.0 17012.5) | **5854.4** (5854.4 5987.7 6349.1 6383.2 6682.6) | **6211.7** (6211.7 6736.5 7798.1 10424.9 12982.6) | **7062.5** (7062.5 8806.0 11440.7 16073.7 16542.2) | within |
+| close | p999 | **17600.1** (17600.1 17730.0 18250.1 18453.4 18459.3) | **8459.6** (8459.6 9910.5 10344.5 16939.5 17497.3) | **17580.3** (17580.3 17602.2 17754.1 17777.4 18275.2) | **17575.8** (17575.8 17630.7 17657.9 17681.1 17766.7) |  |
+| close | max | **19386.7** (19386.7 20596.8 21469.3 21918.8 22008.8) | **19983.3** (19983.3 20323.3 21253.2 34609.9 97280.5) | **20423.8** (20423.8 21129.8 21133.5 22128.5 25613.2) | **21459.0** (21459.0 21674.6 22138.0 22151.2 22176.3) |  |
+
+windows-11-arm, run 42319726082, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **188.2** (188.2 201.0 224.1 226.5 228.0) | **192.8** (192.8 200.1 215.6 224.7 243.3) | **194.8** (194.8 196.3 212.4 223.3 227.8) | **195.7** (195.7 209.3 220.0 223.2 229.8) | within |
+| create | p99 | **709.1** (709.1 742.9 745.8 826.8 843.8) | **763.0** (763.0 799.7 894.5 897.2 1232.6) | **704.8** (704.8 732.6 4990.1 16435.7 25953.0) | **617.0** (617.0 736.8 821.4 858.7 894.9) | within |
+| create | p999 | **21849.4** (21849.4 22470.4 24537.6 26699.8 37222.4) | **34364.7** (34364.7 37233.4 38153.4 38666.7 42637.6) | **33730.6** (33730.6 34198.6 39346.6 42349.6 48778.0) | **33975.2** (33975.2 34791.0 35966.9 36169.8 36786.3) |  |
+| create | max | **50236.2** (50236.2 52123.6 54876.0 69647.2 92452.9) | **47934.9** (47934.9 49873.4 52703.0 54890.6 81119.3) | **52357.5** (52357.5 55200.2 58455.4 72926.3 79619.6) | **50189.6** (50189.6 50665.9 61151.8 68441.5 74640.3) |  |
+| stat | p50 | **143.0** (143.0 144.0 145.2 148.1 148.8) | **150.2** (150.2 152.7 153.1 153.5 154.5) | **142.6** (142.6 144.7 145.1 152.3 152.4) | **189.5** (189.5 189.7 217.1 245.8 255.3) | **worse**: 217.1 > 148.8 |
+| stat | p99 | **16569.0** (16569.0 21713.2 27825.0 28094.6 28144.4) | **680.2** (680.2 692.0 695.4 3379.9 3604.4) | **852.0** (852.0 1108.2 3749.7 4209.7 5327.1) | **36185.9** (36185.9 36769.3 37438.0 40106.1 40144.3) | **worse**: 37438.0 > 28144.4 |
+| stat | p999 | **46209.2** (46209.2 46259.8 49442.1 50544.7 54146.7) | **39706.7** (39706.7 43773.0 46736.9 48953.5 51256.1) | **38050.6** (38050.6 40431.6 43724.9 45979.6 47986.6) | **54181.1** (54181.1 56070.3 56231.7 57601.2 65881.0) |  |
+| stat | max | **66716.5** (66716.5 74840.4 81874.0 105532.7 115242.8) | **87228.0** (87228.0 106062.6 112709.0 135215.3 154096.7) | **68404.4** (68404.4 86326.1 87241.6 88536.8 132658.5) | **84242.2** (84242.2 98115.4 102401.3 158800.4 186248.4) |  |
+| read | p50 | **42.2** (42.2 44.2 50.3 50.8 51.9) | **44.6** (44.6 47.0 50.5 50.8 54.6) | **42.8** (42.8 45.8 50.4 50.8 51.2) | **44.0** (44.0 46.0 48.2 49.3 52.0) | within |
+| read | p99 | **77.8** (77.8 83.7 84.5 87.7 90.2) | **78.3** (78.3 85.3 86.0 86.6 89.5) | **74.9** (74.9 79.7 86.2 86.5 89.8) | **81.3** (81.3 82.4 85.2 85.4 89.0) | within |
+| read | p999 | **130.1** (130.1 149.1 150.0 173.6 179.6) | **142.6** (142.6 163.6 171.1 176.2 176.9) | **152.4** (152.4 160.2 162.8 169.7 180.8) | **157.5** (157.5 158.6 171.4 172.0 181.6) |  |
+| read | max | **179.6** (179.6 209.0 212.2 299.4 938.2) | **206.6** (206.6 235.2 285.6 358.3 1055.7) | **190.6** (190.6 194.4 229.6 250.7 413.9) | **204.2** (204.2 266.0 314.2 321.5 459.9) |  |
+| write | p50 | **92.5** (92.5 93.5 97.1 97.2 99.2) | **189.7** (189.7 197.4 203.3 205.2 216.2) | **168.6** (168.6 172.8 174.5 182.9 190.4) | **181.2** (181.2 183.0 187.1 191.8 193.8) | **worse**: 187.1 > 99.2 |
+| write | p99 | **319.9** (319.9 333.2 362.7 439.7 457.4) | **533.1** (533.1 622.5 700.5 2627.7 5315.2) | **382.5** (382.5 433.0 703.3 7498.0 15988.0) | **328.5** (328.5 422.2 455.4 544.1 1120.7) | within |
+| write | p999 | **25575.4** (25575.4 31565.4 33227.2 33441.2 33899.3) | **30764.2** (30764.2 31862.3 33353.4 34247.3 34931.0) | **30276.6** (30276.6 34352.5 40637.3 41190.3 45894.7) | **28590.9** (28590.9 33836.3 33852.8 39159.8 42696.4) |  |
+| write | max | **48360.6** (48360.6 51719.7 63533.0 66366.8 81385.7) | **49368.9** (49368.9 49743.6 52444.2 79710.9 144970.2) | **50171.9** (50171.9 64261.1 72088.9 78728.8 92299.4) | **51931.9** (51931.9 56164.8 64007.9 66907.6 83465.4) |  |
+| rename | p50 | **423.1** (423.1 426.2 439.9 444.1 445.5) | **512.1** (512.1 512.3 521.8 523.9 538.8) | **471.4** (471.4 492.5 503.3 506.6 513.6) | **503.6** (503.6 513.2 519.5 544.5 548.5) | **worse**: 519.5 > 445.5 |
+| rename | p99 | **23196.6** (23196.6 25185.3 25714.5 26675.4 26809.7) | **36363.1** (36363.1 36458.5 36649.3 36810.9 37774.3) | **34856.3** (34856.3 34880.2 41417.4 42888.6 45090.4) | **52345.1** (52345.1 53534.0 54831.7 55639.0 56333.9) | **worse**: 54831.7 > 26809.7 |
+| rename | p999 | **69106.3** (69106.3 72091.3 74988.7 75495.6 77128.9) | **66190.3** (66190.3 71031.6 71716.3 73311.9 75913.5) | **78870.0** (78870.0 86552.6 90238.1 97242.0 106998.5) | **78733.9** (78733.9 85354.7 88013.8 89825.6 98222.9) |  |
+| rename | max | **92112.8** (92112.8 132611.5 185967.1 224560.8 227509.4) | **110408.8** (110408.8 134888.2 137840.3 176328.1 495949.6) | **142441.1** (142441.1 189840.7 190140.6 222933.8 289092.8) | **143087.5** (143087.5 146522.4 172390.7 182806.9 204889.6) |  |
+| unlink | p50 | **298.7** (298.7 300.5 304.1 304.7 307.4) | **334.4** (334.4 338.1 338.6 342.9 347.0) | **335.1** (335.1 347.0 543.9 572.0 625.0) | **346.8** (346.8 347.6 352.4 376.4 388.7) | **worse**: 352.4 > 307.4 |
+| unlink | p99 | **34731.5** (34731.5 36900.4 37836.0 38201.6 39031.0) | **26671.6** (26671.6 29003.2 29258.4 29763.8 30991.5) | **26736.2** (26736.2 29469.6 39015.3 41528.0 42767.2) | **39975.6** (39975.6 43457.5 43868.1 45508.4 46532.4) | **worse**: 43868.1 > 39031.0 |
+| unlink | p999 | **54211.6** (54211.6 54415.7 57267.2 63454.5 65784.3) | **97185.8** (97185.8 113563.8 124444.3 134797.9 169834.2) | **103747.2** (103747.2 183770.2 205777.7 212389.3 235126.7) | **224088.8** (224088.8 244932.5 254119.9 261491.8 268564.6) |  |
+| unlink | max | **87460.8** (87460.8 91253.8 96709.8 121512.8 136532.7) | **316245.2** (316245.2 368865.2 403268.6 419879.9 448644.0) | **381813.0** (381813.0 395598.1 477474.5 516267.6 654371.9) | **351829.0** (351829.0 402618.5 419554.5 460265.1 469551.5) |  |
+| fsync | p50 | **106.7** (106.7 113.2 121.0 124.1 125.8) | **102.4** (102.4 103.4 106.6 114.3 115.4) | **103.7** (103.7 112.4 115.4 116.1 120.3) | **104.7** (104.7 112.0 112.9 115.1 117.2) | within |
+| fsync | p99 | **282.2** (282.2 311.7 339.7 388.9 435.5) | **224.9** (224.9 246.6 260.7 281.5 305.8) | **253.0** (253.0 274.6 1344.4 8188.4 9653.9) | **251.6** (251.6 323.4 372.5 376.3 413.3) | within |
+| fsync | p999 | **36901.4** (36901.4 38951.4 39457.1 40360.4 46094.7) | **28434.9** (28434.9 32794.6 33239.0 35703.8 36550.2) | **29811.0** (29811.0 32391.1 41441.6 44441.7 48897.1) | **34523.3** (34523.3 39376.5 39543.0 47023.9 51074.2) |  |
+| fsync | max | **54623.1** (54623.1 61479.4 64753.4 71764.5 76026.5) | **55604.0** (55604.0 58108.4 65238.3 68444.8 98219.7) | **52790.1** (52790.1 57861.5 59180.6 65894.9 89451.7) | **49968.7** (49968.7 55021.2 73480.4 84060.3 84588.2) |  |
+| open | p50 | **3592.5** (3592.5 3632.7 3898.4 4049.5 4177.9) | **3735.2** (3735.2 3900.3 4045.0 4056.1 4483.9) | **3707.5** (3707.5 3822.8 4070.3 4157.1 4328.2) | **3829.6** (3829.6 3879.4 3913.8 3997.7 4292.8) | within |
+| open | p99 | **37266.8** (37266.8 37789.2 40364.3 41831.9 46161.4) | **40891.5** (40891.5 43383.6 47742.2 49463.1 51886.7) | **42356.6** (42356.6 42923.7 46350.7 49792.0 51693.3) | **41955.0** (41955.0 43856.3 44601.6 48764.6 54523.3) | within |
+| open | p999 | **62479.2** (62479.2 66617.2 66638.6 67274.0 69011.8) | **85772.2** (85772.2 88355.7 97771.0 112097.9 112424.3) | **85516.6** (85516.6 89151.5 92366.5 113098.9 122071.9) | **84855.1** (84855.1 86438.6 86982.2 96502.3 103139.1) |  |
+| open | max | **89538.1** (89538.1 90370.9 94124.1 96138.7 118136.0) | **169345.1** (169345.1 182189.2 196802.0 200889.6 239101.1) | **127941.1** (127941.1 172657.9 190640.4 274807.5 335863.8) | **205018.1** (205018.1 208488.6 209432.4 211193.9 239421.1) |  |
+| close | p50 | **4183.8** (4183.8 4379.7 4736.2 4858.3 5181.9) | **4285.0** (4285.0 4519.7 4700.8 4736.8 5476.6) | **3963.4** (3963.4 4158.0 4329.3 4590.7 4818.7) | **4065.1** (4065.1 4181.4 4204.5 4240.0 4697.6) | within |
+| close | p99 | **44473.0** (44473.0 45414.6 46795.5 48378.3 51122.7) | **40457.4** (40457.4 43542.3 44110.3 44153.9 49983.0) | **45504.7** (45504.7 45869.9 46449.2 46792.4 49270.4) | **45301.9** (45301.9 46468.8 46801.6 48342.3 51329.2) | within |
+| close | p999 | **67892.9** (67892.9 68648.9 70802.9 72466.0 73560.9) | **62802.9** (62802.9 62860.4 64038.8 66356.0 71497.5) | **63784.6** (63784.6 67490.4 69034.1 69548.9 70295.8) | **62050.3** (62050.3 64621.1 72198.9 73163.0 75318.3) |  |
+| close | max | **85253.6** (85253.6 98870.0 105566.8 107105.1 107310.6) | **91509.7** (91509.7 95603.4 102771.4 108005.5 243918.0) | **83764.6** (83764.6 85492.9 89263.4 91655.4 99667.3) | **89620.8** (89620.8 92215.0 106528.4 131761.0 217893.7) |  |
+
+#### Run 42319726082, windows-latest
+
+**windows-latest, run 42319726082**: 4 runs done, 1 failed; arms dll, sep1, comb1, comb2.
+
+windows-latest, run 42319726082, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **471.8** (471.8 475.1 479.8 510.7 545.8) | **470.3** (470.3 473.0 476.8 494.5 570.4) | **429.9** (429.9 472.3 487.0 513.3 580.1) | **487.5** (487.5 489.8 506.6 512.7 586.4) | within |
+| create | p99 | **838.4** (838.4 865.8 901.0 903.9 1181.8) | **854.1** (854.1 856.6 872.1 898.6 1335.4) | **847.0** (847.0 852.7 872.6 882.5 1300.0) | **865.2** (865.2 871.4 926.5 979.6 1487.8) | within |
+| create | p999 | **1254.4** (1254.4 2427.2 2429.4 2596.7 2620.5) | **12876.2** (12876.2 19988.3 25160.8 32036.7 32683.4) | **3170.6** (3170.6 3427.4 4223.7 4291.6 4751.9) | **4375.7** (4375.7 7814.0 10530.0 17832.8 26949.1) |  |
+| create | max | **25578.9** (25578.9 26284.0 26582.4 26615.3 27841.8) | **69503.8** (69503.8 76396.7 95895.0 127533.2 135262.2) | **33205.3** (33205.3 36059.7 65386.5 66839.1 68034.1) | **65340.7** (65340.7 66007.1 67774.5 70436.7 97985.3) |  |
+| stat | p50 | **115.3** (115.3 117.7 118.8 141.4 151.6) | **120.8** (120.8 123.5 129.4 135.6 143.8) | **121.4** (121.4 130.7 139.4 150.8 164.6) | **133.9** (133.9 135.8 142.9 152.6 193.5) | within |
+| stat | p99 | **172.3** (172.3 180.6 194.2 252.7 272.3) | **203.2** (203.2 217.6 219.8 430.7 471.1) | **194.0** (194.0 214.6 221.1 249.3 429.4) | **191.4** (191.4 220.2 222.1 229.9 391.6) | within |
+| stat | p999 | **248.3** (248.3 262.8 307.0 658.7 1248.7) | **542.6** (542.6 830.5 837.8 1121.5 1471.6) | **534.8** (534.8 550.3 801.2 1099.4 1821.3) | **480.3** (480.3 493.1 525.8 1093.7 1247.5) |  |
+| stat | max | **3769.5** (3769.5 24637.9 24791.3 24866.2 29068.3) | **4311.4** (4311.4 26084.5 33733.6 64345.6 65690.7) | **11611.3** (11611.3 26474.1 32520.2 33259.5 65890.2) | **2056.7** (2056.7 2266.6 24820.9 66028.5 69290.2) |  |
+| read | p50 | **4.7** (4.7 4.8 4.8 4.9 5.3) | **5.1** (5.1 5.2 5.3 5.3 5.9) | **4.7** (4.7 4.7 4.8 4.8 5.5) | **4.6** (4.6 4.8 4.8 4.9 5.4) | within |
+| read | p99 | **7.5** (7.5 7.9 8.8 9.4 15.3) | **7.7** (7.7 7.8 8.1 9.0 15.6) | **7.1** (7.1 7.5 7.6 8.3 18.0) | **8.3** (8.3 8.3 9.0 9.9 19.2) | within |
+| read | p999 | **21.6** (21.6 22.2 22.3 25.8 54.4) | **18.6** (18.6 20.8 23.1 33.5 38.8) | **20.4** (20.4 21.7 22.0 23.0 38.1) | **20.7** (20.7 22.4 23.6 24.1 43.6) |  |
+| read | max | **38.3** (38.3 41.4 59.5 71.6 378.4) | **27.3** (27.3 31.0 73.1 109.0 353.4) | **33.5** (33.5 35.6 38.0 50.0 204.7) | **29.2** (29.2 33.7 35.8 44.6 124.5) |  |
+| write | p50 | **36.3** (36.3 36.5 49.8 50.4 54.4) | **39.7** (39.7 41.7 50.5 52.4 67.9) | **38.0** (38.0 52.2 54.9 56.2 83.8) | **39.5** (39.5 50.5 51.1 56.2 78.1) | within |
+| write | p99 | **109.1** (109.1 129.8 140.3 157.6 175.5) | **104.6** (104.6 113.8 116.2 122.6 207.8) | **99.3** (99.3 115.1 117.8 118.4 177.9) | **102.1** (102.1 103.1 136.7 157.7 218.5) | within |
+| write | p999 | **321.9** (321.9 342.2 351.0 363.9 619.2) | **351.3** (351.3 431.8 595.8 606.0 806.6) | **346.8** (346.8 347.4 440.7 463.9 766.6) | **379.0** (379.0 390.9 605.0 634.1 1867.7) |  |
+| write | max | **754.2** (754.2 2715.4 24882.0 24890.8 25764.0) | **32735.9** (32735.9 32967.8 33445.3 33458.4 35535.3) | **25284.3** (25284.3 32170.6 33142.9 33362.2 36578.8) | **25228.1** (25228.1 29913.1 32272.6 33189.9 33240.2) |  |
+| rename | p50 | **234.8** (234.8 243.6 249.3 306.0 307.2) | **240.5** (240.5 250.1 265.7 267.7 313.0) | **241.9** (241.9 264.9 279.4 302.7 324.3) | **270.4** (270.4 278.6 287.0 305.8 321.0) | within |
+| rename | p99 | **365.6** (365.6 397.2 397.6 473.6 839.5) | **538.2** (538.2 579.5 637.0 664.8 882.2) | **419.8** (419.8 444.3 486.7 631.8 799.3) | **475.9** (475.9 481.2 511.1 692.4 878.9) | within |
+| rename | p999 | **602.2** (602.2 695.0 715.8 975.7 3866.9) | **938.6** (938.6 1540.4 2864.3 5019.7 22018.9) | **739.7** (739.7 763.5 1367.4 5907.2 11012.9) | **1644.3** (1644.3 3777.3 3808.7 7594.5 31742.6) |  |
+| rename | max | **1396.5** (1396.5 1791.7 26259.2 27292.6 27427.3) | **24677.4** (24677.4 30606.8 66763.9 93441.7 98436.2) | **952.9** (952.9 33409.7 33649.6 93567.5 95182.7) | **65247.4** (65247.4 66189.5 66473.4 96883.6 109752.1) |  |
+| unlink | p50 | **139.5** (139.5 143.5 144.9 169.6 176.3) | **155.3** (155.3 155.7 156.3 158.3 177.2) | **145.9** (145.9 163.1 170.2 183.4 184.0) | **171.4** (171.4 173.6 178.7 186.5 251.0) | **worse**: 178.7 > 176.3 |
+| unlink | p99 | **290.6** (290.6 358.4 421.6 541.8 575.4) | **355.0** (355.0 395.2 421.0 434.3 676.4) | **326.6** (326.6 356.6 439.3 453.5 641.4) | **359.1** (359.1 453.9 520.3 567.8 794.5) | within |
+| unlink | p999 | **495.4** (495.4 632.1 977.5 1052.7 1289.8) | **576.6** (576.6 1209.7 1489.0 1512.1 21583.4) | **552.5** (552.5 1122.3 1131.0 1677.4 31892.3) | **733.0** (733.0 1712.0 2187.8 7860.9 9813.0) |  |
+| unlink | max | **1198.8** (1198.8 24926.3 25480.0 26022.2 26693.6) | **6863.9** (6863.9 36582.4 65426.0 75862.5 80594.5) | **25760.4** (25760.4 33400.7 34029.5 42303.7 120782.5) | **33662.4** (33662.4 63476.3 66610.7 75586.9 98515.5) |  |
+| fsync | p50 | **54.7** (54.7 55.7 56.0 61.8 75.8) | **57.7** (57.7 58.9 59.0 61.2 73.2) | **59.6** (59.6 60.9 61.3 77.5 78.6) | **59.2** (59.2 59.5 61.9 66.4 70.2) | within |
+| fsync | p99 | **116.5** (116.5 118.4 171.6 181.7 244.8) | **105.6** (105.6 122.4 123.5 125.7 237.2) | **115.6** (115.6 122.0 136.0 143.2 199.6) | **108.7** (108.7 114.4 132.5 178.0 214.6) | within |
+| fsync | p999 | **334.6** (334.6 399.8 483.4 525.7 547.4) | **468.7** (468.7 523.7 640.8 688.1 906.3) | **249.1** (249.1 262.0 311.1 447.4 985.8) | **282.3** (282.3 291.0 349.2 735.8 1333.4) |  |
+| fsync | max | **936.3** (936.3 1064.0 2086.4 24938.1 26716.9) | **32347.3** (32347.3 32555.5 32836.8 33077.8 66349.0) | **3612.9** (3612.9 25198.0 25837.8 33090.4 36113.0) | **2274.5** (2274.5 5358.4 33122.8 59639.0 65682.2) |  |
+| open | p50 | **63.4** (63.4 65.2 68.3 73.3 75.1) | **71.2** (71.2 72.4 73.9 77.3 92.4) | **62.1** (62.1 74.6 79.2 80.6 108.3) | **75.0** (75.0 75.8 78.7 78.7 83.9) | **worse**: 78.7 > 75.1 |
+| open | p99 | **133.7** (133.7 134.2 137.4 152.1 238.8) | **130.5** (130.5 141.3 145.8 248.0 404.3) | **125.6** (125.6 129.7 149.0 167.6 236.2) | **142.6** (142.6 144.2 149.0 193.5 303.6) | within |
+| open | p999 | **243.6** (243.6 292.9 442.5 456.0 1125.7) | **441.7** (441.7 463.9 464.2 1115.0 1242.2) | **415.3** (415.3 424.3 430.3 465.5 1929.0) | **423.0** (423.0 480.2 582.0 6854.3 31916.4) |  |
+| open | max | **503.1** (503.1 711.3 2947.2 24852.5 24998.4) | **1384.9** (1384.9 1682.4 26471.6 33182.3 33406.2) | **3211.9** (3211.9 17505.1 24391.3 25619.7 25748.7) | **2211.1** (2211.1 24794.0 32562.4 33476.1 33844.3) |  |
+| close | p50 | **27.8** (27.8 28.1 28.3 29.2 30.4) | **30.2** (30.2 30.4 30.7 31.3 33.6) | **30.4** (30.4 31.1 31.3 32.5 34.7) | **30.4** (30.4 30.7 31.4 31.6 34.9) | **worse**: 31.4 > 30.4 |
+| close | p99 | **59.6** (59.6 61.2 61.9 97.7 118.4) | **65.9** (65.9 68.8 71.4 71.7 137.0) | **66.9** (66.9 74.5 75.4 81.2 112.2) | **64.5** (64.5 64.9 76.3 107.5 123.2) | within |
+| close | p999 | **269.9** (269.9 286.6 289.5 319.4 325.1) | **276.0** (276.0 290.4 297.0 298.1 607.5) | **261.3** (261.3 276.0 290.4 297.4 337.9) | **262.1** (262.1 282.9 291.1 297.3 412.8) |  |
+| close | max | **444.4** (444.4 459.8 595.8 958.1 24565.7) | **1047.5** (1047.5 4121.9 27352.3 32930.5 33209.5) | **633.7** (633.7 2276.7 18152.5 26037.7 31850.6) | **422.7** (422.7 1515.3 25649.0 30079.2 32023.7) |  |
+
+windows-latest, run 42319726082, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **716.3** (716.3 728.9 736.1 753.4) | **703.7** (703.7 711.2 714.7 801.7) | **651.7** (651.7 723.5 733.1 833.5) | **825.4** (825.4 883.3 885.7 1109.4) | **worse**: 885.7 > 753.4 |
+| create | p99 | **204395.7** (204395.7 206436.8 207213.2 240922.3) | **64520.5** (64520.5 65129.2 66781.9 71901.8) | **59597.8** (59597.8 65787.5 77858.1 83441.1) | **231731.6** (231731.6 233620.6 239747.8 253862.4) | within |
+| create | p999 | **251205.5** (251205.5 274052.3 285555.1 642192.6) | **125317.6** (125317.6 132118.2 145322.2 177626.6) | **126872.5** (126872.5 147269.0 163926.9 164933.2) | **290195.5** (290195.5 296170.7 299630.7 310749.7) |  |
+| create | max | **304996.3** (304996.3 370419.5 387791.4 776810.5) | **180527.4** (180527.4 187843.7 192290.2 299161.7) | **165747.7** (165747.7 245177.5 308880.1 338854.7) | **325213.7** (325213.7 370919.4 423826.6 526321.7) |  |
+| stat | p50 | **130.8** (130.8 141.1 141.1 153.8) | **129.2** (129.2 133.7 134.1 134.6) | **135.0** (135.0 136.2 139.2 142.8) | **142.8** (142.8 151.3 155.9 157.9) | **worse**: 155.9 > 153.8 |
+| stat | p99 | **84748.6** (84748.6 92728.7 103555.7 105154.7) | **275.5** (275.5 293.5 318.0 800.6) | **291.9** (291.9 310.3 330.2 1082.7) | **98325.4** (98325.4 100563.1 100993.0 101579.3) | within |
+| stat | p999 | **119463.2** (119463.2 129881.1 146736.7 226884.2) | **67325.7** (67325.7 77132.6 81972.0 88158.5) | **66708.9** (66708.9 89424.4 93202.0 97066.8) | **136232.0** (136232.0 156597.0 164128.8 184174.6) |  |
+| stat | max | **160830.1** (160830.1 163388.6 167096.7 674070.2) | **112095.0** (112095.0 119107.5 186649.5 304695.5) | **129502.4** (129502.4 154612.4 164539.9 166405.5) | **474352.7** (474352.7 541972.3 611858.7 773504.7) |  |
+| read | p50 | **50.5** (50.5 51.2 51.8 52.5) | **6.5** (6.5 6.7 7.3 42.9) | **42.0** (42.0 42.7 44.4 46.4) | **46.2** (46.2 46.3 46.4 46.5) | within |
+| read | p99 | **132.7** (132.7 140.5 148.4 148.8) | **86.2** (86.2 89.9 90.6 119.7) | **109.1** (109.1 126.2 129.3 963.9) | **134.3** (134.3 154.7 161.0 164.7) | **worse**: 161.0 > 148.8 |
+| read | p999 | **65834.4** (65834.4 68445.9 70132.4 77059.6) | **3290.0** (3290.0 29339.0 30989.8 37076.5) | **32283.0** (32283.0 47717.0 63655.2 65569.2) | **71196.2** (71196.2 71214.7 89606.2 92270.2) |  |
+| read | max | **111884.6** (111884.6 131899.5 140756.7 146877.5) | **60897.3** (60897.3 119230.7 122934.2 128487.9) | **57503.1** (57503.1 95600.6 103393.2 111019.6) | **102032.9** (102032.9 112531.1 146614.5 162805.4) |  |
+| write | p50 | **53.8** (53.8 54.7 54.8 54.9) | **43.5** (43.5 43.8 43.9 44.2) | **43.6** (43.6 44.7 45.3 46.4) | **46.7** (46.7 47.7 48.8 51.1) | within |
+| write | p99 | **299.4** (299.4 314.1 352.4 19131.3) | **162.1** (162.1 164.1 180.9 304.5) | **268.8** (268.8 969.3 19658.3 20852.1) | **368.3** (368.3 381.7 17320.8 51154.9) | within |
+| write | p999 | **42418.1** (42418.1 44488.7 49246.3 50448.8) | **64751.2** (64751.2 65830.5 65860.4 66597.7) | **65702.4** (65702.4 66996.9 69671.7 72621.0) | **81160.3** (81160.3 85616.8 96510.1 98329.7) |  |
+| write | max | **72859.4** (72859.4 98732.0 119064.4 131292.1) | **102601.2** (102601.2 107267.5 146641.9 162993.0) | **125545.7** (125545.7 127679.8 130830.5 235061.9) | **124391.3** (124391.3 130385.8 152685.8 162925.5) |  |
+| rename | p50 | **310.8** (310.8 316.8 317.6 338.4) | **289.5** (289.5 291.4 291.5 295.4) | **286.4** (286.4 310.1 316.4 323.9) | **315.8** (315.8 319.6 320.6 338.8) | within |
+| rename | p99 | **1268.4** (1268.4 1343.5 1592.3 30168.5) | **2886.8** (2886.8 9555.6 9819.5 11684.6) | **10243.0** (10243.0 11581.1 13491.9 20317.7) | **99950.5** (99950.5 109375.1 112663.6 113800.8) | **worse**: 112663.6 > 30168.5 |
+| rename | p999 | **102158.5** (102158.5 112838.4 113107.9 115793.6) | **93063.7** (93063.7 96209.0 98681.2 104746.7) | **97774.6** (97774.6 110183.5 112431.0 122119.8) | **161442.6** (161442.6 161986.9 167325.1 182521.9) |  |
+| rename | max | **174940.6** (174940.6 192064.1 205352.6 295308.2) | **151156.1** (151156.1 162370.7 164454.3 567716.8) | **146987.7** (146987.7 154902.3 162064.7 547929.6) | **202906.4** (202906.4 230941.9 277176.5 596846.2) |  |
+| unlink | p50 | **180.1** (180.1 184.5 186.0 201.8) | **159.7** (159.7 169.3 181.8 188.4) | **171.1** (171.1 202.3 205.3 206.7) | **209.2** (209.2 215.1 221.0 227.7) | **worse**: 221.0 > 201.8 |
+| unlink | p99 | **99177.9** (99177.9 107633.3 108853.4 112387.8) | **648.0** (648.0 867.1 872.9 1062.8) | **733.1** (733.1 1018.2 1083.5 1190.9) | **220008.5** (220008.5 299571.5 343247.4 387527.2) | **worse**: 343247.4 > 112387.8 |
+| unlink | p999 | **153003.6** (153003.6 154686.8 160492.7 161066.4) | **66458.8** (66458.8 74854.5 77680.4 97297.7) | **97005.3** (97005.3 98853.5 99051.5 106147.3) | **918880.6** (918880.6 1063116.0 1189142.0 1334179.7) |  |
+| unlink | max | **200776.7** (200776.7 217986.5 242992.1 244989.6) | **99158.4** (99158.4 157919.7 635504.0 1452960.8) | **639755.8** (639755.8 799906.4 1252724.2 1473380.4) | **1817952.8** (1817952.8 2211321.5 2311758.9 2763744.4) |  |
+| fsync | p50 | **80.6** (80.6 82.5 84.7 86.2) | **64.1** (64.1 64.6 64.8 68.1) | **65.1** (65.1 70.8 70.8 71.7) | **69.6** (69.6 70.2 72.6 74.1) | within |
+| fsync | p99 | **200.8** (200.8 204.0 204.8 300.9) | **167.4** (167.4 174.9 175.8 228.0) | **152.2** (152.2 190.2 418.3 2012.8) | **217.8** (217.8 224.7 380.3 38968.7) | **worse**: 380.3 > 300.9 |
+| fsync | p999 | **33908.4** (33908.4 38727.7 62027.9 64459.6) | **41584.8** (41584.8 50194.8 55258.1 82809.5) | **32390.8** (32390.8 77644.4 79004.4 92446.8) | **40334.9** (40334.9 67295.2 82796.9 102820.9) |  |
+| fsync | max | **88619.8** (88619.8 91864.8 129850.4 133462.7) | **97588.9** (97588.9 98778.0 144810.9 242653.0) | **135028.4** (135028.4 144766.4 160611.0 299607.5) | **133199.9** (133199.9 141949.9 153032.2 227946.7) |  |
+| open | p50 | **79.2** (79.2 79.9 81.0 82.5) | **82.2** (82.2 83.4 85.8 89.1) | **88.8** (88.8 96.0 99.4 104.9) | **95.0** (95.0 103.2 103.9 104.6) | **worse**: 103.9 > 82.5 |
+| open | p99 | **258.6** (258.6 308.7 402.7 34984.9) | **219.3** (219.3 229.1 232.6 260.7) | **219.0** (219.0 228.8 237.2 256.5) | **406.8** (406.8 1224.6 26026.2 34088.3) | within |
+| open | p999 | **71933.5** (71933.5 88955.3 89575.1 90797.4) | **54479.8** (54479.8 55250.2 61443.4 64163.6) | **63658.9** (63658.9 65186.3 66422.5 75157.2) | **88876.9** (88876.9 94693.8 98079.4 98605.4) |  |
+| open | max | **93157.4** (93157.4 130701.7 139003.1 325674.1) | **109413.3** (109413.3 114146.6 119507.3 119917.0) | **107496.7** (107496.7 118296.2 124296.7 157206.6) | **121475.8** (121475.8 131600.9 169570.6 412995.2) |  |
+| close | p50 | **31.0** (31.0 31.2 31.3 31.3) | **32.1** (32.1 32.3 32.4 33.2) | **32.8** (32.8 33.5 33.7 35.0) | **34.1** (34.1 34.4 34.7 36.1) | **worse**: 34.7 > 31.3 |
+| close | p99 | **94.1** (94.1 94.1 100.2 106.0) | **82.4** (82.4 85.7 89.6 96.1) | **73.7** (73.7 98.6 102.7 102.9) | **101.6** (101.6 101.8 124.6 7980.5) | **worse**: 124.6 > 106.0 |
+| close | p999 | **453.2** (453.2 742.2 773.1 23458.7) | **571.0** (571.0 591.8 25034.4 51511.5) | **10057.1** (10057.1 13128.6 46775.3 51561.5) | **15172.4** (15172.4 32200.3 65816.5 66223.5) |  |
+| close | max | **60498.8** (60498.8 77911.2 99177.9 124688.6) | **46206.7** (46206.7 97899.2 101051.0 115747.4) | **96325.9** (96325.9 99926.7 106579.6 130697.6) | **78436.0** (78436.0 98124.8 119819.0 129108.7) |  |
+
+#### Run 42331462575, windows-11-arm
+
+**windows-11-arm, run 42331462575**: 5 runs done, 0 failed; arms dll, sep1, comb1, comb2.
+
+windows-11-arm, run 42331462575, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **162.7** (162.7 163.4 165.3 167.3 167.5) | **176.2** (176.2 181.3 181.7 186.2 191.5) | **166.8** (166.8 167.1 172.6 175.7 177.5) | **154.6** (154.6 159.0 163.7 169.6 176.0) | within |
+| create | p99 | **227.5** (227.5 238.1 246.2 262.2 290.6) | **255.1** (255.1 266.3 270.5 272.7 291.6) | **234.4** (234.4 264.4 265.7 269.7 288.4) | **241.7** (241.7 246.0 247.5 255.1 256.8) | within |
+| create | p999 | **566.5** (566.5 622.1 630.5 641.6 670.1) | **617.2** (617.2 635.8 648.5 665.8 694.6) | **508.5** (508.5 605.5 627.3 676.5 1091.3) | **611.6** (611.6 630.4 644.2 652.4 660.3) |  |
+| create | max | **1317.2** (1317.2 3253.9 3384.6 3862.0 17609.9) | **1484.0** (1484.0 3284.6 7412.5 7888.7 11813.2) | **3485.6** (3485.6 10898.4 17485.1 17650.9 17691.6) | **3620.0** (3620.0 10597.0 16089.2 17617.7 17900.8) |  |
+| stat | p50 | **109.0** (109.0 109.5 110.3 110.4 111.0) | **139.0** (139.0 139.1 140.3 140.6 142.4) | **138.1** (138.1 138.7 139.7 139.8 140.2) | **126.3** (126.3 127.0 127.4 128.2 128.7) | **worse**: 127.4 > 111.0 |
+| stat | p99 | **169.8** (169.8 175.7 177.1 180.8 183.8) | **201.8** (201.8 205.1 207.8 216.6 218.4) | **204.9** (204.9 211.7 212.6 217.6 270.7) | **203.7** (203.7 213.6 217.0 218.8 376.6) | **worse**: 217.0 > 183.8 |
+| stat | p999 | **240.8** (240.8 254.4 275.3 302.6 333.8) | **501.9** (501.9 506.5 525.3 526.5 546.2) | **490.0** (490.0 547.7 565.8 600.6 679.6) | **486.7** (486.7 530.4 533.0 537.8 595.6) |  |
+| stat | max | **578.1** (578.1 2646.2 3658.2 11179.0 12258.0) | **647.3** (647.3 728.5 874.6 972.0 3499.5) | **836.4** (836.4 9230.4 11879.8 15062.6 17753.1) | **574.8** (574.8 659.3 1120.4 8259.3 10403.5) |  |
+| read | p50 | **22.0** (22.0 23.0 23.1 23.7 24.4) | **22.4** (22.4 22.6 22.7 23.3 25.9) | **22.9** (22.9 23.0 23.6 23.7 24.4) | **22.7** (22.7 23.0 23.2 23.3 28.5) | within |
+| read | p99 | **45.8** (45.8 48.5 49.7 50.9 56.1) | **50.4** (50.4 51.1 51.4 55.8 69.1) | **50.0** (50.0 50.2 50.5 51.6 52.7) | **48.3** (48.3 50.4 51.6 53.2 53.7) | within |
+| read | p999 | **83.9** (83.9 85.7 86.0 110.4 110.8) | **79.9** (79.9 89.5 91.6 92.8 122.2) | **90.9** (90.9 96.9 97.0 112.1 121.8) | **79.8** (79.8 90.1 96.6 103.5 108.5) |  |
+| read | max | **150.8** (150.8 155.7 937.0 3323.1 3513.8) | **136.7** (136.7 191.4 227.4 940.3 4868.9) | **132.2** (132.2 144.9 740.7 1365.5 1786.3) | **147.8** (147.8 152.8 161.3 224.1 2743.0) |  |
+| write | p50 | **81.3** (81.3 83.7 83.7 83.8 84.5) | **84.9** (84.9 86.3 87.1 87.7 90.5) | **87.0** (87.0 88.1 89.4 91.1 91.5) | **85.0** (85.0 86.4 87.8 88.3 88.5) | **worse**: 87.8 > 84.5 |
+| write | p99 | **191.2** (191.2 195.0 197.0 198.3 199.6) | **201.8** (201.8 205.4 206.3 206.8 209.4) | **202.4** (202.4 204.7 207.5 208.6 215.9) | **201.7** (201.7 208.9 210.3 246.5 362.2) | **worse**: 210.3 > 199.6 |
+| write | p999 | **454.7** (454.7 455.9 500.5 577.7 602.4) | **340.6** (340.6 363.3 477.7 531.2 593.7) | **450.9** (450.9 483.1 503.2 505.5 1135.1) | **434.2** (434.2 443.4 470.0 501.9 577.2) |  |
+| write | max | **3031.0** (3031.0 4787.8 5183.2 7136.2 17858.7) | **2652.9** (2652.9 2692.0 3065.7 3123.5 4629.5) | **8964.1** (8964.1 15351.8 15913.9 17521.4 17661.7) | **6226.5** (6226.5 15587.2 16910.9 17372.3 17658.1) |  |
+| rename | p50 | **355.6** (355.6 355.8 358.2 360.7 363.5) | **414.8** (414.8 417.8 424.6 434.7 434.8) | **379.1** (379.1 386.7 395.1 401.8 402.2) | **382.1** (382.1 383.2 397.5 399.3 553.1) | **worse**: 397.5 > 363.5 |
+| rename | p99 | **672.9** (672.9 683.3 721.5 761.3 910.5) | **763.3** (763.3 791.7 811.2 843.6 1172.0) | **740.0** (740.0 757.2 774.3 780.5 1089.9) | **735.9** (735.9 753.1 844.0 855.3 1207.3) | within |
+| rename | p999 | **3329.3** (3329.3 3405.4 6526.5 7439.8 13702.6) | **1994.5** (1994.5 3538.4 3545.1 3647.6 4673.5) | **2119.9** (2119.9 2409.9 2515.8 3503.4 8595.5) | **2633.1** (2633.1 3832.8 3859.2 3909.4 17752.0) |  |
+| rename | max | **40827.6** (40827.6 54605.0 58430.8 84435.5 92665.7) | **16056.1** (16056.1 19960.3 20030.7 25014.5 41825.0) | **41221.1** (41221.1 62510.7 62584.9 62820.6 124280.9) | **22217.5** (22217.5 35858.8 41356.2 63290.3 68821.7) |  |
+| unlink | p50 | **221.6** (221.6 226.4 227.8 228.0 229.9) | **267.6** (267.6 267.8 270.2 271.1 275.8) | **237.6** (237.6 239.3 240.9 246.1 247.0) | **257.0** (257.0 257.3 260.7 263.7 297.3) | **worse**: 260.7 > 229.9 |
+| unlink | p99 | **421.5** (421.5 435.7 442.6 457.2 458.8) | **515.4** (515.4 521.0 542.4 544.5 562.6) | **533.3** (533.3 545.0 564.6 565.6 573.1) | **543.1** (543.1 553.2 570.6 574.6 723.0) | **worse**: 570.6 > 458.8 |
+| unlink | p999 | **708.7** (708.7 744.8 773.8 1202.4 1215.0) | **815.5** (815.5 869.6 1359.6 1803.1 3726.3) | **836.1** (836.1 866.4 1029.0 1465.1 3728.4) | **759.6** (759.6 1144.8 1237.4 2563.6 4725.3) |  |
+| unlink | max | **3604.7** (3604.7 15245.8 17963.1 45320.0 91176.7) | **103356.7** (103356.7 144827.7 145155.6 185583.6 230453.1) | **20407.1** (20407.1 22935.5 40992.9 105380.8 124898.5) | **14979.5** (14979.5 63142.6 82426.6 149058.2 185145.7) |  |
+| fsync | p50 | **99.6** (99.6 100.0 100.6 102.5 102.8) | **102.2** (102.2 102.4 102.9 105.9 107.3) | **80.9** (80.9 82.2 84.5 84.6 89.2) | **80.4** (80.4 81.7 84.1 85.4 89.7) | within |
+| fsync | p99 | **143.4** (143.4 144.6 145.8 150.0 153.3) | **157.9** (157.9 160.4 161.3 162.3 166.8) | **150.0** (150.0 150.3 150.7 158.5 174.6) | **151.9** (151.9 156.7 187.5 250.0 370.8) | **worse**: 187.5 > 153.3 |
+| fsync | p999 | **299.4** (299.4 352.0 360.2 410.8 501.1) | **343.7** (343.7 413.6 426.0 486.7 490.9) | **376.3** (376.3 408.5 451.9 473.6 513.3) | **329.1** (329.1 417.5 442.3 444.8 446.6) |  |
+| fsync | max | **1732.1** (1732.1 1909.9 2584.2 2590.7 17316.3) | **3401.4** (3401.4 3598.5 3726.5 6039.3 14791.3) | **1412.5** (1412.5 17272.6 17755.5 17792.2 78040.0) | **2216.3** (2216.3 3347.4 8366.3 17270.2 17519.2) |  |
+| open | p50 | **98.2** (98.2 105.6 108.3 113.8 121.4) | **126.3** (126.3 127.5 127.6 128.8 149.3) | **108.5** (108.5 111.7 117.8 126.8 141.0) | **133.6** (133.6 136.9 138.2 151.1 733.6) | **worse**: 138.2 > 121.4 |
+| open | p99 | **4383.6** (4383.6 4431.8 4468.7 4509.7 4652.5) | **4604.0** (4604.0 4621.1 4708.1 4844.8 4975.8) | **4589.5** (4589.5 4632.2 4663.7 4683.2 4721.6) | **4592.4** (4592.4 4654.2 4744.4 4757.2 4794.6) | **worse**: 4744.4 > 4652.5 |
+| open | p999 | **4892.3** (4892.3 5200.0 5213.6 5292.2 6038.3) | **5610.2** (5610.2 5637.0 6333.2 6988.5 7025.0) | **5621.5** (5621.5 5625.2 5752.9 8009.1 8148.9) | **5603.6** (5603.6 5709.4 5948.4 6019.1 6461.7) |  |
+| open | max | **8767.8** (8767.8 9856.6 9882.5 12782.6 40042.6) | **65955.1** (65955.1 66467.2 66552.8 86654.2 87701.0) | **65371.5** (65371.5 66764.0 67282.9 81763.4 98046.7) | **24215.7** (24215.7 45497.4 45780.0 66346.3 66709.5) |  |
+| close | p50 | **980.9** (980.9 986.0 995.3 998.9 1016.3) | **1620.5** (1620.5 1698.9 3298.1 3425.6 3668.4) | **994.7** (994.7 995.2 1004.1 1018.0 1023.6) | **1002.3** (1002.3 1012.7 1020.7 1023.6 1026.2) | **worse**: 1020.7 > 1016.3 |
+| close | p99 | **5280.1** (5280.1 5413.7 5444.8 5702.8 6737.3) | **5277.1** (5277.1 5323.2 5353.2 5404.9 5634.5) | **5373.8** (5373.8 5429.1 5450.2 5476.5 5599.1) | **5358.6** (5358.6 5512.5 5563.5 5796.0 6057.1) | within |
+| close | p999 | **17570.0** (17570.0 17574.3 17587.6 17662.4 18096.6) | **7197.0** (7197.0 7246.2 7602.0 8203.6 10418.6) | **17401.7** (17401.7 17422.3 17612.1 17647.4 17656.2) | **17597.6** (17597.6 17656.2 17658.6 17796.8 18310.6) |  |
+| close | max | **21102.0** (21102.0 21245.5 22721.3 23423.7 26202.0) | **21114.0** (21114.0 21217.6 22526.9 27652.1 45405.6) | **19994.3** (19994.3 20725.5 21456.9 21488.1 39128.9) | **23677.3** (23677.3 25763.2 26768.1 34304.3 49272.2) |  |
+
+windows-11-arm, run 42331462575, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **171.0** (171.0 175.6 175.8 176.5 178.7) | **171.8** (171.8 172.2 173.0 175.7 176.0) | **177.7** (177.7 177.9 178.0 178.7 181.0) | **167.6** (167.6 169.2 175.2 178.3 179.7) | within |
+| create | p99 | **612.5** (612.5 621.9 634.7 644.2 661.1) | **616.6** (616.6 616.9 620.3 635.9 647.6) | **579.2** (579.2 615.9 616.3 648.3 690.5) | **628.4** (628.4 630.3 632.7 640.4 14559.3) | within |
+| create | p999 | **19699.7** (19699.7 23143.0 27931.0 31286.6 31512.7) | **31216.3** (31216.3 33799.4 34834.2 36521.4 36821.1) | **28548.5** (28548.5 32338.5 34240.0 34761.7 36434.8) | **34722.1** (34722.1 37391.1 37851.6 38956.4 47029.2) |  |
+| create | max | **40468.3** (40468.3 41335.1 50494.0 51034.4 96629.8) | **45831.5** (45831.5 58402.6 60254.6 74209.9 77351.5) | **45768.1** (45768.1 57482.9 58127.8 63008.2 66983.0) | **55602.0** (55602.0 67157.6 78175.3 78664.8 85427.2) |  |
+| stat | p50 | **139.0** (139.0 140.1 141.1 141.6 142.1) | **145.7** (145.7 145.9 147.8 148.3 149.3) | **146.2** (146.2 146.5 146.8 147.0 148.6) | **188.0** (188.0 208.4 231.4 243.7 439.3) | **worse**: 231.4 > 142.1 |
+| stat | p99 | **20918.9** (20918.9 24090.5 26343.9 28091.4 29125.2) | **616.8** (616.8 637.2 707.9 816.5 1624.0) | **585.0** (585.0 668.2 683.8 718.0 1070.9) | **36374.5** (36374.5 37667.8 38133.3 40758.6 44135.7) | **worse**: 38133.3 > 29125.2 |
+| stat | p999 | **48121.5** (48121.5 48178.3 48439.7 48727.5 49146.2) | **40220.1** (40220.1 41523.1 42623.9 43677.9 47272.9) | **37847.4** (37847.4 41271.5 41858.1 43926.9 45878.7) | **52441.4** (52441.4 57634.6 65294.8 66410.2 70212.8) |  |
+| stat | max | **66179.3** (66179.3 74455.1 80305.0 98805.9 140524.7) | **66896.9** (66896.9 87375.0 89494.9 127006.7 167689.6) | **52952.0** (52952.0 87590.9 89040.3 100745.5 119474.2) | **91247.6** (91247.6 94812.3 125553.9 146339.0 222955.6) |  |
+| read | p50 | **39.3** (39.3 40.2 40.9 41.3 41.4) | **40.2** (40.2 40.3 41.4 41.4 41.4) | **40.4** (40.4 40.5 40.5 40.8 41.3) | **39.2** (39.2 39.8 40.4 41.0 41.5) | within |
+| read | p99 | **61.3** (61.3 62.5 66.2 68.0 74.9) | **63.9** (63.9 65.8 67.0 67.6 71.2) | **63.4** (63.4 65.8 66.4 67.3 67.6) | **62.4** (62.4 63.4 67.4 68.3 68.3) | within |
+| read | p999 | **125.5** (125.5 136.6 137.8 149.7 152.6) | **128.5** (128.5 134.8 139.1 139.3 140.4) | **124.1** (124.1 129.1 129.2 134.8 153.6) | **131.8** (131.8 142.0 143.9 149.5 150.5) |  |
+| read | max | **176.5** (176.5 188.9 204.0 889.1 1227.2) | **163.2** (163.2 182.5 244.7 259.7 485.2) | **167.8** (167.8 169.0 269.0 760.3 809.2) | **185.6** (185.6 198.2 232.9 273.3 1013.2) |  |
+| write | p50 | **86.6** (86.6 87.5 88.6 92.4 92.4) | **175.2** (175.2 175.4 175.9 179.0 179.6) | **174.3** (174.3 174.6 176.3 178.6 179.0) | **157.1** (157.1 173.1 174.6 176.7 177.6) | **worse**: 174.6 > 92.4 |
+| write | p99 | **263.6** (263.6 277.0 296.8 304.2 314.1) | **366.2** (366.2 387.7 439.6 451.1 564.8) | **293.7** (293.7 309.9 317.2 411.3 639.2) | **311.9** (311.9 326.0 327.4 344.1 499.4) | **worse**: 327.4 > 314.1 |
+| write | p999 | **17885.8** (17885.8 26446.5 28068.9 29420.2 31805.0) | **28328.3** (28328.3 30057.3 31967.3 32430.1 33818.9) | **25565.5** (25565.5 29418.8 31101.7 32138.8 34078.8) | **34026.9** (34026.9 34827.0 34870.9 38819.0 38891.1) |  |
+| write | max | **42419.5** (42419.5 48610.4 51109.2 61881.6 69167.3) | **56126.3** (56126.3 67155.5 67782.0 74812.9 75150.5) | **46423.9** (46423.9 56181.4 63038.6 63679.0 134925.3) | **52794.0** (52794.0 57613.6 60221.4 66328.8 88792.6) |  |
+| rename | p50 | **387.0** (387.0 399.8 400.0 401.4 402.4) | **473.7** (473.7 475.7 479.5 480.0 484.0) | **457.3** (457.3 463.2 470.7 473.5 474.1) | **455.2** (455.2 482.9 485.5 487.8 492.4) | **worse**: 485.5 > 402.4 |
+| rename | p99 | **22703.6** (22703.6 23688.1 24088.2 24568.3 28282.6) | **34651.9** (34651.9 35120.6 35354.4 35399.0 36196.3) | **33766.4** (33766.4 34200.6 34574.5 34747.0 35074.5) | **51974.1** (51974.1 53279.4 53731.8 56160.6 62414.4) | **worse**: 53731.8 > 28282.6 |
+| rename | p999 | **67944.9** (67944.9 69472.2 71390.9 73407.6 83655.0) | **63155.6** (63155.6 68570.3 71616.2 77575.2 85448.8) | **66625.0** (66625.0 67861.2 70377.6 71149.4 74431.2) | **79628.1** (79628.1 83300.4 85331.2 89143.5 94343.5) |  |
+| rename | max | **136517.8** (136517.8 163139.1 180457.3 200145.6 210684.1) | **115737.5** (115737.5 119346.9 135035.9 165202.2 172489.8) | **103864.9** (103864.9 125999.3 129777.8 150190.8 236292.9) | **139629.5** (139629.5 156358.1 160553.6 165819.2 207217.2) |  |
+| unlink | p50 | **273.2** (273.2 276.6 277.5 280.2 281.3) | **312.2** (312.2 315.2 316.9 319.6 320.3) | **317.5** (317.5 319.3 320.1 322.7 327.2) | **324.4** (324.4 330.9 372.9 412.3 559.7) | **worse**: 372.9 > 281.3 |
+| unlink | p99 | **29816.6** (29816.6 33975.2 34961.5 36582.6 37740.3) | **23170.5** (23170.5 27129.1 27227.3 27381.8 28485.4) | **25037.7** (25037.7 25393.7 25841.0 26097.4 26678.2) | **39856.5** (39856.5 40882.3 44596.9 51930.5 55657.8) | **worse**: 44596.9 > 37740.3 |
+| unlink | p999 | **52069.3** (52069.3 56335.9 58472.4 59429.3 63937.6) | **86352.3** (86352.3 106233.6 116445.3 134012.6 136162.6) | **77084.9** (77084.9 99185.0 124972.5 136238.0 138404.3) | **193379.7** (193379.7 199512.0 231259.2 238346.6 266425.0) |  |
+| unlink | max | **91835.4** (91835.4 102838.9 105214.5 134131.1 146363.0) | **298895.4** (298895.4 355001.0 435583.8 562972.9 645979.9) | **288131.5** (288131.5 292391.2 299855.1 307103.7 373228.2) | **335520.3** (335520.3 360391.7 361202.0 438332.1 586045.1) |  |
+| fsync | p50 | **99.6** (99.6 102.2 103.2 103.6 104.1) | **90.9** (90.9 91.4 92.1 94.6 100.5) | **96.3** (96.3 96.7 97.0 97.4 98.2) | **96.0** (96.0 96.2 97.1 97.2 97.4) | within |
+| fsync | p99 | **313.2** (313.2 320.5 372.7 1282.9 2924.8) | **202.9** (202.9 210.2 219.0 221.6 224.0) | **217.7** (217.7 218.1 222.9 237.8 436.7) | **226.6** (226.6 283.7 284.1 389.2 577.8) | within |
+| fsync | p999 | **39129.7** (39129.7 41669.1 41889.3 46814.8 47595.5) | **28089.4** (28089.4 30181.2 30981.0 32618.6 37162.4) | **25498.2** (25498.2 32081.9 32165.3 32350.2 32473.0) | **37892.3** (37892.3 38756.6 39011.9 39849.8 41171.0) |  |
+| fsync | max | **58568.5** (58568.5 61813.4 69487.9 71609.7 78263.2) | **47595.0** (47595.0 52674.2 52941.2 62132.7 64099.4) | **48514.7** (48514.7 49673.7 57524.8 71543.0 86304.5) | **57523.7** (57523.7 67113.7 67543.1 74583.9 76339.2) |  |
+| open | p50 | **3511.3** (3511.3 3540.4 3540.9 3559.7 3633.3) | **3586.5** (3586.5 3595.5 3605.5 3617.4 3646.8) | **3557.3** (3557.3 3573.2 3578.0 3636.6 3734.5) | **3569.2** (3569.2 3570.2 3585.3 3605.4 3621.1) | within |
+| open | p99 | **38057.6** (38057.6 38105.7 39393.0 39755.1 43302.6) | **38204.8** (38204.8 38362.8 41466.2 42196.0 42501.2) | **39208.9** (39208.9 39612.3 40238.6 41539.0 45552.2) | **38150.5** (38150.5 39607.7 41592.0 41877.9 42750.8) | within |
+| open | p999 | **60516.2** (60516.2 61002.1 69892.8 72622.4 77807.7) | **76017.3** (76017.3 79510.5 82206.2 83611.5 93429.4) | **76221.5** (76221.5 80757.2 83854.9 95362.5 98023.8) | **70950.0** (70950.0 77652.8 80664.0 84112.5 90571.6) |  |
+| open | max | **75375.7** (75375.7 92081.9 112337.8 116689.0 230842.4) | **151316.0** (151316.0 158139.0 177929.9 226472.7 279043.0) | **150452.2** (150452.2 160342.2 172397.1 191721.1 226450.9) | **134413.8** (134413.8 152568.6 197094.4 212285.7 242856.2) |  |
+| close | p50 | **4029.0** (4029.0 4058.5 4084.4 4092.4 4214.3) | **4124.9** (4124.9 4154.5 4155.5 4174.6 4189.1) | **3802.8** (3802.8 3812.4 3937.9 4021.6 4121.3) | **3751.8** (3751.8 3778.7 3863.2 3883.7 3930.7) | within |
+| close | p99 | **43020.9** (43020.9 43660.8 45242.7 45639.4 50218.5) | **38542.0** (38542.0 41415.9 41552.1 41749.2 45205.7) | **42274.9** (42274.9 42387.7 43603.5 45476.9 46400.0) | **41184.4** (41184.4 42793.3 44568.4 45230.4 46408.4) | within |
+| close | p999 | **61683.9** (61683.9 66290.0 69778.4 71128.5 71361.8) | **56418.8** (56418.8 59152.7 61667.4 63658.9 67528.3) | **59763.7** (59763.7 64864.7 68811.3 71272.6 76654.7) | **64587.4** (64587.4 66615.1 68087.7 68739.6 68887.1) |  |
+| close | max | **78359.3** (78359.3 85966.3 98063.9 128851.7 208368.6) | **83720.0** (83720.0 90964.6 99845.7 101134.6 101643.6) | **83716.3** (83716.3 86777.5 101466.1 120159.4 183456.5) | **82641.2** (82641.2 89331.9 91007.5 98919.2 109739.1) |  |
+
+#### Run 42331462575, windows-latest
+
+**windows-latest, run 42331462575**: 5 runs done, 0 failed; arms dll, sep1, comb1, comb2.
+
+windows-latest, run 42331462575, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **468.8** (468.8 469.8 472.3 476.0 507.7) | **439.9** (439.9 462.9 466.8 476.3 481.0) | **454.9** (454.9 469.3 477.0 498.2 555.8) | **459.5** (459.5 482.8 492.0 494.4 496.9) | within |
+| create | p99 | **838.0** (838.0 855.2 864.3 882.6 896.3) | **850.8** (850.8 856.6 921.4 937.1 9778.7) | **840.5** (840.5 870.4 892.4 899.5 987.1) | **845.1** (845.1 908.9 910.7 911.5 2603.7) | **worse**: 910.7 > 896.3 |
+| create | p999 | **1922.4** (1922.4 1956.0 2163.4 2727.3 2753.1) | **18144.1** (18144.1 20271.3 22502.4 32785.8 34135.2) | **3917.0** (3917.0 4236.1 4297.4 5734.8 19703.5) | **3252.0** (3252.0 5915.4 15990.9 22090.2 33177.2) |  |
+| create | max | **24259.4** (24259.4 25548.5 26016.2 26432.9 27061.8) | **65715.3** (65715.3 91142.9 94812.2 125438.8 263531.3) | **68473.9** (68473.9 89322.5 96502.3 123955.5 153654.5) | **63804.3** (63804.3 65277.2 66351.0 69736.4 249828.1) |  |
+| stat | p50 | **116.3** (116.3 119.8 120.1 143.9 148.0) | **114.0** (114.0 120.4 122.0 122.2 128.6) | **123.2** (123.2 126.6 127.8 132.0 139.9) | **126.3** (126.3 136.9 137.9 138.6 141.7) | within |
+| stat | p99 | **172.6** (172.6 187.3 196.7 198.0 223.5) | **174.8** (174.8 202.4 212.7 216.3 218.4) | **193.4** (193.4 210.3 218.0 225.4 228.7) | **203.0** (203.0 211.1 219.9 228.5 270.6) | within |
+| stat | p999 | **232.8** (232.8 276.2 310.6 512.4 900.3) | **420.4** (420.4 490.0 523.3 540.3 569.6) | **506.5** (506.5 529.1 540.8 562.0 868.6) | **550.7** (550.7 557.2 781.2 999.9 1189.3) |  |
+| stat | max | **24442.8** (24442.8 24570.4 25491.0 25638.2 25718.4) | **10991.9** (10991.9 25565.6 64205.0 66235.2 98234.8) | **3803.5** (3803.5 24082.0 24855.0 25195.7 25552.1) | **1907.4** (1907.4 3554.5 23241.1 32050.9 66422.4) |  |
+| read | p50 | **4.0** (4.0 4.9 4.9 5.1 5.2) | **4.8** (4.8 5.2 5.3 5.6 5.8) | **4.2** (4.2 4.7 4.9 5.0 5.1) | **4.3** (4.3 4.8 4.8 5.1 5.2) | within |
+| read | p99 | **6.9** (6.9 7.8 8.8 8.9 9.3) | **7.7** (7.7 8.5 8.7 12.3 34.6) | **6.9** (6.9 7.3 10.0 11.0 11.4) | **6.4** (6.4 8.4 9.1 10.4 11.0) | within |
+| read | p999 | **21.8** (21.8 22.6 23.6 26.1 26.3) | **18.9** (18.9 24.1 24.5 45.8 129.7) | **19.4** (19.4 21.4 33.6 72.0 88.7) | **22.3** (22.3 25.4 25.5 25.9 95.9) |  |
+| read | max | **33.8** (33.8 35.9 64.1 87.4 100.5) | **34.8** (34.8 38.6 75.5 143.3 407.9) | **25.5** (25.5 34.9 102.8 147.2 171.5) | **40.2** (40.2 45.5 54.8 75.1 166.9) |  |
+| write | p50 | **35.4** (35.4 37.3 37.8 50.1 56.0) | **39.9** (39.9 41.4 44.4 45.3 49.9) | **43.7** (43.7 43.7 44.8 46.6 55.6) | **36.0** (36.0 39.7 41.3 54.2 55.1) | within |
+| write | p99 | **99.0** (99.0 101.2 110.4 112.6 119.2) | **105.8** (105.8 111.9 117.2 122.8 139.8) | **99.4** (99.4 116.6 118.4 125.2 134.6) | **115.2** (115.2 115.5 116.4 125.1 129.0) | within |
+| write | p999 | **336.6** (336.6 362.4 408.4 425.7 501.1) | **389.7** (389.7 413.2 413.3 2006.2 15392.5) | **367.9** (367.9 461.4 463.3 545.7 560.9) | **378.6** (378.6 440.9 443.8 557.5 1281.9) |  |
+| write | max | **1702.2** (1702.2 1957.4 24761.1 25321.0 25477.1) | **32098.0** (32098.0 33165.0 33401.9 33540.6 66275.3) | **31581.9** (31581.9 31903.7 32902.3 34772.2 35949.2) | **3071.0** (3071.0 31959.4 33376.2 33388.6 42838.1) |  |
+| rename | p50 | **234.0** (234.0 244.4 245.2 288.9 308.3) | **234.1** (234.1 242.0 242.7 250.3 261.6) | **245.1** (245.1 258.5 262.7 270.7 285.3) | **242.2** (242.2 271.9 280.4 286.4 291.1) | within |
+| rename | p99 | **381.8** (381.8 395.9 449.5 486.5 622.8) | **405.8** (405.8 441.8 488.4 493.5 604.9) | **408.7** (408.7 410.5 452.0 689.7 742.3) | **449.3** (449.3 452.1 461.4 613.4 619.7) | within |
+| rename | p999 | **670.0** (670.0 791.2 947.7 961.7 2167.6) | **979.4** (979.4 1180.3 1211.1 1403.5 26017.0) | **749.2** (749.2 937.2 1516.6 2219.5 10016.3) | **1314.7** (1314.7 1470.9 2421.9 3621.0 15291.1) |  |
+| rename | max | **2899.8** (2899.8 8403.6 25592.1 25737.3 26803.3) | **2590.8** (2590.8 32163.3 60632.0 97656.2 97688.3) | **2979.5** (2979.5 109776.8 112313.0 121326.4 122253.4) | **32884.5** (32884.5 33243.1 93774.0 97545.7 100880.0) |  |
+| unlink | p50 | **138.1** (138.1 146.5 147.4 161.9 174.5) | **145.4** (145.4 145.8 147.4 148.9 159.6) | **147.3** (147.3 161.9 164.8 168.2 175.4) | **144.8** (144.8 161.8 175.9 177.2 177.9) | **worse**: 175.9 > 174.5 |
+| unlink | p99 | **330.3** (330.3 347.2 402.3 475.0 570.6) | **333.1** (333.1 404.9 408.3 482.8 579.9) | **352.1** (352.1 360.6 395.4 483.9 596.5) | **418.6** (418.6 456.9 544.7 589.4 597.7) | within |
+| unlink | p999 | **536.5** (536.5 579.8 606.6 606.8 1160.2) | **470.7** (470.7 857.1 1213.0 1576.5 1816.4) | **525.1** (525.1 567.9 886.6 957.0 2087.5) | **1349.3** (1349.3 1764.0 3474.8 8633.9 25438.3) |  |
+| unlink | max | **3064.3** (3064.3 23481.3 24907.4 25605.1 25872.1) | **2266.4** (2266.4 3540.7 33654.0 77687.8 119383.2) | **24087.2** (24087.2 33819.7 64892.3 64917.5 85879.2) | **34032.4** (34032.4 35064.1 36828.8 65042.4 123792.9) |  |
+| fsync | p50 | **54.2** (54.2 56.2 56.3 73.3 80.8) | **55.0** (55.0 56.5 58.7 59.1 59.2) | **58.1** (58.1 59.5 60.8 60.9 66.2) | **56.0** (56.0 58.4 59.8 60.0 60.8) | within |
+| fsync | p99 | **109.4** (109.4 123.2 123.9 136.8 140.0) | **108.0** (108.0 110.8 117.7 118.1 155.2) | **111.8** (111.8 120.9 124.5 125.2 132.7) | **112.6** (112.6 113.5 117.5 123.4 125.7) | within |
+| fsync | p999 | **381.4** (381.4 442.5 495.1 602.7 857.3) | **229.5** (229.5 472.4 712.4 1254.5 3020.9) | **274.8** (274.8 334.6 449.5 455.6 657.1) | **400.1** (400.1 530.6 569.6 745.3 1144.4) |  |
+| fsync | max | **2293.2** (2293.2 3078.5 15738.9 24706.4 24872.0) | **25562.4** (25562.4 53067.0 54327.7 59374.2 65112.3) | **26092.3** (26092.3 31842.0 32822.6 33389.6 64753.7) | **13999.2** (13999.2 26511.9 32688.5 56052.8 65451.5) |  |
+| open | p50 | **63.5** (63.5 66.1 66.9 72.0 74.2) | **63.6** (63.6 65.8 72.0 72.3 79.9) | **60.3** (60.3 76.3 78.7 79.0 82.8) | **68.8** (68.8 75.0 76.2 76.5 77.4) | **worse**: 76.2 > 74.2 |
+| open | p99 | **112.3** (112.3 117.1 128.7 138.5 148.9) | **109.3** (109.3 132.7 149.3 161.8 294.7) | **116.2** (116.2 142.8 244.9 279.7 396.0) | **117.3** (117.3 128.3 142.9 150.2 337.8) | within |
+| open | p999 | **198.6** (198.6 212.4 337.0 368.9 546.8) | **417.4** (417.4 485.3 545.0 556.6 665.2) | **424.7** (424.7 459.9 563.5 573.5 1006.1) | **499.4** (499.4 507.6 926.3 1115.3 1129.6) |  |
+| open | max | **962.7** (962.7 1457.3 1894.2 2977.9 25001.4) | **974.2** (974.2 33033.5 33383.9 33505.5 34012.3) | **23219.9** (23219.9 24630.4 25266.9 25305.7 28056.9) | **572.4** (572.4 1735.3 24967.5 25177.0 33502.7) |  |
+| close | p50 | **27.4** (27.4 28.3 28.4 29.1 33.2) | **28.5** (28.5 29.8 30.6 30.7 30.9) | **29.8** (29.8 29.8 30.6 30.8 31.1) | **28.9** (28.9 29.7 30.7 30.8 30.8) | within |
+| close | p99 | **53.3** (53.3 58.2 66.0 68.1 68.3) | **64.7** (64.7 65.0 71.8 71.8 83.8) | **65.0** (65.0 66.9 75.5 79.1 81.5) | **53.2** (53.2 66.5 66.8 75.0 85.3) | within |
+| close | p999 | **300.8** (300.8 303.3 314.8 323.7 328.8) | **286.5** (286.5 299.7 303.2 346.4 347.7) | **288.8** (288.8 294.8 298.9 301.2 330.8) | **271.7** (271.7 295.9 301.7 363.8 844.5) |  |
+| close | max | **547.6** (547.6 778.3 1264.0 1870.9 24363.4) | **617.4** (617.4 839.7 1312.7 31945.1 33121.6) | **384.4** (384.4 1998.6 7207.5 15570.1 33250.9) | **644.9** (644.9 659.1 1470.0 2665.8 24572.0) |  |
+
+windows-latest, run 42331462575, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | dll | sep1 | comb1 | comb2 | comb2 vs dll |
+|---|---|---|---|---|---|---|
+| create | p50 | **720.1** (720.1 728.0 742.0 743.2 750.2) | **711.9** (711.9 712.6 720.1 723.9 726.7) | **709.3** (709.3 716.9 736.8 766.9 770.6) | **875.9** (875.9 876.3 879.0 885.9 887.5) | **worse**: 879.0 > 750.2 |
+| create | p99 | **202418.2** (202418.2 204806.8 209150.4 218903.8 230663.7) | **63974.2** (63974.2 64647.1 64887.7 65843.0 72353.5) | **64764.2** (64764.2 66469.4 66593.3 78587.3 88496.0) | **228644.7** (228644.7 232293.9 234820.6 235631.9 236916.7) | **worse**: 234820.6 > 230663.7 |
+| create | p999 | **263189.8** (263189.8 274871.1 278672.6 282910.3 484536.6) | **122934.0** (122934.0 130930.4 138128.8 143053.0 166633.1) | **147700.2** (147700.2 160895.7 161224.8 164118.1 167139.4) | **285291.8** (285291.8 290110.7 292393.1 297085.5 299015.6) |  |
+| create | max | **306550.5** (306550.5 314850.0 435467.8 728709.8 1116276.6) | **168933.3** (168933.3 172486.0 200035.4 200112.5 283360.6) | **284257.0** (284257.0 288204.7 313885.4 318511.0 327489.9) | **349997.1** (349997.1 353450.4 368812.7 392282.7 407414.3) |  |
+| stat | p50 | **139.3** (139.3 139.9 141.2 144.2 144.4) | **132.9** (132.9 133.2 133.5 135.0 136.0) | **131.7** (131.7 134.4 135.9 137.5 139.1) | **130.7** (130.7 145.1 158.7 161.0 172.5) | **worse**: 158.7 > 144.4 |
+| stat | p99 | **94964.7** (94964.7 96740.9 107706.1 110813.2 114879.2) | **294.1** (294.1 331.7 341.1 359.8 419.2) | **273.2** (273.2 311.6 348.5 385.1 432.5) | **97700.5** (97700.5 98226.9 99697.6 102963.4 110656.1) | within |
+| stat | p999 | **137378.0** (137378.0 140040.5 158695.9 160191.3 224332.6) | **68216.6** (68216.6 74445.7 75326.1 75339.4 79294.2) | **66127.7** (66127.7 66289.0 76665.2 81799.1 95625.5) | **153671.0** (153671.0 164874.7 176299.9 178682.2 191777.1) |  |
+| stat | max | **179154.9** (179154.9 195013.7 212823.9 221507.3 689956.2) | **131102.7** (131102.7 135319.6 150575.8 174121.7 175830.9) | **119154.8** (119154.8 129491.8 136179.9 145899.3 229096.0) | **455508.9** (455508.9 644280.6 722809.6 724977.9 867021.1) |  |
+| read | p50 | **51.4** (51.4 52.6 53.2 53.4 53.5) | **6.4** (6.4 6.6 40.5 41.3 41.9) | **41.5** (41.5 42.8 43.6 44.5 44.6) | **44.6** (44.6 45.3 45.6 46.1 46.6) | within |
+| read | p99 | **137.3** (137.3 156.5 168.8 169.8 207.0) | **82.9** (82.9 86.0 99.0 99.5 116.1) | **103.9** (103.9 104.4 114.2 122.1 125.0) | **159.1** (159.1 177.2 185.2 191.4 1101.2) | within |
+| read | p999 | **67000.0** (67000.0 68514.6 71890.7 78709.9 79605.9) | **3549.7** (3549.7 4172.0 31088.3 32424.9 60510.6) | **32482.0** (32482.0 33588.5 34948.7 35651.8 49003.1) | **74031.7** (74031.7 75125.4 78807.9 79361.3 91198.4) |  |
+| read | max | **105787.3** (105787.3 121786.8 123048.2 130654.0 137369.2) | **58364.7** (58364.7 82627.3 110973.9 153017.5 164516.0) | **65446.0** (65446.0 89545.0 99002.0 106464.4 155778.2) | **104155.7** (104155.7 126941.7 143178.5 159302.7 241677.1) |  |
+| write | p50 | **54.9** (54.9 54.9 56.1 56.6 57.6) | **43.5** (43.5 43.9 45.5 45.5 45.6) | **44.5** (44.5 45.2 46.0 47.4 47.9) | **47.1** (47.1 48.0 49.3 49.4 51.0) | within |
+| write | p99 | **358.6** (358.6 369.2 385.3 5982.5 34735.0) | **161.1** (161.1 161.2 186.9 201.5 298.7) | **183.0** (183.0 209.0 220.5 16074.9 30550.0) | **373.1** (373.1 398.4 1101.1 22344.0 22569.3) | within |
+| write | p999 | **39683.6** (39683.6 51121.6 55810.3 57979.0 82978.5) | **57599.8** (57599.8 57812.4 58077.7 62175.0 65667.5) | **61996.6** (61996.6 65416.9 66410.7 73921.0 86424.4) | **66941.6** (66941.6 67415.7 68152.2 68822.2 81092.8) |  |
+| write | max | **91007.3** (91007.3 101284.6 102326.0 107370.5 195338.9) | **95681.9** (95681.9 109205.5 111540.9 112435.8 128837.7) | **106761.7** (106761.7 128902.7 129728.3 145314.9 152803.8) | **101910.9** (101910.9 123559.8 128593.8 141914.9 142051.8) |  |
+| rename | p50 | **316.0** (316.0 320.0 323.5 324.6 327.1) | **288.1** (288.1 289.8 290.9 291.6 296.8) | **296.6** (296.6 301.7 305.6 325.7 326.1) | **287.8** (287.8 308.4 315.9 318.0 335.6) | within |
+| rename | p99 | **1326.5** (1326.5 1370.5 1452.0 1694.0 1866.8) | **1575.8** (1575.8 1602.9 6462.9 11252.6 11978.0) | **2197.9** (2197.9 6185.6 9467.7 10261.5 10702.5) | **103271.5** (103271.5 104663.2 110273.6 118064.3 120566.5) | **worse**: 110273.6 > 1866.8 |
+| rename | p999 | **107506.7** (107506.7 110396.0 113110.8 117082.9 122187.3) | **89453.6** (89453.6 97802.1 99370.5 100616.7 106798.3) | **89708.8** (89708.8 97723.0 97852.8 99348.8 99801.3) | **155838.7** (155838.7 160653.7 162422.0 169347.3 178365.5) |  |
+| rename | max | **165505.3** (165505.3 177673.4 183029.0 194242.2 218969.9) | **119986.2** (119986.2 130906.6 165462.7 165546.0 406578.7) | **131452.5** (131452.5 150431.2 168833.8 181171.7 195784.9) | **198923.6** (198923.6 223369.2 229349.0 241138.3 279439.0) |  |
+| unlink | p50 | **177.4** (177.4 179.9 180.3 183.2 183.6) | **163.3** (163.3 171.4 174.1 178.1 178.5) | **171.2** (171.2 196.0 205.2 210.7 220.3) | **172.1** (172.1 205.2 206.7 208.1 212.6) | **worse**: 206.7 > 183.6 |
+| unlink | p99 | **98010.8** (98010.8 104119.1 106116.4 112195.7 120867.2) | **819.9** (819.9 956.0 1031.2 1075.1 1192.2) | **948.8** (948.8 1123.9 1134.7 1179.3 1203.5) | **134211.3** (134211.3 234283.8 340975.3 353929.4 383911.9) | **worse**: 340975.3 > 120867.2 |
+| unlink | p999 | **137018.9** (137018.9 148331.8 160725.2 169122.1 190166.6) | **66382.1** (66382.1 73223.6 81822.5 96838.2 106372.8) | **67315.7** (67315.7 87449.6 97084.1 98814.2 100088.2) | **849648.7** (849648.7 1104093.1 1205669.6 1397812.9 1500209.4) |  |
+| unlink | max | **196417.3** (196417.3 203134.9 212465.9 282084.8 560197.3) | **144507.0** (144507.0 369425.4 370051.2 1109137.2 1558421.7) | **497918.2** (497918.2 550405.0 913209.1 1631661.8 1852456.4) | **2057420.6** (2057420.6 2430505.1 3079353.5 3170890.6 3250164.3) |  |
+| fsync | p50 | **87.1** (87.1 87.9 88.0 88.4 89.1) | **63.0** (63.0 63.7 64.7 65.1 65.2) | **66.2** (66.2 66.7 67.4 70.8 71.7) | **69.0** (69.0 70.4 71.4 72.9 74.0) | within |
+| fsync | p99 | **217.5** (217.5 236.6 243.0 304.2 33650.8) | **170.4** (170.4 173.7 183.1 187.0 215.3) | **195.1** (195.1 203.7 209.0 741.6 969.1) | **232.4** (232.4 250.1 334.1 376.0 892.1) | within |
+| fsync | p999 | **39489.3** (39489.3 56305.6 57274.9 64888.1 100245.7) | **33726.9** (33726.9 49983.2 57240.0 57851.0 69775.2) | **65692.5** (65692.5 67334.4 67894.3 84101.8 85685.9) | **31953.8** (31953.8 65334.8 68314.4 71863.3 76263.7) |  |
+| fsync | max | **80042.5** (80042.5 106427.9 114862.4 131518.8 195850.7) | **96411.7** (96411.7 97004.2 97945.8 132550.6 144342.1) | **127655.0** (127655.0 131089.3 146503.7 161205.8 210969.3) | **106013.8** (106013.8 106197.2 107775.6 134143.6 155273.8) |  |
+| open | p50 | **79.5** (79.5 81.2 83.3 85.5 87.6) | **81.3** (81.3 83.9 86.1 86.3 86.6) | **89.6** (89.6 99.6 100.6 105.0 105.7) | **90.7** (90.7 94.7 101.5 103.8 105.2) | **worse**: 101.5 > 87.6 |
+| open | p99 | **261.5** (261.5 357.8 25342.9 36183.6 41351.8) | **206.7** (206.7 217.9 228.6 240.9 246.1) | **217.9** (217.9 230.4 246.1 267.9 281.9) | **730.3** (730.3 1148.5 1207.5 1412.0 2420.5) | within |
+| open | p999 | **71996.6** (71996.6 75805.5 82328.8 87021.7 91953.4) | **57997.7** (57997.7 62522.4 65158.2 66487.4 66620.5) | **52468.5** (52468.5 62638.5 64187.3 65302.5 65436.0) | **86037.2** (86037.2 87930.7 97262.2 98533.6 108486.8) |  |
+| open | max | **99220.5** (99220.5 104797.2 130610.8 135735.9 166056.8) | **102466.4** (102466.4 117685.7 128549.7 137611.3 141699.6) | **107116.9** (107116.9 124526.0 128513.7 128853.3 131125.0) | **100037.1** (100037.1 121964.4 176153.3 313319.2 881913.8) |  |
+| close | p50 | **31.1** (31.1 31.4 31.7 31.9 32.0) | **31.7** (31.7 32.1 32.4 32.5 32.6) | **33.2** (33.2 33.3 33.7 34.1 34.4) | **33.9** (33.9 34.3 34.5 34.7 35.0) | **worse**: 34.5 > 32.0 |
+| close | p99 | **104.3** (104.3 109.1 110.2 122.5 182.3) | **79.8** (79.8 82.3 85.7 92.7 94.7) | **87.6** (87.6 96.3 96.7 101.4 108.4) | **109.0** (109.0 118.3 121.4 122.7 132.3) | within |
+| close | p999 | **664.7** (664.7 762.0 764.0 2511.3 43395.9) | **589.3** (589.3 611.7 746.5 13405.7 15649.8) | **625.0** (625.0 644.6 21254.7 21410.2 39062.1) | **1069.4** (1069.4 10066.2 53412.8 53443.5 68469.1) |  |
+| close | max | **67412.7** (67412.7 83213.5 92947.5 97032.0 181759.2) | **86192.7** (86192.7 94410.2 97641.0 109164.8 130193.0) | **89616.9** (89616.9 93862.3 95364.3 106123.4 135560.8) | **101549.7** (101549.7 105132.9 109031.8 126221.9 129964.2) |  |
+
+**Where the arm64 gap goes (a stat: a Create, a Cleanup and a Close IRP; quiet; from the per-phase profile, before the
+allocation fix).**
+- The journal, the receiver's side, per IRP: the stamp 0.2 µs; the capture 1.2 (its allocations since removed, −4.5 µs a
+  stat above); the decode 0.2; the copy into the working packet that keeps the captured original immutable 0.5; the
+  response's save 0.35; the hand-off 0.35. A Create also confirms its open: 0.7 to post, 1.1 to take the answer. About 3 to
+  4.5 µs an IRP before the fix.
+- The open ledger on the shard: +1.0 µs on an Open's serve, +0.5 on a Release's.
+- A-198's barriers (an Open and a Release wait for the shard's publication, so a successor's volume holds every handle the
+  ledger names): +1.1 µs on an Open, +2.2 on a Release.
+- Direct output into the held section: +0.5 µs a call against the DLL's buffered call (runs 42114236343 and 42190796283).
+- The kernel's share: 3 to 5 µs an IRP between requests, inside the transaction call. It is not the call's wait form (three
+  forms equal within 0.3 µs, run 42190796283), not our interface callbacks (level or faster than `dll`'s), and not the
+  DLL's op function (its access check 0.5 µs in `dll`, 0.6 in `comb2`). User-mode timing places it no further.
+
+- Not crash safety's, and kept, because the baseline is wrong without it: an unlink's `CanDelete` asks the shard (2.6 µs at
+  the p50 in `comb2`, run 42185624364) where `dll` answers at once (0.3 µs). `71cf09ac`'s `can_delete` answers success
+  without reading the volume, leaving the empty-directory check to Cleanup's `rmdir`, but Cleanup answers the kernel
+  nothing. So `RemoveDirectoryW` of a directory holding a file returned success and removed nothing. winfstest's
+  `t/base/03.t` found it on both runners (diagnostics run 41982130174), and main fixed it in `045c0f62`, held by
+  `a_directory_holding_a_file_is_not_removed` (`crates/cli/tests/winfsp_semantics.rs`). The baseline's unlink is cheaper
+  because it is wrong. For a file the shard only reads the object's kind and answers yes. The trip stays because the
+  receiver cannot tell a file's context from a directory's without the shard; carrying the kind in the open's context
+  would let a file's `CanDelete` answer at once (a lever, not taken here).
+
+**What follows.** Crash safety's price on arm64 is about 18 µs a stat and 30 to 35 µs a rename or an unlink, quiet: the
+journal, the ledger and A-198's barriers, with direct output and the kernel's share. Of an unlink's gap, about 2.3 µs is
+`CanDelete`'s check, which the baseline skips at the cost of a wrong answer. The DLL dispatcher it is measured against
+is faster and carries the crash defect A-198 fixes, so the price is kept (R4). On x86_64 main's form and `comb1` are
+nearly level with `dll` quiet.
+
+### The form to ship: A-215's combined transact measured against main's separate one, and rejected
+
+**The question.** Main serves with one receive worker that sends each response in a call of its own and then receives
+(the separate form). A-215's combined form hands a batch's last response to the call that receives the next batch, as
+WinFsp's own dispatcher does. It lands only if it beats the separate form beyond the spread somewhere and loses nowhere.
+
+**The command and the arms.** `windows-ab.sh` as above, two arms, five runs a runner, quiet and loaded. `sep1`: main's
+form with the allocation fix ported (`002d2f11`, `agents/winfsp-overlap-14`). `comb1`: the combined form at one fixed
+worker with the same fix (`792977e9`). Diagnostics run 42354811410 (`diag-winfsp-overlap-42`), 2026-11-07 08:29 to 09:07
+UTC; windows-11-arm image win11-vs2026-arm64 20261101.203.1 (ARM64 Family 8 Model D49), windows-latest image
+win25-vs2026 20261103.298.1 (AMD64 Family 25 Model 1, AuthenticAMD), WinFsp 2.1.25156. Five runs each, none failed, no
+heartbeat lapse; one shard on x86_64 and three on arm64 for both arms, as each build derives.
+
+**The verdict.** Cells worse than the other arm beyond its spread, of 18:
+
+| runner | `comb1` worse than `sep1` (quiet, loaded) | `sep1` worse than `comb1` (quiet, loaded) |
+|---|---|---|
+| windows-11-arm | 4, 5 | 8, 2 |
+| windows-latest | 1, 7 | 1, 1 |
+
+The combined form wins some cells, most of them quiet on arm64, and loses on both runners: on arm64 a read's, an open's,
+a close's and a create's p50, and on x86_64 a loaded stat, read, write and fsync. It does not land. **A-215 is measured
+and rejected**, with A-219's second worker, which needs it (`agents/winfsp-overlap-7`, not landed). Main's separate form
+ships, with the allocation fix.
+
+#### Run 42354811410, windows-11-arm (every run; the verdict column is `comb1` against `sep1`)
+
+**windows-11-arm, run 42354811410**: 5 runs done, 0 failed; arms sep1, comb1.
+
+windows-11-arm, run 42354811410, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | sep1 | comb1 | comb1 vs sep1 |
+|---|---|---|---|---|
+| create | p50 | **179.4** (179.4 180.5 180.8 180.9 184.9) | **152.9** (152.9 158.5 163.5 169.6 169.9) | within |
+| create | p99 | **250.5** (250.5 253.7 266.0 276.1 433.0) | **235.9** (235.9 236.5 242.5 259.4 262.8) | within |
+| create | p999 | **599.0** (599.0 629.0 656.2 829.8 840.9) | **574.8** (574.8 607.5 610.7 628.0 825.9) |  |
+| create | max | **3495.9** (3495.9 17593.6 17879.4 18148.6 39152.7) | **1719.0** (1719.0 3307.5 5478.3 5667.6 17847.3) |  |
+| stat | p50 | **143.3** (143.3 143.7 144.6 144.6 145.2) | **142.4** (142.4 143.0 144.5 144.6 144.8) | within |
+| stat | p99 | **206.7** (206.7 207.3 208.7 208.9 213.6) | **194.4** (194.4 197.8 200.3 201.5 206.8) | within |
+| stat | p999 | **496.6** (496.6 497.0 505.1 521.1 566.4) | **498.1** (498.1 519.4 530.0 538.3 546.4) |  |
+| stat | max | **925.9** (925.9 1453.6 3323.0 3387.2 4030.6) | **3012.1** (3012.1 3098.0 3893.4 10766.8 17686.2) |  |
+| read | p50 | **24.4** (24.4 25.2 25.2 26.3 26.5) | **28.7** (28.7 32.3 33.0 33.7 37.5) | **worse**: 33.0 > 26.5 |
+| read | p99 | **47.5** (47.5 47.8 50.0 50.9 55.4) | **48.4** (48.4 49.1 49.3 49.8 56.4) | within |
+| read | p999 | **89.4** (89.4 102.0 104.1 108.1 115.5) | **83.6** (83.6 97.5 99.9 109.3 114.5) |  |
+| read | max | **156.6** (156.6 166.4 248.9 1449.3 1534.9) | **140.4** (140.4 143.0 143.6 712.2 1022.2) |  |
+| write | p50 | **76.5** (76.5 76.8 77.2 77.8 79.5) | **75.1** (75.1 75.7 76.1 76.3 76.5) | within |
+| write | p99 | **190.8** (190.8 192.8 194.7 199.8 213.7) | **187.5** (187.5 192.3 192.9 203.4 208.3) | within |
+| write | p999 | **347.2** (347.2 405.4 423.6 423.7 575.3) | **382.4** (382.4 397.9 431.2 461.1 469.6) |  |
+| write | max | **1984.3** (1984.3 3314.3 15836.4 46655.6 93714.2) | **2058.9** (2058.9 2371.0 3402.6 3527.2 3940.7) |  |
+| rename | p50 | **425.3** (425.3 426.1 427.2 432.4 437.6) | **384.2** (384.2 391.3 394.7 398.8 403.0) | within |
+| rename | p99 | **804.2** (804.2 828.7 923.7 980.9 1125.0) | **771.9** (771.9 784.4 807.8 933.7 1340.5) | within |
+| rename | p999 | **3307.4** (3307.4 3329.9 4271.1 4388.5 5306.5) | **2467.7** (2467.7 5488.1 6761.8 8329.1 10553.3) |  |
+| rename | max | **26403.7** (26403.7 27645.4 29172.9 29557.7 39690.6) | **25161.2** (25161.2 45163.1 55246.5 58108.3 69358.4) |  |
+| unlink | p50 | **267.6** (267.6 270.9 273.2 278.2 280.9) | **246.6** (246.6 249.0 253.4 255.8 255.8) | within |
+| unlink | p99 | **476.8** (476.8 497.4 502.9 504.7 539.7) | **457.1** (457.1 465.8 466.6 496.7 579.0) | within |
+| unlink | p999 | **908.0** (908.0 955.1 1490.2 1613.9 4098.6) | **629.4** (629.4 708.5 783.0 1023.6 2280.9) |  |
+| unlink | max | **83097.2** (83097.2 106276.3 123664.4 127682.4 207021.6) | **14260.7** (14260.7 145205.7 165852.5 165943.0 184750.6) |  |
+| fsync | p50 | **101.6** (101.6 101.8 102.1 102.4 102.8) | **90.0** (90.0 90.7 91.1 91.5 96.1) | within |
+| fsync | p99 | **156.1** (156.1 158.3 158.6 159.7 172.5) | **151.0** (151.0 151.9 154.5 154.8 224.9) | within |
+| fsync | p999 | **393.2** (393.2 402.2 420.0 468.0 548.3) | **371.6** (371.6 379.3 398.0 424.9 451.0) |  |
+| fsync | max | **1822.8** (1822.8 2938.8 8858.4 15851.5 76372.9) | **659.7** (659.7 2345.8 3276.2 3345.6 17062.6) |  |
+| open | p50 | **136.2** (136.2 137.7 140.9 141.0 152.9) | **540.3** (540.3 739.7 896.1 3568.5 3594.0) | **worse**: 896.1 > 152.9 |
+| open | p99 | **4598.4** (4598.4 4692.9 4708.2 4750.3 4777.0) | **4710.2** (4710.2 4711.8 4805.3 4849.1 4886.7) | **worse**: 4805.3 > 4777.0 |
+| open | p999 | **6998.2** (6998.2 7019.1 7500.1 8378.0 10971.9) | **6601.3** (6601.3 7505.9 7876.1 8013.1 8531.7) |  |
+| open | max | **68036.3** (68036.3 102682.9 103129.8 122923.7 286685.9) | **65535.3** (65535.3 65799.7 86230.5 102286.4 123365.5) |  |
+| close | p50 | **3677.5** (3677.5 3680.9 3695.6 3699.4 3714.2) | **3719.0** (3719.0 3796.7 3797.6 3814.2 3824.6) | **worse**: 3797.6 > 3714.2 |
+| close | p99 | **5145.8** (5145.8 5296.0 5442.5 6211.7 6499.5) | **5227.6** (5227.6 5232.8 5245.1 5347.4 5427.6) | within |
+| close | p999 | **17504.2** (17504.2 17637.7 17647.6 17651.5 17673.6) | **17433.8** (17433.8 17536.1 17593.4 17607.8 17658.9) |  |
+| close | max | **19835.8** (19835.8 21122.7 21191.8 21701.2 31050.9) | **19937.3** (19937.3 23528.2 23916.2 27043.1 32629.7) |  |
+
+windows-11-arm, run 42354811410, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | sep1 | comb1 | comb1 vs sep1 |
+|---|---|---|---|---|
+| create | p50 | **172.1** (172.1 174.0 174.2 174.4 176.6) | **172.3** (172.3 178.3 180.4 180.5 180.6) | **worse**: 180.4 > 176.6 |
+| create | p99 | **615.7** (615.7 620.8 625.1 626.2 646.9) | **607.0** (607.0 618.3 622.6 627.5 638.6) | within |
+| create | p999 | **30824.7** (30824.7 33398.3 33578.6 34054.9 34731.3) | **30255.6** (30255.6 32039.0 32468.7 34336.0 34898.3) |  |
+| create | max | **40810.7** (40810.7 45010.2 47478.9 54445.8 64579.5) | **43062.9** (43062.9 49232.9 53280.3 55964.1 72310.9) |  |
+| stat | p50 | **150.6** (150.6 150.7 151.3 151.7 152.0) | **141.1** (141.1 149.1 149.5 150.2 151.4) | within |
+| stat | p99 | **595.7** (595.7 616.5 705.7 714.6 1489.3) | **617.9** (617.9 625.0 640.6 679.3 6613.6) | within |
+| stat | p999 | **37876.2** (37876.2 38188.2 38263.1 38417.9 39136.1) | **38708.6** (38708.6 39415.6 39606.7 40030.9 45462.8) |  |
+| stat | max | **69413.5** (69413.5 75324.3 79872.0 120413.7 135262.9) | **70712.6** (70712.6 94764.7 113321.3 119517.3 131897.7) |  |
+| read | p50 | **41.6** (41.6 41.9 42.1 42.1 42.4) | **40.3** (40.3 41.2 41.2 41.3 41.5) | within |
+| read | p99 | **60.8** (60.8 61.3 62.4 63.4 65.6) | **59.5** (59.5 60.9 61.4 61.8 63.1) | within |
+| read | p999 | **124.2** (124.2 128.2 128.5 129.1 131.1) | **123.4** (123.4 126.8 127.2 131.0 132.5) |  |
+| read | max | **151.6** (151.6 173.0 175.1 221.1 1047.3) | **142.4** (142.4 171.1 196.7 206.3 449.3) |  |
+| write | p50 | **178.5** (178.5 180.1 182.4 182.8 182.9) | **177.9** (177.9 184.4 185.0 185.3 186.4) | **worse**: 185.0 > 182.9 |
+| write | p99 | **440.6** (440.6 445.7 486.7 536.9 617.5) | **291.7** (291.7 292.1 317.5 396.1 403.9) | within |
+| write | p999 | **25499.2** (25499.2 31650.0 31860.4 32958.9 34099.4) | **33405.7** (33405.7 33623.2 33797.6 36664.2 37492.3) |  |
+| write | max | **40979.6** (40979.6 45909.7 50726.9 53724.6 72373.4) | **48447.8** (48447.8 50014.6 50038.6 55758.3 56303.1) |  |
+| rename | p50 | **468.8** (468.8 471.6 477.6 479.7 491.1) | **440.4** (440.4 466.1 469.4 473.3 481.3) | within |
+| rename | p99 | **34511.7** (34511.7 35036.1 35196.0 35535.4 35851.9) | **34271.8** (34271.8 34465.6 34856.9 35453.4 38073.9) | within |
+| rename | p999 | **57179.1** (57179.1 59193.9 66839.8 66899.3 67403.4) | **64629.6** (64629.6 70853.3 70970.4 72937.2 81539.4) |  |
+| rename | max | **104356.7** (104356.7 109718.0 117719.7 134604.0 139538.0) | **131283.1** (131283.1 137052.6 151795.8 167095.8 183419.5) |  |
+| unlink | p50 | **322.8** (322.8 323.5 329.8 331.1 334.2) | **334.9** (334.9 335.6 335.6 339.9 408.8) | **worse**: 335.6 > 334.2 |
+| unlink | p99 | **25479.5** (25479.5 25592.4 27138.1 27781.1 29058.8) | **26040.6** (26040.6 26065.1 26130.5 28911.0 34788.9) | within |
+| unlink | p999 | **85549.9** (85549.9 97799.7 103148.5 148916.9 155842.0) | **83324.3** (83324.3 101605.2 108166.8 122061.0 147122.0) |  |
+| unlink | max | **292194.6** (292194.6 319846.9 347362.3 402799.3 452467.6) | **315380.2** (315380.2 321890.3 334075.8 338142.7 370105.5) |  |
+| fsync | p50 | **90.4** (90.4 90.9 91.3 93.4 96.0) | **94.2** (94.2 95.5 95.6 96.6 97.5) | within |
+| fsync | p99 | **190.4** (190.4 212.2 220.9 230.3 245.5) | **189.9** (189.9 195.6 196.7 202.8 316.1) | within |
+| fsync | p999 | **31172.1** (31172.1 32298.7 32861.7 34148.6 38292.2) | **27502.2** (27502.2 27813.2 31205.3 33972.1 37072.8) |  |
+| fsync | max | **40546.2** (40546.2 55352.2 55596.7 56653.0 69890.4) | **41058.5** (41058.5 46289.4 50574.7 53097.8 54271.2) |  |
+| open | p50 | **3674.3** (3674.3 3682.5 3726.7 3739.8 3744.8) | **3694.0** (3694.0 3723.1 3773.4 3779.7 3800.4) | **worse**: 3773.4 > 3744.8 |
+| open | p99 | **36103.3** (36103.3 36198.5 36199.8 36906.7 37330.0) | **32704.2** (32704.2 33874.0 36246.2 36960.5 37689.2) | within |
+| open | p999 | **58896.6** (58896.6 63451.5 72600.5 75796.1 80861.2) | **60018.7** (60018.7 73414.9 74350.1 79197.8 83676.6) |  |
+| open | max | **150773.8** (150773.8 194237.6 198602.5 202267.6 215527.1) | **164693.4** (164693.4 180938.1 211707.7 226031.9 229473.0) |  |
+| close | p50 | **4238.6** (4238.6 4252.1 4267.9 4288.2 4298.9) | **4283.1** (4283.1 4290.1 4320.7 4353.8 4394.6) | **worse**: 4320.7 > 4298.9 |
+| close | p99 | **35218.0** (35218.0 35886.3 36500.9 37293.2 37373.5) | **36868.0** (36868.0 37195.6 37228.1 37615.8 38079.2) | within |
+| close | p999 | **51111.8** (51111.8 52137.2 54468.5 54620.0 54803.7) | **51354.7** (51354.7 54114.6 54711.4 55700.9 56243.5) |  |
+| close | max | **68135.4** (68135.4 87065.9 87404.6 93349.4 101665.8) | **72872.7** (72872.7 84319.2 99111.9 103239.5 103820.5) |  |
+
+#### Run 42354811410, windows-latest
+
+**windows-latest, run 42354811410**: 5 runs done, 0 failed; arms sep1, comb1.
+
+windows-latest, run 42354811410, quiet. Each cell: best, then every run sorted, µs.
+
+| op | rank | sep1 | comb1 | comb1 vs sep1 |
+|---|---|---|---|---|
+| create | p50 | **919.2** (919.2 928.4 949.7 952.4 974.7) | **930.8** (930.8 938.6 951.2 953.1 983.3) | within |
+| create | p99 | **1522.0** (1522.0 1526.0 1547.1 1555.3 1556.6) | **1501.5** (1501.5 1514.3 1523.0 1523.2 1566.1) | within |
+| create | p999 | **8181.5** (8181.5 14232.3 32301.3 32540.6 32653.8) | **2659.9** (2659.9 14285.4 20239.2 32409.5 33910.8) |  |
+| create | max | **73812.6** (73812.6 77343.7 80854.5 101298.9 110112.6) | **66284.1** (66284.1 78562.9 79104.3 83855.5 97555.2) |  |
+| stat | p50 | **288.4** (288.4 300.5 302.3 303.6 314.7) | **305.8** (305.8 307.0 310.0 310.6 326.0) | within |
+| stat | p99 | **400.6** (400.6 416.9 417.0 429.1 433.0) | **424.2** (424.2 424.7 426.1 430.4 434.1) | within |
+| stat | p999 | **825.2** (825.2 826.5 836.4 842.0 849.6) | **795.3** (795.3 820.5 853.8 910.7 1036.7) |  |
+| stat | max | **35096.2** (35096.2 35135.8 35282.4 35306.9 35610.4) | **35031.6** (35031.6 35170.4 35211.2 35237.0 35417.2) |  |
+| read | p50 | **13.6** (13.6 13.6 13.6 13.7 13.8) | **12.3** (12.3 12.3 12.3 12.4 12.4) | within |
+| read | p99 | **21.5** (21.5 21.6 21.7 24.1 150.9) | **18.1** (18.1 18.6 19.4 20.4 145.6) | within |
+| read | p999 | **41.7** (41.7 42.0 42.9 43.0 182.2) | **43.6** (43.6 44.3 45.5 47.4 185.1) |  |
+| read | max | **46.7** (46.7 57.9 84.6 106.7 504.8) | **56.4** (56.4 59.1 61.3 80.6 34823.0) |  |
+| write | p50 | **114.8** (114.8 116.1 116.6 120.0 127.3) | **99.2** (99.2 112.9 115.2 116.5 122.9) | within |
+| write | p99 | **188.0** (188.0 189.0 191.7 194.0 202.3) | **186.6** (186.6 187.2 191.2 195.3 196.5) | within |
+| write | p999 | **516.0** (516.0 531.8 579.6 801.5 1254.3) | **402.1** (402.1 426.7 529.8 533.0 993.5) |  |
+| write | max | **33374.2** (33374.2 34916.1 34963.9 34977.6 35091.4) | **32821.8** (32821.8 34864.3 34893.7 34908.2 34914.6) |  |
+| rename | p50 | **641.3** (641.3 668.4 679.7 681.6 694.6) | **667.7** (667.7 668.8 677.9 680.4 704.5) | within |
+| rename | p99 | **872.7** (872.7 875.1 919.0 919.6 953.2) | **883.0** (883.0 917.3 954.8 997.9 1026.6) | **worse**: 954.8 > 953.2 |
+| rename | p999 | **1399.6** (1399.6 1481.6 1483.0 1693.2 17491.1) | **1418.8** (1418.8 1454.9 1661.4 2050.9 5700.4) |  |
+| rename | max | **35954.9** (35954.9 35983.5 36055.0 36084.4 104075.1) | **35709.4** (35709.4 35788.4 35814.4 35971.7 36047.5) |  |
+| unlink | p50 | **363.1** (363.1 370.6 392.5 400.9 412.5) | **371.0** (371.0 376.1 392.8 393.0 396.8) | within |
+| unlink | p99 | **862.8** (862.8 872.2 872.6 910.0 912.3) | **834.9** (834.9 851.7 866.7 868.9 899.7) | within |
+| unlink | p999 | **1386.4** (1386.4 20674.6 24668.9 25522.5 29161.4) | **18133.3** (18133.3 22331.3 25119.8 25916.7 27446.3) |  |
+| unlink | max | **35525.9** (35525.9 38395.8 54550.2 65054.0 66192.3) | **35411.1** (35411.1 36744.6 43867.2 51337.8 65342.2) |  |
+| fsync | p50 | **133.9** (133.9 139.4 143.2 150.0 158.4) | **127.5** (127.5 128.0 135.3 145.1 160.4) | within |
+| fsync | p99 | **234.0** (234.0 244.2 249.7 252.0 260.9) | **231.6** (231.6 236.7 242.5 256.6 263.5) | within |
+| fsync | p999 | **475.4** (475.4 504.0 558.7 571.0 1110.3) | **348.6** (348.6 394.1 483.9 580.1 631.8) |  |
+| fsync | max | **33554.7** (33554.7 33980.0 62857.3 63427.7 64861.1) | **14749.5** (14749.5 34776.2 34992.8 35217.0 45560.2) |  |
+| open | p50 | **180.2** (180.2 181.3 181.3 191.8 193.9) | **177.8** (177.8 179.4 181.2 190.9 192.3) | within |
+| open | p99 | **287.9** (287.9 289.2 294.5 296.0 310.1) | **262.8** (262.8 274.8 279.1 287.1 320.5) | within |
+| open | p999 | **759.2** (759.2 767.3 795.9 992.9 1769.1) | **716.3** (716.3 744.5 764.9 1204.7 5613.1) |  |
+| open | max | **34884.8** (34884.8 34963.9 35127.3 35228.8 35318.2) | **34946.6** (34946.6 34948.3 35057.2 35109.5 35830.6) |  |
+| close | p50 | **66.2** (66.2 66.2 66.5 66.5 68.1) | **67.4** (67.4 67.6 67.6 68.0 72.3) | within |
+| close | p99 | **142.0** (142.0 149.6 150.5 151.4 165.1) | **141.4** (141.4 142.2 143.1 157.8 164.5) | within |
+| close | p999 | **408.7** (408.7 412.7 426.8 428.7 435.5) | **380.9** (380.9 387.9 388.2 402.0 402.2) |  |
+| close | max | **30898.7** (30898.7 33175.5 34808.9 34899.5 36893.6) | **3889.0** (3889.0 31728.9 31763.6 34730.9 34810.9) |  |
+
+windows-latest, run 42354811410, loaded (two spinners a logical CPU). Each cell: best, then every run sorted, µs.
+
+| op | rank | sep1 | comb1 | comb1 vs sep1 |
+|---|---|---|---|---|
+| create | p50 | **1390.1** (1390.1 1436.8 1441.1 1452.9 1454.4) | **1422.3** (1422.3 1423.7 1425.2 1444.3 1506.2) | within |
+| create | p99 | **75588.6** (75588.6 78959.2 80647.5 92015.6 93859.7) | **69649.5** (69649.5 75066.4 85039.2 85591.1 89376.4) | within |
+| create | p999 | **134584.1** (134584.1 141787.7 147237.5 149086.6 154732.2) | **153620.1** (153620.1 157124.0 157897.2 158310.0 195964.3) |  |
+| create | max | **173137.4** (173137.4 179374.7 182519.0 182909.5 195060.0) | **190129.9** (190129.9 248743.2 260052.5 286022.0 304397.5) |  |
+| stat | p50 | **249.9** (249.9 250.7 272.8 276.0 276.0) | **275.8** (275.8 277.3 277.7 305.2 306.3) | **worse**: 277.7 > 276.0 |
+| stat | p99 | **1532.9** (1532.9 2294.0 2760.8 3140.6 3511.2) | **1567.7** (1567.7 2965.9 4455.0 5333.6 5651.8) | **worse**: 4455.0 > 3511.2 |
+| stat | p999 | **66135.4** (66135.4 74067.2 78040.8 79340.4 84386.9) | **67451.7** (67451.7 90090.5 95467.5 95740.6 99311.7) |  |
+| stat | max | **101539.5** (101539.5 129573.7 137597.2 141502.9 154269.0) | **118486.1** (118486.1 138797.4 153646.7 167435.2 200547.7) |  |
+| read | p50 | **91.4** (91.4 91.5 92.3 92.3 92.3) | **94.0** (94.0 94.1 94.6 95.8 95.9) | **worse**: 94.6 > 92.3 |
+| read | p99 | **189.5** (189.5 196.0 199.2 206.8 207.4) | **198.9** (198.9 210.3 212.0 213.5 217.0) | **worse**: 212.0 > 207.4 |
+| read | p999 | **38396.7** (38396.7 54475.5 59245.3 63619.9 64029.1) | **37986.0** (37986.0 41861.8 53282.2 59843.7 64231.3) |  |
+| read | max | **78105.1** (78105.1 91960.1 97982.7 100965.9 101172.0) | **66785.2** (66785.2 68176.5 80583.9 96486.1 110823.7) |  |
+| write | p50 | **86.2** (86.2 86.3 87.5 87.7 87.9) | **89.0** (89.0 89.1 89.4 91.6 94.8) | **worse**: 89.4 > 87.9 |
+| write | p99 | **322.4** (322.4 330.1 352.3 504.0 762.8) | **405.4** (405.4 427.7 556.2 15845.9 24447.9) | within |
+| write | p999 | **52841.5** (52841.5 54212.4 61801.7 64688.9 65657.2) | **65286.6** (65286.6 70919.0 73637.5 84868.6 86085.6) |  |
+| write | max | **95343.0** (95343.0 95791.7 113171.5 131802.0 133125.6) | **106003.5** (106003.5 109182.4 132149.2 136684.8 141712.5) |  |
+| rename | p50 | **581.6** (581.6 598.0 651.9 654.8 683.0) | **633.4** (633.4 640.9 644.0 723.7 739.8) | within |
+| rename | p99 | **42646.9** (42646.9 50053.8 50459.9 53242.3 54405.2) | **48460.0** (48460.0 51140.9 51720.8 52095.6 53685.3) | within |
+| rename | p999 | **129549.0** (129549.0 171883.5 238690.2 253157.1 333833.4) | **188134.8** (188134.8 270598.3 286344.0 367443.2 476304.8) |  |
+| rename | max | **884737.9** (884737.9 963384.5 1073822.6 1556655.5 1697574.5) | **952805.9** (952805.9 1042312.8 1101899.0 1205160.5 1775794.5) |  |
+| unlink | p50 | **340.7** (340.7 342.5 414.1 414.8 417.7) | **352.9** (352.9 354.0 355.2 425.0 427.6) | within |
+| unlink | p99 | **26369.4** (26369.4 27870.7 27996.2 28196.4 32269.6) | **28478.5** (28478.5 28799.9 29134.2 29835.4 30178.9) | within |
+| unlink | p999 | **465329.4** (465329.4 640502.9 664110.0 929076.8 1159301.7) | **694266.4** (694266.4 720623.0 841798.7 970489.1 1107928.4) |  |
+| unlink | max | **1873824.6** (1873824.6 2151967.7 2346667.6 2449800.7 2894031.6) | **1840609.6** (1840609.6 2319285.5 2599447.8 2638206.1 3015082.9) |  |
+| fsync | p50 | **128.8** (128.8 129.1 130.1 131.8 133.1) | **133.9** (133.9 134.2 134.7 140.9 145.4) | **worse**: 134.7 > 133.1 |
+| fsync | p99 | **288.5** (288.5 304.7 319.7 329.6 564.4) | **300.6** (300.6 303.0 303.4 309.7 370.0) | within |
+| fsync | p999 | **65783.0** (65783.0 66551.3 66762.1 81245.8 95410.8) | **63881.3** (63881.3 66041.3 66409.6 74039.3 89427.1) |  |
+| fsync | max | **99312.6** (99312.6 107791.6 118111.4 122759.9 178191.5) | **109049.9** (109049.9 112886.7 122024.3 122102.7 217731.5) |  |
+| open | p50 | **188.0** (188.0 188.6 211.5 212.3 213.0) | **194.2** (194.2 194.3 194.9 220.8 220.9) | within |
+| open | p99 | **426.4** (426.4 428.4 553.8 649.5 755.6) | **381.5** (381.5 404.0 417.5 428.5 475.0) | within |
+| open | p999 | **65006.3** (65006.3 65290.9 65868.1 66030.9 66031.4) | **54109.3** (54109.3 62770.5 63623.0 64270.5 65094.1) |  |
+| open | max | **96563.5** (96563.5 97061.2 131055.9 154869.9 177986.7) | **81306.3** (81306.3 97943.5 98021.1 98060.8 162190.6) |  |
+| close | p50 | **68.7** (68.7 68.7 69.2 69.3 69.3) | **71.2** (71.2 71.4 71.4 71.9 72.2) | **worse**: 71.4 > 69.3 |
+| close | p99 | **155.3** (155.3 160.9 165.5 175.2 182.6) | **168.1** (168.1 173.6 175.4 175.8 189.1) | within |
+| close | p999 | **15684.7** (15684.7 38425.3 47063.7 50094.1 53279.1) | **39128.9** (39128.9 43702.1 47092.8 55789.8 63378.9) |  |
+| close | max | **87729.1** (87729.1 90570.9 98288.3 150206.0 151312.1) | **89958.3** (89958.3 94256.1 95282.9 118662.9 139082.3) |  |
+
+### The allocation fix on one VM: the unlink's +10 µs was the machine
+
+**The question.** Between runs 42319726082 and 42331462575 the combined form's unlink gap against `dll` grew by about
+10 µs, across different VMs. Here the combined form at two fixed workers before the allocation fix (`ea71f839`,
+"rename") and after it (`792977e9`, "alloc") run interleaved on one windows-11-arm VM, quiet (run 42354811410, lane
+`unlink-arm`). **Two runs of five published**: the job published its second at 08:33:50 UTC and nothing after, and the
+account's API limit kept its status unread when this was written. The form lanes, whose builds both carry the fix, ran
+all five runs.
+
+Within each run, quiet p50:
+
+| op | alloc − rename, each run (µs) |
+|---|---|
+| create | +15.2, +2.9 |
+| write | +3.5, +1.0 |
+| fsync | -2.5, -0.8 |
+| close | +27.6, +90.6 |
+| stat | -3.4, -2.2 |
+| open | +3161.4, +484.6 |
+| read | +6.5, +4.4 |
+| rename | -23.3, -6.7 |
+| unlink | -23.6, -3.8 |
+
+On one VM the fix does not slow an unlink (−23.6 and −3.8 µs), a stat or a rename. The open's and the close's
+millisecond outliers, present in both arms of earlier runs, separate nothing in two runs.
+
+### The allocation fix on one VM, five runs, in both forms
+
+**The question.** Run 42354811410's `unlink-arm` lane published two runs of five. Here four arms run interleaved on
+one windows-11-arm VM (4 logical CPUs, WinFsp 2.1.25156), quiet and loaded (two spinners a logical CPU), 5 runs of 5,
+0 failed (run 42404256322, lane `unlink-four`, diag `diag-winfsp-overlap-44`):
+- `combA` and `combB`: the combined form at two fixed workers before the allocation fix (`ea71f839`, diag tree
+  `2fd3041b`) and after it (`792977e9`, diag tree `6cbba703`);
+- `mainA` and `mainB`: main's form, the one that ships, before the allocation fix (`3feba7c5`) and with it (`430efcee`).
+
+**Cells worse beyond the other arm's spread** (p50 and p99, 18 a phase; abtable.py's rule):
+
+| comparison | quiet | loaded |
+|---|---|---|
+| `mainB` (the fix) worse than `mainA` | 0 | 0 |
+| `mainA` worse than `mainB` | 1 (fsync p50) | 2 (stat p50, stat p99) |
+| `combB` (the fix) worse than `combA` | 2 (open p50, close p50) | 0 |
+| `combA` worse than `combB` | 1 (create p50) | 2 (write p50, open p99) |
+
+**Within each run, the fix's arm minus the arm before it, p50, µs** (sorted, then the median and the runs the fix won):
+
+| op | main's form, quiet | main's form, loaded | combined form, quiet | combined form, loaded |
+|---|---|---|---|---|
+| unlink | -6.6 -3.8 -1.8 +1.8 +3.8 (median -1.8; 3 of 5 faster) | -5.9 -3.1 -2.6 +8.1 +9.1 (median -2.6; 3 of 5 faster) | -23.3 -5.4 +0.6 +33.9 +42.3 (median +0.6; 2 of 5 faster) | -145.8 +78.2 +91.7 +96.7 +317.6 (median +91.7; 1 of 5 faster) |
+| stat | -4.3 -3.0 -2.8 -1.8 -1.0 (median -2.8; 5 of 5 faster) | -5.3 -4.3 -2.9 -2.2 -2.0 (median -2.9; 5 of 5 faster) | -3.2 -2.8 -0.5 -0.1 +1.1 (median -0.5; 4 of 5 faster) | -142.0 +25.8 +57.9 +102.9 +148.8 (median +57.9; 1 of 5 faster) |
+| create | -7.4 -1.8 -1.7 +0.3 +1.4 (median -1.7; 3 of 5 faster) | -3.6 -2.8 -0.7 -0.6 -0.3 (median -0.7; 5 of 5 faster) | -18.1 -9.5 -8.6 +0.5 +2.8 (median -8.6; 3 of 5 faster) | -15.0 -13.1 -9.2 +5.0 +6.0 (median -9.2; 3 of 5 faster) |
+| rename | -14.5 -9.5 -1.0 +2.5 +2.9 (median -1.0; 3 of 5 faster) | -13.4 -6.6 +1.4 +1.8 +7.3 (median +1.4; 2 of 5 faster) | -85.3 -5.8 +12.3 +35.2 +79.6 (median +12.3; 2 of 5 faster) | -5.8 +7.2 +7.9 +32.6 +38.7 (median +7.9; 1 of 5 faster) |
+| write | -6.9 -5.0 -1.7 -1.4 +0.9 (median -1.7; 4 of 5 faster) | -1.2 -0.2 +0.0 +1.8 +13.2 (median +0.0; 2 of 5 faster) | -16.8 -3.3 -0.1 +0.0 +11.4 (median -0.1; 3 of 5 faster) | -22.7 -16.4 -12.7 -1.1 +16.2 (median -12.7; 4 of 5 faster) |
+| fsync | -8.9 -6.5 -2.1 -1.2 -1.2 (median -2.1; 5 of 5 faster) | -13.2 -12.4 -2.5 -2.4 +0.2 (median -2.5; 4 of 5 faster) | -4.6 -2.6 -0.9 -0.5 +3.4 (median -0.9; 4 of 5 faster) | -5.9 -3.2 -1.0 +1.1 +1.2 (median -1.0; 3 of 5 faster) |
+| read | -1.1 -1.1 -0.3 -0.2 -0.1 (median -0.3; 5 of 5 faster) | -0.9 -0.7 -0.4 -0.2 +0.7 (median -0.4; 4 of 5 faster) | -2.0 +0.7 +1.1 +1.8 +2.3 (median +1.1; 1 of 5 faster) | -1.2 -0.3 +0.1 +0.2 +0.6 (median +0.1; 2 of 5 faster) |
+| open | -118.7 -59.5 -40.6 -10.6 -6.1 (median -40.6; 5 of 5 faster) | -72.3 -6.2 +11.7 +13.1 +63.7 (median +11.7; 2 of 5 faster) | -105.6 -84.7 +2359.5 +2530.5 +2634.9 (median +2359.5; 2 of 5 faster) | -147.7 -102.9 +60.2 +62.1 +78.9 (median +60.2; 2 of 5 faster) |
+| close | -2485.5 -147.5 -116.9 -53.6 +3.3 (median -116.9; 4 of 5 faster) | -128.3 -107.2 -42.5 -18.6 +25.1 (median -42.5; 4 of 5 faster) | +556.8 +656.6 +681.3 +2695.8 +2831.4 (median +681.3; 0 of 5 faster) | -59.6 -51.2 +29.8 +64.8 +72.7 (median +29.8; 2 of 5 faster) |
+
+- **Main's form: the fix slows nothing, and is beyond the spread faster on a loaded stat.** Unlink −1.8 µs quiet and
+  −2.6 loaded. Stat −2.8 quiet and −2.9 loaded, faster in 5 of 5 runs each; fsync and read faster in 5 of 5 quiet.
+  Loaded stat p99 fell from 2,223–14,546 µs across runs to 661–8,736.
+- **The combined form: no unlink cost quiet (+0.6 µs, 2 of 5).** Loaded, its fix arm was slower in 4 of 5 runs on
+  stat (+57.9) and unlink (+91.7). The two arms' loaded stat p50 spread over 213–536 µs across runs, against main's
+  158–164. An allocation removed cannot add 90 µs, so that is the combined form's two workers under load.
+- **The close's and open's millisecond mode.** A quiet close's p50 sits near 1.1 ms or near 3.5–4.3 ms in a run, and
+  every arm has both (`mainA` 2 runs of 5 slow, `mainB` 1, `combA` 3). `combB` was slow in all 5 and its open in 3
+  (3.5 ms against 0.9), so those are its two worse cells. Run 42354811410's `alloc` arm, the same build, had one such
+  open. Unexplained, and only in the combined form, which does not ship. Main's form shows no such shift.
+
+### The CanDelete lever: measured and rejected (a file's CanDelete answered from its context, `agents/winfsp-overlap-18`)
+
+**The lever.** CanDelete's shard check is kept (above), but only a directory's emptiness needs the volume. A file may
+always be marked. `agents/winfsp-overlap-18` (`10e7c2f8` on main `a2cf9af7`) carries the open's kind in its ledger
+context:
+- a CONTEXT_FORMAT bit and a CONTEXT_DIRECTORY bit;
+- the ledger at version 5 (WFO5), with an old-format context refused `Refusal::Format`, typed;
+- the takeover restore tested with both kinds.
+
+The callback answers a file's CanDelete on WinFsp's thread.
+
+**The test, red first** (diag `diag-winfsp-overlap-45`, run 42405814913, both runners): a client deletes a file and
+removes an empty directory, and the shard's CanDelete requests are counted. At `b21fec11` it counts 2 and fails, exit
+101. At `10e7c2f8` it counts 1, the directory's, with the bridge's 84 tests and the CLI's 15 passing. In the bench,
+main's form made 11,001 CanDelete shard trips a run before and 1 after.
+
+**The A/B: dead even.** Main `a2cf9af7` against `10e7c2f8`, interleaved on one windows-11-arm VM, quiet and loaded,
+5 runs of 5, 0 failed. Cells worse beyond the other arm's spread, of 18: 0 and 0 each way. Within each run, lever
+minus main, p50:
+
+| op | quiet | loaded |
+|---|---|---|
+| unlink | −9.7 −2.0 −0.8 −0.7 +3.7 (median −0.8) | −6.8 −5.8 −3.1 −1.0 +4.8 (median −3.1) |
+| stat | median +2.5 | median −0.8 |
+| create | median +3.8 | median −1.5 |
+| rename | median +3.0 | median +6.8 |
+| fsync | median −2.5 | median −2.4 |
+
+The trip it removes was 2.6 µs at the p50 (run 42185624364), and the unlink moved −0.8 µs quiet and −3.1 loaded,
+about what that predicts. Both are inside an unlink's run-to-run spread of 221–297 µs.
+
+**Rejected (the supervisor's decision, 2026-11-07).** The request-level saving is real: 11,001 CanDelete shard trips a
+run become 1, each 2.6 µs at the p50. At the bench the A/B is dead even, and a dead-even change does not land, least of
+all one that costs a ledger format (version 4 → 5, versioned contexts). `agents/winfsp-overlap-18` stays off main; a
+file's CanDelete still asks the shard, and its check stays as kept above.
+
+### Every remaining per-request cost, with its number
+
+From main's form after the rename, allocation and CanDelete fixes (`10e7c2f8`, profiled at `245be856`), against the
+profiled DLL arm (`40ee5a65`). Diag `diag-winfsp-overlap-46` (run 42406233399): quiet, 5 runs a runner, each build's own
+shard count, the median over runs of each run's p50, µs, arm64 / x86_64.
+
+**Crash safety's own, kept:**
+
+| cost | arm64 | x86_64 | why it stays |
+|---|---|---|---|
+| The journal, in all | ≈1.3 | ≈1.1 | the receive journal |
+| — the receive buffer's begin | 0.2 | 0.2 | |
+| — the capture (1.2 before the allocation fix) | 0.3 | 0.3 | |
+| — the decode | 0.2 | 0.2 | |
+| — the response's save | 0.3–0.5 | 0.2–0.3 | |
+| — the acknowledgement | 0.2 | 0.2 | |
+| The copy into the working packet | 0.3–0.6 | 0.3–0.5 | WinFsp's op functions write into the request (a target-directory open trims the name in place), and a replay needs the original |
+| The ledger's write in the shard's serve, against dll's | Create +2.3, Open +0.8, Release +0.5 | — | the open ledger |
+| A-198's barrier: Release's round, against dll's | 6.7 against 5.0 | 10.7 against 4.4 | A-198 |
+| Cleanup's hop to the shard, against dll's | 17.9 against 9.7 | — | the shard is still publishing the previous request's barrier |
+| A rename's durable name update | 7.3 | — | one shard turn since `c1e9e83f` |
+
+**Not crash safety's:**
+
+| cost | arm64 | x86_64 | standing |
+|---|---|---|---|
+| The open's confirmation round, waited on after the send | 3.6 at the p50 (8.8 mean); the shard round 3.0 | 3.0; round 2.7 | on every open, 66,005 a run; proposed: post it after the send and take its answer once the next receive returns |
+| The separate send, with the kernel's IRP completion | 3.6–14.2 (Create 14.2, Cleanup 11.8, Close 3.6) | 2.7–14.6 | A-215's combined call, measured and rejected (above) |
+| A reply channel allocated per shard call (`sync_channel(1)`) | not timed alone; 0.1–0.2 estimated | — | the DLL arm pays it too; small |
+| An Open's and a Create's path decoded into a String for the shard | — | — | the DLL arm pays it too |
+
+The interface's `between` gaps show what the separate send costs the client. From Cleanup's return to the Close's entry,
+dll takes 25–27 µs and main 35. Flush is 25–28 against 38, VolumeInfo 31–33 against 40–47, and Write 62–69 against 76. A
+dash in a table: not broken out on that runner.
+
+### The bench's own noise: a control arm, and identical arms (audit step 7; 2026-11-08)
+
+**A do-nothing arm.** Diag `diag-winfsp-overlap-47` (run 42463623854) ran main (`4811191a`), cut 0 (`58bf8310`: the
+receive protocol moved into `inflight/settle.rs` and its crash oracle, nothing on the request path changed) and the
+purge slot (`d0492b10`, A-249) interleaved on one VM of each runner, quiet and loaded, 5 runs of 5, 0 failed. Cells
+worse beyond the other arm's spread, p50 and p99, of 18 a phase:
+
+| | arm64 quiet | arm64 loaded | x86_64 quiet | x86_64 loaded |
+|---|---|---|---|---|
+| cut 0 worse than main | 1 | 2 | 0 | 0 |
+| main worse than cut 0 | 2 | 7 | 7 | 2 |
+| purge slot worse than main | 3 | 0 | 0 | 0 |
+| main worse than the purge slot | 2 | 4 | 2 | 6 |
+| purge slot worse than cut 0 | 1 | 1 | 3 | 0 |
+| cut 0 worse than the purge slot | 1 | 1 | 0 | 4 |
+
+Main looks "worse" in up to 7 cells against a tree that changes nothing on the request path, and x86_64's quiet
+unlink moves 19.0 µs within each run (median, 4 runs of 5). So the bench's noise floor, or a bias against the arm
+listed first, is at least that large, and cut 0 is read as the control: the purge slot against it is 1 and 1 cells on
+arm64 and 3 and 4 on x86_64, no effect claimed. **Every later cut carries a do-nothing arm.**
+
+**Identical arms.** Diag `diag-winfsp-overlap-48` (run 42486022157) ran three copies of one binary (main `4811191a`,
+built once a lane, the three files' SHA-256 equal) on one VM of each runner, quiet and loaded, six runs. In a round the
+bench takes the arms in its list's order from `(round + offset) % arms`. The lanes ran that list fixed, as the bench had
+it, or rotated each run to start with the run's first-started arm. The windows-latest fixed lane stalled after its
+first run (no further output in 1 h 40 m, the job still alive), as diag-42's unlink lane once did; it is not used.
+
+Cells one copy was worse than another beyond its spread, per pair and phase, of 18:
+
+| lane | runs | most cells, one pair and phase | cells each copy is worse, both phases (a, b, c) |
+|---|---|---|---|
+| windows-11-arm, list fixed | 6 | 4 | 7, 4, 9 |
+| windows-11-arm, list rotated | 6 | 5 | 3, 7, 6 |
+| windows-latest, list rotated | 6 | 6 | 8, 1, 4 |
+
+Each copy's p50 against the three copies' mean in the same run, over every op (geometric):
+
+| lane | quiet (a, b, c) | loaded (a, b, c) |
+|---|---|---|
+| windows-11-arm, list fixed | −3.15%, −0.75%, +3.90% | +1.19%, −0.30%, −0.89% |
+| windows-11-arm, list rotated | +1.01%, −0.18%, −0.83% | −0.53%, +0.24%, +0.28% |
+| windows-latest, list rotated | +2.33%, −1.92%, −0.41% | +0.77%, −1.08%, +0.31% |
+
+- **The rule's floor.** Identical binaries are "worse" in up to 6 cells of 18 for one pair and phase. A verdict of a few
+  worse cells cannot tell two arms apart, which is why the A/Bs above (diag-44's, diag-45's dead even) are read within
+  each run as well.
+- **The list's order.** Fixed, the first-listed copy ran 3.15% under the run's mean in arm64's quiet pass and the last
+  3.90% over, most of it in open and close, whose millisecond mode it falls in. Rotated, no copy is more than 1.01% off
+  on arm64. A copy still sits 2.33% off on windows-latest rotated, so a run's arms differ by about ±2% with nothing
+  between them.
+- **So:** the bench rotates its list every run from now on (`windows-ab.sh`), and a cut is called only on its
+  within-run differences against a do-nothing arm, measured beyond what identical arms show.
+
+### The Open and Release barriers: measured and rejected as a cut (audit step 7; 2026-11-08)
+
+**The proposal.** A-198's rule that "successful opens and closes publish their reference changes" puts a shard
+publication before an Open's and a Release's reply. Recovery already reconciles the restored open counts against the
+ledger's live contexts (`reconcile_opens`), so the barrier looked removable, a whole publication off each open and close.
+
+**The measurement.** From the per-phase profile of `diag-winfsp-overlap-46` (run 42406233399, five runs a runner): a
+round's mean less its hop-in, serve and to-answer leaves the shard's answer step, which is the barrier and the send.
+Means, µs:
+
+| answer step | arm64, main | arm64, dll | x86_64, main | x86_64, dll |
+|---|---|---|---|---|
+| Open (barrier) | 0.5 | 2.7 | 0.3 | 4.8 |
+| Release (barrier) | 0.8 | 3.6 | 0.7 | 8.0 |
+| Resolve (no barrier) | 0.6 | 0.6 | 0.4 | 0.3 |
+| Info (no barrier) | 0.6 | 1.1 | 0.5 | 0.6 |
+
+In main's form an Open's or a Release's barrier costs what an op with none does, within 0.2 µs; only the DLL arm still
+pays it. Removing it would save under 0.2 µs a request, against the bench's ±2% floor between identical arms (above), so
+it is **rejected**, and A-198 stays as written. The ledger's own writes, the other candidate named with it, show no cost
+against the DLL at the mean either (serve: Create 10.2 against 13.6 µs on arm64 and 7.3 against 8.7 on x86_64; Open
+2.3 against 3.2 and 2.0 against 2.8).
+
+### Step 7's verdict
+
+- **Fixed wherever it was not crash safety:** the replayed Close's refusal, the rename's empty shard turn, the per-batch
+  allocations.
+- **The allocation fix, five runs on one VM:** in main's form it slows nothing (unlink −1.8 µs quiet, −2.6 loaded,
+  within each run) and is beyond the spread faster on a loaded stat (−2.9 µs, 5 runs of 5).
+- **Kept, CanDelete's check:** the baseline skips it and lets a non-empty directory's removal report success. Answering a
+  file's check from its ledger context (`agents/winfsp-overlap-18`) removes 11,001 shard trips a run but measured dead
+  even at the bench (unlink −0.8 µs quiet, −3.1 loaded), so it is rejected and every CanDelete still asks the shard.
+- **Kept, crash safety's price:** on arm64, quiet, about 18 µs a stat and 30 to 35 µs a rename or an unlink against the
+  DLL dispatcher. The journal holds 3 to 4.5 µs a request, the ledger and A-198's barriers about 5 µs a stat, direct
+  output 0.5 µs a call, and a kernel share of 3 to 5 µs a request inside the transaction call. R4 keeps it: the
+  baseline's speed comes with A-198's crash defect.
+- **What is left that crash safety does not need:** the open's confirmation round on the worker's path, 3.6 µs an open
+  on arm64 and 3.0 on x86_64. The separate send is A-215's, rejected. A reply channel per shard call and a path's
+  String the DLL arm pays too.
+- **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
+  and rejected.
+
+## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
+
+`agents/reland-a207-3` (`CreateGreen { base }` walked, hashed and seeded in slices with its reply deferred; the
+identity hashed with no buffer; `with_origin` by value; canonicalizing without cloning keys) against its base, main
+`4326a9d8`.
+
+**The shard** (`crates/server/tests/green_fairness.rs`: 1,000 files of 16 KiB, one shard, a second client probing it;
+CI, quiet 4-vCPU runners, 3 runs each):
+
+| Runner | main `4326a9d8` + the test (diag run 42371545928) | sliced (diag run 42371546045) |
+|---|---|---|
+| ubuntu-latest | one poll of 134.0 / 134.5 / 134.5 ms, 0 probes inside | 155 / 149 / 166 ms, 306 / 259 / 288 probes inside, longest 13.5 / 13.6 / 13.4 ms |
+| ubuntu-24.04-arm | one poll of 961 / 960 / 962 ms, 0 probes inside | 1.71 / 1.74 / 1.76 s, 1,193 / 1,404 / 1,456 probes inside, longest 7.6 / 10.0 / 9.8 ms |
+
+At 4,000 files (diag runs 42365451658, 42367880917) main held the shard 549 to 556 ms on x86_64 and about 3.8 s on
+arm64. The first sliced build left one unit of about 255 ms on arm64, which turned out to be the key cloning in
+canonicalize.
+
+**Memory and time** (`load_bench --tree <linux-v7.4-rc1>/<tree> --clients 1`, release, in-process daemon, under
+`/usr/bin/time -l`; Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1; interleaved; 2026-11-07 12:00-15:00 UTC; main
+`load_bench` MD5 `951c8406…`, the branch's `6b000576…`, each built in its own target dir; other agents' load as shown):
+
+| Tree | Build | Peak RSS (bytes), runs 1 / 2 / 3 | CreateGreen (ns), runs 1 / 2 / 3 | Load at each run's end |
+|---|---|---|---|---|
+| `fs/` (2,365 files, 51 MB) | main | 360,808,448 / 423,182,336 / 512,589,824 | 1,163,369,916 / 666,684,709 / 681,655,833 | 57 / 49 / 48 |
+| `fs/` | sliced | 282,722,304 / 304,676,864 / 292,438,016 | 2,296,340,458 / 1,466,747,791 / 1,619,755,917 | 53 / 51 / 46 |
+| whole (97,229 files, 1.68 GB) | main | 9,622,224,896 / 9,418,211,328 | 48,226,987,000 / 89,095,751,125 | 11 / 12 |
+| whole | sliced | 8,017,805,312 / 8,017,379,328 | 82,290,335,459 / 269,366,051,209 | 84 / 91 |
+
+- **Peak RSS:** best of runs, `fs/` 360.8 to 282.7 MB (22% less); the whole kernel 9.42 to 8.02 GB (15% less, about
+  0.84 of the tree's bytes). That is the two transient copies gone: `encode()`'s clone and buffer, made only to hash,
+  and `with_origin`'s clone.
+- **What is left:** the store's pinned copy (the pin alone took the whole kernel's RSS to 3.4 GB, GAPS), the origin
+  the walk reads out, and the engine's two lifetime copies (head content and version 0's history). The second engine
+  copy is loadtest-scale's to share after W2.
+- **The time is the slicing's price, not comparable here.** The sliced green yields after every slice of its step
+  quantum, so its creation is longer and grows with the shard's load. Its whole-kernel runs ran at load 84 to 91
+  against main's 11 to 12. On the quiet CI runners above, the sliced walk took 1.1 to 1.9 times main's one poll. Main's
+  number is a poll that held the shard throughout.
+- Every run's harness ended with 0 oracle failures.
+
+## A shard's scheduling slice, measured and rejected (A-224; 2026-11-06 to 2026-11-08)
+
+CI's Linux runners (`ubuntu-latest`, x86_64; `ubuntu-24.04-arm`, arm64; kernel 7.0.0-1017-azure), from diagnostics
+branches never merged (`diag-perf-*`). Loaded = the supervisor's controlled load: `systemd-run --user --scope -p
+AllowedCPUs=0-1 -p MemoryMax=256M`, two spinning threads a core, a sibling `dd conv=fsync` writer. Harness:
+`edit_merge_bench` (agents/perf-2 `82e1f011`), `--loaded-only --spinners-per-core 2 --client-spin-ns default
+--shard-slice-ns N --files 10 --form accept --form conflict`. The in-process daemon's shards ask for slice N as they
+start; N = 0 asks nothing. Quiet: `--quiet-only`, paced (`--pause-ns 2000000`) and unpaced. Each invocation is 3 runs
+× up to 1,000 samples.
+
+The confirmation run (diag-perf-9, run 42423446888, 2026-11-07 22:40 to 23:38 UTC; six interleaved rounds an arm).
+Ranges over the six rounds, loaded, 10 files; medians in parentheses:
+
+| Runner, arm | accept p50 µs | accept p99 ms | accept max ms | conflict p50 µs | conflict p99 ms |
+|---|---|---|---|---|---|
+| x86_64, none | 12–13 | 1.02–13.34 (5.95) | 10.6–21.0 (17.5) | 13–14 | 1.05–9.50 (6.01) |
+| x86_64, kernel minimum 100 µs | **16–1,852** | 4.00–6.49 (5.22) | 7.7–12.2 (9.4) | **16–17** | 4.17–7.87 (6.33) |
+| x86_64, step budget × 32, 206 µs | **14–826** | 3.99–6.97 (6.27) | 8.0–10.9 (9.9) | 13–16 | 4.15–6.83 (5.22) |
+| arm64, none | 35–2,063 (80) | 22.00–34.99 (26.57) | 29.1–39.1 (37.1) | 15–21 | 14.80–35.00 (25.98) |
+| arm64, kernel minimum 100 µs | 86–1,994 (152) | 2.15–9.00 (6.02) | 3.9–12.0 (7.0) | **15–4,015** | 2.83–9.00 (4.90) |
+| arm64, step budget × 32, 234 µs | **19–3,911 (2,048)** | 2.52–9.01 (9.00) | 4.2–12.0 (10.8) | **15–3,785** | 3.26–9.00 (9.00) |
+
+Bold: a loaded p50 beyond base's spread. Quiet, every arm, both runners: accept p99 0.02 to 0.13 ms, even. The run
+before it (diag-perf-7, run 42328692666, three rounds) swept eight slices each runner derived: none, the kernel's
+minimum, the step budget (8.27 µs x86_64, 7.02 µs arm64) × 16 to × 256, and the kernel's default (2.25 ms). Slices
+above × 32 lost the gain (arm64 p99 10 to 26 ms at × 64 to the default), and the p50 excursions (2.0 to 7.4 ms on
+arm64) appeared in four slice arms and in none of base's rounds. The runtime's own A/B (diag-perf-6, run 42188445711,
+base `20c74c56` against `7c04f873` asking 100 µs) had shown the same: arm64 p99 13–25 to 6.7–9.0 ms, x86_64
+overlapping, the arm64 p50 3.8 to 4.0 ms in some rounds, and nothing at rest (657 voluntary switches and 4 CPU ticks a
+minute idle, either build).
+
+By the rule (loaded p99 and max keep the gain; loaded p50 not worse than base beyond the spread), no slice is taken,
+and A-224 is measured and rejected.
+
+### The load test's quiet arm after its walls: 3,000 and 10,000 clients on one node (2026-11-07, agents/loadtest-scale)
+
+The same command (`rung.sh` / `rung-ab.sh <label> <bound> --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files
+<0.8 n> --per-connection 32 --rounds 3 --reply-patience 60 --think-us 0`, think time 0 named), against a single-node
+`slates anchor --quick`. Mac Studio (adas-mac-studio.local-2, 32 CPUs, Apple silicon), release binaries (LTO) of
+agents/loadtest-scale-1. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**3,000 clients, A/B of the history (A-242).** Main 4326a9d8 (3 runs) and W3 888e3ae3 (3 runs, interleaved), then W2
+26c0eff4 (2 runs). Load 1.9 to 13. Milliseconds, `SubmitAccepted`:
+
+| Build | Wall s | Accepted | `BudgetExceeded` | p50 | p99 | max | Peak RSS GB |
+|---|---|---|---|---|---|---|---|
+| main 4326a9d8 | 80.9 / 83.1 / 87.3 | 3,786 / 3,740 / 3,743 | 2,416 / 2,419 / 2,410 | 679 / 717 / 659 | 1,368 / 1,354 / 1,572 | 1,560 / 1,510 / 1,758 | 10.96 / 7.02 / 19.61 |
+| W3 888e3ae3 | 72.2 / 77.0 / 104.7 | 3,729 / 3,753 / 3,768 | 2,417 / 2,456 / 2,440 | 639 / 584 / 915 | 1,072 / 1,516 / 1,731 | 1,221 / 1,797 / 1,998 | 21.0 / 15.97 / 16.95 |
+| W2 26c0eff4 | 39.5 / 35.4 | 9,000 / 9,000 | 0 / 0 | 136 / 123 | 264 / 219 | 338 / 256 | 2.91 / 5.15 |
+
+The peak RSS of one build ranges 7 to 21 GB across runs (macOS keeps freed large blocks resident), so it is no
+measure of W3 against main. W2 took every version where the others refused about 2,400 at the retention cap, in half
+the wall.
+
+**10,000 clients, accac5c5** (main ecb86b4f with A-238, the retry hold, A-242, the kept-forward wake, the verdict's
+history walk and A-243), one run, load 4.1 before and 21.7 after, 313 connections. Before these the rung did not finish
+in 30 minutes. Milliseconds:
+
+| Kind | Count | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|
+| CreateWork | 10,000 | 98.6 | 906.7 | 920.8 | 924.6 |
+| Edit | 1,488,140 | 85.7 | 337.9 | 853.4 | 1,042.7 |
+| SubmitAccepted | 26,598 | 50.0 | 214.3 | 355.9 | 798.3 |
+| SubmitConflict | 111,708 | 81.4 | 306.4 | 421.4 | 1,017.3 |
+| ReadHead | 1,405,676 | 92.2 | 275.3 | 413.5 | 1,045.1 |
+| Rebase | 498,562 | 89.5 | 267.1 | 407.9 | 1,038.1 |
+| Destroy | 10,000 | 39.9 | 165.3 | 290.4 | 405.8 |
+
+- **Wall:** 75.9 s.
+- **Correctness:** the oracle and every own file had 0 failures, 0 unknown outcomes, 0 reconnects.
+- **Starved:** 1,204 agents gave up after the harness's conflict-resolution bound: 10,000 agents over 8,000 hot files.
+- **Backpressure:** 2,463,549 requests refused `AcknowledgementOwed` and sent again (a multiplexed connection's older
+  request holds its acknowledgement), owed a look before 100,000.
+- **Daemon:** peak RSS 3.28 GB; CPU 15 min 48 s in the 75.9 s, about 12.5 cores.
+- **The 1 ms bound:** at think time 0 the closed-loop latency is Little's law over the green's one owner shard, p50
+  50 ms at 10,000 clients; W1 (a green's works off its owner) is the lever.
+
+## A give-back makes way for a granted landing (A-226's amendment; 2026-11-08)
+
+reland-a207 found a granted landing about 5 times slower under load on `agents/perf-b3`. The cause, measured: `purge_if_idle`
+went on stepping while the arena allocated nothing, which a landing does not, so give-back steps of a whole quantum
+alternated with the landing's short ones. Now a task that ran across the give-back's yield ends it for that reap tick.
+
+**Command.** `crates/server/tests/presentation_fairness.rs`, `a_granted_landing_never_holds_its_shard_while_it_is_planned`
+(1,000 files of 16 KiB, one shard, debug build), the time it prints. Three saved binaries, interleaved in reversed order
+on alternate rounds, 8 rounds each, every process at `nice -n 19`, beside 144 `nice -n 19 yes > /dev/null`. Script:
+`spin-run.sh 144 8 base current fix`.
+
+**Hardware and load.** adas-macbook-pro-2, Apple M5 Max, 18 CPUs, 128 GB, macOS, 2026-11-08 14:33 to 14:43 UTC; the
+one-minute load 11 to 191 at the start of each run, the Mac shared with other agents.
+
+| Build | Median | All eight, in run order within the arm (s) | Give-back steps a landing |
+|---|---|---|---|
+| base 9a996608 (without a30e4209) | 4.21 s | 3.6, 4.1, 8.8, 4.3, 5.6, 3.3, 3.6, 4.4 | not measured |
+| agents/perf-b3 fd0c41b2 | 21.47 s | 12.4, 30.7, 15.5, 22.1, 55.1, 20.9, 20.1, 34.8 | 2,859 to 4,965 |
+| fd0c41b2 + this fix | 4.16 s | 4.4, 4.2, 4.1, 3.3, 4.2, 3.4, 3.2, 4.7 | 3 to 5 |
+
+All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
+with one step, so the cost needs a starved shard.
+
+## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
+
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+
+**Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
+
+**Command.** `cargo build --release --locked -p slates-client --example provision_bench`, run with no arguments and with `PROVISION_BENCH_SHARDS=2`. Diagnostics runs [diag-liveness-31](https://github.com/hyper-light/slates/actions/runs/42648540654) (windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-latest) and diag-liveness-32 (windows-11-arm), results pushed to `diag-results/liveness-31-<os>` and `liveness-32-windows-11-arm`. Main is 80be552a with this bench applied (2e435448). The A-223 arm is A-223 merged onto 80be552a (d0106bec). Each runner has 4 CPUs (macos-latest 3). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU. Three rounds per cell, the arms alternating. A paced cell has 9 runs (3 rounds of 3), a rest cell 3, a p99 cell 9 (3 rounds of the bench's 3 runs). Ranges are the lowest to the highest run.
+
+**Main, two shards, one client paced at 1 ms:**
+
+| runner | at rest, quiet | paced, quiet | paced, loaded | single-client p99, quiet |
+|---|---|---|---|---|
+| Windows x86_64 (windows-latest) | 0–5 | 34–71 | 742–754 | 40.3 µs–80.1 µs |
+| Windows arm64 (windows-11-arm) | 5–15 | 31–104 | 100–269 | 30.1 µs–70.0 µs |
+| Linux x86_64 (ubuntu-latest) | 1–3 | 1464–2024 | 936–1102 | 17.4 µs–22.4 µs |
+| Linux arm64 (ubuntu-24.04-arm) | 1–2 | 1773–2022 | 859–1111 | 22.3 µs–24.4 µs |
+| macOS arm64 (macos-latest) | 1 | 132–466 | 77–480 | 242.4 µs–1.1 ms |
+
+**Main at each runner's derived shard count:**
+
+| runner | shards | at rest, quiet | paced, quiet | paced, loaded |
+|---|---|---|---|---|
+| Windows x86_64 | 1 | 0–15 | 12–39 | 11–30 |
+| Windows arm64 | 3 | 0–5 | 88–176 | 104–1342 |
+| Linux x86_64 | 1 | 0–1 | 609–692 | 622–863 |
+| Linux arm64 | 3 | 1–2 | 1709–2545 | 1148–1420 |
+| macOS arm64 | 2 | 1 | 180–394 | 127–288 |
+
+**A-223 beside it, two shards:** the paced cost, quiet then loaded, main → A-223.
+
+| runner | paced, quiet | paced, loaded |
+|---|---|---|
+| Windows x86_64 | 34–71 → 191–493 | 742–754 → 756–778 |
+| Windows arm64 | 31–104 → 230–404 | 100–269 → 728–745 |
+| Linux x86_64 | 1464–2024 → 1466–2026 | 936–1102 → 971–1031 |
+| Linux arm64 | 1773–2022 → 1727–2022 | 859–1111 → 848–1206 |
+| macOS arm64 | 132–466 → 117–356 | 77–480 → 118–194 |
+
+**What it means.**
+- **Linux pays on main, and A-223 does not change it.** At two shards a 1 ms-paced client costs Linux x86_64 1,464 to 2,024 thousandths of a core and Linux arm64 1,773 to 2,022, against 0 to 3 at rest. The boot probe's wake was 5.9 to 7.3 µs, so the boot window (0.59 to 0.73 ms) is shorter than the pause. In the paced form, though, the owner shard (shard 1) parked 0 times per 1,000 creates in every round on both runners. Its live estimate had risen to 34 to 70 µs, making its window 3.4 to 7.0 ms. The other shard parked 0 to 819 times per 1,000 (`provision.parked_1 parks per 1000 creates`). The estimate feeding on its own spinning is the window rule's item (i).
+- **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
+- **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
+- **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
