@@ -1,0 +1,51 @@
+name: diag-a232
+
+# Diagnostics only, never on main: A-232's red, a call to a live daemon starved at cpu.weight 1 failed Stalled.
+on:
+  push:
+    branches: ["diag-a232-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  red:
+    name: A-232 red on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 200
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the probe
+        run: cargo test --locked -p slates-client --test a232_red --no-run
+      - name: The probe at cpu.weight 1 beside spinners
+        run: bash .github/diag-a232-red.sh
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/a232-red-1-${{ matrix.os }}"
+          git config user.name "diag-a232"
+          git config user.email "diag-a232@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-a232 red-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
