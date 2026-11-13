@@ -22,6 +22,9 @@ const PROBE_MS: u64 = 5;
 const TEST_SHARDS: u16 = 2;
 /// Shape: how long the rendezvous is retried while a starved daemon starts: far past any start seen starved.
 const START_WAIT: Duration = Duration::from_secs(600);
+/// Shape: how long the probe waits after saying it is ready, for its caller to move it into the starved cgroup: the
+/// script moves it the moment it reads the line, well inside this.
+const SETTLE: Duration = Duration::from_secs(3);
 /// Shape: the wall time the calls run for once the daemon answers: long enough for a starved shard to miss a reply
 /// deadline many times, short enough to keep ten runs inside a lane.
 const CALLING: Duration = Duration::from_secs(45);
@@ -83,6 +86,13 @@ fn a_call_to_a_live_starved_daemon_is_failed_stalled() {
       base: None,
     })
     .expect("the probe's volume");
+  // The caller starves the process from here on (red-2 starved it from its first instruction, and the machine profile
+  // was refused before a daemon existed: about 0.1 s of CPU in 114 s, 10 of 10 runs).
+  println!("A232-READY pid {}", std::process::id());
+  // A test's wait for its caller to act from outside the process (D-9 allows a test's sleep with a reason): nothing in
+  // the process is waited on, so there is no event to wait for instead.
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(SETTLE);
   let began = Instant::now();
   let (mut calls, mut answered, mut stalled_live, mut stalled_judged, mut other) = (0u64, 0u64, 0u64, 0u64, 0u64);
   while began.elapsed() < CALLING {

@@ -40,12 +40,12 @@ jobs:
       - name: Publish the results to a branch
         if: always()
         run: |
-          branch="diag-results/a232-red-2-${{ matrix.os }}"
+          branch="diag-results/a232-red-3-${{ matrix.os }}"
           git config user.name "diag-a232"
           git config user.email "diag-a232@users.noreply.github.com"
           git checkout --orphan results-only
           git rm -rq --cached . || true
           cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
           git add results.txt
-          git commit -qm "diag-a232 red-2 results, ${{ matrix.os }}"
+          git commit -qm "diag-a232 red-3 results, ${{ matrix.os }}"
           git push -q origin "HEAD:refs/heads/$branch"
