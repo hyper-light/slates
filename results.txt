@@ -1,0 +1,84 @@
+runner aarch64, 4 CPUs, 8 spinners at cpu.weight 100, probe at cpu.weight 1, 10 runs
+commit af8bad9ca414bb922b76b2dcf27f8989a9aee77a, base 29ef4521d9711fd380b7fde45f63e83bac3166c7
+kernel 7.0.0-1017-azure; cgroup v2 root controllers: cpuset cpu io memory pids
+probe binary: /home/runner/work/slates/slates/target/debug/deps/a232_red-f9c74830209e6c5f
+weights: starved 1, spinners 100
+spinners in their cgroup: 8
+== run 1 exit 0, stalled-live calls 0, probe CPU 1864 ms, load 7.53
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 192 answered 186 stalled_live 0 stalled_judged 0 other 6 watchdog Some((349, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.58s
+== run 2 exit 0, stalled-live calls 0, probe CPU 1799 ms, load 9.70
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 183 answered 181 stalled_live 0 stalled_judged 0 other 2 watchdog Some((416, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.37s
+== run 3 exit 0, stalled-live calls 0, probe CPU 1795 ms, load 10.34
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 180 answered 180 stalled_live 0 stalled_judged 0 other 0 watchdog Some((434, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.99s
+== run 4 exit 0, stalled-live calls 0, probe CPU 1772 ms, load 10.57
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 173 answered 173 stalled_live 0 stalled_judged 0 other 0 watchdog Some((441, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.14s
+== run 5 exit 0, stalled-live calls 0, probe CPU 1784 ms, load 10.59
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 175 answered 175 stalled_live 0 stalled_judged 0 other 0 watchdog Some((437, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.39s
+== run 6 exit 0, stalled-live calls 0, probe CPU 1780 ms, load 10.88
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 168 answered 168 stalled_live 0 stalled_judged 0 other 0 watchdog Some((427, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.11s
+== run 7 exit 0, stalled-live calls 0, probe CPU 1757 ms, load 10.60
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 189 answered 184 stalled_live 0 stalled_judged 0 other 5 watchdog Some((438, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.83s
+== run 8 exit 0, stalled-live calls 0, probe CPU 1868 ms, load 10.77
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 208 answered 194 stalled_live 0 stalled_judged 0 other 14 watchdog Some((352, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.88s
+== run 9 exit 0, stalled-live calls 0, probe CPU 1885 ms, load 10.91
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 177 answered 177 stalled_live 0 stalled_judged 0 other 0 watchdog Some((384, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.24s
+== run 10 exit 0, stalled-live calls 0, probe CPU 1790 ms, load 10.74
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-SUMMARY calls 173 answered 173 stalled_live 0 stalled_judged 0 other 0 watchdog Some((422, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.69s
+== a232_red: red (a live daemon's call failed Stalled) 0, green 10, other failure 0, of 10
