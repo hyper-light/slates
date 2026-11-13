@@ -1,0 +1,286 @@
+runner x86_64, 4 CPUs, 8 spinners at cpu.weight 100, probe at cpu.weight 1, 10 runs
+commit af8bad9ca414bb922b76b2dcf27f8989a9aee77a, base 29ef4521d9711fd380b7fde45f63e83bac3166c7
+kernel 7.0.0-1019-azure; cgroup v2 root controllers: cpuset cpu io memory pids
+probe binary: /home/runner/work/slates/slates/target/debug/deps/a232_red-bb0288cea0878210
+weights: starved 1, spinners 100
+spinners in their cgroup: 8
+== run 1 exit 0, stalled-live calls 0, probe CPU 2680 ms, load 7.93
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 220 answered 200 stalled_live 0 stalled_judged 0 other 20 watchdog Some((388, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.84s
+== run 2 exit 0, stalled-live calls 0, probe CPU 1847 ms, load 9.41
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 206 answered 193 stalled_live 0 stalled_judged 0 other 13 watchdog Some((402, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.11s
+== run 3 exit 0, stalled-live calls 0, probe CPU 1984 ms, load 10.18
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 221: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 223: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 225: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 227: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 229: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 231: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 233: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 235: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 237: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 239: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 241: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 242 answered 211 stalled_live 0 stalled_judged 0 other 31 watchdog Some((407, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 46.60s
+== run 4 exit 0, stalled-live calls 0, probe CPU 2372 ms, load 10.73
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 199 answered 189 stalled_live 0 stalled_judged 0 other 10 watchdog Some((402, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.26s
+== run 5 exit 0, stalled-live calls 0, probe CPU 2240 ms, load 10.69
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 221: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 223: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 225: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 226 answered 203 stalled_live 0 stalled_judged 0 other 23 watchdog Some((388, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.76s
+== run 6 exit 0, stalled-live calls 0, probe CPU 2607 ms, load 11.09
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 208 answered 194 stalled_live 0 stalled_judged 0 other 14 watchdog Some((397, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.55s
+== run 7 exit 0, stalled-live calls 0, probe CPU 3743 ms, load 11.05
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 221: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 223: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 225: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 227: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 229: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 231: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 233: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 235: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 237: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 239: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 241: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 243: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 245: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 247: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 249: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 251: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 253: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 255: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 257: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 259: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 261: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 263: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 265: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 267: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 269: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 271: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 273: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 275: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 277: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 279: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 281: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 283: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 285: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 287: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 289: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 289 answered 234 stalled_live 0 stalled_judged 0 other 55 watchdog Some((410, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.29s
+== run 8 exit 0, stalled-live calls 0, probe CPU 2442 ms, load 11.10
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 221: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 223: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 225: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 227: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 227 answered 203 stalled_live 0 stalled_judged 0 other 24 watchdog Some((407, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.43s
+== run 9 exit 0, stalled-live calls 0, probe CPU 1893 ms, load 10.93
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 192 answered 186 stalled_live 0 stalled_judged 0 other 6 watchdog Some((368, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.03s
+== run 10 exit 0, stalled-live calls 0, probe CPU 2249 ms, load 10.88
+0::/a232-starved
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-OTHER call 181: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 183: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 185: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 187: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 189: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 191: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 193: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 195: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 197: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 199: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 201: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 203: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 205: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 207: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 209: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 211: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 213: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 215: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 217: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 219: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 221: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 223: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 225: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 227: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 229: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 231: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 233: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 235: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 237: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 239: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 241: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 243: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-OTHER call 245: refused: BadRequest { reason: "reply too large for the bulk area" }
+A232-SUMMARY calls 245 answered 212 stalled_live 0 stalled_judged 0 other 33 watchdog Some((419, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.47s
+== a232_red: red (a live daemon's call failed Stalled) 0, green 10, other failure 0, of 10
