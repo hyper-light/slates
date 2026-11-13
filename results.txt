@@ -1,0 +1,46 @@
+runner x86_64, 4 CPUs, 32 spinners each in its own cgroup at cpu.weight 100, probe at cpu.weight 1, 10 runs
+commit 08162d197de2c0d4333bccd21f9ee29d65615c9c, base af8bad9ca414bb922b76b2dcf27f8989a9aee77a
+kernel 7.0.0-1019-azure; cgroup v2 root controllers: cpuset cpu io memory pids
+probe binary: /home/runner/work/slates/slates/target/debug/deps/a232_red-bb0288cea0878210
+weights: starved 1; spinner cgroups 32, each 100, holding 32 spinners
+== run 1 exit 101, stalled-live calls 0, probe CPU 97 ms, load 30.15
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (5871) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 114.49s
+== run 2 exit 101, stalled-live calls 0, probe CPU 99 ms, load 33.04
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (5942) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 114.88s
+== run 3 exit 101, stalled-live calls 0, probe CPU 95 ms, load 33.31
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6043) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 112.46s
+== run 4 exit 101, stalled-live calls 0, probe CPU 95 ms, load 33.85
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6114) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 109.88s
+== run 5 exit 101, stalled-live calls 0, probe CPU 107 ms, load 33.51
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6176) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 123.03s
+== run 6 exit 101, stalled-live calls 0, probe CPU 101 ms, load 33.75
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6248) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 115.56s
+== run 7 exit 101, stalled-live calls 0, probe CPU 98 ms, load 33.46
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6312) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 112.45s
+== run 8 exit 101, stalled-live calls 0, probe CPU 98 ms, load 33.62
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6453) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 115.57s
+== run 9 exit 101, stalled-live calls 0, probe CPU 96 ms, load 33.77
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6522) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 111.92s
+== run 10 exit 101, stalled-live calls 0, probe CPU 102 ms, load 33.90
+0::/a232-starved
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6588) panicked at crates/client/tests/a232_red.rs:62:4:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 119.06s
+== a232_red: red (a live daemon's call failed Stalled) 0, green 0, other failure 10, of 10
