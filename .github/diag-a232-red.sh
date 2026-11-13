@@ -1,32 +1,34 @@
 #!/bin/bash
 # A-232's red (diagnostics only, never on main): the a232_red probe, 10 runs, its process in a cgroup of cpu.weight 1
-# beside a sibling cgroup of default weight (100) holding two spinners a CPU. Each run prints every call that failed
+# beside eight spinners a CPU, each in a sibling cgroup of its own at the default weight (100), as systemd units are.
+# Red-1 put two spinners a CPU in one weight-100 cgroup: the probe kept 1/101 of the machine, calls took ~225 ms and
+# none stalled in 20 runs; the fixtures' starvation (A-228) came from many default-weight units. Each run prints every call that failed
 # Stalled and whether the daemon's own watchdog withheld a beat across it.
 set +e
 R=../results.txt
 cg=/sys/fs/cgroup
 cpus=$(nproc)
-spinners=$((cpus * 2))
+spinners=$((cpus * 8))
 bin=$(cargo test --locked -p slates-client --test a232_red --no-run --message-format=json 2>/dev/null \
   | jq -r 'select(.profile.test == true and .target.name == "a232_red") | .executable' | tail -1)
 {
-  echo "runner $(uname -m), $cpus CPUs, $spinners spinners at cpu.weight 100, probe at cpu.weight 1, 10 runs"
+  echo "runner $(uname -m), $cpus CPUs, $spinners spinners each in its own cgroup at cpu.weight 100, probe at cpu.weight 1, 10 runs"
   echo "commit $(git rev-parse HEAD), base $(git rev-parse HEAD~1)"
   echo "kernel $(uname -r); cgroup v2 root controllers: $(cat $cg/cgroup.subtree_control)"
   echo "probe binary: $bin"
 } > $R
 grep -qw cpu $cg/cgroup.subtree_control || echo +cpu | sudo tee $cg/cgroup.subtree_control > /dev/null
-sudo mkdir -p $cg/a232-starved $cg/a232-spinners
+sudo mkdir -p $cg/a232-starved
 echo 1 | sudo tee $cg/a232-starved/cpu.weight > /dev/null
-echo 100 | sudo tee $cg/a232-spinners/cpu.weight > /dev/null
-echo "weights: starved $(cat $cg/a232-starved/cpu.weight), spinners $(cat $cg/a232-spinners/cpu.weight)" | tee -a $R
 pids=()
 for i in $(seq $spinners); do
+  sudo mkdir -p $cg/a232-spin-$i
+  echo 100 | sudo tee $cg/a232-spin-$i/cpu.weight > /dev/null
   (while :; do :; done) &
   pids+=($!)
-  echo $! | sudo tee $cg/a232-spinners/cgroup.procs > /dev/null
+  echo $! | sudo tee $cg/a232-spin-$i/cgroup.procs > /dev/null
 done
-echo "spinners in their cgroup: $(wc -l < $cg/a232-spinners/cgroup.procs)" | tee -a $R
+echo "weights: starved $(cat $cg/a232-starved/cpu.weight); spinner cgroups $(ls -d $cg/a232-spin-* | wc -l), each $(cat $cg/a232-spin-1/cpu.weight), holding $(cat $cg/a232-spin-*/cgroup.procs | wc -l) spinners" | tee -a $R
 red=0; green=0; broken=0
 for run in $(seq 10); do
   used_before=$(awk '/usage_usec/ {print $2}' $cg/a232-starved/cpu.stat)

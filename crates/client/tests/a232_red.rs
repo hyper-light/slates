@@ -49,7 +49,7 @@ fn connect(instance: &str) -> Client {
   }
 }
 
-/// Do: start a daemon, call `list` and `create` in turn for [`CALLING`], each call bracketed by the watchdog's turns.
+/// Do: start a daemon, make one volume, call `list` and its `status` in turn for [`CALLING`], each call bracketed by the watchdog's turns.
 /// Expect (the red): one or more calls fail `Stalled` with no beat withheld across them. The test prints every such
 /// call and its counts, and fails when it saw one, so the lane's exit code says red.
 #[test]
@@ -72,6 +72,17 @@ fn a_call_to_a_live_starved_daemon_is_failed_stalled() {
   .unwrap();
   daemon.bootstrap(true).expect("the local consensus group");
   let mut client = connect(&instance);
+  // One volume, made before the calls: a create each turn grew `list`'s reply past the client's bulk area within a
+  // minute ("reply too large for the bulk area", 1,381 of 2,942 calls on this Mac, 2026-11-13).
+  let volume = client
+    .create(&CreateSpec {
+      name: "red".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .expect("the probe's volume");
   let began = Instant::now();
   let (mut calls, mut answered, mut stalled_live, mut stalled_judged, mut other) = (0u64, 0u64, 0u64, 0u64, 0u64);
   while began.elapsed() < CALLING {
@@ -80,15 +91,7 @@ fn a_call_to_a_live_starved_daemon_is_failed_stalled() {
     let result = if calls % 2 == 0 {
       client.list().map(|_| ())
     } else {
-      client
-        .create(&CreateSpec {
-          name: format!("red-{calls}"),
-          size: SizeClass::Bounded { limit: 1 << 20 },
-          names: NamePolicy::Exact,
-          require_locked: false,
-          base: None,
-        })
-        .map(|_| ())
+      client.status(volume).map(|_| ())
     };
     let took = call_began.elapsed();
     let after = daemon.watchdog_turns();
