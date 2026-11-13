@@ -1,0 +1,56 @@
+runner x86_64, 4 CPUs, 32 spinners each in its own cgroup at cpu.weight 100, probe at cpu.weight 1, 10 runs
+commit ffe21f35e9638d716ed10fb8591d411c732418c7, base 08162d197de2c0d4333bccd21f9ee29d65615c9c
+kernel 7.0.0-1019-azure; cgroup v2 root controllers: cpuset cpu io memory pids
+probe binary: /home/runner/work/slates/slates/target/debug/deps/a232_red-bb0288cea0878210
+weights: starved 1; spinner cgroups 32, each 100, holding 32 spinners
+== run 1 exit 0, stalled-live calls 0, probe CPU 0 ms, load 23.07
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 5868
+A232-SUMMARY calls 444 answered 444 stalled_live 0 stalled_judged 0 other 0 watchdog Some((394, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.71s
+== run 2 exit 0, stalled-live calls 0, probe CPU 0 ms, load 30.47
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 5925
+A232-SUMMARY calls 421 answered 421 stalled_live 0 stalled_judged 0 other 0 watchdog Some((385, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.56s
+== run 3 exit 0, stalled-live calls 0, probe CPU 0 ms, load 34.25
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 5980
+A232-SUMMARY calls 408 answered 408 stalled_live 0 stalled_judged 0 other 0 watchdog Some((397, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.54s
+== run 4 exit 0, stalled-live calls 0, probe CPU 0 ms, load 35.21
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6034
+A232-SUMMARY calls 394 answered 394 stalled_live 0 stalled_judged 0 other 0 watchdog Some((403, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.44s
+== run 5 exit 0, stalled-live calls 0, probe CPU 0 ms, load 35.51
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6119
+A232-SUMMARY calls 415 answered 415 stalled_live 0 stalled_judged 0 other 0 watchdog Some((396, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.88s
+== run 6 exit 0, stalled-live calls 0, probe CPU 0 ms, load 37.34
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6173
+A232-SUMMARY calls 371 answered 371 stalled_live 0 stalled_judged 0 other 0 watchdog Some((408, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.64s
+== run 7 exit 0, stalled-live calls 0, probe CPU 0 ms, load 37.36
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6223
+A232-SUMMARY calls 400 answered 400 stalled_live 0 stalled_judged 0 other 0 watchdog Some((418, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.29s
+== run 8 exit 0, stalled-live calls 0, probe CPU 0 ms, load 37.45
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6276
+A232-SUMMARY calls 376 answered 376 stalled_live 0 stalled_judged 0 other 0 watchdog Some((425, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.54s
+== run 9 exit 0, stalled-live calls 0, probe CPU 0 ms, load 38.12
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6323
+A232-SUMMARY calls 373 answered 373 stalled_live 0 stalled_judged 0 other 0 watchdog Some((400, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.55s
+== run 10 exit 0, stalled-live calls 0, probe CPU 0 ms, load 37.60
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6380
+A232-SUMMARY calls 386 answered 386 stalled_live 0 stalled_judged 0 other 0 watchdog Some((414, 0))
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.22s
+== a232_red: red (a live daemon's call failed Stalled) 0, green 10, other failure 0, of 10
