@@ -1,0 +1,178 @@
+runner x86_64, 4 CPUs, 32 spinners each in its own cgroup at cpu.weight 100, probe at cpu.weight 1, 10 runs
+commit e553e306bc054a36ee5e1d4e84ea6e6a4ab0234d, base ffe21f35e9638d716ed10fb8591d411c732418c7
+kernel 7.0.0-1019-azure; cgroup v2 root controllers: cpuset cpu io memory pids
+probe binary: /home/runner/work/slates/slates/target/debug/deps/a232_red-bb0288cea0878210
+weights: starved 1; spinner cgroups 32, each 100, holding 32 spinners
+probe 5873 moved after 4 s: 0::/a232-starved
+== run 1 exit 101, stalled-live calls 3, probe CPU 52 ms, load 25.22
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 5873
+A232-STALLED call 1 after 5.316 s (deadline 1000000000 ns) at 5.3 s; watchdog (looks, withheld) before Some((10, 0)) after Some((12, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 3808 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 5564 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 2.256 s (deadline 1000000000 ns) at 24.7 s; watchdog (looks, withheld) before Some((16, 0)) after Some((18, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2199 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 3348 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 3348 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 8.929 s (deadline 1000000000 ns) at 40.5 s; watchdog (looks, withheld) before Some((20, 0)) after Some((22, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 1786 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2470 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2470 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 6 answered 3 stalled_live 3 stalled_judged 0 other 0 watchdog Some((25, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (5874) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.12s
+probe 6046 moved after 4 s: 0::/a232-starved
+== run 2 exit 101, stalled-live calls 1, probe CPU 57 ms, load 32.61
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6046
+A232-STALLED call 1 after 6.017 s (deadline 1000000000 ns) at 6.0 s; watchdog (looks, withheld) before Some((11, 0)) after Some((12, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 1655 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 1691 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1691 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1590 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1069 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1665 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 7 answered 6 stalled_live 1 stalled_judged 0 other 0 watchdog Some((45, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6048) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.19s
+probe 6217 moved after 4 s: 0::/a232-starved
+== run 3 exit 101, stalled-live calls 3, probe CPU 65 ms, load 34.83
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6217
+slates daemon: shard 1 is starved: no step and no CPU progress for 1733 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 1 after 4.673 s (deadline 1000000000 ns) at 4.7 s; watchdog (looks, withheld) before Some((15, 0)) after Some((18, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 4116 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2971 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 1816 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2474 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 4.885 s (deadline 1000000000 ns) at 31.7 s; watchdog (looks, withheld) before Some((27, 0)) after Some((29, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 1939 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 1828 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 7 after 4.322 s (deadline 1000000000 ns) at 42.9 s; watchdog (looks, withheld) before Some((31, 0)) after Some((33, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2466 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2019 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2019 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 8 answered 5 stalled_live 3 stalled_judged 0 other 0 watchdog Some((37, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6219) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.72s
+probe 6420 moved after 4 s: 0::/a232-starved
+== run 4 exit 101, stalled-live calls 3, probe CPU 51 ms, load 36.07
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6420
+A232-STALLED call 1 after 4.692 s (deadline 1000000000 ns) at 4.7 s; watchdog (looks, withheld) before Some((17, 0)) after Some((19, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 1750 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2092 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 8.410 s (deadline 1000000000 ns) at 18.8 s; watchdog (looks, withheld) before Some((22, 0)) after Some((23, 0)); daemon gone false; LIVE: no beat withheld
+A232-STALLED call 5 after 6.781 s (deadline 1000000000 ns) at 33.0 s; watchdog (looks, withheld) before Some((23, 0)) after Some((25, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 1551 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 8463 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 6 answered 3 stalled_live 3 stalled_judged 0 other 0 watchdog Some((29, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6422) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 56.24s
+probe 6586 moved after 4 s: 0::/a232-starved
+== run 5 exit 101, stalled-live calls 3, probe CPU 64 ms, load 36.29
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6586
+A232-STALLED call 1 after 4.286 s (deadline 1000000000 ns) at 4.3 s; watchdog (looks, withheld) before Some((16, 0)) after Some((17, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2516 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2299 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2463 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 4.885 s (deadline 1000000000 ns) at 21.8 s; watchdog (looks, withheld) before Some((21, 0)) after Some((23, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2460 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2474 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2474 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1885 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 5.808 s (deadline 1000000000 ns) at 39.4 s; watchdog (looks, withheld) before Some((27, 0)) after Some((29, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 0 is starved: no step and no CPU progress for 2475 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2475 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 6 answered 3 stalled_live 3 stalled_judged 0 other 0 watchdog Some((33, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6588) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.70s
+probe 6832 moved after 4 s: 0::/a232-starved
+== run 6 exit 101, stalled-live calls 3, probe CPU 67 ms, load 36.27
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 6832
+A232-STALLED call 1 after 4.385 s (deadline 1000000000 ns) at 4.4 s; watchdog (looks, withheld) before Some((12, 0)) after Some((14, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 4251 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2331 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2331 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 4952 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 1957 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 4.427 s (deadline 1000000000 ns) at 25.0 s; watchdog (looks, withheld) before Some((18, 0)) after Some((20, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2474 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2455 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2455 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1746 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 4326 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 1923 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 6.249 s (deadline 1000000000 ns) at 44.6 s; watchdog (looks, withheld) before Some((25, 0)) after Some((27, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 0 is starved: no step and no CPU progress for 2465 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 6 answered 3 stalled_live 3 stalled_judged 0 other 0 watchdog Some((30, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (6834) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 63.41s
+probe 7012 moved after 4 s: 0::/a232-starved
+== run 7 exit 101, stalled-live calls 3, probe CPU 58 ms, load 36.54
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 7012
+A232-STALLED call 1 after 2.500 s (deadline 1000000000 ns) at 2.5 s; watchdog (looks, withheld) before Some((9, 0)) after Some((10, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 0 is starved: no step and no CPU progress for 1922 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 4046 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 2.485 s (deadline 1000000000 ns) at 15.0 s; watchdog (looks, withheld) before Some((14, 0)) after Some((15, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 4955 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 4618 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 6.704 s (deadline 1000000000 ns) at 31.0 s; watchdog (looks, withheld) before Some((18, 0)) after Some((20, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 3041 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 3830 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2477 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 8 answered 5 stalled_live 3 stalled_judged 0 other 0 watchdog Some((26, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (7015) panicked at crates/client/tests/a232_red.rs:139:3:
+slates daemon: shard 1 is starved: no step and no CPU progress for 1183 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.11s
+probe 7177 moved after 4 s: 0::/a232-starved
+== run 8 exit 101, stalled-live calls 1, probe CPU 53 ms, load 36.70
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 7177
+slates daemon: shard 0 is starved: no step and no CPU progress for 4346 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2501 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2478 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 1942 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2468 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 7 after 7.142 s (deadline 1000000000 ns) at 48.2 s; watchdog (looks, withheld) before Some((25, 0)) after Some((27, 0)); daemon gone false; LIVE: no beat withheld
+A232-SUMMARY calls 7 answered 6 stalled_live 1 stalled_judged 0 other 0 watchdog Some((27, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (7179) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.32s
+probe 7341 moved after 4 s: 0::/a232-starved
+== run 9 exit 101, stalled-live calls 2, probe CPU 60 ms, load 36.52
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 7341
+A232-STALLED call 1 after 5.539 s (deadline 1000000000 ns) at 5.5 s; watchdog (looks, withheld) before Some((18, 0)) after Some((19, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2193 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 5064 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2067 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2129 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 4.100 s (deadline 1000000000 ns) at 38.1 s; watchdog (looks, withheld) before Some((28, 0)) after Some((30, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2467 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2475 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2475 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-SUMMARY calls 6 answered 4 stalled_live 2 stalled_judged 0 other 0 watchdog Some((34, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (7343) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.26s
+probe 7507 moved after 4 s: 0::/a232-starved
+== run 10 exit 101, stalled-live calls 3, probe CPU 59 ms, load 36.24
+test a_call_to_a_live_starved_daemon_is_failed_stalled ... slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on
+A232-READY pid 7507
+A232-STALLED call 1 after 4.086 s (deadline 1000000000 ns) at 4.1 s; watchdog (looks, withheld) before Some((16, 0)) after Some((17, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 7771 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 5400 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 5400 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 6354 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 3 after 8.433 s (deadline 1000000000 ns) at 29.7 s; watchdog (looks, withheld) before Some((21, 0)) after Some((23, 0)); daemon gone false; LIVE: no beat withheld
+slates daemon: shard 1 is starved: no step and no CPU progress for 2476 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 0 is starved: no step and no CPU progress for 2471 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2471 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+slates daemon: shard 1 is starved: no step and no CPU progress for 2470 ms, past the 1000 ms window, while its thread waits for a CPU; the watchdog goes on beating
+A232-STALLED call 5 after 8.673 s (deadline 1000000000 ns) at 49.7 s; watchdog (looks, withheld) before Some((27, 0)) after Some((29, 0)); daemon gone false; LIVE: no beat withheld
+A232-SUMMARY calls 5 answered 2 stalled_live 3 stalled_judged 0 other 0 watchdog Some((29, 0))
+thread 'a_call_to_a_live_starved_daemon_is_failed_stalled' (7509) panicked at crates/client/tests/a232_red.rs:139:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.84s
+== a232_red: red (a live daemon's call failed Stalled) 10, green 0, other failure 0, of 10
