@@ -37,8 +37,10 @@
 //! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
 //! debt in GAPS. A-228 adds no number to it. While every shard is alive and the control loop lives, the thread beats; once
 //! a shard is stuck it logs what it saw and withholds the beat, and the anchor, which judges the beat's age by its own
-//! measured lateness, kills the daemon. When the control loop ends (a refused boot, A-100), the thread withholds the
-//! beat too, so the anchor restarts the daemon as before. A stop tells the thread first ([`Watchdog::stopping`]), since
+//! measured lateness, kills the daemon. Every look is marked in the segment too, beating or not (`SUP_LOOKED`,
+//! A-232), so the anchor tells a withheld beat (the looks go on) from a watchdog that was itself kept off its CPU (they
+//! stop). When the control loop ends (a refused boot, A-100), the thread withholds the beat too, so the anchor restarts
+//! the daemon as before. A stop tells the thread first ([`Watchdog::stopping`]), since
 //! the shutdown ends the control loop before it stops the thread: a control loop that ends then is the stop's, and is
 //! not announced as one to restart (under two spinners a core, 8 of 18 daemons stopped in one `nfs_hostile` run said
 //! so before, an 18-core Mac, 2026-11-07). Under Miri, which has no thread clock, the wall window stands
@@ -454,12 +456,9 @@ fn run(
       }
     }
     turns.looked(stuck.is_some());
+    mark(segment, turn, now);
     match turn {
-      Turn::Beat => {
-        if let Ok(supervision) = segment.supervision() {
-          supervision.beat(now);
-        }
-      }
+      Turn::Beat => {}
       Turn::Withhold(Cause::ControlEnded) => {
         if !stopping && !said_control_ended {
           said_control_ended = true;
@@ -470,6 +469,18 @@ fn run(
       }
       // Ended above, before any line that takes the log's lock.
       Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
+    }
+  }
+}
+
+/// Writes a turn into the segment at `now_ns`: the look, at every turn, beating or not (A-232: a beat that lapses while
+/// the looks go on is the watchdog's verdict, and one that lapses with them is this thread kept off its CPU, which the
+/// anchor tells apart by this word); and the beat, when the turn beats.
+fn mark(segment: &AnchorSegment, turn: Turn, now_ns: u64) {
+  if let Ok(supervision) = segment.supervision() {
+    supervision.look(now_ns);
+    if turn == Turn::Beat {
+      supervision.beat(now_ns);
     }
   }
 }

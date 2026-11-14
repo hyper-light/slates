@@ -393,6 +393,129 @@ fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict
   verdict
 }
 
+/// A running daemon whose beat lapsed while its watchdog had stopped looking (A-232): its process, judged by the start's
+/// rule from when the looks stopped, and whether this episode's spare was said.
+#[derive(Default)]
+struct Quiet {
+  watch: ShardWatch,
+  said_spared: bool,
+}
+
+impl Quiet {
+  /// Starts afresh while the daemon beats: the next silence is judged from its own start.
+  fn reset_while(&mut self, alive: bool) {
+    if alive {
+      *self = Quiet::default();
+    }
+  }
+}
+
+/// The observation loop's next pause: `planned`, or a beat when `look_every_beat`. A killed daemon is waited on until
+/// it is reaped, and a spared one is looked at every beat: its beat, already lapsed, says nothing of when to look next.
+fn next_pause(planned: Duration, look_every_beat: bool) -> Duration {
+  if look_every_beat {
+    observation_pause()
+  } else {
+    planned
+  }
+}
+
+/// What the anchor saw of a running daemon whose beat lapsed, at its clock `now`: the beat, the watchdog's last look
+/// (`SUP_LOOKED`), when the anchor last resumed after a gap of its own (neither word is aged from before it), and the
+/// lapse bound.
+struct LapseSeen {
+  now: u64,
+  heartbeat_ns: u64,
+  looked_ns: Option<u64>,
+  resumed_ns: u64,
+  bound: u64,
+}
+
+/// Acts on a lapsed beat (A-232, [`judge_lapse`]): kills a daemon whose watchdog withheld the beat while looking, or
+/// whose process is stuck by the start's rule while its watchdog is silent, and spares one whose process is starved,
+/// saying so once an episode ([`Quiet`]). Whether a kill was sent.
+fn on_lapse(
+  supervisor: &mut Supervisor,
+  seen: &LapseSeen,
+  lateness: &Lateness,
+  quiet: &mut Quiet,
+) -> Result<bool, Failure> {
+  let now = seen.now;
+  let beat_age = now.saturating_sub(seen.heartbeat_ns);
+  let looked_age = now.saturating_sub(seen.looked_ns.unwrap_or(0).max(seen.resumed_ns));
+  let pid = supervisor.child_pid();
+  match judge_lapse(seen.looked_ns.is_some() && looked_age <= seen.bound, || {
+    judge_start_of(pid, &mut quiet.watch, now)
+  }) {
+    Lapse::Withheld => {
+      slates_machine::log_line!(
+        "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
+         lateness p99 of {} ms over {} waits); killing it",
+        beat_age / NS_PER_MS,
+        seen.bound / NS_PER_MS,
+        LIVENESS_BUDGET_NS / NS_PER_MS,
+        lateness.p99_ns() / NS_PER_MS,
+        lateness.len()
+      );
+      supervisor.kill().map_err(|e| failed("kill", e))?;
+      Ok(true)
+    }
+    Lapse::Stuck(said) => {
+      slates_machine::log_line!(
+        "slates anchor: the daemon's watchdog has not looked for {} ms, its heartbeat {} ms old; its process {said}; \
+         killing it",
+        looked_age / NS_PER_MS,
+        beat_age / NS_PER_MS
+      );
+      supervisor.kill().map_err(|e| failed("kill", e))?;
+      Ok(true)
+    }
+    Lapse::Starved => {
+      if !quiet.said_spared {
+        quiet.said_spared = true;
+        slates_machine::log_line!(
+          "slates anchor: the daemon's heartbeat is {} ms old, but its watchdog has not looked for {} ms either, so its \
+           process is judged in its own CPU time by the start's rule: waited for while starved, killed once frozen or \
+           spinning for a window",
+          beat_age / NS_PER_MS,
+          looked_age / NS_PER_MS
+        );
+      }
+      Ok(false)
+    }
+  }
+}
+
+/// What the anchor does about a running daemon whose beat has lapsed (A-232).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Lapse {
+  /// The watchdog looked within the lapse bound and withheld the beat: its verdict (a stuck shard, or a control loop
+  /// that ended). The daemon is killed.
+  Withheld,
+  /// The watchdog has not looked within the bound and the daemon's process is stuck by the start's rule, as the words
+  /// say (no CPU progress and never runnable for a window, as a frozen process; or a window of CPU on one thread while
+  /// the watchdog never looked). The daemon is killed.
+  Stuck(String),
+  /// The watchdog has not looked within the bound, and the daemon's process is starved or alive by that rule: its
+  /// watchdog was kept off its CPU with the rest of it. A starved daemon is not a stuck one; it is waited for.
+  Starved,
+}
+
+/// What a lapsed beat means (A-232), pure so the table is tested on every host: `watchdog_looking` whether the watchdog
+/// marked a look within the lapse bound; `process` judges the daemon's process by the start's rule, asked only when the
+/// watchdog did not look. Before A-232 every lapse killed: at `cpu.weight` 1 beside default-weight spinners on CI the
+/// watchdog thread itself was held off past the window and the anchor's lateness p99, and the anchor killed a starved
+/// daemon in 3 of 20 runs (`diag-a232-starved-1`, beats 3.3 to 4.1 s old against bounds of 2.5 to 3.3 s).
+fn judge_lapse(watchdog_looking: bool, process: impl FnOnce() -> Verdict) -> Lapse {
+  if watchdog_looking {
+    return Lapse::Withheld;
+  }
+  match start_stuck(process()) {
+    Some(said) => Lapse::Stuck(said),
+    None => Lapse::Starved,
+  }
+}
+
 /// What a start's verdict says when it is to be killed: `None` while it is alive.
 fn start_stuck(verdict: Verdict) -> Option<String> {
   match verdict {
@@ -446,6 +569,7 @@ fn observe(
     }
   );
   let mut kill_sent = false;
+  let mut quiet = Quiet::default();
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -455,7 +579,7 @@ fn observe(
     let bound = lateness.lapse_bound_ns();
     match supervisor.step(now).map_err(|e| failed("step", e))? {
       slates_anchor::Step::Running => {
-        let (heartbeat_ns, alive) = {
+        let (heartbeat_ns, looked_ns, alive) = {
           let sup = supervisor
             .segment()
             .supervision()
@@ -464,8 +588,13 @@ fn observe(
           watch = next;
           // Running and beaten at least once, as the segment judges it; the age is the watch's, which does not count
           // a span the anchor itself did not observe.
-          (sup.heartbeat_ns(), sup.alive(now, u64::MAX).0 && !dead)
+          (
+            sup.heartbeat_ns(),
+            sup.looked_ns(),
+            sup.alive(now, u64::MAX).0 && !dead,
+          )
         };
+        quiet.reset_while(alive);
         // A starting daemon is looked at every beat (its first beat times its start, which sets the restart policy);
         // a running one only when its heartbeat could next be found lapsed (`lapse_wait`).
         let pause = if starting_since.is_some() {
@@ -495,25 +624,22 @@ fn observe(
           }
           Some(_) => {}
           None if !alive && !kill_sent => {
-            slates_machine::log_line!(
-              "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
-               lateness p99 of {} ms over {} waits); killing it",
-              now.saturating_sub(heartbeat_ns) / NS_PER_MS,
-              bound / NS_PER_MS,
-              LIVENESS_BUDGET_NS / NS_PER_MS,
-              lateness.p99_ns() / NS_PER_MS,
-              lateness.len()
-            );
-            supervisor.kill().map_err(|e| failed("kill", e))?;
-            kill_sent = true;
+            kill_sent = on_lapse(
+              supervisor,
+              &LapseSeen {
+                now,
+                heartbeat_ns,
+                looked_ns,
+                resumed_ns: watch.resumed_ns,
+                bound,
+              },
+              &lateness,
+              &mut quiet,
+            )?;
           }
           None => {}
         }
-        let pause = if kill_sent {
-          observation_pause()
-        } else {
-          pause
-        };
+        let pause = next_pause(pause, kill_sent || (!alive && starting_since.is_none()));
         let asked = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
         let waited_from = clock.monotonic_ns();
         await_observation(supervisor, &mut daemon_watch, pause);
@@ -667,6 +793,33 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
+
+  /// A-232, §4.14. Do: judge a lapsed beat with the watchdog still looking, and with it silent while the daemon's process
+  /// is alive, starved, wedged (no CPU, never runnable: frozen) or spinning (a window of CPU on one thread). Expect: a
+  /// looking watchdog's lapse is its verdict and kills without asking about the process; a silent one kills only a
+  /// wedged or spinning process and spares a starved or alive one, since a starved daemon is not a stuck one.
+  #[test]
+  fn a_lapse_kills_a_withheld_beat_or_a_stuck_process_and_spares_a_starved_one() {
+    let window = LIVENESS_BUDGET_NS;
+    assert_eq!(
+      judge_lapse(true, || panic!(
+        "a looking watchdog's lapse asks nothing of the process"
+      )),
+      Lapse::Withheld
+    );
+    for spared in [Verdict::Alive, Verdict::Starved { for_ns: window }] {
+      assert_eq!(judge_lapse(false, || spared), Lapse::Starved, "{spared:?}");
+    }
+    for stuck in [
+      Verdict::Wedged { for_ns: window },
+      Verdict::Spinning { cpu_ns: window },
+    ] {
+      assert!(
+        matches!(judge_lapse(false, || stuck), Lapse::Stuck(_)),
+        "{stuck:?}"
+      );
+    }
+  }
 
   /// A-228, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each wait
   /// 300 ms over its pause), with early-ended waits between, and more waits than it keeps. Expect: a quiet anchor holds a

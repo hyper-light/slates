@@ -130,6 +130,14 @@ pub const SUP_LOG_REFUSALS: usize = 200;
 /// exit under it counts, as before.
 /// Format: the byte offset inside the supervision block, the word after the refused log lines.
 pub const SUP_SERVING: usize = 208;
+/// The current daemon's **looked** word (A-232): when, in the heartbeat's host domain, its watchdog last looked at its
+/// shards, written at every look whether the look beat or withheld the beat; zero until the first, and zeroed at every
+/// start. A beat that lapses while the looks go on is the watchdog's verdict (a stuck shard, or a control loop that
+/// ended), and the anchor kills; a beat that lapses because the watchdog itself has not looked is a daemon whose
+/// watchdog was kept off its CPU, which the anchor judges by its process's own CPU time, as it judges a start, and
+/// spares while it is starved.
+/// Format: the byte offset inside the supervision block, the word after the serving word.
+pub const SUP_LOOKED: usize = 216;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon

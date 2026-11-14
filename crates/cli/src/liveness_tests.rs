@@ -66,6 +66,8 @@ const AT_WORD: &str = "at_ns=";
 const LAPSED_WORDS: &str = "slates anchor: the daemon's heartbeat lapsed (";
 const P99_WORDS: &str = "lateness p99 of ";
 const RESTARTED_WORDS: &str = "slates anchor: daemon exited (";
+const PROCESS_STUCK_WORDS: &str = "; its process ";
+const SPARED_WORDS: &str = "so its process is judged in its own CPU time";
 const WITHHELD_WORDS: &str = "the watchdog withholds the beat";
 const LATE_WORDS: &str = "the looks since it last moved ran ";
 const FIRST_LATE_WORDS: &str = "the first of them ";
@@ -540,6 +542,74 @@ fn an_anchored_daemons_wedged_shard_is_ended_within_the_liveness_bound_and_its_c
   assert!(anchor.stop(), "the anchor stopped when asked");
 }
 
+/// A-232, §4.14, A-228's "a frozen process is still killed". Do: under the anchor that ships, stop the daemon's whole
+/// process (SIGSTOP) with a call of a client outstanding, so its watchdog stops looking as well as beating. Expect: the
+/// anchor does not take the silent watchdog for a starved one: it judges the process by the start's rule (no CPU
+/// progress, never runnable), kills it a window after the lapse, and says so ("; its process ... killing it"); the call
+/// is then answered by the daemon it restarts, after one reconnect. The time from the stop to the kill is reported.
+#[test]
+fn an_anchored_daemon_stopped_whole_is_killed_by_its_process_judgment_and_its_call_answered_after()
+{
+  let instance = format!("a232-frozen-{}", std::process::id());
+  let anchor = AnchorRole::start(&instance, "none");
+  let daemon_pid = u32::try_from(number_after(
+    &await_tag(&anchor.stdout, DAEMON_READY, START_WAIT),
+    PID_WORD,
+  ))
+  .unwrap();
+  let mut client = connect(&instance);
+  // Stopped only once the anchor holds it as running, not starting: a start is judged by the start's rule, which kills
+  // a stopped start too, and is not the path this tests (the first run here was killed as "the starting daemon"). The
+  // watchdog beats within a beat of its start and the anchor sees it at its next look, a beat later; one answered call,
+  // then a window, leaves ten beats of slack.
+  client
+    .list()
+    .expect("the daemon answers before it is stopped");
+  pause(WINDOW);
+  let stopped_ns = slates_machine::clock::monotonic_ns();
+  rustix::process::kill_process(
+    rustix::process::Pid::from_raw(i32::try_from(daemon_pid).unwrap()).unwrap(),
+    rustix::process::Signal::STOP,
+  )
+  .unwrap();
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let deadlines = deadlines();
+  let give_up =
+    GIVE_UP_WINDOWS * WINDOW + Duration::from_nanos(deadlines.reply_ns + deadlines.reconnect_ns);
+  let (call, _, gone_at_ns) = drive(&mut client, &mut driver, ticket, give_up);
+  let lines = drain(&anchor.stderr);
+  let killed = lines
+    .iter()
+    .find(|(_, line)| line.contains(PROCESS_STUCK_WORDS))
+    .cloned();
+  let withheld_kill = lines.iter().any(|(_, line)| line.contains(LAPSED_WORDS));
+  println!(
+    "A232-FROZEN: the anchor's kill line {:?} after the stop; DaemonGone {:?} after it; the call ended {call:?} after {} \
+     reconnect(s); the anchor: {:?}",
+    killed
+      .as_ref()
+      .map(|(at, _)| Duration::from_nanos(at.saturating_sub(stopped_ns))),
+    gone_at_ns.map(|at| Duration::from_nanos(at.saturating_sub(stopped_ns))),
+    client.reconnects(),
+    killed.as_ref().map(|(_, line)| line.as_str()),
+  );
+  assert!(
+    killed.is_some() && !withheld_kill,
+    "the anchor killed the stopped daemon by its process judgment, not as a withheld beat: {lines:?}"
+  );
+  assert!(
+    matches!(call, Some(Ok(()))),
+    "the outstanding call was answered by the restarted daemon, not {call:?}"
+  );
+  assert!(client.reconnects() >= 1, "after a reconnect");
+}
+
 /// Lowers every thread of the process `pid` to the lowest priority a process may give itself: on Linux a nice value is
 /// per thread, so each thread is lowered; elsewhere the process's value is.
 fn lower(pid: u32) {
@@ -712,22 +782,28 @@ fn an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed(
       .map(|(_, line)| line.clone())
       .collect::<Vec<_>>()
   };
-  let (starved, lapsed, restarted) = (
+  let (starved, lapsed, restarted, spared, process_stuck) = (
     said(STARVED_WORDS),
     said(LAPSED_WORDS),
     said(RESTARTED_WORDS),
+    said(SPARED_WORDS),
+    said(PROCESS_STUCK_WORDS),
   );
   println!(
-    "A232-STARVED-LINES starved {} lapsed {lapsed:?} restarted {restarted:?}",
-    starved.len()
+    "A232-STARVED-LINES starved {} spared {} lapsed {lapsed:?} process-stuck {process_stuck:?} restarted {restarted:?}",
+    starved.len(),
+    spared.len()
   );
   assert!(
     failed.is_empty(),
     "every call to the starved daemon was answered: {failed:?}"
   );
   assert!(
-    lapsed.is_empty() && restarted.is_empty() && client.reconnects() == 0,
-    "the anchor ended a starved daemon: {lapsed:?} {restarted:?}, {} reconnect(s)",
+    lapsed.is_empty()
+      && process_stuck.is_empty()
+      && restarted.is_empty()
+      && client.reconnects() == 0,
+    "the anchor ended a starved daemon: {lapsed:?} {process_stuck:?} {restarted:?}, {} reconnect(s)",
     client.reconnects()
   );
   assert!(
