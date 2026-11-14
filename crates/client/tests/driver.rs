@@ -1,7 +1,8 @@
-//! The async client's driver (`slates_client::driver`; AUD-29-19, AUD-29-20) against real daemons: a ticker
+//! The async client's driver (`slates_client::driver`; AUD-29-19, AUD-29-20, A-232) against real daemons: a ticker
 //! loop stands in for an SDK's event loop — it pumps, ticks when the driver asks, and records its longest
-//! single step — while calls overflow admission, a daemon restarts under them, a daemon dies for good, and
-//! a call is cancelled. Every call must end, and the loop must never be held.
+//! single step — while calls overflow admission, a daemon restarts under them, a daemon dies for good, a
+//! daemon is held off its CPU past several reply deadlines, and a call is cancelled. Every call must end — answered
+//! while its daemon lives, `DaemonGone` once it is gone — and the loop must never be held.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -14,6 +15,7 @@ use slates_client::{Client, ClientError, Deadlines};
 use slates_ipc::HeldRendezvous;
 use slates_ipc::protocol::ReplyBody;
 use slates_machine::{MachineProfile, ProfileOptions};
+use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the probe budget of the quick profile these tests measure (milliseconds).
@@ -258,12 +260,12 @@ fn submit_lists(client: &mut Client, driver: &mut Driver, count: usize) -> (Vec<
 }
 
 /// Connects from the loop: the claim begun, then polled at the pacing it asks for, every step timed.
-fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
+fn connect_from_the_loop(instance: &str, deadlines: Deadlines, ticker: &mut Ticker) -> Client {
   let started = Instant::now();
   loop {
     let step = Instant::now();
     let connect_switches = slates_machine::bench::involuntary_switches();
-    match Client::begin_connect(instance, deadlines()) {
+    match Client::begin_connect(instance, deadlines) {
       Ok(mut connecting) => loop {
         let step = Instant::now();
         let switches = slates_machine::bench::involuntary_switches();
@@ -379,7 +381,7 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   let anchor = Anchor::new(&instance);
   let first = anchor.start();
   let mut ticker = Ticker::default();
-  let mut client = connect_from_the_loop(&instance, &mut ticker);
+  let mut client = connect_from_the_loop(&instance, deadlines(), &mut ticker);
   let mut driver = Driver::new(&client);
 
   let second = overflow_then_restart(&anchor, first, &mut client, &mut driver, &mut ticker);
@@ -400,16 +402,18 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   );
   third.stop();
   let noise = noise.stop();
+  assert_never_held(&ticker, step_bound(), noise);
+}
+
+/// Asserts no step of `ticker`'s loop was held past `bound` by the driver: a step over `bound` plus the sampled `noise`
+/// counts only if the scheduler did not take the thread away during it.
+fn assert_never_held(ticker: &Ticker, bound: Duration, noise: Duration) {
   // Reported whether it passes or fails: a timing bound whose margin nobody sees is one nobody can judge, and
   // these three numbers are what a CI failure needs (the `longest_call` comment records a 245 ms step that
   // could not be attributed at all).
   println!(
     "driver loop: longest step {:?} in {}, bound {:?}, sampled noise {:?}, involuntary switches during it {:?}",
-    ticker.longest_step,
-    ticker.longest_call,
-    step_bound(),
-    noise,
-    ticker.longest_switches
+    ticker.longest_step, ticker.longest_call, bound, noise, ticker.longest_switches
   );
   // A step over the bound is the driver's only if the scheduler did not take the thread away during it. The
   // noise allowance stays for jitter below a preemption; the switch count decides the rest, which is the
@@ -418,14 +422,14 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   // estimate swinging 20–65 ms for near-identical steps — a sleeping sampler measures its own wake lateness,
   // which is not what a runnable thread suffers.
   assert!(
-    ticker.longest_step < step_bound() + noise
+    ticker.longest_step < bound + noise
       || ticker.longest_switches.is_none_or(|switches| switches > 0),
     "the longest loop step was {:?} in {}, bound {:?} plus the machine's own scheduling noise {:?}, and the \
      scheduler took the thread away {:?} times during it (Some(0): the driver held it; None: this \
      platform keeps no such counter)",
     ticker.longest_step,
     ticker.longest_call,
-    step_bound(),
+    bound,
     noise,
     ticker.longest_switches
   );
@@ -443,7 +447,7 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
   let anchor = Anchor::new(&instance);
   let daemon = anchor.start();
   let mut ticker = Ticker::default();
-  let mut client = connect_from_the_loop(&instance, &mut ticker);
+  let mut client = connect_from_the_loop(&instance, deadlines(), &mut ticker);
   let mut driver = Driver::new(&client);
   let ticket = driver
     .submit(
@@ -479,4 +483,148 @@ fn a_ready_call_is_reported_once_until_it_is_finished() {
   driver.finish(ticket);
   assert!(driver.is_idle());
   daemon.stop();
+}
+
+/// Shape: the part of the watchdog's window (`LIVENESS_BUDGET_NS`) the held-daemon test holds its shard off the CPU:
+/// half. The watchdog calls a shard stuck only after a whole window in which it did not move (A-228,
+/// `crates/server/src/watchdog.rs`), so the daemon is alive by its own judgment throughout the hold.
+const HOLD_PARTS_OF_WINDOW: u64 = 2;
+/// Shape: the reply deadlines the hold spans: the held-daemon test's client waits a fifth of the hold for a reply
+/// before it asks the daemon's liveness, so every call is overdue several times over before the daemon can answer.
+const DEADLINES_HELD: u64 = 5;
+
+/// How long the held-daemon test keeps its shard off the CPU.
+fn hold_ns() -> u64 {
+  LIVENESS_BUDGET_NS / HOLD_PARTS_OF_WINDOW
+}
+
+/// The held-daemon test's deadlines: the product's reconnect budget, and a reply deadline of [`DEADLINES_HELD`] parts of
+/// the hold.
+fn held_deadlines() -> Deadlines {
+  Deadlines {
+    reply_ns: hold_ns() / DEADLINES_HELD,
+    reconnect_ns: deadlines().reconnect_ns,
+  }
+}
+
+/// A one-shard daemon, run alone: its one shard serves every client and is the control shard the hold wedges.
+fn one_shard_daemon(instance: &str) -> Daemon {
+  let profile = profile();
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, instance, Some(1)),
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  daemon
+}
+
+/// A-232 (§4.7, A-56's every call ends): a call waits while its daemon lives. Do, with a ticker loop timing every step,
+/// on a one-shard daemon whose client waits [`held_deadlines`] for a reply: hold the shard off its CPU for
+/// [`hold_ns`] (`Daemon::wedge_control_shard`: its thread asleep, so it drains nothing), submit twice the client's
+/// outstanding bound of list calls (a ring's worth sent, a ring's worth queued in the driver), run the loop past one
+/// reply deadline, cancel one sent call and one queued call, then run the loop until every other call ends. Expect: each
+/// cancel releases its call at once (the driver holds it no longer, the client awaits it no longer, and no event names
+/// it); every other call answered, the last after more than two reply deadlines (non-vacuous: each was overdue while
+/// the daemon was held); the daemon's watchdog looked during the hold and withheld no beat (the daemon was alive by its
+/// own judgment throughout); and no loop step longer than a tenth of the reply deadline (A-56's bound) unless the
+/// scheduler preempted it. Before A-232 every call ended `Stalled` at its first reply deadline.
+#[test]
+fn a_held_daemons_calls_are_waited_for_and_answered_and_a_cancel_releases_at_once() {
+  let noise = Noise::start();
+  let instance = format!("cl-driver-held-{}", std::process::id());
+  let daemon = one_shard_daemon(&instance);
+  let mut ticker = Ticker::default();
+  let mut client = connect_from_the_loop(&instance, held_deadlines(), &mut ticker);
+  let mut driver = Driver::new(&client);
+  let watchdog_before = daemon.watchdog_turns().unwrap();
+  let hold = daemon
+    .wedge_control_shard(hold_ns())
+    .expect("the hold is admitted");
+  let submitted = Instant::now();
+  let (cancelled, rest) = cancel_two_of_the_held_calls(&mut client, &mut driver, &mut ticker);
+  ticker.run(&mut client, &mut driver, &rest, budgets() * 2);
+  let answered_after = submitted.elapsed();
+  let held_for = Duration::from_nanos(hold.answer().expect("the hold ran"));
+  for ticket in &rest {
+    assert_eq!(
+      ticker.ended.get(ticket),
+      Some(&Ok(())),
+      "call {ticket} to the held daemon was answered"
+    );
+  }
+  assert!(
+    cancelled
+      .iter()
+      .all(|ticket| !ticker.ended.contains_key(ticket)),
+    "no event names a cancelled call"
+  );
+  assert!(driver.is_idle(), "every call ended");
+  let reply = Duration::from_nanos(held_deadlines().reply_ns);
+  assert!(
+    answered_after > reply * 2 && held_for > reply * 2,
+    "non-vacuous: the calls were overdue more than twice (answered after {answered_after:?}, held {held_for:?}, \
+     reply deadline {reply:?})"
+  );
+  assert_alive_throughout(&daemon, watchdog_before);
+  daemon.stop();
+  let noise = noise.stop();
+  assert_never_held(&ticker, reply / 10, noise);
+}
+
+/// The held-daemon test's calls while the shard is held: twice the client's outstanding bound of list calls submitted
+/// (a ring's worth sent, a ring's worth queued in the driver), the loop run past two reply deadlines with nothing
+/// ending, then the first call (sent) and the last (queued) cancelled, each released at once. Returns the cancelled
+/// tickets and the rest.
+fn cancel_two_of_the_held_calls(
+  client: &mut Client,
+  driver: &mut Driver,
+  ticker: &mut Ticker,
+) -> ([Ticket; 2], Vec<Ticket>) {
+  let limit = client.outstanding_limit();
+  let (admitted, refused) = submit_lists(client, driver, limit * 2);
+  assert_eq!(refused, 0, "a ring's worth sent and a ring's worth queued");
+  let (Some(&sent), Some(&queued)) = (admitted.first(), admitted.last()) else {
+    panic!("calls were admitted");
+  };
+  let sent_word = driver.word_of(sent).expect("the first call was sent");
+  assert!(driver.word_of(queued).is_none(), "the last call is queued");
+  ticker.run(
+    client,
+    driver,
+    &admitted,
+    Duration::from_nanos(held_deadlines().reply_ns) * 2,
+  );
+  assert!(
+    ticker.ended.is_empty(),
+    "nothing ends while the daemon is held and alive: {:?}",
+    ticker.ended
+  );
+  driver.cancel(client, sent);
+  driver.cancel(client, queued);
+  assert!(
+    driver.word_of(sent).is_none() && !client.outstanding().contains(&sent_word),
+    "the cancelled sent call is released at once"
+  );
+  let rest = admitted
+    .into_iter()
+    .filter(|ticket| *ticket != sent && *ticket != queued)
+    .collect();
+  ([sent, queued], rest)
+}
+
+/// Asserts `daemon`'s watchdog looked since `before` (its looks and withheld beats then) and withheld no beat: the
+/// daemon was alive by its own judgment throughout.
+fn assert_alive_throughout(daemon: &Daemon, (looks_before, withheld_before): (u64, u64)) {
+  let (looks, withheld) = daemon.watchdog_turns().unwrap();
+  assert!(looks > looks_before, "the watchdog looked during the hold");
+  assert_eq!(
+    withheld, withheld_before,
+    "the watchdog judged the held daemon alive throughout ({looks} looks)"
+  );
 }

@@ -1,4 +1,17 @@
 //! The client: the rendezvous, one request in flight, exactly-once retries, typed verbs.
+//!
+//! **A call waits while its daemon lives, and fails `DaemonGone` once it is gone (§4.7, A-232).** One rule for every
+//! wait a call makes, the async driver's (`crate::driver`) and the two here: `round_trip`'s wait for its
+//! reply and `send`'s wait for a slot on a full command ring. Each reply deadline that passes asks the daemon's
+//! liveness, a cold-path question (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the
+//! bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id within the reconnect budget and
+//! the caller resends, or the call fails `DaemonGone` past it. Alive, the deadline re-arms and the wait goes on: a
+//! daemon answers every call it is given, however long the work (a granted landing, a forward across the fleet) or
+//! however starved its threads, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
+//! runs alone, which the next deadline then finds gone. Until 2026-11-13 a live daemon's overdue call failed
+//! `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with it); a daemon starved at
+//! `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both of CI's Linux runners
+//! (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -81,56 +94,6 @@ impl Deadlines {
       ["liveness_budget_ns", "recovery_budget_ns"]
     )
   }
-}
-
-/// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes; an image's build or merge, a direct map's fill and a writable map's write-back, which run
-/// in slices for as long as their data takes; a FUSE mount, which waits on the OS's mount helper; and any verb the
-/// daemon may forward
-/// to its volume's owner across the fleet (`RequestBody::may_be_forwarded`), under a location round and a forward
-/// the daemon bounds by the measured path — so a caller waits for it while the daemon lives rather than for one reply
-/// deadline.
-pub fn defers_reply(body: &RequestBody) -> bool {
-  // A verb the daemon may forward to its volume's owner on another node, across a WAN: the daemon bounds the location
-  // round and the forward by the measured path and always answers, so the client waits for it while its daemon lives.
-  // Before 2026-10-07 only a page read did; a forwarded write whose round and forward each stayed within their bound
-  // was reported `Stalled` at one liveness budget (`a_forward_answered_within_its_bounds_is_never_reported_stalled`).
-  body.may_be_forwarded()
-    || matches!(
-      body,
-      // A landing is planned in slices on the owner shard, as long as its tree takes, and a granted one runs in them
-      // (AUD-29-25; a presentation since 2026-11-08).
-      RequestBody::Land { .. }
-        // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
-        | RequestBody::ImageBuild { .. }
-        | RequestBody::ImageMerge { .. }
-        // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
-        // (A-201).
-        | RequestBody::Checkout { .. }
-        // A pin reads the subtrees it names into the store in slices on the owner shard, as long as the tree takes
-        // (§4.4, §4.3).
-        | RequestBody::Pin { .. }
-        // A green over a base walks the base snapshot into its origin in slices on the owner shard, as long as the
-        // tree takes (§4.16 "Green creation"); a scratch green is answered at once.
-        | RequestBody::CreateGreen { base: Some(_), .. }
-        // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
-        | RequestBody::MapRead { .. }
-        // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
-        // its sync and its release, as long as the file takes (A-186). A read-only map's release answers at once.
-        | RequestBody::MapWrite { .. }
-        | RequestBody::MapSync { .. }
-        | RequestBody::ReleaseMap { .. }
-        // A WinFsp drive's detach waits for the anchor to release its hold, within the bound the daemon derives (A-206).
-        | RequestBody::Detach { .. }
-        | RequestBody::Attach {
-          form: AttachRequest::FuseMount { .. }
-            | AttachRequest::ScopedFuseMount { .. }
-            | AttachRequest::SharedFuseMount { .. }
-            // A WinFsp volume is answered once its mount thread has mounted it (§4.6 "Windows").
-            | AttachRequest::WinFspMount { .. },
-          ..
-        }
-    )
 }
 
 /// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
@@ -1957,15 +1920,10 @@ impl Client {
           self.reconnect()?;
           return Ok(None);
         }
-        // A verb whose reply the daemon defers until long work ends (a granted landing) is waited for
-        // while the daemon lives: its supervisor ends a daemon that stops answering, and the wait then ends
-        // as `DaemonGone` and a resend, never as a stall of work still running (AUD-29-25's sibling).
-        Err(IpcError::DeadlineExceeded) if defers_reply(body) => {}
-        Err(IpcError::DeadlineExceeded) => {
-          return Err(ClientError::Stalled {
-            after_ns: self.deadlines.reply_ns,
-          });
-        }
+        // The daemon lives: the next wait re-arms the deadline (the module doc's rule, A-232). A daemon that stops
+        // answering is ended by its supervisor, or by its own watchdog when it runs alone, and a later deadline then
+        // finds it gone.
+        Err(IpcError::DeadlineExceeded) => {}
         Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
@@ -2049,13 +2007,6 @@ impl Client {
   pub fn resend(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
     self.bind_without_waiting()?;
     self.try_send(RequestId::from_word(word), body)
-  }
-
-  /// Whether the in-flight request `word` is one whose reply the daemon may defer past one reply deadline
-  /// ([`defers_reply`]): what the async driver waits for while the daemon lives, as the synchronous call does, so a
-  /// forwarded verb is never reported `Stalled` on one path and waited for on the other.
-  pub fn defers(&self, word: u64) -> bool {
-    self.awaited.get(&word).is_some_and(defers_reply)
   }
 
   /// [`Self::resend`] for an outstanding call, with the body it was begun with; `Ok(true)` too for a word no
@@ -2946,10 +2897,6 @@ impl Client {
     }
   }
 
-  /// Writes the request into the command ring, waiting on credit (the daemon drains the ring
-  /// in microseconds; a ring that stays full past the reply deadline is a stalled or gone
-  /// daemon, handled as a stalled reply is). `true` once written; `false` when the daemon was
-  /// found gone instead and the client reconnected (the caller binds and sends again).
   /// One attempt to put `body` under `id` on the command ring: `Ok(false)` when it has no slot.
   fn try_send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     match self.end.send_message(id.word(), body) {
@@ -2959,23 +2906,36 @@ impl Client {
     }
   }
 
+  /// Writes the request into the command ring, waiting for a slot under the module doc's rule (A-232): `true` once
+  /// written; `false` when the daemon was found gone instead and the client reconnected (the caller binds and sends
+  /// again). Within the first reply deadline the wait spins, since the daemon drains its ring in microseconds; each
+  /// deadline that passes asks the daemon's liveness, and while it lives the wait goes on, paced as the reconnect
+  /// paces ([`next_pause_ns`] over the reply deadline: doubling from the wake estimate, at most a tenth of the
+  /// deadline), so a ring that a starved daemon does not drain costs this thread no core beside it.
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let started = Instant::now();
+    let reply_ns = self.deadlines.reply_ns;
+    let mut armed = Instant::now();
+    // `None` while the first reply deadline runs; the pause between slot checks once one has passed.
+    let mut pause_ns: Option<u64> = None;
     loop {
       match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
-          if elapsed_ns(started) < self.deadlines.reply_ns {
-            std::hint::spin_loop();
-            continue;
+          if elapsed_ns(armed) >= reply_ns {
+            if self.end.daemon_gone() {
+              self.reconnect()?;
+              return Ok(false);
+            }
+            armed = Instant::now();
+            pause_ns.get_or_insert(self.end.wake_estimate_ns().max(1));
           }
-          if self.end.daemon_gone() {
-            self.reconnect()?;
-            return Ok(false);
+          match pause_ns {
+            None => std::hint::spin_loop(),
+            Some(pause) => {
+              std::thread::park_timeout(std::time::Duration::from_nanos(pause));
+              pause_ns = Some(next_pause_ns(pause, reply_ns));
+            }
           }
-          return Err(ClientError::Stalled {
-            after_ns: self.deadlines.reply_ns,
-          });
         }
         Err(e) => return Err(ClientError::Ipc(e)),
       }

@@ -588,14 +588,14 @@ fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended 
   ended
 }
 
-/// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
+/// The async driver's wait for long work (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
 /// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply
-/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it — one call submitted
-/// patient (`submit_patient`, as both SDKs' `land` is), the other plain — both landings outlasting the reply deadline.
-/// Expect: both are waited for past it and end with their landing done and every file written. A granted landing
-/// defers its reply (`defers_reply`), and since 2026-10-07 the driver derives patience from the request
-/// (`Client::defers`), as the synchronous call does, so a plain submission of a deferring verb is waited for too;
-/// until then the plain call ended `Stalled` at its deadline, the control this test used to keep.
+/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it, both landings
+/// outlasting the reply deadline. Expect: both are waited for past it and end with their landing done and every file
+/// written, since a call waits while its daemon lives (A-232). Until 2026-11-13 one call was submitted patient
+/// (`submit_patient`, as both SDKs' `land` was) and the other plain, which the driver waited for only because a
+/// granted landing was a request the daemon defers (`Client::defers`, since 2026-10-07); before that the plain call
+/// ended `Stalled` at its deadline. Both are plain submissions now, the driver's one path.
 #[test]
 fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
   let profile = common::machine_profile();
@@ -697,7 +697,7 @@ fn patient_and_plain(
   );
   let mut driver = Driver::new(client);
   let patient = driver
-    .submit_patient(
+    .submit(
       client,
       land_begin(patient_volume, patient_target.path.clone(), patient_grant),
     )

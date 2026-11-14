@@ -76,3 +76,47 @@ Owed, in A-232's plan (plan `01a1d6ca960575d0a36250c5f0a22500` in kiln, steps 2 
 lives. A daemon judged stuck is ended by its supervisor: the anchor, or for a daemon run alone or in-process its own
 watchdog, on the same verdict, window and starved-is-not-stuck rule. The client then sees `DaemonGone`. The green, the
 mutations and the bound (t0 + 2·W + B + L + kill) are recorded here when they are measured.
+
+### Step 3: the client's one rule (`agents/clients-a232-s3`, on `3c17e017`)
+
+Every wait a call makes now keeps one rule: each reply deadline that passes asks the daemon's liveness; gone, the
+client recovers or reconnects and fails `DaemonGone` past the reconnect budget, as before; alive, the deadline re-arms
+and the call goes on waiting. The three waits:
+
+- the async driver's tick (`crates/client/src/driver.rs`): an overdue call, sent or queued, is re-armed while the
+  daemon lives; `submit_patient` and the `patient` flag are gone, and both SDKs' `land` submits as every verb does;
+- the synchronous `round_trip` (`crates/client/src/client.rs`): the `defers_reply` arm and the `Stalled` arm are gone;
+- `send`'s wait for a slot on a full ring: it spins for the first reply deadline as before, then asks the liveness at
+  each deadline and, while the daemon lives, checks for a slot paced as the reconnect paces (`next_pause_ns` over the
+  reply deadline: doubling from the wake estimate, at most a tenth of it), so it costs no core beside a starved daemon.
+
+`ClientError::Stalled` had no other producer and is removed, with `defers_reply` and `Client::defers`, which nothing
+consults once the waits share the rule. `load_bench` waits for a live daemon's reply too (its stall dump still names a
+worker whose replies stop) and no longer retries on `Stalled`; `recovery.rs`'s `read_answered` reads once.
+
+The tests, each driving the real client against a real daemon. A held daemon is a one-shard daemon whose shard
+`Daemon::wedge_control_shard` holds off its CPU (its thread asleep) for half the watchdog's window, with the client's
+reply deadline a fifth of the hold: the call is overdue five times over while the watchdog, which calls a shard stuck
+only after a whole window without movement, judges the daemon alive, and each test asserts it withheld no beat.
+
+- `driver.rs`, `a_held_daemons_calls_are_waited_for_and_answered_and_a_cancel_releases_at_once`: twice the outstanding
+  bound submitted (a ring sent, a ring queued), one sent and one queued call cancelled after two deadlines (released at
+  once, never reported), every other call answered, the loop's longest step within a tenth of the reply deadline unless
+  preempted. The restart, death and overflow test and the ready-once test are unchanged.
+- `waits.rs` (new): a round trip and a send on a full ring (proved full: a call begun after an abandon is refused
+  `RingFull`) to the held daemon, both answered; and both to a daemon `SIGKILL`ed in a child process (this binary
+  re-invoked), both `DaemonGone` past the reconnect budget (the control, green before and after).
+
+Red on `3c17e017` (macOS arm64, 2026-11-13, load 40): the driver test's calls all `Stalled { after_ns: 100000000 }` at
+the first deadline; the round trip `Stalled` after 102 ms; the full-ring send `Stalled` after 100 ms; the killed-daemon
+control passed. Green after the change: driver 3 of 3, waits 3 of 3; the whole client suite (18 binaries) and
+`landing_fairness`'s landing test and `recovery.rs`'s three `read_answered` tests pass, load 30 to 47. Mutations, each
+on a copy of the tree, each restoring a live-daemon failure at one wait: the driver tick turned the driver test red
+(`ChannelLost` at the first deadline), `round_trip` the round-trip test (`RingFull` after 102 ms), `send` the full-ring
+test (`RingFull` after 112 ms). Logs: `~/.cache/slates-agents-scratch/a232/evidence/s3/` (`red-base.log`, `green.log`,
+`mutations.log`, `client-suite.log`, `server-tests.log`). Gates: `cargo fmt --all`, `cargo clippy --workspace
+--all-targets -- -D warnings` and with `-p slates-sdk-node -p slates-sdk-python`, `cargo xtask check`, and CI's
+`cargo doc --workspace --no-deps --document-private-items`, all clean on macOS arm64.
+
+Owed by later steps: the SDK suites' two stopped-group cases each still assert `Stalled`, and with this rule they
+wait instead (step 4); the design text, GAPS and both SDKs' docs still state the old rule (step 6).

@@ -673,8 +673,9 @@ fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
   tally.latencies.entry(kind).or_default().push(elapsed);
 }
 
-/// How many of the client's reply deadlines a request may wait past its send before the harness counts its reply lost:
-/// one, unless `--reply-patience <n>` asks more (to tell a late reply from one never sent).
+/// How many reconnect budgets the harness keeps asking again past a retryable refusal before it gives the request up:
+/// one, unless `--reply-patience <n>` asks more. A request with no reply yet is waited for while its daemon lives, the
+/// client's rule (A-232), so this bounds no reply wait.
 fn reply_patience() -> u64 {
   arg("--reply-patience").map_or(1, |n| n.parse().expect("--reply-patience n"))
 }
@@ -1020,9 +1021,9 @@ impl Worker {
   }
 
   /// No reply yet to some request: past the client's own derived reply deadline, a gone daemon starts the restart
-  /// path; a reply the daemon defers past one deadline while it lives (`Client::defers`) is waited for, as the
-  /// synchronous call waits; anything else past `reply_patience` deadlines is counted lost and named, never waited on
-  /// for ever.
+  /// path, and a live one's request is waited for, the client's own rule (A-232). A worker whose replies stop coming
+  /// is named by its stall dump ([`Self::stall_dump`]). Until 2026-11-13 a request the daemon would not defer
+  /// (`Client::defers`, now gone) was counted lost past `reply_patience` deadlines while its daemon lived.
   fn overdue(&mut self) {
     let now = ns_since(self.epoch);
     for c in 0..self.conns.len() {
@@ -1031,35 +1032,13 @@ impl Worker {
         continue;
       }
       let deadline = conn.client.deadlines().reply_ns;
-      let mut lost = Vec::new();
-      let mut gone = false;
-      for (word, a) in &conn.inflight {
-        let Some((_, sent_ns, kind)) = self.agents[*a].inflight else {
-          continue;
-        };
-        let waited = now.saturating_sub(sent_ns);
-        if waited <= deadline {
-          continue;
-        }
-        if conn.client.daemon_gone() {
-          gone = true;
-          break;
-        }
-        if !conn.client.defers(*word) && waited > deadline.saturating_mul(reply_patience()) {
-          lost.push((*word, *a, kind));
-        }
-      }
-      if gone {
+      let overdue = conn.inflight.values().any(|a| {
+        self.agents[*a]
+          .inflight
+          .is_some_and(|(_, sent_ns, _)| now.saturating_sub(sent_ns) > deadline)
+      });
+      if overdue && conn.client.daemon_gone() {
         conn.lost(self.epoch);
-        continue;
-      }
-      for (word, a, kind) in lost {
-        self.conns[c].inflight.remove(&word);
-        self.conns[c].client.abandon(word);
-        self.agents[a].give_up(
-          &mut self.tally,
-          &format!("no reply to {kind:?} within the reply deadline (daemon gone: false)"),
-        );
       }
     }
   }
@@ -1085,10 +1064,7 @@ impl Worker {
             .inflight
             .map_or(0, |(_, sent, _)| now.saturating_sub(sent) / 1_000_000);
           let kind = agent.inflight.map(|(_, _, kind)| kind);
-          format!(
-            "{word:#x}:{kind:?}:{age}ms:defers={}",
-            conn.client.defers(*word)
-          )
+          format!("{word:#x}:{kind:?}:{age}ms")
         })
         .collect();
       println!(
@@ -1607,10 +1583,9 @@ fn patiently<T>(
     match call(client) {
       Ok(answer) => return answer,
       Err(
-        ClientError::Stalled { .. }
         // A kill rung's restarted node may take longer than one reconnect budget to come back; each call reconnects
         // again (fixtures' 1,000-client primary kill: `versions` met `DaemonGone` 7.52 s in, 2026-11-07).
-        | ClientError::DaemonGone { .. }
+        ClientError::DaemonGone { .. }
         | ClientError::Refused(
           Refusal::LeaseUnconfirmed { .. }
           | Refusal::Overloaded { .. }

@@ -1,5 +1,6 @@
 //! The client's closed refusal taxonomy (§4.4's refusals as the daemon sends them, plus the
-//! channel's own: a stall, a lost daemon, a session another client holds).
+//! channel's own: a lost daemon, a session another client holds). A daemon that lives is waited for and has no
+//! refusal of its own here (A-232): until 2026-11-13 a `Stalled` variant failed a live daemon's overdue call.
 
 use std::fmt;
 
@@ -18,11 +19,6 @@ pub enum ClientError {
   UnexpectedReply {
     /// The verb.
     verb: &'static str,
-  },
-  /// The daemon is alive but has not answered inside the deadline.
-  Stalled {
-    /// The deadline that passed, in nanoseconds.
-    after_ns: u64,
   },
   /// The daemon went away and did not come back inside the reconnect budget.
   DaemonGone {
@@ -86,7 +82,6 @@ impl fmt::Display for ClientError {
       Self::Refused(refusal) => write!(f, "refused: {refusal:?}"),
       Self::Ipc(e) => write!(f, "channel: {e}"),
       Self::UnexpectedReply { verb } => write!(f, "unexpected reply to {verb}"),
-      Self::Stalled { after_ns } => write!(f, "no reply within {after_ns} ns"),
       Self::DaemonGone { after_ns } => write!(f, "daemon gone for {after_ns} ns"),
       Self::SessionTaken { assigned } => {
         write!(f, "session held by a live client; assigned {assigned}")
