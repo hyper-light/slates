@@ -1,0 +1,31 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed ... A232-STARVE pids 9426 9450
+A232-FAILED call 1 after 1.002524255s at 1.002524919s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000813287s at 4.92249807s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.00299009s at 5.925523817s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000614935s at 11.522388579s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.000102297s at 12.522525549s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000568302s at 17.751144182s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.000122233s at 18.751303553s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000808458s at 22.531769821s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000455544s at 31.582017074s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.884592062s at 33.466667994s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000267298s at 38.409837017s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 21 after 1.000736925s at 44.994489442s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 22 after 1.000122972s at 45.994649439s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 22 answered 9 failed 13 longest 7.061997242s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9425) panicked at crates/cli/src/liveness_tests.rs:797:3:
+every call to the starved daemon was answered: [Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }, Stalled { after_ns: 1000000000 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.50s
+
