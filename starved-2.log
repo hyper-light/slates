@@ -1,0 +1,26 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed ... A232-STARVE pids 8978 9005
+A232-FAILED call 4 after 5.005956676s at 26.738042551s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.004956777s at 29.743043023s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.113959981s at 32.857047319s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.005954012s at 35.863038927s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.004946204s at 38.868027133s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.098915477s at 41.966979826s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.007017087s at 44.974034399s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.004965572s at 47.979040511s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 11 answered 3 failed 8 longest 11.735146596s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 2 lapsed ["slates anchor: the daemon's heartbeat lapsed (3633 ms old, past 2573 ms: the 1000 ms window plus this anchor's lateness p99 of 1573 ms over 23 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9112 (0 in the window)"]
+
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (8975) panicked at crates/cli/src/liveness_tests.rs:815:3:
+every call to the starved daemon was answered: [DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 56.67s
+
