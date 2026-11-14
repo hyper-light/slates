@@ -1,0 +1,183 @@
+A-232 step 5 (diag-a232-starved ma-3: mutation (a) on 427d755d, the client's Stalled branch restored (crates/client/src as of 3c17e017) on x86_64, 4 CPUs; kernel 7.0.0-1016-aws
+commit 6fcbc694684a73085e370eb58abac405bb969e00, parent 427d755da948b8b7f0e713390304cc372d29f7ac
+cli tests: /home/runner/work/slates/slates/target/debug/deps/slates-89ec4b69853ee9a6; lone_daemon: /home/runner/work/slates/slates/target/debug/deps/lone_daemon-87c4775c5ed3542d
+shapes: starved
+weights: starved 1; 32 spinner cgroups at 100 holding 32 spinners
+moved 8956 8976 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 1 exit 101, starved CPU 48 ms, load 23.30
+A232-FAILED call 1 after 1.008598694s at 1.008599186s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.002943167s at 13.242621966s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.022957853s at 14.265616142s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000597918s at 22.001269182s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000706919s at 28.963335446s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.000153088s at 29.963529201s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000871099s at 33.910517964s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.000143467s at 34.91070483s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.001004226s at 42.607650297s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.108903952s at 43.716591714s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 17 after 1.000165914s at 44.716790918s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.00082365s at 45.717653684s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 18 answered 6 failed 12 longest 11.23103956s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 9 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (8955) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.48s
+moved 9120 9143 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 2 exit 101, starved CPU 55 ms, load 30.45
+A232-FAILED call 1 after 1.002910229s at 1.002910693s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.001014427s at 5.640967997s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.001906434s at 6.642908808s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000138538s at 19.694091188s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.002778037s at 20.696905815s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000825146s at 27.234776651s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.002093559s at 28.236907787s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000614318s at 32.189562848s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.000159238s at 33.189769262s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000129741s at 37.138969155s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.001896792s at 38.140903954s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000104131s at 44.808326045s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 19 answered 7 failed 12 longest 12.051005332s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9119) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.35s
+moved 9295 9323 after 6 s: 0::/a232-starved 0::/a232-starved 
+== starved run 3 exit 101, starved CPU 59 ms, load 34.16
+A232-FAILED call 1 after 1.006025724s at 1.006026664s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000506995s at 5.155590269s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.005401102s at 6.161027368s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000438956s at 11.079515589s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.000147704s at 12.079686735s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000903989s at 16.046308651s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.014689459s at 17.061033376s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000076088s at 22.898395595s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.00013574s at 23.898567596s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000500514s at 29.650833466s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.872160983s at 31.523035344s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000448374s at 36.38594984s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 21 after 1.000325552s at 43.33939187s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 22 after 1.002597144s at 44.342023802s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 23 answered 9 failed 14 longest 4.961999181s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 4 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9294) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 55.26s
+moved 9477 9494 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 4 exit 101, starved CPU 50 ms, load 35.26
+A232-FAILED call 1 after 1.086588899s at 1.086589567s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.001048095s at 10.123713128s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.00284786s at 11.126598831s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000377377s at 14.630524205s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.002964159s at 23.635585711s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.666112953s at 25.301736032s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000801204s at 29.644647814s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.002906398s at 30.647589673s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000263546s at 39.108897415s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.004651274s at 40.113587672s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000791246s at 45.418956845s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 18 answered 7 failed 11 longest 8.036036093s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 2 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9476) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 50.70s
+moved 9636 9657 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 5 exit 101, starved CPU 54 ms, load 35.42
+A232-FAILED call 1 after 1.002562771s at 1.002563287s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000136126s at 7.688239468s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.005288662s at 8.693561322s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000413357s at 16.947243745s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.000140729s at 17.94742085s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000642199s at 22.40248215s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.006190631s at 23.408721224s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000141098s at 25.895750447s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.00279407s at 26.89856341s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000823636s at 32.062304669s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.002224191s at 33.064567054s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000750814s at 39.274363478s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 19 after 1.002161465s at 40.276564165s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 20 answered 7 failed 13 longest 7.253233836s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 9 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9635) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 53.73s
+moved 9802 9822 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 6 exit 101, starved CPU 51 ms, load 35.78
+A232-FAILED call 1 after 1.013991524s at 1.013992508s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000149264s at 14.314176965s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000690093s at 21.167714273s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000511766s at 26.901535886s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.000145768s at 27.901717417s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000208067s at 36.392715764s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000965499s at 42.221989119s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.000153532s at 43.222180352s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 17 answered 9 failed 8 longest 12.299994798s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9801) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 53.58s
+moved 9974 9993 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 7 exit 101, starved CPU 51 ms, load 35.71
+A232-FAILED call 1 after 1.000188104s at 1.000189233s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000641937s at 4.510800268s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000877863s at 11.198928425s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.003021876s at 12.201997637s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000738568s at 17.876000504s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.008956682s at 18.884995975s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.002946318s at 27.124000476s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.74796287s at 28.87199867s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000183806s at 33.295370675s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.777602055s at 35.073014744s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000985508s at 44.13306146s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 19 after 1.000142524s at 45.133244419s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 19 answered 7 failed 12 longest 8.059022352s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 4 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9971) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.01s
+moved 10137 10157 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 8 exit 101, starved CPU 56 ms, load 35.77
+A232-FAILED call 1 after 1.003038288s at 1.003038728s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.000949692s at 5.206039103s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000723121s at 11.907899778s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.003103814s at 12.911038907s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.00013328s at 18.183402972s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.00013203s at 19.183573735s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.002714345s at 24.891038662s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000083691s at 31.665282854s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.760716403s at 33.426036092s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000782222s at 38.312224415s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 21 after 1.00091411s at 45.19921977s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 21 answered 10 failed 11 longest 4.940208539s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10136) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.94s
+moved 10306 10327 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 9 exit 101, starved CPU 35 ms, load 35.82
+A232-FAILED call 3 after 1.000170568s at 10.305076617s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.011596709s at 11.316709806s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000240277s at 18.637011584s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.000148185s at 19.637195271s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.001057903s at 26.267500735s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.000139013s at 27.267683532s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000460014s at 36.861709253s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.002948511s at 37.86469268s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000961618s at 43.853712564s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.002953711s at 44.856705969s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 17 after 1.000149226s at 45.856889996s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 17 answered 6 failed 11 longest 8.593533998s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 1 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10305) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.45s
+moved 10470 10488 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 10 exit 101, starved CPU 54 ms, load 35.99
+A232-FAILED call 1 after 1.091169409s at 1.091170026s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 3 after 1.001067972s at 7.992144375s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 4 after 1.002843466s at 8.99502653s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 6 after 1.000203235s at 12.923271977s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 7 after 1.005714099s at 13.929021622s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 9 after 1.000088561s at 17.847387397s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 10 after 1.000136874s at 18.847558708s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 12 after 1.000197045s at 24.595267128s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 13 after 1.000140725s at 25.595445758s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 15 after 1.000196433s at 31.277268768s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 16 after 1.83471179s at 33.112017324s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 18 after 1.000258869s at 37.94032713s: no reply within 1000000000 ns; daemon gone false
+A232-FAILED call 19 after 1.963657556s at 39.90402736s: no reply within 1000000000 ns; daemon gone false
+A232-SUMMARY calls 20 answered 7 failed 13 longest 5.899867555s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10469) panicked at crates/cli/src/liveness_tests.rs:815:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.60s
+== starved, supervised: passed 0, failed 10, of 10
