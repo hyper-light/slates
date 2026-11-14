@@ -593,6 +593,11 @@
 >   The same deadline gave up on a probe of `presentation_fairness.rs`'s granted test once in Stack B1's gate. Its
 >   naming since then found every long wait starved, not held: 62 probes of 504 to 982 ms on `4811191a` at 144 spinners,
 >   with the shard runnable in 6,581 of 6,582 samples (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
+>   Reproduced on Linux CI on main `29ef4521` (2026-11-13, `diag-a232-red-4`), with a diagnostics probe at cpu.weight 1
+>   beside 32 default-weight spinner cgroups. 10 of 10 runs were red on each of ubuntu-latest and ubuntu-24.04-arm: 25
+>   and 19 calls failed `Stalled` after 2.152 to 8.929 s, the daemon's own watchdog judging every shard starved and
+>   withholding no beat. On this Mac at nice 19 beside two spinners a CPU, 1 of 3 runs was red. The fix is owed on
+>   `agents/clients-a232` (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
