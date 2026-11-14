@@ -507,7 +507,8 @@ enum Lapse {
 /// watchdog thread itself was held off past the window and the anchor's lateness p99, and the anchor killed a starved
 /// daemon in 3 of 20 runs (`diag-a232-starved-1`, beats 3.3 to 4.1 s old against bounds of 2.5 to 3.3 s).
 fn judge_lapse(watchdog_looking: bool, process: impl FnOnce() -> Verdict) -> Lapse {
-  if watchdog_looking {
+  // MUTANT (d), diagnostics only: every lapse kills, as before A-232 step 5, the looks ignored.
+  if watchdog_looking || true {
     return Lapse::Withheld;
   }
   match start_stuck(process()) {
