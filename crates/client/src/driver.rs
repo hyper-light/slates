@@ -10,24 +10,14 @@
 //! for a ticket (the binding decodes it with its verb's poll and calls [`Driver::finish`]), or the call
 //! failed, typed.
 //!
-//! **Every call ends (AUD-29-20), and waits while its daemon lives (A-232).** The client's one rule, which the
-//! synchronous round trip and its wait for a ring slot keep too (`crate::client`): a call overdue past the client's
-//! reply deadline — sent and unanswered, or queued unsent that long — asks the daemon's liveness. A live daemon's
-//! call goes on waiting, its deadline re-armed, so the next deadline asks again: a daemon answers every call it is
-//! given, a long one (a granted landing, a forward across the fleet) and a starved one alike, and a daemon judged
-//! stuck is ended by its supervisor, or by its own watchdog when it runs alone, which this client then sees as gone.
-//! A gone daemon starts recovery — single reconnect attempts paced as the synchronous reconnect paces them, the
-//! channel bound to the consumer without a blocking round trip, then every call still awaited resent under its own id
-//! (the daemon answers a call it already served from its completion record) and the queue admitted. Past the
-//! reconnect budget every call fails `DaemonGone`. A binding whose reader fails, or whose descriptor closes, fails
-//! every call with [`Driver::fail_all`]; a cancelled call is released at once with [`Driver::cancel`]. Nothing is left
-//! waiting on a reply that cannot come.
-//!
-//! Until A-232 (2026-11-13) a live daemon's overdue call failed `Stalled`, and only a call submitted patient
-//! (`submit_patient`, a landing) or one whose request the daemon may defer (`defers_reply`) waited. A daemon at
-//! `cpu.weight` 1 beside spinners, alive by its own watchdog, had calls failed `Stalled` in 10 of 10 runs on both of
-//! CI's Linux runners (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the second path is
-//! gone with the failure.
+//! **Every call ends (AUD-29-20).** A reply overdue past the client's reply deadline asks the daemon's
+//! liveness once: a live daemon's silence fails the call `Stalled` (the synchronous path's rule), a gone
+//! daemon starts recovery — single reconnect attempts paced as the synchronous reconnect paces them, the
+//! channel bound to the consumer without a blocking round trip, then every call still awaited resent under
+//! its own id (the daemon answers a call it already served from its completion record) and the queue
+//! admitted. Past the reconnect budget every call fails `DaemonGone`. A binding whose reader fails, or whose
+//! descriptor closes, fails every call with [`Driver::fail_all`]; a cancelled call is released with
+//! [`Driver::cancel`]. Nothing is left waiting on a reply that cannot come.
 //!
 //! Until 2026-10-01 `begin` spun on a full ring until the reply deadline and could reconnect through a
 //! parking loop on the event loop's thread, and the SDKs had no deadline, no failure path and no cancel: a
@@ -71,11 +61,13 @@ struct Call {
   begin: Option<Begin>,
   /// Its request id word once sent; `None` while queued.
   word: Option<u64>,
-  /// The base of its reply deadline: when it was submitted or last sent, or when its deadline last found the
-  /// daemon alive and was re-armed.
-  armed: Instant,
+  /// When it was last sent, the base of its reply deadline.
+  sent: Instant,
   /// Whether it must be sent again under its id on the current channel (after a reconnect).
   resend: bool,
+  /// Whether it is waited for while the daemon lives ([`crate::defers_reply`]): its deadline asks
+  /// the daemon's liveness and restarts, never fails it `Stalled`.
+  patient: bool,
   /// Whether its reply was reported [`Event::Ready`] and the binding has not finished it yet: the client
   /// holds a reply until it is taken, so a pump would otherwise report it again — twice in one loop step when
   /// the step's tick pumps after its pump, the second event finding the reply already taken.
@@ -140,7 +132,26 @@ impl Driver {
 
   /// Submits `body`: sent at once when the client admits it, else queued. Refused `TooManyOutstanding` when
   /// the queue is full, or with the client's typed error when the call cannot be sent at all.
-  pub fn submit(&mut self, client: &mut Client, mut begin: Begin) -> Result<Ticket, ClientError> {
+  pub fn submit(&mut self, client: &mut Client, begin: Begin) -> Result<Ticket, ClientError> {
+    self.submit_with(client, begin, false)
+  }
+
+  /// [`submit`](Self::submit) for a call whose reply the daemon defers until long work ends (a granted
+  /// landing): once sent it is waited for while the daemon lives, its deadline only asking the liveness.
+  pub fn submit_patient(
+    &mut self,
+    client: &mut Client,
+    begin: Begin,
+  ) -> Result<Ticket, ClientError> {
+    self.submit_with(client, begin, true)
+  }
+
+  fn submit_with(
+    &mut self,
+    client: &mut Client,
+    mut begin: Begin,
+    patient: bool,
+  ) -> Result<Ticket, ClientError> {
     let ticket = self.next_ticket;
     let sent = if self.lost.is_none() && self.queued.is_empty() {
       match begin(client) {
@@ -172,9 +183,10 @@ impl Driver {
       Call {
         begin: if sent.is_none() { Some(begin) } else { None },
         word: sent,
-        armed: Instant::now(),
+        sent: Instant::now(),
         resend: false,
         reported: false,
+        patient,
       },
     );
     Ok(ticket)
@@ -228,8 +240,8 @@ impl Driver {
     events
   }
 
-  /// The timer's turn: recovery when the channel is lost, else the reply deadlines — an overdue call starts
-  /// recovery when the daemon is gone, and has its deadline re-armed while the daemon lives — then the queue admitted.
+  /// The timer's turn: recovery when the channel is lost, else the reply deadlines — an overdue call fails
+  /// `Stalled` while the daemon lives, and starts recovery when it is gone — then the queue admitted.
   pub fn tick(&mut self, client: &mut Client) -> Vec<Event> {
     if self.lost.is_some() {
       let mut events = Vec::new();
@@ -247,31 +259,49 @@ impl Driver {
       })
       .collect();
     let reply_ns = client.deadlines().reply_ns;
-    // Overdue: a call sent and unanswered past the reply deadline, or one still queued that long (a ring that does
-    // not free while the daemon lives is waited on, as the synchronous send waits on it).
-    let overdue: Vec<Ticket> = self
+    // Overdue: a call sent and unanswered past the reply deadline, or one still queued that long (a ring
+    // that never frees is a stall too, as the synchronous `begin` finds it after the same deadline).
+    let overdue: Vec<(Ticket, Option<u64>, bool)> = self
       .calls
       .iter()
       .filter(|(ticket, call)| {
-        !answered.contains(ticket) && !call.resend && elapsed_ns(call.armed) >= reply_ns
+        !answered.contains(ticket) && !call.resend && elapsed_ns(call.sent) >= reply_ns
       })
-      .map(|(ticket, _)| *ticket)
+      .map(|(ticket, call)| {
+        // Patient when submitted so (a granted landing) or when its request is one the daemon may defer past the
+        // deadline, the synchronous call's rule (`Client::defers`): before 2026-10-07 a forwarded verb through an
+        // SDK was failed `Stalled` while its daemon was still answering within its bounds.
+        let patient = call
+          .word
+          .is_some_and(|word| call.patient || client.defers(word));
+        (*ticket, call.word, patient)
+      })
       .collect();
-    if overdue.is_empty() {
-      self.resend_and_admit(client, &mut events);
-      return events;
-    }
-    if client.daemon_gone() {
+    if !overdue.is_empty() && client.daemon_gone() {
       self.start_recovery();
       self.recover(client, &mut events);
       return events;
     }
-    // The daemon lives: every overdue call goes on waiting, and its next deadline asks again (A-232).
-    let now = Instant::now();
-    for ticket in overdue {
-      if let Some(call) = self.calls.get_mut(&ticket) {
-        call.armed = now;
+    for (ticket, word, patient) in overdue {
+      if patient {
+        // Its daemon lives: the deferred reply is still being worked for; the next deadline asks again.
+        if let Some(call) = self.calls.get_mut(&ticket) {
+          call.sent = Instant::now();
+        }
+        continue;
       }
+      self.calls.remove(&ticket);
+      match word {
+        Some(word) => {
+          self.by_word.remove(&word);
+          client.abandon(word);
+        }
+        None => self.queued.retain(|queued| *queued != ticket),
+      }
+      events.push(Event::Failed {
+        ticket,
+        error: ClientError::Stalled { after_ns: reply_ns },
+      });
     }
     self.resend_and_admit(client, &mut events);
     events
@@ -295,11 +325,11 @@ impl Driver {
       );
     }
     let reply_ns = client.deadlines().reply_ns;
-    // Every call — sent or queued — has a reply deadline from when it was armed.
+    // Every call — sent or queued — has a reply deadline from when it was sent or submitted.
     self
       .calls
       .values()
-      .map(|call| reply_ns.saturating_sub(elapsed_ns(call.armed)))
+      .map(|call| reply_ns.saturating_sub(elapsed_ns(call.sent)))
       .min()
   }
 
@@ -359,7 +389,7 @@ impl Driver {
             call.resend = true;
             call.reported = false;
           } else {
-            call.armed = now;
+            call.sent = now;
           }
         }
         self.resend_and_admit(client, events);
@@ -404,7 +434,7 @@ impl Driver {
         Ok(true) => {
           if let Some(call) = self.calls.get_mut(&ticket) {
             call.resend = false;
-            call.armed = Instant::now();
+            call.sent = Instant::now();
           }
         }
         Ok(false) => return,
@@ -442,7 +472,7 @@ impl Driver {
           self.by_word.insert(id.word(), ticket);
           if let Some(call) = self.calls.get_mut(&ticket) {
             call.word = Some(id.word());
-            call.armed = Instant::now();
+            call.sent = Instant::now();
             call.begin = None;
           }
         }
