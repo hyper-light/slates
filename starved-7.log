@@ -1,0 +1,25 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed ... A232-STARVE pids 10362 10386
+A232-FAILED call 9 after 3.108669612s at 29.142172593s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.00483087s at 32.14704254s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.001954488s at 35.149039521s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.101861821s at 38.250941067s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 13 after 3.0070469s at 41.258041755s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 14 after 3.003954512s at 44.26203916s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 15 after 3.108973631s at 47.371053188s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 15 answered 8 failed 7 longest 4.96311113s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 2 lapsed ["slates anchor: the daemon's heartbeat lapsed (3278 ms old, past 3076 ms: the 1000 ms window plus this anchor's lateness p99 of 2076 ms over 20 waits); killing it"] restarted ["slates anchor: daemon exited (None); restarted as pid 10472 (0 in the window)"]
+
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10361) panicked at crates/cli/src/liveness_tests.rs:724:3:
+every call to the starved daemon was answered: [DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 55 filtered out; finished in 54.59s
+
