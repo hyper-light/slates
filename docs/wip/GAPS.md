@@ -599,10 +599,19 @@
 >   withholding no beat. On this Mac at nice 19 beside two spinners a CPU, 1 of 3 runs was red. The fix is owed on
 >   `agents/clients-a232` (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
 >   Step 2 of A-232's plan is built (2026-11-13): a daemon run alone ends its own process on its watchdog's stuck verdict,
->   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good (A-232's amendment; exit
->   within `W + 2·(B + L)` of a wedge, measured 1.30 to 1.34 s on this Mac). Owed: the client's one rule (step 3), the
->   tests that claimed `Stalled` (step 4), the live proof on Linux CI at `cpu.weight` 1 (step 5), and §4.7's words
->   (step 6). `W` itself is still R3 debt. Found on the way (open, not this change's):
+>   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good. Only `FromEnv` is
+>   supervised; `Create` and `Handoff` end themselves (A-232's amendment). The exit comes within `W + B + L` of a
+>   wedge, `L` the verdict's lateness the end line names: measured 1.412 s against 1.465 s on this Mac at load 100.
+>   Starved, it was ended in 0 of 10 runs at nice 19 here and 0 of 10 at `cpu.weight` 1 on adacachy2. Owed: the
+>   client's one rule (step 3), the tests that claimed `Stalled` (step 4), the live proof on CI (step 5), §4.7's words
+>   (step 6), and the first Windows run of the lone daemon and the supervised roles (jupiter was offline). `W` itself
+>   is still R3 debt. Open (found by step 2's tests, measured not to be the change's): on adacachy2 under kiln, the
+>   supervised roles (a `FromEnv` daemon in a child of the test, `crates/server/tests/common/supervised.rs`) of
+>   `liveness.rs` and `nfs_hostile.rs` fail intermittently beside their binary's other tests, and pass alone or with
+>   the tests run one at a time. In a failing run the held shard's own thread kept waking (voluntary switches 12 to
+>   27 in 2.4 s) inside a blocking wait, so the watchdog rightly saw it move; the waker is unknown. The base with the
+>   same harness failed 1 of 6 in the same period. Next: find the waker, or run the roles in a binary of their own,
+>   one at a time. Found on the way (open, not this change's):
 >   `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this Mac at load 57 to
 >   63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s hold ends rather than
 >   inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`.

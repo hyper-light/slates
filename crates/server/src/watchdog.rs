@@ -194,12 +194,13 @@ pub const FAILED_EXIT_CODE: u8 = 4;
 /// ([`crate::SegmentSource::supervision`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Supervision {
-  /// An anchor holds the segment and reads the beat: across the spawn (`FromEnv`, the `slates anchor` process, which
-  /// kills a daemon whose beat lapses) or in this process (`Handoff`, a test or an embedding that plays the anchor and
-  /// owns what a lapse means). A stuck shard withholds the beat, and the anchor ends the daemon.
+  /// An anchor in another process holds the segment, reads the beat and kills a daemon whose beat lapses (`FromEnv`,
+  /// the `slates anchor` process, or a test that plays it across a spawn). A stuck shard withholds the beat, and the
+  /// anchor ends the daemon.
   Anchored,
-  /// Nobody reads the beat (`Create`: `slates daemon` run alone, or a test's daemon with no anchor). A stuck shard ends
-  /// the daemon's own process, on the verdict that withholds an anchored daemon's beat.
+  /// No other process can end the daemon: `Create` (`slates daemon` run alone, or a test's daemon with no anchor) and
+  /// `Handoff` (an anchor in this process, which cannot kill the daemon without ending itself). A stuck shard ends the
+  /// daemon's own process, on the verdict that withholds an anchored daemon's beat.
   Alone,
 }
 
@@ -295,6 +296,11 @@ pub struct ShardWatch {
   moved_ns: u64,
   /// Its thread's time waited for a CPU at the last look, nanoseconds, where the scheduler says.
   waited_ns: Option<u64>,
+  /// When the watchdog last looked at it.
+  looked_ns: u64,
+  /// The look before the one that last saw it move: its last movement came after this look, so a verdict's lateness is
+  /// measured from here ([`ShardWatch::still_after_ns`]).
+  still_after_ns: u64,
 }
 
 /// One look at a shard: its step count, whether it is parked, its thread clock reading (CPU nanoseconds, progress),
@@ -314,6 +320,24 @@ pub struct Look {
 }
 
 impl ShardWatch {
+  /// A shard's history before the watchdog's first look, which began at `began_ns`: whatever the shard does after it,
+  /// the watchdog can bound, so the first look's "look before" is the watchdog's own start (A-232). A shard that the
+  /// first look already finds still may have stopped before the watchdog began; its verdict's lateness is then measured
+  /// from the start, which bounds only what came after it.
+  pub fn begun_at(began_ns: u64) -> ShardWatch {
+    ShardWatch {
+      looked_ns: began_ns,
+      ..ShardWatch::default()
+    }
+  }
+
+  /// The watchdog's look before the one that last saw this shard move: whatever it did last, it did after this look.
+  /// A wedge verdict is due a window after the last movement, and looks come a beat apart, so the verdict comes no
+  /// later than a window and a beat after this look, past which is the verdict's own lateness (A-232).
+  pub fn still_after_ns(&self) -> u64 {
+    self.still_after_ns
+  }
+
   /// Whether `look` leaves the shard under suspicion, so the scheduler is asked about its thread: it is not parked, has
   /// completed no step since the last look, and its CPU clock did not rise. A shard that steps or parks costs nothing.
   fn suspects(&self, look: &Look) -> bool {
@@ -323,6 +347,34 @@ impl ShardWatch {
       && look
         .cpu
         .is_none_or(|(_, progress)| self.progress.is_none_or(|before| progress <= before))
+  }
+
+  /// The history after a look at a shard that neither stepped nor parked: `rose` whether its CPU progress rose, `moved`
+  /// whether it moved in any way (that, or runnable, or credited a wait).
+  fn after_still_look(
+    self,
+    look: &Look,
+    progress: Option<u64>,
+    rose: bool,
+    moved: bool,
+  ) -> ShardWatch {
+    ShardWatch {
+      progress: if rose { progress } else { self.progress },
+      progressed_ns: if rose {
+        look.now_ns
+      } else {
+        self.progressed_ns
+      },
+      moved_ns: if moved { look.now_ns } else { self.moved_ns },
+      waited_ns: look.run.and_then(|run| run.waited_ns),
+      looked_ns: look.now_ns,
+      still_after_ns: if moved {
+        self.looked_ns
+      } else {
+        self.still_after_ns
+      },
+      ..self
+    }
   }
 
   /// Judges one look against the history (A-65's rule; `window_ns` is the liveness budget) and returns the verdict
@@ -343,6 +395,8 @@ impl ShardWatch {
           progressed_ns: look.now_ns,
           moved_ns: look.now_ns,
           waited_ns,
+          looked_ns: look.now_ns,
+          still_after_ns: self.looked_ns,
         },
       );
     }
@@ -355,21 +409,7 @@ impl ShardWatch {
     // rise; the state says so instead. A rise says it waited between two looks, seen in neither.
     let waiting = look.run.is_some_and(|run| run.state == RunState::Runnable)
       || matches!((self.waited_ns, waited_ns), (Some(before), Some(now)) if now > before);
-    let next = ShardWatch {
-      progress: if rose { progress } else { self.progress },
-      progressed_ns: if rose {
-        look.now_ns
-      } else {
-        self.progressed_ns
-      },
-      moved_ns: if rose || waiting {
-        look.now_ns
-      } else {
-        self.moved_ns
-      },
-      waited_ns,
-      ..self
-    };
+    let next = self.after_still_look(&look, progress, rose, rose || waiting);
     let still_for = look.now_ns.saturating_sub(next.moved_ns);
     if still_for >= window_ns {
       return (Verdict::Wedged { for_ns: still_for }, next);
@@ -404,7 +444,7 @@ fn run(
   turns: &Turns,
 ) {
   let mut clock = HostClock::new();
-  let mut watches = vec![ShardWatch::default(); holders.len()];
+  let mut watches = vec![ShardWatch::begun_at(clock.monotonic_ns().max(1)); holders.len()];
   let mut reported = vec![None; holders.len()];
   let mut control_ended = false;
   let mut said_control_ended = false;
@@ -435,15 +475,17 @@ fn run(
         Some((holder.shard(), verdict))
       })
       .collect();
-    let stuck = verdicts
+    let stuck_at = verdicts
       .iter()
-      .flatten()
-      .copied()
-      .find(|(_, verdict)| !verdict.beats());
+      .position(|found| found.is_some_and(|(_, verdict)| !verdict.beats()));
+    let stuck = stuck_at.and_then(|index| verdicts.get(index).copied().flatten());
     let turn = decide(supervision, stuck, control_ended, stopping);
     if let Turn::End(cause) = turn {
       turns.looked(stuck.is_some());
-      end_process(cause, lateness.since_beat(false, late_ns));
+      let verdict_late_ns = stuck_at
+        .and_then(|index| watches.get(index))
+        .and_then(|watch| verdict_lateness_ns(now, watch.still_after_ns()));
+      end_process(cause, lateness.since_beat(false, late_ns), verdict_late_ns);
     }
     for (found, said) in verdicts.iter().zip(reported.iter_mut()) {
       if let Some((shard, verdict)) = found {
@@ -509,6 +551,21 @@ impl Lateness {
   }
 }
 
+/// How late a stuck verdict at `now_ns` came: past a window and a beat after `still_after_ns`, the watchdog's look before
+/// the one that last saw the shard move ([`ShardWatch::still_after_ns`]). The shard last moved after that look, so a
+/// wedge ends a lone daemon within a window, a beat and this lateness of the wedge: the look's phase against the wedge
+/// and the thread's own lateness, both measured here (A-232).
+/// `None` when the shard's last movement was seen at the watchdog's first look of it, which has no look before it to
+/// measure from.
+fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64) -> Option<u64> {
+  (still_after_ns != 0).then(|| {
+    now_ns
+      .saturating_sub(still_after_ns)
+      .saturating_sub(LIVENESS_BUDGET_NS)
+      .saturating_sub(HEARTBEAT_NS)
+  })
+}
+
 /// Ends the daemon's process on the watchdog's verdict (A-232): nobody reads this daemon's beat, so nobody else would end
 /// it. A deliberate exit with [`FAILED_EXIT_CODE`], not a panic: a stuck shard's thread can be neither joined nor
 /// stopped, so an orderly stop would wait on it for good. The exit runs no destructor; what the process held, the kernel
@@ -518,12 +575,19 @@ impl Lateness {
 /// write to a standard error nobody drains, holding the lock every log line takes, and a watchdog that waited on that
 /// lock would never end anything. So the line is written by a thread of its own, which the exit ends if it is still
 /// blocked; the exit is that thread's owner.
-fn end_process(cause: Cause, late_ns: u64) -> ! {
+fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
       "slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit {FAILED_EXIT_CODE}): \
-       shard {shard} is {}; the watchdog's looks ran at most {} us late since its last beat",
+       shard {shard} is {}; {}; the watchdog's looks ran at most {} us late since its last beat",
       describe(verdict),
+      verdict_late_ns.map_or_else(
+        || "the shard last moved at the watchdog's first look of it, so the verdict's lateness is not known".to_owned(),
+        |late| format!(
+          "the verdict came {} us past a window and a beat after the watchdog's last look before the shard last moved",
+          late / NS_PER_US
+        )
+      ),
       late_ns / NS_PER_US
     ),
     Cause::ControlEnded => format!(
@@ -1036,6 +1100,85 @@ mod tests {
     };
     assert_eq!(first_end(&vec![blocked(None); 30], 3), Some(13), "wedged");
     assert_eq!(first_end(&vec![runnable(None); 50], 3), None, "starved");
+  }
+
+  /// A-232. Do: replay a shard that last ran between turns 2 and 3 (its CPU rise seen at turn 3) and then never moved,
+  /// to its wedged verdict, and read the look the verdict's lateness is measured from. Expect: turn 2's look, the last
+  /// before the shard last moved; with looks on time the verdict comes at turn 13, a window and a beat after it, so its
+  /// lateness is zero; a verdict one look later is a look late.
+  #[test]
+  fn a_wedge_verdicts_lateness_is_measured_from_the_look_before_the_last_movement() {
+    let mut watch = ShardWatch::default();
+    for turn in 1..=2_u64 {
+      watch = watch
+        .judge(look(turn, false, Some((turn, turn)), turn * TURN), WINDOW)
+        .1;
+    }
+    let mut wedged_at = None;
+    for turn in 3..=20_u64 {
+      let (verdict, next) = watch.judge(
+        Look {
+          run: blocked(None),
+          ..look(2, false, Some((3, 3)), turn * TURN)
+        },
+        WINDOW,
+      );
+      watch = next;
+      if matches!(verdict, Verdict::Wedged { .. }) {
+        wedged_at = Some(turn);
+        break;
+      }
+    }
+    assert_eq!(wedged_at, Some(13));
+    assert_eq!(
+      watch.still_after_ns(),
+      2 * TURN,
+      "the look before the last movement"
+    );
+    assert_eq!(
+      verdict_lateness_ns(13 * TURN, watch.still_after_ns()),
+      Some(0)
+    );
+    assert_eq!(
+      verdict_lateness_ns(14 * TURN, watch.still_after_ns()),
+      Some(TURN)
+    );
+    assert_eq!(
+      verdict_lateness_ns(14 * TURN, 0),
+      None,
+      "no look before the first"
+    );
+  }
+
+  /// A-232. Do: begin a watch when the watchdog starts, and let its first look find the shard already held (a step
+  /// count it has not seen, then no movement). Expect: the look its lateness is measured from is the watchdog's start,
+  /// not nothing: a lone daemon whose shard wedged within a beat of its watchdog's start still names its lateness.
+  #[test]
+  fn a_shard_found_still_at_the_first_look_is_measured_from_the_watchdogs_start() {
+    let began = TURN / 2;
+    let mut watch = ShardWatch::begun_at(began);
+    for turn in 1..=12_u64 {
+      watch = watch
+        .judge(
+          Look {
+            run: blocked(None),
+            ..look(24, false, Some((7, 7)), turn * TURN)
+          },
+          WINDOW,
+        )
+        .1;
+    }
+    assert_eq!(watch.still_after_ns(), began);
+    assert_eq!(
+      verdict_lateness_ns(11 * TURN, watch.still_after_ns()),
+      Some(0),
+      "on time: within a window and a beat of the start"
+    );
+    assert_eq!(
+      verdict_lateness_ns(12 * TURN, watch.still_after_ns()),
+      Some(12 * TURN - began - WINDOW - TURN),
+      "a look later"
+    );
   }
 
   /// A-232. Do: record looks a beat apart, one of them late, then a beat, then late looks with no beat. Expect: each

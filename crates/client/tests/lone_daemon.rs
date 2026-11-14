@@ -7,11 +7,13 @@
 //! The parent connects, tells the child its client id, and the child holds the shard that serves that client in one
 //! poll: asleep for good (wedged) or on the CPU for good (spinning). The parent then submits a call the client waits for
 //! while its daemon lives (`Driver::submit_patient`), so the call is outstanding behind the hold, and drives the driver
-//! as an SDK's loop does while it watches the child. The bound is the rule's, from its named terms: the watchdog sees
-//! the shard's last movement at its first look after the hold began, which is at most one look (a beat plus its
-//! lateness) late, and ends the process at its first look a whole window after that, at most one look more. So the
-//! process exits within `W + 2·(B + L)` of the hold, where `W` is the liveness budget, `B` the beat and `L` the
-//! lateness of the watchdog's own looks, which its end line names.
+//! as an SDK's loop does while it watches the child. The bound is the rule's, from its named terms: the process exits
+//! within `W + B + L` of the wedge, where `W` is the liveness budget, `B` the beat and `L` the verdict's own lateness,
+//! which the watchdog measures and names in its end line: how far past a window and a beat its verdict came after its
+//! last look before the shard last moved. The shard last moved after that look, so the wedge did too. `L` holds the
+//! look's phase against the wedge and the lateness of the watchdog's thread; without the phase (the looks' lateness
+//! alone, also named) the bound would be `W + 2·(B + L)`, since the look that sees the last movement can come a beat
+//! after it.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -42,6 +44,7 @@ const HELD_TAG: &str = "LONE-DAEMON-HELD";
 /// Format: the words the watchdog's end line begins its cause with, and the ones that name its lateness.
 const END_WORDS: &str = "so the watchdog ends the daemon's process";
 const LATE_WORDS: &str = "the watchdog's looks ran at most ";
+const VERDICT_LATE_WORDS: &str = "the verdict came ";
 /// Shape: the probe budget of the quick profile (milliseconds).
 const PROBE_MS: u64 = 5;
 /// Shape: shards in the child's daemon: two, so the held shard is one of several.
@@ -49,8 +52,10 @@ const TEST_SHARDS: u16 = 2;
 /// Shape: the window, the beat.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 const BEAT: Duration = Duration::from_nanos(HEARTBEAT_NS);
-/// Shape: how long the child may take to start and the client to connect: twenty windows, a busy machine's start.
-const START_WAIT: Duration = Duration::from_nanos(20 * LIVENESS_BUDGET_NS);
+/// Shape: how long the child may take to start and the client to connect: a hundred windows, a backstop far past any
+/// start, so only a start that never ends fails here. The start is not what is tested, and a busy machine stretches it:
+/// the role took 22 s to say it was ready at load 92 to 112 on the 18-CPU Mac (2026-11-13), past twenty windows.
+const START_WAIT: Duration = Duration::from_nanos(100 * LIVENESS_BUDGET_NS);
 /// Shape: the test's own bound on the whole exchange once the hold has begun: ten windows, far past the rule's bound and
 /// the reconnect budget after it, so a daemon that never ends itself fails here with the call still pending.
 const GIVE_UP: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
@@ -187,7 +192,7 @@ fn a_lone_daemon_role() {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
-  if hold == Hold::Starved {
+  if hold == Hold::Starved && !starved_by_cgroup() {
     lower_this_process();
   }
   println!("{READY_TAG}");
@@ -324,13 +329,14 @@ struct Ended {
   exit: Option<(ExitStatus, Duration)>,
 }
 
-/// Drives `driver` as an SDK's loop does until the call `ticket` ends or [`GIVE_UP`] passes, watching `daemon`'s process.
+/// Drives `driver` as an SDK's loop does until the call `ticket` ends or `give_up` passes from `held_at`, watching
+/// `daemon`'s process.
 fn drive(
   client: &mut Client,
   driver: &mut Driver,
   ticket: u64,
   daemon: &mut LoneDaemon,
-  held_at: Instant,
+  (held_at, give_up): (Instant, Duration),
 ) -> Ended {
   let mut ended = Ended {
     call: None,
@@ -338,7 +344,7 @@ fn drive(
     exit: None,
   };
   let mut next_tick = Instant::now();
-  while ended.call.is_none() && held_at.elapsed() < GIVE_UP {
+  while ended.call.is_none() && held_at.elapsed() < give_up {
     let mut events = driver.pump(client);
     if Instant::now() >= next_tick {
       events.extend(driver.tick(client));
@@ -374,18 +380,28 @@ fn drive(
   ended
 }
 
-/// The lateness the watchdog's end line names, and the line, from everything the child said on standard error.
-fn end_line(stderr: &Receiver<(Instant, String)>) -> Option<(Duration, String)> {
+/// The microseconds the end line names after `words`.
+fn micros_after(line: &str, words: &str) -> Duration {
+  let micros: u64 = line
+    .split(words)
+    .nth(1)
+    .and_then(|rest| rest.split(' ').next())
+    .and_then(|number| number.parse().ok())
+    .unwrap_or_else(|| panic!("the end line names {words:?}: {line}"));
+  Duration::from_micros(micros)
+}
+
+/// What the watchdog's end line names, from everything the child said on standard error: the verdict's lateness, the
+/// looks' lateness, and the line.
+fn end_line(stderr: &Receiver<(Instant, String)>) -> Option<(Duration, Duration, String)> {
   let mut found = None;
   while let Ok((_, line)) = stderr.recv_timeout(BEAT) {
     if line.contains(END_WORDS) {
-      let late_us: u64 = line
-        .split(LATE_WORDS)
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|number| number.parse().ok())
-        .unwrap_or_else(|| panic!("the end line names its lateness: {line}"));
-      found = Some((Duration::from_micros(late_us), line));
+      found = Some((
+        micros_after(&line, VERDICT_LATE_WORDS),
+        micros_after(&line, LATE_WORDS),
+        line,
+      ));
     }
   }
   found
@@ -405,8 +421,8 @@ fn spun_for(line: &str) -> Duration {
 /// One lone daemon held `hold` with a call outstanding: the daemon must end itself within the rule's bound, with the
 /// failed exit code, and the call must end `DaemonGone`.
 ///
-/// The bound is the rule's own measure. A wedge is judged on the wall clock, so the exit comes within `W + 2·(B + L)` of
-/// the hold on the test's clock. A spin is judged in the shard's own CPU time, which a busy machine hands out slower
+/// The bound is the rule's own measure. A wedge is judged on the wall clock, so the exit comes within `W + B + L` of the
+/// hold on the test's clock, `L` the verdict's lateness the end line names. A spin is judged in the shard's own CPU time, which a busy machine hands out slower
 /// than the wall runs, so its verdict must name at least a window of CPU and at most a window and one look's (`B + L`).
 /// The call then ends at its next deadline after the exit, past the reconnect budget: within `exit + reply + reconnect`
 /// and one of the reconnect's paced attempts (`reconnect / 10`, the driver's pacing).
@@ -426,7 +442,13 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
       Box::new(|client: &mut Client| client.list_begin()),
     )
     .unwrap();
-  let ended = drive(&mut client, &mut driver, ticket, &mut daemon, held_at);
+  let ended = drive(
+    &mut client,
+    &mut driver,
+    ticket,
+    &mut daemon,
+    (held_at, GIVE_UP),
+  );
   let (status, exited_after) = ended
     .exit
     .unwrap_or_else(|| {
@@ -436,20 +458,21 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
         ended.call
       )
     });
-  let (late, line) = end_line(&daemon.stderr).unwrap_or_else(|| {
+  let (verdict_late, looks_late, line) = end_line(&daemon.stderr).unwrap_or_else(|| {
     panic!("{name}: the lone daemon exited ({status}) without the watchdog's end line")
   });
-  let look = BEAT + late;
-  let wall_bound = WINDOW + 2 * look;
+  let look = BEAT + looks_late;
+  let wall_bound = WINDOW + BEAT + verdict_late;
   let deadlines = deadlines();
   let call_bound = exited_after
     + Duration::from_nanos(
       deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10,
     );
   println!(
-    "{name}: the shard held, the process exited {exited_after:?} later ({status}); L = {late:?}, so W + 2(B + L) = \
-     {wall_bound:?} and W + B + L = {:?}; the call ended {:?} after {:?}, bound {call_bound:?}; the watchdog said: {line}",
-    WINDOW + look,
+    "{name}: the shard held, the process exited {exited_after:?} later ({status}); W + B + L = {wall_bound:?} with the \
+     verdict's L = {verdict_late:?}; the looks ran {looks_late:?} late, so W + 2(B + looks' lateness) = {:?}; the call \
+     ended {:?} after {:?}, bound {call_bound:?}; the watchdog said: {line}",
+    WINDOW + 2 * look,
     ended.call,
     ended.call_after
   );
@@ -461,7 +484,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   match hold {
     Hold::Wedged => assert!(
       exited_after <= wall_bound,
-      "{name}: the process exited {exited_after:?} after the wedge, past the rule's bound {wall_bound:?}"
+      "{name}: the process exited {exited_after:?} after the wedge, past W + B + L = {wall_bound:?}"
     ),
     Hold::Starved => {
       panic!("{name}: a starved daemon is not a stuck one; this case is not run here")
@@ -489,7 +512,8 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
 
 /// A-232, §4.14. Do: in a lone daemon (a child process, `SegmentSource::Create`), wedge the shard that serves a client —
 /// one poll asleep for good — and keep a call of that client outstanding. Expect: the daemon's process exits with the
-/// failed exit code within `W + 2·(B + L)` of the wedge, its watchdog's end line naming the verdict, and the call ends
+/// failed exit code within `W + B + L` of the wedge (`L` the verdict's lateness its end line names), the line naming the
+/// verdict, and the call ends
 /// `DaemonGone`. Before A-232 the watchdog withheld a beat nobody read, the process lived on, and the call waited until
 /// this test's own bound.
 #[test]
@@ -499,7 +523,7 @@ fn a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone() 
 
 /// A-232, §4.14. Do: as the wedged case, with the shard on the CPU for good in one poll (a task that never yields).
 /// Expect: the process exits with the failed exit code on a spinning verdict that names a window of CPU to a window and
-/// one look's, and the call ends `DaemonGone`.
+/// one look's (a beat and the looks' lateness), and the call ends `DaemonGone`.
 #[test]
 fn a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone() {
   a_lone_daemons_stuck_shard_ends_it("spinning", Hold::Spinning);
@@ -516,6 +540,32 @@ const STARVE_FOR: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
 /// Shape: spinners per logical CPU beside the starved daemon (the busy-machine bar's two a CPU).
 #[cfg(unix)]
 const SPINNERS_PER_CPU: usize = 2;
+
+/// Format: the value of [`STARVE_ENV`] that says the run's cgroup does the starving (Linux at `cpu.weight` 1 beside
+/// default-weight spinner units its wrapper starts): no spinners of this test's own, no nice value, and the tags the
+/// wrapper starts and stops its spinners on.
+#[cfg(unix)]
+const STARVE_BY_CGROUP: &str = "cgroup";
+#[cfg(unix)]
+const STARVE_BEGIN_TAG: &str = "LONE-STARVE-BEGIN";
+#[cfg(unix)]
+const STARVE_END_TAG: &str = "LONE-STARVE-END";
+/// Shape: how long one call to the starved daemon may take: six spans of the starvation, past the 8.9 s the red lane's
+/// calls took at `cpu.weight` 1, so a call is failed here only if it was never answered.
+#[cfg(unix)]
+const STARVED_CALL_WAIT: Duration = Duration::from_nanos(60 * LIVENESS_BUDGET_NS);
+
+/// Whether the run's cgroup does the starving ([`STARVE_BY_CGROUP`]).
+fn starved_by_cgroup() -> bool {
+  #[cfg(unix)]
+  {
+    std::env::var(STARVE_ENV).is_ok_and(|mode| mode == STARVE_BY_CGROUP)
+  }
+  #[cfg(not(unix))]
+  {
+    false
+  }
+}
 
 /// Spinners at the parent's priority, two a logical CPU, until `running` is cleared.
 #[cfg(unix)]
@@ -552,7 +602,13 @@ fn call_for_the_span(client: &mut Client, daemon: &mut LoneDaemon) -> Calls {
     let ticket = driver
       .submit_patient(client, Box::new(|client: &mut Client| client.list_begin()))
       .unwrap();
-    let ended = drive(client, &mut driver, ticket, daemon, asked);
+    let ended = drive(
+      client,
+      &mut driver,
+      ticket,
+      daemon,
+      (asked, STARVED_CALL_WAIT),
+    );
     calls.longest = calls.longest.max(asked.elapsed());
     match ended.call {
       Some(Ok(())) if ended.exit.is_none() => calls.answered += 1,
@@ -578,7 +634,9 @@ fn starved_and_ended(stderr: &Receiver<(Instant, String)>) -> (usize, Option<Str
 
 /// A-232, §4.14 (heavy, so run only with `SLATES_STARVE_LONE_DAEMON=1`; it skips loudly otherwise). Do: run a lone daemon
 /// at the lowest priority a process may give itself (nice 19 on Unix) beside two spinners a CPU at the parent's, and keep
-/// calling it, one patient call after another, for ten windows. Expect: every call answered, the daemon's process still
+/// calling it, one patient call after another, for ten windows. With `SLATES_STARVE_LONE_DAEMON=cgroup` the run's own
+/// cgroup starves it instead (Linux, `cpu.weight` 1 beside default-weight spinner units its wrapper starts on this
+/// test's begin tag and stops on its end tag). Expect: every call answered, the daemon's process still
 /// running at the end, and no end line: a starved shard is not a stuck one, so it never ends a daemon. Non-vacuous only
 /// if the daemon was starved: a call waited past the reply deadline, or the watchdog said a shard was starved; a run that
 /// starved nothing fails, since it proves nothing.
@@ -597,8 +655,14 @@ fn a_lone_daemon_starved_beside_spinners_is_never_ended() {
   let mut client = connect(&instance);
   let running: &'static std::sync::atomic::AtomicBool =
     Box::leak(Box::new(std::sync::atomic::AtomicBool::new(true)));
-  let spun = spinners(running);
+  let spun = if starved_by_cgroup() {
+    Vec::new()
+  } else {
+    spinners(running)
+  };
+  println!("{STARVE_BEGIN_TAG}");
   let calls = call_for_the_span(&mut client, &mut daemon);
+  println!("{STARVE_END_TAG}");
   running.store(false, std::sync::atomic::Ordering::Relaxed);
   for spinner in spun {
     spinner.join().unwrap();
