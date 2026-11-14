@@ -1,0 +1,9 @@
+python run 1 exit=0 Ran 7 tests in 62.025s OK 
+node run 1 exit=0 ℹ pass 7 ℹ fail 0 
+python run 2 exit=0 Ran 7 tests in 62.021s OK 
+node run 2 exit=0 ℹ pass 7 ℹ fail 0 
+python run 3 exit=0 Ran 7 tests in 62.014s OK 
+node run 3 exit=0 ℹ pass 7 ℹ fail 0 
+python run 4 exit=0 Ran 7 tests in 61.983s OK 
+node run 4 exit=0 ℹ pass 7 ℹ fail 0 
+nproc 4 kernel 7.0.0-1017-azure

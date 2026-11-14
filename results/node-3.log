@@ -1,0 +1,16 @@
+✔ the addon loads and exposes the Client surface (2.424349ms)
+✔ connecting to a missing daemon throws a typed error (0.775807ms)
+✔ lifecycle round trip over a live daemon (369.853991ms)
+✔ a listing says which volumes are live-shipped and which recovery could not rebuild (462.560619ms)
+✔ the addon exposes the async low-level primitives (1.649047ms)
+✔ async lifecycle over a live daemon (338.033642ms)
+the harness's own process spawns, each off the loop: slowest exec wait pgrep 2.2 ms, ps 2.3 ms, slates 3.7 ms
+✔ every async call ends across restart, silence, reader loss and death (6586.662605ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6983.692784
