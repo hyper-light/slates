@@ -1,0 +1,15 @@
+
+running 1 test
+test a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone ... 
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8471) panicked at crates/client/tests/lone_daemon.rs:479:5:
+wedged: the lone daemon was still running 10s after its shard was held; the call: None (None: still pending)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+
