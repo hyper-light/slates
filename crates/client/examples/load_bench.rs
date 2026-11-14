@@ -1549,7 +1549,8 @@ fn read_files(
     .collect()
 }
 
-/// A file read that a busy daemon may stall past one reply deadline, or refuse for now: tried again (`patiently`).
+/// A file read that a busy daemon may refuse for now: tried again (`patiently`). A late reply is waited for while the
+/// daemon lives (A-232).
 fn read_patiently(client: &mut Client, green: VolumeId, path: &str, at: ReadAt) -> Vec<u8> {
   patiently(client, &format!("read {path}"), |client| {
     client.read(green, path, at)
@@ -1561,8 +1562,8 @@ fn versions_patiently(client: &mut Client, green: VolumeId) -> u64 {
   patiently(client, "versions", |client| client.versions(green))
 }
 
-/// An oracle or setup call tried again while its answer is only late or refused for now: a stall past one reply
-/// deadline (the daemon draining after every client is done), its daemon gone for longer than one reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
+/// An oracle or setup call tried again while its answer is refused for now: its daemon gone for longer than one
+/// reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
 /// kill: fixtures' 1,000-client replica-kill rung aborted the harness on one, 2026-11-07), `Overloaded` or
 /// `OwnerUnreachable`. Paced by the client's own retry pause and bounded by `reply_patience` reconnect budgets, past
 /// which the harness stops with the last answer named.

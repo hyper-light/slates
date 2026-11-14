@@ -21,6 +21,9 @@ const addonPath = process.env.SLATES_NODE_ADDON;
 // Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 const REPLY_NS = 1_000_000_000;
 const RECONNECT_NS = 2_000_000_000;
+// Shape: the reply deadlines a call to a stopped daemon is held past and must still be waiting (A-232): more
+// than one, so a call ended at its first deadline, or re-armed once and ended at its second, is caught.
+const HELD_DEADLINES = 3;
 // How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
 const STARTUP_MS = 20_000;
 const POLL_MS = 20;
@@ -420,22 +423,37 @@ test('every async call ends across restart, silence, reader loss and death', asy
       `every admitted call is answered after the restart: ${JSON.stringify(settled.filter((r) => r.status === 'rejected' && !/TooManyOutstanding/.test(r.reason.message)).map((r) => r.reason.message))}`);
     await waitFor(async () => (await daemonPids(daemon, instance)).length > 0, 'the anchor restarted the daemon');
 
-    // (2) A live but silent daemon: the call ends Stalled at its reply deadline. The anchor's whole process
-    // group (it leads it, `detached`, and every daemon it spawns is in it) is stopped in one signal (a negative
-    // pid), so its supervision cannot replace the silent daemon and no child it forked can escape the stop.
-    // The helper waits until every member has really stopped, because the signal only queues and a daemon
-    // still running answers the call this requires to stall.
+    // (2) A live but silent daemon: the call waits, and is answered once the daemon runs again (A-232). The
+    // anchor's whole process group (it leads it, `detached`, and every daemon it spawns is in it) is stopped in
+    // one signal (a negative pid), so its supervision cannot replace the silent daemon and no child it forked can
+    // escape the stop. The helper waits until every member has really stopped, because the signal only queues and
+    // a daemon still running answers the call before it can wait. Until 2026-11-13 the call ended `Stalled` at its
+    // first reply deadline. The group is resumed in `finally`, so a failed claim never leaves it stopped.
     await stopGroupAndWait(daemon, instance, anchor.pid);
-    await assert.rejects(client.list(), /Stalled/);
+    const held = client.list();
+    let heldOutcome;
+    held.then((value) => { heldOutcome = { value }; }, (error) => { heldOutcome = { error }; });
+    try {
+      await sleep(HELD_DEADLINES * REPLY_NS / 1e6);
+      assert.equal(heldOutcome, undefined,
+        `a call to a stopped daemon is still waiting after ${HELD_DEADLINES} reply deadlines: ${JSON.stringify(heldOutcome?.error?.message)}`);
 
-    // (2b) A cancelled call is released at once: it rejects AbortError and nothing is left waiting.
-    const cancelled = client.list();
-    assert.ok(client.cancel(cancelled), 'a waiting call is cancelled');
-    await assert.rejects(cancelled, { name: 'AbortError' });
+      // (2b) A cancelled call is released at once: it rejects AbortError and nothing but the held call waits.
+      const cancelled = client.list();
+      assert.ok(client.cancel(cancelled), 'a waiting call is cancelled');
+      await assert.rejects(cancelled, { name: 'AbortError' });
+      assert.equal(client._pending.size, 1, 'only the held call is left waiting');
+      assert.equal(client.cancel(cancelled), false, 'an ended call is not cancelled again');
+    } finally {
+      process.kill(-anchor.pid, 'SIGCONT');
+    }
+    await waitFor(async () => heldOutcome !== undefined, 'the held call ends once the group resumes');
+    assert.ok(Array.isArray(heldOutcome.value),
+      `the held call is answered with a listing: ${heldOutcome.error?.message}`);
     assert.equal(client._pending.size, 0, 'nothing is left waiting');
-    assert.equal(client.cancel(cancelled), false, 'an ended call is not cancelled again');
 
-    // (3) The completion reader lost under a waiting call.
+    // (3) The completion reader lost under a waiting call: the group stopped again, so the call waits.
+    await stopGroupAndWait(daemon, instance, anchor.pid);
     const waiting = client.list();
     await sleep(POLL_MS);
     client._sock.destroy();
