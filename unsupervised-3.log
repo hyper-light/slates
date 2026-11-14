@@ -1,0 +1,7 @@
+
+running 1 test
+test a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone ... A232-UNSUPERVISED wedged: W = 1s, B = 100ms, L = 2.159ms, so W + B + L = 1.102159s; the verdict's line read 1.098523112s after t0 (margin -3635888 ns); end = 3.008198ms; DaemonGone (the client's liveness) 1.10153131s after t0: minus (W + B + L + end) = -3635888 ns, minus (W + B + L) = -627690 ns; exit exit status: 4 seen 1.101658439s after the hold was read; the call ended Some(Err(DaemonGone { after_ns: 2000000000 })) after Some(4.098359991s), bound 4.301658439s; the watchdog said: slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit 4): shard 1 is wedged, unmoved for 1002 ms against the 1000 ms window; the verdict came 2159 us past a window and a beat after the watchdog's last look before the shard last moved; the watchdog's looks ran at most 244 us late since its last beat
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 4.44s
+
