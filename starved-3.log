@@ -1,0 +1,9 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed ... A232-STARVE pids 9466 9486
+A232-SUMMARY calls 10 answered 10 failed 0 longest 9.324029705s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.69s
+

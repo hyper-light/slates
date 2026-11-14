@@ -1,0 +1,31 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed ... A232-STARVE pids 9808 9830
+A232-FAILED call 2 after 6.009965795s at 10.088661741s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 3 after 3.131362614s at 13.220055032s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.014589428s at 16.234675187s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.004978988s at 19.239684943s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.134202608s at 22.373920853s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.001721039s at 25.37567248s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.006963006s at 28.382665983s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.113968908s at 31.496663985s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.027970468s at 34.524665842s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.006003572s at 37.530699912s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.225127754s at 40.755860166s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 13 after 3.053800838s at 43.809692914s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 14 after 3.009937708s at 46.819666649s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 14 answered 1 failed 13 longest 6.009964943s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 1 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (1925 ms old, past 1497 ms: the 1000 ms window plus this anchor's lateness p99 of 497 ms over 17 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9871 (0 in the window)"]
+
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9807) panicked at crates/cli/src/liveness_tests.rs:797:3:
+every call to the starved daemon was answered: [DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }, DaemonGone { after_ns: 2000000000 }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 53.42s
+

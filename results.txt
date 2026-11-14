@@ -1,0 +1,70 @@
+A-232 step 5 (diag-a232-starved md-1: mutation (d) on a7c479b3, the anchor ignores the watchdog's looks (every lapse kills), the starv) on x86_64, 4 CPUs; kernel 7.0.0-1019-azure
+commit e1a193f9d6f0a12bb25c967c0c341a148a17b0a2, parent a7c479b30065b9395740e58d33006cf54089c038
+cli tests: /home/runner/work/slates/slates/target/debug/deps/slates-89ec4b69853ee9a6; lone_daemon: /home/runner/work/slates/slates/target/debug/deps/lone_daemon-87c4775c5ed3542d
+shapes: starved
+weights: starved 1; 32 spinner cgroups at 100 holding 32 spinners
+moved 9095 9114 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 1 exit 0, starved CPU 45 ms, load 25.07
+A232-SUMMARY calls 11 answered 11 failed 0 longest 9.711126606s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 54.24s
+moved 9292 9311 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 2 exit 0, starved CPU 48 ms, load 32.70
+A232-SUMMARY calls 12 answered 12 failed 0 longest 7.012004913s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 57.76s
+moved 9466 9486 after 6 s: 0::/a232-starved 0::/a232-starved 
+== starved run 3 exit 0, starved CPU 46 ms, load 34.87
+A232-SUMMARY calls 10 answered 10 failed 0 longest 9.324029705s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.69s
+moved 9634 9654 after 6 s: 0::/a232-starved 0::/a232-starved 
+== starved run 4 exit 0, starved CPU 53 ms, load 35.99
+A232-SUMMARY calls 12 answered 12 failed 0 longest 7.090035864s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 5 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 57.11s
+moved 9808 9830 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 5 exit 101, starved CPU 52 ms, load 35.84
+A232-FAILED call 2 after 6.009965795s at 10.088661741s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 3 after 3.131362614s at 13.220055032s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.014589428s at 16.234675187s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.004978988s at 19.239684943s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.134202608s at 22.373920853s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.001721039s at 25.37567248s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.006963006s at 28.382665983s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.113968908s at 31.496663985s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.027970468s at 34.524665842s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.006003572s at 37.530699912s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.225127754s at 40.755860166s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 13 after 3.053800838s at 43.809692914s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 14 after 3.009937708s at 46.819666649s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 14 answered 1 failed 13 longest 6.009964943s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 1 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (1925 ms old, past 1497 ms: the 1000 ms window plus this anchor's lateness p99 of 497 ms over 17 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9871 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9807) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 53.42s
+moved 9973 9999 after 9 s: 0::/a232-starved 0::/a232-starved 
+== starved run 6 exit 0, starved CPU 47 ms, load 35.79
+A232-SUMMARY calls 11 answered 11 failed 0 longest 10.270655861s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 7 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 56.56s
+moved 10153 10175 after 7 s: 0::/a232-starved 0::/a232-starved 
+== starved run 7 exit 0, starved CPU 52 ms, load 35.78
+A232-SUMMARY calls 13 answered 13 failed 0 longest 5.568993061s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 55.85s
+moved 10319 10342 after 7 s: 0::/a232-starved 0::/a232-starved 
+== starved run 8 exit 0, starved CPU 52 ms, load 35.92
+A232-SUMMARY calls 11 answered 11 failed 0 longest 7.560947282s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 57.61s
+moved 10493 10515 after 7 s: 0::/a232-starved 0::/a232-starved 
+== starved run 9 exit 0, starved CPU 53 ms, load 36.60
+A232-SUMMARY calls 12 answered 12 failed 0 longest 6.028983298s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 58.19s
+moved 10656 10680 after 7 s: 0::/a232-starved 0::/a232-starved 
+== starved run 10 exit 0, starved CPU 51 ms, load 37.03
+A232-SUMMARY calls 12 answered 12 failed 0 longest 7.29848678s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 57.95s
+== starved, supervised: passed 9, failed 1, of 10
