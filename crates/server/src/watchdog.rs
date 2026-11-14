@@ -244,8 +244,8 @@ pub fn decide(
     (None, false) => return Turn::Beat,
   };
   match (supervision, stopping) {
-    (Supervision::Alone, false) => Turn::End(cause),
-    (Supervision::Anchored, _) | (Supervision::Alone, true) => Turn::Withhold(cause),
+    // MUTANT (b), diagnostics only: the unsupervised self-end removed.
+    (Supervision::Alone, _) | (Supervision::Anchored, _) => Turn::Withhold(cause),
   }
 }
 
