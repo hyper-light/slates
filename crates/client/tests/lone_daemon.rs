@@ -411,9 +411,27 @@ fn drive(
     }
     next_tick = Instant::now()
       + Duration::from_nanos(driver.next_wake_ns(client).unwrap_or(deadlines().reply_ns));
-    pause(STEP_PAUSE);
+    step_wait(client, ended.gone_at_ns.is_some());
   }
   ended
+}
+
+/// The loop's wait between steps: [`STEP_PAUSE`], or less on Linux while the daemon is not yet seen gone, since there it
+/// wakes the moment the daemon's control socket closes (`Client::daemon_watch`), so the gone time is read when it
+/// happens rather than at the next step. A step's sleep made the gone time up to a step late: "DaemonGone time" is the
+/// test's measurement, and a 1 ms sample was error added to it (A-232 step 5, round 2). Once gone, a closed socket
+/// would wake every wait at once, so the loop sleeps its step.
+fn step_wait(client: &Client, gone_seen: bool) {
+  #[cfg(target_os = "linux")]
+  if !gone_seen && let Some(watch) = client.daemon_watch() {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut interest = [PollFd::new(&watch, PollFlags::RDHUP | PollFlags::HUP)];
+    let timeout = Timespec::try_from(STEP_PAUSE).ok();
+    let _ = poll(&mut interest, timeout.as_ref());
+    return;
+  }
+  let _ = (client, gone_seen);
+  pause(STEP_PAUSE);
 }
 
 /// The lateness the watchdog's end line names, when the parent read the line (the host's monotonic clock), and the
