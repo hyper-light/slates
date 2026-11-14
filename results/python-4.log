@@ -1,0 +1,24 @@
+test_a_listing_says_which_volumes_are_live_shipped_and_which_recovery_could_not_rebuild (test_sdk.SlatesSdkRoundTrip.test_a_listing_says_which_volumes_are_live_shipped_and_which_recovery_could_not_rebuild)
+The two listing fields the CLI's `volume list` shows, by use against a real anchor+daemon: a volume made ... ok
+test_lifecycle_round_trip_over_a_live_daemon (test_sdk.SlatesSdkRoundTrip.test_lifecycle_round_trip_over_a_live_daemon)
+Spawns a real anchor+daemon, connects the SDK client to it, creates a volume, snapshots it, ... bootstrapped
+ok
+test_connect_to_a_missing_daemon_raises_a_typed_error (test_sdk.SlatesSdkSurface.test_connect_to_a_missing_daemon_raises_a_typed_error)
+Connecting to an instance with no daemon raises SlatesError carrying the typed refusal — the ... ok
+test_module_exposes_the_client_surface (test_sdk.SlatesSdkSurface.test_module_exposes_the_client_surface)
+The extension loads and exposes the Client class, the SlatesError exception, and a version. ... ok
+test_every_async_call_ends_across_restart_silence_cancellation_and_death (test_sdk_async.SlatesAsyncEveryCallEnds.test_every_async_call_ends_across_restart_silence_cancellation_and_death)
+AUD-29-19 / AUD-29-20: every call ends, and the loop is never held. Do, with an independent ... the harness's own process spawns, each off the loop: slowest exec wait pgrep 0.001 s, ps 0.001 s, slates 0.001 s
+the ticker: worst charge 0.002 s in phase '(1) overflow, then a restart under the outstanding calls' (that tick 0.002 s late, 0.002 s of CPU, the sibling 0.000 s late); worst lateness 0.002 s in phase '(1) overflow, then a restart under the outstanding calls', charged 0.002 s; 0 ticks late past the bound and not charged (the loop idle in its selector, the sibling free, the process quiet); the control loop's worst lateness 0.000 s
+this process's 10 ms waits came back late by, at the median of 5: time.sleep 0.1 ms, the selector 0.1 ms
+ok
+test_async_lifecycle_over_a_live_daemon (test_sdk_async.SlatesAsyncRoundTrip.test_async_lifecycle_over_a_live_daemon)
+Spawns a real anchor+daemon, connects the async client, and awaits create → snapshot → ... bootstrapped
+ok
+test_module_exposes_the_async_client (test_sdk_async.SlatesAsyncSurface.test_module_exposes_the_async_client)
+The extension exposes AsyncClient with its awaitable verbs, alongside the sync Client. ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 61.526s
+
+OK
