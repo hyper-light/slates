@@ -1,0 +1,81 @@
+name: diag-a232-s4
+
+# Diagnostics only, never on main: A-232 step 4, the Node and Python acceptance suites with the stopped-group case's
+# new claim (the call waits, then is answered once the group resumes), 4 runs each per Linux arch.
+on:
+  push:
+    branches: ["diag-a232-s4-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sdks:
+    name: A-232 step 4 SDK suites on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      NAPI_CLI_VERSION: 3.7.2 # keep in sync with ci.yml's sdk job
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The daemon both SDK suites spawn
+        run: cargo build -p slates-cli
+      - name: Build and install the wheel, build the addon
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet 'maturin>=1.5,<2'
+          "$RUNNER_TEMP/venv/bin/maturin" build --release --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml --compatibility linux
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --no-index "$RUNNER_TEMP"/dist/slates-*.whl
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+          (cd crates/sdk-node && npm run build)
+      - name: Four runs of each suite
+        env:
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+        run: |
+          out="$RUNNER_TEMP/results"; mkdir -p "$out"
+          addon="$PWD/$(ls crates/sdk-node/slates.*.node)"
+          daemon="$PWD/target/debug/slates"
+          for run in 1 2 3 4; do
+            code=0
+            SLATES_DAEMON="$daemon" timeout 1200 "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v > "$out/python-$run.log" 2>&1 || code=$?
+            echo "python run $run exit=$code $(grep -E '^(Ran|OK|FAILED)' "$out/python-$run.log" | tr '\n' ' ')" | tee -a "$out/summary.txt"
+            code=0
+            SLATES_NODE_ADDON="$addon" SLATES_DAEMON="$daemon" timeout 1200 node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs > "$out/node-$run.log" 2>&1 || code=$?
+            echo "node run $run exit=$code $(grep -E '^ℹ (pass|fail) ' "$out/node-$run.log" | tr '\n' ' ')" | tee -a "$out/summary.txt"
+          done
+          echo "nproc $(nproc) kernel $(uname -r)" >> "$out/summary.txt"
+          ! grep -q 'exit=[1-9]' "$out/summary.txt"
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/a232-s4-1-${{ matrix.os }}"
+          git config user.name "diag-a232"
+          git config user.email "diag-a232@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          mkdir -p results && cp "$RUNNER_TEMP"/results/* results/ 2>/dev/null || echo "no results" > results/summary.txt
+          git add results
+          git commit -qm "diag-a232 s4-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
