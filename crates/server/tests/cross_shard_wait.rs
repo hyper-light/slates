@@ -15,6 +15,8 @@
 
 mod common;
 
+use common::anchor::Anchored;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,7 @@ use slates_ipc::protocol::{Refusal, ReplyBody, RequestBody};
 use slates_rt::shard::ShardId;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_server::{Daemon, DaemonConfig};
 
 /// Shape: the liveness budget, each call's budget.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
@@ -45,19 +47,16 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// run that finds none in this many is a fault of the placement, not luck.
 const CLIENT_TRIES: usize = 16;
 
-fn daemon(name: &str) -> (Daemon, String) {
+/// A two-shard daemon over an anchor the test holds: the wedged cases hold a shard past a window while the daemon goes
+/// on answering, which only an anchored daemon lives through (A-232).
+fn daemon(name: &str) -> (Anchored, String) {
   let profile = common::machine_profile();
   let instance = format!("xwait-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2));
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: common::fixture_object("slates-seg", &format!("xwait-{name}")),
-    },
+  (
+    Anchored::start(&format!("xwait-{name}"), &profile, config),
+    instance,
   )
-  .unwrap();
-  (daemon, instance)
 }
 
 /// The shard that serves `client_id`, asked of each shard until one has taken the client: a client's connect returns

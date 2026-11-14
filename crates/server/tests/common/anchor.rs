@@ -48,3 +48,43 @@ pub(crate) fn source_of(anchor: &Anchor) -> SegmentSource {
     rendezvous: anchor.rendezvous.adoption(),
   }
 }
+
+/// A daemon started over an anchor the test holds (A-232): the test plays the anchor, so the daemon's beat is read
+/// (`SegmentSource::Handoff` is anchored) and a stuck shard withholds the beat rather than ending the test's process.
+/// A test that keeps a shard stuck past a window while it watches the daemon go on (its beat stop, an observation's
+/// deadline, a refusal by the wedged shard's peers) is about an anchored daemon, the only kind that lives stuck, until
+/// its anchor kills it; this test ends it itself. Derefs to the daemon.
+pub(crate) struct Anchored {
+  /// Declared first, so it drops first: the daemon stops before the anchor lets its segment and rendezvous go.
+  daemon: slates_server::Daemon,
+  anchor: Anchor,
+}
+
+impl Anchored {
+  /// Starts a daemon of `config` over a fresh anchor named for `name`.
+  pub(crate) fn start(name: &str, profile: &MachineProfile, config: DaemonConfig) -> Anchored {
+    let anchor = held_anchor(name, profile, &config);
+    let daemon = slates_server::Daemon::start(profile, config, source_of(&anchor)).unwrap();
+    Anchored { daemon, anchor }
+  }
+
+  /// The anchor the test holds.
+  pub(crate) fn anchor(&self) -> &Anchor {
+    &self.anchor
+  }
+
+  /// Stops the daemon, then lets the anchor go.
+  pub(crate) fn stop(self) {
+    let Anchored { daemon, anchor } = self;
+    daemon.stop();
+    drop(anchor);
+  }
+}
+
+impl std::ops::Deref for Anchored {
+  type Target = slates_server::Daemon;
+
+  fn deref(&self) -> &slates_server::Daemon {
+    &self.daemon
+  }
+}

@@ -51,8 +51,9 @@ const EXIT_REFUSED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// Format: the exit code when no daemon answers at the instance.
 const EXIT_UNAVAILABLE: u8 = 3;
-/// Format: the exit code when the anchor or the daemon itself failed.
-const EXIT_FAILED: u8 = 4;
+/// Format: the exit code when the anchor or the daemon itself failed; a daemon its own watchdog ends exits with it too
+/// (A-232), so it is the server's one constant.
+const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();

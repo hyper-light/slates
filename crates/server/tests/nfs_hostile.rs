@@ -18,6 +18,8 @@ use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
+
+use common::anchor::Anchored;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
   lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status,
@@ -78,24 +80,18 @@ fn provision_remote_volume(instance: &str) -> String {
   panic!("no volume landed on the non-control shard in 32 attempts");
 }
 
-fn two_shard_daemon(name: &str) -> (Daemon, String) {
+fn two_shard_daemon(name: &str) -> (Anchored, String) {
   two_shard_daemon_with(name, |_| {})
 }
 
 /// [`two_shard_daemon`], its configuration adjusted by `adjust` before it starts.
-fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Daemon, String) {
+/// Over an anchor the test holds, since a test wedges a shard past a window and asks the daemon on (A-232).
+fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Anchored, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(2));
   adjust(&mut config);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: common::fixture_object("slates-seg", name),
-    },
-  )
-  .unwrap();
+  let daemon = Anchored::start(name, &profile, config);
   daemon.bootstrap(true).unwrap();
   (daemon, instance)
 }

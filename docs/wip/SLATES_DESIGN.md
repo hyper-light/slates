@@ -7221,6 +7221,16 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > still stops the beat within 1.08 s on both. A frozen process is still killed at its lapse. macOS could not be held off
 > the CPU on demand (a full window in 1 of 20 CI runs), so there the replays carry the rule.
 
+> **Status (2026-11-13, A-232 step 2): a daemon nobody supervises ends itself on the stuck verdict.** The watchdog knows
+> from the segment's source whether an anchor reads its beat (`Supervision`: `FromEnv` and `Handoff` are anchored,
+> `Create` runs alone), and each turn is one of beat, withhold or end (`Turn`, decided by the pure `decide`). An
+> anchored daemon is unchanged: a stuck shard withholds the beat and the anchor kills it. A lone daemon ends its own
+> process on the same verdict, window and starved-is-not-stuck rule, exit 4, so its clients see the exit as they see a
+> kill. A starved shard, and anything found while the daemon stops, ends nothing. A lone daemon exits within
+> `W + 2·(B + L)` of a wedge (`L`, its looks' lateness, is named in the end line): measured 1.30 to 1.34 s against
+> 1.50 to 1.54 s on a loaded Mac and 1.10 s against 1.20 s on Linux, red-checked; a lone daemon starved at nice 19
+> beside two spinners a CPU was ended in 0 of 10 runs (`crates/client/tests/lone_daemon.rs`; A-232).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -20235,3 +20245,69 @@ Applied in the same change to:
   `promise_local_copies`, `initial_epoch`, `answer_own_copies_by_name`, and the module doc's account of the empty
   promise.
 - Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.
+
+### A-232 — A call waits while its daemon lives; a daemon judged stuck is ended by its supervisor, or by its own watchdog when it has none (accepted 2026-11-13, the supervisor's goal 5875dc0c, uniform (a); step 2 of 6 built: the watchdog's self-end)
+
+Applied in the same change to (step 2): §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs`
+(`Supervision`, `Turn`, `Cause`, `decide`, the end, `FAILED_EXIT_CODE`), `crates/server/src/daemon.rs`
+(`SegmentSource::supervision`, `Daemon::start`, `starve_control_shard` and `starved_share_ns`), `crates/cli/src/main.rs`
+(`EXIT_FAILED` taken from the server), `crates/client/tests/lone_daemon.rs` (new), the server test fixtures named below,
+GAPS, and `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`. Steps 3 to 6 of plan
+`01a1d6ca960575d0a36250c5f0a22500` (the client's one rule, the tests that claimed `Stalled`, the live proof, and this
+amendment's rewrite of A-56's words in §4.7) are owed.
+
+- **Why (this step).** The client's half of A-232 makes a call wait while its daemon lives, and fail `DaemonGone` once
+  it is gone. That is safe only if a daemon that will never answer is ended. An anchored daemon is: its watchdog
+  withholds the beat on a stuck shard (A-228) and the anchor kills it at its lapse. A daemon run alone
+  (`SegmentSource::Create`: `slates daemon` with no anchor) withheld a beat nobody read, and lived on stuck for good.
+- **The rule.** The watchdog is told at its start whether an anchor reads its beat (`Supervision`, from the segment's
+  source), and each turn decides one of three typed outcomes (`Turn`): beat, withhold, or end. An anchored daemon's turns
+  are A-228's, unchanged. A lone daemon's turn ends its own process where an anchored one's withholds the beat: on the
+  same verdict (wedged or spinning), the same window (`LIVENESS_BUDGET_NS`) and the same starved-is-not-stuck rule, and
+  on a control loop that ended (a refused boot, which nobody would restart). A starved shard ends nothing. Nothing found
+  while the daemon stops ends it, since the stop is its end already. The end is a deliberate `std::process::exit` with
+  `FAILED_EXIT_CODE` (4, the CLI's code for a failed daemon), never a panic: a stuck shard's thread cannot be joined, so
+  an orderly stop would wait on it for good. The end's line is written by a thread of its own, waited for at most one
+  beat, since a shard can be wedged in a write to an undrained standard error while holding the lock every log line takes.
+- **Decided: `Handoff` is anchored.** The plan's step proposed `Handoff` (an anchor in this process) as unsupervised.
+  The tree says otherwise: every `Handoff` user holds the segment and reads the beat as the anchor does. The boot tests
+  assert the beat stops so the anchor restarts the daemon
+  (`a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon`, `crates/server/tests/recovery.rs`).
+  The recovery tests hold the beat to a gap bound (`watch_recovery`, `crates/server/tests/recovery_slicing.rs`), and the
+  client's restart oracles play the anchor across two daemons. Ending a stuck daemon is that holder's to decide, and a
+  watchdog that ended the process would end the holder with it. So `FromEnv` and `Handoff` are anchored, and only
+  `Create` runs alone.
+- **The bound, by its terms.** A wedge is judged on the wall clock. The watchdog credits the shard's last CPU rise to
+  the first look that sees it, at most one look after the wedge, and ends the process at its first look a whole window
+  after that, at most one look more. So a lone daemon exits within `W + 2·(B + L)` of the wedge: `W` the liveness
+  budget, `B` the beat (`HEARTBEAT_NS`), `L` the lateness of the watchdog's own looks since its last beat, which the end
+  line names. The plan's `W + B + L` leaves out the first of those two looks. A spin is judged in the shard's own CPU
+  time, which a busy machine hands out slower than the wall runs, so its verdict names between a window and a window and
+  one look of CPU.
+- **Test fixtures that held a shard stuck in a lone daemon.** Before A-232 they were harmless, since nobody read the
+  beat. Each is now one of two things. Those that watch a daemon with a stuck shard go on (the beat stopping, an
+  observation's deadline, a peer's refusal) are about an anchored daemon, the only kind that lives stuck, and now start
+  over an anchor the test holds (`common::anchor::Anchored`: `liveness.rs`, `observe.rs`, `nfs_hostile.rs`,
+  `cross_shard_wait.rs`). `Daemon::starve_control_shard`, which spun its whole span (a spinning, stuck shard by A-228's
+  rule, killed by an anchor), now runs as a starved thread runs: a share of each beat on the CPU, its whole CPU over the
+  span at most half a window (`starved_share_ns`).
+- **Proven** on this Mac (M5 Max, 18 CPUs, macOS 26.4.1), 2026-11-13, at load averages 41 to 64 from other sessions:
+  `cargo test -p slates-client --test lone_daemon`. A lone daemon whose client's shard was wedged exited 1.301 s and
+  1.340 s after the wedge (bounds 1.537 s and 1.498 s; `L` 168 ms and 149 ms). The outstanding call (`submit_patient`)
+  ended `DaemonGone` 4.07 s and 4.12 s after the wedge. A spinning shard's verdict named 1,074 ms and 1,159 ms of CPU,
+  and its call ended `DaemonGone` too. Red-checked on a copy of the tree with the self-end removed (a lone daemon's stuck
+  turn withheld): "still running 10s after its shard was held; the call: None (None: still pending)". The verdict table
+  is `each_verdict_maps_to_beat_withhold_or_end_by_who_reads_the_beat` in `watchdog.rs`.
+- **Proven on Linux** (adacachy2, x86_64, 32 CPUs, 2026-11-13, through kiln): the wedged lone daemon exited 1.099 s
+  after the wedge (bound 1.200 s, `L` 241 µs; inside `W + B + L` too), the spinning one on a verdict of 1,098 ms of
+  CPU, both calls `DaemonGone` at 4.10 s; clippy `-D warnings` on the three crates.
+- **A starved lone daemon is never ended**: `SLATES_STARVE_LONE_DAEMON=1 cargo test -p slates-client --test lone_daemon
+  -- --exact a_lone_daemon_starved_beside_spinners_is_never_ended`, 10 runs on this Mac at load 62 to 77, the daemon at
+  nice 19 beside 36 spinners (two a CPU). 0 of 10 runs ended it; every call was answered (178 to 829 a run, the longest
+  85 to 766 ms), and the watchdog judged a shard starved in each run, so no run was vacuous. Linux at `cpu.weight` 1
+  is owed (step 5's lane).
+- **The fixtures' suites**, this Mac: `liveness` 10 of 10, `observe` 8 of 8, `cross_shard_wait` 7 of 7, `nfs_hostile` 20
+  of 20, `recovery`'s three boot-fault tests, `recovery_slicing` 1 of 1, and two of the three fleet tests over the
+  starved hold. The third, `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`, failed 3 of 3 here at load
+  57 to 63 (placed 3.037 to 3.049 s against its 3 s hold). With the old spinning hold on a copy of the tree it failed the
+  same way, 3 of 3 (3.031 to 3.111 s), so that failure is the base's at this load, not this change's (GAPS).

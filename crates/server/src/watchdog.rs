@@ -43,6 +43,18 @@
 //! not announced as one to restart (under two spinners a core, 8 of 18 daemons stopped in one `nfs_hostile` run said
 //! so before, an 18-core Mac, 2026-11-07). Under Miri, which has no thread clock, the wall window stands
 //! alone, as it does for observations.
+//!
+//! **A daemon nobody supervises ends itself (A-232).** Withholding the beat ends a daemon only when an anchor reads the
+//! beat. A daemon run alone (`slates daemon` with no anchor, [`crate::SegmentSource::Create`]) is read by nobody, so
+//! before A-232 a stuck one sat with its beat withheld for good, and its clients waited on a daemon that would never
+//! answer. The watchdog is told at its start which it is ([`Supervision`], from the segment's source), and each turn it
+//! decides one of three things ([`Turn`], [`decide`]): beat; withhold the beat, for the anchor to judge; or end the
+//! daemon's process. On the same verdict, the same window and the same starved-is-not-stuck rule as an anchored
+//! daemon, a lone one ends its own process where an anchored one withholds the beat, so its clients see the exit as they
+//! see a kill: the socket's close on Linux, the exit watch on macOS and Windows. A starved shard ends nothing, and
+//! neither does anything found while the daemon stops: the stop is already its end. The end is a deliberate exit with
+//! [`FAILED_EXIT_CODE`] after the verdict is logged, never a panic: a stuck shard's thread cannot be joined, so an orderly
+//! stop would wait on it for good.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
@@ -99,24 +111,39 @@ impl std::fmt::Debug for Watchdog {
 
 impl Watchdog {
   /// Starts the thread over `segment` (its own mapping of the anchor's segment), judging the shards `holders` name.
-  /// `control` is the control loop's life: while its sender lives the loop lives.
+  /// `control` is the control loop's life: while its sender lives the loop lives. `supervision` says whether an anchor
+  /// reads the beat, and so whether a stuck verdict withholds it or ends the process (A-232).
   pub fn start(
     segment: AnchorSegment,
     holders: Vec<SlotHolder>,
     control: Receiver<()>,
+    supervision: Supervision,
   ) -> std::io::Result<Watchdog> {
     let (stop, stop_signal) = channel();
     slates_machine::log_line!(
       "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step, with \
        no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard \
-       waiting for a CPU is starved, not stuck, and the beat goes on",
+       waiting for a CPU is starved, not stuck, and the beat goes on; {}",
       HEARTBEAT_NS / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      LIVENESS_BUDGET_NS / NS_PER_MS,
+      match supervision {
+        Supervision::Anchored => "an anchor reads the beat, so a stuck shard withholds it",
+        Supervision::Alone =>
+          "no anchor reads the beat, so a stuck shard ends the daemon's process",
+      }
     );
     let turns: &'static Turns = Box::leak(Box::default());
     let handle = std::thread::Builder::new()
       .name("slates-watchdog".to_owned())
-      .spawn(move || run(&segment, &holders, (&control, &stop_signal), turns))?;
+      .spawn(move || {
+        run(
+          &segment,
+          &holders,
+          (&control, &stop_signal),
+          supervision,
+          turns,
+        )
+      })?;
     Ok(Watchdog {
       stop: Some(stop),
       handle: Some(handle),
@@ -156,6 +183,71 @@ impl Drop for Watchdog {
 
 /// Format: nanoseconds per millisecond, for the watchdog's log lines.
 const NS_PER_MS: u64 = 1_000_000;
+/// Format: nanoseconds per microsecond, for the lateness the end's log line names.
+const NS_PER_US: u64 = 1_000;
+
+/// Format: the exit code of a daemon its own watchdog ended (A-232), and `slates`'s code for an anchor or a daemon that
+/// failed (`EXIT_FAILED` in `crates/cli/src/main.rs`, which takes it from here, so the two cannot drift).
+pub const FAILED_EXIT_CODE: u8 = 4;
+
+/// Whether an anchor reads this daemon's beat (A-232), told to the watchdog at its start from the segment's source
+/// ([`crate::SegmentSource::supervision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Supervision {
+  /// An anchor holds the segment and reads the beat: across the spawn (`FromEnv`, the `slates anchor` process, which
+  /// kills a daemon whose beat lapses) or in this process (`Handoff`, a test or an embedding that plays the anchor and
+  /// owns what a lapse means). A stuck shard withholds the beat, and the anchor ends the daemon.
+  Anchored,
+  /// Nobody reads the beat (`Create`: `slates daemon` run alone, or a test's daemon with no anchor). A stuck shard ends
+  /// the daemon's own process, on the verdict that withholds an anchored daemon's beat.
+  Alone,
+}
+
+/// Why a turn did not beat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+  /// A shard was found stuck (wedged or spinning): the first such shard and its verdict.
+  Stuck {
+    /// The shard.
+    shard: u16,
+    /// What the watchdog found of it.
+    verdict: Verdict,
+  },
+  /// The control loop ended (a refused boot, A-100) while the daemon was not stopping.
+  ControlEnded,
+}
+
+/// What one turn of the watchdog does (A-232).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turn {
+  /// Every shard is alive (a starved one included) and the control loop lives: write the beat.
+  Beat,
+  /// Leave the beat unwritten, for the anchor to judge, or because the daemon is stopping.
+  Withhold(Cause),
+  /// End the daemon's process: no anchor reads the beat, so nobody else would.
+  End(Cause),
+}
+
+/// One turn's decision, pure so the table is tested on every host: what the shards' verdicts and the control loop's life
+/// mean for a daemon of `supervision`. `stuck` is the first shard found stuck this turn, if any; `control_ended` whether
+/// the control loop has ended; `stopping` whether the daemon has begun its own stop ([`Watchdog::stopping`]), which
+/// already ends it, so nothing found then ends the process.
+pub fn decide(
+  supervision: Supervision,
+  stuck: Option<(u16, Verdict)>,
+  control_ended: bool,
+  stopping: bool,
+) -> Turn {
+  let cause = match (stuck, control_ended) {
+    (Some((shard, verdict)), _) => Cause::Stuck { shard, verdict },
+    (None, true) => Cause::ControlEnded,
+    (None, false) => return Turn::Beat,
+  };
+  match (supervision, stopping) {
+    (Supervision::Alone, false) => Turn::End(cause),
+    (Supervision::Anchored, _) | (Supervision::Alone, true) => Turn::Withhold(cause),
+  }
+}
 
 /// What the watchdog found of one shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,19 +394,22 @@ impl ShardWatch {
   }
 }
 
-/// The thread's loop: each beat, look at every shard, and beat the anchor's word while every shard is alive and the
-/// control loop lives.
+/// The thread's loop: each beat, look at every shard, decide the turn ([`decide`]) and do it: beat the anchor's word,
+/// withhold it, or end the process.
 fn run(
   segment: &AnchorSegment,
   holders: &[SlotHolder],
   (control, stop): (&Receiver<()>, &Receiver<()>),
+  supervision: Supervision,
   turns: &Turns,
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::default(); holders.len()];
   let mut reported = vec![None; holders.len()];
   let mut control_ended = false;
+  let mut said_control_ended = false;
   let mut stopping = false;
+  let mut lateness = Lateness::default();
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -324,38 +419,145 @@ fn run(
     }
     if !control_ended && matches!(control.try_recv(), Err(TryRecvError::Disconnected)) {
       control_ended = true;
-      if !stopping {
-        slates_machine::log_line!(
-          "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
-        );
-      }
     }
     let now = clock.monotonic_ns();
-    let mut all_alive = true;
+    let late_ns = lateness.look(now);
     let mut looks: Vec<Option<Look>> = holders.iter().map(|holder| look_at(*holder, now)).collect();
     read_runs(holders, &watches, &mut looks);
-    for (index, (holder, look)) in holders.iter().zip(looks).enumerate() {
-      let Some(look) = look else {
-        continue;
-      };
-      let Some(watch) = watches.get_mut(index) else {
-        continue;
-      };
-      let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
-      *watch = next;
-      let Some(said) = reported.get_mut(index) else {
-        continue;
-      };
-      report(said, holder.shard(), verdict);
-      all_alive &= verdict.beats();
+    // In shard order, aligned with `reported`: `None` for a slot that now holds another registration.
+    let verdicts: Vec<Option<(u16, Verdict)>> = holders
+      .iter()
+      .zip(looks)
+      .zip(watches.iter_mut())
+      .map(|((holder, look), watch)| {
+        let (verdict, next) = watch.judge(look?, LIVENESS_BUDGET_NS);
+        *watch = next;
+        Some((holder.shard(), verdict))
+      })
+      .collect();
+    let stuck = verdicts
+      .iter()
+      .flatten()
+      .copied()
+      .find(|(_, verdict)| !verdict.beats());
+    let turn = decide(supervision, stuck, control_ended, stopping);
+    if let Turn::End(cause) = turn {
+      turns.looked(stuck.is_some());
+      end_process(cause, lateness.since_beat(false, late_ns));
     }
-    turns.looked(!all_alive);
-    if all_alive
-      && !control_ended
-      && let Ok(supervision) = segment.supervision()
-    {
-      supervision.beat(now);
+    for (found, said) in verdicts.iter().zip(reported.iter_mut()) {
+      if let Some((shard, verdict)) = found {
+        report(said, *shard, *verdict, turn);
+      }
     }
+    turns.looked(stuck.is_some());
+    lateness.since_beat(turn == Turn::Beat, late_ns);
+    match turn {
+      Turn::Beat => {
+        if let Ok(supervision) = segment.supervision() {
+          supervision.beat(now);
+        }
+      }
+      Turn::Withhold(Cause::ControlEnded) => {
+        if !stopping && !said_control_ended {
+          said_control_ended = true;
+          slates_machine::log_line!(
+            "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
+          );
+        }
+      }
+      // Ended above, before any line that takes the log's lock.
+      Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
+    }
+  }
+}
+
+/// How late the watchdog's own looks run, past the beat they wait for: the thread is itself scheduled, and a busy
+/// machine delays it. Kept since the last turn that beat, so the end names the lateness of the very looks its verdict
+/// rests on (the one that last saw the shard move, and each after it), for a test to bound the end by (A-232).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Lateness {
+  /// The last look's time on the watchdog's clock; zero before the first.
+  last_look_ns: u64,
+  /// The largest lateness of a look since the last beat, the beating look's own included.
+  since_beat_ns: u64,
+}
+
+impl Lateness {
+  /// Records a look at `now_ns` and returns how late it was: its gap from the last look past one beat.
+  fn look(&mut self, now_ns: u64) -> u64 {
+    let late_ns = if self.last_look_ns == 0 {
+      0
+    } else {
+      now_ns
+        .saturating_sub(self.last_look_ns)
+        .saturating_sub(HEARTBEAT_NS)
+    };
+    self.last_look_ns = now_ns.max(1);
+    late_ns
+  }
+
+  /// Folds this look's lateness into the episode's and returns the episode's: a beating look starts the episode
+  /// afresh, since the verdicts that follow rest on what it saw.
+  fn since_beat(&mut self, beat: bool, late_ns: u64) -> u64 {
+    self.since_beat_ns = if beat {
+      late_ns
+    } else {
+      self.since_beat_ns.max(late_ns)
+    };
+    self.since_beat_ns
+  }
+}
+
+/// Ends the daemon's process on the watchdog's verdict (A-232): nobody reads this daemon's beat, so nobody else would end
+/// it. A deliberate exit with [`FAILED_EXIT_CODE`], not a panic: a stuck shard's thread can be neither joined nor
+/// stopped, so an orderly stop would wait on it for good. The exit runs no destructor; what the process held, the kernel
+/// releases, and its clients see it as they see a kill.
+///
+/// The verdict is logged first, but the end never waits on the log for longer than one beat: a shard can be wedged in a
+/// write to a standard error nobody drains, holding the lock every log line takes, and a watchdog that waited on that
+/// lock would never end anything. So the line is written by a thread of its own, which the exit ends if it is still
+/// blocked; the exit is that thread's owner.
+fn end_process(cause: Cause, late_ns: u64) -> ! {
+  let line = match cause {
+    Cause::Stuck { shard, verdict } => format!(
+      "slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit {FAILED_EXIT_CODE}): \
+       shard {shard} is {}; the watchdog's looks ran at most {} us late since its last beat",
+      describe(verdict),
+      late_ns / NS_PER_US
+    ),
+    Cause::ControlEnded => format!(
+      "slates daemon: the control loop ended and no anchor restarts the daemon, so the watchdog ends its process \
+       (exit {FAILED_EXIT_CODE})"
+    ),
+  };
+  let (written, logged) = channel::<()>();
+  let writer = std::thread::Builder::new()
+    .name("slates-watchdog-end".to_owned())
+    .spawn(move || {
+      slates_machine::log_line!("{line}");
+      let _ = written.send(());
+    });
+  if writer.is_ok() {
+    let _ = logged.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS));
+  }
+  std::process::exit(i32::from(FAILED_EXIT_CODE))
+}
+
+/// A stuck verdict in the end's words.
+fn describe(verdict: Verdict) -> String {
+  match verdict {
+    Verdict::Wedged { for_ns } => format!(
+      "wedged, unmoved for {} ms against the {} ms window",
+      for_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    ),
+    Verdict::Spinning { cpu_ns } => format!(
+      "spinning, {} ms of CPU without a step against the {} ms window",
+      cpu_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS
+    ),
+    Verdict::Alive | Verdict::Starved { .. } => "not stuck".to_owned(),
   }
 }
 
@@ -397,8 +599,14 @@ fn read_runs(holders: &[SlotHolder], watches: &[ShardWatch], looks: &mut [Option
 }
 
 /// Logs what the watchdog found of a shard the first look it finds it: `said` holds the kind last logged, cleared once
-/// the shard is alive. A starved shard that then blocks is logged again as wedged.
-fn report(said: &mut Option<std::mem::Discriminant<Verdict>>, shard: u16, verdict: Verdict) {
+/// the shard is alive. A starved shard that then blocks is logged again as wedged. `turn` is what the watchdog does this
+/// turn, which a stuck shard's line names.
+fn report(
+  said: &mut Option<std::mem::Discriminant<Verdict>>,
+  shard: u16,
+  verdict: Verdict,
+  turn: Turn,
+) {
   if verdict == Verdict::Alive {
     *said = None;
     return;
@@ -406,12 +614,21 @@ fn report(said: &mut Option<std::mem::Discriminant<Verdict>>, shard: u16, verdic
   let kind = std::mem::discriminant(&verdict);
   if *said != Some(kind) {
     *said = Some(kind);
-    log_verdict(shard, verdict);
+    log_verdict(shard, verdict, turn);
+  }
+}
+
+/// What a turn does, in a stuck shard's log line.
+fn consequence(turn: Turn) -> &'static str {
+  match turn {
+    Turn::Beat => "the watchdog goes on beating",
+    Turn::Withhold(_) => "the watchdog withholds the beat",
+    Turn::End(_) => "the watchdog ends the daemon's process",
   }
 }
 
 /// Logs one episode's verdict, with what the watchdog saw.
-fn log_verdict(shard: u16, verdict: Verdict) {
+fn log_verdict(shard: u16, verdict: Verdict, turn: Turn) {
   match verdict {
     Verdict::Starved { for_ns } => slates_machine::log_line!(
       "slates daemon: shard {shard} is starved: no step and no CPU progress for {} ms, past the {} ms window, while its \
@@ -421,15 +638,16 @@ fn log_verdict(shard: u16, verdict: Verdict) {
     ),
     Verdict::Wedged { for_ns } => slates_machine::log_line!(
       "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past the {} ms \
-       window; the watchdog withholds the beat",
+       window; {}",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      LIVENESS_BUDGET_NS / NS_PER_MS,
+      consequence(turn)
     ),
     Verdict::Spinning { cpu_ns } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past the {} ms window; the watchdog \
-       withholds the beat",
+      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past the {} ms window; {}",
       cpu_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      LIVENESS_BUDGET_NS / NS_PER_MS,
+      consequence(turn)
     ),
     Verdict::Alive => {}
   }
@@ -656,17 +874,30 @@ mod tests {
     assert!(Verdict::Alive.beats() && starved.beats());
     assert!(!wedged.beats() && !spinning.beats());
     let mut said = None;
-    report(&mut said, 1, starved);
+    report(&mut said, 1, starved, Turn::Beat);
     assert_eq!(said, Some(std::mem::discriminant(&starved)));
-    report(&mut said, 1, Verdict::Starved { for_ns: 2 * WINDOW });
+    report(
+      &mut said,
+      1,
+      Verdict::Starved { for_ns: 2 * WINDOW },
+      Turn::Beat,
+    );
     assert_eq!(
       said,
       Some(std::mem::discriminant(&starved)),
       "the same episode"
     );
-    report(&mut said, 1, wedged);
+    report(
+      &mut said,
+      1,
+      wedged,
+      Turn::Withhold(Cause::Stuck {
+        shard: 1,
+        verdict: wedged,
+      }),
+    );
     assert_eq!(said, Some(std::mem::discriminant(&wedged)), "now stuck");
-    report(&mut said, 1, Verdict::Alive);
+    report(&mut said, 1, Verdict::Alive, Turn::Beat);
     assert_eq!(said, None);
   }
 
@@ -703,6 +934,142 @@ mod tests {
     readings.extend(vec![blocked(Some(CREDITED_WAIT)); 20]);
     let verdicts = replay(&readings);
     assert_eq!(first_wedged(&verdicts), Some(19), "{verdicts:?}");
+  }
+
+  /// A-232, §4.14. Do: decide the turn for every verdict a shard can have (alive, starved, wedged, spinning) and for a
+  /// control loop that ended, for an anchored daemon and a lone one, running and stopping. Expect: alive and starved
+  /// beat for both; a stuck shard or an ended control loop withholds the beat of an anchored daemon and ends a lone one;
+  /// while stopping nothing ends, the stop being the daemon's end already; and a stuck shard is named over an ended loop.
+  #[test]
+  fn each_verdict_maps_to_beat_withhold_or_end_by_who_reads_the_beat() {
+    for supervision in [Supervision::Anchored, Supervision::Alone] {
+      for stopping in [false, true] {
+        a_beating_shard_beats(supervision, stopping);
+        a_stuck_shard_or_an_ended_loop_does_not(supervision, stopping);
+      }
+    }
+  }
+
+  /// The rule's turn for `cause` in a daemon of `supervision`: only a lone daemon that is not stopping ends.
+  fn expected(supervision: Supervision, stopping: bool, cause: Cause) -> Turn {
+    if supervision == Supervision::Alone && !stopping {
+      Turn::End(cause)
+    } else {
+      Turn::Withhold(cause)
+    }
+  }
+
+  /// Alive and starved shards are not handed in as stuck, and the turn beats.
+  fn a_beating_shard_beats(supervision: Supervision, stopping: bool) {
+    for verdict in [Verdict::Alive, Verdict::Starved { for_ns: WINDOW }] {
+      assert!(verdict.beats(), "{verdict:?}");
+      assert_eq!(
+        decide(supervision, None, false, stopping),
+        Turn::Beat,
+        "{supervision:?} {verdict:?} stopping={stopping}"
+      );
+    }
+  }
+
+  /// A wedged or spinning shard, named over an ended control loop, and an ended control loop alone.
+  fn a_stuck_shard_or_an_ended_loop_does_not(supervision: Supervision, stopping: bool) {
+    for verdict in [
+      Verdict::Wedged { for_ns: WINDOW },
+      Verdict::Spinning { cpu_ns: WINDOW },
+    ] {
+      let want = expected(supervision, stopping, Cause::Stuck { shard: 3, verdict });
+      for control_ended in [false, true] {
+        assert_eq!(
+          decide(supervision, Some((3, verdict)), control_ended, stopping),
+          want,
+          "{supervision:?} {verdict:?} stopping={stopping} control_ended={control_ended}"
+        );
+      }
+    }
+    assert_eq!(
+      decide(supervision, None, true, stopping),
+      expected(supervision, stopping, Cause::ControlEnded),
+      "{supervision:?} the control loop ended, stopping={stopping}"
+    );
+  }
+
+  /// A-232. Do: replay a shard that steps, then wedges, through the judge and the decision a lone daemon makes each
+  /// turn, as the watchdog's loop does. Expect: it beats while the shard steps and never ends it while it is starved
+  /// (runnable at every look); once it is wedged, the first turn past a whole window ends the process, at turn 13 here:
+  /// the look after the wedge (turn 3) sees its last CPU rise, and the window runs from that look, so a lone daemon
+  /// ends up to one window and two looks after its shard last ran.
+  #[test]
+  fn a_lone_daemon_ends_a_window_after_its_shard_last_moved_and_never_while_it_starves() {
+    let first_end = |readings: &[Option<RunReading>], cpu_after_wedge: u64| {
+      let mut watch = ShardWatch::default();
+      for turn in 1..=2_u64 {
+        let (verdict, next) =
+          watch.judge(look(turn, false, Some((turn, turn)), turn * TURN), WINDOW);
+        watch = next;
+        assert_eq!(
+          decide(Supervision::Alone, None, false, false),
+          Turn::Beat,
+          "{verdict:?}"
+        );
+      }
+      // Wedged at turn 2's step: one last CPU rise, seen at turn 3, then nothing.
+      for (turn, run) in (3_u64..).zip(readings) {
+        let (verdict, next) = watch.judge(
+          Look {
+            run: *run,
+            ..look(
+              2,
+              false,
+              Some((cpu_after_wedge, cpu_after_wedge)),
+              turn * TURN,
+            )
+          },
+          WINDOW,
+        );
+        watch = next;
+        let stuck = (!verdict.beats()).then_some((1, verdict));
+        if let Turn::End(_) = decide(Supervision::Alone, stuck, false, false) {
+          return Some(turn);
+        }
+      }
+      None
+    };
+    assert_eq!(first_end(&vec![blocked(None); 30], 3), Some(13), "wedged");
+    assert_eq!(first_end(&vec![runnable(None); 50], 3), None, "starved");
+  }
+
+  /// A-232. Do: record looks a beat apart, one of them late, then a beat, then late looks with no beat. Expect: each
+  /// look's lateness is its gap past a beat; the episode's is the largest since the last beating look, that look's own
+  /// included, and starts afresh at the next beat.
+  #[test]
+  fn the_lateness_an_end_names_is_the_largest_since_the_last_beat() {
+    let mut lateness = Lateness::default();
+    assert_eq!(
+      lateness.look(TURN),
+      0,
+      "the first look has no gap to be late by"
+    );
+    assert_eq!(lateness.look(2 * TURN), 0);
+    let late = TURN / 4;
+    assert_eq!(lateness.look(3 * TURN + late), late);
+    assert_eq!(
+      lateness.since_beat(true, late),
+      late,
+      "the beating look's own lateness"
+    );
+    assert_eq!(lateness.look(4 * TURN + late), 0);
+    assert_eq!(
+      lateness.since_beat(false, 0),
+      late,
+      "kept until the next beat"
+    );
+    assert_eq!(lateness.look(5 * TURN + 3 * late), 2 * late);
+    assert_eq!(lateness.since_beat(false, 2 * late), 2 * late);
+    assert_eq!(
+      lateness.since_beat(true, 0),
+      0,
+      "a beat starts the episode afresh"
+    );
   }
 
   /// A-228, §4.14. Do: replay a shard with no step and no CPU that the scheduler never saw runnable: asleep with a wait

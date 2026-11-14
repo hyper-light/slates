@@ -11,6 +11,8 @@
 
 mod common;
 
+use common::anchor::Anchored;
+
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -19,7 +21,7 @@ use slates_rt::RtError;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::observe::{OBSERVE_LATE_REPLY, ObserveError, ObserveStage};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_server::{Daemon, DaemonConfig};
 
 /// Derived: how long a held control shard spins — two anchor liveness budgets ([`LIVENESS_BUDGET_NS`]),
 /// long past the short budget below, so a question submitted behind the hold is judged while the hold
@@ -81,19 +83,13 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
     .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A one-shard laptop daemon (no fleet) named for the history.
-fn laptop(name: &str) -> Daemon {
+/// A one-shard laptop daemon (no fleet) named for the history, over an anchor the test holds: several tests wedge its
+/// shard past a window and go on asking it, which only an anchored daemon lives through (A-232).
+fn laptop(name: &str) -> Anchored {
   let profile = common::machine_profile();
   let instance = format!("observe-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: common::fixture_object("slates-seg", &format!("observe-{name}")),
-    },
-  )
-  .expect("the laptop daemon starts")
+  Anchored::start(&format!("observe-{name}"), &profile, config)
 }
 
 /// A question with a fixed answer, so a delivered answer is told from a stranger's.

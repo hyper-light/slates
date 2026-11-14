@@ -18,6 +18,8 @@
 
 mod common;
 
+use common::anchor::Anchored;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,7 @@ use slates_rt::shard::ShardId;
 use slates_rt::{RunState, SlotHolder};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_server::{Daemon, DaemonConfig};
 
 /// Shape: the liveness window, the anchor's budget.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
@@ -38,18 +40,13 @@ const SAMPLE: Duration = Duration::from_nanos(HEARTBEAT_NS / 10);
 const BURST: Duration = Duration::from_millis(10);
 const OFF: Duration = Duration::from_millis(40);
 
-fn daemon(name: &str) -> (Daemon, ShardId, ShardId) {
+/// A two-shard daemon over an anchor the test holds: the test reads its beat as the anchor does, so the daemon is
+/// anchored (A-232), and a stuck shard withholds the beat rather than ending this process.
+fn daemon(name: &str) -> (Anchored, ShardId, ShardId) {
   let profile = common::machine_profile();
   let instance = format!("liveness-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2));
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: common::fixture_object("slates-seg", &format!("liveness-{name}")),
-    },
-  )
-  .unwrap();
+  let daemon = Anchored::start(&format!("liveness-{name}"), &profile, config);
   let control = daemon.shards()[0];
   let other = daemon.shards()[1];
   (daemon, control, other)
