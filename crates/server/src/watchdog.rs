@@ -277,7 +277,8 @@ pub enum Verdict {
 impl Verdict {
   /// Whether a shard with this verdict lets the watchdog beat: a starved shard is not a stuck one.
   fn beats(self) -> bool {
-    matches!(self, Verdict::Alive | Verdict::Starved { .. })
+    // MUTANT (c), diagnostics only: a starved shard treated as stuck.
+    matches!(self, Verdict::Alive)
   }
 }
 
