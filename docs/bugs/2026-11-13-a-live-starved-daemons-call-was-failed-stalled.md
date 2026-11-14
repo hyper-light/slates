@@ -245,3 +245,11 @@ bound names `kill`, every run is inside, by the verdict line's own margin.
 | `diag-a232-starved-ma-1`, on `bd84c944` | (a) the client's `Stalled` branch restored (`crates/client/src` as of `3c17e017`, step 1's base) | starved | 10 of 10 red: 8 to 17 calls a run "no reply within 1000000000 ns", daemon alive | 10 of 10 red: 10 to 15 calls a run |
 | `diag-a232-starved-mb-1`, on `bd84c944` | (b) the unsupervised self-end removed | unsupervised | 10 of 10 red: "still running 10s after its shard was held; the call: None (still pending)" | 10 of 10 red, the same |
 | `diag-a232-starved-mc-1`, on `bd84c944` | (c) a starved verdict treated as stuck | starved | 4 of 10 red (runs 1, 5, 6, 8: the anchor kills the live daemon, 3 to 11 calls `DaemonGone`); in the other 6 a starved verdict never lasted until the beat lapsed | 10 of 10 red, 7 to 12 calls a run |
+| `diag-a232-starved-ma-2`, on `a7c479b3` | (a), as above | starved | 10 of 10 red, 7 to 18 calls a run | 10 of 10 red, 10 to 13 calls a run |
+| `diag-a232-starved-mb-2`, on `a7c479b3` | (b), as above | unsupervised | 10 of 10 red, the same words | 10 of 10 red |
+| `diag-a232-starved-mc-2`, on `a7c479b3` | (c), as above | starved | 7 of 10 red: the watchdog, looking, withholds the beat on a starved shard and the anchor kills the live daemon | 9 of 10 red |
+| `diag-a232-starved-md-1`, on `a7c479b3` | (d) the anchor ignores the watchdog's looks: every lapse kills, the rule before this step | starved | 1 of 10 red (run 5: killed, 13 calls `DaemonGone`) | 1 of 10 red (run 10: 11 calls) |
+
+Mutation (d)'s rate, 2 of 20, matches round 1's before the fix, 3 of 20. The stronger evidence for the fix is the green
+round 2 itself: in 5 of its 20 starved runs (x86_64 runs 3, 4, 5; arm64 runs 2, 5) the anchor met a lapsed beat with a
+silent watchdog and spared the daemon, and under the rule before this step each of those lapses was a kill.
