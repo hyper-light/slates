@@ -1,0 +1,58 @@
+name: diag-a232-step5
+
+# Diagnostics only, never on main: A-232 step 5, the rule and its bound live on both Linux runners.
+on:
+  push:
+    branches: ["diag-a232-starved-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  step5:
+    name: A-232 step 5 on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy over the changed crates (Linux-only branches included)
+        run: cargo clippy --locked -p slates-cli -p slates-server -p slates-client --all-targets -- -D warnings
+      - name: Build the tests
+        if: always()
+        run: |
+          cargo test --locked -p slates-cli --bin slates --no-run
+          cargo test --locked -p slates-client --test lone_daemon --no-run
+      - name: The three shapes
+        if: always()
+        run: bash .github/diag-a232-step5.sh "$(git log -1 --format=%s | cut -c1-120)"
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/${GITHUB_REF_NAME#diag-}-${{ matrix.os }}"
+          git config user.name "diag-a232"
+          git config user.email "diag-a232@users.noreply.github.com"
+          mkdir -p ../publish && cp ../results.txt ../*.log ../publish/ 2>/dev/null
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          rm -rf ./* && cp ../publish/* . 2>/dev/null || echo "no results" > results.txt
+          git add -A
+          git commit -qm "diag ${GITHUB_REF_NAME} results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"

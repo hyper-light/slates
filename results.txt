@@ -1,0 +1,107 @@
+A-232 step 5 (diag-a232-starved mc-2: mutation (c) on a7c479b3, a starved verdict treated as stuck, the starved shape) on x86_64, 4 CPUs; kernel 7.0.0-1016-aws
+commit 8a6ab1038139c55c75ebcc08f6333a09f21ed154, parent a7c479b30065b9395740e58d33006cf54089c038
+cli tests: /home/runner/work/slates/slates/target/debug/deps/slates-89ec4b69853ee9a6; lone_daemon: /home/runner/work/slates/slates/target/debug/deps/lone_daemon-87c4775c5ed3542d
+shapes: starved
+weights: starved 1; 32 spinner cgroups at 100 holding 32 spinners
+moved 8982 9001 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 1 exit 101, starved CPU 52 ms, load 23.22
+A232-FAILED call 13 after 5.007081889s at 45.473046786s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 13 answered 12 failed 1 longest 5.946006215s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 8 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (5901 ms old, past 4478 ms: the 1000 ms window plus this anchor's lateness p99 of 3478 ms over 19 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9120 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (8981) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 50.96s
+moved 9144 9166 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 2 exit 101, starved CPU 57 ms, load 30.93
+A232-FAILED call 2 after 12.018986253s at 17.875992862s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 3 after 3.098577793s at 20.974611763s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.004344089s at 23.978990575s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.004972552s at 26.983998111s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.097043654s at 30.081079154s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.001883136s at 33.083003118s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.001957316s at 36.085003603s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.121320962s at 39.206361793s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.001592858s at 42.207995747s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 11 answered 2 failed 9 longest 12.01898552s (reply deadline 1s) reconnects 1
+A232-STARVED-LINES starved 3 spared 2 lapsed ["slates anchor: the daemon's heartbeat lapsed (2833 ms old, past 2354 ms: the 1000 ms window plus this anchor's lateness p99 of 1354 ms over 16 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9223 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9143) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 55.92s
+moved 9328 9348 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 3 exit 0, starved CPU 57 ms, load 33.93
+A232-SUMMARY calls 14 answered 14 failed 0 longest 6.113017524s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 4 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 55.83s
+moved 9585 9604 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 4 exit 101, starved CPU 60 ms, load 34.98
+A232-FAILED call 3 after 7.121685413s at 11.634448781s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.015942014s at 14.650426414s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.023957116s at 17.674421067s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.101448572s at 20.775907026s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.001477366s at 23.77741897s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.018958444s at 26.796413525s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.100394187s at 29.896845285s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.001540037s at 32.898420931s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.003958831s at 35.902418341s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.098215211s at 39.000671689s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 13 after 3.006698456s at 42.00740819s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 14 answered 3 failed 11 longest 8.832988648s (reply deadline 1s) reconnects 1
+A232-STARVED-LINES starved 4 spared 1 lapsed ["slates anchor: the daemon's heartbeat lapsed (4803 ms old, past 3013 ms: the 1000 ms window plus this anchor's lateness p99 of 2013 ms over 16 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 9651 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9584) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 57.79s
+moved 9769 9790 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 5 exit 0, starved CPU 62 ms, load 35.11
+A232-SUMMARY calls 14 answered 14 failed 0 longest 5.964028143s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 4 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 56.01s
+moved 9943 9964 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 6 exit 101, starved CPU 60 ms, load 35.43
+A232-FAILED call 3 after 6.103208725s at 14.916298513s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.001792019s at 17.918124683s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.003872564s at 20.922033091s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.103971572s at 24.026044404s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.006950806s at 27.033027742s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.001963062s at 30.035028505s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.098152802s at 33.133218014s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.003769929s at 36.137023972s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.00498297s at 39.142040603s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.102487643s at 42.244570205s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 13 answered 3 failed 10 longest 6.153001674s (reply deadline 1s) reconnects 1
+A232-STARVED-LINES starved 3 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (3754 ms old, past 2732 ms: the 1000 ms window plus this anchor's lateness p99 of 1732 ms over 13 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 10013 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (9940) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 54.33s
+moved 10116 10133 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 7 exit 101, starved CPU 52 ms, load 35.46
+A232-FAILED call 2 after 9.009006937s at 15.647975166s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 3 after 3.099438787s at 18.747452236s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.001494493s at 21.748979979s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.010959718s at 24.759978276s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.098678839s at 27.858707152s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.002230984s at 30.860979794s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.003963205s at 33.864982082s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.121764814s at 36.986783403s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.002160903s at 39.988977368s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.011018619s at 43.00003558s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.138698958s at 46.138772641s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 12 answered 1 failed 11 longest 9.00900606s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (4282 ms old, past 2954 ms: the 1000 ms window plus this anchor's lateness p99 of 1954 ms over 12 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 10187 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10114) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.96s
+moved 10286 10305 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 8 exit 101, starved CPU 69 ms, load 35.24
+A232-FAILED call 14 after 12.027001685s at 54.877004602s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 14 answered 13 failed 1 longest 12.02700072s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 11 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (3650 ms old, past 3292 ms: the 1000 ms window plus this anchor's lateness p99 of 2292 ms over 32 waits); killing it"] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10285) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 61.48s
+moved 10468 10486 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 9 exit 101, starved CPU 44 ms, load 35.36
+A232-FAILED call 10 after 8.009961541s at 47.874723504s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 10 answered 9 failed 1 longest 10.646555954s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 2 spared 3 lapsed ["slates anchor: the daemon's heartbeat lapsed (4764 ms old, past 4150 ms: the 1000 ms window plus this anchor's lateness p99 of 3150 ms over 33 waits); killing it"] process-stuck [] restarted []
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10466) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.47s
+moved 10633 10650 after 4 s: 0::/a232-starved 0::/a232-starved 
+== starved run 10 exit 0, starved CPU 47 ms, load 35.72
+A232-SUMMARY calls 11 answered 11 failed 0 longest 8.227647494s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 2 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 54.56s
+== starved, supervised: passed 3, failed 7, of 10
