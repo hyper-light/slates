@@ -110,7 +110,8 @@ pub enum LinkAfter {
 /// A-114), or nothing.
 #[derive(Clone, Debug)]
 pub enum SegmentSource {
-  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor).
+  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor). Nobody reads such a
+  /// daemon's beat, so its watchdog ends its process on a stuck verdict (A-232, [`SegmentSource::supervision`]).
   Create {
     /// The object's name.
     name: String,
@@ -132,6 +133,34 @@ pub enum SegmentSource {
     /// maps it, no daemon after the first could otherwise make its own.
     rendezvous: Adoption,
   },
+}
+
+/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns`: one beat times half a liveness
+/// window over the span, at most the whole beat, so the hold's whole CPU is at most half a window and the watchdog never
+/// finds it spinning, while each beat's share shows CPU progress, so it is never wedged either (A-228's rule).
+pub fn starved_share_ns(span_ns: u64) -> u64 {
+  HEARTBEAT_NS
+    .saturating_mul(LIVENESS_BUDGET_NS / 2)
+    .checked_div(span_ns)
+    .unwrap_or(HEARTBEAT_NS)
+    .min(HEARTBEAT_NS)
+}
+
+impl SegmentSource {
+  /// Whether an anchor reads the beat of a daemon started over this source (A-232), which decides what the watchdog does
+  /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the `slates anchor` process across the spawn, which
+  /// kills a daemon whose beat lapses. `Handoff` is an anchor in this process: whoever holds the segment and hands it
+  /// over plays the anchor (a restart oracle, a boot test, an embedding) and reads the beat as the anchor does; ending a
+  /// stuck daemon is that holder's to decide, and a watchdog that ended the process would end the holder with it.
+  /// `Create` has no anchor: the daemon made its own segment, nobody reads its beat, so its watchdog ends it.
+  pub fn supervision(&self) -> crate::watchdog::Supervision {
+    match self {
+      SegmentSource::FromEnv | SegmentSource::Handoff { .. } => {
+        crate::watchdog::Supervision::Anchored
+      }
+      SegmentSource::Create { .. } => crate::watchdog::Supervision::Alone,
+    }
+  }
 }
 
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
@@ -666,6 +695,7 @@ impl Daemon {
       }))
     })?;
     let identity = profile.facts.identity.clone();
+    let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
     let adoption = match &source {
@@ -842,6 +872,7 @@ impl Daemon {
       AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
       holders,
       control_alive,
+      supervision,
     )
     .map_err(|error| {
       ServerError::Ipc(slates_ipc::IpcError::OsRefused {
@@ -2207,10 +2238,16 @@ impl Daemon {
   /// Test support: **starves** this daemon's control shard for `span_ns` — the CPU starvation a shared,
   /// oversubscribed box inflicts on a live daemon (measured here at load average 41: a live root voter was
   /// retired and re-admitted in a loop), injected deterministically so the fleet's tolerance of it is a
-  /// test, not a hope. The hold is a task spawned onto the control shard that spins on the shard clock
-  /// until the span has passed: the shard is cooperative, so while the hold runs nothing else on that shard
+  /// test, not a hope. The hold is a task spawned onto the control shard that runs until the span has passed:
+  /// the shard is cooperative, so while the hold runs nothing else on that shard
   /// does — its probe serve tasks (so its acknowledgements to every peer's probes stop for the whole span,
-  /// then resume), its own probes, its record plane and its consensus loops. Admission is retried while the
+  /// then resume), its own probes, its record plane and its consensus loops.
+  ///
+  /// It runs as a starved thread runs, a little CPU at a time (A-232): each beat it spins for its share and sleeps the
+  /// rest, its share being what keeps its whole CPU over the span to half a liveness window
+  /// ([`starved_share_ns`]). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
+  /// CPU without a step a spinning, stuck shard, not a starved one: an anchor would kill that daemon, and since A-232 a
+  /// lone one ends itself. So a span past a window was a stuck daemon, not the live, starved one this models. Admission is retried while the
   /// control channel is full ([`Self::observation`]); the typed refusal when there is no control shard or
   /// the hold was not admitted within the observe budget, otherwise the **admitted** hold, whose answer
   /// ([`Admitted::answer`]) is its **measured span** (nanoseconds) once it ends — so a test proves the
@@ -2224,6 +2261,7 @@ impl Daemon {
     // question in the same step it took the hold, which a loaded runner would otherwise do (§4.3). The
     // admission-vs-execution staging the observe oracle asserts rides on this ordering being certain.
     let (spinning, confirm) = std::sync::mpsc::channel::<()>();
+    let share_ns = starved_share_ns(span_ns);
     let held = self
       .pending(
         self.shards.first().copied(),
@@ -2232,8 +2270,18 @@ impl Daemon {
           let _ = spinning.send(());
           let begin = slates_rt::futures::now_ns();
           let end = begin.saturating_add(span_ns);
+          let mut beat_began = begin;
           while slates_rt::futures::now_ns() < end {
-            std::hint::spin_loop();
+            let share_ends = beat_began.saturating_add(share_ns).min(end);
+            while slates_rt::futures::now_ns() < share_ends {
+              std::hint::spin_loop();
+            }
+            let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
+            let rest = beat_ends.saturating_sub(slates_rt::futures::now_ns());
+            // The point of the fixture: off the CPU for the rest of the beat, as a starved thread is.
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(std::time::Duration::from_nanos(rest));
+            beat_began = beat_ends;
           }
           Ok(slates_rt::futures::now_ns().saturating_sub(begin))
         },

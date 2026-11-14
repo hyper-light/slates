@@ -77,6 +77,16 @@ lives. A daemon judged stuck is ended by its supervisor: the anchor, or for a da
 watchdog, on the same verdict, window and starved-is-not-stuck rule. The client then sees `DaemonGone`. The green, the
 mutations and the bound (t0 + 2·W + B + L + kill) are recorded here when they are measured.
 
+### Step 2: a lone daemon ends itself (`agents/clients-a232`, `6aaded0c`)
+
+**Step 2, built 2026-11-13.** A daemon with no anchor (`SegmentSource::Create`) ends its own process on its watchdog's
+stuck verdict (`crates/server/src/watchdog.rs`, `decide` and the end; A-232's amendment). In
+`crates/client/tests/lone_daemon.rs` a lone daemon whose client's shard was wedged exited 1.301 s and 1.340 s after the
+wedge, within `W + 2·(B + L)`, and the outstanding call ended `DaemonGone`. With the self-end removed, on a copy of the
+tree, the daemon was still running at the test's 10 s bound and the call still pending. On Linux (adacachy2) the wedged lone daemon exited 1.099 s
+after the wedge. A lone daemon starved at nice 19 beside two spinners a CPU was ended in 0 of 10 runs on this Mac, each
+run judged starved by the watchdog at least once.
+
 ### Step 3: the client's one rule (`agents/clients-a232-s3`, on `3c17e017`)
 
 Every wait a call makes now keeps one rule: each reply deadline that passes asks the daemon's liveness; gone, the

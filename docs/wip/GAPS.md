@@ -598,6 +598,14 @@
 >   and 19 calls failed `Stalled` after 2.152 to 8.929 s, the daemon's own watchdog judging every shard starved and
 >   withholding no beat. On this Mac at nice 19 beside two spinners a CPU, 1 of 3 runs was red. The fix is owed on
 >   `agents/clients-a232` (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
+>   Step 2 of A-232's plan is built (2026-11-13): a daemon run alone ends its own process on its watchdog's stuck verdict,
+>   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good (A-232's amendment; exit
+>   within `W + 2·(B + L)` of a wedge, measured 1.30 to 1.34 s on this Mac). Owed: the client's one rule (step 3), the
+>   tests that claimed `Stalled` (step 4), the live proof on Linux CI at `cpu.weight` 1 (step 5), and §4.7's words
+>   (step 6). `W` itself is still R3 debt. Found on the way (open, not this change's):
+>   `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this Mac at load 57 to
+>   63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s hold ends rather than
+>   inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`.
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
