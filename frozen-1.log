@@ -1,0 +1,7 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemon_stopped_whole_is_killed_by_its_process_judgment_and_its_call_answered_after ... A232-FROZEN: the anchor's kill line Some(2.000111947s) after the stop; DaemonGone Some(2.001413441s) after it; the call ended Some(Ok(())) after 1 reconnect(s); the anchor: Some("slates anchor: the daemon's watchdog has not looked for 2002 ms, its heartbeat 2002 ms old; its process made no progress for 1002 ms (the 1000 ms liveness window); killing it")
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 3.47s
+

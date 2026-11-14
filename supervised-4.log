@@ -1,0 +1,7 @@
+
+running 1 test
+test liveness_tests::an_anchored_daemons_wedged_shard_is_ended_within_the_liveness_bound_and_its_call_answered_after ... A232-SUPERVISED: W = 1s, B = 100ms, L = 1.075ms (the watchdog's first look 75µs, the anchor's age past the window 1ms, of it the p99 0ns), so 2W + B + L = 2.101075s; the kill line read 1.999183799s after t0 (margin -101891201 ns; against the plan's 2W + B + p99 = 2.1s, -100816201 ns); kill = 1.307505ms (to the client's liveness; to the reap Some(1.746476ms)); the verdict read 1.099003341s after t0, the shard last moved Some(98.003341ms) after t0 by it; DaemonGone 2.000491304s after t0, minus (2W + B + L + kill) = -101891201 ns, minus (2W + B + p99 + kill) = -100816201 ns; the call ended Some(Ok(())) 22.27097ms after it, bound 3s, after 1 reconnect(s); the watchdog: slates daemon: shard 1 is wedged: no step, no CPU progress and no wait for a CPU for 1001 ms, past the 1000 ms window; the watchdog withholds the beat; the looks since it last moved ran 1437 us late in all, the first of them 75 us; the anchor: slates anchor: the daemon's heartbeat lapsed (1000 ms old, past 1000 ms: the 1000 ms window plus this anchor's lateness p99 of 0 ms over 7 waits); killing it
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 2.46s
+
