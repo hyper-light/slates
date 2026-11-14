@@ -130,3 +130,118 @@ test (`RingFull` after 112 ms). Logs: `~/.cache/slates-agents-scratch/a232/evide
 
 Owed by later steps: the SDK suites' two stopped-group cases each still assert `Stalled`, and with this rule they
 wait instead (step 4); the design text, GAPS and both SDKs' docs still state the old rule (step 6).
+
+### Step 5: the rule and its bound, live (`agents/clients-a232-s5`, on step 4 with step 2's `6aaded0c` merged)
+
+Three end-to-end tests, one per shape, each against real processes:
+
+- **Stuck, supervised** (`crates/cli/src/liveness_tests.rs`,
+  `an_anchored_daemons_wedged_shard_is_ended_within_the_liveness_bound_and_its_call_answered_after`). The test binary is
+  the anchor. A child runs `anchor::supervise`, which is the `slates anchor` path after its arguments: `anchor::run` now
+  builds the `slates daemon` arguments and calls it. It supervises this binary re-invoked as the daemon
+  (`daemon::start` then `daemon::serve`, split from `daemon::run` unchanged; `SegmentSource::FromEnv`, so supervised).
+  The first daemon wedges the shard that serves the parent's client in one poll, on a read of a pipe nobody writes.
+  `t0` is the host's monotonic clock read just before that read, which every process on the host shares. The test
+  asserts four things: the watchdog's wedged line says it withholds the beat; the anchor's kill line arrives within
+  `t0 + 2·W + B + L`; the client's liveness answers gone `kill` after that line; and the call is then answered by the
+  daemon the anchor restarts, after one reconnect, within the reply deadline and the reconnect budget.
+- **Stuck, unsupervised** (`crates/client/tests/lone_daemon.rs`, step 2's child-role daemon,
+  `SegmentSource::Create`). `t0` is read the same way. The watchdog's end line must arrive within `t0 + W + B + L`. The
+  call ends `DaemonGone` past the reconnect budget.
+- **Starved, supervised** (`an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed`, heavy, run
+  only with `SLATES_A232_STARVE=1`). The anchor and its daemon are held off their CPUs: on Linux CI they are moved into
+  a cgroup of `cpu.weight` 1 beside eight default-weight spinners a CPU, each spinner in its own cgroup; elsewhere they
+  run at nice 19 beside two spinners a CPU. For 45 windows the test calls `list`, `status` and an async `list` in turn.
+  No call may fail, the anchor may kill nothing, there may be no reconnect, and the run must have starved something.
+
+**The bound, by name.** `W` is the liveness budget and `B` the beat. A shard wedged at `t0` is first seen still at the
+watchdog's next look `a1`, at most a beat and that look's lateness later, because the look before `a1` came before
+`t0` (the watchdog thread's start counts as that look when there was no other). The shard is found stuck at the first
+look a whole window after `a1`. Since a beat divides the window, the verdict comes within `W + B + L` of `t0`, where `L`
+is the summed lateness of the looks from `a1` to the verdict. An anchored daemon's last beat is the look before the
+verdict, still within a window of `a1`, so it comes within `W + B + late(a1)`. The anchor kills once the beat is older
+than `W` plus its own lateness p99, at a look its own lateness makes late too, and its kill line logs that age. So the
+supervised bound is `t0 + 2·W + B + L + kill`, with `L` the watchdog's first-look lateness plus the anchor's logged age
+past the window (its p99 and its overshoot). `kill` is the measured time from the kill line to the client's liveness
+answering gone. The watchdog now names both of its terms on its wedged and spinning lines and on its end line, as "the
+looks since it last moved ran N us late in all, the first of them M us".
+
+**Where the plan's words were short, measured.**
+- *Supervised.* With `L` the anchor's p99 alone, as the plan worded it, the bound failed on this Mac in 5 of 5 runs, by
+  0.3 to 98 ms, at load 15 to 60. The watchdog's 100 ms looks came back about 245 ms apart under kiln's launchd timer
+  policy, and its first look after the wedge was 124 to 150 ms late (`macos-timed-waits-stretched`). With the
+  watchdog's term the same runs passed 10 of 10, 50 to 230 ms inside the bound. On Linux CI the watchdog's own lateness
+  is microseconds, and the two readings of `L` agree to within it.
+- *Unsupervised.* Read as the client's call ending `DaemonGone`, the plan's `W + B + L` cannot hold: the call ends past
+  the reconnect budget, `reconnect_ns = RECOVERY_BUDGET_NS + W`, after the exit. "DaemonGone time" is therefore the
+  instant the client's liveness first answers gone, which the test polls at each step of its loop, a hundredth of a
+  beat. The verdict-to-gone time `end` is measured and named as the supervised case's `kill` is. The test asserts the
+  verdict's line by `t0 + W + B + L` and reports gone against both `W + B + L + end` and `W + B + L`.
+- *Supervised, the call.* An anchor restarts the daemon it kills, so the outstanding call is resent under its id to
+  the successor and answered. It does not end `DaemonGone`. The test asserts it is answered after one reconnect.
+- *A shard's first look.* The watchdog counted its first look's lateness as none. A wedge 2.8 ms after a daemon began
+  serving was first seen 187 ms later while the line named 0 us (macOS). The thread's start now counts as the look
+  before its first. Red-checked on a copy: without it, the watchdog's bound unit test fails ("a late first look,
+  wedged at 0: 1.175 s past 1.1 s").
+- *`t0` read before a write.* The role had printed its held line from inside the poll, then blocked. On a loaded Mac
+  the shard lost its CPU after the write and blocked 51 to 55 ms after the time it named, in 2 of 3 runs. `t0` is now
+  the last read before the block, and another thread prints it.
+
+**The anchor killed a starved daemon (found by this step, fixed in it).** Round 1 on Linux CI (`diag-a232-starved-1`
+on `bd84c944`) answered every call to a live daemon, but in 3 of its 20 starved runs (x86_64 run 6, arm64 runs 6 and 7)
+the anchor killed the starved daemon: "the daemon's heartbeat lapsed (3495 ms old, past 2518 ms: the 1000 ms window
+plus this anchor's lateness p99 of 1518 ms over 16 waits); killing it". The restarted daemon, starved too, did not
+answer within the client's 2 s reconnect budget, so 11, 5 and 7 calls ended `DaemonGone`. At `cpu.weight` 1 the
+watchdog thread is held off its CPU with the rest of the daemon. Its beat then lapses past the window and the anchor's
+own lateness p99, and the anchor could not tell that from a withheld beat. Mutation (a)'s run 3, which changes the
+client alone, met the same kill.
+
+The fix (`a7c479b3`). The watchdog marks every look in the segment, beating or not: `SUP_LOOKED`, the supervision
+block's word at offset 216, zeroed at each start. On a lapse the anchor decides by `judge_lapse`:
+- Looks within the lapse bound: the watchdog's verdict, killed as before.
+- No look within it: the daemon's process is judged by the start's rule, in its own CPU time, from when the looks
+  stopped. Starved or alive, it is spared and looked at every beat. Wedged (no CPU progress, never runnable, as a
+  stopped process) or spinning for a window, it is killed, by a line of its own.
+
+A daemon stopped whole (SIGSTOP) is still killed that way, 1.88 to 1.93 s after the stop (macOS 5 of 5): the lapse,
+then a window of the process's own CPU time.
+
+**adacachy2 is not a place to judge a wedge from `t0`.** It pauses whole processes for about 1.16 s at a time. A plain
+Python probe, one thread blocked on a pipe read and a 100 ms sleeper, saw 2 gaps of 1.164 and 1.165 s in 20 s, and the
+blocked thread was charged 8.6 to 11.7 us of CPU across each. Its run cgroup's freezer bits stayed 0 throughout. Such a
+pause wakes the wedged shard, so the watchdog rightly sees it move after `t0`: 35 of 35 supervised runs there failed in
+one stretch, the shard last seen moving 1.4 to 5.2 s after `t0`. Its Linux runs therefore went to CI.
+
+**Linux CI, the green lanes** (`.github/workflows/diag-a232-step5.yml` and `.github/diag-a232-step5.sh` in each lane's
+tree; `ubuntu-latest` x86_64 and `ubuntu-24.04-arm`, 4 CPUs each; results on `diag-results/<lane>-<os>`, read with git).
+The stuck shapes ran on an unloaded runner, 10 runs each. The starved shape then ran 10 runs with the anchor and its
+daemon in a cgroup of `cpu.weight` 1 beside 32 spinners in 32 sibling cgroups of weight 100 (load 23 to 37); each run
+kept 39 to 60 ms of CPU in the starved cgroup over its 45 windows.
+
+| Lane, tree | Shape | x86_64 | arm64 |
+|---|---|---|---|
+| `diag-a232-starved-1`, `bd84c944` | stuck, supervised | 10 of 10; kill line 100.4 to 102.5 ms inside `2W + B + L` | 10 of 10; 100.4 to 101.8 ms inside |
+| | stuck, unsupervised | 10 of 10; verdict line 2.8 to 4.4 ms inside `W + B + L` | 10 of 10; 2.9 to 6.2 ms inside |
+| | starved | 9 of 10: run 6 killed by the anchor, 11 calls `DaemonGone` | 8 of 10: runs 6, 7 killed, 5 and 7 calls `DaemonGone` |
+| `diag-a232-starved-2`, `a7c479b3` | stuck, supervised | 10 of 10; 99.8 to 102.1 ms inside; `L` 1.07 to 1.09 ms, `kill` 1.0 to 2.2 ms | 10 of 10; 90.0 to 102.2 ms inside |
+| | stuck, unsupervised | 10 of 10; 2.7 to 4.6 ms inside | 10 of 10; 3.2 to 4.2 ms inside |
+| | frozen (SIGSTOP) | 10 of 10; killed by its process judgment 1.90 to 2.00 s after the stop | 10 of 10 |
+| | starved | 10 of 10: 108 calls, 0 failed, 0 kills, 0 reconnects; the anchor spared a silent watchdog 8 times | 10 of 10: 123 calls, 0 failed, 0 kills, 0 reconnects; spared 2 times |
+
+Every starved run was non-vacuous: its longest call waited 4.9 to 14.6 s against the 1 s reply deadline, and the
+watchdog judged a shard starved 1 to 17 times a run. No call failed `Stalled` in any run. Before step 3 every such run
+failed (step 1's red, 10 of 10 on each runner).
+
+**The unsupervised bound in the plan's words.** "DaemonGone time minus `t0` minus `(W + B + L)`" exceeds zero in 15 of
+40 CI runs (round 1: 9 of 10 x86_64, 1 of 10 arm64; round 2: 0 of 10, 5 of 10), by 0.005 to 1.08 ms. The exit is the
+missing term. From the watchdog's end line to the client's liveness answering gone takes `end` = 1.7 to 4.6 ms: the
+log write, `exit`, and the kernel's teardown before the control socket closes. With `end` named, as the supervised
+bound names `kill`, every run is inside, by the verdict line's own margin.
+
+**Mutations, each a lane of its own on Linux CI, each turning its own shape red:**
+
+| Lane | Mutation | Shape | x86_64 | arm64 |
+|---|---|---|---|---|
+| `diag-a232-starved-ma-1`, on `bd84c944` | (a) the client's `Stalled` branch restored (`crates/client/src` as of `3c17e017`, step 1's base) | starved | 10 of 10 red: 8 to 17 calls a run "no reply within 1000000000 ns", daemon alive | 10 of 10 red: 10 to 15 calls a run |
+| `diag-a232-starved-mb-1`, on `bd84c944` | (b) the unsupervised self-end removed | unsupervised | 10 of 10 red: "still running 10s after its shard was held; the call: None (still pending)" | 10 of 10 red, the same |
+| `diag-a232-starved-mc-1`, on `bd84c944` | (c) a starved verdict treated as stuck | starved | 4 of 10 red (runs 1, 5, 6, 8: the anchor kills the live daemon, 3 to 11 calls `DaemonGone`); in the other 6 a starved verdict never lasted until the beat lapsed | 10 of 10 red, 7 to 12 calls a run |

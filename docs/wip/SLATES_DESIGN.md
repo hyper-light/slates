@@ -7231,6 +7231,21 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > 1.50 to 1.54 s on a loaded Mac and 1.10 s against 1.20 s on Linux, red-checked; a lone daemon starved at nice 19
 > beside two spinners a CPU was ended in 0 of 10 runs (`crates/client/tests/lone_daemon.rs`; A-232).
 
+> **Status (2026-11-14, A-232 step 5): a lapsed beat kills only a stuck daemon, never a starved one.** The watchdog marks
+> every look in the segment, beating or not (`SUP_LOOKED`, offset 216 of the supervision block, zeroed at each start). On
+> a lapse the anchor decides (`judge_lapse` in `crates/cli/src/anchor.rs`):
+> - Looks within the lapse bound: the watchdog's verdict, killed as before.
+> - No look within it: the daemon's watchdog was held off its CPU with the rest of the daemon. The anchor judges the
+>   process by the start's rule, in its own CPU time, from when the looks stopped. Starved or alive, it is spared and
+>   looked at every beat. Wedged (no CPU progress and never runnable, as a stopped process) or spinning for a window,
+>   it is killed.
+>
+> Before, the anchor killed a starved daemon in 3 of 20 runs at `cpu.weight` 1 on CI. After, 0 of 20, the anchor
+> sparing a silent watchdog 10 times. A daemon stopped whole is still killed, 1.88 to 2.00 s after the stop.
+> A stuck shard's verdict now names the lateness of the looks it rests on, summed and the first alone, the terms of the
+> bound from a wedge: the verdict within `W + B + sum`, an anchored daemon's last beat within `W + B + first`. The
+> thread's start counts as the look before its first. Measured on both Linux runners and this Mac (A-232).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -20306,6 +20321,32 @@ amendment's rewrite of A-56's words in §4.7) are owed.
   nice 19 beside 36 spinners (two a CPU). 0 of 10 runs ended it; every call was answered (178 to 829 a run, the longest
   85 to 766 ms), and the watchdog judged a shard starved in each run, so no run was vacuous. Linux at `cpu.weight` 1
   is owed (step 5's lane).
+- **Step 5 (2026-11-14, `agents/clients-a232-s5`): the rule and its bound, live.** Applied in the same change to:
+  §4.14 (its status), `crates/server/src/watchdog.rs` (`Lateness`, `LateLooks`, `mark`, the start as look zero, the
+  verdict lines), `crates/anchor/src/layout.rs` and `segment.rs` (`SUP_LOOKED`, `Supervision::look`, `looked_ns`),
+  `crates/cli/src/anchor.rs` (`supervise` split from `run`, `judge_lapse`, `on_lapse`, `Quiet`), `crates/cli/src/daemon.rs`
+  (`start` and `serve` split from `run`), `crates/cli/src/liveness_tests.rs` (new),
+  `crates/client/tests/lone_daemon.rs`, GAPS, and the bug record's step 5.
+  - **The bound, by its terms**, corrected from step 2's. A shard wedged at `t0` is first seen still at the next look
+    `a1`, at most a beat and that look's lateness later, since the look before it came before `t0` (the watchdog
+    thread's start counts as that look). It is found stuck at the first look a whole window after `a1`, and a beat divides
+    the window. So the verdict comes within `W + B + L`, with `L` the summed lateness of the looks from `a1` to the
+    verdict, and the verdict lines name it. Step 2's `W + 2·(B + L)` with `L` the largest lateness since the last beat
+    is not a bound: it misses `a1`'s lateness, asserted in the watchdog's unit test. An anchored daemon's last beat comes
+    within `W + B + late(a1)`, and the anchor kills at its logged age past that beat. So the supervised bound is
+    `t0 + 2·W + B + L + kill`, with `L` the watchdog's `late(a1)` plus the anchor's age past the window (its p99 and its
+    look's overshoot), each read from its own line, and `kill` the measured time to the client seeing the daemon gone.
+    With the anchor's p99 alone, as the plan worded it, the bound failed on this Mac 5 of 5 times, the watchdog's looks
+    late under kiln's launchd timer policy. On CI the two readings agree to within about a millisecond.
+  - **What the client sees.** A supervised daemon's outstanding call is resent to the daemon the anchor restarts and
+    answered there, not failed. A lone daemon's call ends `DaemonGone` past the reconnect budget. "DaemonGone time" in
+    the bounds is when the client's liveness first answers gone. For a lone daemon that is the verdict plus `end`, the
+    exit: 1.7 to 4.6 ms on CI, and the plan's `W + B + L` without it was exceeded by up to 1.08 ms in 15 of 40 runs.
+  - **Proven** on both Linux runners (`diag-a232-starved-2`, 10 runs each shape): starved at `cpu.weight` 1, 0 failed
+    calls of 231; stuck supervised, 20 of 20 inside; stuck unsupervised, 20 of 20 inside; frozen, 20 of 20 killed by
+    the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
+    their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
+    The tables are in the bug record.
 - **The fixtures' suites**, this Mac: `liveness` 10 of 10, `observe` 8 of 8, `cross_shard_wait` 7 of 7, `nfs_hostile` 20
   of 20, `recovery`'s three boot-fault tests, `recovery_slicing` 1 of 1, and two of the three fleet tests over the
   starved hold. The third, `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`, failed 3 of 3 here at load

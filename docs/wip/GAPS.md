@@ -602,7 +602,26 @@
 >   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good (A-232's amendment; exit
 >   within `W + 2·(B + L)` of a wedge, measured 1.30 to 1.34 s on this Mac). Owed: the client's one rule (step 3), the
 >   tests that claimed `Stalled` (step 4), the live proof on Linux CI at `cpu.weight` 1 (step 5), and §4.7's words
->   (step 6). `W` itself is still R3 debt. Found on the way (open, not this change's):
+>   (step 6). `W` itself is still R3 debt.
+>   Step 5 is built (2026-11-14, `agents/clients-a232-s5`): end-to-end proofs on both Linux runners
+>   (`diag-a232-starved-2` on `a7c479b3`). A daemon starved at `cpu.weight` 1 beside default-weight spinners had 0 calls
+>   fail over 10 runs per architecture (231 calls, each run waiting 4.9 to 14.6 s on its longest). A wedged anchored
+>   shard's kill line came within `t0 + 2·W + B + L`, 90 to 102 ms inside, 20 of 20. A wedged lone daemon's verdict came
+>   within `t0 + W + B + L`, 2.7 to 4.6 ms inside, 20 of 20. Mutations (a), (b) and (c) each turned their own shape red.
+>   The step found and fixed one more starved kill: the anchor killed a starved daemon whose watchdog thread was itself
+>   held off its CPU, 3 of 20 runs. The watchdog now marks every look (`SUP_LOOKED`), and the anchor kills on a lapse
+>   only when the watchdog was looking or the process is frozen or spinning by the start's rule
+>   (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`, step 5). Still open: the plan's
+>   unsupervised bound without the exit term exceeds zero by up to 1.08 ms in 15 of 40 runs (the exit, `end`, takes 1.7
+>   to 4.6 ms). The supervised bound in the plan's words (`L` the anchor's p99 alone) fails on a loaded Mac, where the
+>   watchdog's own looks run late. And the Windows form of the supervised tests is owed: the Windows anchor hands its
+>   daemon an explicit handle list, so the roles' shared standard input does not reach it.
+>   Found on the way (open, not this change's): adacachy2 pauses whole processes about 1.16 s at a time (a plain Python
+>   probe: 2 gaps of 1.164 and 1.165 s in 20 s, a thread blocked on a pipe read charged 8.6 to 11.7 us across each, the
+>   run cgroup's freezer bits 0 throughout), which wakes a wedged shard; no wedge timing can be judged there. And on this
+>   Mac under kiln's launchd timer policy the watchdog's 100 ms looks come back about 245 ms apart (a condvar timed
+>   wait, `recv_timeout`; `macos-timed-waits-stretched`), so its verdicts and beats run late there.
+>   Also found on the way (open, not this change's):
 >   `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this Mac at load 57 to
 >   63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s hold ends rather than
 >   inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`.
