@@ -1,0 +1,40 @@
+# Every platform checks out the same bytes.
+#
+# slates has doc-truth tests that compare a record's bytes against a table generated from the
+# registry it documents: crates/wire/src/observe.rs and crates/ipc/src/protocol.rs over
+# docs/wip/observability.md, crates/conformance/tests/matrix.rs over docs/wip/conformance.md, and
+# xtask over SLATES_DESIGN.md and README.md. Those comparisons only mean something if the file on
+# disk is the file that was committed.
+#
+# Without this declaration they are not. GitHub's Windows runner images ship git with
+# core.autocrlf=true, so a Windows checkout rewrites every LF to CRLF. The marker search
+# `find("<!-- chokepoints:begin -->\n")` then cannot match a line ending `-->\r\n`, and the
+# byte-for-byte table compare behind it could not match either. That is how the aarch64 Windows
+# lane went red on 2026-10-20 reporting "the record has the chokepoints:begin marker" about a
+# marker sitting on line 12 of the file
+# (docs/bugs/2026-10-20-a-windows-checkout-rewrote-the-bytes-a-doc-truth-test-compares.md).
+#
+# Declaring the tree's text as LF makes the checkout deterministic on every platform — the same
+# rule the determinism gates already hold the build to — and fixes the site that went red along
+# with the eight siblings that read a document, rather than teaching each reader to strip carriage
+# returns and leaving the tenth to rediscover it.
+*               text=auto eol=lf
+
+# vendor/ holds upstream's own files (mantle's patched aws-lc-rs and aws-lc-sys copies). `!text`
+# and `!eol` *unspecify* both attributes rather than setting them, which restores exactly the state
+# vendor was in before this file existed: no opinion from slates, upstream's own nested
+# .gitattributes the only one that speaks.
+#
+# This has to be unspecify and not `-text`. vendor/aws-lc-rs/third_party/NIST/.gitattributes says
+# `*.rsp eol=crlf` and says why: "Preserve the line endings on the NIST test vectors so that we can
+# use sha256sum and friends to verify that they haven't been tampered with." With `-text` here, a
+# `git add --renormalize .` still rewrote 263 lines in each of 24 of those vectors — every line, so
+# every checksum. Those are NIST's bytes and a tampering check reads them; slates does not have an
+# opinion about them to express.
+vendor/**       !text !eol
+
+# The binaries slates does own. text=auto detects these by content anyway; declaring them is so a
+# reader of this file knows which tracked files are not text, and so detection is never the thing
+# standing between a golden vector and its bytes.
+*.png           -text
+*.bin           -text
