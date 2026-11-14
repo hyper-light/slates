@@ -148,17 +148,17 @@ pub fn starved_share_ns(span_ns: u64) -> u64 {
 
 impl SegmentSource {
   /// Whether an anchor reads the beat of a daemon started over this source (A-232), which decides what the watchdog does
-  /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the `slates anchor` process across the spawn, which
-  /// kills a daemon whose beat lapses. `Handoff` is an anchor in this process: whoever holds the segment and hands it
-  /// over plays the anchor (a restart oracle, a boot test, an embedding) and reads the beat as the anchor does; ending a
-  /// stuck daemon is that holder's to decide, and a watchdog that ended the process would end the holder with it.
-  /// `Create` has no anchor: the daemon made its own segment, nobody reads its beat, so its watchdog ends it.
+  /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the anchor across the spawn, which kills a daemon
+  /// whose beat lapses. `Handoff` is an anchor in this process: it may read the beat, but it cannot end a stuck daemon
+  /// without ending itself, so nothing would, and its watchdog ends the process as a lone daemon's does. `Create` has no
+  /// anchor at all. A test that needs a supervised daemon to live on stuck plays the anchor across a spawn
+  /// (`crates/server/tests/common/supervised.rs`).
   pub fn supervision(&self) -> crate::watchdog::Supervision {
     match self {
-      SegmentSource::FromEnv | SegmentSource::Handoff { .. } => {
-        crate::watchdog::Supervision::Anchored
+      SegmentSource::FromEnv => crate::watchdog::Supervision::Anchored,
+      SegmentSource::Create { .. } | SegmentSource::Handoff { .. } => {
+        crate::watchdog::Supervision::Alone
       }
-      SegmentSource::Create { .. } => crate::watchdog::Supervision::Alone,
     }
   }
 }
@@ -3589,7 +3589,7 @@ async fn start_shard(
     .boot_fault
     .filter(|fault| fault.partition == partition)
   {
-    hold_start(fault);
+    hold_start(fault, config.copy_slice_ns()).await;
   }
   let outcome = init_shard(
     &config,
@@ -3634,7 +3634,12 @@ const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
-fn hold_start(fault: crate::config::BootFault) {
+///
+/// A long recovery runs in slices that each end a step ([`crate::recovery_slices`], A-228), so the busy hold runs in the
+/// same slices, under the same budget. Until A-232 it spun its whole span as one poll, which the watchdog's rule calls a
+/// spinning, stuck shard, and which an anchor kills: since A-232 a daemon with no anchor in another process ends itself on
+/// it, so a hold past a window modelled a stuck start, not the long recovery its tests are about.
+async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
   let duration = std::time::Duration::from_nanos(fault.for_ns);
   match fault.kind {
     // A stuck shard is a thread blocked without using CPU, which only a blocking wait models (D-9's exception for
@@ -3643,9 +3648,12 @@ fn hold_start(fault: crate::config::BootFault) {
     crate::config::BootFaultKind::Stuck => std::thread::sleep(duration),
     crate::config::BootFaultKind::Busy => {
       let started = std::time::Instant::now();
+      let mut slices = crate::recovery_slices::RecoverySlices::begin(slice_ns);
       while started.elapsed() < duration {
         std::hint::spin_loop();
+        slices.unit_done().await;
       }
+      let _report = slices.finish();
     }
   }
 }

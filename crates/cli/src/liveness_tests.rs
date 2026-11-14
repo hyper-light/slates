@@ -11,8 +11,8 @@
 //! - **Stuck, supervised.** The shard serving the parent's client is wedged at `t0` (one poll asleep for good), read
 //!   inside the poll from the host's monotonic clock, which every process on the host shares. The watchdog first sees
 //!   it still at its next look `a1`, within a beat and that look's lateness, and withholds the beat from its first look
-//!   a whole window after `a1`, so the last beat comes within `W + B + late(a1)` of `t0` (`slates_server::watchdog`'s
-//!   `Lateness`, which the wedged line names). The anchor kills once the beat is older than the window and its own
+//!   a whole window after `a1`, so the last beat comes within `W + B + late(a1)` of `t0` (the wedged line names it:
+//!   "the look that last saw it move came N us past a beat after the one before it"). The anchor kills once the beat is older than the window and its own
 //!   lateness p99, at the look its own lateness lets it make; its kill line logs that age. So the client's liveness
 //!   answers the daemon gone within `t0 + 2·W + B + L + kill`: `W` the liveness budget, `B` the beat, `L` the lateness
 //!   of the two judges — the watchdog's first look and the anchor's age past the window (its p99 and its kill look's
@@ -69,8 +69,8 @@ const RESTARTED_WORDS: &str = "slates anchor: daemon exited (";
 const PROCESS_STUCK_WORDS: &str = "; its process ";
 const SPARED_WORDS: &str = "so its process is judged in its own CPU time";
 const WITHHELD_WORDS: &str = "the watchdog withholds the beat";
-const LATE_WORDS: &str = "the looks since it last moved ran ";
-const FIRST_LATE_WORDS: &str = "the first of them ";
+const LATE_WORDS: &str = "the verdict came ";
+const FIRST_LATE_WORDS: &str = "the look that last saw it move came ";
 const AGE_WORDS: &str = "heartbeat lapsed (";
 const STARVED_WORDS: &str = "is starved";
 /// Format: the environment variables that run the starved case, and that name the cgroup a caller moves the anchor and

@@ -18,8 +18,6 @@
 
 mod common;
 
-use common::anchor::Anchored;
-
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -27,7 +25,7 @@ use slates_rt::shard::ShardId;
 use slates_rt::{RunState, SlotHolder};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig};
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the liveness window, the anchor's budget.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
@@ -40,16 +38,32 @@ const SAMPLE: Duration = Duration::from_nanos(HEARTBEAT_NS / 10);
 const BURST: Duration = Duration::from_millis(10);
 const OFF: Duration = Duration::from_millis(40);
 
-/// A two-shard daemon over an anchor the test holds: the test reads its beat as the anchor does, so the daemon is
-/// anchored (A-232), and a stuck shard withholds the beat rather than ending this process.
-fn daemon(name: &str) -> (Anchored, ShardId, ShardId) {
+fn daemon(name: &str) -> (Daemon, ShardId, ShardId) {
   let profile = common::machine_profile();
   let instance = format!("liveness-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2));
-  let daemon = Anchored::start(&format!("liveness-{name}"), &profile, config);
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &format!("liveness-{name}")),
+    },
+  )
+  .unwrap();
   let control = daemon.shards()[0];
   let other = daemon.shards()[1];
   (daemon, control, other)
+}
+
+/// The daemon of the supervised role `role` (A-232): this test binary re-invoked, its daemon attached from the
+/// environment its anchor, the parent test, gave it, so a stuck shard withholds the beat and the daemon lives on, as an
+/// anchored daemon does until its anchor kills it. `None` outside that child. A lone daemon (`Create`) would end its own
+/// process on the stuck verdict, so every test here that keeps a shard stuck runs its body in such a role.
+fn supervised(role: &str) -> Option<(Daemon, ShardId, ShardId)> {
+  let (daemon, _) = common::supervised::daemon(role)?;
+  let control = daemon.shards()[0];
+  let other = daemon.shards()[1];
+  Some((daemon, control, other))
 }
 
 /// The anchor's heartbeat word now.
@@ -183,8 +197,10 @@ fn block_in_a_read(held: Duration) {
 /// on the shard, and holds the beat to stopping — a gap of a whole window — no later than a window and three beats after
 /// the block began. The stop is timed from the block's own start, since under load the observation reaches the shard
 /// some time after it is sent, and the beat resumes once the block ends, so only the first window-long gap counts.
-fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
-  let (daemon, _, other) = daemon(name);
+fn a_blocked_shard_stops_the_beat(role: &str, name: &str, block: fn(Duration)) {
+  let Some((daemon, _, other)) = supervised(role) else {
+    return;
+  };
   let _serving = beating(&daemon);
   let held = WINDOW * 3;
   let base = Instant::now();
@@ -248,7 +264,18 @@ fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
 /// Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
 #[test]
 fn a_wedged_shard_stops_the_beat() {
-  a_blocked_shard_stops_the_beat("wedged", block_on_a_channel);
+  common::supervised::run("a_wedged_shard_stops_the_beat_role", "liveness-wedged", 2);
+}
+
+/// The role [`a_wedged_shard_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_wedged_shard_stops_the_beat as a supervised child"]
+fn a_wedged_shard_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat(
+    "a_wedged_shard_stops_the_beat_role",
+    "wedged",
+    block_on_a_channel,
+  );
 }
 
 /// A-228, §4.14, the stuck extreme of starved-is-not-stuck. Do: block one poll in a real syscall, a read of a pipe nobody
@@ -256,7 +283,22 @@ fn a_wedged_shard_stops_the_beat() {
 /// sees the thread runnable, so a shard stuck in the kernel is still found.
 #[test]
 fn a_shard_blocked_in_a_syscall_stops_the_beat() {
-  a_blocked_shard_stops_the_beat("syscall", block_in_a_read);
+  common::supervised::run(
+    "a_shard_blocked_in_a_syscall_stops_the_beat_role",
+    "liveness-syscall",
+    2,
+  );
+}
+
+/// The role [`a_shard_blocked_in_a_syscall_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_shard_blocked_in_a_syscall_stops_the_beat as a supervised child"]
+fn a_shard_blocked_in_a_syscall_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat(
+    "a_shard_blocked_in_a_syscall_stops_the_beat_role",
+    "syscall",
+    block_in_a_read,
+  );
 }
 
 /// Shape: spinners at nice 0 on the starved shard's CPU: 63, the most measured, which held a SCHED_IDLE thread off its
@@ -703,7 +745,20 @@ const LEAST_CPU_SHARE_WINDOWS: u32 = 60;
 /// saw a spinning shard.
 #[test]
 fn a_spinning_shard_stops_the_beat() {
-  let (daemon, _, other) = daemon("spinning");
+  common::supervised::run(
+    "a_spinning_shard_stops_the_beat_role",
+    "liveness-spinning",
+    2,
+  );
+}
+
+/// The role [`a_spinning_shard_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_spinning_shard_stops_the_beat as a supervised child"]
+fn a_spinning_shard_stops_the_beat_role() {
+  let Some((daemon, _, other)) = supervised("a_spinning_shard_stops_the_beat_role") else {
+    return;
+  };
   let _serving = beating(&daemon);
   let backstop = WINDOW * LEAST_CPU_SHARE_WINDOWS;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
@@ -922,7 +977,22 @@ fn a_shard_waiting_on_a_starved_thread_keeps_the_beat() {
 /// deadlock however the wait is marked.
 #[test]
 fn a_shard_waiting_on_a_blocked_thread_stops_the_beat() {
-  let (daemon, _, other) = daemon("waits-on-blocked");
+  common::supervised::run(
+    "a_shard_waiting_on_a_blocked_thread_stops_the_beat_role",
+    "liveness-waits-on-blocked",
+    2,
+  );
+}
+
+/// The role [`a_shard_waiting_on_a_blocked_thread_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_shard_waiting_on_a_blocked_thread_stops_the_beat as a supervised child"]
+fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
+  let Some((daemon, _, other)) =
+    supervised("a_shard_waiting_on_a_blocked_thread_stops_the_beat_role")
+  else {
+    return;
+  };
   let _serving = beating(&daemon);
   let holder: &'static std::sync::OnceLock<Option<slates_rt::registry::ThreadHandle>> =
     Box::leak(Box::default());

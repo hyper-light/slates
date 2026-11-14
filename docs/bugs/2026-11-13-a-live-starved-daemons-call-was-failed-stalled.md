@@ -79,13 +79,14 @@ mutations and the bound (t0 + 2·W + B + L + kill) are recorded here when they a
 
 ### Step 2: a lone daemon ends itself (`agents/clients-a232`, `6aaded0c`)
 
-**Step 2, built 2026-11-13.** A daemon with no anchor (`SegmentSource::Create`) ends its own process on its watchdog's
-stuck verdict (`crates/server/src/watchdog.rs`, `decide` and the end; A-232's amendment). In
-`crates/client/tests/lone_daemon.rs` a lone daemon whose client's shard was wedged exited 1.301 s and 1.340 s after the
-wedge, within `W + 2·(B + L)`, and the outstanding call ended `DaemonGone`. With the self-end removed, on a copy of the
-tree, the daemon was still running at the test's 10 s bound and the call still pending. On Linux (adacachy2) the wedged lone daemon exited 1.099 s
-after the wedge. A lone daemon starved at nice 19 beside two spinners a CPU was ended in 0 of 10 runs on this Mac, each
-run judged starved by the watchdog at least once.
+**Step 2, built 2026-11-13.** A daemon no other process can end (`SegmentSource::Create`, and `Handoff`, an anchor in
+its own process) ends its own process on its watchdog's stuck verdict (`crates/server/src/watchdog.rs`, `decide` and
+the end; A-232's amendment). In `crates/client/tests/lone_daemon.rs` a lone daemon whose client's shard was wedged
+exited 1.412 s after the wedge, within `W + B + L` (1.465 s, `L` the verdict's lateness its end line names, at load
+100). The outstanding call ended `DaemonGone`. With the self-end removed, on a copy of the tree, the daemon was still
+running at the test's 10 s bound and the call still pending. Starved, it was ended in 0 of 10 runs at nice 19 beside
+two spinners a CPU on this Mac and 0 of 10 at `cpu.weight` 1 beside default-weight spinner units on Linux
+(adacachy2), each run judged starved by the watchdog.
 
 ### Step 3: the client's one rule (`agents/clients-a232-s3`, on `3c17e017`)
 
@@ -154,17 +155,17 @@ Three end-to-end tests, one per shape, each against real processes:
   run at nice 19 beside two spinners a CPU. For 45 windows the test calls `list`, `status` and an async `list` in turn.
   No call may fail, the anchor may kill nothing, there may be no reconnect, and the run must have starved something.
 
-**The bound, by name.** `W` is the liveness budget and `B` the beat. A shard wedged at `t0` is first seen still at the
-watchdog's next look `a1`, at most a beat and that look's lateness later, because the look before `a1` came before
-`t0` (the watchdog thread's start counts as that look when there was no other). The shard is found stuck at the first
-look a whole window after `a1`. Since a beat divides the window, the verdict comes within `W + B + L` of `t0`, where `L`
-is the summed lateness of the looks from `a1` to the verdict. An anchored daemon's last beat is the look before the
-verdict, still within a window of `a1`, so it comes within `W + B + late(a1)`. The anchor kills once the beat is older
+**The bound, by name.** `W` is the liveness budget and `B` the beat. The verdict comes within `W + B + L` of a wedge at
+`t0`, `L` the verdict's own lateness (step 2's rule: measured from the look before the shard last moved, which came
+before `t0`; the watchdog's start counts as that look when there was no other). A shard wedged at `t0` is first seen
+still at the next look `a1`, a beat and that look's lateness after the look before it, and the beat is withheld from
+the first look a whole window after `a1`. So an anchored daemon's last beat comes within `W + B + late(a1)`. The anchor kills once the beat is older
 than `W` plus its own lateness p99, at a look its own lateness makes late too, and its kill line logs that age. So the
 supervised bound is `t0 + 2·W + B + L + kill`, with `L` the watchdog's first-look lateness plus the anchor's logged age
 past the window (its p99 and its overshoot). `kill` is the measured time from the kill line to the client's liveness
-answering gone. The watchdog now names both of its terms on its wedged and spinning lines and on its end line, as "the
-looks since it last moved ran N us late in all, the first of them M us".
+answering gone. The watchdog's withhold line names both of its terms: "the verdict came N us past a window and a beat
+after the watchdog's last look before the shard last moved; the look that last saw it move came M us past a beat after
+the one before it".
 
 **Where the plan's words were short, measured.**
 - *Supervised.* With `L` the anchor's p99 alone, as the plan worded it, the bound failed on this Mac in 5 of 5 runs, by
@@ -174,15 +175,15 @@ looks since it last moved ran N us late in all, the first of them M us".
   is microseconds, and the two readings of `L` agree to within it.
 - *Unsupervised.* Read as the client's call ending `DaemonGone`, the plan's `W + B + L` cannot hold: the call ends past
   the reconnect budget, `reconnect_ns = RECOVERY_BUDGET_NS + W`, after the exit. "DaemonGone time" is therefore the
-  instant the client's liveness first answers gone, which the test polls at each step of its loop, a hundredth of a
-  beat. The verdict-to-gone time `end` is measured and named as the supervised case's `kill` is. The test asserts the
-  verdict's line by `t0 + W + B + L` and reports gone against both `W + B + L + end` and `W + B + L`.
+  instant the client's liveness first answers gone. On Linux the test waits on the daemon's control socket and reads
+  it as it closes (`Client::daemon_watch`); elsewhere it polls at each step of its loop, a hundredth of a beat. The
+  verdict-to-gone time `end` is measured and named as the supervised case's `kill` is. The test asserts the verdict's
+  line by `t0 + W + B + L` and reports gone against both `W + B + L + end` and `W + B + L`.
 - *Supervised, the call.* An anchor restarts the daemon it kills, so the outstanding call is resent under its id to
   the successor and answered. It does not end `DaemonGone`. The test asserts it is answered after one reconnect.
-- *A shard's first look.* The watchdog counted its first look's lateness as none. A wedge 2.8 ms after a daemon began
-  serving was first seen 187 ms later while the line named 0 us (macOS). The thread's start now counts as the look
-  before its first. Red-checked on a copy: without it, the watchdog's bound unit test fails ("a late first look,
-  wedged at 0: 1.175 s past 1.1 s").
+- *A shard's first look.* A wedge 2.8 ms after a daemon began serving was first seen 187 ms later while the line named
+  0 us of lateness (macOS): the first look had no look before it. Step 2 found the same and begins each shard's watch
+  at the watchdog's own start (`ShardWatch::begun_at`), which this branch takes from it (`d8df0952`).
 - *`t0` read before a write.* The role had printed its held line from inside the poll, then blocked. On a loaded Mac
   the shard lost its CPU after the write and blocked 51 to 55 ms after the time it named, in 2 of 3 runs. `t0` is now
   the last read before the block, and another thread prints it.

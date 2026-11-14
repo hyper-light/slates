@@ -18,8 +18,6 @@ use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-
-use common::anchor::Anchored;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
   lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status,
@@ -80,18 +78,24 @@ fn provision_remote_volume(instance: &str) -> String {
   panic!("no volume landed on the non-control shard in 32 attempts");
 }
 
-fn two_shard_daemon(name: &str) -> (Anchored, String) {
+fn two_shard_daemon(name: &str) -> (Daemon, String) {
   two_shard_daemon_with(name, |_| {})
 }
 
 /// [`two_shard_daemon`], its configuration adjusted by `adjust` before it starts.
-/// Over an anchor the test holds, since a test wedges a shard past a window and asks the daemon on (A-232).
-fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Anchored, String) {
+fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(2));
   adjust(&mut config);
-  let daemon = Anchored::start(name, &profile, config);
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", name),
+    },
+  )
+  .unwrap();
   daemon.bootstrap(true).unwrap();
   (daemon, instance)
 }
@@ -1773,7 +1777,24 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
 /// this test's first MOUNT 3 of 3 times on `d61c3be2`, after 1.00 s (adacachy).
 #[test]
 fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
-  let (daemon, instance) = two_shard_daemon("starved-owner");
+  common::supervised::run(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+    "srv-starved-owner",
+    2,
+  );
+}
+
+/// The role [`a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused`] runs as a supervised daemon's process: its second half wedges the owner shard past a window
+/// while the control shard answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused as a supervised child"]
+fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role() {
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+  ) else {
+    return;
+  };
+  daemon.bootstrap(true).unwrap();
   let name = provision_remote_volume(&instance);
   let export = daemon.mount_capability(&name).unwrap().unwrap();
   let port = daemon.nfs_port().unwrap();

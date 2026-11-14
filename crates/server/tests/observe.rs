@@ -11,8 +11,6 @@
 
 mod common;
 
-use common::anchor::Anchored;
-
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -21,7 +19,7 @@ use slates_rt::RtError;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::observe::{OBSERVE_LATE_REPLY, ObserveError, ObserveStage};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig};
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Derived: how long a held control shard spins — two anchor liveness budgets ([`LIVENESS_BUDGET_NS`]),
 /// long past the short budget below, so a question submitted behind the hold is judged while the hold
@@ -83,13 +81,19 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
     .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A one-shard laptop daemon (no fleet) named for the history, over an anchor the test holds: several tests wedge its
-/// shard past a window and go on asking it, which only an anchored daemon lives through (A-232).
-fn laptop(name: &str) -> Anchored {
+/// A one-shard laptop daemon (no fleet) named for the history.
+fn laptop(name: &str) -> Daemon {
   let profile = common::machine_profile();
   let instance = format!("observe-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  Anchored::start(&format!("observe-{name}"), &profile, config)
+  Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &format!("observe-{name}")),
+    },
+  )
+  .expect("the laptop daemon starts")
 }
 
 /// A question with a fixed answer, so a delivered answer is told from a stranger's.
@@ -123,7 +127,23 @@ fn late_replies_reach(daemon: &Daemon, expected: u64) -> u64 {
 #[test]
 fn a_full_control_channel_is_retried_then_named_by_the_deadline() {
   let _serial = serialize();
-  let daemon = laptop("control-full");
+  common::supervised::run(
+    "a_full_control_channel_is_retried_then_named_by_the_deadline_role",
+    "observe-control-full",
+    1,
+  );
+}
+
+/// The role [`a_full_control_channel_is_retried_then_named_by_the_deadline`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_full_control_channel_is_retried_then_named_by_the_deadline as a supervised child"]
+fn a_full_control_channel_is_retried_then_named_by_the_deadline_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("a_full_control_channel_is_retried_then_named_by_the_deadline_role")
+  else {
+    return;
+  };
   // Wedged, the shard drains nothing: the flood fills its control channel to the bound.
   let hold = daemon
     .wedge_control_shard(HOLD_NS)
@@ -267,7 +287,23 @@ fn a_stopped_target_terminates_its_pending_question_and_its_reused_slot_never_an
 #[test]
 fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted() {
   let _serial = serialize();
-  let daemon = laptop("late-reply");
+  common::supervised::run(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+    "observe-late-reply",
+    1,
+  );
+}
+
+/// The role [`a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted as a supervised child"]
+fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+  ) else {
+    return;
+  };
   let hold = daemon
     .wedge_control_shard(HOLD_NS)
     .expect("the hold is admitted");
@@ -327,7 +363,23 @@ fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_coun
 #[test]
 fn an_unavailable_shard_is_told_apart_from_an_observed_zero() {
   let _serial = serialize();
-  let daemon = laptop("zero");
+  common::supervised::run(
+    "an_unavailable_shard_is_told_apart_from_an_observed_zero_role",
+    "observe-zero",
+    1,
+  );
+}
+
+/// The role [`an_unavailable_shard_is_told_apart_from_an_observed_zero`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by an_unavailable_shard_is_told_apart_from_an_observed_zero as a supervised child"]
+fn an_unavailable_shard_is_told_apart_from_an_observed_zero_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("an_unavailable_shard_is_told_apart_from_an_observed_zero_role")
+  else {
+    return;
+  };
   let repairs = |state: &mut ShardState| state.repairs;
   let observed = daemon.observe_control(OBSERVE_BUDGET_NS, repairs);
   assert_eq!(
@@ -416,7 +468,23 @@ fn a_starved_but_working_shard_is_answered_past_the_wall_budget() {
 #[test]
 fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
   let _serial = serialize();
-  let daemon = laptop("wedged");
+  common::supervised::run(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+    "observe-wedged",
+    1,
+  );
+}
+
+/// The role [`a_wedged_shard_ends_the_observation_long_before_its_wedge_does`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_wedged_shard_ends_the_observation_long_before_its_wedge_does as a supervised child"]
+fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+  ) else {
+    return;
+  };
   let switches_before = slates_machine::bench::involuntary_switches();
   let started = std::time::Instant::now();
   // The wedge reports the moment it took the shard. The claim is about what happens *from there* — how long

@@ -15,8 +15,6 @@
 
 mod common;
 
-use common::anchor::Anchored;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,7 +23,7 @@ use slates_ipc::protocol::{Refusal, ReplyBody, RequestBody};
 use slates_rt::shard::ShardId;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
-use slates_server::{Daemon, DaemonConfig};
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the liveness budget, each call's budget.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
@@ -47,16 +45,19 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// run that finds none in this many is a fault of the placement, not luck.
 const CLIENT_TRIES: usize = 16;
 
-/// A two-shard daemon over an anchor the test holds: the wedged cases hold a shard past a window while the daemon goes
-/// on answering, which only an anchored daemon lives through (A-232).
-fn daemon(name: &str) -> (Anchored, String) {
+fn daemon(name: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("xwait-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2));
-  (
-    Anchored::start(&format!("xwait-{name}"), &profile, config),
-    instance,
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &format!("xwait-{name}")),
+    },
   )
+  .unwrap();
+  (daemon, instance)
 }
 
 /// The shard that serves `client_id`, asked of each shard until one has taken the client: a client's connect returns
@@ -222,8 +223,24 @@ fn a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window
 /// the wedge ends: a shard that makes no progress for a window is not waited for.
 #[test]
 fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+    "xwait-boot-wedged",
+    2,
+  );
+}
+
+/// The role [`a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window as a supervised child"]
+fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("boot-wedged");
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+  ) else {
+    return;
+  };
   let (control, other) = (daemon.shards()[0], daemon.shards()[1]);
   let (mut client, _others) = client_on(&daemon, &instance, other);
   let member = daemon.member_identity().unwrap().0;
@@ -328,8 +345,24 @@ fn a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window() {
 /// throughout (wedged). Expect: refused `NotFound` after a window and before the wedge ends.
 #[test]
 fn a_revoke_with_a_wedged_shard_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_revoke_with_a_wedged_shard_is_refused_after_a_window_role",
+    "xwait-revoke-wedged",
+    2,
+  );
+}
+
+/// The role [`a_revoke_with_a_wedged_shard_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_revoke_with_a_wedged_shard_is_refused_after_a_window as a supervised child"]
+fn a_revoke_with_a_wedged_shard_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("revoke-wedged");
+  let Some((daemon, instance)) =
+    common::supervised::daemon("a_revoke_with_a_wedged_shard_is_refused_after_a_window_role")
+  else {
+    return;
+  };
   let mut client = connect(&instance);
   let (consumer, _, secret) = enrolled(&daemon, &mut client, ACCOUNT);
   let wedged = other_than(&daemon, serving(&daemon, client.client_id()));
