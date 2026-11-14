@@ -1,0 +1,35 @@
+A-232 step 5 (diag-a232-starved mb-3: mutation (b) on 427d755d, the unsupervised self-end removed, the unsupervised shape) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit 9d9d916aa0bc27d36ae2e933ab3be63798f27234, parent 427d755da948b8b7f0e713390304cc372d29f7ac
+cli tests: /home/runner/work/slates/slates/target/debug/deps/slates-ed8e08ae2e56f640; lone_daemon: /home/runner/work/slates/slates/target/debug/deps/lone_daemon-e46358ea75a17ee9
+shapes: unsupervised
+== unsupervised run 1 exit 101, load 2.42
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8374) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 2 exit 101, load 1.95
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8400) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 3 exit 101, load 1.65
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8423) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 4 exit 101, load 1.40
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8447) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.35s
+== unsupervised run 5 exit 101, load 1.18
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8470) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 6 exit 101, load 1.00
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8496) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 7 exit 101, load 0.85
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8519) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 8 exit 101, load 0.80
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8548) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 9 exit 101, load 0.75
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8572) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== unsupervised run 10 exit 101, load 0.63
+thread 'a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone' (8594) panicked at crates/client/tests/lone_daemon.rs:518:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.34s
+== stuck, unsupervised: passed 0, failed 10, of 10
