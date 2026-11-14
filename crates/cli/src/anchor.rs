@@ -178,8 +178,37 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
 
-/// Runs the anchor until a stop is requested or the daemon loops.
+/// Runs the anchor until a stop is requested or the daemon loops: [`supervise`] over the `slates daemon` arguments
+/// `options` name.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  let mut args = vec![
+    "--instance".to_owned(),
+    options.instance.clone(),
+    "daemon".to_owned(),
+  ];
+  if options.quick {
+    args.push("--quick".to_owned());
+  }
+  if let Some(shards) = options.shards {
+    args.push("--shards".to_owned());
+    args.push(shards.to_string());
+  }
+  // A fleet node's daemon joins the fleet; the anchor only passes the selection through (the daemon
+  // reads the manifest, so a restart re-reads an operator's edit).
+  if let Some(fleet) = &options.fleet {
+    args.push("--fleet".to_owned());
+    args.push(fleet.manifest.clone());
+    args.push("--node".to_owned());
+    args.push(fleet.node.clone());
+  }
+  supervise(options, &args)
+}
+
+/// The anchor itself: measure, create the segment, publish the profile, and supervise this very executable started
+/// with `daemon_args` until a stop is requested. [`run`] passes the `slates daemon` arguments; a test of this crate
+/// passes its own binary's role arguments (`crate::liveness_tests`), so the anchor that judges the daemon there is this
+/// one, not a copy.
+pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Result<(), Failure> {
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;
@@ -213,33 +242,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   segment
     .publish(RegionKind::Profile, json.as_bytes())
     .map_err(|e| failed("publish", e))?;
-  let mut args = vec![
-    "--instance".to_owned(),
-    options.instance.clone(),
-    "daemon".to_owned(),
-  ];
-  if options.quick {
-    args.push("--quick".to_owned());
-  }
-  if let Some(shards) = options.shards {
-    args.push("--shards".to_owned());
-    args.push(shards.to_string());
-  }
-  // A fleet node's daemon joins the fleet; the anchor only passes the selection through (the daemon
-  // reads the manifest, so a restart re-reads an operator's edit).
-  if let Some(fleet) = &options.fleet {
-    args.push("--fleet".to_owned());
-    args.push(fleet.manifest.clone());
-    args.push("--node".to_owned());
-    args.push(fleet.node.clone());
-  }
   // Until a start is measured, the budget holds one start: a daemon that fails once
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);
   // The daemon is this very executable, restarted from the image the anchor runs (A-145), never from what its path holds
   // after an upgrade in place.
   let mut supervisor =
-    Supervisor::new(segment, &args, policy.get()).map_err(|e| failed("supervise", e))?;
+    Supervisor::new(segment, daemon_args, policy.get()).map_err(|e| failed("supervise", e))?;
   // Hold the NFS loopback listener in the anchor so its port survives a daemon restart (§4.6): bind
   // it once and hand it to every daemon the supervisor spawns; the daemon adopts it.
   #[cfg(unix)]

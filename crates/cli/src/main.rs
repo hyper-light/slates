@@ -33,6 +33,11 @@ mod dumps;
 mod exec;
 mod fleet;
 mod format;
+// A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
+// daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
+// is owed there.
+#[cfg(test)]
+mod liveness_tests;
 mod mount;
 // The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
 // `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
