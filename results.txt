@@ -1,0 +1,68 @@
+A-232 step 5 (diag-a232-starved md-1: mutation (d) on a7c479b3, the anchor ignores the watchdog's looks (every lapse kills), the starv) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit e1a193f9d6f0a12bb25c967c0c341a148a17b0a2, parent a7c479b30065b9395740e58d33006cf54089c038
+cli tests: /home/runner/work/slates/slates/target/debug/deps/slates-ed8e08ae2e56f640; lone_daemon: /home/runner/work/slates/slates/target/debug/deps/lone_daemon-e46358ea75a17ee9
+shapes: starved
+weights: starved 1; 32 spinner cgroups at 100 holding 32 spinners
+moved 8547 8568 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 1 exit 0, starved CPU 50 ms, load 23.08
+A232-SUMMARY calls 6 answered 6 failed 0 longest 9.862818523s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.72s
+moved 8749 8773 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 2 exit 0, starved CPU 56 ms, load 30.95
+A232-SUMMARY calls 14 answered 14 failed 0 longest 4.977003328s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 5 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.39s
+moved 8918 8939 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 3 exit 0, starved CPU 59 ms, load 33.82
+A232-SUMMARY calls 15 answered 15 failed 0 longest 4.961006112s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.88s
+moved 9086 9108 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 4 exit 0, starved CPU 52 ms, load 35.24
+A232-SUMMARY calls 13 answered 13 failed 0 longest 5.919946535s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 6 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.44s
+moved 9249 9270 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 5 exit 0, starved CPU 55 ms, load 35.73
+A232-SUMMARY calls 14 answered 14 failed 0 longest 7.464401108s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 2 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 52.53s
+moved 9414 9438 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 6 exit 0, starved CPU 53 ms, load 36.31
+A232-SUMMARY calls 8 answered 8 failed 0 longest 8.238004843s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 16 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.21s
+moved 9574 9595 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 7 exit 0, starved CPU 54 ms, load 35.99
+A232-SUMMARY calls 14 answered 14 failed 0 longest 7.296748605s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 5 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 51.56s
+moved 9743 9765 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 8 exit 0, starved CPU 60 ms, load 36.00
+A232-SUMMARY calls 14 answered 14 failed 0 longest 9.402461303s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 4 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 53.39s
+moved 9914 9937 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 9 exit 0, starved CPU 59 ms, load 36.43
+A232-SUMMARY calls 14 answered 14 failed 0 longest 4.974726031s (reply deadline 1s) reconnects 0
+A232-STARVED-LINES starved 3 spared 0 lapsed [] process-stuck [] restarted []
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out; finished in 54.80s
+moved 10084 10105 after 5 s: 0::/a232-starved 0::/a232-starved 
+== starved run 10 exit 101, starved CPU 61 ms, load 35.76
+A232-FAILED call 3 after 5.096333954s at 13.486502398s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 4 after 3.003492636s at 16.490034723s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 5 after 3.001967664s at 19.492043317s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 6 after 3.106560582s at 22.598643932s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 7 after 3.001360605s at 25.600044786s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 8 after 3.001955936s at 28.602041715s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 9 after 3.098042732s at 31.70012484s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 10 after 3.004874416s at 34.705043081s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 11 after 3.001959384s at 37.707044242s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 12 after 3.094380526s at 40.801467641s: daemon gone for 2000000000 ns; daemon gone true
+A232-FAILED call 13 after 3.001533051s at 43.803041469s: daemon gone for 2000000000 ns; daemon gone true
+A232-SUMMARY calls 14 answered 3 failed 11 longest 7.666076106s (reply deadline 1s) reconnects 1
+A232-STARVED-LINES starved 3 spared 0 lapsed ["slates anchor: the daemon's heartbeat lapsed (2345 ms old, past 1418 ms: the 1000 ms window plus this anchor's lateness p99 of 418 ms over 9 waits); killing it"] process-stuck [] restarted ["slates anchor: daemon exited (None); restarted as pid 10158 (0 in the window)"]
+thread 'liveness_tests::an_anchored_daemon_starved_beside_spinners_fails_no_call_and_is_never_killed' (10083) panicked at crates/cli/src/liveness_tests.rs:797:3:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 57 filtered out; finished in 58.28s
+== starved, supervised: passed 9, failed 1, of 10
