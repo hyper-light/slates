@@ -602,10 +602,10 @@
 >   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good. Only `FromEnv` is
 >   supervised; `Create` and `Handoff` end themselves (A-232's amendment). The exit comes within `W + B + L` of a
 >   wedge, `L` the verdict's lateness the end line names: measured 1.412 s against 1.465 s on this Mac at load 100.
->   Starved, it was ended in 0 of 10 runs at nice 19 here and 0 of 10 at `cpu.weight` 1 on adacachy2. Owed: the
->   client's one rule (step 3), the tests that claimed `Stalled` (step 4), the live proof on CI (step 5), §4.7's words
->   (step 6), and the first Windows run of the lone daemon and the supervised roles (jupiter was offline). `W` itself
->   is still R3 debt. Open (found by step 2's tests, measured not to be the change's): on adacachy2 under kiln, the
+>   Starved, it was ended in 0 of 10 runs at nice 19 here and 0 of 10 at `cpu.weight` 1 on adacachy2. Steps 3 to 6
+>   followed (2026-11-14): the client's one rule (step 3), the tests that claimed `Stalled` (step 4), the live proof on
+>   CI (step 5, below), and §4.7's status with A-232's amendment and both SDKs' docs (step 6). Still owed: the first
+>   Windows run of the lone daemon and the supervised roles (jupiter was offline). `W` itself is still R3 debt. Open (found by step 2's tests, measured not to be the change's): on adacachy2 under kiln, the
 >   supervised roles (a `FromEnv` daemon in a child of the test, `crates/server/tests/common/supervised.rs`) of
 >   `liveness.rs` and `nfs_hostile.rs` fail intermittently beside their binary's other tests, and pass alone or with
 >   the tests run one at a time. In a failing run the held shard's own thread kept waking (voluntary switches 12 to
@@ -1124,8 +1124,10 @@
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
->   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; classes B (the
->   transport's round-trip estimate) and C+D (A-232, the window itself) are open. Found on
+>   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
+>   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
+>   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
+>   itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 

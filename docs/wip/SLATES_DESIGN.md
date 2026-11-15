@@ -4546,6 +4546,25 @@ drops.
 > the Rust driver test, the Node suite (4/4 runs) and the Python suite (4/4 runs) on macOS. Record:
 > `docs/bugs/2026-10-01-an-async-call-could-hold-the-loop-or-never-end.md`.
 
+> **Status (2026-11-14, A-232): a call waits while its daemon lives.** A-56's typed ends lose `Stalled`. Its rule had an
+> overdue call fail `Stalled` while the daemon lived, and a stopped daemon's call stay a stall. That failed calls to
+> daemons their own watchdog judged alive. At `cpu.weight` 1 beside default-weight spinners on main `29ef4521`, 10 of
+> 10 runs were red on both Linux runners, 44 calls failed 2.152 to 8.929 s after sending, and no beat was withheld. Now
+> every wait a call makes keeps one rule: the driver's tick, the synchronous round trip, and the wait for a slot on a
+> full ring. Each reply deadline that passes asks the daemon's liveness. Gone, the client recovers or reconnects and
+> fails `DaemonGone` past the reconnect budget, as before. Alive, the deadline re-arms and the call waits; a stopped
+> daemon's call waits until it resumes or is cancelled.
+>
+> The rule is safe because a daemon that will never answer is ended. An anchored (`FromEnv`) daemon is killed by its
+> anchor at its lapse, within `t0 + 2·W + B + L + kill` of a wedge at `t0`, and the client's resend is answered by the
+> daemon the anchor restarts. A daemon no other process can end (`Create`, `Handoff`) ends itself on its watchdog's
+> stuck verdict, within `t0 + W + B + L` plus its exit, and its calls end `DaemonGone` (§4.14). `W` is the liveness
+> budget, `B` the beat and `L` the lateness each line names. `ClientError::Stalled`, `defers_reply` and the driver's
+> patient submissions are gone with the old rule. Measured on both Linux runners, 10 runs a shape: starved, 0 failed
+> calls of 231; stuck, 40 of 40 inside their bounds. A-232's amendment and
+> `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md` hold the tests, the mutations and what stays
+> open.
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
@@ -20260,16 +20279,59 @@ Applied in the same change to:
   promise.
 - Bug record `docs/bugs/2026-11-08-a-page-that-left-a-copy-out-read-as-holding-nothing.md`; GAPS's A-251 entry.
 
-### A-232 — A call waits while its daemon lives; a daemon judged stuck is ended by its supervisor, or by its own watchdog when it has none (accepted 2026-11-13, the supervisor's goal 5875dc0c, uniform (a); step 2 of 6 built: the watchdog's self-end)
+### A-232 — A call waits while its daemon lives; a daemon judged stuck is ended by its supervisor, or by its own watchdog when it has none (accepted 2026-11-13, the supervisor's goal 5875dc0c, uniform (a); built 2026-11-14, steps 1 to 6 of plan `01a1d6ca960575d0a36250c5f0a22500`)
 
 Applied in the same change to (step 2): §4.14 (its status on `daemon.alive`), `crates/server/src/watchdog.rs`
 (`Supervision`, `Turn`, `Cause`, `decide`, the end, `FAILED_EXIT_CODE`), `crates/server/src/daemon.rs`
 (`SegmentSource::supervision`, `Daemon::start`, `starve_control_shard` and `starved_share_ns`), `crates/cli/src/main.rs`
 (`EXIT_FAILED` taken from the server), `crates/client/tests/lone_daemon.rs` (new),
 `crates/server/tests/common/supervised.rs` (new), the server tests named below,
-GAPS, and `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`. Steps 3 to 6 of plan
-`01a1d6ca960575d0a36250c5f0a22500` (the client's one rule, the tests that claimed `Stalled`, the live proof, and this
-amendment's rewrite of A-56's words in §4.7) are owed.
+GAPS, and `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`. Applied in the same change to
+(steps 3, 4 and 6): §4.7 (its status), `crates/client/src/driver.rs`, `client.rs` and `error.rs` (the one rule;
+`ClientError::Stalled`, `defers_reply`, `Client::defers` and `submit_patient` removed), `crates/client/tests/driver.rs`
+and `waits.rs` (new), both SDKs' acceptance tests, READMEs and Node's `index.d.ts`, `sdk-node`'s `async.mjs`,
+`crates/cli/tests/cli.rs` (`bootstrap_once`), `crates/server/tests/recovery.rs` (`read_answered`),
+`crates/client/examples/load_bench.rs`, and `crates/ipc/src/exit_watch.rs`'s module doc.
+
+- **The rule, replacing A-56's.** A-56 said "an overdue call fails `Stalled` while the daemon lives and starts recovery
+  when it is gone", and that a stopped daemon's call "stays a stall". Both are replaced by one rule. A call waits while
+  its daemon lives. A daemon judged stuck is ended by its supervisor, or by its own watchdog when no other process can
+  end it, on the same verdict, window and starved-is-not-stuck rule (A-228). The client then sees the daemon gone: an
+  anchored daemon's calls are resent to the daemon the anchor restarts and answered there; a lone daemon's calls end
+  `DaemonGone` past the reconnect budget. A stopped daemon has not exited, so its calls wait until it resumes or they
+  are cancelled. Every wait a call makes keeps the rule: the async driver's tick, the synchronous round trip, and the
+  wait for a slot on a full ring. Each reply deadline that passes asks the daemon's liveness; gone, the client recovers
+  or reconnects; alive, the deadline re-arms and the call waits (a full ring's slot is checked at paces doubling from
+  the wake estimate, at most a tenth of the deadline, so the wait costs no core beside a starved daemon).
+  `ClientError::Stalled` had no other producer and is gone, as are `defers_reply`, `Client::defers` and the driver's
+  patient submissions, the rule's earlier exception for long work, which is now every call's rule.
+- **The bound, by its terms** (`W` the liveness budget, `B` the beat, `L` the lateness each line names, `t0` a wedge).
+  Supervised: `t0 + 2·W + B + L + kill`, `L` the watchdog's first-look lateness plus the anchor's age past the window,
+  `kill` the time to the client seeing the daemon gone. Unsupervised: the verdict within `t0 + W + B + L` and the exit
+  `end` after it. Step 2 and step 5 below derive each term.
+- **Why.** A call to a daemon its own watchdog judged alive failed. Red on main `29ef4521` (`diag-a232-red-4` at
+  `e553e306`, a diagnostics probe at `cpu.weight` 1 beside 32 default-weight spinner cgroups): 10 of 10 runs on each of
+  ubuntu-latest and ubuntu-24.04-arm, 25 and 19 calls failed `Stalled` 2.152 to 8.929 s after sending, no beat
+  withheld, every shard judged starved. On this Mac at nice 19 beside two spinners a CPU, 1 of 3 runs.
+- **Evidence, by step** (each in the bug record with its commands, revisions and logs). Step 3, the client's rule: the
+  driver's and the waits' tests red on `3c17e017` (every call `Stalled` at its first deadline), green after; each of
+  the three waits' mutations red. Step 4, the tests that claimed `Stalled`: both SDKs' stopped-group calls pending past
+  3 reply deadlines and answered after the group resumes, red against `3c17e017`; Python 4 of 4 and Node 4 of 4 on each
+  Linux runner (`diag-a232-s4-1`). Step 5, live (`diag-a232-starved-2` on `a7c479b3`, 10 runs a shape a runner):
+  starved, 0 failed calls of 231; stuck supervised, 20 of 20 within the bound; stuck unsupervised, 20 of 20 verdicts
+  within; frozen, 20 of 20 killed. Mutations (`diag-a232-starved-ma`, `-mb`, `-mc-2`): the client's `Stalled` branch
+  restored, 10 of 10 red on each runner; the lone self-end removed, 10 of 10 red on each; starved treated as stuck, 7
+  and 9 of 10 red.
+- **What it does not change.** The watchdog's verdicts and window (A-228), the anchor's lapse rule, the restart
+  policy, the wire, the reconnect budget's derivation, and R1 to R10. `W` is still the fixed liveness budget, recorded
+  as R3 debt in GAPS. A call cancelled by its caller is still released at once.
+- **Open** (GAPS): the first Windows run of the lone daemon and the supervised roles (jupiter was offline); the
+  unsupervised bound without its exit term exceeds zero by up to 1.08 ms in 15 of 40 runs; adacachy2's whole-process
+  pauses of about 1.16 s, which wake a wedged shard, so no wedge timing can be judged there; and `agents/clients-a232`'s
+  `611840a2` (step 2's agent timing the lone daemon's end in two parts), which conflicts with step 5's rework of the
+  same test and is not merged here.
+
+The steps' own records follow.
 
 - **Why (this step).** The client's half of A-232 makes a call wait while its daemon lives, and fail `DaemonGone` once
   it is gone. That is safe only if a daemon that will never answer is ended. An anchored daemon is: its watchdog

@@ -72,10 +72,10 @@ words: "an overdue call fails `Stalled` while the daemon lives", and "a stopped 
 
 ## Fix
 
-Owed, in A-232's plan (plan `01a1d6ca960575d0a36250c5f0a22500` in kiln, steps 2 to 6). A call waits while its daemon
-lives. A daemon judged stuck is ended by its supervisor: the anchor, or for a daemon run alone or in-process its own
-watchdog, on the same verdict, window and starved-is-not-stuck rule. The client then sees `DaemonGone`. The green, the
-mutations and the bound (t0 + 2·W + B + L + kill) are recorded here when they are measured.
+Built 2026-11-13 and -14, in A-232's plan (plan `01a1d6ca960575d0a36250c5f0a22500` in kiln, steps 2 to 6). A call
+waits while its daemon lives. A daemon judged stuck is ended by its supervisor: the anchor, or for a daemon no other
+process can end (`Create`, `Handoff`) its own watchdog, on the same verdict, window and starved-is-not-stuck rule. The
+client then sees the daemon gone. Each step's green, mutations and bound follow; A-232's amendment states the rule.
 
 ### Step 2: a lone daemon ends itself (`agents/clients-a232`, `6aaded0c`)
 
@@ -131,6 +131,30 @@ test (`RingFull` after 112 ms). Logs: `~/.cache/slates-agents-scratch/a232/evide
 
 Owed by later steps: the SDK suites' two stopped-group cases each still assert `Stalled`, and with this rule they
 wait instead (step 4); the design text, GAPS and both SDKs' docs still state the old rule (step 6).
+
+### Step 4: every test that claimed `Stalled` now claims the wait (`agents/clients-a232-s4`, `c5d3f282`, `7d6fc2eb`)
+
+No test was deleted. Each changed test's doc comment states its new claim.
+
+- Both SDKs' stopped-group case (Node `sdk_async.test.mjs`, Python `test_sdk_async.py`, case (2)): the anchor's whole
+  group is stopped, and a `list()` call is still pending after 3 reply deadlines. The cancel case runs beside it with
+  its claim unchanged. The group is resumed in a `finally`, and the held call must end with a listing within the
+  suite's startup bound. Red against the pre-fix client `3c17e017`: both failed "still waiting", the call `Stalled`
+  after 1 s (`~/.cache/slates-agents-scratch/a232/s4-runs/{node,py}-red.log`).
+- `cli.rs`: `bootstrap_through_stalls` and `STALLED_WORDS` became `bootstrap_once`, which must succeed.
+- `load_bench`'s patient reads no longer name a stall as a retried answer, and doc comments in `client.rs`,
+  `rendezvous.rs` and `test_sdk.py` that cite `Stalled` say it is history and what the test proves now.
+- A sibling found and fixed: Node's `async.mjs` let a call to a resumed daemon be answered within the spin after its
+  completion reader was lost. It now refuses with the lost reader's error before it begins, as Python's `begin` does.
+  The old test had passed only because the anchor's restart after a long stop pushed the call past the spin.
+- The sync Python suite's start wall now scales with `SLATES_TEST_RESTART_SLOWDOWN`, as its async twin's does.
+
+Runs. Linux CI, `diag-a232-s4-1` (on `c5d3f282`), x86_64 and arm64: Python 4 of 4 and Node 4 of 4 on each. This Mac, three
+sets of 4: Python 3/4, 4/4, 4/4 and Node 4/4, 3/4, 4/4. Each failure was outside the step's claims: the sync Python
+suite's 20 s start wall (connects measured to 20.79 s beside a build; the file now reads the slowdown knob), and Node's
+loop-lateness bound at its edge (134 ms against 127 ms; the held phases were at most 22 ms over 10 probes). `cli.rs`
+and `recovery.rs` at nice 19 beside 36 spinners, 10 runs: 99 of 100 tests passed, every bootstrap and read answered;
+the 1 failure was the successor-spawn wait in the frozen-daemon test at load 196.
 
 ### Step 5: the rule and its bound, live (`agents/clients-a232-s5`, on step 4 with step 2's `6aaded0c` merged)
 
@@ -254,3 +278,19 @@ bound names `kill`, every run is inside, by the verdict line's own margin.
 Mutation (d)'s rate, 2 of 20, matches round 1's before the fix, 3 of 20. The stronger evidence for the fix is the green
 round 2 itself: in 5 of its 20 starved runs (x86_64 runs 3, 4, 5; arm64 runs 2, 5) the anchor met a lapsed beat with a
 silent watchdog and spared the daemon, and under the rule before this step each of those lapses was a kill.
+
+### Step 6: the record (`agents/clients-a232-s5`)
+
+A-232's amendment states the one rule in place of A-56's words, with the bound by its terms, the evidence by step and
+what it does not change. §4.7 has its status, the exit watch's module doc no longer says "a stall stays a stall", and
+both SDKs' READMEs and Node's `index.d.ts` no longer promise `Stalled` at the reply deadline. GAPS marks A-232's client
+part of classes C+D done. A grep of `crates/` and `docs/` for `Stalled`, "stays a stall" and "no reply within" finds
+only history (dated status, bug records, benchmark entries, tests' notes of what failed before A-232) and the new rule's
+own words.
+
+**Still open** (GAPS): the first Windows run of the lone daemon and the supervised roles; the unsupervised bound without
+its exit term, exceeded by up to 1.08 ms in 15 of 40 runs; adacachy2's whole-process pauses of about 1.16 s, which wake
+a wedged shard; `W` itself, a fixed budget (R3 debt). And `agents/clients-a232` at `611840a2`, step 2's agent's later
+rework of the lone daemon's timing (the verdict timed against the hold, the exit against the end's own cap), is not
+merged into step 5's tree: it conflicts with step 5's rework of the same test in 12 places, and which measurement stands
+is the coordinator's decision.
