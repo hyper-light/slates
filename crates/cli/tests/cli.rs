@@ -542,23 +542,20 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
   None
 }
 
-/// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
-/// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
-/// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
-/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
-/// that bound.
+/// §4.14 `daemon.alive`, A-232: a daemon frozen whole is killed by its process judgment once its heartbeat lapses, and
+/// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
+/// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
+/// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
+/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
+/// start wait.
 ///
-/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
-/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
-/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
-/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
-/// failed the old bound of the window less a beat (900 ms).
-///
-/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
-/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
-/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
-/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
+/// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
+/// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
+/// and killing a frozen one a window after the lapse (`crates/cli/src/anchor.rs` `on_lapse`). Until A-232 it killed at
+/// the lapse itself, as a withheld beat: measured 2026-11-06 on macOS arm64 at load 54, 1,045 ms against a 1,044 ms
+/// bound (the liveness window plus the anchor's lateness p99 of 44 ms over 15 waits). Still waiting for those words, this
+/// test timed out on the landing of A-232 (CI's ubuntu-latest, 2026-11-17), whose kill line read "has not looked for
+/// 2004 ms, its heartbeat 2004 ms old; its process made no progress for 1004 ms (the 1000 ms liveness window)".
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -574,7 +571,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   anchor.drain = Some(std::thread::spawn(move || {
     for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
       eprintln!("{line}");
-      if line.contains(LAPSE_KILL_LINE) {
+      if line.contains(PROCESS_KILL_LINE) || line.contains(LAPSE_KILL_LINE) {
         let _ = kills.send(line);
       }
     }
@@ -602,9 +599,14 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .recv_timeout(START_WAIT)
     .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let (age, bound, window) = lapse_of(&line);
+  assert!(
+    line.contains(PROCESS_KILL_LINE) && !line.contains(LAPSE_KILL_LINE),
+    "the anchor killed the frozen daemon by its process judgment, not as a withheld beat: {line}"
+  );
+  let (age, still, window) = frozen_kill_of(&line);
   println!(
-    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old, its process still for {still:?} \
+     against its {window:?} window"
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
@@ -614,36 +616,45 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     "the anchor's window is the liveness budget"
   );
   assert!(
-    age >= bound && age >= window,
-    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
+    age >= window && still >= window,
+    "not killed before its heartbeat lapsed and its process made no progress for a window: the beat was {age:?} old, \
+     the process still for {still:?} ({line})"
   );
-  // Killed at the lapse: within one more window of it. How soon the successor then answers is the machine's, and
+  // Killed by the judgment: within one more window of it. How soon the successor then answers is the machine's, and
   // `await_daemon` judges it by the successor's progress.
   assert!(
-    age <= bound + window,
-    "killed within a window of the lapse: the beat was {age:?} old against a {bound:?} bound ({line})"
+    still <= window + window,
+    "killed within a window of the judgment: the process was still for {still:?} against a {window:?} window ({line})"
   );
 }
 
-/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+/// Format: the words of the anchor's kill line for a beat its watchdog withheld while looking (`crates/cli/src/anchor.rs`
+/// `on_lapse`): never a frozen daemon's, whose watchdog is frozen with it.
 const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
-/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
-/// W ms window …".
-fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
-  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+/// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
+/// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
+/// process made no progress for F ms (the W ms liveness window); killing it".
+const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
+
+/// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
+/// four numbers are the watchdog's silence, the beat's age, the process's stillness and the window, in that order.
+fn frozen_kill_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line
+    .split_once("the daemon's watchdog has not looked for ")
+    .expect("a process kill line");
   let numbers: Vec<u64> = rest
     .split(|c: char| !c.is_ascii_digit())
     .filter(|word| !word.is_empty())
-    .take(3)
+    .take(4)
     .map(|word| word.parse().unwrap())
     .collect();
-  let [age, bound, window] = numbers[..] else {
-    panic!("the kill line names the age, the bound and the window: {line}");
+  let [_silent, age, still, window] = numbers[..] else {
+    panic!("the kill line names the silence, the beat's age, the stillness and the window: {line}");
   };
   (
     Duration::from_millis(age),
-    Duration::from_millis(bound),
+    Duration::from_millis(still),
     Duration::from_millis(window),
   )
 }

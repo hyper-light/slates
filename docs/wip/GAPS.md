@@ -647,7 +647,13 @@
 >   `check_typed_refusal` reads half of it as a part's half-window wait for room. `forward_retry.rs` holds half a window
 >   asleep, A-232's own form, since its hold only has to outlast the flood and the forward's first try (microseconds).
 >   `ack_release.rs`'s `hold_until_answered` waits in 10 ms turns, whose wakes show CPU progress, so it was never a
->   wedge.
+>   wedge. The landing's Linux run of every binary (`diag-a232-land-1`, ubuntu-latest, against main's
+>   `diag-a232-land-main-1`) found two more that main passes: `shards.rs`'s `hold_starved` held its shard on the CPU a
+>   fixed fifth of the time for 7.5 s, 1,013 ms of CPU in one poll, which the watchdog calls spinning (exit 4); it runs
+>   `starve_this_thread` now, whose whole CPU over any span is half a window. And `cli.rs`'s
+>   `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` waited for the withheld beat's kill line, which
+>   this change no longer writes for a frozen daemon (its process judgment kills it a window after the lapse); it now
+>   holds the anchor to that line and its numbers.
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'

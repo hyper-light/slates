@@ -20409,7 +20409,10 @@ The steps' own records follow.
   spends slowly, so it waited out the 20 s hold (placed at 20.016 s, PR #10's Windows lane, 2026-11-17); the poll now
   leaves the held candidate out. `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`, which slept a lone
   daemon's shard for two windows and so ended its test binary (exit 4), now starves it, and three siblings that slept
-  one for exactly a window starve it or hold half a window, as each one's assertions need (GAPS).
+  one for exactly a window starve it or hold half a window, as each one's assertions need. Two more, found by the
+  landing's Linux run of every binary: `shards.rs`'s starved hold, a fixed fifth of the CPU for 7.5 s and so a
+  spinning shard, now starves by the derived share; and the CLI's frozen-daemon test now waits for the process
+  judgment's kill line, which is how this change's anchor kills a frozen daemon (GAPS).
 - **Linux (adacachy2, x86_64, 32 CPUs, kernel 7.3.3, 2026-11-13 and -14, through kiln).** Clippy `-D warnings` on
   the three crates; the 16 watchdog unit tests. The wedged lone daemon exited 1.100 s after the wedge, inside
   `W + B + L` = 1.102 s, and the spinning one on 1,003 to 1,098 ms of CPU, both calls `DaemonGone`. `recovery` passed

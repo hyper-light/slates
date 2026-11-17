@@ -52,3 +52,22 @@ first). A test that can end its own binary now and then is a failure, so each no
   stays a window.
 
 `ack_release.rs`'s `hold_until_answered` was never a wedge: it waits in 10 ms turns, and each wake shows CPU progress.
+
+## Two more, from the landing's Linux run of every binary
+
+`diag-a232-land-1` ran every test binary with `--no-fail-fast` on both Linux runners, past main's known red that stops
+CI's own Test step first (`owner_turn.rs:295`), beside the same run of main (`diag-a232-land-main-1`). On ubuntu-latest
+two failures were the landing's alone:
+
+- `crates/server/tests/shards.rs`, `a_guest_waits_past_one_window_for_a_starved_daemon_and_counts_it`: its
+  `hold_starved` held the shard on the CPU a fixed fifth of the time (10 ms on, 40 ms off) for 7.5 s, so the one poll
+  ran 1,013 ms of CPU, which the watchdog calls a spinning shard: "shard 2 is spinning, 1013 ms of CPU without a step
+  against the 1000 ms window", exit 4, the binary with it. `hold_starved` runs `starve_this_thread` now: its share is
+  derived from the span, so the whole hold's CPU is half a window, and the watchdog still sees the shard work every
+  beat, which is what the test's guest waits on. The other fixed-fifth holds run 1.5 s, 300 ms of CPU, and stay.
+- `crates/cli/tests/cli.rs`, `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted`: it waited for the
+  anchor's withheld-beat kill line ("the daemon's heartbeat lapsed ("). A-232's anchor kills a frozen daemon by its
+  process judgment instead, a window after the lapse ("has not looked for 2004 ms, its heartbeat 2004 ms old; its
+  process made no progress for 1004 ms (the 1000 ms liveness window); killing it"), so the test timed out. It now
+  waits for that line and holds the anchor to it: a process judgment, not a withheld beat; the beat at least a window
+  old; the process still for at least the window and at most one more; the window the liveness budget.
