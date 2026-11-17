@@ -146,6 +146,32 @@ pub fn starved_share_ns(span_ns: u64) -> u64 {
     .min(HEARTBEAT_NS)
 }
 
+/// Test support: runs the calling thread for `span_ns` as a starved thread runs, a little CPU at a time (A-232): each
+/// beat it spins for its share ([`starved_share_ns`]) and sleeps the rest, so the shard it runs on steps nothing else
+/// for the span while the watchdog sees it move every look, alive and never stuck. Returns the span it measured,
+/// nanoseconds. [`Daemon::starve_control_shard`] runs it on the control shard; a test that keeps another shard silent
+/// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
+/// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+pub fn starve_this_thread(span_ns: u64) -> u64 {
+  let share_ns = starved_share_ns(span_ns);
+  let begin = slates_rt::futures::now_ns();
+  let end = begin.saturating_add(span_ns);
+  let mut beat_began = begin;
+  while slates_rt::futures::now_ns() < end {
+    let share_ends = beat_began.saturating_add(share_ns).min(end);
+    while slates_rt::futures::now_ns() < share_ends {
+      std::hint::spin_loop();
+    }
+    let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
+    let rest = beat_ends.saturating_sub(slates_rt::futures::now_ns());
+    // The point of the fixture: off the CPU for the rest of the beat, as a starved thread is.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(rest));
+    beat_began = beat_ends;
+  }
+  slates_rt::futures::now_ns().saturating_sub(begin)
+}
+
 impl SegmentSource {
   /// Whether an anchor reads the beat of a daemon started over this source (A-232), which decides what the watchdog does
   /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the anchor across the spawn, which kills a daemon
@@ -2261,29 +2287,13 @@ impl Daemon {
     // question in the same step it took the hold, which a loaded runner would otherwise do (§4.3). The
     // admission-vs-execution staging the observe oracle asserts rides on this ordering being certain.
     let (spinning, confirm) = std::sync::mpsc::channel::<()>();
-    let share_ns = starved_share_ns(span_ns);
     let held = self
       .pending(
         self.shards.first().copied(),
         OBSERVE_BUDGET_NS.saturating_add(span_ns),
         move || {
           let _ = spinning.send(());
-          let begin = slates_rt::futures::now_ns();
-          let end = begin.saturating_add(span_ns);
-          let mut beat_began = begin;
-          while slates_rt::futures::now_ns() < end {
-            let share_ends = beat_began.saturating_add(share_ns).min(end);
-            while slates_rt::futures::now_ns() < share_ends {
-              std::hint::spin_loop();
-            }
-            let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
-            let rest = beat_ends.saturating_sub(slates_rt::futures::now_ns());
-            // The point of the fixture: off the CPU for the rest of the beat, as a starved thread is.
-            #[allow(clippy::disallowed_methods)]
-            std::thread::sleep(std::time::Duration::from_nanos(rest));
-            beat_began = beat_ends;
-          }
-          Ok(slates_rt::futures::now_ns().saturating_sub(begin))
+          Ok(starve_this_thread(span_ns))
         },
       )?
       .admit()?;

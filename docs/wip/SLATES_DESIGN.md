@@ -20404,8 +20404,11 @@ The steps' own records follow.
   does") runs in the recovery's own slices (`RecoverySlices`). As one poll it was a spinning shard, judged so at 1,093
   ms of CPU, which an anchor would kill too. A fleet test, `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`,
   failed 3 of 3 here at load 57 to 63 with the new starved hold (placed 3.037 to 3.049 s against its 3 s hold), and 3
-  of 3 on a copy with the old spinning hold (3.031 to 3.111 s). So it is the base's failure at that load, not this
-  change's (GAPS).
+  of 3 on a copy with the old spinning hold (3.031 to 3.111 s). So it is the base's failure at that load. On CI it was
+  this change's: the poll's trace of the held candidate is bounded in that shard's own CPU time, which the starved hold
+  spends slowly, so it waited out the 20 s hold (placed at 20.016 s, PR #10's Windows lane, 2026-11-17); the poll now
+  leaves the held candidate out. `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`, which slept a lone
+  daemon's shard for two windows and so ended its test binary (exit 4), now starves it (GAPS).
 - **Linux (adacachy2, x86_64, 32 CPUs, kernel 7.3.3, 2026-11-13 and -14, through kiln).** Clippy `-D warnings` on
   the three crates; the 16 watchdog unit tests. The wedged lone daemon exited 1.100 s after the wedge, inside
   `W + B + L` = 1.102 s, and the spinning one on 1,003 to 1,098 ms of CPU, both calls `DaemonGone`. `recovery` passed

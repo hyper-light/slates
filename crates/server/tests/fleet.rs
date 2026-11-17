@@ -302,8 +302,10 @@ fn describe(daemons: &[&Daemon]) -> String {
         .collect();
       // The control shard's refusal counts (a bind that failed, a peer refused …), so a daemon whose fleet
       // never started says why; an observation it could not make is shown as that refusal. Within one liveness
-      // budget, never the full observation budget: a trace must not wait out a shard a test holds (the hedge
-      // test's held candidate), or it changes the timing it describes.
+      // budget, never the full observation budget: a trace must not wait out a shard a test holds, or it changes the
+      // timing it describes. The budget is the shard's own CPU time (A-65), which a starved hold spends a little at a
+      // time (A-232), so a wait that must not stand behind a held daemon leaves it out of the daemons it traces (the
+      // hedge test's held candidate).
       let refusals = match daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS) {
         Ok(counts) => format!("{counts:?}"),
         Err(refusal) => format!("unobserved({refusal:?})"),
@@ -5349,7 +5351,10 @@ fn volume_owned_by(client: &mut Client, partition: usize, tag: &str, fleet: &[Da
 
 /// Shape: how long [`a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`] holds the owner's shard: two
 /// liveness budgets, so every forward sent inside it stays alive on b's control shard (given up at its stall budget,
-/// sent again) as a killed owner's would.
+/// sent again) as a killed owner's would. The hold is starved, not asleep
+/// (`slates_server::daemon::starve_this_thread`): a's daemon has no anchor, so a shard asleep past a window is a wedge
+/// that ends its process (A-232), and with it this test binary, as the macOS and Windows CI lanes saw (exit 4,
+/// 2026-11-17).
 const ADMITTED_FORWARDS_HOLD: Duration = Duration::from_nanos(2 * LIVENESS_BUDGET_NS);
 /// Shape: how long one read of a client waits for its remaining replies before the next client is read: a liveness
 /// budget, so a client whose last forwards are still draining does not hold the others' reads back.
@@ -5481,8 +5486,9 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
         slates_server::daemon::OBSERVE_BUDGET_NS,
         |_: &mut slates_server::state::ShardState| {
           ADMITTED_OWNER_HELD.store(true, std::sync::atomic::Ordering::Release);
-          #[allow(clippy::disallowed_methods)]
-          std::thread::sleep(ADMITTED_FORWARDS_HOLD);
+          let _ = slates_server::daemon::starve_this_thread(
+            u64::try_from(ADMITTED_FORWARDS_HOLD.as_nanos()).unwrap(),
+          );
         },
       )
       .unwrap();
@@ -10322,7 +10328,16 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
     }
     panic!("the second snapshot was not taken");
   };
-  let placed = poll_snapshot_placed(&all, &mut client, id, second);
+  // The poll watches the daemons the hold leaves running. An observation of the held candidate is budgeted in its
+  // shard's own CPU time (A-65), which a starved hold spends a little at a time (A-232), so the poll's trace of it
+  // waited out the whole hold: placed after 20.016 s against a 20 s hold on CI's Windows lane (2026-11-17).
+  let unheld: Vec<&Daemon> = all
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != first_index)
+    .map(|(_, daemon)| *daemon)
+    .collect();
+  let placed = poll_snapshot_placed(&unheld, &mut client, id, second);
   let placed_after = started.elapsed();
   let manifest = daemons[0].fleet_head_manifest(object);
   let outcome = HedgeOutcome {

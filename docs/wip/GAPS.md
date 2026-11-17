@@ -630,10 +630,17 @@
 >   run cgroup's freezer bits 0 throughout), which wakes a wedged shard; no wedge timing can be judged there. And on this
 >   Mac under kiln's launchd timer policy the watchdog's 100 ms looks come back about 245 ms apart (a condvar timed
 >   wait, `recv_timeout`; `macos-timed-waits-stretched`), so its verdicts and beats run late there.
->   Found on the way (open, not this change's):
->   `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this Mac at load 57 to
->   63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s hold ends rather than
->   inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`.
+>   Found on the way: `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this
+>   Mac at load 57 to 63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s
+>   hold ends rather than inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`. On CI
+>   it was this change's (the landing's PR #10, 2026-11-17): its Windows lane saw the seal placed only at 20.016 s, past
+>   its 20 s hold, where main's last five nightlies passed. The poll's trace reads each daemon it watches within one liveness budget of
+>   that shard's own CPU time (A-65, `755e6924`); the spinning hold spent that budget in a second of wall time, and the
+>   starved hold spends it a little at a time, so the trace of the held candidate waited out the hold. The poll now
+>   leaves the held candidate out. And `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` slept its owner's
+>   shard for two windows in a daemon no anchor supervises, which this change ends: the test binary exited 4 on the
+>   macOS and Windows lanes the same day. Its hold is starved now (`daemon::starve_this_thread`), silent to b as before
+>   (`docs/bugs/2026-11-17-two-fleet-tests-held-a-lone-daemon-as-a-232-ends-one.md`).
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
