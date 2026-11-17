@@ -1,0 +1,20 @@
+A-232 landing tests (diag-a232-land 1: the A-232 landing 8a74e1a3 on both Linux runners, every test binary with CI's Test environment (--no-f) on x86_64, 4 CPUs; kernel 7.0.0-1019-azure
+commit 725cfdb2e1bc5edc86bcc0a48eb104943b38b34b, parent 8a74e1a3bdcc7534ab42380efff17f378cac0477
+== workspace: exit 101 in 2711 s (workspace.log)
+   FAILED a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio  [tests/owner_turn.rs (target/debug/deps/owner_turn-b02a474f61c3c9ee)]
+   target `-p slates-bridge-fuse --test owner_turn`
+   target `-p slates-server --test fleet`
+   target `-p slates-server --test shards`
+      1    panicked at crates/bridge-fuse/tests/owner_turn.rs:295:3:
+kernel.apparmor_restrict_unprivileged_userns = 0
+== namespaces (client netns): exit 0 in 45 s (netns.log)
+== namespaces (ipc rendezvous): exit 0 in 7 s (rendezvous.log)
+user_allow_other in /etc/fuse.conf: 1
+== CLI flow: exit 101 in 168 s (cli.log)
+      1    panicked at crates/cli/tests/cli.rs:603:6:
+   skip: test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+   skip: SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: test a_verified_container_source_is_checked_again_before_it_is_bound ... SKIP: set SLATES_TEST_CLI=1 on a host with mount_nfs to run the source check
+   skip: SKIP the granted legs: this platform publishes no issuer surface through the environment, so a separate process cannot issue a grant (on Linux the anchor's segment is a descriptor its children hold). The ungranted half — the landing presents and the target is untouched — ran.
+   skip: SKIP: the setuid probe needs root to make a root-owned binary
