@@ -159,8 +159,9 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
   let observation = daemon
     .observation(Some(shard), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
       // A host call that never returns (the watchdog's own example of a wedge): a read of a pipe whose write end is
-      // kept open and never written.
-      let (never, _kept) = rustix::pipe::pipe().unwrap();
+      // kept open and never written. The standard library's pipe, as `crates/server/tests/liveness.rs` reads one: rustix
+      // has no pipe on Windows, whose lint lane builds every target of this crate.
+      let (mut never, _kept) = std::io::pipe().unwrap();
       let mut byte = [0_u8; 1];
       HELD_AT_NS.store(
         slates_machine::clock::monotonic_ns(),
@@ -168,7 +169,7 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
       );
       match hold {
         Hold::Wedged => {
-          let _ = rustix::io::read(&never, &mut byte);
+          let _ = std::io::Read::read_exact(&mut never, &mut byte);
         }
         Hold::Spinning => loop {
           std::hint::spin_loop();
