@@ -1,0 +1,20 @@
+A-232 landing tests (diag-a232-land-main 1: main 29ef4521, the baseline for diag-a232-land-1, on both Linux runners: every test binary with C) on x86_64, 4 CPUs; kernel 7.0.0-1019-azure
+commit 1be35226e3d1b11cd0452c61eb24417403982c39, parent 29ef4521d9711fd380b7fde45f63e83bac3166c7
+== workspace: exit 101 in 2619 s (workspace.log)
+   FAILED a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile  [tests/anchor.rs (target/debug/deps/anchor-de7069372e2784fc)]
+   FAILED a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio  [tests/owner_turn.rs (target/debug/deps/owner_turn-b02a474f61c3c9ee)]
+   target `-p slates-anchor --test anchor`
+   target `-p slates-bridge-fuse --test owner_turn`
+      1    panicked at crates/anchor/tests/anchor.rs:1417:3:
+      1    panicked at crates/bridge-fuse/tests/owner_turn.rs:295:3:
+kernel.apparmor_restrict_unprivileged_userns = 0
+== namespaces (client netns): exit 0 in 48 s (netns.log)
+== namespaces (ipc rendezvous): exit 0 in 7 s (rendezvous.log)
+user_allow_other in /etc/fuse.conf: 1
+== CLI flow: exit 0 in 164 s (cli.log)
+   skip: test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+   skip: SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: test a_verified_container_source_is_checked_again_before_it_is_bound ... SKIP: set SLATES_TEST_CLI=1 on a host with mount_nfs to run the source check
+   skip: SKIP the granted legs: this platform publishes no issuer surface through the environment, so a separate process cannot issue a grant (on Linux the anchor's segment is a descriptor its children hold). The ungranted half — the landing presents and the target is untouched — ran.
+   skip: SKIP: the setuid probe needs root to make a root-owned binary

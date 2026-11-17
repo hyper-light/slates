@@ -1,0 +1,60 @@
+name: diag-a232-land
+
+# Diagnostics only, never on main: the A-232 landing's workspace tests (--no-fail-fast), the namespace pair and the CLI
+# flow on both Linux runners, past main's known red that stops CI's own Test step before the crates A-232 changes.
+on:
+  push:
+    branches: ["diag-a232-land-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  land:
+    name: A-232 landing tests on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # The workspace runs the chart's byte-for-byte golden, rendered by ci.yml's pinned Helm (its gates job).
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      # ci.yml's linux-arm64 job installs fuse3 where the image lacks it; the CLI flow mounts through it.
+      - name: FUSE
+        run: command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+      - name: The workspace, the namespace pair and the CLI flow
+        if: always()
+        run: bash .github/diag-a232-land.sh "$(git log -1 --format=%s | cut -c1-120)"
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/${GITHUB_REF_NAME#diag-}-${{ matrix.os }}"
+          git config user.name "diag-a232"
+          git config user.email "diag-a232@users.noreply.github.com"
+          gzip -9 ../*.log 2>/dev/null
+          mkdir -p ../publish && cp ../results.txt ../*.log.gz ../publish/ 2>/dev/null
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          rm -rf ./* && cp ../publish/* . 2>/dev/null || echo "no results" > results.txt
+          git add -A
+          git commit -qm "diag ${GITHUB_REF_NAME} results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
