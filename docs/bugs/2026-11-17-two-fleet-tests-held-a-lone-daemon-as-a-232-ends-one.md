@@ -33,11 +33,22 @@ thread runs, a little CPU each beat, so the watchdog sees it move. Two fleet tes
 - The hedge test's poll watches the daemons the hold leaves running, not the held candidate; `describe`'s note says why
   a held daemon is left out.
 
-## Siblings (reported, not changed)
+## Siblings, changed in the same push
 
-Tests that hold a shard asleep for exactly one window in a daemon no anchor supervises:
+Three more tests held a shard asleep for exactly one window in a daemon no anchor supervises:
 `crates/client/tests/acknowledge.rs` (`HOLD`, two holds), `crates/server/tests/ack_release.rs` (`HOLD`, `hold`) and
 `crates/server/tests/forward_retry.rs` (`HOLD`). The stuck verdict comes at the first look a window after the shard last
-moved, which can fall before a one-window sleep returns, so each such hold can end its binary now and then. On the same
-macOS run `acknowledge` passed 2 of 2 and `ack_release` 6 of 6; `forward_retry` did not run (the fleet binary ended
-first). A-232's own held-daemon tests hold half a window (`HOLD_PARTS_OF_WINDOW`) for this reason.
+moved, which can fall before a one-window sleep returns, so each such hold could end its binary now and then. On the
+same macOS run `acknowledge` passed 2 of 2 and `ack_release` 6 of 6; `forward_retry` did not run (the fleet binary ended
+first). A test that can end its own binary now and then is a failure, so each now takes the form its assertions need:
+
+- `acknowledge.rs`, both holds: the starved loop for the whole window. The acknowledgement goes out once a count of
+  calls is due (half the command ring's slots, which the machine's measured rate sizes), and must go out within half
+  the hold, so the hold keeps its whole window.
+- `ack_release.rs`, `hold`: the starved loop for the whole window. `check_typed_refusal` reads half of `HOLD` as a
+  part's half-window wait for room, so `HOLD` stays a window.
+- `forward_retry.rs`: half a window, asleep, A-232's own form (`HOLD_PARTS_OF_WINDOW` in the client's held-daemon
+  tests). Its hold only has to outlast the flood and the forward's first try, microseconds; the answer's own bound
+  stays a window.
+
+`ack_release.rs`'s `hold_until_answered` was never a wedge: it waits in 10 ms turns, and each wake shows CPU progress.

@@ -640,7 +640,14 @@
 >   leaves the held candidate out. And `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun` slept its owner's
 >   shard for two windows in a daemon no anchor supervises, which this change ends: the test binary exited 4 on the
 >   macOS and Windows lanes the same day. Its hold is starved now (`daemon::starve_this_thread`), silent to b as before
->   (`docs/bugs/2026-11-17-two-fleet-tests-held-a-lone-daemon-as-a-232-ends-one.md`).
+>   (`docs/bugs/2026-11-17-two-fleet-tests-held-a-lone-daemon-as-a-232-ends-one.md`). Three siblings slept a lone
+>   daemon's shard for exactly one window, which the verdict can meet before the sleep returns; each now takes the form
+>   its assertions need. `acknowledge.rs`'s two holds and `ack_release.rs`'s `hold` run the starved loop for the whole
+>   window: the acknowledgement, sent once a count of calls is due, must go out within half of it, and
+>   `check_typed_refusal` reads half of it as a part's half-window wait for room. `forward_retry.rs` holds half a window
+>   asleep, A-232's own form, since its hold only has to outlast the flood and the forward's first try (microseconds).
+>   `ack_release.rs`'s `hold_until_answered` waits in 10 ms turns, whose wakes show CPU progress, so it was never a
+>   wedge.
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'

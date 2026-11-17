@@ -20,14 +20,17 @@ use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, Size
 use slates_ipc::HeldRendezvous;
 use slates_ipc::protocol::{ReplyBody, RequestBody};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
-use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS, starve_this_thread};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: each probe's wall budget for the test's machine profile (milliseconds), as `client.rs` measures it.
 const PROBE_MS: u64 = 5;
 /// Shape: how long the other shard is held: one liveness budget, so a call that waits for it waits out a second, and a
-/// call that does not returns in microseconds.
+/// call that does not returns in microseconds. The hold is starved, not asleep ([`starve_this_thread`]): this daemon has
+/// no anchor, and a shard asleep for a whole window can be judged wedged before the sleep returns, which ends the
+/// daemon's process and this test binary with it (A-232). The whole window stays, since the acknowledgement, sent once
+/// a count of calls is due, must go out within half of it.
 const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 /// Raised by the held shard when its hold begins, so the test's calls start inside it.
 static HELD: AtomicBool = AtomicBool::new(false);
@@ -158,8 +161,7 @@ fn a_call_is_never_held_behind_the_periodic_acknowledgement() {
     .observation(Some(other), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
       HELD.store(true, Ordering::Release);
       // The held shard's thread does nothing else for the hold: the scatter's part on it waits.
-      #[allow(clippy::disallowed_methods)]
-      std::thread::sleep(HOLD);
+      let _ = starve_this_thread(u64::try_from(HOLD.as_nanos()).unwrap());
     })
     .unwrap();
   let holder = std::thread::spawn(move || hold.wait());
@@ -354,8 +356,7 @@ fn acknowledge_past_a_held_create(
       move |_: &mut ShardState| {
         HELD_AWAITED.store(true, Ordering::Release);
         // The held shard's thread does nothing else for the hold: the create it owns waits.
-        #[allow(clippy::disallowed_methods)]
-        std::thread::sleep(HOLD);
+        let _ = starve_this_thread(u64::try_from(HOLD.as_nanos()).unwrap());
       },
     )
     .unwrap();
