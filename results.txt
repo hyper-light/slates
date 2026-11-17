@@ -1,0 +1,15 @@
+A-232 landing tests (diag-a232-land 1: the A-232 landing 8a74e1a3 on both Linux runners, every test binary with CI's Test environment (--no-f) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit 725cfdb2e1bc5edc86bcc0a48eb104943b38b34b, parent 8a74e1a3bdcc7534ab42380efff17f378cac0477
+== workspace: exit 101 in 2525 s (workspace.log)
+   target `-p slates-server --test fleet`
+   target `-p slates-server --test shards`
+kernel.apparmor_restrict_unprivileged_userns = 0
+== namespaces (client netns): exit 0 in 46 s (netns.log)
+== namespaces (ipc rendezvous): exit 0 in 7 s (rendezvous.log)
+user_allow_other in /etc/fuse.conf: 1
+== CLI flow: exit 124 in 3600 s (cli.log)
+      1    panicked at crates/cli/tests/cli.rs:603:6:
+   TIMED OUT after 60 min; the last binary started:      Running tests/cli.rs (target/debug/deps/cli-01f27adb513d26ff)
+   skip: test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+   skip: SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
