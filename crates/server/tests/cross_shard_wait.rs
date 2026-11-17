@@ -223,8 +223,24 @@ fn a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window
 /// the wedge ends: a shard that makes no progress for a window is not waited for.
 #[test]
 fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+    "xwait-boot-wedged",
+    2,
+  );
+}
+
+/// The role [`a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window as a supervised child"]
+fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("boot-wedged");
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+  ) else {
+    return;
+  };
   let (control, other) = (daemon.shards()[0], daemon.shards()[1]);
   let (mut client, _others) = client_on(&daemon, &instance, other);
   let member = daemon.member_identity().unwrap().0;
@@ -329,8 +345,24 @@ fn a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window() {
 /// throughout (wedged). Expect: refused `NotFound` after a window and before the wedge ends.
 #[test]
 fn a_revoke_with_a_wedged_shard_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_revoke_with_a_wedged_shard_is_refused_after_a_window_role",
+    "xwait-revoke-wedged",
+    2,
+  );
+}
+
+/// The role [`a_revoke_with_a_wedged_shard_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_revoke_with_a_wedged_shard_is_refused_after_a_window as a supervised child"]
+fn a_revoke_with_a_wedged_shard_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("revoke-wedged");
+  let Some((daemon, instance)) =
+    common::supervised::daemon("a_revoke_with_a_wedged_shard_is_refused_after_a_window_role")
+  else {
+    return;
+  };
   let mut client = connect(&instance);
   let (consumer, _, secret) = enrolled(&daemon, &mut client, ACCOUNT);
   let wedged = other_than(&daemon, serving(&daemon, client.client_id()));

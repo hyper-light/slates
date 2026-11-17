@@ -33,6 +33,11 @@ mod dumps;
 mod exec;
 mod fleet;
 mod format;
+// A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
+// daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
+// is owed there.
+#[cfg(test)]
+mod liveness_tests;
 mod mount;
 // The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
 // `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
@@ -51,8 +56,9 @@ const EXIT_REFUSED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// Format: the exit code when no daemon answers at the instance.
 const EXIT_UNAVAILABLE: u8 = 3;
-/// Format: the exit code when the anchor or the daemon itself failed.
-const EXIT_FAILED: u8 = 4;
+/// Format: the exit code when the anchor or the daemon itself failed; a daemon its own watchdog ends exits with it too
+/// (A-232), so it is the server's one constant.
+const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();

@@ -2548,24 +2548,16 @@ const FILL_FILES: u64 = 34;
 /// Shape: one file of that test.
 const FILL_FILE: usize = 1 << 20;
 
-/// Reads `name` at the head, asking again while the client answers `Stalled` (the daemon alive but not yet answering:
-/// the typed refusal a caller retries; a read is idempotent) for up to the recovery budget a restart is bounded by.
-/// CI's TSan lane met it 3 runs of 3 on 2026-10-06: a read after the restart past the 1 s reply deadline, the runner's
-/// four vCPUs shared by the suite's parallel tests under the sanitizer's slowdown; alone, or in the whole suite on a
-/// 4-CPU container here, it never stalled (6 runs).
+/// Reads `name` at the head, once: the client waits for the reply while the daemon lives (A-232). Until 2026-11-13 the
+/// client failed a live daemon's late reply `Stalled`, and this asked again for up to the recovery budget: CI's TSan
+/// lane met it 3 runs of 3 on 2026-10-06, a read after the restart past the 1 s reply deadline, the runner's four vCPUs
+/// shared by the suite's parallel tests under the sanitizer's slowdown.
 fn read_answered(
   client: &mut Client,
   volume: VolumeId,
   name: &str,
 ) -> Result<Vec<u8>, slates_client::ClientError> {
-  let began = Instant::now();
-  loop {
-    match client.read(volume, name, slates_ipc::protocol::ReadAt::Head) {
-      Err(slates_client::ClientError::Stalled { .. })
-        if began.elapsed() < Duration::from_nanos(slates_db::replay::RECOVERY_BUDGET_NS) => {}
-      answered => return answered,
-    }
-  }
+  client.read(volume, name, slates_ipc::protocol::ReadAt::Head)
 }
 
 /// §4.2 capacity (2026-10-05): a shard's reserve is RAM ÷ shards ÷ classes, rarely a power of two, and the buddy
@@ -2970,25 +2962,40 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
 /// restarts a daemon whose heartbeat lapses, restarts it) instead of beating on while it can never serve.
 #[test]
 fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon() {
-  let profile = common::machine_profile();
-  let instance = format!("srv-stuck-start-{}", std::process::id());
-  let config =
-    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
-      partition: 1,
-      kind: BootFaultKind::Stuck,
-      for_ns: HELD_START_NS,
-    });
-  let anchor = held_anchor("stuck-start", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  common::supervised::run(
+    "a_shard_stuck_in_its_start_stops_the_heartbeat_role",
+    "stuck-start",
+    TEST_SHARDS,
+  );
+}
+
+/// The role [`a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon`] runs as a supervised
+/// daemon's process (A-232): the test plays the anchor across the spawn, as the claim is the anchor's. Over a segment it
+/// made, or one an anchor in its own process handed over, the daemon would end itself on the refused boot instead.
+#[test]
+#[ignore = "a role: run by a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon"]
+fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
+  let Some((daemon, _)) = common::supervised::daemon_with(
+    "a_shard_stuck_in_its_start_stops_the_heartbeat_role",
+    |config| {
+      config.with_boot_fault(BootFault {
+        partition: 1,
+        kind: BootFaultKind::Stuck,
+        for_ns: HELD_START_NS,
+      })
+    },
+  ) else {
+    return;
+  };
   let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
   let started = Instant::now();
   let mut stopped = false;
   while started.elapsed() < START_WAIT {
-    let before = anchor.segment.supervision().unwrap().heartbeat_ns();
-    // The test plays the anchor, which watches the heartbeat from its own thread across time.
+    let before = daemon.segment().supervision().unwrap().heartbeat_ns();
+    // The role reads the beat the anchor reads, from its own mapping of the same segment.
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(quiet);
-    let after = anchor.segment.supervision().unwrap().heartbeat_ns();
+    let after = daemon.segment().supervision().unwrap().heartbeat_ns();
     if before > 0 && before == after {
       stopped = true;
       break;
@@ -2999,7 +3006,6 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
     "the heartbeat stopped after the stuck shard was refused"
   );
   daemon.stop();
-  drop(anchor);
 }
 
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the

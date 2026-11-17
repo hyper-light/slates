@@ -36,11 +36,16 @@ SLOWDOWN = max(1, int(os.environ.get("SLATES_TEST_RESTART_SLOWDOWN") or 1))
 # Scaled, because they are budgets for work a slow machine does slowly. Measured 2026-10-20: with ten
 # busy spinners on an 18-core machine (load 32), phase 1's calls came back
 # `Stalled { after_ns: 1000000000 }` instead of being answered across the restart — the restarted
-# daemon simply had not answered inside a flat one second. One failure in five runs; none in six at
+# daemon simply had not answered inside a flat one second. Since A-232 (2026-11-13) a late reply from a
+# live daemon is waited for, so the reply deadline paces the client's liveness checks; the reconnect
+# budget is still the bound on a daemon's return. One failure in five runs; none in six at
 # four spinners. That is the same defect as the Rust side's flat START_WAIT, in a test that read no
 # knob at all.
 REPLY_NS = 1_000_000_000 * SLOWDOWN
 RECONNECT_NS = 2_000_000_000 * SLOWDOWN
+# Shape: the reply deadlines a call to a stopped daemon is held past and must still be waiting (A-232): more
+# than one, so a call ended at its first deadline, or re-armed once and ended at its second, is caught.
+HELD_DEADLINES = 3
 # How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
 STARTUP_SECS = 20.0 * SLOWDOWN
 POLL_SECS = 0.02
@@ -596,10 +601,11 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
         """AUD-29-19 / AUD-29-20: every call ends, and the loop is never held. Do, with an independent
         ticker on the loop and every connect made from it: (1) stop the daemon, issue three bounds' worth
         of list calls, and kill it under them, so the anchor restarts it; (2) stop the anchor and the
-        daemon and issue a call; (3) issue a call to the stopped daemon and cancel it; (4) connect
-        afresh, kill the anchor and its daemon for good and issue calls. Expect: the overflow refused at
-        once; every admitted call answered after the restart; the call to the stopped daemon failed
-        Stalled; the cancelled call released (nothing left waiting); every call after the death failed
+        daemon and issue a call; (3) issue a call to the stopped daemon and cancel it, then resume the
+        group; (4) connect afresh, kill the anchor and its daemon for good and issue calls. Expect: the
+        overflow refused at once; every admitted call answered after the restart; the call to the stopped
+        daemon still waiting after HELD_DEADLINES reply deadlines and answered with a listing once the group
+        resumes (A-232); the cancelled call released (nothing left waiting); every call after the death failed
         DaemonGone (the daemon's exit seen, not a stall); and the ticker never late past its bound."""
         asyncio.run(self._every_call_ends())
 
@@ -653,24 +659,38 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             await _wait_for(restarted, "the anchor restarted the daemon")
 
             ticker.phase = "(2) a live but silent daemon, stopped by signal"
-            # (2) A live but silent daemon: the call ends Stalled. The anchor's whole process group (the
-            # anchor leads it, `start_new_session`, and every daemon it spawns is in it) is stopped in one
-            # signal, so its supervision cannot replace the silent daemon and no child it forked can escape
-            # the stop — and the helper waits until every member has really stopped, because the signal
-            # only queues and a daemon still running answers the call this requires to stall.
+            # (2) A live but silent daemon: the call waits, and is answered once the daemon runs again
+            # (A-232). The anchor's whole process group (the anchor leads it, `start_new_session`, and every
+            # daemon it spawns is in it) is stopped in one signal, so its supervision cannot replace the silent
+            # daemon and no child it forked can escape the stop — and the helper waits until every member has
+            # really stopped, because the signal only queues and a daemon still running answers the call before
+            # it can wait. Until 2026-11-13 the call failed Stalled at its first reply deadline. The group is
+            # resumed in `finally`, so a failed claim never leaves it stopped.
             group = await _stop_group_and_wait(binary, instance, anchor.pid)
-            with self.assertRaisesRegex(slates.SlatesError, "Stalled"):
-                await client.list()
+            held = asyncio.ensure_future(client.list())
+            try:
+                await asyncio.sleep(HELD_DEADLINES * REPLY_NS / 1e9)
+                self.assertFalse(
+                    held.done(),
+                    f"a call to a stopped daemon is still waiting after {HELD_DEADLINES} reply deadlines"
+                    + (f": {held.exception()!r}" if held.done() and not held.cancelled() else ""),
+                )
 
-            ticker.phase = "(3) a cancelled call is released"
-            # (3) A cancelled call is released: nothing is left waiting on the loop.
-            waiting = asyncio.ensure_future(client.list())
-            await asyncio.sleep(POLL_SECS)
-            waiting.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await waiting
-            await asyncio.sleep(POLL_SECS)
-            os.killpg(group, signal.SIGCONT)
+                ticker.phase = "(3) a cancelled call is released"
+                # (3) A cancelled call is released: nothing but the held call is left waiting on the loop.
+                waiting = asyncio.ensure_future(client.list())
+                await asyncio.sleep(POLL_SECS)
+                waiting.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting
+                await asyncio.sleep(POLL_SECS)
+            finally:
+                os.killpg(group, signal.SIGCONT)
+            ticker.phase = "(2) the held call answered after the group resumes"
+            self.assertIsInstance(
+                await asyncio.wait_for(held, STARTUP_SECS), list,
+                "the held call is answered with a listing once the group resumes",
+            )
             self.assertIsInstance(await client.list(), list, "the client serves after the cancel")
 
             ticker.phase = "(4) the anchor and its daemon killed for good"

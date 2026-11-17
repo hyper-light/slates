@@ -593,6 +593,47 @@
 >   The same deadline gave up on a probe of `presentation_fairness.rs`'s granted test once in Stack B1's gate. Its
 >   naming since then found every long wait starved, not held: 62 probes of 504 to 982 ms on `4811191a` at 144 spinners,
 >   with the shard runnable in 6,581 of 6,582 samples (`docs/bugs/2026-11-08-a-landings-plan-held-its-shard.md`).
+>   Reproduced on Linux CI on main `29ef4521` (2026-11-13, `diag-a232-red-4`), with a diagnostics probe at cpu.weight 1
+>   beside 32 default-weight spinner cgroups. 10 of 10 runs were red on each of ubuntu-latest and ubuntu-24.04-arm: 25
+>   and 19 calls failed `Stalled` after 2.152 to 8.929 s, the daemon's own watchdog judging every shard starved and
+>   withholding no beat. On this Mac at nice 19 beside two spinners a CPU, 1 of 3 runs was red. The fix is owed on
+>   `agents/clients-a232` (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
+>   Step 2 of A-232's plan is built (2026-11-13): a daemon run alone ends its own process on its watchdog's stuck verdict,
+>   so a call that waits while its daemon lives cannot wait on a stuck lone daemon for good. Only `FromEnv` is
+>   supervised; `Create` and `Handoff` end themselves (A-232's amendment). The exit comes within `W + B + L` of a
+>   wedge, `L` the verdict's lateness the end line names: measured 1.412 s against 1.465 s on this Mac at load 100.
+>   Starved, it was ended in 0 of 10 runs at nice 19 here and 0 of 10 at `cpu.weight` 1 on adacachy2. Steps 3 to 6
+>   followed (2026-11-14): the client's one rule (step 3), the tests that claimed `Stalled` (step 4), the live proof on
+>   CI (step 5, below), and §4.7's status with A-232's amendment and both SDKs' docs (step 6). Still owed: the first
+>   Windows run of the lone daemon and the supervised roles (jupiter was offline). `W` itself is still R3 debt. Open (found by step 2's tests, measured not to be the change's): on adacachy2 under kiln, the
+>   supervised roles (a `FromEnv` daemon in a child of the test, `crates/server/tests/common/supervised.rs`) of
+>   `liveness.rs` and `nfs_hostile.rs` fail intermittently beside their binary's other tests, and pass alone or with
+>   the tests run one at a time. In a failing run the held shard's own thread kept waking (voluntary switches 12 to
+>   27 in 2.4 s) inside a blocking wait, so the watchdog rightly saw it move; the waker is unknown. The base with the
+>   same harness failed 1 of 6 in the same period. The waker is the box itself (step 5, below): adacachy2 pauses whole
+>   processes about 1.16 s at a time, which wakes a thread blocked anywhere.
+>   Step 5 is built (2026-11-14, `agents/clients-a232-s5`): end-to-end proofs on both Linux runners
+>   (`diag-a232-starved-2` on `a7c479b3`). A daemon starved at `cpu.weight` 1 beside default-weight spinners had 0 calls
+>   fail over 10 runs per architecture (231 calls, each run waiting 4.9 to 14.6 s on its longest). A wedged anchored
+>   shard's kill line came within `t0 + 2·W + B + L`, 90 to 102 ms inside, 20 of 20. A wedged lone daemon's verdict came
+>   within `t0 + W + B + L`, 2.7 to 4.6 ms inside, 20 of 20. Mutations (a), (b) and (c) each turned their own shape red.
+>   The step found and fixed one more starved kill: the anchor killed a starved daemon whose watchdog thread was itself
+>   held off its CPU, 3 of 20 runs. The watchdog now marks every look (`SUP_LOOKED`), and the anchor kills on a lapse
+>   only when the watchdog was looking or the process is frozen or spinning by the start's rule
+>   (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`, step 5). Still open: the plan's
+>   unsupervised bound without the exit term exceeds zero by up to 1.08 ms in 15 of 40 runs (the exit, `end`, takes 1.7
+>   to 4.6 ms). The supervised bound in the plan's words (`L` the anchor's p99 alone) fails on a loaded Mac, where the
+>   watchdog's own looks run late. And the Windows form of the supervised tests is owed: the Windows anchor hands its
+>   daemon an explicit handle list, so the roles' shared standard input does not reach it.
+>   Found on the way (open, not this change's): adacachy2 pauses whole processes about 1.16 s at a time (a plain Python
+>   probe: 2 gaps of 1.164 and 1.165 s in 20 s, a thread blocked on a pipe read charged 8.6 to 11.7 us across each, the
+>   run cgroup's freezer bits 0 throughout), which wakes a wedged shard; no wedge timing can be judged there. And on this
+>   Mac under kiln's launchd timer policy the watchdog's 100 ms looks come back about 245 ms apart (a condvar timed
+>   wait, `recv_timeout`; `macos-timed-waits-stretched`), so its verdicts and beats run late there.
+>   Found on the way (open, not this change's):
+>   `fleet.rs`'s `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` fails 3 of 3 on this Mac at load 57 to
+>   63, with either form of the starved hold: the second seal is placed 31 to 111 ms after its 3 s hold ends rather than
+>   inside it. The test widens its window only through `SLATES_TEST_HEDGE_STARVATION_SECS`.
 > The bug record of 2026-11-07 has the per-phase table.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
@@ -1083,8 +1124,10 @@
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
->   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; classes B (the
->   transport's round-trip estimate) and C+D (A-232, the window itself) are open. Found on
+>   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
+>   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
+>   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
+>   itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 

@@ -44,8 +44,10 @@ const status = await async.status(volume);
 ```
 
 Connecting where no daemon answers throws (`AsyncClient.connect` rejects; it never holds the event
-loop while the daemon answers). Every async call ends: answered, refused typed, `Stalled` at its reply
-deadline, `DaemonGone` when the daemon is gone and no restart answers within the reconnect budget, or
+loop while the daemon answers). A call waits while its daemon lives, however long a busy machine keeps
+the daemon off its CPU: a daemon that will never answer is ended (by its anchor, or by its own watchdog
+when it runs alone), and its calls are then resent to the restarted daemon. Every async call ends: answered,
+refused typed, `DaemonGone` when the daemon is gone and no restart answers within the reconnect budget, or
 `CompletionLost` when the completion reader fails; `client.cancel(promise)` releases a waiting call
 and rejects it with an `AbortError`. Calls past the client's bound (its outstanding limit in
 flight, as many again queued) are refused `TooManyOutstanding` at once. Use a client from the thread that connected it.

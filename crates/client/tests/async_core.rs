@@ -25,11 +25,8 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the fast-path spin budget (nanoseconds): a tenth of a second, well past a live daemon's
 /// microsecond reply, so the fast path always catches it here.
 const SPIN_NS: u64 = 100_000_000;
-/// Shape: how long the fast path is retried window after window before the test calls the reply lost: far past a
-/// daemon slowed by a sanitizer or a loaded runner.
-const REPLY_WAIT: Duration = Duration::from_secs(30);
-/// Shape: how long the slow path waits for the completion fd to signal (nanoseconds): two seconds,
-/// far past a live daemon's reply.
+/// Shape: one look at the completion fd (nanoseconds): two seconds. A look that sees nothing is followed by another
+/// while the daemon lives ([`await_live`]); it is no bound on the reply.
 const FD_WAIT_NS: u64 = 2_000_000_000;
 
 /// The machine profile this binary's daemons derive from, measured **once per process** (§4.1), as production
@@ -61,6 +58,28 @@ fn deadlines() -> Deadlines {
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get()
+}
+
+/// Retries `step` until it yields, for as long as the in-process `daemon` lives by its own watchdog's judgment (A-228,
+/// A-232's rule: a call waits while its daemon lives, and only a daemon judged stuck fails it). The test fails when the
+/// watchdog withholds the beat for a stuck shard, or has stopped, never because a live daemon was slow: a starved one,
+/// on a loaded runner or under a sanitizer, is waited for. Before 2026-11-12 these waits were wall clocks (the reply
+/// deadline's one second, five-second drains), and at nice 19 beside two spinners a CPU 6 of 10 runs on x86_64 and 4 of
+/// 10 on arm64 failed "a reply ... arrived within the deadline" with the daemon alive.
+fn await_live<T>(daemon: &Daemon, what: &str, mut step: impl FnMut() -> Option<T>) -> T {
+  let withheld_before = daemon.watchdog_turns().map(|(_, withheld)| withheld);
+  loop {
+    if let Some(done) = step() {
+      return done;
+    }
+    let turns = daemon.watchdog_turns();
+    assert!(
+      withheld_before.is_some() && turns.map(|(_, withheld)| withheld) == withheld_before,
+      "{what}: the daemon's watchdog judged a shard stuck or stopped (looks and withheld beats {turns:?}, withheld \
+       {withheld_before:?} when the wait began)"
+    );
+    std::hint::spin_loop();
+  }
 }
 
 fn connect(instance: &str) -> Client {
@@ -112,7 +131,7 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   let profile = profile();
   let instance = format!("cl-async-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let _daemon = Daemon::start(
+  let daemon = Daemon::start(
     &profile,
     config,
     SegmentSource::Create {
@@ -120,7 +139,7 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
     },
   )
   .unwrap();
-  _daemon
+  daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
@@ -129,16 +148,9 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   // Window after window, never the fd: what is proved is the path the reply takes, not how fast a slowed daemon (TSan,
   // a loaded runner) commits its first create. One 100 ms window failed on CI's TSan lane, 2026-10-06.
   let create_id = client.begin(&create("async-fast")).unwrap();
-  let began = std::time::Instant::now();
-  let fast = loop {
-    if let Some(reply) = client.spin_reply(create_id, SPIN_NS).unwrap() {
-      break reply;
-    }
-    assert!(
-      began.elapsed() < REPLY_WAIT,
-      "the create replied through the spin path within {REPLY_WAIT:?}"
-    );
-  };
+  let fast = await_live(&daemon, "the create replied through the spin path", || {
+    client.spin_reply(create_id, SPIN_NS).unwrap()
+  });
   let volume = match fast {
     ReplyBody::Created { id } => id,
     other => panic!("the create's reply is Created, got {other:?}"),
@@ -150,9 +162,10 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   let fd = client.enable_async_completion().unwrap();
   client.arm_async().unwrap();
   let snapshot_id = client.begin(&RequestBody::Snapshot { volume }).unwrap();
-  assert!(
-    wait_readable(fd, FD_WAIT_NS),
-    "the completion fd signals the reply to the armed (parked) request"
+  await_live(
+    &daemon,
+    "the completion fd signals the reply to the armed (parked) request",
+    || wait_readable(fd, FD_WAIT_NS).then_some(()),
   );
   client.drain_completion();
   match client
@@ -170,35 +183,27 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   // buffer — the multiplexing an async pump relies on.
   let a = client.begin(&create("async-a")).unwrap();
   let b = client.begin(&create("async-b")).unwrap();
-  let reply_b = poll_until(&mut client, b);
-  let reply_a = poll_until(&mut client, a);
+  let reply_b = poll_until(&mut client, &daemon, b);
+  let reply_a = poll_until(&mut client, &daemon, a);
   assert!(
     matches!(reply_a, ReplyBody::Created { .. }) && matches!(reply_b, ReplyBody::Created { .. }),
     "each of two in-flight requests got its own Created reply: a={reply_a:?} b={reply_b:?}"
   );
 }
 
-/// Polls `id`'s reply until it lands within the reply deadline (the async core is non-blocking, so
-/// the test drives the ring itself here rather than through an event loop).
-fn poll_until(client: &mut Client, id: RequestId) -> ReplyBody {
-  let started = Instant::now();
-  loop {
-    if let Some(reply) = client.poll_reply(id).unwrap() {
-      return reply;
-    }
-    assert!(
-      u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) < deadlines().reply_ns,
-      "a reply for {id:?} arrived within the deadline"
-    );
-    std::hint::spin_loop();
-  }
+/// Polls `id`'s reply until it lands, while the daemon lives ([`await_live`]; the async core is non-blocking, so the
+/// test drives the ring itself here rather than through an event loop).
+fn poll_until(client: &mut Client, daemon: &Daemon, id: RequestId) -> ReplyBody {
+  await_live(daemon, &format!("a reply for {id:?}"), || {
+    client.poll_reply(id).unwrap()
+  })
 }
 
 /// Begins `List` and takes its reply, driving the ring until it lands.
-fn list_round_trip(client: &mut Client) {
+fn list_round_trip(client: &mut Client, daemon: &Daemon) {
   let id = client.begin(&RequestBody::List).unwrap();
   client.begin_ack_if_due().unwrap();
-  let _ = poll_until(client, id);
+  let _ = poll_until(client, daemon, id);
 }
 
 /// AUD-29-22 (§4.9, banned item 8): an awaited reply is never evicted to bound the buffer. Do: begin a call
@@ -227,10 +232,10 @@ fn an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound() {
   let mut client = connect(&instance);
 
   let early = client.begin(&RequestBody::List).unwrap();
-  drain_until_ready(&mut client, early);
-  let limit = fill_to_the_bound(&mut client);
+  drain_until_ready(&mut client, &daemon, early);
+  let limit = fill_to_the_bound(&mut client, &daemon);
   for _ in 0..limit * 3 {
-    list_round_trip(&mut client);
+    list_round_trip(&mut client, &daemon);
   }
   assert!(
     matches!(
@@ -239,7 +244,7 @@ fn an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound() {
     ),
     "the early reply is still there after three bounds of drained traffic"
   );
-  assert_abandoned_replies_are_dropped(&mut client);
+  assert_abandoned_replies_are_dropped(&mut client, &daemon);
   assert!(
     client.outstanding().is_empty(),
     "nothing is left outstanding"
@@ -247,18 +252,20 @@ fn an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound() {
   daemon.stop();
 }
 
-/// Drains the completion ring until `id`'s reply is in the client's buffer.
-fn drain_until_ready(client: &mut Client, id: RequestId) {
-  let started = Instant::now();
-  while !client.take_ready().unwrap().contains(&id.word()) {
-    assert!(started.elapsed() < START_WAIT, "{id:?}'s reply is drained");
-    std::hint::spin_loop();
-  }
+/// Drains the completion ring until `id`'s reply is in the client's buffer, while the daemon lives ([`await_live`]).
+fn drain_until_ready(client: &mut Client, daemon: &Daemon, id: RequestId) {
+  await_live(daemon, &format!("{id:?}'s reply is drained"), || {
+    client
+      .take_ready()
+      .unwrap()
+      .contains(&id.word())
+      .then_some(())
+  });
 }
 
 /// Begins calls until admission refuses, checks the bound counts the one already outstanding, then takes
 /// every reply back; returns the bound.
-fn fill_to_the_bound(client: &mut Client) -> usize {
+fn fill_to_the_bound(client: &mut Client, daemon: &Daemon) -> usize {
   let mut held = Vec::new();
   let limit = loop {
     match client.begin(&RequestBody::List) {
@@ -273,15 +280,15 @@ fn fill_to_the_bound(client: &mut Client) -> usize {
     "the early call holds one of the slots"
   );
   for id in held {
-    let _ = poll_until(client, id);
+    let _ = poll_until(client, daemon, id);
   }
   limit
 }
 
 /// An abandoned call's buffered reply is gone, and a late reply to an abandoned call is dropped and counted.
-fn assert_abandoned_replies_are_dropped(client: &mut Client) {
+fn assert_abandoned_replies_are_dropped(client: &mut Client, daemon: &Daemon) {
   let abandoned = client.begin(&RequestBody::List).unwrap();
-  drain_until_ready(client, abandoned);
+  drain_until_ready(client, daemon, abandoned);
   let dropped_before = client.unawaited_dropped();
   assert!(client.abandon(abandoned.word()));
   assert!(
@@ -290,13 +297,8 @@ fn assert_abandoned_replies_are_dropped(client: &mut Client) {
   );
   let late = client.begin(&RequestBody::List).unwrap();
   client.abandon(late.word());
-  let started = Instant::now();
-  while client.unawaited_dropped() == dropped_before {
+  await_live(daemon, "the late reply arrives and is dropped", || {
     let _ = client.take_ready().unwrap();
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the late reply arrives and is dropped"
-    );
-    std::hint::spin_loop();
-  }
+    (client.unawaited_dropped() != dropped_before).then_some(())
+  });
 }

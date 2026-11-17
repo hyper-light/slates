@@ -181,8 +181,11 @@ export class AsyncClient {
   // One verb's call: begins it (sent or queued, never waiting), resolves at once when its reply came within
   // the spin, else waits for it by ticket. A refusal at the begin rejects the returned Promise. A unit verb
   // (`unit`) resolves to undefined, its poll yielding `true` when done. The Promise returned is the one
-  // `cancel` takes.
+  // `cancel` takes. A lost reader refuses the call before it begins, as Python's begin does: a reply that came
+  // within the spin would otherwise resolve past the refusal (until 2026-11-13 a later call to a running daemon was
+  // answered after its client's reader was lost).
   _call(begin, poll, unit = false) {
+    if (this._broken) return Promise.reject(this._broken);
     let begun;
     try {
       begun = begin();
