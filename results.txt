@@ -1,0 +1,12 @@
+A-232 landing tests (diag-a232-land-main 1: main 29ef4521, the baseline for diag-a232-land-1, on both Linux runners: every test binary with C) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit 1be35226e3d1b11cd0452c61eb24417403982c39, parent 29ef4521d9711fd380b7fde45f63e83bac3166c7
+== workspace: exit 0 in 2586 s (workspace.log)
+kernel.apparmor_restrict_unprivileged_userns = 0
+== namespaces (client netns): exit 0 in 44 s (netns.log)
+== namespaces (ipc rendezvous): exit 0 in 7 s (rendezvous.log)
+user_allow_other in /etc/fuse.conf: 1
+== CLI flow: exit 124 in 3600 s (cli.log)
+   TIMED OUT after 60 min; the last binary started:      Running tests/cli.rs (target/debug/deps/cli-01f27adb513d26ff)
+   skip: test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+   skip: SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
