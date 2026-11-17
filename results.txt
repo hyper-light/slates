@@ -1,0 +1,19 @@
+A-232 landing tests (diag-a232-land 2: the A-232 landing 1b849ad9 (with the fleet and sibling hold fixes) on both Linux runners, every test b) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit adfa4a5cc784781d8c33f37475d6d2327eb89cf8, parent 1b849ad94b4245a5a52dfbf8004b1e7607ffac8f
+== workspace: exit 101 in 2688 s (workspace.log)
+   FAILED a_daemon_killed_mid_publication_leaves_its_successor_the_anchors_profile  [tests/anchor.rs (target/debug/deps/anchor-2e0426135c2df037)]
+   target `-p slates-anchor --test anchor`
+   target `-p slates-server --test shards`
+      1    panicked at crates/anchor/tests/anchor.rs:1417:3:
+kernel.apparmor_restrict_unprivileged_userns = 0
+== namespaces (client netns): exit 0 in 45 s (netns.log)
+== namespaces (ipc rendezvous): exit 0 in 7 s (rendezvous.log)
+user_allow_other in /etc/fuse.conf: 1
+== CLI flow: exit 101 in 175 s (cli.log)
+      1    panicked at crates/cli/tests/cli.rs:603:6:
+   skip: test a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon ... SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)
+   skip: SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform publishes no issuer surface through the environment, so no separate process can issue a grant
+   skip: test a_verified_container_source_is_checked_again_before_it_is_bound ... SKIP: set SLATES_TEST_CLI=1 on a host with mount_nfs to run the source check
+   skip: SKIP the granted legs: this platform publishes no issuer surface through the environment, so a separate process cannot issue a grant (on Linux the anchor's segment is a descriptor its children hold). The ungranted half — the landing presents and the target is untouched — ran.
+   skip: SKIP: the setuid probe needs root to make a root-owned binary
