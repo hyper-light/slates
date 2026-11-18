@@ -1047,7 +1047,7 @@ impl DaemonConfig {
       discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
-      closed_loop_hold_ns: loop_hold.get(),
+      closed_loop_hold_ns: 0,
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
