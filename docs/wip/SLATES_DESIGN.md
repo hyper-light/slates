@@ -32497,3 +32497,15 @@ record `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its
   volume moved to a third member, the install walked onto it, the target retired and the next install walked on). Red
   without the fix on the Mac Studio (the copy stayed routed to its old owner, and the target's takeover listed nothing
   for its successor); green with it.
+
+### A-487 — Goal 85's bug 2, the move back to the creator, had A-485's cause; its regression test (2026-11-18, g230; §4.8 "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398, A-485)
+Applied in the same change to: GAPS (the move's entry), A-485's bug record (a section of its own), and
+`crates/server/src/fleet.rs`'s unit tests.
+- **What happened.** `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the
+  quiet Mac Studio at main 3022c6894: the move back answered `Moving` and `MoveRefused { Unplaced }` in turn until its
+  deadline. The third node refused every head and catalog record and 2,663 content puts of the volume's new owner
+  `Unauthorized`, and no node counted `fleet.move.followed`: A-485's cause. No rule changes here.
+- **Tests.** `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests):
+  the move installed through the walk as the coordinator drives it; the copy routed to the new owner, its authority
+  naming it, the new owner's next record accepted and the creator's refused `Unauthorized`. The fleet test is main's.
+

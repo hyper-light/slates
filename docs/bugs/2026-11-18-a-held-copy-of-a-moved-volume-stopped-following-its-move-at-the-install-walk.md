@@ -76,3 +76,23 @@ successor in the target's takeover. Red without the fix on the Mac Studio (d1323
 `cargo test -p slates-server --lib a_held_copy_follows_its_move`.
 
 The fleet test that found it, and the volume-moved test (bug 2), are main's to run on macOS and Linux.
+
+## The same cause, goal 85's bug 2 (A-487, g230)
+
+`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the quiet Mac Studio
+(adas-mac-studio-3) at main 3022c6894: the move there completed, and the move back to the creator answered `Moving` and
+`Refused { MoveRefused { reason: Unplaced } }` in turn until the test's deadline. The counters the failure printed
+(`~/.cache/slates-gate/fleet-q1.log` there) are this record's cause, seen from the other side of a move: the third node c
+refused every head and catalog record the volume's new owner b shipped `Unauthorized` (`fleet.record.refused.
+unauthorized` 8,006 = b's `fleet.ship.head.short` 4,000 + `fleet.ship.catalog.short` 4,006) and 2,663 of its content
+puts (`fleet.content.unauthorized`); b began 223 handoffs of the head off itself and finished none
+(`fleet.heal.unfinished` 222), and its move back was refused `Unplaced` 40 times; no node counted
+`fleet.move.followed`. A move back must hand over a head held by `f + 1` members other than its owner, at `f = 1` both
+the creator and c, and c's copy still named the creator. It is not the A-435, A-436 or A-437 commits main bisected
+between: A-398 predates both points; what let it pass once at 2a5bf7264 is not read from any log.
+
+A-485's fix closes it. Its regression test, `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_
+reaches_it` (`crates/server/src/fleet.rs`), installs the move through the walk as the coordinator drives it
+(`install_slice` until the walk ends) and judges what the move back needs: the copy routed to the new owner, its
+authority naming it, the new owner's next record accepted and the creator's refused `Unauthorized`, counted followed
+once. (g230's branch agents/g230-a487-move-back built the same rule independently and was dropped for A-485's.)

@@ -961,6 +961,17 @@
 >   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
 >   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back may
 >   lean on the same following (not shown: holders a new owner's own move round reaches take its authority there).
+> - **Closed by A-485 too: goal 85's bug 2, the move back to the creator (2026-11-18, A-487).**
+>   `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the quiet Mac Studio
+>   at main 3022c6894, the move back answering `Moving` and `MoveRefused { Unplaced }` in turn until its deadline. Its
+>   counters show A-485's cause, not a cause of its own: the third node refused every head and catalog record of the
+>   volume's new owner `Unauthorized` (8,006 = the owner's `fleet.ship.head.short` 4,000 + `catalog.short` 4,006) and
+>   2,663 of its content puts, the owner's handoff of the head off itself never finished (`fleet.heal.unfinished` 222),
+>   and no node counted `fleet.move.followed`: the move back must place the head on both other members, and the third
+>   kept the creator's authority. Its regression test:
+>   `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests: the move
+>   installed through the walk as the coordinator drives it, then the new owner's next record accepted and the creator's
+>   refused `Unauthorized`). **Owed (main's):** the volume-moved fleet test on the merged tree.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
