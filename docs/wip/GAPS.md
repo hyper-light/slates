@@ -203,8 +203,17 @@
 > `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart`,
 > `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`). Bug
 > record `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
-> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix, and an owner-restart flow across real
->   processes (`kill -9` under the anchor, writes before and after, then the owner's loss).
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix.
+> - **Written (2026-11-18): the owner-restart flow across real processes**,
+>   `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor` (`crates/cli/tests/live_fleet.rs`, gated
+>   on `SLATES_TEST_CLI=1`; landed first with one write after the restart, 63b31d5b3, then made one flow with g229's). Three anchored processes; five files written through the owner; its daemon `kill -9`ed and
+>   replaced by its anchor; five more through the restarted owner, each given the fleet wait to be answered; then the
+>   owner killed whole. The flow requires the daemon replaced, the restarted log's head past the head shipped before
+>   plus the writes made since (each write is its own entry, so a log begun again at genesis ends at their count), and a
+>   survivor serving all ten files. On a Mac Studio (release, 2026-11-18) it passed 4 of 4, heads 4 then 10 or 11, 3.9
+>   to 6.1 s a run. Red with a restarted owner's log begun again at genesis (`Start::Resumed` taken for `Start::New`): the
+>   first write through the restarted owner was never answered, the log at head 0 with nothing durable and owed (with
+>   no bound on that write, the run held 23 minutes until killed; the flow now fails it at the fleet wait).
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
@@ -681,7 +690,14 @@
 > every `hg` exited 2 on both sides, Python handed `/c/hostedtoolcache/…/Scripts/hg` unconverted (pip's `hg` is a `#!`
 > script naming `python.exe`, started with the script's path as its argument) and reading it on drive `D:`. The shared
 > environment now leaves only Subversion's `^/` URLs unconverted (`MSYS2_ARG_CONV_EXCL=^/`), red-tested by
-> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. In the same run
+> git and git's history failed on the drive alone, `fatal: detected dubious ownership`, git naming the owner Everyone
+> (`S-1-1-0`): the drive answered no security query (WinFsp's DLL refused each, and Windows reported its world
+> descriptor), and the one descriptor it held named the Administrators group. **Fixed by A-350:** that descriptor names
+> the account the daemon runs as, which every client of a Windows daemon is, for owner and its primary group for group,
+> and the drive answers security queries with it, as NTFS reports a file its account made
+> (`what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`); three winfstest cases that ask for exactly
+> its access list pass and are struck (382 to 379). **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
@@ -690,10 +706,12 @@
 > `MountUseMountmgrFromFSD=1`, which an Administrator sets once (as WinFsp itself is installed once) and which then lets
 > an unprivileged mount use the Mount Manager from WinFsp's kernel driver, its drives global to the machine (WinFsp's
 > registry-settings page: "not recommended for general use"); (c) mount as a WinFsp network file system, whose
-> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
-> cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
-> first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
-> Windows form.
+> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Shown
+> (2026-11-18, diagnostics run 44336880588, with A-327's correction and A-350):** on both Windows runners git and
+> Subversion ran identical over the drive, and git's history and Mercurial identical but for the drive's stated
+> hard-link lines; the cell's record (`native-windows-winfsp.workloads.json`, the owed skip of 2026-11-05 until then) is
+> re-recorded from the x86_64 run. **Open:** the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor,
+> watcher) are owed a Windows form.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
@@ -897,7 +915,10 @@
 > 63 cases of `chown/00.t` unlisted (`expected 0,0, got 0,20`): an object root makes takes the group of the directory
 > the run starts in under BSD's rule, and that directory was the harness's own user's (staff). pjdfstest assumes root's
 > directory, as the file system under test's is, so a root run now starts in a directory handed to root, owner and
-> group 0 (A-328's entry); (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> group 0 (A-328's entry): diagnostics run 44329324901 ran pjdfstest as root there with no unlisted failure (8,569 of
+> 8,686 passed, the 117 listed failed), and the macOS records are re-recorded, pjdfstest's from that run (the unprivileged
+> run of 2026-09-16 until then) and the workloads' from 44271637767 (all twelve identical); (2) ~~the Windows WinFsp
+> roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
@@ -10010,8 +10031,46 @@ Open:
   against a ledger of the send in flight (A-113) before it may resume one.
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
+  - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),
+    17 `SIGKILL`s over two runs of `docs/wip/bench/kill_fsync_macos.sh` with main's binary and its traced build caused
+    no panic and no reconnect (one held connection each).
+  - The next run, with A-358's binary, lost the machine right after its first kill, at 15:25:39.688 UTC. It answered no
+    ping and waits at FileVault's unlock screen. A panic is suspected and not yet read.
+  - Its report (`/Library/Logs/DiagnosticReports/panic-full-*.panic`) is the next step: the GAPS entry below.
 
-### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (open)
+### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; the kernel-client run with the fix open)
+
+> **2026-11-18 (g079): reproduced through Apple's kernel client, traced, and fixed server-side (A-358).**
+> - **Machine.** Adas-Mac-Studio-2 (kiln b24c5c95): M4 Max, macOS 26.2 (25C56), xnu-12377.61.12, NFS kext
+>   B922B1FE-2CDC-3A5B-8757-37D99A870355. `docs/wip/bench/kill_fsync_macos.sh` (new) is `kill_fsync.sh`'s writer and
+>   killer through `slates mount`; afterwards an unmount while a daemon serves, a mount again, and every file read back.
+>
+> | binary | kills | files checked | intact | empty | missing | resurrected | panics |
+> |---|---|---|---|---|---|---|---|
+> | main `1cd57d18b` | 2 | 3,025 | 3,024 | 1 | 0 | 0 | 0 |
+> | main + one line per NFS call (`59c43709c`) | 15 | 6,607 | 6,606 | 1 | 0 | 0 | 0 |
+>
+> - **The cause, from the per-call log.** The empty file's only WRITE was answered `UNSTABLE` by daemon D1, and D1 was
+>   killed 5 ms later, before any publication carried the bytes. D2 answered the COMMIT with a new write verifier, as
+>   RFC 1813 §3.3.7 asks, and Apple's client never wrote the bytes again. Its `fsync` and `close` returned 0.
+>   - Over the run, 3 COMMITs answered a verifier other than their WRITE's, and 0 were followed by a WRITE.
+>   - All 17,631 COMMITs started where their WRITE's bytes ended, and all 19,324 WRITEs asked for `UNSTABLE`.
+>   - So it is Apple's client, and not its reconnect path (A-113 holds the connection: no reconnects).
+>   - Bug record: docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md.
+> - **The fix (A-358).** Every WRITE is published before its reply, whatever stability it asked for. The reply still
+>   says what was asked, and only a stability claim waits for a live-shipped volume's candidates.
+>   - `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite` (`crates/cli/tests/nfs_held.rs`) plays Apple's
+>     client. It lost 6 of 6 files on main (0 of 52,177 bytes each) and 0 of 6 with the fix; all 6 COMMITs met a
+>     successor's verifier.
+>   - With the fix (d1323898, 2026-11-18): `nfs_held` 6/6, the live-shipped v4 COMMIT flow 1/1, `nfs_writeback` 7/7,
+>     `nfs_mount` 40/40, the recovery tests on acknowledged content and retried compounds 2/2, the server's nfs unit
+>     tests 10/10, bridge-nfs `procedures` 52/52, and the v4 COPY test 1/1.
+> - **Open: the kernel client with the fix.** Its first run (8 rounds of 15 kills planned) lost the machine right after
+>   its first kill: b24c5c95 went offline about 15:26 UTC and answered no ping. FileVault holds it at the unlock screen.
+>   Next steps, in order:
+>   1. Parse its panic report (the A-113 entry above).
+>   2. Run the round again, its log streamed without a filter (that run's was behind a block-buffered `grep`).
+>   3. Close this entry with the counts.
 
 > **2026-11-06 (bug-sweep): not reproduced server-side by the Linux kernel client.** The 10-06 run, step for step:
 > files of 100 B to 300 KB written whole and fsynced, each hashed only once its fsync returned, an old one deleted every
@@ -10041,6 +10100,25 @@ whose verifier disagrees written again — with a kill per round and a final kil
 6 rewrite rounds forced by a changed verifier, 0 lost, in each of three runs. The empty files came from runs where every
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
+
+### 2026-11-18: a WinFsp write answered before its publication may be lost across a daemon kill (A-358's sibling; open, unproven)
+
+A-358 found that an NFS write answered before any publication is lost when the daemon dies, if the client never sends
+it again (Apple's never does). WinFsp has the same shape:
+- a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
+  that wrote publish first (`crates/server/src/winfsp.rs`);
+- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- a WinFsp drive outlives a killed daemon (A-198).
+
+So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
+would answer success over the state without it, since Windows' cache manager already counts those pages clean.
+
+Owed:
+1. The test, on CI's Windows runners: `crates/cli/tests/nfs_held.rs`'s `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite`
+   shape on a WinFsp drive: write, kill, flush, close, read back.
+2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
+
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 

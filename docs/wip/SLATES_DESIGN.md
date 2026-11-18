@@ -7417,10 +7417,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
 >   until a write, its holders keep the old chain, which holds every write acknowledged before the restart. Across real
->   processes (2026-11-18): `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
->   (`crates/cli/tests/live_fleet.rs`, three anchored daemons: the owner killed and replaced by its anchor, a write
->   through it, then the owner killed whole; a survivor serves every file, and the owner's head after the restart's
->   write is past its head before it). Owed: its first run (the integrator's lanes).
+>   processes the owner's case is held by `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
+>   (`crates/cli/tests/live_fleet.rs`; written twice on 2026-11-18 and kept as one flow): five writes, the owner's
+>   daemon killed and replaced by its anchor, five more through it, each given the fleet wait, the owner killed whole
+>   (its anchor stopped first); the restarted log ends past the head shipped before plus the writes since, and a
+>   survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log begun again
+>   at genesis the first write through it is never answered, its log at head 0 with nothing durable.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -12832,8 +12834,9 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
   one stays true. A file's **open extent** is written in place after the image that names it, so its bytes
   can run ahead of the imaged length. Those bytes are never served: every read stops at the extent's length,
   and a write zero-fills any gap it extends over (`ChunkStore::write_open`), so recovery zeroes nothing (a
-  test proves it with no zeroing at all). They are writes no barrier made stable. NFS re-sends them when the
-  write verifier changes (RFC 1813 §3.3.7), and the FUSE write log replays them (A-63).
+  test proves it with no zeroing at all). They are writes no barrier made stable yet. NFS publishes every write
+  before its reply (A-358), since a client cannot be relied on to send them again when the write verifier changes
+  (RFC 1813 §3.3.7): Apple's sends nothing. The FUSE write log replays them (A-63).
 - **No block the committed image names is reused before a newer image commits.** The arena keeps one bit per
   granule for the blocks the committed image references, set at capture. A free of a block outside that set is
   immediate. A free of one inside it is deferred until the next publication commits; the commit then releases
@@ -15129,10 +15132,11 @@ Status: built 2026-10-09.
     with its result, except that a bulk read is recorded by its key alone and served again on a retry. One record per
     slot; a later compound replaces it.
   - **The record rides the commit that makes the effect durable.** A call that changed a volume rides the barrier's
-    publication; an UNSTABLE write's call rides the next publication. A call that changed file state rides that
-    change's own transaction. So no restart can keep an effect and lose its record. The calls before a compound's
-    first change ride the same commit, which keeps the retry's path through them the original's. A call recorded after
-    the compound's last change rides nothing new: a retry serves it again, past every recorded change.
+    publication, an UNSTABLE write's included, since every write publishes before its reply (A-358). A call that
+    changed file state rides that change's own transaction. So no restart can keep an effect and lose its record.
+    The calls before a compound's first change ride the same commit, which keeps the retry's path through them the
+    original's. A call recorded after the compound's last change rides nothing new: a retry serves it again, past
+    every recorded change.
   - **Answered, not served.** On a retry, the compound runs its own logic again. Each call that meets its key at its
     owner is answered from the record, and the rest are served. The logic is deterministic in its calls' results, so
     the retry takes the original's path through every recorded call. A record made in the same daemon life is never
@@ -16465,7 +16469,12 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     NOT_CONTENT_INDEXED and a directory's READONLY beside the mode, and a file's READONLY is its mode's write bits, so
     the reason stands for READONLY and no longer for the rest; the 18 cases are off the list.
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
-    volume's own rule; a DACL set or asked for at create is not kept.
+    volume's own rule; a DACL set or asked for at create is not kept. **Amended by A-350 (2026-11-18):** the one
+    descriptor names the account the daemon runs as for owner and that account's primary group for group (it named the
+    Administrators group), and a security query is answered with it (before, WinFsp's DLL refused every query, and
+    Windows reported its world descriptor: owner Everyone, no access list), so git trusts a repository on the drive. The
+    reason stands for access lists and for an owner or group set after the create; three winfstest cases that ask for
+    exactly the drive's access list pass and are off the list.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
@@ -17599,10 +17608,10 @@ Applied in the same change to:
   - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
     confirmation ahead of the worker's next request.
   - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
-    it, and a request answered without the shard can come right after a Create: the host registers no GetSecurity
-    callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without
-    calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and QueryStreamInformation likewise
-    (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    it, and a request answered without the shard can come right after a Create: the host's GetSecurity answers
+    QuerySecurity from the mount's one descriptor on the receiving thread (A-350; before it, WinFsp's DLL refused the
+    query itself, `src/dll/fsop.c:1444-1445` of v2.1), and WinFsp answers QueryEa and QueryStreamInformation without
+    calling the host at all (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
     shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
     replaces.
   - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
@@ -24921,8 +24930,9 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   the Subversion script stopped at its first `^/` there (the harness runs every script under `set -e`). Test:
   `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url`
   (`crates/conformance/src/workload.rs`, run by both Windows lanes once their tools are installed): `hg version` and
-  Python's echo of `^/trunk` under the shared environment, red under `MSYS_NO_PATHCONV` (exit 2) and under no setting
-  (`^C:\Program Files\Git\trunk`).
+  Python's echo of `^/trunk` under the shared environment. Green on both Windows runners in diagnostics run 44329324901,
+  and red there with each setting put back: under `MSYS_NO_PATHCONV`, `hg` exits 2 with CI's own message (`can't open
+  file 'D:\\c\\hostedtoolcache\\…\\Scripts\\hg'`); with no setting, Python is handed `^C:/Program Files/Git/trunk`.
 
 ### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
 Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
@@ -24971,7 +24981,10 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and its record's command says so. Linux's System V rule gave root's objects group 0 whatever the directory's group,
   so nothing changes there, and no listed case is about a group. Test:
   `what_root_makes_where_a_root_run_starts_is_in_group_0` (the same file), run by CI's macOS gates job, whose runner
-  has passwordless `sudo`; it skips loudly without it.
+  has passwordless `sudo`; it skips loudly without it. Green on macos-latest in diagnostics run 44329324901, and red
+  there with the group left out of the hand-over (`chown 0`): root's directory took group 20, its start's. In the same
+  run pjdfstest as root over the NFS loopback mount failed only its 117 listed cases (8,569 of 8,686 passed;
+  `chown/00.t` its 8 listed), and its record replaces the unprivileged run of 2026-09-16.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
@@ -26484,6 +26497,101 @@ nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`
 `crates/server/src/takeover.rs`, the tests in `crates/server/src/daemon.rs`, `crates/server/src/lease.rs`,
 `crates/server/src/takeover.rs` and `crates/server/tests/fleet.rs`, and the bug record
 `docs/bugs/2026-11-18-a-retired-owner-heard-again-was-never-readmitted-and-the-fleet-stayed-split.md`.
+
+### A-358 — Every NFS WRITE is published before its reply, whatever stability it asked for: Apple's client never writes again what a restart lost (2026-11-18, goal g079 / kiln 7cda92b5, fsync'd files never come back empty after daemon kills; §4.6 NFS v3, §4.8 barrier, D-18; A-113, A-127, A-128, A-200)
+
+Applied in the same change to:
+- `crates/server/src/nfs.rs`: `needs_barrier` names every successful WRITE; `changes_volume` folded into it; `unstable_write`
+  and `barrier`'s `claims_stability`; the module doc.
+- `crates/bridge-nfs/src/procedures.rs` (the WRITE, COMMIT, `UNSTABLE`, `write_stable_how` and `is_unstable` docs),
+  `crates/bridge-nfs/src/v4/v42.rs` (the COPY's `UNSTABLE4` doc).
+- `crates/cli/tests/nfs_held.rs`: `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite`.
+- `docs/wip/bench/kill_fsync_macos.sh` (new); §4.8's open-extent paragraph and A-127's call-record paragraph; GAPS (the
+  2026-10-06 entries); BENCHMARKS; `docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md`.
+
+- **What was there.** An `UNSTABLE` WRITE was answered `UNSTABLE` and left in the volume until the next publication.
+  RFC 1813 §3.3.7 makes the client responsible for such bytes: when its COMMIT answers a write verifier other than the
+  WRITE's, it writes them again. The verifier is per boot, so a daemon's death showed as a new verifier.
+- **Why it changed.** Apple's client does not write them again. A traced kill run through `slates mount` (macOS 26.2,
+  M4 Max) produced the following:
+  - 3 COMMITs answered a verifier other than their file's WRITE, and none was followed by a WRITE;
+  - every COMMIT started where the WRITE's bytes ended (17,631 of 17,631), and every WRITE asked for `UNSTABLE`
+    (19,324 of 19,324);
+  - the one file whose bytes no publication had carried came back empty, while its `fsync` and `close` had returned 0.
+
+  So on macOS an acknowledged write's survival rested on a client that drops it.
+- **The rule.**
+  - Every WRITE is published by the §4.8 barrier before its reply, whatever stability it asked for. It survives its
+    daemon's death without the client's help.
+  - The reply still says what was asked. An `UNSTABLE` WRITE is answered `UNSTABLE`, and its reply claims nothing past
+    its daemon, so it waits for no live-shipped volume's candidates; the COMMIT does (A-200).
+  - A held connection's WRITE holds its reply around the barrier as every barriered call does (A-128). A successor
+    answers a WRITE it reads again from that reply and never applies it twice.
+  - Measured and rejected on the way: answering every WRITE `FILE_SYNC`. It would spare the client its COMMIT, but on a
+    live-shipped volume it makes every WRITE wait for the candidates, and an `UNSTABLE` WRITE stopped being answered
+    while they were stopped. `live_fleet.rs` holds the opposite: an `UNSTABLE` write claims nothing, so it is answered.
+- **Cost.** One publication per WRITE where there was one per COMMIT. A publication costs the change since the last one
+  (A-68, A-126). The kernel-client A/B is in BENCHMARKS.
+- **Proven.**
+  - `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite` plays Apple's client: one `UNSTABLE` WRITE, a
+    kill as soon as it is answered, a COMMIT, and no WRITE again. Before the change it lost 6 of 6 files (0 of
+    52,177 bytes each); after, 0 of 6, every COMMIT having met a successor's verifier.
+  - The kernel client under kills: see GAPS ("2026-10-06: two fsync-acknowledged files came back empty").
+
+### A-350 — The WinFsp drive reports the account it serves as every object's owner, and answers security queries with its one descriptor (2026-11-18, g261, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route; amends A-209's SECURITY difference)
+Applied in the same change to: §4.6 (the stated SECURITY difference; the receiver's rule for why the confirmation's
+post wakes the shard), GAPS (A-300's entry), `crates/bridge-winfsp/src/account.rs` (new: a SID's text from its bytes,
+the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_descriptor`, `token_information`,
+`get_security`), `ffi.rs` (the `GetSecurity` slot), `unsafe-budget.toml` (148 to 155), winfstest's reviewed list
+(three cases struck, 382 to 379) and its record, the drive's workloads record, the evidence matrix, and
+`crates/cli/tests/winfsp_semantics.rs`.
+- **What CI found.** Run 44271637767, both Windows lanes: git and git's history failed on the drive alone, `fatal:
+  detected dubious ownership in repository at 'E:/conformance-8232/workloads/git'`, git naming the owner `Everyone
+  (S-1-1-0)` and the user `runneradmin (S-1-5-21-…-500)`. Git for Windows trusts a repository whose owner is the user, or
+  the Administrators group when the user is a member (`compat/mingw.c` `is_path_owned_by_current_sid`); NTFS records a
+  new object's owner and group from its maker's token.
+- **Why Everyone.** The host registered no `GetSecurity`, so WinFsp's DLL refused every security query
+  `STATUS_INVALID_DEVICE_REQUEST` without calling it (v2.1 `src/dll/fsop.c` 1444-1445), and WinFsp's driver keeps no
+  descriptor from an open unless the volume lets opens run in kernel mode (`AllowOpenInKernelMode`, `src/sys/create.c`
+  699-700, which slates does not set). Windows' I/O manager answers a file system's refusal of a query with its world
+  descriptor: owner and group Everyone and no access list (`D:NO_ACCESS_CONTROL`, as winfstest's outputs printed it).
+  The descriptor the drive did hold, which only WinFsp's open check read, named the Administrators group.
+- **The decision.** The drive still keeps no descriptor per object, and every maker on it is one account: a Windows
+  daemon's clients are its own user (its rendezvous objects admit that user's SID alone, §4.6 "Rendezvous"; A-237
+  records the account as uid 0). So the drive's one descriptor names that account, the user of the daemon's token, as
+  owner and the token's primary group as group, which is what NTFS gives a file the account makes unelevated; and the
+  host answers `GetSecurity` with it, on the receiving thread and without the shard, since every object reports the
+  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before.
+  Rejected: the Administrators group as owner, which git trusts only for an elevated administrator's process, so an
+  unelevated user's repository stays refused; a descriptor kept per object in the volume, a format change for an owner
+  that is the same account on every object; and each object's uid mapped to a SID by WinFsp's POSIX map
+  (`FspPosixMapUidToSid`), since every Windows object's uid is 0, so all would map to one SID and not the user's.
+- **What stays stated.** No access list set or asked for at a create is kept or enforced, and no owner or group set
+  later (no `SetSecurity`; Windows answers such a set with success, as winfstest's `SetFileSecurity` calls show, none of
+  them on the reviewed list). Objects
+  made by other routes (the SDK, a base directory's files, another host) report the same account too.
+- **Cost.** None to the shard: a query is a copy of the mount's bytes on the receiving thread, where WinFsp's DLL
+  refused it before; and the driver now keeps the answered descriptor on the open file node for `SecurityTimeout`, which
+  version-1 parameters without their own take from `FileInfoTimeout`, infinite (`src/sys/volume.c` 255-256), so a second
+  query of an open file stays in the kernel. g258, which measures the receiver, was told.
+- **winfstest.** Three listed cases ask for exactly the drive's access list, `D:P(A;;FA;;;WD)`, and pass with it:
+  `t/base/10.t` cases 2 and 12, and `t/streams/03.t` case 17 (a directory's, after the stream's refusal). They are struck
+  (382 to 379 entries), and the record is re-recorded from diagnostics run 44336880588 (x86_64; arm64 gave the same
+  verdicts): 733 cases, 354 passed, 379 failed, every one listed. Every other SECURITY case reads an
+  access list set after its create, or one the open check would have to enforce, and fails as before.
+- **Tests.** `what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`
+  (`crates/cli/tests/winfsp_semantics.rs`): a directory and a file made through the drive, and the drive's root, report
+  this process's account as owner and its primary group as group, each read through Windows' own
+  `GetNamedSecurityInfoW` and `ConvertSidToStringSidW`. Green on both Windows runners in diagnostics run 44329324901
+  (each owned by the runner's account, `S-1-5-21-…-500`, in its primary group, `…-513`), and red on both with the
+  callback removed: the drive's root reported owner and group `S-1-1-0`, as git saw in CI. And by use, the roster's
+  version-control workloads over the drive (diagnostics run 44336880588, x86_64 and arm64 alike): git and Subversion
+  identical, git's history and Mercurial identical but for the drive's stated hard-link lines (A-300); the drive's
+  workloads record is re-recorded from it, where the record of 2026-11-05 was an owed skip. The SID's text
+  (`crate::account`): golden vectors (the CI
+  runner's account as git printed it, Everyone, the Administrators group, an authority past 2^32 in its hexadecimal
+  form) and hostile bytes (empty, a cut header, another revision, sixteen sub-authorities, a cut sub-authority), on
+  every host.
 
 ### A-337 — A pair's canonical dialer keeps direct contact with a peer that holds a record session it dialed to it (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 direct contact and learners; amends the 2026-10-10 rule that contact is kept from both sides)
 
