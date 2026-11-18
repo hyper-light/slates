@@ -1,5 +1,5 @@
-# DIAG (not for main): the idle-spin poller test under ThreadSanitizer, main's test (pollers_old) against the fixed one
-# (pollers), 16 runs each, interleaved (g251, the TSan pollers flake).
+# DIAG (not for main): the poller test binaries under ThreadSanitizer, whole (the sibling tests running beside, as the
+# lane runs them), main's (pollers_old) against the fixed (pollers), 16 runs each, interleaved (g251, the TSan pollers flake).
 name: diag-g251-pollers
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
           mkdir -p target/diag
           for i in $(seq 1 16); do
             for t in pollers_old pollers; do
-              cargo +nightly test -q -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-rt --test $t -- --exact a_ring_during_the_idle_spin_wakes_a_consuming_poller > target/diag/$t-$i.log 2>&1
+              cargo +nightly test -q -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-rt --test $t > target/diag/$t-$i.log 2>&1
               echo "$t run $i rc=$? $(grep -ho 'spin hits [0-9]*' target/diag/$t-$i.log | head -1) $(grep -ho 'test result: [a-zA-Z]*' target/diag/$t-$i.log | head -1)"
             done
           done | tee target/diag/summary.txt
