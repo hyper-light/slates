@@ -30,8 +30,22 @@ const TICK_NS: u64 = 5_000_000;
 const QUIET: Duration = Duration::from_nanos(WINDOW_NS);
 /// Shape: how long a shard gets to answer a counters question (a step is microseconds).
 const ANSWER: Duration = Duration::from_secs(5);
+/// Shape: the held test's own window, a millisecond: a fifth of the timer period, so the window an activity opens
+/// covers at most the idle moment it began in.
+const OWN_WINDOW_NS: u64 = 1_000_000;
+/// Shape: the hold the held test asks for, as long as the first test's window: forty timer periods, two hundred times
+/// the shard's own window.
+const HOLD_NS: u64 = WINDOW_NS;
+/// Shape: the spins a hold of [`HOLD_NS`] must show at least: half its timer periods, far above the one idle moment the
+/// shard's own window covers, so a run whose timers came late still tells a held window from an unheld one.
+const LEAST_HELD_SPINS: u64 = HOLD_NS / TICK_NS / 2;
 
 fn config() -> RuntimeConfig {
+  config_with_window(WINDOW_NS)
+}
+
+/// A one-shard configuration whose idle window is `window_ns` and tracks no wake estimate.
+fn config_with_window(window_ns: u64) -> RuntimeConfig {
   RuntimeConfig {
     shards: 1,
     tasks_per_shard: 64,
@@ -43,7 +57,7 @@ fn config() -> RuntimeConfig {
     pin: false,
     cores: Vec::new(),
     page_bytes: 4096,
-    spin_ns: WINDOW_NS,
+    spin_ns: window_ns,
     wake_tracking: None,
   }
 }
@@ -112,6 +126,49 @@ fn a_shard_spins_only_inside_the_window_its_last_client_activity_opened() {
     spins(&later),
     spins(&after_window),
     "the shard spun after its client's window had ended: {later:?}"
+  );
+  rt.shutdown().unwrap();
+}
+
+/// A-326 by use (§4.7). Do: run a periodic timer task on an idle shard whose own window is a millisecond; from a task,
+/// hold the shard's window open for two hundred milliseconds (the daemon's hold for a client in R9's closed loop); wait
+/// out the hold; then wait a quiet stretch. Expect: the shard spins at the idle moments all through the hold, two hundred
+/// times its own window (at least half its timer periods: the non-vacuity count), the hold counted; and no spin once
+/// the hold has ended, so a hold never leaves the shard spinning past it.
+#[test]
+fn a_held_window_keeps_the_shard_polling_past_its_own_window_until_the_hold_ends() {
+  let rt = Runtime::start(&config_with_window(OWN_WINDOW_NS)).unwrap();
+  let shard = rt.shard_ids()[0];
+  rt.spawn_on(shard, async {
+    loop {
+      sleep(TICK_NS).await.unwrap();
+    }
+  })
+  .unwrap();
+  let start = counters_of(&rt, shard);
+  rt.spawn_on(shard, async {
+    registry::with_current(|ctx| ctx.hold_idle_window(HOLD_NS));
+  })
+  .unwrap();
+  wait(Duration::from_nanos(HOLD_NS).saturating_mul(2));
+  let held = counters_of(&rt, shard);
+  assert_eq!(
+    held.idle_holds,
+    start.idle_holds + 1,
+    "the hold counted: {held:?}"
+  );
+  assert!(
+    spins(&held) >= spins(&start) + LEAST_HELD_SPINS,
+    "the shard parked inside its hold: {} spins in a hold of {HOLD_NS} ns against a timer period of {TICK_NS} ns: \
+     {held:?}",
+    spins(&held) - spins(&start)
+  );
+  wait(QUIET);
+  let later = counters_of(&rt, shard);
+  assert_eq!(
+    spins(&later),
+    spins(&held),
+    "the shard spun after its hold had ended: {later:?}"
   );
   rt.shutdown().unwrap();
 }

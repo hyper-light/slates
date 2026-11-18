@@ -32,8 +32,11 @@ use crate::{derived, probes, wake};
 /// (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md). 4 (2026-11-05): each
 /// core names the physical core it is a hardware thread of ([`crate::facts::CoreFacts::physical`]), and the
 /// placement counts shards in physical cores, as §4.1 says (A-208); version 3 counted every hardware thread.
+/// 5 (2026-11-05): the wake confirms its waiter asleep on Windows too, by its cycle count, and counts the wakes
+/// it dropped because the waiter had run before its kick ([`crate::wake::WakeLatency::woke_running`], A-223);
+/// version 4's Windows wake let the waiter's announcement stand in.
 /// Format: the version this build writes and the only one it reads.
-pub const PROFILE_VERSION: u32 = 4;
+pub const PROFILE_VERSION: u32 = 5;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,7 +153,7 @@ impl MachineProfile {
     let budget = options.budget_per_probe;
     let timer_overhead_ns = timer_overhead_ns();
     let syscall = probes::syscall(budget);
-    let faults = probes::faults(&facts.page, budget);
+    let faults = probes::faults(&facts.page, budget)?;
     let wake = wake::wake(budget, &Placement::of(&facts.cores, facts.cpu_budget))?;
     let (core_rtt, pinning) = if options.core_matrix {
       probes::core_matrix(&facts.cores, budget)

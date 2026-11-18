@@ -47,6 +47,16 @@ pub struct Mounted {
   pub path: String,
 }
 
+/// A mount removed ([`Instance::unmount`]). On Windows the drive is found among the volumes' reported mounts, and a
+/// volume whose status the daemon refused (one recovery could not rebuild) cannot report its mounts: when another
+/// volume reported the drive and it was released, each such volume is named here, so the caller can say whose mounts
+/// are unknown. Empty on macOS and Linux, whose unmount is the OS's own and asks no volume.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Unmounted {
+  /// Each volume the scan could not ask, and its status's refusal.
+  pub unreported: Vec<crate::error::Unreported>,
+}
+
 /// Format: a mount capability as `attach` returns it — the attachment id and its 16-byte secret token (§4.13; AUD-01),
 /// the bearer authority the daemon validates every request's file handle against.
 pub type MountCapability = (u64, [u8; 16]);
@@ -80,8 +90,8 @@ impl Instance {
 
   /// Removes the mount at `path`: on macOS and Linux the OS's own unmount ([`unmount`]), which needs no daemon; on
   /// Windows the drive is the daemon's own, so its attachment is found among the volumes' reported mounts and
-  /// detached.
-  pub fn unmount(&mut self, path: &str) -> Result<(), Error> {
+  /// detached. What was removed names each volume the Windows scan could not ask ([`Unmounted::unreported`]).
+  pub fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     self.unmount_platform(path)
   }
 
@@ -208,17 +218,20 @@ impl Instance {
 
   /// See [`Instance::unmount`]: the OS's own unmount.
   #[cfg(not(windows))]
-  fn unmount_platform(&mut self, path: &str) -> Result<(), Error> {
-    unmount(path).map_err(Error::Mount)
+  fn unmount_platform(&mut self, path: &str) -> Result<Unmounted, Error> {
+    unmount(path).map_err(Error::Mount)?;
+    Ok(Unmounted::default())
   }
 
   /// See [`Instance::unmount`]: the WinFsp drive at `path` is the daemon's own, so it is unmounted by detaching its
   /// attachment, found among the volumes' reported mounts; the daemon then removes the drive. Every volume is asked:
-  /// one whose status is refused (a volume recovery could not rebuild answers `NotFound`) cannot report its mounts, so
-  /// it is passed over and named in the refusal, and the drive is still released when another volume reports it. A
-  /// channel or daemon failure ends the scan, since no later volume can be asked either.
+  /// one whose status is refused (a volume recovery could not rebuild answers `NotRecovered`) cannot report its mounts,
+  /// so it is passed over and named, and the drive is still released when another volume reports it: named in the
+  /// answer then, in the refusal when no volume reported the drive. Until 2026-11-18 the answer dropped the names
+  /// (the integrator's Windows lane, run 44257181904). A channel or daemon failure ends the scan, since no later volume
+  /// can be asked either.
   #[cfg(windows)]
-  fn unmount_platform(&mut self, path: &str) -> Result<(), Error> {
+  fn unmount_platform(&mut self, path: &str) -> Result<Unmounted, Error> {
     let volumes = self.list()?;
     let mut found = None;
     let mut unreported = Vec::new();
@@ -248,7 +261,10 @@ impl Instance {
       }
     }
     match found {
-      Some(attachment) => self.detach(attachment),
+      Some(attachment) => {
+        self.detach(attachment)?;
+        Ok(Unmounted { unreported })
+      }
       None => Err(Error::Mount(MountFault::NotMounted {
         path: path.to_owned(),
         unreported,

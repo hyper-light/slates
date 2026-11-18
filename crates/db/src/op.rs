@@ -512,6 +512,14 @@ pub enum Op {
     /// The work.
     work: VolumeId,
   },
+  /// A volume's trusted signers were set by its launcher (signed work, A-321): the whole set, replacing the last.
+  /// Appended (2026-11-17).
+  VolumeSignersSet {
+    /// The volume.
+    id: VolumeId,
+    /// The public keys, in SSH wire form, in the order set.
+    keys: Vec<Vec<u8>>,
+  },
 }
 
 impl Op {
@@ -591,6 +599,7 @@ impl Op {
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
+      Op::VolumeSignersSet { .. } => "volume_signers_set",
     }
   }
 }

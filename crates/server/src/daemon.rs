@@ -405,6 +405,9 @@ pub struct ShardPulse {
   /// parks it paid (§4.3), which its step quantum and idle windows follow; 0 until its first measured
   /// wake.
   pub wake_cost_ns: u64,
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake (`ShardContext::counters`); 0 until its
+  /// first. Beside `wake_cost_ns` it shows whether the window follows the estimate (A-223).
+  pub idle_window_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -1656,6 +1659,7 @@ impl Daemon {
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
+          idle_window_ns: entry.pulse.idle_window_ns(),
         })
       })
       .collect()
@@ -2797,8 +2801,9 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), in
-  /// place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each slice after one volume, so
+  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), and
+  /// a returned holder's walk's turns (`live_ship::reached_slice`), in place of the shard's own step quantum; `None` gives
+  /// the shard its own back. Zero ends each slice after one volume, so
   /// a test sees the slicing whatever the machine's wake cost. Delivered like [`Self::inject_live_state_withhold`]; `Ok`
   /// once installed, else the typed refusal.
   pub fn inject_live_period_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
@@ -2821,6 +2826,25 @@ impl Daemon {
       })?;
     }
     Ok(())
+  }
+
+  /// Test support: this node is superseded on `volume` at `epoch` (`live_ship::inject_superseded`, never reachable from
+  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts are told, or as a restart
+  /// over a kept fence finds it, telling none (A-344). So a mount's answer to a takeover (A-346) is driven without a
+  /// fleet, each path alone. Delivered on the volume's owner shard; `Ok` once installed, else the typed refusal.
+  pub fn inject_superseded(
+    &self,
+    volume: slates_ipc::protocol::VolumeId,
+    epoch: u64,
+    learned: bool,
+  ) -> Result<(), ObserveError> {
+    let id = slates_db::catalog::VolumeId {
+      bytes: volume.bytes,
+    };
+    self.observe(
+      self.shard_of_object(slates_db::register::ObjectId(volume.bytes)),
+      move |s| crate::live_ship::inject_superseded(s, id, epoch, learned),
+    )
   }
 
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
@@ -4256,6 +4280,10 @@ async fn init_shard(
     // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).
     tracer: slates_wire::observe::Tracer::new(host.0, partition),
     current_span: None,
+    forward_hold_ns: 0,
+    loop_run: 0,
+    last_client_io_ns: 0,
+    loop_io: false,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
@@ -4287,7 +4315,6 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
-    taken_over: std::collections::BTreeMap::new(),
     seal_walk_quantum_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
@@ -5267,9 +5294,9 @@ impl Drop for EndStreams {
 
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
-/// any client has activity within the window), and idles past it. The window is a multiple of what a
-/// wake costs the shard now — its online wake estimate (§4.3) — so it follows the wakes the shard
-/// actually pays rather than the boot probe's first guess.
+/// any client has activity within the window), and idles past it. The window is the shard's own
+/// (`ShardContext::idle_window_ns`): R9's floor, or the platform's multiple of its online wake estimate where a
+/// loaded wake costs more than parking saves (`config::idle_window_ns`; A-223).
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
@@ -5283,11 +5310,9 @@ async fn serve_loop() {
   }
   loop {
     let idle_window_ns = derived!(
-      futures::wake_cost_ns()
-        .unwrap_or(0)
-        .saturating_mul(crate::config::IDLE_WINDOW_RATIO),
-      "the shard's wake estimate × IDLE_WINDOW_RATIO",
-      ["rt.wake_cost_ns", "IDLE_WINDOW_RATIO"]
+      futures::idle_window_ns().unwrap_or(crate::config::PROVISION_FLOOR_NS),
+      "the shard's idle window: max(provision_floor_ns, wake estimate × loaded_wake_ratio)",
+      ["rt.idle_window_ns"]
     )
     .get();
     let (did, within_window) = state::with_state(|s| {
@@ -8606,22 +8631,27 @@ mod tests {
         Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
       };
       let local = state.fleet.host();
-      let others: Vec<HostId> = (100..104).map(|key| HostId(local.0 ^ key)).collect();
       // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
       let scatter = 3;
       let quorum = Quorum { f: 1 };
-      let members_with = |departed: HostId| {
+      // Shape: each candidate region's ids, the departed member's and its four others', apart from the next one's.
+      let stride = 8;
+      let members_with = |departed: HostId, others: &[HostId]| {
         let mut members = vec![local, departed];
         members.extend(others.iter().copied());
         members
       };
       // A member whose neighbourhood leaves the audit node out, and an object of it whose successor places it
-      // elsewhere too: rendezvous decides both, so search a few ids.
-      let (departed, object) = (1..64u64)
-        .map(|key| HostId(local.0 ^ key))
-        .find_map(|departed| {
+      // elsewhere too: rendezvous decides both, so search a few regions. Each candidate region has members of its own:
+      // with the other four fixed, whether a successor's neighbourhood holds the audit node is fixed by the audit
+      // node's random id alone, and about one id in ten was in all four (4 of 40 runs failed here, 2026-11-18).
+      let (departed, others, object) = (0..64u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let departed = HostId(local.0 ^ (base + 1));
+          let others: Vec<HostId> = (2..6).map(|key| HostId(local.0 ^ (base + key))).collect();
           let formed = RegionalConfiguration::formed(
-            members_with(departed),
+            members_with(departed, &others),
             quorum,
             std::collections::BTreeMap::new(),
             scatter,
@@ -8643,12 +8673,12 @@ mod tests {
                     .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
                 })
             })
-            .map(|object| (departed, object))
+            .map(|object| (departed, others.clone(), object))
         })
         .expect("a member whose neighbourhood and successor both leave the audit node out");
       state.council = RegionalCouncil::new(
         local,
-        members_with(departed),
+        members_with(departed, &others),
         vec![local],
         quorum,
         std::collections::BTreeMap::new(),
