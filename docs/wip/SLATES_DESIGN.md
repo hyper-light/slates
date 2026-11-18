@@ -5805,6 +5805,26 @@ refinement and revalidation before those results can be applied to the corrected
 > (`fleet.takeover.kept_unresolved`) or a lost one (`fleet.takeover.kept_lost`). Why it must drop, and what the operator
 > sees, are A-340's.
 
+> **Status (2026-11-18, A-353: a round started over keeps its epoch over what it adopted; g230).** Each survivor's
+> confirmation of its own share is a new configuration (`RegionalConfiguration::confirm` bumps the version), so a
+> successor whose round adopted before another survivor confirmed starts its round over under that configuration. The
+> round's epoch then rose one above every epoch of the successor's own copies of the objects that fall to it, and those
+> included the objects it had just adopted, whose copies hold its own adoption at the round's epoch: so the round started
+> over one above its own writes, its pages fenced every holder's copy of the adopted registers there (and its own), and
+> every record it wrote for them at its takeover epoch was refused `StaleEpoch` for good. Caught live by g229 on a Mac
+> Studio (2026-11-18, the lossy live flow): the catalog naming the successor's live holders was refused every period,
+> so its shipper never shipped and a write through it waited 21 minutes until killed. Now a round's starting epoch
+> leaves out the objects the round adopted (`takeover::initial_epoch`): a round started over under a newer
+> configuration keeps its epoch, and a holder's re-prepare at the same epoch moves no fence. Counted
+> `fleet.takeover.restarted`. Held by
+> `a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable` (`crates/server/tests/fleet.rs`:
+> both survivors' confirmations withheld, `Daemon::inject_confirmation_withheld`; the other survivor's released once the
+> successor adopted; a write and a snapshot through the successor after its round started over). Owed (GAPS): a round
+> started over above a fence a holder reported, and a round made again after the successor's warm restart, still
+> prepare the objects it adopted above the epoch it writes them at: an acceptor's positions do not record their writer,
+> so telling the successor's own adoption from another's needs the round's epoch kept durably or a writer with each
+> position, a change to model first.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -7026,6 +7046,26 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > can stand in for an ask the owner has not yet made of a live one (a stopped candidate and a stretched period at once,
 > where the rule is A-292's alone).
 >
+> **A held verb's reply ends at the failover SLO (A-354, 2026-11-18; g230).** A verb of the slates protocol whose
+> reply waits for its volume's log (`live_ship::defer`) or for its destroy's tombstone (`live_ship::defer_destroy`) was
+> answered only once durable, fenced or destroyed: every transport judges its own held reply by the rule above, and
+> this, its own holder, by none. So a log that could never be held kept its writer waiting as long as its daemon lived:
+> A-353's successor, whose holders' catalog was refused for good, held a write 21 minutes (g229's capture, 2026-11-18).
+> Each held reply now keeps when it was held and is refused at the rule's total bound, the failover SLO from its hold:
+> judged at the period's visit to its volume (`live_ship::judge_held`), a destroy's once a period on its shard
+> (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
+> `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
+> silence the writer still waits, as the 2026-11-05 sweep chose (a writer waits, never a false success), so a candidate
+> stopped for a few liveness budgets still answers the write when it resumes. The refusal is recorded as the request's
+> completion, as a fence's is, so a retry under the same id meets it (§4.9); the verb's effects stay committed on the
+> owner, never claimed durable, and a consumer runs the verb again under a new id (slates-api's
+> `RetryCause::DurabilityPending`, CONTRACT 22). A retry that joined a request's wait is answered with it, judged by the
+> request's first hold. Held by
+> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`
+> (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
+> places; the write refused after 10.03 and 10.08 s, the same request answered the same refusal, and the write sent again
+> answered `FsDone` once the refusals lifted).
+>
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
 > it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
@@ -7347,7 +7387,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart` and
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
->   until a write, its holders keep the old chain, which holds every write acknowledged before the restart.
+>   until a write, its holders keep the old chain, which holds every write acknowledged before the restart. Across real
+>   processes (2026-11-18): `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
+>   (`crates/cli/tests/live_fleet.rs`, three anchored daemons: the owner killed and replaced by its anchor, a write
+>   through it, then the owner killed whole; a survivor serves every file, and the owner's head after the restart's
+>   write is past its head before it). Owed: its first run (the integrator's lanes).
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -26100,6 +26144,44 @@ Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its s
   the wall, so a shard that stops is judged within a budget of stopping, as before.
 - **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
   judgments on the wall, the anchor's lapse bound and the beat.
+
+### A-353 — A takeover round started over under a newer configuration keeps its epoch over the objects it adopted (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover"; the lossy flow's post-takeover hang)
+Applied in the same change to:
+- §4.8 "Promotion and takeover": A-353's status.
+- `crates/server/src/takeover.rs`: `initial_epoch` leaves out the objects the round adopted; `begin_round` counts a
+  round started over (`fleet.takeover.restarted`); the test hook's withheld confirmation
+  (`fleet.takeover.confirmation_withheld_by_fault`). `crates/server/src/daemon.rs`, `state.rs`:
+  `Daemon::inject_confirmation_withheld`.
+- Tests: `a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable`
+  (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18 (the restart epoch; its owed fence and warm-restart paths).
+- **What was there.** A round started over at `max(its epoch, the epoch a new round would start at)`, and a new round
+  starts one above every epoch of this node's copies of the objects that fall to it. After an adoption those copies
+  hold the adoption itself, at the round's epoch, so every restart of a round that had adopted anything went one above
+  its own writes, and the holders' re-prepare fenced the adopted objects above the epoch the successor writes them at.
+- **The rule.** A round's epoch must exceed the records of the objects it still has to adopt, never its own: the
+  objects a round adopted are left out of its starting epoch, so a round started over under a newer configuration
+  keeps its epoch, and a re-prepare at the same epoch is a promise its holders already made.
+
+### A-354 — A verb's reply held for durability is refused at the failover SLO, never held for good (2026-11-18, g230, scale-out; §4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9)
+Applied in the same change to:
+- §4.10 "Live shipping": A-354's status, beside the rule every transport judges a held reply by.
+- `crates/ipc/src/protocol.rs`: `Refusal::DurabilityPending { held_ns }`, appended and published
+  (`crates/ipc/tests/wire_order.txt`, tag 71). `crates/api/src/error.rs`, `lib.rs`: `RetryCause::DurabilityPending`,
+  CONTRACT 22.
+- `crates/server/src/live_ship.rs`: `Awaiting::held_since_ns`, `judge_held` (at the period's visit to a live volume),
+  `judge_held_destroys` (once a period on each shard), `held_past` (a request's entries judged by its first hold),
+  counters `fleet.live.held_gave_up` and `fleet.destroy.held_gave_up`. `crates/server/src/verbs.rs`: the refusal's name.
+- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`
+  (`crates/server/tests/fleet.rs`); `a_reply_held_past_its_durable_bound_is_a_retry` (`crates/api/src/error.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** A deferred verb's reply ended only once its log was durable where its publication put it (or its
+  tombstone placed), its owner fenced, or its volume destroyed. The 2026-11-05 sweep chose to keep the writer waiting
+  rather than refuse it at the transports' silent window, and nothing bounded the wait: a log that could never be held
+  held its writer for as long as the daemon lived.
+- **The rule.** A held reply waits through a silence and is refused at the total bound of the durable-wait rule, the
+  failover SLO from its hold: the operator's bound on how long an object may go unserved before a takeover serves it,
+  past which a write not yet held is past what the fleet promises. The refusal is the request's recorded outcome.
 
 ### A-351 — A takeover the retired owner cannot lease against completes, and one that gave objects up starts over once its retired owner is heard again, so a fleet settles on one configuration once its faults stop (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 "Leases and reads", "Promotion and takeover", "Membership fed by SWIM"; the chaos nemesis, seeds 6876545201569229162 and 7236833171758868842; AUD-08, A-15, A-304)
 
