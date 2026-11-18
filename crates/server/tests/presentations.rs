@@ -20,7 +20,7 @@ use slates_client::{
   Client, ClientError, ConflictClass, CreateSpec, EntriesCursor, Filter, Landing, LandingSummary,
   PlannedAction, PlannedContent, PlannedEntry, Refusal, SnapshotId, VolumeId,
 };
-use slates_ipc::protocol::{GrantScope, Intent};
+use slates_ipc::protocol::{AuditKind, GrantScope, Intent};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -613,6 +613,77 @@ fn a_landed_presentations_list_named_what_it_wrote_and_goes_with_it() {
     matches!(consumed, Err(ClientError::Refused(Refusal::NotFound))),
     "the landed presentation's list went with it: {consumed:?}"
   );
+  drop(client);
+  daemon.stop();
+}
+
+/// §4.15 "Audit" (AUD-29-06): a landing's trail records each step once. Do: present a scratch volume's file, grant the
+/// manifest, land it under the grant and read the audit. Expect one record of the presentation's plan (no grant), one of
+/// the grant, one of the granted run's plan and one of its finish. Before 2026-11-18 the finish mirrored every record
+/// the engine's ring held for the landing's id, so the presentation's plan, which the presentation records itself, was
+/// recorded twice (measured: plan, grant, plan, plan under the grant, validation, entry, finish;
+/// `docs/bugs/2026-11-18-a-presented-landings-plan-was-audited-twice.md`). One shard: `Audit` reads the partition of
+/// the shard that serves it (GAPS).
+#[test]
+fn a_presented_then_granted_landing_records_each_step_once() {
+  let (daemon, instance) = daemon("audit-once", None);
+  let target = target_dir();
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("audit-once")).unwrap();
+  let attachment = client
+    .attach(volume, None, Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((volume, attachment), "once.txt", b"once", 0o644)
+    .unwrap();
+  let snapshot = client.snapshot(volume).unwrap();
+  let Ok(Landing::GrantRequired {
+    landing, manifest, ..
+  }) = present(&mut client, volume, Some(snapshot), &target.path)
+  else {
+    panic!("the landing was not presented");
+  };
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let proof = slates_server::landing::grant_proof(
+    &secret,
+    landing,
+    &manifest,
+    GrantScope::Once,
+    GRANT_TERM_NS,
+  );
+  let grant = client
+    .grant(landing, manifest, GrantScope::Once, GRANT_TERM_NS, proof)
+    .unwrap();
+  let landed = client
+    .land(
+      volume,
+      Some(snapshot),
+      &target.path,
+      Filter::default(),
+      Some(grant),
+    )
+    .unwrap();
+  assert!(matches!(landed, Landing::Landed(_)), "{landed:?}");
+  let steps: Vec<(AuditKind, Option<u64>)> = client
+    .audit(0)
+    .unwrap()
+    .iter()
+    .filter(|record| record.landing == Some(landing))
+    .map(|record| (record.audit_kind, record.grant))
+    .collect();
+  for step in [
+    (AuditKind::LandingPlanned, None),
+    (AuditKind::GrantIssued, Some(grant)),
+    (AuditKind::LandingPlanned, Some(grant)),
+    (AuditKind::LandingFinished, Some(grant)),
+  ] {
+    assert_eq!(
+      steps.iter().filter(|recorded| **recorded == step).count(),
+      1,
+      "{step:?} once: {steps:?}"
+    );
+  }
   drop(client);
   daemon.stop();
 }

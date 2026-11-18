@@ -66,6 +66,19 @@ pub struct MergeStatement {
   pub statement: Vec<u8>,
 }
 
+/// A landing's answer as signed work sees it (A-321; [`Client::land_with_signature`]): the landing's outcome, how its
+/// signature was judged (`Unsigned` when it carried none), and for a presentation the statement a signature over it signs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedLanding {
+  /// The outcome: landed, or presented for a grant.
+  pub landing: Landing,
+  /// How the landing's signature was judged.
+  pub verification: Verification,
+  /// The landing's statement, for a presentation: the volume, the target as the request named it and the presented
+  /// manifest, which a signer signs under the namespace `slates-work`.
+  pub statement: Option<Vec<u8>>,
+}
+
 /// A green version's merge record as a consumer reads it back (A-321, [`Client::merge_record`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeRecord {
@@ -964,18 +977,34 @@ fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
 /// Extracts a landing's outcome from its reply — landed, or a grant required — or a typed mismatch.
 /// The same rule the sync [`Client::land`] applies.
 fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
+  extract_signed_landing(body).map(|signed| signed.landing)
+}
+
+/// Extracts a landing's outcome with its signed-work parts (A-321): a finished landing's verdict from its outcome, a
+/// presentation's from its reply, with the statement a signature over it signs.
+fn extract_signed_landing(body: ReplyBody) -> Result<SignedLanding, ClientError> {
   match body {
-    ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
+    ReplyBody::Landed { outcome } => Ok(SignedLanding {
+      verification: outcome.verification,
+      statement: None,
+      landing: Landing::Landed(outcome),
+    }),
     ReplyBody::GrantRequired {
       landing,
       manifest,
       summary,
       conflicts,
-    } => Ok(Landing::GrantRequired {
-      landing,
-      manifest,
-      summary,
-      conflicts,
+      statement,
+      verification,
+    } => Ok(SignedLanding {
+      landing: Landing::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      },
+      verification,
+      statement: Some(statement),
     }),
     _ => Err(ClientError::UnexpectedReply { verb: "land" }),
   }
@@ -2994,6 +3023,7 @@ impl Client {
       target: target.to_owned(),
       filter,
       grant,
+      signature: None,
     })
   }
 
@@ -4138,27 +4168,31 @@ impl Client {
     filter: Filter,
     grant: Option<u64>,
   ) -> Result<Landing, ClientError> {
-    match self.call(&RequestBody::Land {
+    self
+      .land_with_signature((volume, snapshot), target, filter, grant, None)
+      .map(|signed| signed.landing)
+  }
+
+  /// [`Client::land`] as signed work when `signature` is given (A-321): an SSH signature blob over the landing's
+  /// statement (a presentation's answer carries it), made under the namespace `slates-work`. The daemon judges it
+  /// against the manifest the landing writes, or presents, under the volume's trusted signers, records the verdict with
+  /// the landing's audit records, and answers it beside the landing's outcome. It permits nothing: the write mode does.
+  pub fn land_with_signature(
+    &mut self,
+    (volume, snapshot): (VolumeId, Option<SnapshotId>),
+    target: &str,
+    filter: Filter,
+    grant: Option<u64>,
+    signature: Option<&[u8]>,
+  ) -> Result<SignedLanding, ClientError> {
+    extract_signed_landing(self.call(&RequestBody::Land {
       volume,
       snapshot,
       target: target.to_owned(),
       filter,
       grant,
-    })? {
-      ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
-      ReplyBody::GrantRequired {
-        landing,
-        manifest,
-        summary,
-        conflicts,
-      } => Ok(Landing::GrantRequired {
-        landing,
-        manifest,
-        summary,
-        conflicts,
-      }),
-      _ => Err(ClientError::UnexpectedReply { verb: "land" }),
-    }
+      signature: signature.map(<[u8]>::to_vec),
+    })?)
   }
 
   /// Presents a landing and never lands it, whatever the volume's write policy (A-285): `Landing::GrantRequired` with
@@ -4171,11 +4205,26 @@ impl Client {
     target: &str,
     filter: Filter,
   ) -> Result<Landing, ClientError> {
-    extract_landed(self.call(&RequestBody::Present {
+    self
+      .present_with_signature((volume, snapshot), target, filter, None)
+      .map(|signed| signed.landing)
+  }
+
+  /// [`Client::present`] carrying a signature (A-321): the presentation's answer says how it was judged against the
+  /// presented manifest, and carries the statement a signature over the landing signs.
+  pub fn present_with_signature(
+    &mut self,
+    (volume, snapshot): (VolumeId, Option<SnapshotId>),
+    target: &str,
+    filter: Filter,
+    signature: Option<&[u8]>,
+  ) -> Result<SignedLanding, ClientError> {
+    extract_signed_landing(self.call(&RequestBody::Present {
       volume,
       snapshot,
       target: target.to_owned(),
       filter,
+      signature: signature.map(<[u8]>::to_vec),
     })?)
   }
 

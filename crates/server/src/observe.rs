@@ -273,11 +273,25 @@ pub(crate) struct ShardTime {
 /// the watchdog's replays run `crate::watchdog::ShardWatch::judge`.
 #[derive(Clone, Copy, Debug)]
 struct OwnTime {
+  /// The wait's budget on the wall: no window is longer, so a shard that stops is judged within it.
   budget_ns: u64,
+  /// The CPU the shard may run before a busy one that never answers ends the wait: the budget held to this build
+  /// ([`held_to_this_build`], A-318's rule for a poll's CPU).
+  cpu_budget_ns: u64,
   /// The CPU time the shard had run when the observation began.
   began: Option<u64>,
   /// The shard's progress at the last window's end (first: at the observation's start); it only rises.
   mark: Option<u64>,
+}
+
+/// `ns` of CPU held to the build this process runs (A-318): scaled by how much slower it runs compiled code than the
+/// machine runs the same work in machine code, measured once a process (`slates_machine::build_cost::build_cost`), never
+/// below `ns`; where the cost was not measured (Miri, a refused measure), `ns` itself. A wait judged in a shard's own CPU
+/// gives the shard its budget of work, and a build that runs every poll slower needs more CPU for the same work: under
+/// ThreadSanitizer (17.9 to 35.3 times machine code on CI's runners) a shard busy with a second's worth of native work
+/// runs tens of seconds of CPU, and a bare budget gave up on it as a busy shard that would never answer.
+fn held_to_this_build(ns: u64) -> u64 {
+  slates_machine::build_cost::build_cost().map_or(ns, |cost| cost.scale(ns))
 }
 
 impl ShardTime {
@@ -287,6 +301,7 @@ impl ShardTime {
       holder,
       own: OwnTime {
         budget_ns,
+        cpu_budget_ns: held_to_this_build(budget_ns),
         began: began.map(|reading| reading.spent_ns),
         mark: began.map(|reading| reading.progress),
       },
@@ -364,12 +379,16 @@ impl OwnTime {
   }
 
   /// The budget the shard has not yet run at `reading`, as wall time: an uncontended shard runs at the wall clock's pace
-  /// and has next to none left; a starved one has most of it. `None` once it has run the budget, or without a start.
+  /// and has next to none left; a starved one has most of it. `None` once it has run its CPU budget (the budget held to
+  /// this build), or without a start. Never longer than the budget on the wall: a slower build runs more CPU before the
+  /// wait ends, but a shard that stops is still judged within a budget of its stopping, as A-318 leaves the wedged and
+  /// starved judgments on the wall.
   fn unspent_at(&self, reading: CpuReading) -> Option<u64> {
     self
-      .budget_ns
+      .cpu_budget_ns
       .checked_sub(reading.spent_ns.checked_sub(self.began?)?)
       .filter(|unspent| *unspent > 0)
+      .map(|unspent| unspent.min(self.budget_ns))
   }
 
   /// The next window for a shard that ran in the one just ended, its progress marked: the budget it has not yet run.
@@ -680,13 +699,48 @@ mod tests {
   /// Shape: the CPU one run of the shard is charged: one Windows tick.
   const RUN_NS: u64 = 15_625_000;
 
-  /// The rule as a wait begins.
+  /// The rule as a wait begins, in a build that runs compiled code at machine code's speed.
   fn begun() -> OwnTime {
     OwnTime {
       budget_ns: BUDGET_NS,
+      cpu_budget_ns: BUDGET_NS,
       began: Some(BEGAN_NS),
       mark: Some(MARK),
     }
+  }
+
+  /// A-318's sibling, §4.14. Do: in a build measured three times as slow as machine code (its CPU budget three wall
+  /// budgets), end windows whose clock shows the shard ran a budget and a half of CPU, then a further budget, then the
+  /// rest of its three. Expect: past the bare budget the shard is given another window, never longer than the wall budget,
+  /// and the wait ends once it has run its three budgets. Before, the bare budget was its CPU too, and a busy shard in a
+  /// slower build was given up on at one budget of CPU, as a shard that would never answer.
+  #[test]
+  fn a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build() {
+    let slowdown = 3;
+    let mut own = OwnTime {
+      cpu_budget_ns: slowdown * BUDGET_NS,
+      ..begun()
+    };
+    let half = BUDGET_NS / 2;
+    let first = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + BUDGET_NS + half, MARK + 1)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(
+      first,
+      Some(BUDGET_NS),
+      "past the bare budget, within the build's: a whole window, the wall budget at most"
+    );
+    let second = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + 2 * BUDGET_NS + half, MARK + 2)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(second, Some(half), "the CPU budget it has not yet run");
+    let third = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + slowdown * BUDGET_NS, MARK + 3)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(third, None, "it ran the budget held to its build");
   }
 
   /// A clock reading: `spent_ns` of CPU run in all, progress count `progress`.

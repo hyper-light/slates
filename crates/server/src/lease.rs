@@ -282,6 +282,11 @@ pub enum LeaseVerdict {
     /// The confirmations it needs ([`confirmations_needed`]).
     needed: usize,
   },
+  /// This node lost the object to a successor (`verbs::lost_to_a_successor`): it yielded it when its host was admitted
+  /// again under its id (A-334), or its log of it was fenced at a later epoch (A-338), so the successor serves it.
+  /// However this node's lease stands, it never serves the object's latest state from its copy, which its successor's
+  /// writes have passed.
+  LostToSuccessor,
 }
 
 impl LeaseVerdict {
@@ -296,9 +301,15 @@ impl LeaseVerdict {
       LeaseVerdict::Holds => None,
       LeaseVerdict::Superseded { .. } => Some(LEASE_SUPERSEDED),
       LeaseVerdict::Unconfirmed { .. } => Some(LEASE_UNCONFIRMED),
+      LeaseVerdict::LostToSuccessor => Some(LEASE_LOST_TO_SUCCESSOR),
     }
   }
 }
+
+/// The status count under which a node records a latest-state request it refused for an object it lost to a successor
+/// ([`LeaseVerdict::LostToSuccessor`]).
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+pub const LEASE_LOST_TO_SUCCESSOR: &str = "lease.refused.lost_to_successor";
 
 /// The status count under which an owner records a latest-state request it refused while superseded
 /// ([`LeaseVerdict::Superseded`]).

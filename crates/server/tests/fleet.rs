@@ -3095,6 +3095,30 @@ fn start_mesh_unbootstrapped(
 /// Each node's (probe, record) serve port pair, in node order.
 type PortPairs = [(u16, u16)];
 
+/// The failover SLO the meshes started next are configured with in place of the derived default (0: the default),
+/// for a test whose subject is an SLO below a path's floor ([`a_forward_is_never_refused_below_its_paths_floor`]). Set
+/// and cleared by [`MeshFailoverSlo`]; the fleet tests run one at a time ([`serialize_fleet_tests`]), so no other test's
+/// mesh reads it.
+static MESH_FAILOVER_SLO_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Holds [`MESH_FAILOVER_SLO_NS`] at a value for its life, and clears it when dropped, a failed assertion's unwinding
+/// included.
+struct MeshFailoverSlo;
+
+impl MeshFailoverSlo {
+  /// The meshes started while this lives are configured with a failover SLO of `slo_ns`.
+  fn set(slo_ns: u64) -> MeshFailoverSlo {
+    MESH_FAILOVER_SLO_NS.store(slo_ns, std::sync::atomic::Ordering::Release);
+    MeshFailoverSlo
+  }
+}
+
+impl Drop for MeshFailoverSlo {
+  fn drop(&mut self) {
+    MESH_FAILOVER_SLO_NS.store(0, std::sync::atomic::Ordering::Release);
+  }
+}
+
 /// [`start_mesh_unbootstrapped`] with each node bound at its pair of `bound` and advertised at its pair of `advertised`
 /// (A-277): its peers dial it at the advertised pair and it announces that pair, so a node advertised where a port
 /// mapping listens is reached only through the mapping. Where the two pairs are the same, the node binds where it
@@ -3150,6 +3174,10 @@ fn start_mesh_bound_and_advertised(
           durability: None,
           region_mirrors: mirrors.clone(),
         });
+      let config = match MESH_FAILOVER_SLO_NS.load(std::sync::atomic::Ordering::Acquire) {
+        0 => config,
+        slo_ns => config.with_failover_slo(slo_ns),
+      };
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
@@ -6124,18 +6152,27 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
   }
 }
 
-/// Shape: how long a test waits, in the daemons' own time, for b to drop a deaf session and answer on a new one: the
-/// rule's window (a liveness budget, or the session's persistent-congestion duration if longer, about 2 s), the next
-/// return of the session by whichever borrower holds it (every hold is bounded by a derived budget), and the redial.
-const DEAD_SESSION_WATCH: Duration = Duration::from_nanos(8 * LIVENESS_BUDGET_NS);
-/// Shape: [`DEAD_SESSION_WATCH`] as the fleet's own periods, one a heartbeat, so a watch that never holds (the red case)
-/// spends its own periods rather than `poll_until`'s whole convergence budget (about 400 s).
-const DEAD_SESSION_WATCH_PERIODS: u64 =
-  8 * LIVENESS_BUDGET_NS / slates_server::daemon::HEARTBEAT_NS;
-/// Shape: how soon after the drop the forward lane's first answer on the replacement must come: the link dials again at
-/// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
-/// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
-const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon::HEARTBEAT_NS;
+/// Derived: the coordinator periods a dead-session test watches for, in the daemons' own time (`poll_for_periods`): the
+/// forwards' failover bound on `daemon` (`DaemonConfig::failover_slo_ns`, one period a heartbeat). Past it a forward
+/// through the dead session is refused and sent afresh, so an answer after it is no longer the lane's recovery, and the
+/// red case (no borrower judges the session) spends the watch and fails. Counted in periods, never on the wall: a daemon
+/// kept off its CPUs runs fewer of them a wall second, so the watch stretches with it (A-228). On the wall it read 8 s,
+/// which the burst's 256 connects alone outlasted at nice 19 beside two spinners a CPU (20 of 20 runs, diagnostics run
+/// 44274886122).
+fn dead_session_watch_periods(daemon: &Daemon) -> u64 {
+  daemon
+    .config()
+    .failover_slo_ns
+    .div_ceil(slates_server::daemon::HEARTBEAT_NS)
+}
+/// Derived: the coordinator periods within which b's forward lane owes its first answer on the replacement after the
+/// drop (§4.8 "Lookup", the design's rule): the link dials again at its next pace, one period, and a forward begun on the
+/// new session is answered within its own stall budget, a liveness budget, both in b's own periods. On the wall it read
+/// 1.1 s, and at nice 19 beside two spinners a CPU every recovery missed it (2.3 to 13.7 s, 20 of 20 runs, diagnostics
+/// run 44274886122) while no live session was dropped and no forward was given up: the machine's wait, not the lane's.
+const DEAD_SESSION_RECOVERY_PERIODS: u64 = (LIVENESS_BUDGET_NS
+  + slates_server::daemon::HEARTBEAT_NS)
+  .div_ceil(slates_server::daemon::HEARTBEAT_NS);
 /// Shape: the readers that keep b's forward lane borrowing its session to a, each with one read in flight and the next
 /// sent as the last is answered: enough that a borrower returns the session every turn, the only place it is judged
 /// with discovery held, and few enough that the recovery timed is the product's (the link's redial and a round trip).
@@ -6143,10 +6180,6 @@ const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon
 /// was missed at 1.33 s (loadtest-scale, load 41) and 1.38 s (load 28 to 47, 2026-11-18): the burst is the resend's
 /// test ([`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]), not this one's.
 const DEAD_SESSION_READERS: usize = 4;
-/// Shape: how long a reader waits for one read: the failover bound a forward is resent within, and a liveness budget
-/// for the refusal that ends it to come back, so a read through the dead session is always answered one way or the
-/// other before the reader asks again.
-const DEAD_SESSION_READ_NS: u64 = slates_server::config::FAILOVER_SLO_NS + LIVENESS_BUDGET_NS;
 /// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s readers keep reading.
 static DEAD_SESSION_READING: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
@@ -6154,12 +6187,21 @@ static DEAD_SESSION_READING: std::sync::atomic::AtomicBool =
 static DEAD_SESSION_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One reader of [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]: reads `read` through `instance`
-/// while the readers are on, one read at a time, and counts each read served, refused, or not answered in its time.
-fn read_while_reading(instance: &str, read: &RequestBody) -> [u64; 3] {
-  let mut client = Client::connect(instance);
+/// while the readers are on, one read at a time, and counts each read served, refused, or not answered while `control`
+/// (the node's control shard) ran `patience_periods` of its own periods.
+fn read_while_reading(
+  instance: &str,
+  read: &RequestBody,
+  control: u16,
+  patience_periods: u64,
+) -> [u64; 3] {
+  let mut client = Client::connect_for_periods(instance, control, patience_periods);
   let mut counts = [0u64; 3];
   while DEAD_SESSION_READING.load(std::sync::atomic::Ordering::Acquire) {
-    match client.try_call(read, DEAD_SESSION_READ_NS) {
+    match client
+      .try_call_for_periods(read, control, patience_periods)
+      .1
+    {
       Ok(ReplyBody::Status { .. }) => {
         counts[0] += 1;
         DEAD_SESSION_SERVED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -6182,10 +6224,13 @@ fn read_while_reading(instance: &str, read: &RequestBody) -> [u64; 3] {
 /// pages on the session and nothing but the return of a borrow can judge it. Do: three nodes; a volume on a, read
 /// through b by four readers that keep b's forward lane borrowing the session; b's session to a made deaf. Expect: b
 /// judges the session silent where a borrower returns it (`fleet::return_sessions`), drops it, and the forward lane's
-/// first answer on the replacement comes within a liveness budget of the drop. Before: no borrower judged it, the
-/// readers' forwards were given up and resent into it until their failover bound, and no replacement was ever answered.
-/// With the return's judgment removed it fails 5 of 5, and passes 5 of 5 with it (answered on the replacement 21 to 112
-/// ms after the drop), interleaved on a Mac beside 8 spinners at load 33 to 56 (2026-11-18).
+/// first answer on the replacement comes within [`DEAD_SESSION_RECOVERY_PERIODS`] of b's own periods of the drop (its
+/// redial pace and a forward's stall budget). Before: no borrower judged it, the readers' forwards were given up and
+/// resent into it until their failover bound, and no replacement was ever answered. With the return's judgment removed it
+/// fails 5 of 5, and passes 5 of 5 with it (answered on the replacement 21 to 112 ms after the drop), interleaved on a Mac
+/// beside 8 spinners at load 33 to 56 (2026-11-18). Every wait is in the daemons' own periods since 2026-11-18 (goal
+/// g255): on the wall, at nice 19 beside two spinners a CPU, it failed 20 of 20 on its 1.1 s recovery bound with no
+/// live session dropped and no forward given up (the integrator's diagnostics run 44274886122).
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
@@ -6208,55 +6253,53 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
+  // Every wait below is charged in the daemons' own periods (`poll_for_periods`), never on the wall.
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let watch = dead_session_watch_periods(&daemons[1]);
   // The link's own discovery refresh, which can take the session from its slot when a page falls due, is held, so the
   // rescue tested is the one at the return of a borrow.
-  let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
-  let holding = Instant::now();
-  while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
-    held = daemons[1].inject_discovery_hold(Some(hosts[0]));
-  }
+  let held = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1]
+      .inject_discovery_hold(Some(hosts[0]))
+      .map(|()| true)
+  });
   DEAD_SESSION_READING.store(true, std::sync::atomic::Ordering::Release);
   DEAD_SESSION_SERVED.store(0, std::sync::atomic::Ordering::Release);
+  // Derived: a reader's patience for one read, in b's own periods: the failover bound its forward is resent within and a
+  // liveness budget for the refusal that ends it to come back, so a read through the dead session is answered one way or
+  // the other before the reader asks again.
+  let read_patience = (daemons[1].config().failover_slo_ns + LIVENESS_BUDGET_NS)
+    .div_ceil(slates_server::daemon::HEARTBEAT_NS);
+  let control_b = daemons[1].shards()[0].0;
   let readers: Vec<std::thread::JoinHandle<[u64; 3]>> = (0..DEAD_SESSION_READERS)
     .map(|_| {
       let through_b = daemons[1].instance().to_owned();
       let read = read.clone();
-      std::thread::spawn(move || read_while_reading(&through_b, &read))
+      std::thread::spawn(move || read_while_reading(&through_b, &read, control_b, read_patience))
     })
     .collect();
   // The lane forwarding before the session goes deaf: a read of every reader served on the healthy session.
-  let starting = Instant::now();
   let readers_served = || DEAD_SESSION_SERVED.load(std::sync::atomic::Ordering::Acquire);
-  while readers_served() < u64::try_from(DEAD_SESSION_READERS).unwrap()
-    && starting.elapsed() < DEAD_SESSION_WATCH
-  {
-    std::thread::yield_now();
-  }
+  poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    Ok(readers_served() >= u64::try_from(DEAD_SESSION_READERS).unwrap())
+  });
   let forwarding = readers_served();
   // Installed once the control shard answers.
-  let mut marked = daemons[1].inject_session_deafness(hosts[0]);
-  let marking = Instant::now();
-  while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
-    marked = daemons[1].inject_session_deafness(hosts[0]);
-  }
-  // Until the lane has answered on the replacement, charged in the daemons' own periods (`poll_for_periods`).
+  let marked = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1].inject_session_deafness(hosts[0]).map(|()| true)
+  });
+  // Until the lane has answered on the replacement.
   let mut recovered = None;
-  let everyone: Vec<&Daemon> = daemons.iter().collect();
-  poll_for_periods(
-    &everyone,
-    DEAD_SESSION_WATCH,
-    DEAD_SESSION_WATCH_PERIODS,
-    || {
-      recovered = daemons[1]
-        .observation(
-          Some(daemons[1].shards()[0]),
-          slates_server::daemon::OBSERVE_BUDGET_NS,
-          |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
-        )?
-        .wait()?;
-      Ok(recovered.is_some())
-    },
-  );
+  poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    recovered = daemons[1]
+      .observation(
+        Some(daemons[1].shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |s: &mut slates_server::state::ShardState| s.dead_session_recovered,
+      )?
+      .wait()?;
+    Ok(recovered.is_some())
+  });
   drop(everyone);
   DEAD_SESSION_READING.store(false, std::sync::atomic::Ordering::Release);
   let reads: Vec<[u64; 3]> = readers
@@ -6276,25 +6319,26 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     daemon.stop();
   }
   eprintln!(
-    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; reads [served, refused, \
-     unanswered] per reader {reads:?}; b's counters {counters:?}",
-    recovered.map(Duration::from_nanos)
+    "b's deaf session to a: the lane answered on its replacement {:?} and {:?} of b's periods after the drop; reads \
+     [served, refused, unanswered] per reader {reads:?}; b's counters {counters:?}",
+    recovered.map(|span| Duration::from_nanos(span.ns)),
+    recovered.map(|span| span.periods)
   );
   assert!(routed, "b routed the volume to a: {last:?}");
-  assert_eq!(held, Ok(()), "b's discovery to a was held");
+  assert!(held, "b's discovery to a was held");
   assert!(
     forwarding >= u64::try_from(DEAD_SESSION_READERS).unwrap(),
     "b's lane served a read of every reader before the deafness: {forwarding} served"
   );
-  assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(marked, "the deafness was installed on b");
   let judged = counters
     .iter()
     .find(|(name, _)| *name == "fleet.link.session_judged_dead")
     .map_or(0, |(_, count)| *count);
   let recovered = recovered.unwrap_or_else(|| {
     panic!(
-      "b never answered on a replacement within the watch ({DEAD_SESSION_WATCH:?} of the daemons' periods) of the \
-       session going deaf: no borrower judged it silent (counters {counters:?})"
+      "b never answered on a replacement within the watch ({watch} of the daemons' periods, its forwards' failover \
+       bound) of the session going deaf: no borrower judged it silent (counters {counters:?})"
     )
   });
   assert!(
@@ -6302,10 +6346,11 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     "the deaf session was dropped where a borrower returned it: fleet.link.session_judged_dead {judged}"
   );
   assert!(
-    recovered <= DEAD_SESSION_RECOVERY_NS,
-    "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
-    Duration::from_nanos(recovered),
-    Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
+    recovered.periods <= DEAD_SESSION_RECOVERY_PERIODS,
+    "the lane's first answer on the replacement came {} of b's periods ({:?}) after the drop, past \
+     {DEAD_SESSION_RECOVERY_PERIODS} periods",
+    recovered.periods,
+    Duration::from_nanos(recovered.ns)
   );
 }
 
@@ -6321,14 +6366,22 @@ static PLACE_BURST_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// [`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]'s burst: reads through `instance` from
 /// [`PLACE_BURST_CLIENTS`] clients a round at a time, a ring of `slots` each, while it is on: the rounds it finished.
-fn burst_while_on(instance: &str, read: &RequestBody, slots: usize) -> u64 {
+/// Its connects wait in the daemon's own periods (`control`, at most `periods` each), and a round sends only into the
+/// room each ring has, so a daemon kept off its CPUs slows the burst and never fails it on a wall.
+fn burst_while_on(
+  instance: &str,
+  read: &RequestBody,
+  slots: usize,
+  control: u16,
+  periods: u64,
+) -> u64 {
   let mut clients: Vec<Client> = (0..PLACE_BURST_CLIENTS)
-    .map(|_| Client::connect(instance))
+    .map(|_| Client::connect_for_periods(instance, control, periods))
     .collect();
   let mut rounds = 0u64;
   while PLACE_BURST_ON.load(std::sync::atomic::Ordering::Acquire) {
     for client in &mut clients {
-      client.send_burst(read, slots);
+      client.send_burst_while_room(read, slots);
     }
     PLACE_BURST_SENT.store(true, std::sync::atomic::Ordering::Release);
     for client in &mut clients {
@@ -6348,7 +6401,10 @@ fn burst_while_on(instance: &str, read: &RequestBody, slots: usize) -> u64 {
 /// (`fleet.forward.resent_in_place`), and the probe is answered on the replacement within its failover bound. Before:
 /// with the probe sent just after the burst's first round, it was refused at its bound in 1 of 10 runs on a Mac at load
 /// 37 to 46 and answered 9.2 and 9.5 s after its send in two more; with its place kept, 4.1 to 6.5 s in 10 of 10 at
-/// load 27 to 33 (2026-11-18). Sent before the burst, as here, its place is the lane's first.
+/// load 27 to 33 (2026-11-18). Sent before the burst, as here, its place is the lane's first. Every wait is in the
+/// daemons' own periods since 2026-11-18 (goal g255), the probe's failover bound too: on the wall, at nice 19 beside two
+/// spinners a CPU, it failed 20 of 20 (the burst's 256 connects outlasted an 8 s wait, a connect's claim outlasted its
+/// credit wait once, and the test's own 11 s deadline cut off the probe's answer), with no live session dropped.
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
@@ -6372,57 +6428,51 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
   let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
   let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
-  let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
-  let holding = Instant::now();
-  while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
-    held = daemons[1].inject_discovery_hold(Some(hosts[0]));
-  }
-  let mut marked = daemons[1].inject_session_deafness(hosts[0]);
-  let marking = Instant::now();
-  while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
-    marked = daemons[1].inject_session_deafness(hosts[0]);
-  }
+  // Every wait below is charged in the daemons' own periods, never on the wall: the injections and the deafness within
+  // the probe's failover bound, the probe's answer within that bound and a liveness budget for a refusal to come back,
+  // and the burst's first round within `poll_until`'s convergence budget, its 256 connects being as slow as the daemon.
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let watch = dead_session_watch_periods(&daemons[1]);
+  let control_b = daemons[1].shards()[0].0;
+  let held = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1]
+      .inject_discovery_hold(Some(hosts[0]))
+      .map(|()| true)
+  });
+  let marked = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1].inject_session_deafness(hosts[0]).map(|()| true)
+  });
   // The probe: its forward takes the session first, and that turn makes it deaf.
   let probe_read = read.clone();
   let probe_through_b = daemons[1].instance().to_owned();
+  let patience = (daemons[1].config().failover_slo_ns + LIVENESS_BUDGET_NS)
+    .div_ceil(slates_server::daemon::HEARTBEAT_NS);
   let asking = std::thread::spawn(move || {
-    let mut probe = Client::connect(&probe_through_b);
+    let mut probe = Client::connect_for_periods(&probe_through_b, control_b, patience);
     let began = Instant::now();
-    let reply = probe.try_call(
-      &probe_read,
-      slates_server::config::FAILOVER_SLO_NS + LIVENESS_BUDGET_NS,
-    );
-    (began.elapsed(), reply)
+    let (periods, reply) = probe.try_call_for_periods(&probe_read, control_b, patience);
+    (began.elapsed(), periods, reply)
   });
-  let everyone: Vec<&Daemon> = daemons.iter().collect();
-  let deafened = poll_for_periods(
-    &everyone,
-    DEAD_SESSION_WATCH,
-    DEAD_SESSION_WATCH_PERIODS,
-    || {
-      daemons[1]
-        .observation(
-          Some(daemons[1].shards()[0]),
-          slates_server::daemon::OBSERVE_BUDGET_NS,
-          |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
-        )?
-        .wait()
-    },
-  );
+  let deafened = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1]
+      .observation(
+        Some(daemons[1].shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
+      )?
+      .wait()
+  });
   // The burst, every forward of it first queued after the probe's.
   PLACE_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
   PLACE_BURST_SENT.store(false, std::sync::atomic::Ordering::Release);
   let through_b = daemons[1].instance().to_owned();
   let burst_read = read.clone();
-  let burst = std::thread::spawn(move || burst_while_on(&through_b, &burst_read, slots));
-  let starting = Instant::now();
-  while !PLACE_BURST_SENT.load(std::sync::atomic::Ordering::Acquire)
-    && starting.elapsed() < DEAD_SESSION_WATCH
-  {
-    std::thread::yield_now();
-  }
-  let sent = PLACE_BURST_SENT.load(std::sync::atomic::Ordering::Acquire);
-  let (took, answer) = asking.join().unwrap();
+  let burst =
+    std::thread::spawn(move || burst_while_on(&through_b, &burst_read, slots, control_b, patience));
+  let sent = poll_until(&everyone, FROZEN_CAP, || {
+    Ok(PLACE_BURST_SENT.load(std::sync::atomic::Ordering::Acquire))
+  });
+  let (took, took_periods, answer) = asking.join().unwrap();
   PLACE_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
   let rounds = burst.join().unwrap();
   drop(everyone);
@@ -6441,8 +6491,8 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
     daemon.stop();
   }
   eprintln!(
-    "the probe through b's dead session: answered after {took:?} with {answer:?}; burst rounds {rounds}; b's \
-     counters {counters:?}"
+    "the probe through b's dead session: answered after {took:?} and {took_periods} of b's periods with {answer:?}; \
+     burst rounds {rounds}; b's counters {counters:?}"
   );
   let count = |wanted: &str| {
     counters
@@ -6451,15 +6501,15 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
       .map_or(0, |(_, count)| *count)
   };
   assert!(routed, "b routed the volume to a: {last:?}");
-  assert_eq!(held, Ok(()), "b's discovery to a was held");
-  assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(held, "b's discovery to a was held");
+  assert!(marked, "the deafness was installed on b");
   assert!(
     deafened,
     "the probe's forward took b's session to a and made it deaf"
   );
   assert!(
     sent,
-    "the burst sent its first round within {DEAD_SESSION_WATCH:?} of starting"
+    "the burst sent its first round within the convergence budget of the daemons' own periods"
   );
   assert!(
     count("fleet.link.session_judged_dead") >= 1,
@@ -6474,8 +6524,104 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
     "the probe was answered on the replacement session: {answer:?} after {took:?}"
   );
   assert!(
-    took <= Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS),
-    "the probe was answered within its failover bound: {took:?}"
+    took_periods <= watch,
+    "the probe was answered within its failover bound, {watch} of b's own periods: {took_periods} ({took:?})"
+  );
+}
+
+/// §4.8 "Lookup", A-352 (goal g255): a forward is never refused below the floor of the path it waits on. A forward
+/// through a session gone silent can be answered only once the transport has judged the session dead, the link has
+/// dialed again and the replacement has carried it, and a failover SLO shorter than that (an operator's choice, or a
+/// path a starved process stretched) refused the forward `OwnerUnreachable` at the SLO, before the session could even be
+/// judged. Do: three nodes whose failover SLO is one liveness budget, below the transport's silence window on any path
+/// (never under a liveness budget, and floored at three initial probe timeouts, about 2 s); a volume on a; b's discovery
+/// to a held; b's session to a made deaf; a probe read through b, the first forward after the deafness. Expect: b drops
+/// the deaf session, and the probe is answered on the replacement after its SLO has passed, b counting the forward held
+/// at its path's measured floor (`fleet.forward.held_past_slo`). Before A-352: refused `OwnerUnreachable` at the SLO.
+#[test]
+fn a_forward_is_never_refused_below_its_paths_floor() {
+  let _serial = serialize_fleet_tests();
+  let _slo = MeshFailoverSlo::set(LIVENESS_BUDGET_NS);
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let slo = Duration::from_nanos(daemons[1].config().failover_slo_ns);
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "below-floor", &daemons);
+  let mut router = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  // Every wait is in the daemons' own periods; the probe's within `poll_until`'s convergence budget, since what is
+  // asserted is how it is answered, not how soon.
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let watch = dead_session_watch_periods(&daemons[1]);
+  let control_b = daemons[1].shards()[0].0;
+  let held = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1]
+      .inject_discovery_hold(Some(hosts[0]))
+      .map(|()| true)
+  });
+  let marked = poll_for_periods(&everyone, FROZEN_CAP, watch, || {
+    daemons[1].inject_session_deafness(hosts[0]).map(|()| true)
+  });
+  let mut probe = Client::connect_for_periods(daemons[1].instance(), control_b, PERIOD_BUDGET);
+  let began = Instant::now();
+  let (periods, answer) = probe.try_call_for_periods(&read, control_b, PERIOD_BUDGET);
+  let took = began.elapsed();
+  drop(everyone);
+  let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
+    .into_iter()
+    .filter(|(name, _)| {
+      name.contains("judged_dead")
+        || name.contains("given_up")
+        || name.contains("past_slo")
+        || name.contains("replaced_answered")
+    })
+    .collect();
+  drop(probe);
+  drop(router);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "the probe through b's deaf session under a {slo:?} failover SLO: answered after {took:?} and {periods} of b's \
+     periods with {answer:?}; b's counters {counters:?}"
+  );
+  let count = |wanted: &str| {
+    counters
+      .iter()
+      .find(|(name, _)| *name == wanted)
+      .map_or(0, |(_, count)| *count)
+  };
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert!(held, "b's discovery to a was held");
+  assert!(marked, "the deafness was installed on b");
+  assert!(
+    matches!(answer, Ok(ReplyBody::Status { .. })),
+    "the probe was answered on the replacement, never refused below its path's floor: {answer:?} after {took:?}"
+  );
+  assert!(
+    took > slo,
+    "the probe's answer came past its failover SLO ({took:?} against {slo:?}), so the floor is what held it"
+  );
+  assert!(
+    count("fleet.link.session_judged_dead") >= 1,
+    "b dropped the deaf session where a borrower returned it"
+  );
+  assert!(
+    count("fleet.forward.held_past_slo") >= 1,
+    "b held the probe's bound at its path's measured floor"
   );
 }
 
@@ -8756,6 +8902,46 @@ impl Client {
     }
   }
 
+  /// [`connect`](Self::connect), its retries charged in the daemons' own time: a claim the daemon did not answer within
+  /// the claim wait is made again while `control`, its control shard, has run fewer than `periods` of its coordinator
+  /// periods since the first, or until it ran none for [`FROZEN_CAP`], so a daemon kept off its CPUs, which answers a
+  /// claim late, is never taken for one that is gone (A-232). At nice 19 beside two spinners a CPU a burst's connect
+  /// failed on [`CREDIT_WAIT`]'s wall in 1 of 20 runs (the integrator's diagnostics run 44274886122).
+  fn connect_for_periods(instance: &str, control: u16, periods: u64) -> Client {
+    let progress =
+      || slates_rt::registry::with_entry(control, |entry| entry.pulse.progress()).unwrap_or(0);
+    let began = progress();
+    let mut seen = began;
+    let mut advanced = Instant::now();
+    loop {
+      match connect(instance) {
+        Ok(connected) => {
+          let client = connected.region.client_id();
+          return Client {
+            end: ClientEnd::connected(connected),
+            client,
+            sequence: 0,
+            acknowledged: 0,
+          };
+        }
+        Err(IpcError::DaemonUnavailable { .. }) => {
+          let now = progress();
+          if now != seen {
+            seen = now;
+            advanced = Instant::now();
+          }
+          assert!(
+            now.saturating_sub(began) < periods && advanced.elapsed() < FROZEN_CAP,
+            "{instance} answered no claim while its control shard ran {} periods",
+            now.saturating_sub(began)
+          );
+          std::thread::yield_now();
+        }
+        Err(e) => panic!("{e}"),
+      }
+    }
+  }
+
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
     if matches!(body, RequestBody::DaemonStatus) {
       // Acknowledged once before the first page, as `slates_client` does, and never between pages: any request but the
@@ -8838,6 +9024,61 @@ impl Client {
     Ok(unpack(self.end.region(), reply.kind, &reply.payload).unwrap())
   }
 
+  /// Sends `body` as the next request and waits for its reply while `control`, the daemon's control shard, has run fewer
+  /// than `periods` of its own coordinator periods since the send ([`Daemon::fleet_progress`]'s count, read off the
+  /// runtime's registry so this thread needs no daemon handle), or until it ran none for [`FROZEN_CAP`]: the daemons'
+  /// own time, as [`poll_for_periods`] charges a wait, so an answer a starved daemon is still working on is never cut
+  /// off by a wall the machine kept it from (A-228, A-232). The periods it waited, with the reply or the typed error.
+  fn try_call_for_periods(
+    &mut self,
+    body: &RequestBody,
+    control: u16,
+    periods: u64,
+  ) -> (u64, Result<ReplyBody, IpcError>) {
+    self.acknowledge_if_due();
+    self.sequence += 1;
+    let id = RequestId {
+      client: self.client,
+      sequence: self.sequence,
+    };
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )
+    .unwrap();
+    if let Err(refused) = self.end.send(&slot) {
+      return (0, Err(refused));
+    }
+    let progress =
+      || slates_rt::registry::with_entry(control, |entry| entry.pulse.progress()).unwrap_or(0);
+    let began = progress();
+    let mut seen = began;
+    let mut advanced = Instant::now();
+    loop {
+      let waited = self.end.wait(Some(HEARTBEAT_NS));
+      let now = progress();
+      match waited {
+        Ok(reply) => {
+          let body = unpack(self.end.region(), reply.kind, &reply.payload).unwrap();
+          return (now.saturating_sub(began), Ok(body));
+        }
+        Err(IpcError::DeadlineExceeded) => {}
+        Err(other) => return (now.saturating_sub(began), Err(other)),
+      }
+      if now != seen {
+        seen = now;
+        advanced = Instant::now();
+      }
+      if now.saturating_sub(began) >= periods || advanced.elapsed() >= FROZEN_CAP {
+        return (now.saturating_sub(began), Err(IpcError::DeadlineExceeded));
+      }
+    }
+  }
+
   /// Re-sends the **same** request id as the last call (a retry, like [`call_retry`](Self::call_retry))
   /// and waits at most `deadline_ns` for its reply, returning the typed error instead of panicking.
   fn try_retry(&mut self, body: &RequestBody, deadline_ns: u64) -> Result<ReplyBody, IpcError> {
@@ -8887,6 +9128,34 @@ impl Client {
         }
       }
     }
+  }
+
+  /// Sends up to `count` requests of `body` under new ids without waiting for any reply, as
+  /// [`send_burst`](Self::send_burst) does, but stops at a full request ring rather than waiting for room: a burst that
+  /// keeps a ring of requests in flight leaves the rest of a full ring to its next round, so a daemon kept off its CPUs,
+  /// which drains a ring slowly, never fails the burst on a wall it was kept from. The requests sent.
+  fn send_burst_while_room(&mut self, body: &RequestBody, count: usize) -> usize {
+    for sent in 0..count {
+      let id = RequestId {
+        client: self.client,
+        sequence: self.sequence + 1,
+      };
+      let index = self.end.next_request_index();
+      let slot = pack(
+        self.end.region_mut(),
+        Direction::Request,
+        index,
+        id.word(),
+        body,
+      )
+      .unwrap();
+      match self.end.send(&slot) {
+        Ok(()) => self.sequence += 1,
+        Err(IpcError::RingFull) => return sent,
+        Err(e) => panic!("a burst's send: {e}"),
+      }
+    }
+    count
   }
 
   /// [`collect_tagged`](Self::collect_tagged) in one unbroken wait: each reply with when it came, from `began`.
@@ -12039,6 +12308,174 @@ fn a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds
   );
 }
 
+/// Format: the status count of the volumes a shard yielded at its host's re-admission (`readmission::YIELDED`).
+const READMISSION_YIELDED: &str = "fleet.readmission.yielded";
+/// Shape: how long reads through an owner admitted again are made: past the lease bound a read parks for (the stale
+/// answer before A-334 came from a parked read served once the lease confirmed), the owner location's round, and its
+/// forward's resends, twice over.
+const READMITTED_READS: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+/// Shape: the pause between two of those reads.
+const READMITTED_READ_PACE: Duration = Duration::from_millis(50);
+
+/// The bytes [`an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`]
+/// writes through the successor, after the takeover: the file the owner's own copy never held.
+fn written_by_the_successor() -> Vec<u8> {
+  b"written through the successor after its owner's false death\n".to_vec()
+}
+
+/// A live volume on `daemons[0]`, shared with every node's account and written once (`/first`, answered at durability).
+fn shared_live_volume(daemons: &[Daemon]) -> VolumeId {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("owner-admitted-again")) else {
+    panic!("the live volume is created on its owner");
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/first".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first write is answered at durability: {first:?}"
+  );
+  id
+}
+
+/// Cuts `daemons[0]`, the live volume's owner (`hosts[0]`), off the probe plane both ways while it runs on, so the
+/// survivors stop answering it and judge it dead, and their promotion opens once they have not answered it for the
+/// horizon; waits for one of them to take its live volume over. That survivor's index. A false death injected alone is
+/// refuted while the owner still probes, and its objects are never taken over (the holders kept answering it).
+fn falsely_taken_over(daemons: &[Daemon], hosts: &[HostId]) -> usize {
+  isolate_owner_on_the_probe_plane(daemons, hosts);
+  let survivors: Vec<&Daemon> = daemons.iter().skip(1).collect();
+  let mut successor = None;
+  let took = poll_until(&survivors, RETIREMENT_DEADLINE + SERVE_DEADLINE, || {
+    successor = (1..daemons.len())
+      .find(|index| refusal_count(&daemons[*index], LIVE_TAKEN_OVER).is_ok_and(|count| count > 0));
+    Ok(successor.is_some())
+  });
+  assert!(
+    took,
+    "a survivor took the live volume over from its owner cut off the probe plane"
+  );
+  successor.unwrap()
+}
+
+/// Ends [`falsely_taken_over`]'s cut: every node hears every other on the probe plane again, so the owner, still alive,
+/// refutes its death and is admitted again under its id.
+fn heal_the_probe_plane(daemons: &[Daemon]) {
+  for daemon in daemons {
+    daemon
+      .inject_probe_deafness(&[])
+      .expect("the probe plane is whole again");
+  }
+}
+
+/// This node's host epoch, from its status, through a client of `daemon`.
+fn host_epoch_of(daemon: &Daemon) -> Option<u64> {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.fleet.host_epoch),
+    _ => None,
+  }
+}
+
+/// Reads `/second` of `volume` through `daemon` every [`READMITTED_READ_PACE`] until it answers its bytes or
+/// [`READMITTED_READS`] passes: every answer, in order.
+fn reads_through(daemon: &Daemon, volume: VolumeId) -> Vec<ReplyBody> {
+  let mut client = Client::connect(daemon.instance());
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  let began = Instant::now();
+  let mut answers = Vec::new();
+  while began.elapsed() < READMITTED_READS {
+    let answer = client.call(&RequestBody::Read {
+      volume,
+      path: "/second".to_owned(),
+      at: ReadAt::Head,
+    });
+    let served =
+      matches!(&answer, ReplyBody::ReadBytes { bytes } if *bytes == written_by_the_successor());
+    answers.push(answer);
+    if served {
+      break;
+    }
+    let _ = pace.recv_timeout(READMITTED_READ_PACE);
+  }
+  answers
+}
+
+/// A-334, §4.8 "Authority scope" and "Leases and reads" (ReadSafety through an owner admitted again; T-8.7's partition).
+/// Do: on a three-node fleet, make a live volume on a, share it and write a first file; cut a off the probe plane both
+/// ways while it runs, so the council retires it and a survivor takes the volume over; write a second file through the
+/// successor; heal, and wait until a, refuting its death, is admitted again at a newer host epoch; read the second file
+/// through a. Expect: every read answers the file's bytes or a refusal, never `NotFound` or other bytes, and one answers
+/// its bytes (a forwards it to the successor); and a counted the volume yielded. Before A-334, a served the copy its
+/// catalog kept, once its lease confirmed again, and answered the second file `NotFound`: what the SIGSTOP owner flow of
+/// `crates/cli/tests/live_chaos.rs` read through its resumed owner (goal g229, 2026-11-18).
+#[test]
+fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy()
+ {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = shared_live_volume(&daemons);
+  let successor = falsely_taken_over(&daemons, &hosts);
+  let mut writer = Client::connect(daemons[successor].instance());
+  let attachment = write_attachment(&mut writer, id);
+  let second = writer.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/second".to_owned(),
+    bytes: written_by_the_successor(),
+    mode: 0o644,
+  });
+  assert!(
+    matches!(second, ReplyBody::FsDone { .. }),
+    "the successor's write is answered at durability: {second:?}"
+  );
+  heal_the_probe_plane(&daemons);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  let answers = reads_through(&daemons[0], id);
+  let yielded = refusal_count(&daemons[0], READMISSION_YIELDED);
+  drop(daemons);
+  let stale: Vec<&ReplyBody> = answers
+    .iter()
+    .filter(|answer| match answer {
+      ReplyBody::ReadBytes { bytes } => *bytes != written_by_the_successor(),
+      ReplyBody::Refused { refusal } => matches!(refusal, Refusal::NotFound),
+      _ => false,
+    })
+    .collect();
+  assert!(
+    stale.is_empty(),
+    "an owner admitted again answered its successor's acknowledged write from its own copy: {stale:?} of {answers:?}"
+  );
+  assert!(
+    answers
+      .last()
+      .is_some_and(|answer| matches!(answer, ReplyBody::ReadBytes { .. })),
+    "a read through the owner admitted again reached the successor's write: {answers:?}"
+  );
+  assert!(
+    matches!(yielded, Ok(count) if count > 0),
+    "the owner admitted again yielded its volume: {yielded:?}"
+  );
+}
+
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
 /// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
 /// has to cover; the hold ends with the owner in any case.
@@ -13673,7 +14110,7 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
 /// The reports of `a_successor_reports_the_loss_window_its_takeover_left`. Expect the owner's report at its placed seal
 /// (`sealed`) to put nothing at risk and name that seal's head sequence; its report after the later writes
 /// (`unsealed`) to put them at risk, still naming that seal; and the successor's (`taken`) to report a takeover served
-/// from that seal, not a live log, under a later epoch.
+/// from that seal, not a live log, under a later epoch, within tolerance (A-332).
 fn expect_the_loss_window_reported_then_taken(
   sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
   unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
@@ -13699,6 +14136,10 @@ fn expect_the_loss_window_reported_then_taken(
   assert!(
     !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
     "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
+  );
+  assert_eq!(
+    taken.past_tolerance, None,
+    "two of three members survived at f = 1, so the takeover was within tolerance (A-332): {taken:?}"
   );
 }
 
@@ -14522,6 +14963,65 @@ fn a_superseded_owners_nfs_mount_answers_stale() {
   assert!(
     stale,
     "a read through the old owner's mount answered NFS3ERR_STALE: {statuses:?}"
+  );
+}
+
+/// A-334 with A-346 (§4.8 "Leases and reads", "Authority scope"): an idle volume's NFS mount on an owner admitted again
+/// learns of the takeover at the re-admission's yield, with no write to meet a holder's fence. Do: three nodes at
+/// `f = 1`; on a, a live-shipped volume shared with the fleet; mount it over NFS on a's port, create a file there and
+/// write it; cut a off the probe plane both ways until a survivor takes the volume over, then heal and wait until a,
+/// refuting its death, is admitted again at a newer host epoch; then only read the file through the same mount. Expect a
+/// read answered `NFS3ERR_STALE` within the wait, and a counted the volume yielded. Before, the gate read the fenced
+/// log alone, which a never learns without a write, so its mount answered the reads from its own copy once its lease
+/// confirmed again.
+#[test]
+fn an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let name = "yielded-nfs";
+  let mut client = Client::connect(daemons[0].instance());
+  let id = live_volume_named(&mut client, &daemons, name);
+  drop(client);
+  let port = daemons[0].nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability_path(&daemons[0], name), 1);
+  let file_fh = create(&mut stream, &root_fh, "idle-over-nfs.txt", 2);
+  write(&mut stream, &file_fh, b"before the takeover", 3);
+  let successor = falsely_taken_over(&daemons, &hosts);
+  heal_the_probe_plane(&daemons);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  let mut xid = 3;
+  let mut statuses = Vec::new();
+  let stale = readmitted
+    && poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+      xid += 1;
+      let read = read_status(&mut stream, &file_fh, xid);
+      statuses.push(read);
+      Ok(read == NFS3ERR_STALE)
+    });
+  drop(observed);
+  drop(stream);
+  let yielded = refusal_count(&daemons[0], READMISSION_YIELDED);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "an idle volume's NFS mount on an owner admitted again: taken over by node {successor}, readmitted {readmitted}, \
+     yielded {yielded:?}, the last statuses {:?}",
+    statuses.iter().rev().take(6).collect::<Vec<_>>()
+  );
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  assert!(
+    matches!(yielded, Ok(count) if count > 0),
+    "the owner admitted again yielded its volume: {yielded:?}"
+  );
+  assert!(
+    stale,
+    "a read through the owner admitted again answered NFS3ERR_STALE with nothing written after the takeover: \
+     {statuses:?}"
   );
 }
 
@@ -18460,6 +18960,125 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
+  );
+}
+
+/// Shape: the coordinator periods [`a_work_catalog_with_no_session_to_ship_over_waits_for_the_period`] holds the
+/// creating node's record sessions out: several, so a plane that retries the catalog once a period is seen to, and the
+/// counter's bound below is a few periods' worth, not one.
+const CATALOG_HELD_PERIODS: u64 = 5;
+
+/// §4.16 "Commit", A-255's work catalog (g251; windows-11-arm, where `a_submit_made_while_the_council_forms_...` ended
+/// its binary exit 4 in 3 of 3 runs, "shard 0 is spinning", the stuck shard inside `run_record_plane`'s poll,
+/// diag-g251-spin-3). Do: on a formed three-node fleet at `f = 1`, one shard a node, hold the creating node's record
+/// sessions to both peers out of their links for [`CATALOG_HELD_PERIODS`] periods, create a green and a work there, so
+/// the work's catalog finds no session to ship over, and count the catalog ships that found none. Expect: the record
+/// plane retries the catalog at most once a coordinator period meanwhile (the ships with no session grow by at most the
+/// periods that passed, plus the work's own nudge), and once the sessions return a submit of the work is answered as
+/// version 1. Before, the arm that ships a work's catalog nudged the record plane whatever the ship did, so a ship that
+/// found no session ran the next merge pass at once, in the same poll, and the next: the control shard never yielded,
+/// the hold's own task never ran to give the sessions back, and the watchdog ended the process.
+#[test]
+fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let held_ns = HEARTBEAT_NS * CATALOG_HELD_PERIODS;
+  let holds: Vec<_> = hosts
+    .iter()
+    .skip(1)
+    .map(|peer| daemons[0].hold_record_session(*peer, held_ns))
+    .collect();
+  let no_session = |daemon: &Daemon| {
+    daemon
+      .fleet_refusals()
+      .ok()
+      .and_then(|refusals| refusals.get("fleet.ship.catalog.no_session").copied())
+      .unwrap_or(0)
+  };
+  let before = no_session(&daemons[0]);
+  let held_from = Instant::now();
+  let created = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  });
+  // Read once the hold has run out: a plane that waits for its period retried a few times; one that never yields is
+  // read after its watchdog, or not at all.
+  let (_hold, pause) = std::sync::mpsc::channel::<()>();
+  let _ = pause.recv_timeout(Duration::from_nanos(held_ns));
+  let during = no_session(&daemons[0]).saturating_sub(before);
+  let periods =
+    u64::try_from(held_from.elapsed().as_nanos() / u128::from(HEARTBEAT_NS)).unwrap_or(u64::MAX);
+  let submitted = match created {
+    ReplyBody::WorkCreated { id: work, .. } => {
+      let _ = client.call(&RequestBody::Edit {
+        work,
+        path: "f".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"hello".to_vec(),
+      });
+      client
+        .try_call(
+          &RequestBody::Submit {
+            work,
+            evidence: Vec::new(),
+          },
+          u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
+        )
+        .ok()
+    }
+    _ => None,
+  };
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    holds
+      .iter()
+      .all(|held| matches!(held, Ok(SessionHold::Took { .. }))),
+    "both peers' record sessions were held out: {holds:?}"
+  );
+  assert!(
+    matches!(created, ReplyBody::WorkCreated { .. }),
+    "the work was created: {created:?}"
+  );
+  assert!(
+    during > 0,
+    "the work's catalog was shipped with no session to ship over while the sessions were held (non-vacuity)"
+  );
+  // A period ships each catalog its node owes at most twice with no session: once among the period's heads
+  // (`run_record_period`) and once in a merge pass a nudge from elsewhere ran (`pace_running_merges`). Two catalogs
+  // can be owed here, the green's (made just before the hold, and perhaps not yet placed) and the work's, over the
+  // periods that passed and the one under way; the work's own nudge runs one pass more.
+  let owed_catalogs = 2;
+  let ships_a_period = 2;
+  let most = periods
+    .saturating_add(1)
+    .saturating_mul(owed_catalogs * ships_a_period)
+    .saturating_add(1);
+  assert!(
+    during <= most,
+    "the catalog was shipped {during} times with no session in {periods} periods (at most {most}): the record plane \
+     ran its passes back to back instead of waiting for its period"
+  );
+  assert_eq!(
+    submitted,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "once the sessions returned the catalog committed and the submit was answered"
   );
 }
 
