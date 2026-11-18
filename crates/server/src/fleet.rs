@@ -6276,8 +6276,9 @@ async fn restore_in_turns(
   };
   futures::yield_now().await;
   let mut restoring = making_turn(object, |s| {
-    let (budget, room) =
-      past_the_pressure_hold(s, |s| verbs::restore_admitted(s, id, catalog, planned.needed()));
+    let (budget, room) = past_the_pressure_hold(s, |s| {
+      verbs::restore_admitted(s, id, catalog, planned.needed())
+    });
     planned
       .restoring(budget)
       .map_err(|e| materialize_refusal_counter(&verbs::restore_refused(e, room)))
