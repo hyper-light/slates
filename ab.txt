@@ -2414,3 +2414,5 @@ slates-server: shard 0 initialized in 1929 µs
 slates daemon: instance fsb-1629-10-dll serving on 3 shards under the anchor
 slates daemon: a heartbeat came 553 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 207 steps and 141 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 52 ms and its timer overrun 472 ms
 ## run 10 of 10 done, 2026-11-18T13:49:41Z
+To https://github.com/hyper-light/slates
+   aee8557..9b53e6d  9b53e6d80b6d549999ba4552473f629737ad3be2 -> diag-results/g258-44292211799-dll-arm
