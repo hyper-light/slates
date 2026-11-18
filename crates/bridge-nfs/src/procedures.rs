@@ -3135,7 +3135,7 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotDirectory => Nfsstat3::Notdir,
     VfsError::IsDirectory => Nfsstat3::Isdir,
     VfsError::NotEmpty => Nfsstat3::Notempty,
-    VfsError::NoSpace => Nfsstat3::Nospc,
+    VfsError::NoSpace | VfsError::RetentionExceeded => Nfsstat3::Nospc,
     // An offset or length past what the volume addresses: the file would be too large (RFC 1813 §2.6), never the
     // server's own fault.
     VfsError::FileTooLarge => Nfsstat3::Fbig,
