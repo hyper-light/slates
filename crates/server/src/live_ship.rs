@@ -717,12 +717,12 @@ fn note_asked(live: &mut LiveVolume, now_ns: u64) {
 const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
 /// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
-/// apart while a silence is confirmed, and at most the shard's failover SLO from the hold (10 s by default; the
-/// supervisor's landing condition of 2026-11-11, banned item 8).
+/// apart while a silence is confirmed, and at most the failover delay from the hold, this node's live estimate (A-363;
+/// the operator's 10 s placeholder before; the supervisor's landing condition of 2026-11-11, banned item 8).
 fn durable_spans(state: &ShardState) -> Spans {
   Spans {
     window_ns: DURABLE_WAIT_NS,
-    total_ns: state.config.failover_slo_ns,
+    total_ns: state.failover_ns,
     look_ns: DURABLE_LOOK_NS,
   }
 }

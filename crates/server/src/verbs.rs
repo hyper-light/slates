@@ -1976,7 +1976,7 @@ async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<Ho
   let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let began = slates_rt::futures::now_ns();
   let horizon = crate::lease::horizon_ns();
-  let ceiling = crate::state::with_state(|state| state.config.failover_slo_ns).unwrap_or(horizon);
+  let ceiling = crate::state::with_state(|state| state.failover_ns).unwrap_or(horizon);
   let known = || crate::state::with_state(|state| query.known_owner(state, None)).flatten();
   loop {
     let look_began = slates_rt::futures::now_ns().saturating_sub(began);
@@ -13191,8 +13191,10 @@ fn restore_held_image(
     )
   });
   match recovered_hold {
-    Ok(hold) => {
+    Ok(mut hold) => {
       rebuilt.replicas = hold.manifest_count();
+      // The image it was rebuilt from carries every piece of it, so no change is owed to the next publication (A-376).
+      hold.clear_changes();
       state.held_content = hold;
     }
     Err(e) => {
