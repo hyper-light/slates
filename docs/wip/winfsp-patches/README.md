@@ -17,7 +17,9 @@ file system makes a hard link, and git's and Mercurial's local clones copy on sl
   name with an open handle, as a rename's target. Its completion acquires no second file node (it runs on the file
   system's answering thread); it takes a replaced name's node out of the name table as a rename does, invalidates the
   new name's directory listing and notifies its watchers. `NumberOfLinks` becomes the file system's count for such a
-  volume, 1 for a directory. A volume without `HardLinks` is answered as before.
+  volume, 1 for a directory; the file node keeps the count with the rest of the information it caches, since a query
+  is answered from that cache (the first build read a field the cache never filled: 1 for a file with two names, on the
+  VM). A volume without `HardLinks` is answered as before.
 - `0002` advertises `FILE_SUPPORTS_HARD_LINKS` for such a volume.
 
 The definitions some WDKs lack (`FileLinkInformationEx`'s class 72, its `Flags`, two `FILE_LINK_*` flags) are WinFsp's

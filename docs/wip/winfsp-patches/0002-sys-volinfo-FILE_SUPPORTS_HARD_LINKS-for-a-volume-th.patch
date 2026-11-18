@@ -1,4 +1,4 @@
-From d3afb20dcbd7790dafc7e465e58bc57cf72e4550 Mon Sep 17 00:00:00 2001
+From 2708c772545dfd693fde452d414d58bbdec35a7d Mon Sep 17 00:00:00 2001
 From: Ada Lundhe <adalundhe@lundhe.audio>
 Date: Wed, 18 Nov 2026 07:03:57 -0800
 Subject: [PATCH 2/2] sys: volinfo: FILE_SUPPORTS_HARD_LINKS for a volume that
@@ -12,10 +12,10 @@ do; GetVolumeInformation's FILE_SUPPORTS_HARD_LINKS is what programs read before
  2 files changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/src/sys/driver.h b/src/sys/driver.h
-index b55365a5..8609a128 100644
+index 319657c8..eff5b82c 100644
 --- a/src/sys/driver.h
 +++ b/src/sys/driver.h
-@@ -2051,6 +2051,9 @@ typedef struct
+@@ -2052,6 +2052,9 @@ typedef struct
  } FSP_FILE_LINK_INFORMATION_EX, *PFSP_FILE_LINK_INFORMATION_EX;
  #define FSP_FILE_LINK_POSIX_SEMANTICS           0x00000002
  #define FSP_FILE_LINK_IGNORE_READONLY_ATTRIBUTE 0x00000040
