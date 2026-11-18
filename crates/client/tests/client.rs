@@ -1306,12 +1306,13 @@ fn a_read_map_of_a_directory_is_refused_typed() {
 }
 
 /// A-299's sibling sweep (the integrator, 2026-11-18): a read of a directory is refused as the volume core's typed
-/// `IsDirectory`, whether whole (`Read`, which the asynchronous SDKs send) or paged (`ReadRange`, which
-/// `Client::read` and the library send). Do: on a volume holding a directory, read it both ways. Expect:
-/// `Refusal::Volume { IsDirectory }` from each. Until 2026-11-18 each was `BadRequest { "the path is a directory" }`
-/// (`crates/server/src/merge_service.rs`, `read_plain` and `read_plain_range`).
+/// `IsDirectory`, never in words. Do: on a volume holding a directory, read it (`ReadRange`, which `Client::read` and
+/// the library send). Expect: `Refusal::Volume { IsDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is a
+/// directory" }` (`crates/server/src/merge_service.rs`, `read_plain_range`). The whole-file `Read`, the other read the
+/// sweep typed, is retired (A-267): refused `Unsupported` whatever it names, in its published wire place
+/// (`crates/server/tests/base_read_pages.rs`).
 #[test]
-fn a_read_of_a_directory_is_refused_typed_whole_or_paged() {
+fn a_paged_read_of_a_directory_is_refused_typed() {
   let (_daemon, mut client, _instance) = one_shard_daemon("readdir");
   let id = client.create(&room_for("readdir", 4 << 10)).unwrap();
   let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
@@ -1319,14 +1320,6 @@ fn a_read_of_a_directory_is_refused_typed_whole_or_paged() {
   let typed = Refusal::Volume {
     refusal: VolumeRefusal::IsDirectory,
   };
-  match client.call(&RequestBody::Read {
-    volume: id,
-    path: "/d".to_owned(),
-    at: slates_client::ReadAt::Head,
-  }) {
-    Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a whole read"),
-    other => panic!("a typed refusal expected of a whole read: {other:?}"),
-  }
   match client.read(id, "/d", slates_client::ReadAt::Head) {
     Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a paged read"),
     other => panic!("a typed refusal expected of a paged read: {other:?}"),

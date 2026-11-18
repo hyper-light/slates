@@ -208,6 +208,11 @@ pub mod flags {
   /// `fs/fuse/acl.c`). Asked for on a guest kernel's route alone, whose ACLs are the guest's (A-314); a host's mount
   /// reaches no ACL (A-302), so its kernel must never ask for one.
   pub const POSIX_ACL: u64 = 1 << 20;
+  /// Format: FUSE_SETXATTR_EXT — the kernel sends the extended `fuse_setxattr_in` ([`super::SETXATTR_IN_BYTES`]), whose
+  /// third word carries the setter's flags ([`super::SETXATTR_ACL_KILL_SGID`]); set from the reply's flags alone, any
+  /// minor (Linux `fs/fuse/inode.c` `process_init_reply`, `fs/fuse/xattr.c` `fuse_setxattr`; protocol 7.33). Asked for
+  /// on a guest kernel's route, with [`POSIX_ACL`] (A-378).
+  pub const SETXATTR_EXT: u64 = 1 << 29;
   /// Format: FUSE_HAS_EXPIRE_ONLY — the kernel honours `FUSE_EXPIRE_ONLY` on an entry
   /// invalidation (revalidate the name on its next use rather than drop it now; 6.2+). In the
   /// second flags word (`flags2`), hence the bit above 31.
@@ -218,6 +223,18 @@ pub mod flags {
   /// `flags2`, hence the bit above 31.
   pub const HAS_RESEND: u64 = 1 << 39;
 }
+
+/// Format: the bytes of `fuse_setxattr_in` before its name under [`flags::SETXATTR_EXT`]: the value's size, the
+/// `setxattr(2)` flags, the setter's flags and a zero pad, a little-endian `u32` each.
+pub const SETXATTR_IN_BYTES: usize = 4 * size_of::<u32>();
+/// Format: the bytes of `fuse_setxattr_in` before its name without [`flags::SETXATTR_EXT`]
+/// (`FUSE_COMPAT_SETXATTR_IN_SIZE`): the value's size and the `setxattr(2)` flags.
+pub const COMPAT_SETXATTR_IN_BYTES: usize = 2 * size_of::<u32>();
+/// Format: FUSE_SETXATTR_ACL_KILL_SGID, a setter's flag in the extended `fuse_setxattr_in`: clear the file's
+/// set-group-ID bit as `system.posix_acl_access` is set. Linux sends it when the setter is outside the file's group
+/// and lacks `CAP_FSETID`, on a connection with [`flags::POSIX_ACL`] (`fs/fuse/acl.c` `fuse_set_acl`), as a local
+/// filesystem's `posix_acl_update_mode` clears the bit itself.
+pub const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
 
 /// The `fuse_open_out.open_flags` slates sets on an `OPEN`, `OPENDIR` or `CREATE` reply (`<linux/fuse.h>`; a kernel
 /// that does not know one ignores it).

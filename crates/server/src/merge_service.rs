@@ -403,6 +403,10 @@ pub struct MergeRetention {
   pub history: u64,
   /// The same, recounted from the histories (the balance check).
   pub history_recounted: u64,
+  /// The change index's bytes (the paths each version changed, A-264), as the engine's running total.
+  pub changes: u64,
+  /// The same, recounted from the index (the balance check).
+  pub changes_recounted: u64,
   /// The rejected-result cache's bytes.
   pub rejected: u64,
   /// The bytes the green has charged to the shard's budget as retention.
@@ -428,6 +432,8 @@ pub(crate) fn merge_retention(state: &ShardState, green: DbVolumeId) -> MergeRet
     content: as_u64(retained.content),
     history: as_u64(retained.history),
     history_recounted: as_u64(engine.history_bytes_recounted()),
+    changes: as_u64(retained.changes),
+    changes_recounted: as_u64(engine.changes_recounted()),
     rejected: as_u64(retained.rejected),
     charged: state.green_retention.get(&green).copied().unwrap_or(0),
     folded_below: engine.folded_below(),
@@ -1050,57 +1056,7 @@ pub(crate) fn advance(
   );
   // A move up may raise the reachable floor: fold and credit what that releases.
   let _ = settle_green_retention(state, pin.green);
-  ReplyBody::Advanced {
-    version: target,
-    invalidated,
-  }
-}
-
-/// `read(volume, path, at)` (§4.12 `slates.fs.read`): a file's bytes at a view. A green serves
-/// its head, a named version (`UnknownBase` past the head) or the version an attachment pins (the
-/// attachment must be of this green); a work serves its live content (`BadRequest` for a version
-/// or attachment view, which a work has no chain for); a plain volume serves its live tree through
-/// the volume core (an overlay through its host). A path that names nothing is `NotFound`; a
-/// directory is `BadRequest`.
-pub(crate) fn read(
-  state: &mut ShardState,
-  principal: &Principal,
-  volume: VolumeId,
-  path: &str,
-  at: ReadAt,
-) -> ReplyBody {
-  let record = match find_record(state, volume) {
-    Ok(record) => record,
-    Err(refusal) => return refused(refusal),
-  };
-  if !rights_of(&record, principal).read {
-    return forbidden("read");
-  }
-  let key = canonical_path(path);
-  match record.policy.role {
-    Role::Green { .. } => read_green(state, record.id, key, at),
-    Role::Work { .. } => match at {
-      ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.files.get(work_base(state, w), key) {
-          Ok(Some(bytes)) => ReplyBody::ReadBytes {
-            bytes: bytes.to_vec(),
-          },
-          Ok(None) => refused(Refusal::NotFound),
-          Err(_) => refused(unreadable_base(w)),
-        },
-        None => refused(Refusal::NotFound),
-      },
-      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
-        reason: "a work volume has no versions to read at; read its head".to_owned(),
-      }),
-    },
-    Role::Plain => match at {
-      ReadAt::Head => read_plain(state, volume, path),
-      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
-        reason: "a plain volume has no green versions; read its head".to_owned(),
-      }),
-    },
-  }
+  crate::verbs::advanced_reply(target, invalidated)
 }
 
 /// Format: the encoded bytes of a `ReadPage` reply beside its page (variant, lengths, total, stamp), with room to
@@ -1284,78 +1240,6 @@ fn read_plain_range(
   }
 }
 
-/// A green's file at the head, a named version, or an attachment's pinned version.
-fn read_green(state: &ShardState, green: DbVolumeId, path: &str, at: ReadAt) -> ReplyBody {
-  let Some(engine) = state.greens.get(&green) else {
-    return refused(Refusal::NotFound);
-  };
-  let version = match at {
-    ReadAt::Head => engine.head(),
-    ReadAt::Version { version } => version,
-    ReadAt::Attachment { attachment } => match state.merge.attachments.get(&attachment) {
-      Some(pin) if pin.green == green => pin.version,
-      Some(_) => {
-        return refused(Refusal::BadRequest {
-          reason: "the attachment pins another green".to_owned(),
-        });
-      }
-      None => return refused(Refusal::NotFound),
-    },
-  };
-  if version > engine.head() {
-    return refused(Refusal::UnknownBase {
-      green: wire_id(green),
-      version,
-    });
-  }
-  match engine.content_at(path, version) {
-    Some(bytes) => ReplyBody::ReadBytes { bytes },
-    None => refused(Refusal::NotFound),
-  }
-}
-
-/// A plain volume's file at its head, through the volume core: an overlay through its host (an
-/// untouched entry reads the disk), a scratch volume from the store.
-fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody {
-  let (handle, _) = match find(state, volume) {
-    Ok(found) => found,
-    Err(reply) => return *reply,
-  };
-  let ShardState { store, volumes, .. } = state;
-  let Ok(slot) = volumes.get_mut(handle) else {
-    return refused(Refusal::NotFound);
-  };
-  let read = match slot.host.as_mut() {
-    Some(host) => {
-      let mut overlay = slot.volume.with_host(host);
-      overlay.resolve(store, path).and_then(|located| {
-        if matches!(located.child, Child::Dir(_)) {
-          return Err(slates_vfs::error::VfsError::IsDirectory);
-        }
-        let size = overlay.stat(store, located.inode)?.size;
-        let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
-        let read = overlay.read(store, located.inode, 0, &mut bytes)?;
-        bytes.truncate(read);
-        Ok(bytes)
-      })
-    }
-    None => slot.volume.resolve(store, path).and_then(|located| {
-      if matches!(located.child, Child::Dir(_)) {
-        return Err(slates_vfs::error::VfsError::IsDirectory);
-      }
-      let size = slot.volume.stat(store, located.inode)?.size;
-      let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
-      let read = slot.volume.read(store, located.inode, 0, &mut bytes)?;
-      bytes.truncate(read);
-      Ok(bytes)
-    }),
-  };
-  match read {
-    Ok(bytes) => ReplyBody::ReadBytes { bytes },
-    Err(e) => refused(refusal_of_vfs(&e)),
-  }
-}
-
 /// `destroy` of a merge volume, or `None` for a plain one (the store-backed destroy runs). A work
 /// is removed with its declared operations; a green with its engine, its pins and its works'
 /// ability to merge (their next submit refuses `UnknownBase`, §4.16 failure matrix). Every
@@ -1489,7 +1373,7 @@ pub(crate) fn status_merge_volume(
       attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
       head: SnapshotId { value: head },
       drifted: Vec::new(),
-      watcher: "merge".to_owned(),
+      watcher: crate::verbs::WATCHER_MERGE.to_owned(),
       snapshots: u32::try_from(head).unwrap_or(u32::MAX),
       placed,
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
@@ -1499,6 +1383,7 @@ pub(crate) fn status_merge_volume(
       // attachments, the record form).
       mounts: Vec::new(),
       mounts_elided: 0,
+      drifted_elided: 0,
       // A green or a work volume keeps no op log (its history is the merge engine's), so it has no journal to report.
       journal: slates_ipc::protocol::JournalReport::default(),
       // A merge volume serves no FUSE mount of its own, so nothing is kept for one (U10).
@@ -2351,7 +2236,7 @@ const SHIPMENT_LENGTH_BYTES: usize = size_of::<u32>();
 
 /// A merge shipment (the bytes a holder is sent on [`MERGE_RECORD_STREAM`]): the record, then the content requests
 /// that place its inputs (an offer and its chunks), each frame behind its length.
-fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
   let total = frames.iter().fold(SHIPMENT_LENGTH_BYTES, |sum, frame| {
     sum
       .saturating_add(SHIPMENT_LENGTH_BYTES)
@@ -3279,11 +3164,15 @@ pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64
         version: Some(version),
         conflicts: Vec::new(),
         verification,
+        conflicts_elided: 0,
+        verdict: 0,
       }
     }
     Some(slates_ipc::protocol::Verification::Unsigned) | None => ReplyBody::Submitted {
       version: Some(version),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
   }
 }
@@ -3430,12 +3319,50 @@ fn record_standing(
   }
 }
 
+/// Whether `record` offers a different value at a position this holder's ledger holds one (A-373): a higher epoch's,
+/// once `fleet::check_held_record` admitted it.
+fn replaces_held_value(state: &ShardState, record: &Record) -> bool {
+  state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice())
+}
+
+/// Holds `record`, a green's merge record, in this holder's register before its inputs and its recomputation when it
+/// replaces a different value held at its position (A-373): admitted by `fleet::check_held_record`, it comes under a
+/// higher epoch than the held value, which therefore never committed. Until it is held the door refuses its inputs,
+/// since the held value names others at that position (`content_retention::admits`), and the replica built over the
+/// replaced value is rewound as it is held (`fleet::hold_checked_record`), so [`accept_merge_record`] then serves the
+/// record as the replica's next version. The acknowledgement this acceptance makes is not sent: the record is
+/// acknowledged once recomputed. Anything else (no value held there, the same one, a refused record, a green refused
+/// here or a test's withheld acknowledgement) is left to [`accept_merge_record`].
+pub(crate) fn hold_replacing_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) {
+  if !replaces_held_value(state, record)
+    || state.merge.refused.contains(&record.object)
+    || state.merge.fault.refuse_records
+    || MergeRecordValue::from_record_bytes(&record.value)
+      .is_none_or(|value| value.version != record.sequence)
+    || crate::fleet::check_held_record(state, local, peer_host, record).is_err()
+  {
+    return;
+  }
+  // The reply goes unsent: the version is answered by its recomputation, or not at all.
+  let _ = crate::fleet::accept_held_record(state, local, peer_host, record);
+}
+
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
 /// acknowledgement returned. A holder with the green's records and no replica (a warm restart) rebuilds the replica
-/// from them first (A-313). Every other case is an empty reply the owner counts as no
-/// acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
+/// from them first (A-313); a higher epoch's different value at a version this holder holds is held first, which
+/// rewinds the replica below it ([`hold_replacing_record`], A-373). Every other case is an empty reply the owner counts
+/// as no acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
 pub(crate) fn accept_merge_record(
   state: &mut ShardState,
   local: HostId,
@@ -3465,6 +3392,9 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
+  // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
+  // it replaces; the record is then served as the replica's next version (A-373).
+  hold_replacing_record(state, local, peer_host, record);
   match record_standing(state, object, value.version) {
     None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
