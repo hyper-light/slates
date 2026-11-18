@@ -1366,42 +1366,70 @@ mod tests {
     let (from, to) = (HostId(1), HostId(2));
     let object = ObjectId::new(from, 7);
     let mut out = begun(object, to);
-    assert_eq!(step_for(&regional, from, &out), Step::Wait);
+    expect_a_report_only_once_placed_and_never_refused_once_reported(&regional, from, &mut out);
+    assert!(regional.move_object(object, from, to, &out.cohort));
+    expect_the_copy_kept_until_adopted_and_never_thawed(
+      &mut regional,
+      (from, to),
+      object,
+      &mut out,
+    );
+    expect_a_thaw_only_without_a_switch_and_a_covered_cohort(from, to);
+  }
+
+  /// The first part of the decision test. Do: decide `out` as it is unplaced, overdue, placed, then reported and
+  /// overdue. Expect wait, refused `Unplaced`, report, and report again (a reported move can still commit).
+  fn expect_a_report_only_once_placed_and_never_refused_once_reported(
+    regional: &RegionalConfiguration,
+    from: HostId,
+    out: &mut Outgoing,
+  ) {
+    assert_eq!(step_for(regional, from, out), Step::Wait);
     out.overdue = true;
     assert_eq!(
-      step_for(&regional, from, &out),
+      step_for(regional, from, out),
       Step::Refuse(MoveRefusal::Unplaced)
     );
     out.overdue = false;
     out.ready = true;
-    assert_eq!(step_for(&regional, from, &out), Step::Report);
+    assert_eq!(step_for(regional, from, out), Step::Report);
     out.reported = true;
     out.overdue = true;
     assert_eq!(
-      step_for(&regional, from, &out),
+      step_for(regional, from, out),
       Step::Report,
       "a reported move is never refused: it can still commit"
     );
-    assert!(regional.move_object(object, from, to, &out.cohort));
-    assert_eq!(
-      step_for(&regional, from, &out),
-      Step::Switched { owner: to }
-    );
+  }
+
+  /// The middle of the decision test, the move committed. Do: decide; report it adopted and decide; drop the exception
+  /// as its new owner's destroy does and decide. Expect switched to `to` (the copy kept), released once adopted, and
+  /// released to itself (the copy let go, never thawed) once the switched move's exception is gone.
+  fn expect_the_copy_kept_until_adopted_and_never_thawed(
+    regional: &mut RegionalConfiguration,
+    (from, to): (HostId, HostId),
+    object: ObjectId,
+    out: &mut Outgoing,
+  ) {
+    assert_eq!(step_for(regional, from, out), Step::Switched { owner: to });
     out.switched = true;
     assert!(regional.adopt_move(object, to));
-    assert_eq!(step_for(&regional, from, &out), Step::Release { owner: to });
+    assert_eq!(step_for(regional, from, out), Step::Release { owner: to });
     let mut gone = regional.clone();
     assert!(gone.forget_moved(object, to));
     assert_eq!(
-      step_for(&gone, from, &out),
+      step_for(&gone, from, out),
       Step::Release { owner: from },
       "a switched move whose exception is gone (destroyed by its new owner, or handed back by its takeover) lets the \
        frozen copy go, never thaws it"
     );
+  }
 
+  /// The end of the decision test. Do: decide a reported move whose target retired before any switch, and a move whose
+  /// cohort the target's neighbourhood does not cover. Expect a thaw, and a refusal `Neighbourhood`.
+  fn expect_a_thaw_only_without_a_switch_and_a_covered_cohort(from: HostId, to: HostId) {
     let mut leaving = region();
-    let other = ObjectId::new(from, 8);
-    let mut out = begun(other, HostId(3));
+    let mut out = begun(ObjectId::new(from, 8), HostId(3));
     out.ready = true;
     out.reported = true;
     assert!(leaving.retire(HostId(3), SCATTER));
@@ -1410,7 +1438,6 @@ mod tests {
       Step::Thaw,
       "no entry can move it to a host that left"
     );
-
     let mut out = begun(ObjectId::new(from, 9), to);
     out.ready = true;
     out.cohort = vec![from, HostId(9)];

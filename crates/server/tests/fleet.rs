@@ -4732,58 +4732,112 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
 #[test]
 fn a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards() {
   let _serial = serialize_fleet_tests();
-  let names = ["a", "b", "c"];
-  let n = names.len();
-  let nodes: Vec<(MachineProfile, HostId, Identity)> =
-    names.iter().map(|name| fleet_node(name)).collect();
-  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
-  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let (_serve_lease, serve) = mesh_serve_ports(n);
-  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
-  let instances: Vec<String> = daemons
-    .iter()
-    .map(|daemon| daemon.instance().to_owned())
-    .collect();
-  let hosts: Vec<HostId> = daemons
-    .iter()
-    .map(|daemon| daemon.member_identity().unwrap())
-    .collect();
-  assert_fleet_forms(&daemons, &hosts, &names);
-  let fleet: Vec<&Daemon> = daemons.iter().collect();
-  let stop_all = |daemons: Vec<Daemon>| {
-    for daemon in daemons {
-      daemon.stop();
-    }
-  };
-  let counter = |daemon: &Daemon, name: &str| {
-    daemon
-      .refusals_on_every_shard()
-      .map(|counts| counts.get(name).copied().unwrap_or(0))
-  };
-
-  let mut client_a = Client::connect(&instances[0]);
-  let ReplyBody::Created { id } = client_a.call(&scratch("moving")) else {
-    stop_all(daemons);
-    panic!("create on node a did not return an id");
-  };
-  let ReplyBody::Attached { attachment, .. } = client_a.call(&RequestBody::Attach {
-    volume: id,
-    snapshot: None,
-    intent: Intent::Write,
-    form: AttachRequest::Root,
-  }) else {
-    stop_all(daemons);
-    panic!("write attach on node a");
-  };
+  let members = three_members();
   let files: [(&str, &[u8]); 3] = [
     ("/one", b"the first file"),
     ("/two", b"the second, longer file"),
     ("/three", b"written on b"),
   ];
-  for (path, bytes) in files.iter().take(2) {
-    let written = client_a.call(&RequestBody::FsWrite {
-      volume: id,
+  let (there, back, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let (id, refused_while_attached) =
+      written_on_a_and_refused_while_attached(&mut client_a, &members, &files[..2]);
+    let mut there = moved_to_b_and_written_there(&fleet, &members, &mut client_a, id, &files);
+    there.refused_while_attached = refused_while_attached;
+    let back = moved_back_to_a(&fleet, &members, &mut client_a, &mut there, id, &files);
+    (there, back, describe(&fleet))
+  };
+  let to = members.hosts[1];
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert_the_move_there(&there, to, &described);
+  assert_the_move_back(&back, &described);
+}
+
+/// Three daemons at `f = 1`, formed, with their member ids and instance names (A-291's move tests); the serve ports
+/// stay leased while the fleet lives.
+struct ThreeMembers {
+  daemons: Vec<Daemon>,
+  hosts: Vec<HostId>,
+  instances: Vec<String>,
+  _serve_lease: PortLease,
+}
+
+/// [`ThreeMembers`], started and formed.
+fn three_members() -> ThreeMembers {
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let instances = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  ThreeMembers {
+    daemons,
+    hosts,
+    instances,
+    _serve_lease: serve_lease,
+  }
+}
+
+/// The count `name` across `daemon`'s shards.
+fn move_counter(daemon: &Daemon, name: &str) -> Result<u64, ObserveError> {
+  daemon
+    .refusals_on_every_shard()
+    .map(|counts| counts.get(name).copied().unwrap_or(0))
+}
+
+/// Asks `client` to move `volume` to `to` until the move is done: whether it was, and each distinct answer in order.
+fn move_until_done(
+  fleet: &[&Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+  to: HostId,
+) -> (bool, Vec<String>) {
+  let mut answers: Vec<String> = Vec::new();
+  let done = poll_until(fleet, COUNCIL_RETIRE_DEADLINE, || {
+    let reply = client.call(&RequestBody::Move { volume, to: to.0 });
+    let done = matches!(reply, ReplyBody::Moved { to: moved } if moved == to.0);
+    let named = format!("{reply:?}");
+    if answers.last() != Some(&named) {
+      answers.push(named);
+    }
+    Ok(done)
+  });
+  (done, answers)
+}
+
+/// Writes `files` into `volume` through a write attachment of `client`'s, asking `before_detach` before the attachment
+/// ends, and returns its answer.
+fn write_files_then(
+  client: &mut Client,
+  volume: VolumeId,
+  files: &[(&str, &[u8])],
+  before_detach: impl FnOnce(&mut Client) -> ReplyBody,
+) -> ReplyBody {
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("write attach of {volume:?}");
+  };
+  for (path, bytes) in files {
+    let written = client.call(&RequestBody::FsWrite {
+      volume,
       attachment,
       path: (*path).to_owned(),
       bytes: bytes.to_vec(),
@@ -4794,199 +4848,295 @@ fn a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards()
       "write {path}: {written:?}"
     );
   }
-  let refused_while_attached = client_a.call(&RequestBody::Move {
-    volume: id,
-    to: hosts[1].0,
+  let asked = before_detach(client);
+  assert!(matches!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  ));
+  asked
+}
+
+/// The first part of the move test: on a, a volume with `files` written through a write attachment, its move asked
+/// while attached, then shared with b's account. Returns the volume and the answer to the attached move.
+fn written_on_a_and_refused_while_attached(
+  client_a: &mut Client,
+  members: &ThreeMembers,
+  files: &[(&str, &[u8])],
+) -> (VolumeId, ReplyBody) {
+  let ReplyBody::Created { id } = client_a.call(&scratch("moving")) else {
+    panic!("create on node a did not return an id");
+  };
+  let to = members.hosts[1];
+  let refused = write_files_then(client_a, id, files, |client| {
+    client.call(&RequestBody::Move {
+      volume: id,
+      to: to.0,
+    })
   });
+  share_with_node(client_a, id, &members.daemons[1], ALL_RIGHTS);
+  (id, refused)
+}
+
+/// What the move test saw of the move to b.
+struct MovedThere {
+  refused_while_attached: ReplyBody,
+  moved: bool,
+  answers: Vec<String>,
+  client_b: Client,
+  b_attachment: Option<u64>,
+  served_on_b: bool,
+  last_read: Option<ReplyBody>,
+  wrote_on_b: bool,
+  forwarded: bool,
+  last_forward: Option<ReplyBody>,
+  asked_again: ReplyBody,
+  released_by_a: bool,
+  adoption: (Result<u64, ObserveError>, Result<bool, ObserveError>),
+}
+
+/// The move to b: moved until done; b attaches the volume when it serves it, reads `files`' first two and writes the
+/// third; a's client reads the third (forwarded to b); the move asked again; a lets its copy go; b's adoption counts.
+fn moved_to_b_and_written_there(
+  fleet: &[&Daemon],
+  members: &ThreeMembers,
+  client_a: &mut Client,
+  id: VolumeId,
+  files: &[(&str, &[u8]); 3],
+) -> MovedThere {
+  let to = members.hosts[1];
+  let (moved, answers) = move_until_done(fleet, client_a, id, to);
+  let mut client_b = Client::connect(&members.instances[1]);
+  let b_attachment = if moved {
+    attach_when_served(fleet, &mut client_b, id)
+  } else {
+    None
+  };
+  let (served_on_b, last_read) = match b_attachment {
+    Some(_) => read_back(fleet, &mut client_b, id, &files[..2]),
+    None => (false, None),
+  };
+  let wrote_on_b = served_on_b
+    && b_attachment.is_some_and(|attachment| write_one(&mut client_b, id, attachment, files[2]));
+  let (forwarded, last_forward) = if wrote_on_b {
+    read_back(fleet, client_a, id, &files[2..])
+  } else {
+    (false, None)
+  };
+  let asked_again = client_a.call(&RequestBody::Move {
+    volume: id,
+    to: to.0,
+  });
+  let released_by_a = forwarded
+    && poll_until(fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[0], "fleet.move.released")? == 1)
+    });
+  let adoption = (
+    move_counter(&members.daemons[1], "fleet.move.adopted"),
+    move_counter(&members.daemons[1], "fleet.move.adoption_reported").map(|reports| reports > 0),
+  );
+  MovedThere {
+    refused_while_attached: ReplyBody::Detached,
+    moved,
+    answers,
+    client_b,
+    b_attachment,
+    served_on_b,
+    last_read,
+    wrote_on_b,
+    forwarded,
+    last_forward,
+    asked_again,
+    released_by_a,
+    adoption,
+  }
+}
+
+/// A write attachment of `volume` through `client` once its owner serves it, or none within the serve deadline.
+fn attach_when_served(fleet: &[&Daemon], client: &mut Client, volume: VolumeId) -> Option<u64> {
+  let mut attached = None;
+  poll_until(fleet, SERVE_DEADLINE, || {
+    if let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+      volume,
+      snapshot: None,
+      intent: Intent::Write,
+      form: AttachRequest::Root,
+    }) {
+      attached = Some(attachment);
+    }
+    Ok(attached.is_some())
+  });
+  attached
+}
+
+/// Whether `file` was written into `volume` through `attachment`.
+fn write_one(
+  client: &mut Client,
+  volume: VolumeId,
+  attachment: u64,
+  (path, bytes): (&str, &[u8]),
+) -> bool {
+  matches!(
+    client.call(&RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: path.to_owned(),
+      bytes: bytes.to_vec(),
+      mode: 0o644,
+    }),
+    ReplyBody::FsDone { .. }
+  )
+}
+
+/// What the move test saw of the move back to a.
+struct MovedBack {
+  detached_on_b: bool,
+  moved_back: bool,
+  answers_back: Vec<String>,
+  served_back: bool,
+  last_back: Option<ReplyBody>,
+  released_by_b: bool,
+}
+
+/// The move back: b's attachment ends, b's client moves the volume to a until done (once a released its copy), a
+/// serves all of `files`, and b lets its copy go.
+fn moved_back_to_a(
+  fleet: &[&Daemon],
+  members: &ThreeMembers,
+  client_a: &mut Client,
+  there: &mut MovedThere,
+  id: VolumeId,
+  files: &[(&str, &[u8]); 3],
+) -> MovedBack {
+  let detached_on_b = there.b_attachment.is_some_and(|attachment| {
+    matches!(
+      there.client_b.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    )
+  });
+  let (moved_back, answers_back) = if there.released_by_a && detached_on_b {
+    move_until_done(fleet, &mut there.client_b, id, members.hosts[0])
+  } else {
+    (false, Vec::new())
+  };
+  let (served_back, last_back) = if moved_back {
+    read_back(fleet, client_a, id, files)
+  } else {
+    (false, None)
+  };
+  let released_by_b = served_back
+    && poll_until(fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[1], "fleet.move.released")? == 1)
+    });
+  MovedBack {
+    detached_on_b,
+    moved_back,
+    answers_back,
+    served_back,
+    last_back,
+    released_by_b,
+  }
+}
+
+/// The move test's expectations of the move to `to` (b).
+fn assert_the_move_there(there: &MovedThere, to: HostId, described: &str) {
   assert!(
     matches!(
-      &refused_while_attached,
+      &there.refused_while_attached,
       ReplyBody::Refused {
         refusal: Refusal::MoveRefused {
           reason: slates_ipc::protocol::MoveRefusal::Attached
         }
       }
     ),
-    "an attached volume does not move: {refused_while_attached:?}"
-  );
-  assert!(matches!(
-    client_a.call(&RequestBody::Detach { attachment }),
-    ReplyBody::Detached
-  ));
-  share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
-
-  // Asks `client` to move the volume to `to` until the move is done: whether it was, and each distinct answer in order.
-  let move_until_done = |client: &mut Client, to: HostId| {
-    let mut answers: Vec<String> = Vec::new();
-    let done = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
-      let reply = client.call(&RequestBody::Move {
-        volume: id,
-        to: to.0,
-      });
-      let done = matches!(reply, ReplyBody::Moved { to: moved } if moved == to.0);
-      let named = format!("{reply:?}");
-      if answers.last() != Some(&named) {
-        answers.push(named);
-      }
-      Ok(done)
-    });
-    (done, answers)
-  };
-  // Reads every file of `files` through `client` until each reads back whole: whether they did, and the last answer.
-  let read_all = |client: &mut Client, files: &[(&str, &[u8])]| {
-    let mut last = None;
-    let read = poll_until(&fleet, SERVE_DEADLINE, || {
-      let mut all = true;
-      for (path, bytes) in files {
-        let reply = client.call(&RequestBody::Read {
-          volume: id,
-          path: (*path).to_owned(),
-          at: ReadAt::Head,
-        });
-        all &= matches!(&reply, ReplyBody::ReadBytes { bytes: read } if read == bytes);
-        last = Some(reply);
-      }
-      Ok(all)
-    });
-    (read, last)
-  };
-
-  let (moved, answers) = move_until_done(&mut client_a, hosts[1]);
-  let mut client_b = Client::connect(&instances[1]);
-  let mut b_attachment = None;
-  let attached_on_b = moved
-    && poll_until(&fleet, SERVE_DEADLINE, || {
-      if let ReplyBody::Attached { attachment, .. } = client_b.call(&RequestBody::Attach {
-        volume: id,
-        snapshot: None,
-        intent: Intent::Write,
-        form: AttachRequest::Root,
-      }) {
-        b_attachment = Some(attachment);
-      }
-      Ok(b_attachment.is_some())
-    });
-  let (served_on_b, last_read) = if attached_on_b {
-    read_all(&mut client_b, &files[..2])
-  } else {
-    (false, None)
-  };
-  let wrote_on_b = served_on_b
-    && b_attachment.is_some_and(|attachment| {
-      matches!(
-        client_b.call(&RequestBody::FsWrite {
-          volume: id,
-          attachment,
-          path: files[2].0.to_owned(),
-          bytes: files[2].1.to_vec(),
-          mode: 0o644,
-        }),
-        ReplyBody::FsDone { .. }
-      )
-    });
-  let (forwarded, last_forward) = if wrote_on_b {
-    read_all(&mut client_a, &files[2..])
-  } else {
-    (false, None)
-  };
-  let asked_again = client_a.call(&RequestBody::Move {
-    volume: id,
-    to: hosts[1].0,
-  });
-  let released_by_a = forwarded
-    && poll_until(&fleet, SERVE_DEADLINE, || {
-      Ok(counter(&daemons[0], "fleet.move.released")? == 1)
-    });
-  let adoption = (
-    counter(&daemons[1], "fleet.move.adopted"),
-    counter(&daemons[1], "fleet.move.adoption_reported").map(|reports| reports > 0),
-  );
-
-  // The move back to the creator: b's client asks, once b's attachment is gone.
-  let detached_on_b = b_attachment.is_some_and(|attachment| {
-    matches!(
-      client_b.call(&RequestBody::Detach { attachment }),
-      ReplyBody::Detached
-    )
-  });
-  let (moved_back, answers_back) = if released_by_a && detached_on_b {
-    move_until_done(&mut client_b, hosts[0])
-  } else {
-    (false, Vec::new())
-  };
-  let (served_back, last_back) = if moved_back {
-    read_all(&mut client_a, &files)
-  } else {
-    (false, None)
-  };
-  let released_by_b = served_back
-    && poll_until(&fleet, SERVE_DEADLINE, || {
-      Ok(counter(&daemons[1], "fleet.move.released")? == 1)
-    });
-  let described = describe(&fleet);
-  stop_all(daemons);
-  assert!(
-    moved,
-    "the move was done (answers in order: {answers:?}); {described}"
+    "an attached volume does not move: {:?}",
+    there.refused_while_attached
   );
   assert!(
-    answers
+    there.moved,
+    "the move was done (answers in order: {:?}); {described}",
+    there.answers
+  );
+  assert!(
+    there
+      .answers
       .first()
       .is_some_and(|first| first.starts_with("Moving")),
-    "the first ask began the move: {answers:?}"
-  );
-  assert!(attached_on_b, "b attaches the moved volume; {described}");
-  assert!(
-    served_on_b,
-    "b serves both files (last read: {last_read:?}); {described}"
-  );
-  assert!(wrote_on_b, "b takes a write to the moved volume");
-  assert!(
-    forwarded,
-    "a forwards to b (last: {last_forward:?}); {described}"
+    "the first ask began the move: {:?}",
+    there.answers
   );
   assert!(
-    matches!(asked_again, ReplyBody::Moved { to } if to == hosts[1].0),
-    "a move asked again is answered done: {asked_again:?}"
+    there.b_attachment.is_some(),
+    "b attaches the moved volume; {described}"
   );
   assert!(
-    released_by_a,
+    there.served_on_b,
+    "b serves both files (last read: {:?}); {described}",
+    there.last_read
+  );
+  assert_the_move_there_settled(there, to, described);
+}
+
+/// The rest of [`assert_the_move_there`]: b took the write, a forwards to b, the move asked again is done, and a let its
+/// copy go once b adopted the volume and reported it adopted.
+fn assert_the_move_there_settled(there: &MovedThere, to: HostId, described: &str) {
+  assert!(there.wrote_on_b, "b takes a write to the moved volume");
+  assert!(
+    there.forwarded,
+    "a forwards to b (last: {:?}); {described}",
+    there.last_forward
+  );
+  assert!(
+    matches!(there.asked_again, ReplyBody::Moved { to: moved } if moved == to.0),
+    "a move asked again is answered done: {:?}",
+    there.asked_again
+  );
+  assert!(
+    there.released_by_a,
     "a released its copy once b adopted the volume; {described}"
   );
-  assert_eq!(
-    adoption,
-    (Ok(1), Ok(true)),
-    "b adopted the volume and reported it adopted"
-  );
-  assert!(detached_on_b, "b's attachment ends");
   assert!(
-    moved_back,
-    "the move back to its creator was done (answers in order: {answers_back:?}); {described}"
+    matches!(there.adoption, (Ok(1), Ok(true))),
+    "b adopted the volume and reported it adopted: {:?}",
+    there.adoption
+  );
+}
+
+/// The move test's expectations of the move back to a.
+fn assert_the_move_back(back: &MovedBack, described: &str) {
+  assert!(back.detached_on_b, "b's attachment ends");
+  assert!(
+    back.moved_back,
+    "the move back to its creator was done (answers in order: {:?}); {described}",
+    back.answers_back
   );
   assert!(
-    served_back,
-    "a serves all three files again (last read: {last_back:?}); {described}"
+    back.served_back,
+    "a serves all three files again (last read: {:?}); {described}",
+    back.last_back
   );
   assert!(
-    released_by_b,
+    back.released_by_b,
     "b released its copy once a adopted the volume back; {described}"
   );
 }
 
 /// The volume a moved-volume fault test moves (A-291): created on `daemons[0]` through `client`, two files written
 /// through a write attachment that is then ended, shared with every other node's account, and moved to `to` until the
-/// switch. Returns the volume, its files, and whether the move was done (with its answers in order).
+/// switch.
+struct MovedTwoFiles {
+  id: VolumeId,
+  files: [(&'static str, &'static [u8]); 2],
+  moved: bool,
+  answers: Vec<String>,
+}
+
+/// [`MovedTwoFiles`], made and moved.
 fn move_two_files(
   daemons: &[Daemon],
   client: &mut Client,
   name: &str,
   to: HostId,
-) -> (
-  VolumeId,
-  [(&'static str, &'static [u8]); 2],
-  bool,
-  Vec<String>,
-) {
+) -> MovedTwoFiles {
   let files: [(&'static str, &'static [u8]); 2] = [
     ("/one", b"the first file"),
     ("/two", b"the second, longer file"),
@@ -4994,49 +5144,18 @@ fn move_two_files(
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     panic!("create {name} on node {}", daemons[0].instance());
   };
-  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
-    volume: id,
-    snapshot: None,
-    intent: Intent::Write,
-    form: AttachRequest::Root,
-  }) else {
-    panic!("write attach of {name}");
-  };
-  for (path, bytes) in files {
-    let written = client.call(&RequestBody::FsWrite {
-      volume: id,
-      attachment,
-      path: path.to_owned(),
-      bytes: bytes.to_vec(),
-      mode: 0o644,
-    });
-    assert!(
-      matches!(written, ReplyBody::FsDone { .. }),
-      "write {path}: {written:?}"
-    );
-  }
-  assert!(matches!(
-    client.call(&RequestBody::Detach { attachment }),
-    ReplyBody::Detached
-  ));
+  write_files_then(client, id, &files, |_| ReplyBody::Detached);
   for node in &daemons[1..] {
     share_with_node(client, id, node, ALL_RIGHTS);
   }
   let fleet: Vec<&Daemon> = daemons.iter().collect();
-  let mut answers: Vec<String> = Vec::new();
-  let moved = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
-    let reply = client.call(&RequestBody::Move {
-      volume: id,
-      to: to.0,
-    });
-    let done = matches!(reply, ReplyBody::Moved { to: moved } if moved == to.0);
-    let named = format!("{reply:?}");
-    if answers.last() != Some(&named) {
-      answers.push(named);
-    }
-    Ok(done)
-  });
-  (id, files, moved, answers)
+  let (moved, answers) = move_until_done(&fleet, client, id, to);
+  MovedTwoFiles {
+    id,
+    files,
+    moved,
+    answers,
+  }
 }
 
 /// Reads every file of `files` from `volume` through `client` until each reads back whole: whether they did, and the
@@ -5089,8 +5208,12 @@ fn a_move_completes_when_its_old_owner_dies_at_the_switch() {
     .map(|daemon| daemon.instance().to_owned())
     .collect();
   let mut client_a = Client::connect(&instances[0]);
-  let (id, files, moved, answers) =
-    move_two_files(&daemons, &mut client_a, "orphaned-move", hosts[1]);
+  let MovedTwoFiles {
+    id,
+    files,
+    moved,
+    answers,
+  } = move_two_files(&daemons, &mut client_a, "orphaned-move", hosts[1]);
   drop(client_a);
   let old_owner = daemons.remove(0);
   old_owner.stop();
@@ -5146,8 +5269,12 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
     .map(|daemon| daemon.instance().to_owned())
     .collect();
   let mut client_a = Client::connect(&instances[0]);
-  let (id, files, moved, answers) =
-    move_two_files(&daemons, &mut client_a, "stranded-move", hosts[1]);
+  let MovedTwoFiles {
+    id,
+    files,
+    moved,
+    answers,
+  } = move_two_files(&daemons, &mut client_a, "stranded-move", hosts[1]);
   let target = daemons.remove(1);
   target.stop();
   let retired = moved && poll_survivors_retire(&daemons, hosts[1]);
@@ -5197,24 +5324,7 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
 #[test]
 fn a_clone_of_a_captured_base_moves_and_gives_its_pin_back() {
   let _serial = serialize_fleet_tests();
-  let names = ["a", "b", "c"];
-  let nodes: Vec<(MachineProfile, HostId, Identity)> =
-    names.iter().map(|name| fleet_node(name)).collect();
-  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
-  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let (_serve_lease, serve) = mesh_serve_ports(names.len());
-  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
-  let hosts: Vec<HostId> = daemons
-    .iter()
-    .map(|daemon| daemon.member_identity().unwrap())
-    .collect();
-  assert_fleet_forms(&daemons, &hosts, &names);
-  let instances: Vec<String> = daemons
-    .iter()
-    .map(|daemon| daemon.instance().to_owned())
-    .collect();
-  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let members = three_members();
   let files: [(&str, &[u8]); 3] = [
     ("/one", b"the first captured file"),
     ("/two", b"the second, longer captured file"),
@@ -5224,19 +5334,50 @@ fn a_clone_of_a_captured_base_moves_and_gives_its_pin_back() {
   for (path, bytes) in files.iter().take(2) {
     base.seed(path.trim_start_matches('/'), bytes);
   }
-  let mut client_a = Client::connect(&instances[0]);
+  let (captured, moved, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let captured = captured_and_cloned_on_a(&mut client_a, &members, &base.path, files[2]);
+    let moved = clone_moved_to_b_and_unpinned(&fleet, &members, &mut client_a, &captured, &files);
+    (captured, moved, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert_the_capture(&captured);
+  assert_the_clone_moved_and_unpinned(&moved, &described);
+}
+
+/// What the captured-clone test saw on a: the overlay's move asked, the capture, the clone, and the captured snapshot's
+/// destroy asked while the clone pins it.
+struct CapturedOnA {
+  overlay: VolumeId,
+  overlay_move: ReplyBody,
+  snapshot: SnapshotId,
+  clone: VolumeId,
+  destroy_while_pinned: ReplyBody,
+}
+
+/// On a: an overlay of `base`, its move asked; its base captured; the captured snapshot cloned and its destroy asked;
+/// `third` written into the clone; the clone shared with every other member's account.
+fn captured_and_cloned_on_a(
+  client_a: &mut Client,
+  members: &ThreeMembers,
+  base: &str,
+  third: (&str, &[u8]),
+) -> CapturedOnA {
   let ReplyBody::Created { id: overlay } = client_a.call(&RequestBody::Create {
     name: "captured-workspace-base".to_owned(),
     size: SizeClass::Bounded { limit: 1 << 20 },
     names: NamePolicy::Exact,
     require_locked: false,
-    base: Some(base.path.clone()),
+    base: Some(base.to_owned()),
   }) else {
     panic!("overlay on node a");
   };
   let overlay_move = client_a.call(&RequestBody::Move {
     volume: overlay,
-    to: hosts[1].0,
+    to: members.hosts[1].0,
   });
   let captured = client_a.call(&RequestBody::CaptureBase { volume: overlay });
   let ReplyBody::BaseCaptured { snapshot } = captured else {
@@ -5253,110 +5394,142 @@ fn a_clone_of_a_captured_base_moves_and_gives_its_pin_back() {
     volume: overlay,
     snapshot,
   });
-  let ReplyBody::Attached { attachment, .. } = client_a.call(&RequestBody::Attach {
-    volume: clone,
-    snapshot: None,
-    intent: Intent::Write,
-    form: AttachRequest::Root,
-  }) else {
-    panic!("write attach of the clone");
-  };
-  let wrote = client_a.call(&RequestBody::FsWrite {
-    volume: clone,
-    attachment,
-    path: files[2].0.to_owned(),
-    bytes: files[2].1.to_vec(),
-    mode: 0o644,
-  });
-  assert!(
-    matches!(wrote, ReplyBody::FsDone { .. }),
-    "write into the clone: {wrote:?}"
-  );
-  assert!(matches!(
-    client_a.call(&RequestBody::Detach { attachment }),
-    ReplyBody::Detached
-  ));
-  for node in &daemons[1..] {
-    share_with_node(&mut client_a, clone, node, ALL_RIGHTS);
+  write_files_then(client_a, clone, &[third], |_| ReplyBody::Detached);
+  for node in &members.daemons[1..] {
+    share_with_node(client_a, clone, node, ALL_RIGHTS);
   }
-  let mut answers: Vec<String> = Vec::new();
-  let moved = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
-    let reply = client_a.call(&RequestBody::Move {
-      volume: clone,
-      to: hosts[1].0,
-    });
-    let done = matches!(reply, ReplyBody::Moved { to } if to == hosts[1].0);
-    let named = format!("{reply:?}");
-    if answers.last() != Some(&named) {
-      answers.push(named);
-    }
-    Ok(done)
-  });
-  let mut client_b = Client::connect(&instances[1]);
+  CapturedOnA {
+    overlay,
+    overlay_move,
+    snapshot,
+    clone,
+    destroy_while_pinned,
+  }
+}
+
+/// What the captured-clone test saw of the clone's move to b.
+struct CloneMoved {
+  moved: bool,
+  answers: Vec<String>,
+  served: bool,
+  last: Option<ReplyBody>,
+  released: bool,
+  unpinned: bool,
+  destroyed: Option<ReplyBody>,
+  served_alone: bool,
+  last_alone: Option<ReplyBody>,
+}
+
+/// The clone moved to b until done; b serves all of `files`; a lets its copy go; the captured snapshot destroyed on a
+/// once the clone's pin is given back; b serves every file again.
+fn clone_moved_to_b_and_unpinned(
+  fleet: &[&Daemon],
+  members: &ThreeMembers,
+  client_a: &mut Client,
+  captured: &CapturedOnA,
+  files: &[(&str, &[u8]); 3],
+) -> CloneMoved {
+  let (moved, answers) = move_until_done(fleet, client_a, captured.clone, members.hosts[1]);
+  let mut client_b = Client::connect(&members.instances[1]);
   let (served, last) = if moved {
-    read_back(&fleet, &mut client_b, clone, &files)
+    read_back(fleet, &mut client_b, captured.clone, files)
   } else {
     (false, None)
   };
   let released = served
-    && poll_until(&fleet, SERVE_DEADLINE, || {
-      daemons[0]
-        .refusals_on_every_shard()
-        .map(|counts| counts.get("fleet.move.released").copied().unwrap_or(0) == 1)
+    && poll_until(fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[0], "fleet.move.released")? == 1)
     });
-  let mut destroyed = None;
-  let unpinned = released
-    && poll_until(&fleet, SERVE_DEADLINE, || {
-      let reply = client_a.call(&RequestBody::DestroySnapshot {
-        volume: overlay,
-        snapshot,
-      });
-      let done = matches!(reply, ReplyBody::SnapshotDestroyed);
-      destroyed = Some(reply);
-      Ok(done)
-    });
-  let (served_alone, last_alone) = if unpinned {
-    read_back(&fleet, &mut client_b, clone, &files)
+  let (unpinned, destroyed) = if released {
+    destroyed_when_unpinned(fleet, client_a, captured)
   } else {
     (false, None)
   };
-  let described = describe(&fleet);
-  drop(client_a);
-  drop(client_b);
-  for daemon in daemons {
-    daemon.stop();
+  let (served_alone, last_alone) = if unpinned {
+    read_back(fleet, &mut client_b, captured.clone, files)
+  } else {
+    (false, None)
+  };
+  CloneMoved {
+    moved,
+    answers,
+    served,
+    last,
+    released,
+    unpinned,
+    destroyed,
+    served_alone,
+    last_alone,
   }
+}
+
+/// Destroys the captured snapshot through `client` until the destroy is done: whether it was, and the last answer.
+fn destroyed_when_unpinned(
+  fleet: &[&Daemon],
+  client: &mut Client,
+  captured: &CapturedOnA,
+) -> (bool, Option<ReplyBody>) {
+  let mut last = None;
+  let done = poll_until(fleet, SERVE_DEADLINE, || {
+    let reply = client.call(&RequestBody::DestroySnapshot {
+      volume: captured.overlay,
+      snapshot: captured.snapshot,
+    });
+    let done = matches!(reply, ReplyBody::SnapshotDestroyed);
+    last = Some(reply);
+    Ok(done)
+  });
+  (done, last)
+}
+
+/// The captured-clone test's expectations on a before the move: the overlay refused `NotPlain` (its base stays on its
+/// host), and the captured snapshot held while the clone pins it.
+fn assert_the_capture(captured: &CapturedOnA) {
   assert!(
     matches!(
-      &overlay_move,
+      &captured.overlay_move,
       ReplyBody::Refused {
         refusal: Refusal::MoveRefused {
           reason: slates_ipc::protocol::MoveRefusal::NotPlain
         }
       }
     ),
-    "an overlay does not move: {overlay_move:?}"
+    "an overlay does not move: {:?}",
+    captured.overlay_move
   );
   assert!(
-    matches!(destroy_while_pinned, ReplyBody::Refused { .. }),
-    "the captured snapshot is held while its clone is on a: {destroy_while_pinned:?}"
+    matches!(captured.destroy_while_pinned, ReplyBody::Refused { .. }),
+    "the captured snapshot is held while its clone is on a: {:?}",
+    captured.destroy_while_pinned
+  );
+}
+
+/// The captured-clone test's expectations of the move: done, served whole by b, a's copy released and with it the
+/// clone's pin (the captured snapshot destroyed), and b still serving every file, its copy standing alone.
+fn assert_the_clone_moved_and_unpinned(moved: &CloneMoved, described: &str) {
+  assert!(
+    moved.moved,
+    "the clone's move was done (answers: {:?}); {described}",
+    moved.answers
   );
   assert!(
-    moved,
-    "the clone's move was done (answers: {answers:?}); {described}"
+    moved.served,
+    "b serves the captured files and the clone's own (last: {:?}); {described}",
+    moved.last
   );
   assert!(
-    served,
-    "b serves the captured files and the clone's own (last: {last:?}); {described}"
-  );
-  assert!(released, "a released its copy of the clone; {described}");
-  assert!(
-    unpinned,
-    "the captured snapshot is destroyed once a let the clone go (last: {destroyed:?}); {described}"
+    moved.released,
+    "a released its copy of the clone; {described}"
   );
   assert!(
-    served_alone,
-    "b still serves every file with the captured snapshot gone (last: {last_alone:?}); {described}"
+    moved.unpinned,
+    "the captured snapshot is destroyed once a let the clone go (last: {:?}); {described}",
+    moved.destroyed
+  );
+  assert!(
+    moved.served_alone,
+    "b still serves every file with the captured snapshot gone (last: {:?}); {described}",
+    moved.last_alone
   );
 }
 

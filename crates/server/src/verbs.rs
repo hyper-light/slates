@@ -4251,6 +4251,20 @@ fn lease_gate(
 /// Format: a counter name in the daemon's status report.
 const MOVE_FROZEN: &str = "fleet.move.frozen_refused";
 
+/// The answer to a verb on a volume frozen for a planned move (A-291), or none for any other: a frozen volume answers
+/// only its status and the move itself until it leaves or thaws; every other verb is told to come back (retryable,
+/// counted), and once the volume has left it forwards to its new owner.
+fn frozen_for_a_move(state: &mut ShardState, body: &RequestBody) -> Option<ReplyBody> {
+  let volume = volume_of(body)?;
+  if !crate::moves::frozen(state, volume)
+    || matches!(body, RequestBody::Status { .. } | RequestBody::Move { .. })
+  {
+    return None;
+  }
+  state.count(MOVE_FROZEN, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
+}
+
 /// The gates a verb passes before it runs: the owner's lease, and for a work whose green lives on another shard its
 /// owner for a base or a verdict (A-247): the verb is parked until the answer comes, and its later verbs park behind
 /// it (`crate::work_home`).
@@ -4325,14 +4339,8 @@ pub(crate) fn dispatch(
     state.count(GREEN_FENCED, 1);
     return refused(Refusal::ContentUnavailable);
   }
-  // A volume frozen for a planned move (A-291) answers only its status and the move itself until it leaves or thaws:
-  // every other verb is told to come back (retryable), and once the volume has left it forwards to its new owner.
-  if let Some(volume) = volume_of(&body)
-    && crate::moves::frozen(state, volume)
-    && !matches!(body, RequestBody::Status { .. } | RequestBody::Move { .. })
-  {
-    state.count(MOVE_FROZEN, 1);
-    return refused(Refusal::Overloaded { shard: state.shard });
+  if let Some(come_back) = frozen_for_a_move(state, &body) {
+    return come_back;
   }
   let reply = dispatch_inner(state, client_id, principal, body);
   if let Some(volume) = fenced
@@ -10555,12 +10563,13 @@ fn step_releases(state: &mut ShardState, budget: u64) -> bool {
   any
 }
 
+/// A volume's pin on its origin's snapshot, by the origin volume and the snapshot, or none (§4.5): a clone's origin, or
+/// the snapshot an image volume was built from (A-160).
+pub(crate) type OriginPin = Option<(DbVolumeId, DbSnapshotId)>;
+
 /// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
 /// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
-pub(crate) fn origin_pin_of(
-  state: &ShardState,
-  id: DbVolumeId,
-) -> Option<(DbVolumeId, DbSnapshotId)> {
+pub(crate) fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> OriginPin {
   state
     .db
     .partition()
@@ -10576,10 +10585,7 @@ pub(crate) fn origin_pin_of(
 
 /// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
 /// Best-effort: the origin may be gone or on another shard.
-pub(crate) fn release_origin_pin(
-  state: &mut ShardState,
-  origin_pin: Option<(DbVolumeId, DbSnapshotId)>,
-) {
+pub(crate) fn release_origin_pin(state: &mut ShardState, origin_pin: OriginPin) {
   if let Some((origin_volume, origin_snapshot)) = origin_pin
     && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
   {
