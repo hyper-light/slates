@@ -7857,6 +7857,23 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > page-in under that pressure, Linux `D`, XNU's uninterruptible wait) past a watched window is still judged wedged; the
 > scheduler states that would tell it from a sleep are not read yet (GAPS, 2026-10-22).
 
+> **Status (2026-11-18, A-318): a poll's CPU is held to the build the daemon runs in.** A shard is spinning once it has
+> run the spin window of CPU without a step, and the spin window is the budget scaled by how much slower this build runs
+> compiled code than the machine runs the same work in machine code, never below the budget
+> (`watchdog::spin_window_ns`). The slowdown is measured once a process (`slates_machine::build_cost`): one dependent
+> chain over a page of words, `acc = acc × K + word`, compiled by this build and written in the machine's instructions
+> (`asm!`, x86-64 and AArch64), timed alternately in batches past the clock's grain, the least of each kept, the two
+> required to compute the same value. The watchdog's start line names the window and the measure. On CI's
+> ThreadSanitizer lane, whose runtime is called at every memory access and every function's entry and exit, a poll of
+> 1,054 ms of CPU ended the client tests' binary and one of 1,060 ms the server's library tests (runs 44238377555 and
+> diag-b13-2), each an in-process daemon's lone watchdog ending the whole process. Measured: an unoptimized build 3.5
+> times machine code (a Mac Studio), a release build 1.0 (its window the budget), and ThreadSanitizer's 24.2 to 33.2
+> times on CI's runners, whose lane then passed with no spinning verdict (diag-g251-tsan, two runs of two). The wedged
+> and starved judgments stay on the wall and the budget. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `the_spin_window_is_the_budget_held_to_the_builds_measured_cost` (`crates/server/src/watchdog.rs`),
+> `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
+> the build-cost tests (`crates/machine/src/build_cost.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -22661,3 +22678,25 @@ Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 
   before the gap, so the end line's `W + B + L` bound holds as A-232 states it.
 - **What it does not change.** A spinning verdict (a window of the shard's own CPU without a step), the starved rule, the
   anchor's lapse judgment (A-232 step 5), and the window.
+
+### A-318 — The watchdog holds a poll's CPU to the build it runs in (2026-11-18, goal g251: every open slates bug fixed; the supervisor's order for the TSan lane)
+Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/build_cost.rs`
+(new: `BuildCost`, `measure_build_cost`, `build_cost`), `crates/server/src/watchdog.rs` (`spin_window_ns`,
+`ShardWatch::judge`, `Verdict::Spinning`'s window, the start line), `crates/server/src/daemon.rs`
+(`Daemon::spin_window_ns`), `unsafe-budget.toml` (slates-machine 70 → 72).
+- **Why.** A-228 calls a shard spinning once it has run a window of CPU without a step, on the ground that a cooperative
+  task yields within the shard's step budget, microseconds. That ground is the build's: a build that runs every poll
+  slower runs a window of CPU in a poll that is no spin. On CI's ThreadSanitizer lane polls of 1,054 and 1,060 ms of CPU
+  were judged spinning, and the watchdog of an in-process daemon, which no anchor reads, ended the whole test binary
+  (A-232; runs 44238377555 and diag-b13-2, 2026-11-18). The supervisor's order: the window derived for the build it runs
+  in, the sanitizer's slowdown measured, not assumed.
+- **The rule.** The spin window is the liveness budget times compiled ÷ machine-code time for one piece of work, never
+  below the budget. The work is a dependent chain over one page of words, `acc = acc × K + word`: compiled by this build,
+  and in machine code, which no compiler flag instruments or deoptimizes and which costs what an optimized build's chain
+  costs (a load, a multiply and an add a word, the multiply's latency bounding each). Each is timed in batches of at
+  least `TIMER_OVERHEAD_FACTOR` clock readings' cost, alternately over `MIN_SAMPLES` rounds, the least of each kept, so a
+  preemption or a move between core classes taints neither; the two must compute the same value or the measure is
+  refused, and the budget stands. Measured once a process: the binary does not change while it runs.
+- **What it does not change.** The wedged and starved judgments (wall time, the budget), the anchor's lapse judgment,
+  the beat, and a release build's window (its chain runs at machine code's speed, so the budget stands). Under Miri, which
+  runs no machine code and has no thread clock, the watchdog judges by the wall as before.

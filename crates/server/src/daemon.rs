@@ -3371,6 +3371,15 @@ impl Daemon {
       .map(|watchdog| watchdog.turns().read())
   }
 
+  /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
+  /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
+  pub fn spin_window_ns(&self) -> Option<u64> {
+    self
+      .watchdog
+      .as_ref()
+      .map(crate::watchdog::Watchdog::spin_window_ns)
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
