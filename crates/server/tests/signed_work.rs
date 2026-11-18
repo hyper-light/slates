@@ -125,8 +125,9 @@ fn signed(client: &mut Client, work: VolumeId, key: &TestSigner) -> Vec<u8> {
 /// statement its work has since moved past, and one unsigned; read each version's merge record back, and version 0's.
 /// Expect all four merged — a signature permits nothing and refuses nothing here, the green requiring none — answered
 /// and recorded: verified naming the trusted key, invalid `UnregisteredKey`, invalid `BadSignature`, and unsigned, each
-/// record read back after the checkpoints that folded the versions' chain entries (each work moved past its version);
-/// version 0 the origin, unsigned.
+/// record read back from the green's accepted record though checkpoints folded the versions' chain entries (each work
+/// moved past its version; `a_merges_verdict_survives_a_daemon_restart` reads them back from the checkpoint); version 0
+/// the origin, unsigned.
 #[test]
 fn a_signed_merge_is_judged_recorded_and_read_back() {
   let (daemon, instance) = daemon("judged", TEST_SHARDS);
@@ -152,8 +153,7 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
   );
   assert_eq!(
     client.merge_record(green, 1).unwrap().verification,
-    signer_of(&trusted),
-    "read back after the checkpoint the merge let fold its chain entry"
+    signer_of(&trusted)
   );
   let second = work_with(&mut client, green, "second", b"signed by a stranger");
   let by_stranger = signed(&mut client, second, &stranger);
@@ -183,8 +183,7 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
     ),
     "a version not yet committed has no record"
   );
-  // Non-vacuity: the records were read back from checkpoints that folded the chain entries carrying them, and every
-  // verdict was the verifier's.
+  // Non-vacuity: checkpoints folded the chain entries that carried the verdicts, and every verdict was the verifier's.
   assert!(counter(&daemon, "merge.checkpoint.taken") > 0);
   assert_eq!(
     [
@@ -510,7 +509,8 @@ fn a_signed_merge_off_its_greens_shard_is_judged_there() {
 
 /// A-321, provenance is durable: do merge a signed work and an unsigned one, restart the daemon over the same segment,
 /// and read both versions' merge records back. Expect the verdicts as they were judged before the restart — the signed
-/// version verified naming its key, the other unsigned — read from the versions' chain entries, never judged again.
+/// version verified naming its key, the other unsigned — never judged again: the first version's entry was folded into
+/// a checkpoint before the restart (each work moved past it), so its verdict comes back from the checkpoint.
 #[test]
 fn a_merges_verdict_survives_a_daemon_restart() {
   let instance = format!("signed-restart-{}", std::process::id());
@@ -549,6 +549,10 @@ fn a_merges_verdict_survives_a_daemon_restart() {
     b"unsigned before the restart",
   );
   assert_eq!(client.submit(unsigned).unwrap(), Submitted::Accepted(2));
+  assert!(
+    counter(&first, "merge.checkpoint.taken") > 0,
+    "the signed version was folded into a checkpoint before the restart"
+  );
   drop(client);
   first.stop();
   let second = start_over(&config, (&segment, &rendezvous));
