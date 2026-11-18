@@ -26031,3 +26031,24 @@ relinquish a step of the db model's histories.
 Applied in the same change to: §4.10 (the chaos flows' status), A-334's owed line (`crates/server/src/readmission.rs`),
 GAPS (the nemesis entry), `crates/db/src/{op,partition}.rs`, `crates/db/tests/{model.rs,wire_order.txt}`,
 `crates/server/src/{verbs,state,daemon}.rs`.
+
+### A-364 — A ledger is adopted position by position: modelled, and the record half of GAP-A9-7 built on it (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Commit"; GAP-A9-7, BUG-12)
+
+- **The model.** `docs/wip/models/FencedLedger.tla` (text, configurations `FencedLedger.cfg`, `FencedLedger_3.cfg`,
+  `FencedLedger_register.cfg`) models a green's merge-record log as §4.8 states its takeover: each holder keeps an
+  accepted `(epoch, value)` per position and a promise; phase one reports every position, and the new owner adopts at
+  each the value accepted under the highest epoch among a majority's reports; it proposes in order, the adopted
+  positions again under its own epoch (BUG-12) and a position only once the one before committed under it, as the
+  merge plane ships a green's next version only once the last is placed. Checked: Agreement (no position commits two
+  values), Continuity (an adopted log holds every value committed at a lower epoch, whenever it commits),
+  AdoptedIsPrefix (no hole below a held position), StaleNeverCommits and ReadSafety. A switch puts the server's round
+  before the record half in its place (the highest record alone), and TLC must refute it.
+- **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
+  the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
+  were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
+- **The build owed** (GAPS, the record half): the green successor's materialization adopts, by this rule, the positions
+  between its own highest record and the adopted version from the members of the green's recovery cohorts, and
+  re-commits each under its own epoch, before it gathers the chain.
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
+files.
