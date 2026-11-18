@@ -3607,11 +3607,14 @@
 >   was refused `NoSpace` at the first read of an untouched base file, and a second volume on the shard was refused. A
 >   dynamic volume now holds a slot per live inode from the unpromised slots (`crates/server/tests/dynamic_versions.rs`,
 >   red on main f6c515447).
-> - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
->   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
->   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`. Since A-342 a dynamic
->   volume no longer holds the whole slab, so its rebuild finds unpromised slots; a bounded claim whose allowance takes
->   the whole slab can still meet it.
+> - **Fixed (A-395): a volume promised the whole version slab was refused at recovery** (bug record of 2026-11-05): a
+>   recovered snapshot rebuilt its directories privately, one retained version slot each the live volume did not hold;
+>   the whole kernel's base volume was 6,348 slots short at the primary's restart (648,393 requested, 642,045
+>   available), and linux-v7.4-rc1 has 6,348 directories. A snapshot's directory the head still holds by its handle is
+>   now captured as shared and rebuilt as the head's node, stamped at its own birth epoch so the head copies before it
+>   writes (`a_snapshots_unchanged_directories_take_no_version_slot_after_a_restart`: committed and retained slots equal
+>   across a restart; red on main 457 committed and 3 retained after against 454 and 0 before, the snapshot's three
+>   directories).
 > - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb** (the slicing fixed
 >   2026-11-06 by agents/loadtest-scale, and the memory not reproduced: see that entry above): `kernel/` (754
 >   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and

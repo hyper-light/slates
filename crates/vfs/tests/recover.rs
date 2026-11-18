@@ -1372,9 +1372,10 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   );
   assert_eq!(
     fresh.inodes.len(),
-    5,
-    "the shared version is one inode across both snapshots (head root, head f, root a, shared f, \
-     root b); an independent copy per snapshot would be six"
+    3,
+    "the shared version is one inode across both snapshots, and the root, which the head never changed, is the \
+     head's in both (head root, head f, shared f), as the live volume holds them; a private root per snapshot made it \
+     five until A-395, and an independent copy per snapshot six"
   );
   let mut buf = vec![0u8; 16];
   let n = recovered.read_in(&fresh, snap_a, f, 0, &mut buf).unwrap();
@@ -1499,8 +1500,9 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   .unwrap();
   assert_eq!(
     fresh.inodes.len(),
-    6,
-    "one shared version, not one per snapshot: head root, head f, three snapshot roots, one shared f"
+    3,
+    "one shared version, not one per snapshot, and the root the head never changed shared by all three: head root, \
+     head f, one shared f (a private root per snapshot made it six until A-395)"
   );
 
   let mut buf = vec![0u8; 16];
