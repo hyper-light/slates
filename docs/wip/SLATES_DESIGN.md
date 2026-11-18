@@ -12881,6 +12881,12 @@ goal g260); the test's first runs are owed (crosvm on adacachy; CI's live-guest 
     control's copy runs as uid 0: this entry's escalation itself.
   - Owed: the test's first runs. The supervisor's is crosvm on adacachy; CI's live-guest lane runs every test of
     `guest_vhost.rs` in QEMU 11.1 from the first push.
+  - Credit: the gap was first found on 2026-11-09 by the agent of `agents/conformance-19` (0717586a, d701b534). Its
+    guest's root planted a setuid-root copy of the probe and ran it as `nobody`, expected red under the then-documented
+    `-o dax=always` alone, and the fix put `nosuid,nodev` on the probe's mount and the documented one. It never landed:
+    the B12 stack that held it failed its gate on other branches. This amendment supersedes it and keeps its idea, a
+    copy of the probe run as `nobody` that says its effective ids; it adds the host-side writer, `nodev`, and the
+    control mount, which shows in every run, on every box, that the bits reached the guest.
 
 ### A-95 — A v4 READDIR page is encoded at the directory's owner (2026-10-05)
 Applied in the same change to: `crates/bridge-nfs/src/v4/listing.rs` (new: `PageRequest`, `encode_page`,

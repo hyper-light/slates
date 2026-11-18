@@ -8646,7 +8646,9 @@ goal g260): slates cannot set a guest's flags, so `docs/cli.md`'s `slates vhost-
 (`crates/cli/tests/guest_vhost.rs`): it expects a set-id file and a whiteout the host's user made to run as their
 caller and be refused `EACCES` through the guest's mount, and to act through a control mount without the flags.
 **Owed:** its first runs: crosvm on adacachy (the supervisor's), and CI's live-guest lane, which runs every
-`guest_vhost.rs` test in QEMU.
+`guest_vhost.rs` test in QEMU. The gap was first found on 2026-11-09 on `agents/conformance-19` (0717586a, d701b534: a
+setuid-root copy of the probe planted by the guest's root and run as `nobody`), which never landed; A-94's amendment
+supersedes it with credit.
 
 FUSE create path, 2026-10-05 (A-96): the delta's whole reference list and the op log's full scan are gone (2,000
 creates 0.64 → 0.36–0.45 s). Owed:
