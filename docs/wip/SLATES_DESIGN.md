@@ -7339,6 +7339,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
 > chunk, at each publication that changed it) and the mirror records.
 >
+> **The content hold is its pieces (2026-11-18, A-376; image version 30).** The content hold's image was one piece,
+> every stored chunk, held manifest and stage, re-encoded at every publication and re-put whenever it changed: at
+> `f > 0` every version of a green, whose inputs its holders keep. Now each stored chunk, each manifest held for an object
+> and each stage is a piece (`ContentHold::pieces`), the hold keeps which it changed since the last committed
+> publication (`ContentHold::changed_pieces`), and a delta carries those; a recovery puts them back into the hold's image
+> (`ContentHold::image_from_pieces`) and rebuilds the hold from it as before, every chunk verified. Still carried whole
+> when changed: the mirror records.
+>
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
 > - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
@@ -11549,7 +11557,9 @@ Recipes to copy verbatim:
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
-  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210). Every push starts CI's debug build
+  there too, the runtime's DLLs beside it, so an import Nano Server lacks fails the push that adds it (A-357); one
+  action (`.github/actions/nano-server-start`) serves both, and starts Docker's engine when a runner left it stopped.
 - The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
@@ -26645,8 +26655,18 @@ Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release 
   process-isolated `nanoserver:ltsc2025` on `windows-2025`: main 68148152d exited 0xC0000139, the same commit with this
   change answered `slates 0.1.0`, and its import table holds none of the three. The module's test
   (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
-- **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
-  this kind shows on the next test tag, not on the push that makes it.
+- **Every push checks it (the CI half, 2026-11-18).** Until then only the release lane ran the Nano Server check (a
+  tag or a dry run), so this regression showed on the next test tag, not on the push that made it. Now CI's Windows
+  lane starts the debug binary its CLI tests built in the same container, with the Visual C++ runtime's DLLs beside it
+  (that build's C runtime is a DLL), so every other import must resolve from Nano Server's own. One composite action
+  (`.github/actions/nano-server-start`) serves both callers. It also starts Docker's engine first: its service, set to
+  start automatically, was stopped when the job began on 1 of 11 `windows-2025` runners sampled (diag runs
+  44352989836 and 44353300409), and the tag `v0.1.0`'s run read the missing engine as the binary's exit 1 (run
+  44347535833). A Docker failure is now named as the runner's. By use (diag-g071-ci-1, run 44354728411), each job
+  with Docker's service stopped first: CI's shape answered `slates 0.1.0` from this change and refused main 68148152d
+  with 0xC0000139, and the release's shape answered from test 4's static binary. The step adds 21 s to the lane (31 s
+  for the release's shape). Applied to `.github/workflows/ci.yml` (the Windows lane), `.github/workflows/release.yml`
+  (its Nano Server step), the new action, Appendix B.2, GAPS and the bug record.
 
 ### A-333 — A green's takeover successor adopts its holder ledger and the replica it built from it, instead of recording the green again; a restarted successor re-adopts it at boot (2026-11-18, built for goal g232, one primary and two replicas)
 Applied in the same change to:
@@ -27263,3 +27283,33 @@ Applied in the same change to:
   a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation
   signing). Both are Ada's. Until then the drive on WinFsp as released makes no hard link and A-300's stated difference
   stands.
+
+### A-376 — A holder publishes what changed of its content hold: the hold's image is a piece per stored chunk, per held manifest and per stage, and a delta carries those the hold changed since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 30)
+Applied in the same change to: §4.8 (A-270's status: "The content hold is its pieces"), GAPS (the load test's
+ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `ContentHold::changed_pieces`, `clear_changes`,
+`piece_bytes`, `pieces`, `image_from_pieces`, every change noted where the hold makes it; `manifest_image`, `chunk_image`,
+`stage_image`), `crates/server/src/content_holder.rs` (`KIND_CONTENT_CHUNK`, `KIND_CONTENT_MANIFEST`,
+`KIND_CONTENT_STAGE`, `hold_piece_key`, the content pieces in `held_image`, `held_changes`, `held_committed` and
+`split_held`, `HeldRefused::Content`), `crates/server/src/verbs.rs` (a recovered hold owes no change),
+`crates/vfs/src/recover.rs` (`IMAGE_VERSION` 30), and the tests below.
+- **What was there.** A-270 left the content hold's image whole: one piece holding every stored chunk, held manifest and
+  stage, recomputed at every publication (`ContentHold::to_image`) and re-put whenever its bytes changed. A holder of a
+  green holds every version's inputs, so every version's put and record re-encoded and re-wrote every input it held:
+  `sample` of the late-submit test at 1,000 versions (Mac Studio, debug, after A-372) found about a tenth of each
+  holder's time in that encoding, and its deltas big enough that the journal checkpointed about as often as it logged.
+- **The rule.** The hold's image is a piece per stored chunk (keyed by its identity's first 24 bytes), per manifest held
+  for an object (by the first 24 bytes of the BLAKE3 of its object and identity, since one manifest can be held for
+  several objects) and per stage (by its object). The hold notes each piece where it changes it (a chunk stored or
+  released, a manifest held, placed again or forgotten, a stage opened, grown or closed), and a delta carries the pieces
+  noted since the last committed publication, each put if held and removed if not; a checkpoint carries every piece.
+  A recovery puts the pieces back into the hold's image in its canonical order and rebuilds the hold from it as before,
+  every chunk verified, and the rebuilt hold owes no change.
+- **Tests.** `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold` (`daemon.rs`: 64 puts, every delta
+  one size, the folded deltas the whole image); the held-pieces oracle (`daemon.rs`) puts and releases content between
+  deltas and checkpoints; the hold's model tests (`slates-cluster`) fold every step's changed pieces and hold them to
+  the hold's pieces, and the folded pieces to the hold's image, byte for byte.
+- **Measured.** Kiln r3543, the Mac Studio, 2026-11-18, debug build: on main's code a put's delta carried the whole hold,
+  170 bytes at the first of 64 puts and 158 more at each after (64 sizes); with this change one size each. The
+  late-submit test's late median at 300 versions 2.28 to 2.37 ms against the early 2.31 to 2.49 (after A-372, 2.92 to
+  3.28 against 1.87 to 1.96), and at 1,000 versions 3.76 ms against 6.00 (after A-372, 8.49 against 2.28; before A-367,
+  18.2 against 2.16): a version late in a green's history now costs what an early one does.
