@@ -7103,7 +7103,7 @@ fn judge_submission(
         inc.id,
         inc.base,
         inc.evidence,
-        (completion, Some(work_id)),
+        (completion, Some(sealed.work)),
       );
       // True the retention charge up to what the commit retained (the secured surplus credited). A settle after an
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
