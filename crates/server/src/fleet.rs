@@ -9923,7 +9923,7 @@ fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
 /// its resumed stale self `StaleEpoch`), then the object moved to the successor its lineage ranks or let go as stale
 /// (`takeover::resolve_held_object`), then its authority moved to the owner its route names at `generation`
 /// ([`reconcile_held_copy`]).
-fn install_on_copy(
+pub(crate) fn install_on_copy(
   s: &mut ShardState,
   local: HostId,
   (regional, retired): (

@@ -6085,7 +6085,10 @@ refinement and revalidation before those results can be applied to the corrected
 > successor); with all three removed StaleNeverCommits fails at depth 12 (GAPS' model table). So a copy the walk has not
 > reached refuses, and nothing the walk delays can let a stale owner's record commit: a takeover round's page promises
 > and fences each copy it lists itself. Held by `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`
-> (`crates/server/tests/fleet.rs`).
+> (`crates/server/tests/fleet.rs`). Since A-485 each copy the walk reaches also follows its object's move, if the
+> configuration moved it (A-291, `moves::follow_moved_object`), whatever its route: A-398's per-copy step followed a
+> move only for a copy routed to a retired host, so a copy routed to its live old owner kept that owner's authority and
+> no takeover of a target that died before adopting listed it.
 
 > **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
 > The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
@@ -8116,7 +8119,9 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > its workspace volume by `Instance::move_volume` to the target's member id (its runner says the member its daemon
 > serves as at every start, `Instance::member`), following `MoveProgress` until `Moved` with no clock of its own (the
 > move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
-> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out).
+> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out). Its
+> workspaces on the fleet's runners are clones of the folder's captured base (A-463), plain volumes the move takes; one
+> capture serves the agents started over an unchanged folder, and a base goes with its last clone.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -10059,7 +10064,16 @@ entry either old or new, never torn).
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
    barriers only; Windows `FlushFileBuffers` on the directory handles). The directory syncs and the media
-   barrier still run on the shard: A-132's measured residual, the next piece (GAPS).
+   barrier still run on the shard: A-132's measured residual, the next piece (GAPS). A metadata entry (a mode or bits
+   change alone, A-458, A-466) is durable before it is reported, through its file's own handle in the same batch: its
+   fields are set in place, the handle stays open in the batch, and the barrier syncs the file whole — Linux `fsync`,
+   which "also flushes the metadata information associated with the file" where `fdatasync` "does not flush modified
+   metadata unless that metadata is needed in order to allow a subsequent data retrieval" (fsync(2)); macOS `fsync`,
+   which moves "all modified data and attributes" (Apple's fsync(2)); Windows `FlushFileBuffers`, which "writes all the
+   buffered information for a specified file" through a handle that may write (its documentation). No source says a
+   directory's sync covers another inode's mode: fsync(2) names the file it flushes; ext4's documentation says a
+   power loss loses "as much as the latest 5 seconds of metadata changes" (`commit=`); XFS's says its transactions
+   are asynchronous until a log force (A-472).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -31016,7 +31030,8 @@ takeover status, after A-429's), GAPS (A-422's entry, its third sibling) and the
   recorded and held unrecovered on its shard). Red with the period's wall bound: the seal unrecorded, the object
   settled unrecorded. The revocation's wait is Linux's and its mounts the kernel's: its run is filed for main's Linux lane.
 - **Owed.** The seal is still taken again when its answer is lost to a stopped shard: recording it on the owner shard
-  would make `seal_adopted` idempotent (GAPS).
+  would make `seal_adopted` idempotent (GAPS). *Done by A-488 (2026-11-18): the owner shard records the seal on the
+  volume and answers a second ask the recorded seal.*
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{moves,takeover,verbs,
 daemon}.rs`.
@@ -32380,6 +32395,160 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-472 — A landed mode or bits change is synced through its file's own handle in its batch's barrier before it is reported, by the rule each platform documents (2026-11-18, g085; §4.15 step 8; A-130, A-132, A-458, A-466)
+Applied in the same change to: §4.15 step 8 (the rule and its sources), GAPS (A-185's owed list), `crates/land`
+(`src/engine.rs`: `StagedMeta` and `MetaSet`, `stage_meta`, `set_meta`, `report_meta`, the batch's files
+(`batch_files`) and room (`batch_pages_of`, `stages_meta`), a batch that ends unsynced recording its metadata entries;
+`src/os.rs`: the barrier's `Durability`, a metadata entry's file synced whole; `src/os_windows.rs`: `CHMOD_ACCESS` asks
+`FILE_WRITE_DATA`; `src/chmod_tests.rs` and `src/captured_tests.rs`, the tests; and, from main's clippy and literal scan
+of the same files, `src/test_store.rs`, new, the suites' one store fixture, the golden vectors' inputs as named
+constants, a named type, and two tests split under the complexity bound), `crates/vfs` (`src/host/mod.rs`: the
+barrier's and `open_to_chmod`'s documentation; `src/host/sim.rs`: a mode or bits set in place unsynced until a barrier
+names its file, `holds_unsynced_metadata`).
+- **What was there.** A-458's metadata entry set a file's mode or bits in place and reported the entry at once; the
+  only sync after it was its directory's, at the landing's end.
+- **The sources (read 2026-11-18).**
+  - fsync(2) (Linux man-pages, man7.org): fsync "also flushes the metadata information associated with the file", and
+    "does not necessarily ensure that the entry in the directory containing the file has also reached disk"; fdatasync
+    "does not flush modified metadata unless that metadata is needed in order to allow a subsequent data retrieval",
+    its examples the times and, needed, the size. A mode is not needed to read the bytes.
+  - ext4 (docs.kernel.org, `filesystems/ext4/journal` and `admin-guide/ext4`): the journal carries metadata, a
+    transaction commits within `commit=` seconds, "if you lose your power, you will lose as much as the latest 5 seconds
+    of metadata changes". Neither page says a directory's fsync commits another inode's changes.
+  - XFS (`filesystems/xfs/xfs-delayed-logging-design`): "all high level transactions are asynchronous by default",
+    durable at a log force, forces "to a specific LSN" and every checkpoint before it; nothing names a directory's
+    fsync as forcing another inode's later change.
+  - Apple's fsync(2): "causes all modified data and attributes of fildes to be moved to a permanent storage device",
+    the drive's own cache aside, which `F_FULLFSYNC` (fcntl(2)) asks it to flush.
+  - FlushFileBuffers (learn.microsoft.com): "writes all the buffered information for a specified file to the device",
+    its handle "must have the GENERIC_WRITE access right"; flushing every file of a volume asks administrative
+    privileges, which slates never holds (R10).
+  - So no platform documents a directory's sync covering a child's mode: on each, the file's own sync is the rule, and
+    nothing was left as it was.
+- **The rule.** A metadata entry is staged in A-130's batch beside the files: its fields set in place through its own
+  handle, judged again there (A-458), the handle held open and counted one page against the batch's room, the barrier
+  syncing it off the shard (A-132) — Linux `fsync`, since a temporary's `fdatasync` would not do, macOS `fsync`, Windows
+  `FlushFileBuffers` — and the entry reported and advanced only after. A set is atomic, so the file holds the old value
+  or the new one whatever happens before then; what waits is the report. A batch that ends without its barrier records
+  its metadata entries as it records its files, skipped or failed, which never advances them, so the volume keeps them
+  and the next landing judges the file again. A file the landing may not open to set its metadata fails its entry alone:
+  on Windows that is a read-only file, whose handle may not write (owed, GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r433, load 5.3 to 11.1, debug), the simulated host's
+  sync model in place and the engine as it was: 3 of 35 `slates-land` lib tests failed — the new
+  `a_metadata_entry_is_synced_by_its_batchs_barrier_before_it_is_reported` (no barrier taken) and the two captured
+  clones' metadata tests (the mode left unsynced). With the fix (load 7.8 to 10.3): `cargo test --locked -p slates-land
+  --lib` 35 of 35, the writer ignored; `slates-vfs --lib -- host::sim captured` 3 of 3. Red-checked once: with the
+  barrier given the batch's temporaries alone, the same 3 failed. `cargo fmt` laid the lines out. Filed for main: the
+  crash oracle, whose metadata entries now take a barrier.
+
+### A-463 — A consumer's workspace is a clone of its folder's captured base where it must move (2026-11-18, g267, kiln goal 95101ef3 K5; §4.15 `capture_base`, §4.10 "Overlay volumes in a fleet", A-291, A-424, A-450)
+
+- **What was there.** A-291 decided that a kiln agent's workspace moves as a clone of a captured base and built the
+  capture and the clone's move; A-424 lands such a clone against its capture; A-450 drove the move from kiln. But kiln
+  still made every workspace an overlay of its folder, so every move of one was refused `NotPlain` (§4.10 "Overlay
+  volumes in a fleet": an overlay's base stays on its source host).
+- **The rule.** A consumer whose workspaces must move makes each one by capture-then-clone, never by a copy through a
+  disk: an overlay laid over the folder, `capture_base` on it (a `Retry` with `ChangedWhileRead` asked again after the
+  pause it carries, a bounded number of times), and `VolumeSpec::clone_of` that captured snapshot per agent: a plain
+  volume with no base plane, which `move_volume` takes. One capture serves every agent started over the folder while the
+  folder is as captured, which the consumer learns from the base overlay's drift (every entry the capture witnessed
+  re-checked, none drifted or unverified); a changed folder gets a new capture. The clone's drift is read from its base
+  (the clone reads no folder), and its landing is A-424's, judged by content against the capture. A base goes with its
+  last clone: once the clone's destroy has finished (`status` answers `NotFound` rather than `Unusable::Destroying`,
+  since the clone's pin on the captured snapshot is given back at the destroy's end), `destroy_snapshot` of the
+  capture, refused `Busy` while another clone pins it, and then `destroy` of the base. A clone that moved keeps no
+  lineage on its new owner and lands there as a scratch volume until stage 2 (A-424), so a consumer refuses its landing
+  until then. A capture reads the folder whole, ignored build output included, into memory, so a consumer whose
+  workspaces never move keeps overlays, which read only what an agent uses.
+- **Kiln's side** (kiln main, `workspace::slates::provision`, `capture`, `base_for`, `release_base`, `arrived`, `landing`): a
+  runner the server's `[slates_fleet]` lists makes captured clones, asked at each workspace's start; any other machine
+  keeps overlays. A workspace that came with its agent from another runner is marked moved and written back to no folder.
+- **Tests.** Kiln's `k5_a_fleet_workspace_is_a_captured_clone_whose_review_and_landing_are_the_agents_changes_since_its_capture`
+  (`crates/kiln/src/workspace/captured_tests.rs`, against a real instance run by a kiln executable, `KILN_TEST_KILN`,
+  no mount: the clone has no base plane and an overlay has one; two workspaces over the unchanged folder share one
+  capture and one after an outsider's edit has a new one reading it; the review is the agent's three changes alone; the
+  landing writes them under kiln's launcher authority and passes the outsider's edit; a base goes with its last clone),
+  and the unit tests `k5_a_workspace_from_another_machine_is_marked_moved_and_a_local_hand_over_is_not`,
+  `k5_a_moved_workspace_is_written_back_nowhere_until_slates_carries_its_capture`,
+  `k5_a_captured_clones_drift_is_read_from_its_base`, `k5_a_capture_is_shared_only_while_its_folder_is_as_captured` and
+  `k5_a_workspace_record_from_before_reads_and_writes_as_it_did`. On the Mac Studio (2026-11-18, kiln r407, load 9.5
+  to 16.8, debug), `cargo test --locked -p kiln --lib -- k5_ k4_ k3_ w1_kiln_speaks bindings_are_current
+  w3_an_archived` with `KILN_TEST_KILN` set passed 19 of 19 in 13.8 s, the real-instance test among them. Red-checked
+  once, six mutations at once (an overlay made where a capture was asked, a moved workspace's landing let through, the
+  drift read from the clone, a capture shared on its drifted entries alone, a workspace from another machine left
+  unmarked, a record from before written with a null base): 6 of 6 failed, each at its own assertion. No library change
+  was needed.
+- **Owed.** A capture of what the folder's version control tracks alone; admission reserving a capture's cost ahead
+  (§4.15's status); the advance and stage 2 (A-424's owed list); the live move of a captured clone between two Mac
+  runners and the bare-metal run on a captured clone's mount, filed for main.
+
+Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
+
+### A-485 — Every held copy follows its object's move as the install's walk reaches it, whatever its route (2026-11-18, goal 85 bug 1, g079; §4.8 "Promotion and takeover", "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398)
+Applied in the same change to: §4.8 "Promotion and takeover" (A-398's status), GAPS (the move entry's target-dies
+line), `crates/server/src/takeover.rs` (`resolve_held_object` judges a copy by its route, `resolve_by_route`, then
+follows its move), `crates/server/src/moves.rs` (`follow_moved_object`, one copy, replacing the whole pass
+`follow_moved_objects`), `crates/server/src/fleet.rs` (`install_on_copy` reachable from the crate's tests), and the bug
+record `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`.
+- **What was there.** A-291 had every holder follow a move once the install had resolved every held copy: a pass over
+  the moved objects took each copy's route to the exception's owner, so the next reconcile moved its authority there.
+  A-398 cut the install into a walk a copy a turn and put that pass at the end of the per-copy step, after the step's
+  early returns: it ran only when the copy reached was routed to a retired host. At a move's switch every copy is routed
+  to its live old owner, so no holder followed: each copy kept the old owner's route and authority. A takeover lists a
+  copy only along its authority's line (`copy_falls_to`), so when the target died before adopting, no survivor's round
+  learned the volume, both confirmed without it, and the configuration, which follows by lineage alone, handed the
+  volume's line to the target's successor (dropping the exception where that successor was the creator). The old owner
+  then let its frozen copy go: nobody held the volume (`a_move_whose_target_dies_at_the_switch_is_served_by_its_
+  successor`, red every run since A-398: no `fleet.takeover.adopted` or `fleet.materialize.*` on either survivor; the
+  last read `NotFound` on Linux and `HomedElsewhere { region 0 }` on macOS, the answers the code gives with the
+  successor a, and with the successor c whose own route still named a).
+- **The rule.** The per-copy step judges the copy by its route as before, then brings it to its object's move, if the
+  configuration moved it, whatever the route judged (`moves::follow_moved_object`): routed to the exception's owner
+  (counted `fleet.move.followed`), or dropped once the move is adopted by an owner whose placement leaves this holder
+  out (`fleet.move.reclaimed`). The walk's `reconcile_held_copy` then moves its authority there. One copy a step: the
+  whole pass that ran inside every per-copy step since A-398 went over every held copy each time, a pass per copy.
+- **Tests.** `a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_targets_successor`
+  (`crates/server/src/takeover.rs`, the lib's unit tests: A-340's seven-member region; a copy of another member's
+  volume moved to a third member, the install walked onto it, the target retired and the next install walked on). Red
+  without the fix on the Mac Studio (the copy stayed routed to its old owner, and the target's takeover listed nothing
+  for its successor); green with it.
+
+### A-488 — An adopted move's seal is taken once: its owner shard records it on the volume and answers a second ask the recorded seal (2026-11-18, goal 85 via g225, bug 3; §4.10 "Ownership follows the writer"; A-291, A-435)
+
+- **What was there.** Once a move's new owner serves the volume, its control shard asks the volume's owner shard each
+  period for the volume's seal (`moves::settle_adopted`), and keeps the seal the shard answers in the adoption
+  (`MoveAdoption::sealed`). With no seal kept there it asks for one, and the owner shard took a seal at every such ask
+  (`verbs::seal_adopted_head`). An answer can be lost after the seal is taken: A-435 made the ask wait in the owner
+  shard's own time, but a shard that stops for a window still has its call forgotten by the caller, and runs it once
+  it resumes. The next period's ask then took a second seal, which superseded the first rather than the snapshot the
+  move handed over, so the settle dropped the first seal and the handed-over snapshot stayed with the volume for good.
+- **The rule.** The seal is taken once for a volume's adoption: `seal_adopted_head` records the seal it took on the
+  volume's slot on its owner shard (`VolumeSlot::adopted_seal`: the head it superseded and the seal's head epoch), and
+  answers any later ask that record. The record lives and ends with the slot, so it never carries one adoption's seal
+  into another: a released volume's slot is freed, and a frozen copy is let go whole before a move back to this node
+  makes the volume again (`moves::supersede_frozen`). The control shard keeps what it learns as before; whichever of
+  its asks is answered, the answer names the one seal.
+- **Why this and not another.** The seal is the owner shard's effect, so its record belongs where the effect is: a
+  record on the control shard is what an answer lost in between cannot reach. A durable record is not needed: a
+  restarted daemon is a new member, and the move's adoption then falls to a takeover's successor, which materializes
+  the volume afresh.
+- **Test.** `an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once` (`crates/server/src/moves.rs`:
+  on a shard, a volume snapshotted as a move hands one over; two asks with no seal known, as after a lost answer; the
+  answered seal's head and the catalog placed at `f + 1`; a third ask with that seal). Expect the second ask to answer
+  the first seal (the same epoch, superseding the handed-over snapshot), the head sealed once, the settle `Placed`, and
+  the seal the only snapshot the volume holds.
+- **Evidence.** Mac Studio (kiln r13, 2026-11-19, debug build). Red once, the product as it was before the fix with the
+  test in place: the second ask answered a second seal (`Sealed(0, 2)` then `Sealed(4294967296, 3)`, head epochs 1 to
+  3), and after the settle the volume held the handed-over snapshot 0 beside the second seal. Green: `cargo test
+  --locked -p slates-server --lib -- moves::` 4 of 4 (the second ask answered `Sealed(0, 2)` again, head epochs 1 to 2,
+  the seal the only snapshot held; A-435's busy-shard test passing beside it). `cargo fmt --check` and `cargo clippy
+  --locked -p slates-server --all-targets -- -D warnings` clean; `cargo xtask check`'s 45 literal findings are all in
+  other changes' files (`crates/land`, `crates/base/src/s3/list.rs`, `crates/anchor/src/handles.rs`), none in these.
+
+Applied in the same change to: A-435's entry (its owed item done), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, its
+owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-after-its-answer-was-lost.md`,
+`crates/server/src/{state,verbs,moves}.rs`.
 
 ### A-489 — A location query bound to a newer root than its peer holds sends the peer's root learner to fetch from the asker (2026-11-18, g229, UI goal 85 bug 4; §4.8 "Lookup" and learners, D-14; A-406)
 - **What was there.** A location query is bound to its asker's root version, and a peer under another root view refuses
