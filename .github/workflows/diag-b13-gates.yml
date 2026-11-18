@@ -1,0 +1,294 @@
+name: diag-b13-gates
+on:
+  push:
+    branches: ['diag-b13-gates-*']
+
+env:
+  CARGO_TERM_COLOR: always
+  # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would
+  # turn every Windows lane red the day upstream ships a release. The hash is the one GitHub publishes for the release
+  # asset, and matched the file downloaded on 2026-11-04. Raising it is a review of the receiver's layout.
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  # How a pinned tool's download is retried (the WinFsp installer, kind, kubectl). Shape, from the outage that turned main
+  # red in run 42471186455 on 2026-11-08: GitHub's release downloads answered 504 and 503 from at least 10:23:21 to
+  # 10:41:08 UTC (17 min 47 s, one Windows job after another), each failed try taking 12-51 s. Twenty retries 60 s
+  # apart cover 20 minutes of it. One try is bounded by twice the slowest failed try seen (120 s), since a successful
+  # download of these few megabytes takes seconds. A step's own bound is above the whole: 21 tries of up to 120 s
+  # with 60 s between them is 63 minutes at worst, but the outage it answers is 20, so `timeout-minutes` is 45.
+  DOWNLOAD_RETRIES: "20"
+  DOWNLOAD_RETRY_SECONDS: "60"
+  DOWNLOAD_TRY_SECONDS: "120"
+  # kind and kubectl, pinned, each with the SHA-256 its release publishes (kind-linux-amd64.sha256sum, kubectl.sha256; read
+  # 2026-11-08). They are installed by a step of this workflow, not helm/kind-action, whose installer runs curl without
+  # --fail: a 504 wrote an error page over the checksum file and the step failed with "no properly formatted checksum
+  # lines found" (run 42471186455, job 128702055861).
+  KIND_URL: https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KUBECTL_URL: https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+  KUBECTL_SHA256: a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989
+
+jobs:
+  gates:
+    name: fmt + clippy + structural + literals + test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The workspace runs the byte-for-byte chart golden too. Use its renderer, as in the
+      # KIND lane; the runner image's preinstalled Helm changes document-separator whitespace.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      # slates has no inherited code, so the format gate is appropriate from day one
+      # (Appendix B.1). A red-forever check is worse than no check: never let it rot.
+      - name: Format
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: Clippy (the lint wall)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Documentation is load-bearing here: the design's numbered identifiers and the module docs are how a
+      # subsystem is handed to the next engineer, and rustdoc is the only thing that can tell a reference to a
+      # real item from a reference to one that was renamed or deleted. Nothing in this repository ran it until
+      # 2026-10-20, and the first run failed with 95 errors across fourteen crates — among them three links to
+      # `WithHost`, a type that has never existed in this tree, and a doc comment that had become separated from
+      # the function it described by an item inserted between them.
+      #
+      # Private items are documented because most of slates' design lives in private module docs, and
+      # `private_intra_doc_links` is allowed for the same reason: with `--document-private-items` those links do
+      # resolve in the output this builds. `broken_intra_doc_links` — the one that catches a stale reference —
+      # stays denied, which is the check worth having.
+      - name: Documentation (every reference names something that exists)
+        continue-on-error: true
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items
+      # R1/R2 by construction: forbidden symbols, forbidden dependencies, and write-capable
+      # syscalls outside the landing crate fail the build (AC-0.1).
+      - name: Structural test
+        continue-on-error: true
+        run: cargo xtask structural
+      # R3: every numeric literal in a tuning position carries its derivation (AC-0.2).
+      - name: Literal check
+        continue-on-error: true
+        run: cargo xtask literals
+      # The one version (docs/publish.md): the Python wheel derives it through maturin and the npm
+      # packages are derived copies of the workspace version; a drift fails here, on every push,
+      # not at tag time in the publish lanes.
+      - name: Version check
+        continue-on-error: true
+        run: cargo xtask version
+      # The daemon provisions from usable memory and degrades honestly when the OS grants little
+      # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
+      # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
+      - name: Test
+        continue-on-error: true
+        env:
+          # The fleet harness's wait trace (crates/server/tests/common/trace.rs): held in memory per test and printed
+          # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
+          # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).
+          SLATES_FLEET_TRACE: "1"
+          # a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget runs an in-process daemon, whose
+          # stop cannot fire the client's process-exit watch, so the client detects the restart only when the
+          # successor republishes its bootstrap stamp. A loaded shared runner publishes that far slower than a dev
+          # machine, racing the reply deadline (it reported Stalled{1ms} on macOS + TSan, run 38537130473). Scale the
+          # restart timings together so the publish has room; the invariant publish << reply << recovery << reconnect
+          # holds at any scale (crates/client/tests/client.rs). A normal local run keeps the prompt default of 1.
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          # The fleet deadlines (DEADLINE_NS reply wait and formation_deadline convergence poll, crates/server/tests/
+          # fleet.rs) default to 30 s — ample locally, but a loaded shared runner takes far longer to converge a
+          # multi-node takeover (a_cross_region_client_finds_the_copyset_successor passed locally in 5.7 s yet exceeded
+          # a fixed 30 s on this lane). Scale both to 120 s here so a loaded runner does not false-fail; a real
+          # non-convergence is still caught at the bound, and a normal local run keeps the prompt 30 s default.
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: cargo test --workspace --no-fail-fast
+      # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
+      - name: The vendored crates' suites
+        continue-on-error: true
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+      - name: AC-1.1 model suite over 10^6 generated operations
+        continue-on-error: true
+        run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
+      # By exact name: the file's other ignored test is a diagnosis tool (`replay_to_the_first_violation`),
+      # which a bare `--ignored` swept in (CI run 36511884967).
+      - name: T-8.13 Raft safety explorer at full scale
+        continue-on-error: true
+        run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
+      - name: The multi-log explorer at full scale (MLRaft's merge, research record §3.6)
+        continue-on-error: true
+        run: cargo test -p slates-cluster --release --test multilog -- --ignored --exact the_multi_log_merges_alike_at_full_scale
+      # By exact name, one at a time: each search spreads over every core and holds up to 4 GiB, and the file's
+      # third ignored test is a measurement tool.
+      - name: The slot model's exhaustive searches (the fast track's recovery, research record §3.7 and §4)
+        continue-on-error: true
+        run: >-
+          cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1 --exact
+          the_ballot_recovery_keeps_agreement_at_full_scope
+          the_published_recovery_loses_agreement_when_its_leader_decides_by_votes
+      - name: The prefix model's exhaustive searches (the dialect's design and its rejected alternatives, §4)
+        continue-on-error: true
+        run: >-
+          cargo test -p slates-cluster --release --test prefix_model -- --ignored --test-threads=1 --exact
+          the_design_keeps_agreement_at_full_scope
+          each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one
+      - name: AC-1.2 differential suite against the host filesystem (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture
+      - name: Host semantics over the disk (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: cargo test -p slates-base --test host -- --nocapture
+      - name: Landing over the disk, with kill -9 (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: cargo test -p slates-land --release --test os -- --nocapture
+      # Clients in namespaces of their own (A-187): one in a network namespace maps a file through the rendezvous's
+      # socket file (`crates/client/tests/netns.rs`), and one in a pid namespace the daemon cannot see into is served
+      # (`crates/ipc/tests/rendezvous.rs`). Each makes an unprivileged user namespace, which the runner's AppArmor
+      # refuses (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`), so both skipped in the workspace
+      # run. The job lifts the restriction on its own runner, as a host without it is, and a skip fails.
+      - name: Clients in namespaces of their own (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p slates-client --test netns -- --nocapture 2>&1 | tee namespaces.log
+          cargo test -p slates-ipc --test rendezvous -- --nocapture --exact \
+            a_client_whose_process_the_daemon_cannot_see_is_served 2>&1 | tee -a namespaces.log
+          if grep -q "SKIP" namespaces.log; then echo "a namespace test skipped"; exit 1; fi
+      # A listener of another user is refused by the client (A-187). Only root can start a process of another user and
+      # the runner is not root, so the test binary runs as root in a container of the runner's own Ubuntu (whose
+      # util-linux carries `setpriv`), bound in at its own path; a skip fails.
+      - name: A listener of another user refused by the client (Linux, as root in a container)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary=$(CARGO_TERM_COLOR=never cargo test -p slates-ipc --test rendezvous --no-run 2>&1 \
+            | sed -n 's/.*Executable tests\/rendezvous.rs (\(.*\))/\1/p' | tail -1)
+          docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:24.04 "$binary" --nocapture --exact \
+            a_listener_of_another_user_is_refused_by_the_client 2>&1 | tee impostor.log
+          if grep -q "SKIP" impostor.log; then echo "the impostor test skipped"; exit 1; fi
+          grep -q "test result: ok. 1 passed" impostor.log
+      # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
+      # itself (a busy parallel suite starves the daemon), so it is its own step.
+      # The Linux container profile binds a FUSE mount shared with the runtime's processes (`slates mount
+      # --shared`, allow_other), which the host's operator grants with user_allow_other (Ada authorized it on
+      # the CI runner, 2026-10-01; AUD-29-67/74/78).
+      - name: Grant user_allow_other (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The slates CLI flow (anchor + daemon)
+        continue-on-error: true
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
+      # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
+      # namespaces. GitHub's Ubuntu runner does (kernel.apparmor_restrict_unprivileged_userns=1), so every step above,
+      # on the default policy, proves the launcher's refusal that names the sysctl
+      # (`the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`). This step lifts the restriction for
+      # itself alone: test setup on the runner, not a privilege the product needs, modelling hosts without the
+      # restriction (Fedora's and Debian's defaults), so the bind is proven too. It puts the restriction back whatever the
+      # tests answer. The supervisor's decision, 2026-11-06 (GAPS 8a-launcher-ci).
+      - name: The slates exec FUSE flow, user namespaces unconfined (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          status=0
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it > exec.log 2>&1 || status=$?
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          cat exec.log
+          if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
+          grep -q "test result: ok. 2 passed" exec.log
+          exit "$status"
+      # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
+      # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
+      # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
+      # kept separate so the FSVolume handler can compile against the library (see the next step).
+      - name: FSKit Swift shim wire cross-check (macOS)
+        continue-on-error: true
+        if: runner.os == 'macOS'
+        run: |
+          swiftc crates/bridge-fskit/swift/ShimWire.swift crates/bridge-fskit/swift/ShimWireMain.swift \
+            -o "$RUNNER_TEMP/shimwire" && "$RUNNER_TEMP/shimwire"
+      # The FSKit FSVolume handler (SlatesVolume.swift) conforms to the real FSKit operation protocols.
+      # HandlerTest.swift constructs the real handler against FSKit (no mount) and drives it through a
+      # mock ShimChannel, asserting the shim requests it emits and the FSKit objects it builds — the
+      # translation logic by use (R5), including the open/close handle-stack that releases every handle.
+      # Building the test also compiles the handler, so this one step is both the compile-verify and the
+      # by-use check. FSKit ships in the macOS 15.4+ SDK; on an older runner the step skips loudly and
+      # passes (it never fails for the pin being absent). The app-group ring transport and the live-mount
+      # FSItem lifecycle are the Phase 4 spike, marked SPIKE: in the source (docs/wip/GAPS.md §4.6).
+      - name: FSKit FSVolume handler by-use tests against the real framework (macOS 15.4+)
+        continue-on-error: true
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            swiftc \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              crates/bridge-fskit/swift/HandlerTest.swift \
+              -framework FSKit -o "$RUNNER_TEMP/handlertest"
+            "$RUNNER_TEMP/handlertest"
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); handler tests skipped."
+          fi
+      # The in-process transport (§4.6): the `test-harness` cdylib exposes a C ABI over `serve`, and
+      # InProcessTest.swift links it to drive the real handler through serve() over a real VolumeBridge
+      # on a real scratch volume — the whole handler↔codec↔bridge stack end to end in one process, no
+      # ring and no mount. This is the one link the Rust `serve` tests and the Swift mock tests each
+      # cover only half of. The production transport form (this in-process form vs forwarding over the
+      # app-group ring) and the live mount remain the spike's (docs/wip/GAPS.md §4.6).
+      - name: FSKit in-process transport end-to-end test (macOS 15.4+)
+        continue-on-error: true
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            cargo build -p slates-bridge-fskit --features test-harness
+            swiftc \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              crates/bridge-fskit/swift/InProcessTest.swift \
+              -framework FSKit -L target/debug -lslates_bridge_fskit \
+              -o "$RUNNER_TEMP/inprocess"
+            DYLD_LIBRARY_PATH=target/debug "$RUNNER_TEMP/inprocess"
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); in-process test skipped."
+          fi
+      # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
+      # shared runner (no ratchet baseline), the numbers land in the job log.
+      - name: Landing bench over the disk (Linux)
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: cargo run --release -p slates-land --example land_bench
+      # The ratchet skips loudly on a machine with no recorded baseline (shared runners have
+      # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
+      - name: Ratchet
+        continue-on-error: true
+        run: cargo xtask ratchet
+
+  # The live guest (AUD-29-68, AC-9.7): QEMU's vhost-user-fs-pci drives a Linux guest whose /init mounts a
+  # daemon volume's tag, then runs the conformance roster on slates and on its RAM. QEMU, the distribution
+  # kernel and a busybox initramfs come from ci/guest (Ada authorized QEMU in CI, 2026-10-01). KVM accelerates
+  # the guest when the runner exposes /dev/kvm; the tests read it and fall back to software emulation.
