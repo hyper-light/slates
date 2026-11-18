@@ -2573,6 +2573,29 @@ impl Daemon {
     })
   }
 
+  /// Test support: the record this node holds of `object` at ledger position `sequence`, with the epoch its fence has
+  /// seen; `None` when it holds none there. A test reads what a takeover adopted at a position whatever the successor
+  /// wrote after it.
+  pub fn fleet_held_record_at(
+    &self,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+  ) -> Result<Option<HeldRecordView>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let acceptor = s.holder_records.get(&object)?;
+      let (promised, accepted) = acceptor.persisted();
+      accepted
+        .into_iter()
+        .find(|(held, at, _, _)| *held == object && *at == sequence)
+        .map(|(_, sequence, epoch, value)| HeldRecordView {
+          sequence,
+          epoch: epoch.0,
+          value,
+          fence: promised.0,
+        })
+    })
+  }
+
   /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
   /// phase one would read from it.
   pub fn fleet_held_record(
