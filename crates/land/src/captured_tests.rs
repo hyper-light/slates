@@ -260,6 +260,13 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
   );
   let report = result.unwrap();
   assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  assert_the_change_landed_and_the_outsiders_passed(&host);
+  assert!(!clone.is_overlay(), "the clone took a base from the target");
+}
+
+/// The target after the captured clone's landing: the rewritten file holds the agent's body, the made file is there, the
+/// removed file and directory are gone, and the outsider's file and the untouched one are as they were.
+fn assert_the_change_landed_and_the_outsiders_passed(host: &SimHost) {
   assert_eq!(
     host.bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
@@ -285,7 +292,6 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
-  assert!(!clone.is_overlay(), "the clone took a base from the target");
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes

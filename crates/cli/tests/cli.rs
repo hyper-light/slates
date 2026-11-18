@@ -7662,45 +7662,8 @@ fn judge_apparmor_launches(
 ) {
   let executable = report["executable"].as_str().unwrap_or_default();
   match readiness {
-    "profile-loaded" => {
-      assert_eq!(
-        on.code, 0,
-        "the profile's launcher runs the command: {}",
-        on.err
-      );
-      assert_eq!(
-        on.out.lines().collect::<Vec<_>>(),
-        ["through-the-bind", "unconfined", "grant-withheld"],
-        "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
-      );
-      assert_eq!(
-        off.code, 4,
-        "without the option the launcher leaves the profile: {}",
-        off.err
-      );
-      assert!(
-        off.err.contains("--apparmor-profile") && off.err.contains(executable),
-        "the refusal names the option and the loaded profile: {}",
-        off.err
-      );
-    }
-    "profile-missing" => {
-      assert_eq!(off.code, 4, "{}", off.err);
-      assert_eq!(
-        off.err.trim(),
-        format!("slates: {CONFINED_REFUSAL}"),
-        "without the option, the refusal as it read before A-370"
-      );
-      assert_eq!(on.code, 4, "{}", on.err);
-      let file = report["profile_file"].as_str().unwrap_or_default();
-      assert!(
-        !file.is_empty()
-          && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
-          && on.err.contains(executable),
-        "with the option, the refusal names this binary's profile and how to load it: {}",
-        on.err
-      );
-    }
+    "profile-loaded" => judge_launches_under_a_loaded_profile(off, on, executable),
+    "profile-missing" => judge_launches_with_the_profile_missing(off, on, report, executable),
     _ if off.err.contains("cannot create a user+mount namespace") => {
       eprintln!(
         "SKIP: this host refuses unprivileged user namespaces outright: {}",
@@ -7714,6 +7677,58 @@ fn judge_apparmor_launches(
       }
     }
   }
+}
+
+/// Under a loaded profile only the option's launch runs, outside the profile and holding no user-namespace grant; the
+/// launch without the option is refused, naming the option and the loaded profile's `executable`.
+#[cfg(target_os = "linux")]
+fn judge_launches_under_a_loaded_profile(off: &Launched, on: &Launched, executable: &str) {
+  assert_eq!(
+    on.code, 0,
+    "the profile's launcher runs the command: {}",
+    on.err
+  );
+  assert_eq!(
+    on.out.lines().collect::<Vec<_>>(),
+    ["through-the-bind", "unconfined", "grant-withheld"],
+    "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+  );
+  assert_eq!(
+    off.code, 4,
+    "without the option the launcher leaves the profile: {}",
+    off.err
+  );
+  assert!(
+    off.err.contains("--apparmor-profile") && off.err.contains(executable),
+    "the refusal names the option and the loaded profile: {}",
+    off.err
+  );
+}
+
+/// With the profile missing both launches are refused: the one without the option as it read before A-370, the option's
+/// naming this binary's profile file from `report` and how to load it.
+#[cfg(target_os = "linux")]
+fn judge_launches_with_the_profile_missing(
+  off: &Launched,
+  on: &Launched,
+  report: &serde_json::Value,
+  executable: &str,
+) {
+  assert_eq!(off.code, 4, "{}", off.err);
+  assert_eq!(
+    off.err.trim(),
+    format!("slates: {CONFINED_REFUSAL}"),
+    "without the option, the refusal as it read before A-370"
+  );
+  assert_eq!(on.code, 4, "{}", on.err);
+  let file = report["profile_file"].as_str().unwrap_or_default();
+  assert!(
+    !file.is_empty()
+      && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+      && on.err.contains(executable),
+    "with the option, the refusal names this binary's profile and how to load it: {}",
+    on.err
+  );
 }
 
 /// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
