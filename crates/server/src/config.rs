@@ -648,14 +648,18 @@ impl DaemonConfig {
 
   /// Derived: the copies an anchor may hold for this daemon across a restart: every writable direct map's copy its shards
   /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; and every Shards
-  /// stream's DAX object (A-365), `shards × dax_range_slots`, since each backing counts at least one range against its
-  /// shard's fill budget.
+  /// stream's DAX object ([`DaemonConfig::held_dax_bound`]).
   pub fn held_copy_bound(&self) -> usize {
-    usize::from(self.runtime.shards).saturating_mul(
-      self
-        .direct_maps_per_shard
-        .saturating_add(self.dax_range_slots()),
-    )
+    usize::from(self.runtime.shards)
+      .saturating_mul(self.direct_maps_per_shard)
+      .saturating_add(self.held_dax_bound())
+  }
+
+  /// Derived: the Shards streams' DAX objects an anchor may hold for this daemon across a restart (A-365; Windows' DAX
+  /// sections, A-448): `shards × dax_range_slots`, since each backing counts at least one range against its shard's fill
+  /// budget, so no shard ever has more backings than slots.
+  pub fn held_dax_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(self.dax_range_slots())
   }
 
   /// Derived (A-365): the slots of each shard's DAX range table, one for each range its fill budget can count: the

@@ -26,7 +26,7 @@ use slates_anchor::{AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Su
 use slates_machine::facts::Identity;
 
 use slates_anchor::handles::{
-  HandleMessage, HandleRefusal, MESSAGE_BYTES, WHAT_WINFSP_MOUNT, encode, parse_env,
+  HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, WHAT_WINFSP_MOUNT, encode, parse_env,
 };
 use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
 use slates_ipc::win_spawn::{
@@ -72,6 +72,14 @@ const ANCHORED_ROLE: &str = "SLATES_HANDLE_TEST_ANCHORED_ROLE";
 const REFUSALS_TAG: &str = "ANCHOR_REFUSALS=";
 /// Format: the words of the anchor's log line for a refused message, counted by the log's test.
 const REFUSAL_LINE: &str = "a hold message was refused";
+/// Bounds of `count` entries an attachment holds and no DAX section (A-448): these fixtures hold mounts alone.
+fn attachments(count: usize) -> HoldBounds {
+  HoldBounds {
+    attachments: count,
+    sections: 0,
+  }
+}
+
 /// Shape: how many short and how many corrupted hold messages the garbling child writes (each kind this many).
 const GARBLED_EACH: usize = 10;
 /// Shape: the entries a garbling child holds: one before its bad messages, so they must leave it held, and one after,
@@ -223,7 +231,7 @@ fn a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor() {
       sender.try_wait()
     ),
   };
-  let mut held = Held::new(8);
+  let mut held = Held::new(attachments(8));
   let answer = held.apply(sender.raw_handle(), message);
   assert_eq!(answer, Some(HandleMessage::Held { id: ENTRY_ID }));
   anchor.send(&answer.unwrap(), WAIT_MS).unwrap();
@@ -370,7 +378,7 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
   // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
   // a crash loop (A-311), which ends the fixture's observation.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(1).unwrap();
+  anchor.0.hold_handles(attachments(1)).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_SUPERVISED.to_owned());
   anchor
     .0
@@ -506,7 +514,7 @@ fn refusals_while_supervising(role: &str) -> u64 {
   // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
   // a crash loop (A-311), which ends the fixture's observation.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(GARBLERS_HOLDS).unwrap();
+  anchor.0.hold_handles(attachments(GARBLERS_HOLDS)).unwrap();
   anchor.0.hold_environment(ROLE, role.to_owned());
   anchor
     .0
@@ -567,7 +575,7 @@ fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
   // observation. Its successor's first hold waits on an anchor that steps no more, so it publishes nothing over the
   // first child's answers, and the fixture's drop stops it.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(PROMPT_HOLDS).unwrap();
+  anchor.0.hold_handles(attachments(PROMPT_HOLDS)).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_PROMPT.to_owned());
   anchor
     .0

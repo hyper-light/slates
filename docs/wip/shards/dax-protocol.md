@@ -187,6 +187,16 @@ descriptor refuses any duplicate of more, a rewrite of the descriptor included.
 **The slice.** A ranged ask begins at a multiple of the system's allocation granularity, 64 KiB here, where a view of a
 section must begin. Any other offset is refused `EINVAL` before anything is made or filled (A-211).
 
+**After a daemon's death (A-448).** On a stream whose resync the anchor holds (A-427), the anchor holds a duplicate of
+each section the guest maps, taken before the answer naming the section goes out; the section's descriptor lets the
+anchor widen it no more than any holder. A successor takes the sections back with the stream, writes the guest's
+unsynced stores into the files before it serves anything, and answers each ask after its `Resync` with the same section,
+duplicated into the asking process again: the stream handle the `Resync` named there is a known holder's, so the claim
+check passes it. Nothing new crosses the stream, and nothing rides the `Resync` (A-418's 40 bytes): the device asks
+again at its next `FUSE_SETUPMAPPING`, as it always does, and its maps of the old section stay right, being views of the
+same section. Where the anchor refuses a section (its bound, `shards × dax_range_slots`), the stream gives its resync
+up, and its share ends with the daemon, as before A-448.
+
 ## What Shards' device does
 
 **Nothing new is required.** The design rests on behaviour the device already has, each confirmed by its owner on

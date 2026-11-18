@@ -1,7 +1,8 @@
 //! The daemon's Windows mount holds (A-198, §4.6): the anchor owns duplicates of the control and ledger handles until
-//! an acknowledged release, and the held volume keeps its Mount Manager drive (A-369); and its Shards streams' resync
+//! an acknowledged release, and the held volume keeps its Mount Manager drive (A-369); its Shards streams' resync
 //! ends (A-427), each held with its stream's session as its record, which a `Record` replaces as the session moves
-//! (A-423). One IOCP pipe lives on the control shard; exchanges borrow it by
+//! (A-423); and those streams' DAX sections (A-448), each held with its attachment and file as its record, the
+//! counterpart of A-365's held copies. One IOCP pipe lives on the control shard; exchanges borrow it by
 //! move, and a bounded deadline covers both waiting for its owner and the request/acknowledgement pair. NFS socket
 //! holds are still owed; those paired Unix API calls continue to report that no connection hold is available on Windows.
 //!
@@ -13,7 +14,7 @@
 //! reading plus the budget, given to waits that take a span, so it lasted the daemon's whole uptime and more.
 
 use slates_anchor::handles::{
-  self, HandleMessage, MESSAGE_BYTES, WHAT_SHARDS_RESYNC, WHAT_WINFSP_MOUNT,
+  self, HandleMessage, MESSAGE_BYTES, WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC, WHAT_WINFSP_MOUNT,
 };
 use slates_rt::futures;
 use slates_rt::pipe::{PipeEnd, PipeRead, PipeWrite};
@@ -126,6 +127,18 @@ pub(crate) struct HandedResync {
   pub(crate) record: Vec<u8>,
 }
 
+/// A Shards stream's DAX section the anchor handed back (A-448), as Unix hands back a held copy (A-365): its id, the
+/// section, and its record, the stream's attachment and the file (`crate::shards::dax_hold::DaxRecord`).
+#[derive(Debug)]
+pub(crate) struct HandedCopy {
+  /// The section's id: its dead daemon's backing, named apart from every attachment (`dax_hold::section_id`).
+  pub(crate) copy: u64,
+  /// The section, as the anchor held it: mapping read and write and asking its size.
+  pub(crate) object: OwnedHandle,
+  /// Its record.
+  pub(crate) record: Vec<u8>,
+}
+
 /// A connection the anchor handed back: its id and the socket. None is handed back on Windows.
 #[derive(Debug)]
 pub(crate) struct HandedConnection {
@@ -135,8 +148,8 @@ pub(crate) struct HandedConnection {
   pub(crate) socket: OwnedStream,
 }
 
-/// The inherited mount objects, the Shards streams' resync ends and the fresh control channel; Windows NFS connections
-/// are still owed.
+/// The inherited mount objects, the Shards streams' resync ends and DAX sections, and the fresh control channel;
+/// Windows NFS connections are still owed.
 #[derive(Debug, Default)]
 pub(crate) struct Handed {
   /// The held NFS connections.
@@ -144,10 +157,13 @@ pub(crate) struct Handed {
   pub(crate) mounts: Vec<HandedMount>,
   /// The held Shards streams' resync ends (A-433).
   pub(crate) resync_ends: Vec<HandedResync>,
+  /// The held Shards streams' DAX sections (A-448).
+  pub(crate) copies: Vec<HandedCopy>,
   pub(crate) channel: Option<OwnedHandle>,
 }
 
-/// Adopts the explicitly inherited channel and held mounts exactly once, before handle values can be reused.
+/// Adopts the explicitly inherited channel and held entries exactly once, before handle values can be reused. `bound` is
+/// every entry the anchor may hold for this daemon, of every class (`HoldBounds::total`, A-448).
 pub(crate) fn adopt(bound: usize) -> Handed {
   let mut handed = Handed::default();
   let Ok(value) = std::env::var(handles::ENV_HANDLES) else {
@@ -170,22 +186,29 @@ pub(crate) fn adopt(bound: usize) -> Handed {
     }
   };
   for entry in entries {
-    // A Shards stream's resync end (A-433), one handle: kept for the shard that owns its attachment, which serves the
-    // stream again or lets the end go. One this process cannot own keeps its id as a refused entry with no handle, so
-    // the control shard releases the anchor's copy; its value is never taken a second time.
-    if entry.what == WHAT_SHARDS_RESYNC
+    // A Shards stream's resync end (A-433) or DAX section (A-448), one handle: kept for the shard that owns its
+    // attachment, which serves the stream again and takes its sections back, or lets them go. One this process cannot
+    // own keeps its id as a refused entry with no handle, so the control shard releases the anchor's copy; its value is
+    // never taken a second time.
+    if (entry.what == WHAT_SHARDS_RESYNC || entry.what == WHAT_SHARDS_DAX)
       && let [value] = entry.values.as_slice()
     {
       match adopted(*value) {
-        Ok(end) => handed.resync_ends.push(HandedResync {
+        Ok(end) if entry.what == WHAT_SHARDS_RESYNC => handed.resync_ends.push(HandedResync {
           attachment: entry.id,
           end,
           record: entry.record,
         }),
+        Ok(section) => handed.copies.push(HandedCopy {
+          copy: entry.id,
+          object: section,
+          record: entry.record,
+        }),
         Err(error) => {
           slates_machine::log_line!(
-            "slates-server: held resync end {} refused: {error}",
-            entry.id
+            "slates-server: held Shards entry {} (kind {}) refused: {error}",
+            entry.id,
+            entry.what
           );
           handed.mounts.push(HandedMount {
             attachment: entry.id,
@@ -358,6 +381,28 @@ pub(crate) async fn release_resync(id: u64) -> Result<(), HoldRefusal> {
   exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
 }
 
+/// Holds a Shards stream's DAX section, `value` in this daemon's table, as entry `id` (its backing, named apart from every
+/// attachment), with `record` its attachment and file (A-448): answered once the anchor has duplicated the section out
+/// of this process, within the same budget a mount's hold has.
+pub(crate) async fn hold_section(id: u64, value: u64, record: Vec<u8>) -> Result<(), HoldRefusal> {
+  exchange(
+    HandleMessage::Hold {
+      id,
+      what: WHAT_SHARDS_DAX,
+      values: vec![value],
+      record,
+    },
+    HOLD_BUDGET_NS,
+  )
+  .await
+}
+
+/// Lets a Shards stream's DAX section go (A-448): one attempt, as a mount's release; idempotent at the anchor, so a
+/// release of a section it never took is answered the same.
+pub(crate) async fn release_section(id: u64) -> Result<(), HoldRefusal> {
+  exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
+}
+
 /// One exchange with the anchor over the channel `OWNER`'s shard holds: the anchor's part within `budget_ns` on the wall,
 /// once the owner shard runs it; the owner shard waited for in its own time (A-440; R3's class A), since a hold the
 /// anchor takes is a side effect its caller must learn of: waited `budget_ns` on the wall, a busy owner shard ran the
@@ -464,10 +509,14 @@ mod tests {
 
   /// Format: the handle value the scripted resync hold names (the stand-in anchor duplicates nothing).
   const RESYNC_END: u64 = 0x2c4;
+  /// Format: the handle value the scripted DAX section hold names.
+  const SECTION: u64 = 0x2d8;
+  /// Format: the scripted section's id, a backing's named apart from every attachment (`dax_hold::section_id`).
+  const SECTION_ID: u64 = (1 << 63) | 0x0100_0002;
 
   /// The scripted exchanges, in order, on the shard that owns the pipe; each answer goes back with how long it took.
   async fn scripted(answers: Sender<(Result<(), String>, u64)>) {
-    for step in 0..8u8 {
+    for step in 0..11u8 {
       let began = futures::now_ns();
       let answer = match step {
         0 => release_mount(7).await,
@@ -476,7 +525,9 @@ mod tests {
         4 => hold_resync(10, RESYNC_END, b"the attach's session".to_vec()).await,
         5 => record_resync(10, b"the guest named its owner".to_vec()).await,
         6 => record_resync(11, Vec::new()).await,
-        _ => release_resync(10).await,
+        7 => release_resync(10).await,
+        8 | 9 => hold_section(SECTION_ID, SECTION, b"attachment and file".to_vec()).await,
+        _ => release_section(SECTION_ID).await,
       };
       let took = futures::now_ns().saturating_sub(began);
       let sent = answers.send((answer.map_err(|refusal| refusal.to_string()), took));
@@ -488,7 +539,8 @@ mod tests {
 
   /// A-206 (2026-11-04), the exchange against a stand-in anchor on a real pipe and shard, with no WinFsp. Do: leave a
   /// release unanswered until its deadline passes; answer it late, then answer a hold; then refuse a release and answer
-  /// its repeat; then the exchanges of a Shards stream's resync end (A-427, `resync_exchanges`). Expect: the deadline
+  /// its repeat; then the exchanges of a Shards stream's resync end (A-427, `resync_exchanges`) and of its DAX section
+  /// (A-448, `section_exchanges`). Expect: the deadline
   /// passes within its budget, not the daemon's uptime; the channel survives it, so the hold is served and the late
   /// answer passed over; the refusal is typed and the repeat served. Before: the deadline was the clock's reading plus
   /// the budget, and passing it closed the only pipe, so every later exchange was refused for the daemon's life.
@@ -557,7 +609,50 @@ mod tests {
       .unwrap();
     assert_eq!(answers.recv_timeout(STAND_IN_WAIT).unwrap().0, Ok(()));
     resync_exchanges(&anchor, &answers);
+    section_exchanges(&anchor, &answers);
     daemon.stop();
+  }
+
+  /// A-448, the scripted exchanges' DAX section steps, answered by the stand-in anchor. Do: hold a section, refused at
+  /// the anchor's bound; hold it again, held; let it go. Expect: each hold names the DAX kind, the one handle, the
+  /// section's id apart from every attachment's and its record; the refusal at the bound reaches the daemon typed, as one
+  /// the anchor will not hold; the second is served on `Held`, and the release on `Released`.
+  fn section_exchanges(
+    anchor: &Channel,
+    answers: &std::sync::mpsc::Receiver<(Result<(), String>, u64)>,
+  ) {
+    let answered = |message: HandleMessage| {
+      anchor.send(&message, STAND_IN_WAIT_MS).unwrap();
+      answers.recv_timeout(STAND_IN_WAIT).unwrap().0
+    };
+    let hold = HandleMessage::Hold {
+      id: SECTION_ID,
+      what: WHAT_SHARDS_DAX,
+      values: vec![SECTION],
+      record: b"attachment and file".to_vec(),
+    };
+    assert_eq!(anchor.recv(STAND_IN_WAIT_MS).unwrap(), Some(hold.clone()));
+    let bound = HoldRefusal::Protocol(handles::HandleRefusal::Refused {
+      reason: handles::Reason::Bound,
+    });
+    assert!(
+      !bound.may_hold(),
+      "a section refused at the bound is not held"
+    );
+    assert_eq!(
+      answered(HandleMessage::Refused {
+        id: SECTION_ID,
+        reason: handles::Reason::Bound,
+      }),
+      Err(bound.to_string())
+    );
+    assert_eq!(anchor.recv(STAND_IN_WAIT_MS).unwrap(), Some(hold));
+    assert_eq!(answered(HandleMessage::Held { id: SECTION_ID }), Ok(()));
+    assert_eq!(
+      anchor.recv(STAND_IN_WAIT_MS).unwrap(),
+      Some(HandleMessage::Release { id: SECTION_ID })
+    );
+    assert_eq!(answered(HandleMessage::Released { id: SECTION_ID }), Ok(()));
   }
 
   /// A-427, the scripted exchanges' resync steps, answered by the stand-in anchor. Do: hold a resync end with its

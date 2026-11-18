@@ -814,8 +814,16 @@
 >   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
 >   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
 >   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
->   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
->   first map). **Built since (A-402, 2026-11-18):** the write log on
+>   `{resync}` stands; and its DAX sections (A-448, the same day): the anchor holds a duplicate of each section a
+>   resynced stream's guest maps (read, write and query, under the section's confining descriptor) before the answer
+>   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
+>   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
+>   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
+>   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
+>   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
+>   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
+>   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -3759,9 +3767,15 @@
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
 >   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
->   daemon and no successor's takeover is refused (A-176). Owed in C-a: the fleet tests' `CREDIT_WAIT` in daemon time,
->   and the macOS region fetch's own wait for the owner's turn (the Mach reply's send-once notification would end it at
->   the owner's death); Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
+>   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
+>   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
+>   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
+>   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
+>   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
+>   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

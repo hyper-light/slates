@@ -4493,11 +4493,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
   whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
   resync up, as a stream did at its first map before A-365, since the guest's stores live where only the device maps
-  them once the daemon is gone.
+  them once the daemon is gone. On Windows (A-448) the anchor holds a duplicate of each file's section that maps read
+  and write and may ask its size, which the section's confining descriptor lets no holder widen (A-175); its hold is an
+  exchange, so the answer naming the section waits for it, as a reply waits for the session's `Record`; its id is the
+  backing's marked apart from every attachment's, since the Windows anchor keeps one table of ids; and the sections are
+  held to a bound of their own, `shards × dax_range_slots`, past which a hold is refused `Bound` and the stream gives
+  its resync up, while the attachments' mounts and resync ends keep theirs.
   A successor takes the held DAX objects back while recovery rebuilds the shard, at the very handles their backings
   had, dormant through the write log's replay (each already holds every write the dead daemon made to its ranges, in
   order with its guest's stores), and its stream ingests their writable ranges before it serves anything, wakes them so
-  every change reaches them again, and answers the device's new asks with the same objects. It hands the device a fresh
+  every change reaches them again, and answers the device's new asks with the same objects: on Windows each ask after
+  the `Resync` gets the same section duplicated into the holder again, the holder's handle of the fresh stream being a
+  known holder's for the claim check (A-448), and a file whose section the anchor did not hand back is asked for again
+  at its next answer, never assumed held. It hands the device a fresh
   stream over the channel in a `Resync` naming the same token, and keeps its own copy of
   the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
   closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
@@ -30850,8 +30858,8 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
   Windows. The real-process test (an anchor, a killed daemon, the probe reading the file through the stream its
   `Resync` names) and the Windows unit and suite runs are filed for main.
 - **Owed.** A Windows stream's DAX sections held by the anchor (A-365 is Unix's; a Windows stream gives its resync up at
-  its first map, A-427); and Shards' device half, which takes the `Resync` through its spawner's grants (its
-  coordinator's condition 4c).
+  its first map, A-427): built by A-448; and Shards' device half, which takes the `Resync` through its spawner's grants
+  (its coordinator's condition 4c).
 
 ### A-442 — An NFSv4.1 callback waits its back channel's learned round trip, backed off after a timeout up to the NFSv4 lease; the told wait and the callbacks share one learner (2026-11-18, built for goal g255; R3's class B, item B-c; RFC 8881 §2.10.6.2, §2.10.6.3, §10.4.5; A-78, A-79, A-425, A-431)
 - **What was there.** Every callback on a session's back channel (the probe that proves it, `nfs::probe_back_channel`,
@@ -31084,3 +31092,115 @@ remote_attach}.rs`.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
 wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
+
+### A-452 — The macOS region fetch waits while its owner lives: no timeout, the kernel's send-once notification ending it at the owner's departure (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; GAP-A9-9, A-178, A-443)
+
+- **What was there.** A macOS claimant fetches its answered region from the instance's owner over the owner's token
+  (`mach_claim::fetch`, GAP-A9-9). The fetch waited a fixed second for its send to be queued and another for the answer
+  (the claim wait), so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
+  and an owner that went away with the fetch queued was reported as keeping nothing for the claim: the kernel's notice
+  of the fetch's destroyed send-once right was read as a malformed answer.
+- **The rule.** The fetch waits while its owner lives, never by a clock, as a claim does (A-443): its send has no
+  timeout, so it waits for room in the owner's queue until it is queued or the owner's port dies (refused
+  `MACH_SEND_INVALID_DEST`); its receive has none, so it waits for the owner's answer until the kernel's send-once
+  notification (`MACH_NOTIFY_SEND_ONCE`) says the owner went away holding the fetch's reply right, or with the fetch
+  still in its queue, each refused as an owner that went away.
+- **Tests.** `a_fetch_answered_past_the_claim_wait_is_served` (the token held with nothing serving it, a region kept,
+  the fetch made, and the owner's service started half again the claim wait later: the region fetched) and
+  `a_fetch_whose_owner_went_away_is_refused_by_its_departure` (the token let go with the fetch queued: refused as an
+  owner that went away, at once). Red with the old timeouts: the first refused at the second, the second reported as
+  an owner keeping nothing.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{mach_claim,rendezvous}.rs`.
+
+### A-454 — The fleet tests' client waits in its daemon's own time: a connect is one claim, a full ring is waited out while its shard steps (2026-11-18, goal 85 via g251; R3's class C, C-a's second half; A-426, A-443, A-447)
+
+- **What was there.** The fleet suite's client (`crates/server/tests/fleet.rs`) retried a connect refused as unavailable,
+  and a send refused for a full request ring, for five seconds on the wall (`CREDIT_WAIT`). A daemon kept off its CPUs
+  could outlast it while alive, and the connect's retry dated from when a claim gave up at a second with its daemon
+  alive.
+- **The rule.** A connect is one claim: since A-443 and A-447 a claim waits while its daemon lives and ends at its
+  death, and every daemon of the suite opens its rendezvous before its start returns, so a refusal says no daemon holds
+  the instance's rendezvous and fails the test at once. A send that meets a full ring waits for room while the ring's
+  shard steps, since a shard drains its clients' rings at its steps (A-426's rule for room), and ends only once the
+  shard has taken no step for `FROZEN_CAP`, the suite's one wall bound for a daemon frozen or dead (`RoomWait`). No
+  product behaviour changes.
+- **Owed.** The same constant and the same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs`.
+- **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
+
+### A-448 — The anchor holds a Windows Shards stream's DAX sections, so a stream whose guest maps files outlives its daemon (2026-11-18, goal 90, item b, piece five; A-365's Windows half; A-175's confinement, A-180's sections, A-433's successor)
+Applied in the same change to: §4.6, the Shards form's resync bullet; A-433's owed list; GAPS, A-281's entry (its
+Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's death); and:
+- `crates/anchor`: `handles.rs` (`WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`, `admits`; `HoldBounds`, each class of entry
+  held to its own bound); `held_windows.rs` (`Held::new(HoldBounds)`, the sections counted apart, refused `Bound` at
+  theirs); `supervise.rs` and `supervise_windows.rs` (`hold_handles(HoldBounds)`, the drain bound over every class).
+- `crates/api`: `role/anchor.rs` (the anchor's bounds: `held_device_bound` and `held_dax_bound`).
+- `crates/mem`: `dax_object.rs` (Windows `DaxObject::adopt`, a held section checked whole: its last range maps writable
+  and a duplicate of read, write and query is granted; `DaxObject::held`, the anchor's duplicate);
+  `tests/dax_section.rs` (`a_held_section_is_adopted_whole_and_never_widened`).
+- `crates/vfs`: `shards_backing.rs` (`BackingObject::held` on Windows).
+- `crates/cli`: `tests/shards.rs` (`slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill`, the real-process
+  restart with a stored section, sharing A-433's restart harness, `read_across_a_kill`).
+- `crates/server`: `config.rs` (`held_dax_bound`, which `held_copy_bound` now adds); `anchor_hold_windows.rs`
+  (`HandedCopy`, `adopt` keeps a section entry for its shard, `hold_section`, `release_section`; the stand-in anchor's
+  section exchanges); `shards/dax_hold.rs` (on every platform: `marked`, `hold_asked`, Windows' `hold`, `release`,
+  `owed`, `hold_owed`, `settle_section`, `refuse_section`, `unroutable`); `shards.rs` (`section_owed`,
+  `Turned::Section`, `keep_resync_through_dax` and `give_up_resync_for_dax` on Windows, the successor's `claim` and
+  its holder named); `shards/dax.rs` (the Windows answer keeps the section; its end lets it go);
+  `shards/resync_handle.rs` (`send_resync` gives the holder's value back); `daemon.rs` (Windows' `ShardHolds`, the
+  sections split by partition, the range table opened on every platform); `state.rs`, `lib.rs`, `verbs.rs` and
+  `dax_ranges.rs` (the range table and the adoption on every platform).
+
+- **What was there.** A Windows stream gave its resync up at its guest's first DAX map (A-427): the guest's stores
+  through a section live in an object only the device maps once its daemon is gone, and no anchor held one, so a DAX
+  share ended at a daemon's death.
+- **The hold.** The daemon hands the anchor a duplicate of each section a resynced stream's guest maps, as Unix hands
+  it the object (A-365): before the answer naming the section goes out, with the attachment and the file as its
+  record, and released when the backing ends (the guest forgets the file, the stream ends, the resync is given up). The
+  duplicate maps read and write and may ask its size, the access a successor works the section by and a writable ask's
+  duplicate takes. It is made under the section's own `D:P(A;;RC;;;OW)` (A-175), so the anchor, and the successor it
+  hands the section to, can widen it no more than any holder. Windows' hold is an exchange, so the answer waits for
+  it, as a reply that rests on the session waits for its `Record` (A-427): the serve task asks it (`Turned::Section`).
+  Held, the section is the stream's; refused, past the anchor's bound or with the exchange failed, the stream gives its
+  resync up and its device learns its share ends with this daemon (A-365's rule); an answer that never came is
+  released all the same, since the anchor may hold it. Each range answered is recorded in the range table, which now
+  opens on every platform.
+- **Its id.** The section's backing's handle encoded with its partition, as on Unix, with the top bit set: the Windows
+  anchor keeps one table of ids for every kind, and a release and its answer name an entry by id alone, while an
+  attachment's id carries its partition in the same top 16 bits, so the two could be equal. A partition below 2^15
+  leaves the bit clear in both; under one past it no section is held and the stream gives its resync up.
+- **Its bound.** The anchor holds each class of entry to its own derived bound (`HoldBounds`): mounts and resync ends
+  one per live attachment (`shards × MAX_ATTACHMENTS`, as before), and sections one per range the shards' fill budgets
+  can count (`shards × dax_range_slots`, the derivation of A-365's copy bound), since each section held counts at least
+  one range against its shard's. A section past its bound is refused `Bound`, typed, and never crowds out a mount or a
+  resync end; the handoff names at most the two together, which the daemon parses at most.
+- **The successor.** Recovery takes each held section back as a held Unix object is taken (A-365): at its backing's
+  handle, in one ascending order, dormant through the write log's replay, checked whole (`DaxObject::adopt`: its last
+  range maps writable, so it spans the machine's size, and a duplicate of read, write and query is granted, which the
+  descriptor grants no handle lacking any of them). The stream's adoption claims them, wakes them and ingests their
+  writable ranges before it serves anything. Its device's asks after the `Resync` are answered with the same sections
+  duplicated into the holder again, so the guest's maps stay right: the holder's value of the fresh stream is a known
+  holder's, which a DAX ask names for the claim check (A-180). A file whose section the anchor did not hand back is
+  asked for again at its next answer (`hold_asked`), never taken for held; a section no kept stream claims is released.
+- **Not in the `Resync`.** The sections are offered again at the device's asks, as on Unix, and not named in the
+  `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for a section at every
+  `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be a handle no one
+  closes in its process.
+- **Evidence.** Red first, on main at `0576faacf` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
+  lib tests did not build (13 errors: no `HoldBounds`, `WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`), nor `slates-server`'s
+  (9 errors: no `marked`, `hold_asked`). Green on the tree as merged with main, the same day and machine:
+  `cargo test -p slates-anchor --lib handles` 14 of 14, among them `the_anchor_admits_each_kind_at_its_handle_counts_alone`
+  and `each_class_of_entry_is_refused_at_its_own_bound`; `cargo test -p slates-server --lib shards::` 8 of 8, among them
+  `a_sections_id_is_never_an_attachments_and_keeps_its_handle` and
+  `a_successor_that_finds_no_held_section_asks_the_anchor_again`; rustfmt's layout taken; and `cargo xwin check
+  --target x86_64-pc-windows-msvc` clean for `slates-anchor`, `slates-mem`, `slates-vfs`, `slates-server` and
+  `slates-api` (lib and tests) and `slates-cli` (bins and tests). The Windows tests (`dax_section.rs`'s adoption,
+  `held_windows.rs`'s bound, the stand-in anchor's section exchanges) and the real-process restart run only on Windows:
+  filed for main.
+- **Owed.** The real-process restart with DAX (`slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill`:
+  a section stored into before the kill, the same section handed again by a fresh ask after it, the store read back
+  through the fresh stream) on CI's Windows runners, filed for main; Shards' device half (its coordinator's condition
+  4c). Found beside it (GAPS): the Windows handoff names every held entry in one environment variable, whose length
+  Windows bounds, and the anchor's bounds were never set against it.

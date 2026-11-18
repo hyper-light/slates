@@ -108,8 +108,8 @@ mod resync;
 // end handed by the handle route.
 #[cfg(windows)]
 mod resync_handle;
-// A resyncable stream's DAX objects held by the anchor, and their adoption by a successor (A-365).
-#[cfg(unix)]
+// A resyncable stream's DAX objects held by the anchor, and their adoption by a successor (A-365; Windows' sections,
+// A-448).
 pub(crate) mod dax_hold;
 
 pub use end::HandedEnd;
@@ -394,10 +394,13 @@ pub(crate) struct ShardsStream {
   /// ([`wait_for_work`]).
   #[cfg(unix)]
   fresh_copy: Option<HandedEnd>,
-  /// The DAX objects of this stream's backings the anchor holds (A-365; [`dax_hold`]), by inode: each its copy id, so its
-  /// backing's end releases it. Only a stream whose resync the anchor holds has any.
-  #[cfg(unix)]
+  /// The DAX objects of this stream's backings the anchor holds (A-365; Windows' sections, A-448; [`dax_hold`]), by inode:
+  /// each its copy id, so its backing's end releases it. Only a stream whose resync the anchor holds has any.
   held_dax: BTreeMap<u64, u64>,
+  /// The file whose DAX section the anchor must hold before the owed answer goes out (Windows, A-448): the hold is an
+  /// exchange, which the serve task asks (`dax_hold::hold_owed`). At most one, since the device waits for each answer.
+  #[cfg(windows)]
+  section_owed: Option<u64>,
 }
 
 impl ShardsStream {
@@ -446,8 +449,9 @@ impl ShardsStream {
       replay: None,
       #[cfg(unix)]
       fresh_copy: None,
-      #[cfg(unix)]
       held_dax: BTreeMap::new(),
+      #[cfg(windows)]
+      section_owed: None,
     }
   }
 }
@@ -672,13 +676,13 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
   })
 }
 
-/// Keeps `stream`'s resync through its guest's DAX map of `inode`, just answered (A-365; `dax::answer`): the anchor holds
-/// the object and the range table records its ranges ([`dax_hold::keep`]), so a successor can take them back. Where
-/// either is refused, or the answer names no file, the resync is given up instead ([`give_up_resync_for_dax`]). A stream
-/// whose resync no anchor holds keeps nothing.
-#[cfg(unix)]
+/// Keeps `stream`'s resync through its guest's DAX map of `inode`, just answered (A-365; Windows, A-448; `dax::answer`):
+/// the anchor holds the object and the range table records its ranges ([`dax_hold::keep`]), so a successor can take them
+/// back; on Windows the answer waits for the anchor's hold (`dax_hold::hold_owed`). Where either is refused, or the
+/// answer names no file, the resync is given up instead ([`give_up_resync_for_dax`]). A stream whose resync no anchor
+/// holds keeps nothing.
 fn keep_resync_through_dax(s: &mut ShardState, stream: &mut ShardsStream, inode: Option<u64>) {
-  if !stream.resync.as_ref().is_some_and(resync::Resync::held) {
+  if !resync_held(stream) {
     return;
   }
   if inode.is_some_and(|inode| dax_hold::keep(s, stream, inode)) {
@@ -706,11 +710,14 @@ fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
   }
 }
 
-/// Gives `stream`'s resync up, counted, at its guest's first DAX map (Windows, A-427): the guest's stores through the
-/// section live where only the device maps them once this daemon is gone, and no anchor holds a Windows DAX section
-/// (A-365 holds DAX objects on Unix alone), so a successor could not take them back.
+/// Gives `stream`'s resync up, counted, where its guest's DAX sections cannot be held for a successor (Windows, A-427,
+/// A-448): the anchor refused one (its bound for sections reached, or the exchange failed) or the range table refused
+/// its ranges. The guest's stores through a section live where only the device maps them once this daemon is gone, so
+/// the device reads its resync channel's end and knows its share ends at a daemon's death, and every section the anchor
+/// held for it is let go.
 #[cfg(windows)]
 fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
+  dax_hold::let_go_all(s, stream);
   if resync_handle::give_up(s, stream) {
     s.count(RESYNC_GIVEN_UP, 1);
   }
@@ -1253,6 +1260,10 @@ enum Turned {
   /// it (`resync_handle::tell`), then sends the reply.
   #[cfg(windows)]
   Session,
+  /// The anchor must hold the DAX section the owed answer hands before it goes out (Windows, A-448): the task asks the
+  /// hold (`dax_hold::hold_owed`), then sends the answer.
+  #[cfg(windows)]
+  Section,
   /// The attachment ended.
   Ended,
 }
@@ -1430,6 +1441,8 @@ async fn serve(attachment: u64) {
         }
         #[cfg(windows)]
         Some(Turned::Session) => resync_handle::tell(attachment).await,
+        #[cfg(windows)]
+        Some(Turned::Section) => dax_hold::hold_owed(attachment).await,
         Some(Turned::Told(owed)) => {
           // Every FUSE mount of the volume is told of the change, or the bound passes, before the reply goes out
           // (AC-3.3); the next turn sends it. Shards' VMM sends nothing more meanwhile, since it waits for this reply.
@@ -1476,6 +1489,10 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     }
     if let Some(owed) = told_owed(s, stream) {
       return Turned::Told(owed);
+    }
+    #[cfg(windows)]
+    if dax_hold::owed(stream) {
+      return Turned::Section;
     }
     #[cfg(windows)]
     if resync_handle::owed(stream) {
@@ -1645,7 +1662,12 @@ fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Tu
   if let Some(owed) = told_owed(s, stream) {
     return Turned::Told(owed);
   }
-  // A reply that rests on a change of the resync session waits until the anchor has it (Windows, A-427).
+  // A DAX answer waits until the anchor holds the section it hands (Windows, A-448), and a reply that rests on a change
+  // of the resync session until the anchor has it (A-427).
+  #[cfg(windows)]
+  if dax_hold::owed(stream) {
+    return Turned::Section;
+  }
   #[cfg(windows)]
   if resync_handle::owed(stream) {
     return Turned::Session;
@@ -2710,7 +2732,8 @@ pub(crate) fn split_held_resync(
 
 /// Serves again every Windows Shards stream recovery kept because the anchor held its resync end (A-433), each on a
 /// fresh stream ([`adopt_one`]); every held end no kept record claims is let go first, by a task, since the anchor's
-/// release is an exchange: its device reads the channel's end.
+/// release is an exchange: its device reads the channel's end. Every DAX section recovery kept for a stream no adoption
+/// took is let go after (A-448).
 #[cfg(windows)]
 pub(crate) fn adopt_held() {
   let (kept, orphaned) = state::with_state(|s| {
@@ -2728,14 +2751,18 @@ pub(crate) fn adopt_held() {
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
+  let _ = state::with_state_counted(dax_hold::let_go_every_unclaimed);
 }
 
 /// Serves `record`, a Shards attachment its dead daemon served on Windows, again on a fresh stream, then hands its
 /// device the fresh end (A-433): the same attachment, its owner view, form, token and holder from the record the anchor
 /// kept; no `INIT` and no restore; the reply the dead daemon published and never wrote answers the request the device
-/// resends. The fresh end is duplicated into the holder, checked by its creation time, and a `Resync` naming it is
-/// written on the held channel without waiting ([`resync_handle::send_resync`]). Anything refused ends the attachment,
-/// whose end releases the hold, counted: the device reads the channel's end (Shards' option (a)).
+/// resends. Its DAX sections recovery kept are taken into its session and ingested before it serves anything, and its
+/// device's asks after the `Resync` are answered with the same sections (A-448). The fresh end is duplicated into the
+/// holder, checked by its creation time, and a `Resync` naming it is written on the held channel without waiting
+/// ([`resync_handle::send_resync`]); the holder's handle of it is then a known holder's, which a DAX ask names
+/// (`dax::record_holder`). Anything refused ends the attachment, whose end releases the hold and its sections,
+/// counted: the device reads the channel's end (Shards' option (a)).
 #[cfg(windows)]
 fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::anchor_hold::HandedResync) {
   let attachment = record.id;
@@ -2777,6 +2804,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::anchor_h
   stream.restorable = false;
   stream.resync = Some(resync_handle::adopted(token, holder));
   stream.replay = s.recovered_replies.remove(&attachment);
+  // Its DAX sections recovery kept, taken into its session and ingested before it serves anything (A-365, A-448).
+  let _ingesting = dax_hold::claim(s, &mut stream);
   s.shards_streams.insert(attachment, stream);
   if futures::spawn(serve(attachment))
     .and_then(futures::detach)
@@ -2786,11 +2815,15 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::anchor_h
     ended(s, attachment);
     return;
   }
-  if !resync_handle::send_resync(&held.end, (attachment, token), holder, device_end) {
+  let Some(handle) = resync_handle::send_resync(&held.end, (attachment, token), holder, device_end)
+  else {
     s.count(RESYNC_REFUSED, 1);
     end_stream(s, attachment);
     return;
-  }
+  };
+  // The holder's handle of the fresh stream is the one its DAX asks name: a known holder's, so the claim check passes
+  // it and its asks are answered with the sections the anchor kept (A-448).
+  dax::record_holder(s, attachment, holder.pid, handle);
   s.count(RESYNCED, 1);
   if s.writes_lost {
     s.count(RESYNC_WRITES_LOST, 1);

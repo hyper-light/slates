@@ -32,14 +32,17 @@
 //! the fresh end into the holder the session names, opened once and checked by its creation time, so a later process
 //! given the same id is never handed it, and writes a Windows `Resync` (A-418's `HandedResync`) naming the end's value
 //! on the held channel without waiting: a device that reads nothing never holds the shard. It keeps no copy of the
-//! fresh end, so the stream lives exactly as long as the holder's. A `Resync` refused takes the duplicate back out of
-//! the holder (its value told to no one yet) and ends the attachment.
+//! fresh end, so the stream lives exactly as long as the holder's, and the holder's value of it is a known holder's for
+//! the DAX claim check, so the device's asks after the `Resync` are answered with the sections the anchor kept (A-448).
+//! A `Resync` refused takes the duplicate back out of the holder (its value told to no one yet) and ends the
+//! attachment.
 //!
-//! **Giving it up** ([`give_up`]): at the attachment's end; at its guest's first DAX map, since the guest's stores
-//! through a section live where only the device maps them once the daemon is gone and the anchor holds no Windows DAX
-//! section (A-365 is Unix's); at a refused update; and where the device's end was not handed to the client. The
-//! anchor's release is an exchange too, so it runs as a task of the shard; a refused one is counted, and the next
-//! daemon releases the end as one no record claims.
+//! **Giving it up** ([`give_up`]): at the attachment's end; where the anchor refuses a DAX section its guest maps (its
+//! bound for sections reached, or the exchange failed; A-448, which holds the sections as A-365 holds Unix's objects),
+//! since the guest's stores through a section live where only the device maps them once the daemon is gone; at a
+//! refused update; and where the device's end was not handed to the client. The anchor's release is an exchange too,
+//! so it runs as a task of the shard; a refused one is counted, and the next daemon releases the end as one no record
+//! claims.
 
 use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 
@@ -164,19 +167,19 @@ pub(super) fn held(stream: &ShardsStream) -> bool {
 
 /// Hands the device of `attachment` the fresh stream's end `device` (A-433): duplicated into `holder`, the process the
 /// session names, checked by its creation time; then a Windows `Resync` naming its value and `token` written on
-/// `held`, the channel's end the anchor kept, without waiting. Whether it went: a holder gone or another, or a channel
-/// the device does not read, refuses it, and a duplicate already made is closed again in the holder, which no one has
-/// told its value.
+/// `held`, the channel's end the anchor kept, without waiting. The end's value in the holder, once it went, which the
+/// device's DAX asks name (A-448); none where a holder gone or another, or a channel the device does not read, refuses
+/// it, and a duplicate already made is closed again in the holder, which no one has told its value.
 pub(super) fn send_resync(
   held: &OwnedHandle,
   (attachment, token): (u64, [u8; TOKEN_BYTES]),
   holder: Holder,
   device: OwnedHandle,
-) -> bool {
+) -> Option<u64> {
   let Ok(handle) =
     slates_ipc::handle_route::hand_stream_to(device.as_handle(), holder.pid, holder.started)
   else {
-    return false;
+    return None;
   };
   // The holder's copy is the only one from here: the stream lives as long as it does.
   drop(device);
@@ -191,10 +194,10 @@ pub(super) fn send_resync(
   }
   .to_bytes();
   match slates_ipc::stream::write_now(held.as_handle(), &message) {
-    Ok(written) if written == message.len() => true,
+    Ok(written) if written == message.len() => Some(handle),
     _ => {
       let _ = slates_ipc::handle_route::close_handed(holder.pid, handle);
-      false
+      None
     }
   }
 }
