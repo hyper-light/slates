@@ -327,6 +327,11 @@ pub enum Stale {
   Bootstrap,
   /// The reviewed state or the daemon's authority changed before a recovery was authorized.
   Recovery,
+  /// A write policy moved after it was read (A-285): read it again and set it from there.
+  Policy {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why a call is refused for now.
@@ -422,9 +427,6 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
-  /// A write-policy verb: the daemon's side of the write modes is not in this build ([`crate::policy`]). Nothing was
-  /// sent.
-  WritePolicies,
 }
 
 /// What is wrong with the request.
@@ -693,6 +695,7 @@ impl Error {
       Refusal::UnknownBase { green, version } => Error::Stale(Stale::Base { green, version }),
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
+      Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
       Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
@@ -726,21 +729,7 @@ impl Error {
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
       Refusal::PolicyForbids { act, by } => {
-        Error::Denied(Denied::Policy(crate::policy::PolicyRefusal {
-          act: match act {
-            slates_ipc::protocol::WriteAct::Merge => crate::policy::WriteAct::Merge,
-            slates_ipc::protocol::WriteAct::Land => crate::policy::WriteAct::Land,
-          },
-          by: match by {
-            slates_ipc::protocol::PolicySubject::Consumer { consumer } => {
-              crate::policy::PolicySubject::Consumer(consumer)
-            }
-            slates_ipc::protocol::PolicySubject::Volume { volume } => {
-              crate::policy::PolicySubject::Volume(volume)
-            }
-          },
-          reason: crate::policy::PolicyReason::Forbidden,
-        }))
+        Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),

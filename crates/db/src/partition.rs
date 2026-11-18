@@ -201,6 +201,14 @@ pub struct Partition {
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
+  /// The completions a green's successor adopted from the green's merge records (A-255), each with the work whose submit
+  /// it completes (A-288), by key `(origin, client, sequence)`: held while the client's window retains the completion,
+  /// and dropped when the client acknowledges it. The work's route (its catalog record) is kept while one is held here
+  /// ([`Partition::completions_routed_by`]). Bounded by the windows: one entry per retained completion at most.
+  routed_completions: BTreeMap<(u64, u32, u32), VolumeId>,
+  /// How many of `routed_completions` each work has, so the route's question is one lookup. Derived from
+  /// `routed_completions` and rebuilt with it from a snapshot, which carries only each record's work.
+  routed_by_work: BTreeMap<VolumeId, usize>,
   /// A scalar reservation, retained even when a client ran no recorded verb.
   client_id_high_water: u32,
   grants: BTreeMap<u64, GrantRecord>,
@@ -294,6 +302,8 @@ impl Partition {
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
+      routed_completions: BTreeMap::new(),
+      routed_by_work: BTreeMap::new(),
       client_id_high_water: 0,
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
@@ -642,6 +652,14 @@ impl Partition {
       .completions
       .get(&(origin, client))
       .map_or_else(Vec::new, |w| w.owed().collect())
+  }
+
+  /// How many completions this partition retains that a green's successor adopted for `work`'s submits and a resend can
+  /// reach only through the work's route (A-288): while any is retained, a resend of one is answered here, so the work's
+  /// route (its catalog record) is kept; at zero nothing the route leads to can answer, and its adopter retires it. Zero
+  /// for every work that has none here.
+  pub fn completions_routed_by(&self, work: VolumeId) -> usize {
+    self.routed_by_work.get(&work).copied().unwrap_or(0)
   }
 
   /// The highest sequence a client has acknowledged (its completion window's watermark), or `None` if it has
@@ -1277,6 +1295,7 @@ impl Partition {
       // The catalog register carries the policy (A-285), so its version moves as the live-shipping flag's does.
       Op::VolumeWritePolicySet { id, policy } => self.update_volume(*id, |v| {
         v.policy.write = Some(*policy);
+        v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {
@@ -1487,11 +1506,16 @@ impl Partition {
         Ok(())
       }
       Op::CompletionRecorded { record } => {
-        self
+        let window = self
           .completions
           .entry((record.origin, record.client))
-          .or_default()
-          .record(record.sequence, record.result.clone());
+          .or_default();
+        window.record(record.sequence, record.result.clone());
+        // Routed only while the window retains it: a completion the client already acknowledged is not kept (A-288).
+        let routed = record
+          .work
+          .filter(|_| matches!(window.lookup(record.sequence), Seen::Completed(_)));
+        self.route_completion((record.origin, record.client, record.sequence), routed);
         Ok(())
       }
       Op::CompletionAwaiting {
@@ -1519,6 +1543,7 @@ impl Partition {
           .entry((*origin, *client))
           .or_default()
           .acknowledge(*up_to, owed);
+        self.prune_routes(*origin, *client);
         Ok(())
       }
       Op::GrantIssued { record } => {
@@ -1813,6 +1838,10 @@ impl Partition {
               client: *client,
               sequence,
               result: result.clone(),
+              work: self
+                .routed_completions
+                .get(&(*origin, *client, sequence))
+                .copied(),
             })
             .collect(),
           awaiting: w
@@ -1957,6 +1986,61 @@ impl Partition {
         // acknowledgement applied had them).
         w.acknowledge(up_to, &c.owed);
       }
+      // The routes the records carry (A-288), once the window is whole: a snapshot holds only retained records.
+      for r in &c.records {
+        if r.work.is_some() {
+          self.route_completion((c.origin, c.client, r.sequence), r.work);
+        }
+      }
+      self.prune_routes(c.origin, c.client);
+    }
+  }
+
+  /// Sets the work the completion `key` routes to (A-288), or clears it with `None`, keeping each work's count.
+  fn route_completion(&mut self, key: (u64, u32, u32), work: Option<VolumeId>) {
+    let previous = match work {
+      Some(work) => self.routed_completions.insert(key, work),
+      None => self.routed_completions.remove(&key),
+    };
+    if let Some(previous) = previous
+      && let Some(count) = self.routed_by_work.get_mut(&previous)
+    {
+      *count = count.saturating_sub(1);
+      if *count == 0 {
+        self.routed_by_work.remove(&previous);
+      }
+    }
+    if let Some(work) = work {
+      let count = self.routed_by_work.entry(work).or_insert(0);
+      *count = count.saturating_add(1);
+    }
+  }
+
+  /// Drops the routes of `(origin, client)`'s completions its window no longer retains (A-288): an acknowledgement
+  /// released them, so no resend of one is answered here any more. One range lookup for a client with no routes.
+  fn prune_routes(&mut self, origin: u64, client: u32) {
+    let keys = (origin, client, u32::MIN)..=(origin, client, u32::MAX);
+    if self.routed_completions.range(keys.clone()).next().is_none() {
+      return;
+    }
+    let retained: BTreeSet<u32> = self
+      .completions
+      .get(&(origin, client))
+      .map(|window| {
+        window
+          .retained_entries()
+          .map(|(sequence, _)| sequence)
+          .collect()
+      })
+      .unwrap_or_default();
+    let released: Vec<(u64, u32, u32)> = self
+      .routed_completions
+      .range(keys)
+      .map(|(key, _)| *key)
+      .filter(|(_, _, sequence)| !retained.contains(sequence))
+      .collect();
+    for key in released {
+      self.route_completion(key, None);
     }
   }
 

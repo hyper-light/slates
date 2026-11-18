@@ -11,16 +11,18 @@
 //! a policy per subject — an enrolled consumer, that is an agent's session (§4.13 "Principals"), or a volume — and an
 //! act follows the stricter of its caller's and its volume's ([`WritePolicy::meet`]). An agent never raises its own:
 //! setting a policy needs the launcher's authority, which the daemon refuses on a consumer's channel, and an agent holds
-//! only its consumer's capability. A subject with no policy set is asked ([`WritePolicy::UNSET`]), which is how every
-//! landing behaved before A-299: it waited for a grant.
+//! only its consumer's capability. A subject with no policy set keeps what every subject did before A-299
+//! ([`WritePolicy::UNSET`]): its merges run at once, since a merge is a change in memory (§4.16), and its landings ask,
+//! since a write to disk waits for an approval (R10).
 //!
 //! The daemon keeps and enforces the policies (A-285, kiln agent g220); this module is the contract's half: the
 //! modes, the policy, its subjects and the typed refusal a forbidden act answers.
 
 use std::fmt;
 
-use slates_ipc::protocol::VolumeId;
+use slates_ipc::protocol::{self as wire, VolumeId};
 
+use crate::error::{Error, Unsupported};
 use crate::signed::Verification;
 
 /// What a write mode governs.
@@ -71,9 +73,11 @@ pub struct WritePolicy {
 }
 
 impl WritePolicy {
-  /// The policy of a subject nobody set one for: both acts asked, signatures not required.
+  /// The policy of a subject nobody set one for, which is what every subject had before write modes existed: merges
+  /// at once (a merge changes memory, §4.16), landings asked (a write to disk waits for an approval, R10), signatures
+  /// not required. Agreed with the daemon's side (A-285), which applies the same when no policy is recorded.
   pub const UNSET: WritePolicy = WritePolicy {
-    merge: WriteMode::Ask,
+    merge: WriteMode::Bypass,
     land: WriteMode::Ask,
     require_signed_merges: false,
   };
@@ -137,6 +141,89 @@ pub enum PolicyReason {
   },
 }
 
+impl WriteAct {
+  /// The act as the wire names it.
+  pub(crate) fn of_wire(act: wire::WriteAct) -> WriteAct {
+    match act {
+      wire::WriteAct::Merge => Self::Merge,
+      wire::WriteAct::Land => Self::Land,
+    }
+  }
+}
+
+impl WriteMode {
+  /// The mode as the wire carries it.
+  fn wire(self) -> wire::WriteMode {
+    match self {
+      Self::Forbid => wire::WriteMode::Forbid,
+      Self::Ask => wire::WriteMode::Ask,
+      Self::Bypass => wire::WriteMode::Bypass,
+    }
+  }
+
+  /// The mode as the wire names it.
+  fn of_wire(mode: wire::WriteMode) -> WriteMode {
+    match mode {
+      wire::WriteMode::Forbid => Self::Forbid,
+      wire::WriteMode::Ask => Self::Ask,
+      wire::WriteMode::Bypass => Self::Bypass,
+    }
+  }
+}
+
+impl WritePolicy {
+  /// The policy as the wire carries it (A-285). The wire keeps no signed-merge requirement yet, so a policy that sets
+  /// one is refused [`Unsupported::SignedWork`] here, before anything is sent: a requirement the daemon would drop is
+  /// never sent as if it held.
+  pub(crate) fn wire(&self) -> Result<wire::WritePolicy, Error> {
+    if self.require_signed_merges {
+      return Err(Error::Unsupported(Unsupported::SignedWork));
+    }
+    Ok(wire::WritePolicy {
+      merge: self.merge.wire(),
+      land: self.land.wire(),
+    })
+  }
+
+  /// The policy as the wire names it; no signed-merge requirement, which the wire does not keep yet.
+  pub(crate) fn of_wire(policy: wire::WritePolicy) -> WritePolicy {
+    WritePolicy {
+      merge: WriteMode::of_wire(policy.merge),
+      land: WriteMode::of_wire(policy.land),
+      require_signed_merges: false,
+    }
+  }
+}
+
+impl PolicySubject {
+  /// The subject as the wire carries it.
+  pub(crate) fn wire(self) -> wire::PolicySubject {
+    match self {
+      Self::Consumer(consumer) => wire::PolicySubject::Consumer { consumer },
+      Self::Volume(volume) => wire::PolicySubject::Volume { volume },
+    }
+  }
+
+  /// The subject as the wire names it.
+  pub(crate) fn of_wire(subject: wire::PolicySubject) -> PolicySubject {
+    match subject {
+      wire::PolicySubject::Consumer { consumer } => Self::Consumer(consumer),
+      wire::PolicySubject::Volume { volume } => Self::Volume(volume),
+    }
+  }
+}
+
+impl PolicyRefusal {
+  /// The daemon's `PolicyForbids { act, by }` (A-285): the act's mode forbids it.
+  pub(crate) fn forbidden(act: wire::WriteAct, by: wire::PolicySubject) -> PolicyRefusal {
+    PolicyRefusal {
+      act: WriteAct::of_wire(act),
+      by: PolicySubject::of_wire(by),
+      reason: PolicyReason::Forbidden,
+    }
+  }
+}
+
 impl fmt::Display for PolicyRefusal {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let act = match self.act {
@@ -190,8 +277,16 @@ mod tests {
     assert!(WriteMode::Bypass.raises(WriteMode::Ask));
     assert!(!WriteMode::Forbid.raises(WriteMode::Ask));
     assert!(
-      consumer.raises(&WritePolicy::UNSET),
-      "a bypass is a raise over ask"
+      !consumer.raises(&WritePolicy::UNSET),
+      "unset already merges at once and asks for landings"
+    );
+    let landing_bypass = WritePolicy {
+      land: WriteMode::Bypass,
+      ..WritePolicy::UNSET
+    };
+    assert!(
+      landing_bypass.raises(&WritePolicy::UNSET),
+      "a landing bypass is a raise over unset's ask"
     );
     let dropped = WritePolicy {
       require_signed_merges: false,
