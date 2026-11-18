@@ -4763,12 +4763,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     // Follow the peer's current id (task #22): a restart is a new process, so the session to its previous
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
-    let addressed = peer_host;
     peer_host = refresh_record_identity(anchor, peer_host, &mut client, &mut discovery_cursor);
-    if peer_host != addressed {
-      // The dial's state is the previous incarnation's: the link starts afresh under the new id.
-      state::with_state(|s| s.record_dials.remove(&addressed));
-    }
     if out_of_contact(peer_host, &mut idling) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
@@ -5011,6 +5006,8 @@ fn refresh_record_identity_in(
     .map_or(previous, |learned| learned.host);
   if current != previous {
     state.record_sessions.remove(&previous);
+    // The dial's record is the previous id's: the link's dial under the new id starts afresh.
+    state.record_dials.remove(&previous);
     let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
     if previous_was_a_live_incarnation && client.take().is_some() {
       count_refusal_in(state, DIAL_STALE_DROPPED);
