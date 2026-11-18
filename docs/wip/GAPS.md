@@ -1041,6 +1041,19 @@
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
 >   there is neither learned nor let go.
+> - **Fixed (A-340, g250, 2026-11-18): the bound's drop is typed and counted.** Why it must drop is stated (the
+>   configuration is bounded by its members; keeping every outstanding retirement grows it with every restart while one
+>   share stays open, refusing admissions stalls the region while one round is stuck, refusing a takeover leaves a dead
+>   host unfenced). The rounds it ends give every object they learned and did not adopt up by name: `NotRecovered
+>   { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted `fleet.takeover.given_up.retirement_dropped`;
+>   before, the rounds were forgotten silently and such a volume answered a retryable `OwnerUnreachable` for good. Every
+>   holder counts the copies it keeps on an unresolved line (`fleet.takeover.kept_unresolved`) or a lost one
+>   (`fleet.takeover.kept_lost`). Tests: `a_round_the_retirement_bound_ended_names_what_it_had_learned`,
+>   `a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (`crates/server/src/takeover.rs`).
+> - **Open (A-340): a volume no round had learned when its retirement went** is served by no member and answers
+>   `OwnerUnreachable` once the lookup's bound passes; only its holders' `kept_unresolved` shows it. Owed: a holder
+>   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
+>   `NotRecovered` by name.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
