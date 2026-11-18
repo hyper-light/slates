@@ -83,6 +83,9 @@ pub struct MergeShardState {
   pub replicas: BTreeMap<ObjectId, Green>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
+  /// The greens whose ledger inputs this holder is fetching from a record's sender, its replica behind its own ledger
+  /// (A-412, `fleet::fetch_ledger_inputs`): one fetch a green at a time. Bounded by the greens this holder backs.
+  pub catching_up: BTreeSet<ObjectId>,
   /// Faults a test injects on this holder; never set from the wire.
   pub fault: MergeFault,
   /// Submits whose acceptance waits for their version's merge record to commit at the quorum
@@ -3321,6 +3324,7 @@ fn record_standing(
   state: &mut ShardState,
   object: ObjectId,
   version: u64,
+  sender: HostId,
 ) -> Option<RecordStanding> {
   let next = match state.merge.replicas.get(&object) {
     Some(replica) => Some(replica.head().saturating_add(1)),
@@ -3337,10 +3341,48 @@ fn record_standing(
     (Some(next), version) if version < next => Some(RecordStanding::Applied),
     (None, 0) => Some(RecordStanding::Next),
     (Some(next), version) if version == next => Some(RecordStanding::Next),
+    (Some(next), version) => catch_up(state, object, (next, version), sender),
     _ => {
       state.count(OUT_OF_ORDER, 1);
       None
     }
+  }
+}
+
+/// A record of `version` ahead of this holder's replica, whose next version is `next` (A-412). A takeover commits the
+/// versions it adopted again through the register path (`takeover::commit_adopted`), which carries no inputs, and the
+/// record plane never ships a placed version again, so a holder whose replica had not reached them held their records
+/// and nothing that would bring its replica up to them: it answered every later version out of order, for good, and at
+/// `f = 1` with the old owner gone the successor's next version never reached its quorum. Now the versions between come
+/// from this holder's own ledger: with their inputs held, the replica is advanced through the version before and the
+/// record served as its next; with an input not held, it is fetched by identity from `sender`, the record's owner, which
+/// holds every version's inputs while its records name them (A-244), and the record waits for the owner's next
+/// shipment. A version between whose record this holder lacks is out of order, as before.
+fn catch_up(
+  state: &mut ShardState,
+  object: ObjectId,
+  (next, version): (u64, u64),
+  sender: HostId,
+) -> Option<RecordStanding> {
+  let Some(through) = version.checked_sub(1) else {
+    state.count(OUT_OF_ORDER, 1);
+    return None;
+  };
+  match crate::merge_origin::ledger_unheld(state, object, (next, through)) {
+    Err(_) => {
+      state.count(OUT_OF_ORDER, 1);
+      None
+    }
+    Ok(unheld) if !unheld.is_empty() => {
+      crate::fleet::fetch_ledger_inputs(state, object, sender, unheld);
+      None
+    }
+    Ok(_) => match crate::merge_origin::advance_replica(state, object, through) {
+      crate::merge_origin::Rebuild::Installed(head) if head == through => {
+        Some(RecordStanding::Next)
+      }
+      _ => None,
+    },
   }
 }
 
@@ -3420,7 +3462,7 @@ pub(crate) fn accept_merge_record(
   // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
   // it replaces; the record is then served as the replica's next version (A-373).
   hold_replacing_record(state, local, peer_host, record);
-  match record_standing(state, object, value.version) {
+  match record_standing(state, object, value.version, peer_host) {
     None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     Some(RecordStanding::Applied) => {
