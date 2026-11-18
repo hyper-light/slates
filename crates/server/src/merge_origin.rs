@@ -59,6 +59,11 @@
 //! once it holds the version: as a record's own recomputation (`merge_service::fold_replica`) and at each version a
 //! rebuild or an advance recomputes. No later increment is based below the floor, so the fold changes no verdict.
 //!
+//! **A replica keeps a durable checkpoint (A-404).** Each merge record also names the newest version its owner knew
+//! committed (`MergeRecordValue::checkpoint_floor`), and a holder keeps its replica's checkpoint there as a held piece
+//! (`merge_service::checkpoint_replica`); a rebuild applies it to the origin it seeds and recomputes only the versions
+//! after it. It is what lets a replica release the records and inputs below it.
+//!
 //! At `f = 0` none of it runs: the local append is the placement (R8).
 
 use slates_archive::Archive;

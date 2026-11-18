@@ -2988,6 +2988,13 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Step one 2026-11-18 (g232, A-404): a replica keeps a durable checkpoint at its owner's committed floor.** Each
+> merge record names the newest version its owner knew committed (record format 4); a holder keeps its replica's
+> checkpoint there as a held piece, and a rebuild starts from it and recomputes only the versions after it
+> (`a_rebuilt_replica_starts_from_the_checkpoint_its_holder_keeps`: versions 1 and 2's increments not held, the replica
+> rebuilt to 3). Owed, step two: the holder lets go of its records and inputs below the checkpoint, and a takeover's
+> adoption reads the checkpoint below them.
+>
 > **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
 > green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
 > recomputes every version on and a takeover adopts, folded nothing. Now each merge record names where the owner's engine

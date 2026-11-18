@@ -10266,7 +10266,8 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
 in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
 and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
-A-313). Green owner loss in a fleet: Degraded for the
+A-313; since A-404 from the durable checkpoint it keeps at the newest version its owner's records name committed, so it
+recomputes only the versions after it). Green owner loss in a fleet: Degraded for the
 membership horizon, then Masked after takeover on a candidate that holds the ledger (the successor adopts its own holder
 ledger and replica, whatever the origin's size, and a restart of it re-adopts them at boot, A-333). Work volume owner loss before
 `submit`: the volume's loss window (D-18) applies to the unsubmitted work. Submitter crash after
@@ -28877,3 +28878,32 @@ Applied in the same change to: §4.2's status, GAPS (the load test's ledger),
   directory and snapshot unit tests 17 of 17, and the server's recovery tests 58 of 58 passed on the same tree; kiln
   r340: the vfs image, retained-bytes, retention, clone, content-in-place and chunk-ownership tests passed (45), and
   with the vfs change reverted the new vfs test held 5 inodes where the live volume held 3.
+
+### A-404 — A replica keeps a durable checkpoint of its green at the owner's committed floor, and its rebuild starts there (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders" and its failure matrix; A-238's owed item, the replica's records and inputs, step one)
+
+Applied in the same change to: §4.16's failure matrix (a green holder's restart), GAPS (the load test's ledger),
+`crates/server/src/merge_service.rs` (`MergeRecordValue::checkpoint_floor`, `RECORD_VERSION` 4, `HeldCheckpoint`,
+`checkpoint_replica`, `forget_checkpoint`, `REPLICA_CHECKPOINTED`, the record path), `crates/server/src/merge_origin.rs`
+(a rebuild from the checkpoint, `REPLICA_FROM_CHECKPOINT`, the chain step's checkpoint), `crates/server/src/content_holder.rs`
+(`KIND_REPLICA_CHECKPOINT` pieces in the held image, its deltas and its restore), `crates/server/src/tombstone.rs` and
+`crates/server/src/takeover.rs` (the checkpoint goes with the green), and the tests below.
+- **What was there.** A holder kept every merge record it accepted and every version's inputs, and rebuilt its
+  replica after a restart from version 0 through every version (A-313): at the goal's 300,000 versions, every record,
+  every increment and a rebuild of them all, on each replica.
+- **The rule.** Each merge record names the newest version its owner knew committed when it made it: the green's
+  checkpoint floor (the reachable floor, below every version still waiting for placement) and below the record's own
+  version, so every version up to it is placed at `f + 1` and no live reader names one (`checkpoint_floor`, appended;
+  the record format moves to 4). A holder that holds a version whose record names a floor past the checkpoint it keeps
+  takes its replica's checkpoint there (`Green::checkpoint`, before the replica folds, since the checkpoint reads the
+  history at its version) and keeps it as a held piece (`KIND_REPLICA_CHECKPOINT`, carried by its publication's
+  deltas when it changes). A rebuild applies the checkpoint to the origin it seeds, checks the record's identity at
+  its version, and recomputes only the versions after it.
+- **Tests** (`crates/server/src/merge_origin.rs`): `a_holder_keeps_a_checkpoint_of_its_replica_at_the_committed_floor_its_owner_names`
+  (served a shipment whose record names version 1 committed: the checkpoint at 1 reaches version 1's identity, counted,
+  and the holder's image carries it through a restore); `a_rebuilt_replica_starts_from_the_checkpoint_its_holder_keeps`
+  (records 0 to 3, a checkpoint at 2 and only version 3's increment held: the replica rebuilt to 3 from the checkpoint,
+  one version recomputed).
+- **Measured.** The server's merge, retention, state and takeover unit tests, 34 of 34 (kiln, the Mac Studio,
+  2026-11-18, debug).
+- **Still owed (step two).** The holder lets go of its ledger positions below the checkpoint and the inputs placed at
+  or below it, and a takeover's adoption (A-333) reads the checkpoint for the versions below it.
