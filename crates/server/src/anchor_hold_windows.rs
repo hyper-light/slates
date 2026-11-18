@@ -316,10 +316,14 @@ pub(crate) async fn release_resync(id: u64) -> Result<(), HoldRefusal> {
   exchange(HandleMessage::Release { id }, RELEASE_ATTEMPT_NS).await
 }
 
+/// One exchange with the anchor over the channel `OWNER`'s shard holds: the anchor's part within `budget_ns` on the wall,
+/// once the owner shard runs it; the owner shard waited for in its own time (A-440; R3's class A), since a hold the
+/// anchor takes is a side effect its caller must learn of: waited `budget_ns` on the wall, a busy owner shard ran the
+/// exchange after the caller had been answered `Deadline`, and the anchor held what its caller took for unheld.
 async fn exchange(message: HandleMessage, budget_ns: u64) -> Result<(), HoldRefusal> {
   let owner = *OWNER.get().ok_or(HoldRefusal::NoChannel)?;
   let origin = crate::state::with_state(|s| s.shard).ok_or(HoldRefusal::Unavailable)?;
-  crate::xshard::task_within(
+  crate::xshard::task_in_shard_time(
     origin,
     owner,
     move || async move {
