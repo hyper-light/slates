@@ -26122,7 +26122,10 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
     The move now reports only a head held by `f + 1` members other than the old owner: a head short of them is placed
     again at the next sequence on the cohort without the old owner and republished there (`Heal::Handoff`, the
     healer's replace with the owner neither a candidate nor counted; `fleet.move.handoff_begun`), and the healer
-    passes a frozen copy by (a frozen copy's heal had republished its head once its target died). Rejected: reusing
+    passes a frozen copy by (a frozen copy's heal had republished its head once its target died). The test forces the
+    shape: c refuses every content put while a seals the head, and b's move questions go unanswered, so b never adopts;
+    the move's own verb on the old owner's frozen copy is answered there (`Moved` once its routing follows the switch),
+    since forwarded to a target that never adopted it was never answered. Rejected: reusing
     the frozen copy in the old owner's own takeover (it serves only the case where the old owner is the successor) and
     the old owner holding its own content as a holder (its hold outlives no event that would release it when it is
     outside the new owner's placement). The cost is one more content copy before the switch, the copy the new owner's

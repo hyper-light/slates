@@ -542,7 +542,11 @@
 >   it there when short (A-291's handoff, `Heal::Handoff`, counted `fleet.move.handoff_begun`, which the test now
 >   requires); the healer passes a frozen copy by (it had republished the frozen copy's head after b died,
 >   `fleet.heal.named_gone` 1, `fleet.heal.republished` 1); and a takeover lets a frozen copy go before it adopts the
->   volume's keys, which the release erases.
+>   volume's keys, which the release erases. The test forces the shape it guards: c refuses every content put while a
+>   seals the head (so a and b alone hold it), and a and c leave b's move questions unanswered, so b never adopts
+>   (`inject_takeover_silence` covers a move's questions by name). Doing so found the operator's own move verb
+>   forwarded from the old owner to the target, which never answered it: the move's verb on a frozen copy is now
+>   answered there, `Moved` once its routing follows the switch.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
