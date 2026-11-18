@@ -13075,6 +13075,95 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   );
 }
 
+/// Shape: the writes of [`a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`]'s closed loop:
+/// enough for every stream to run past its first message and every answer window to be timed, with room to spare.
+const HELD_LOOP_WRITES: usize = 32;
+/// Format: the owner's count of replies held for durability that held its shard's idle window (`live_ship`, A-396).
+const LIVE_HOLD_ANSWER: &str = "fleet.live.hold.answer";
+/// Format: the owner's count of exchanges its control shard held its idle window through (A-396).
+const LIVE_HOLD_EXCHANGE: &str = "fleet.live.hold.exchange";
+/// Format: the owner's count of dispatches after which its control shard held its window for the next (A-396).
+const LIVE_HOLD_DISPATCHES: &str = "fleet.live.hold.dispatches";
+/// Format: a holder's count of entries after which it held its window for the owner's next (A-396).
+const LIVE_HOLD_ENTRIES: &str = "fleet.live.hold.entries";
+
+/// A-396 (§4.10 "Live shipping", §4.7): do write a live-shipped volume over and over from one client, each write sent as
+/// soon as the last was answered (a closed loop). Expect every write answered at durability, and each shard on the write's
+/// path to have held its idle window rather than parked: the owner while a reply waited for durability, its node's control
+/// shard through an exchange and for the next dispatch, and the holders for the owner's next entry. These counts are the
+/// holds' non-vacuity check; parked, each of those steps cost a thread's wake (the contract command measured live
+/// shipping adding 136-291 µs to a stable write at the median on main and 63-120 µs held, adacachy, 2026-11-18).
+#[test]
+fn a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "held".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BURST_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the held volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let replies: Vec<ReplyBody> = (0..HELD_LOOP_WRITES)
+    .map(|write| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: "/looped".to_owned(),
+        bytes: vec![u8::try_from(write % 251).unwrap(); BURST_WRITE_BYTES],
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let owners = [LIVE_HOLD_ANSWER, LIVE_HOLD_EXCHANGE, LIVE_HOLD_DISPATCHES]
+    .map(|kind| refusal_count(&daemons[0], kind).unwrap());
+  let holders =
+    [&daemons[1], &daemons[2]].map(|holder| refusal_count(holder, LIVE_HOLD_ENTRIES).unwrap());
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "held loop: the owner's answer, exchange and dispatch holds {owners:?}; the holders' entry holds {holders:?}"
+  );
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write of the loop is answered at durability: {replies:?}"
+  );
+  assert!(
+    owners[0] > 0,
+    "a reply held for durability held the owner's window"
+  );
+  assert!(
+    owners[1] > 0,
+    "the control shard held its window through an exchange"
+  );
+  assert!(
+    owners[2] > 0,
+    "the control shard held its window for its next dispatch"
+  );
+  assert!(
+    holders.iter().any(|held| *held > 0),
+    "a holder held its window for the owner's next entry: {holders:?}"
+  );
+}
+
 /// The volume of `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume` before its burst. Do: write
 /// volume `id` through `attachment` with half a MiB of base files, live-ship it, and write it once more, its log's first
 /// entry then the whole state. Expect every write answered at durability and the volume live-shipped.
