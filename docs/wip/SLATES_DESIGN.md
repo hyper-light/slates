@@ -7356,14 +7356,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
 > awaiting the dispatch and then the holder's answer, the holder awaiting the entry) slept in its driver between its
-> parts and paid a wake. Each now holds its idle window across its wait (`crate::live_hold`): the owner while a reply
-> waits for durability, for the volume's answer window (`hold_for_answer`, from `done_or_park` and `defer`); the
+> parts and paid a wake. Each now asks to hold its idle window across its wait (`crate::live_hold`): the owner while a
+> reply waits for durability, for the volume's answer window (`hold_for_answer`, from `done_or_park` and `defer`); the
 > control shard through an exchange, for that holder's (`hold_for_exchange`), and after a dispatch, for its stream's
 > next; a holder after it answers an entry, for the owner's next (`serve_taken`). Every window is learned from the
-> traffic it waits on by RFC 9002 §5.3's law, a stream's never longer than its run (A-326's rule), and none is held on
-> macOS, whose held shard naps in its driver poll (A-387). Counted `fleet.live.hold.{answer,exchange,dispatches,
-> entries}`; held by `a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`. Prototype and
-> first A/B figures in A-396; the supervisor's A/B (main, these holds, the answer holds alone) decides the landing.
+> traffic it waits on by RFC 9002 §5.3's law, a stream's never longer than its run (A-326's rule), and each shard keeps a
+> hold only while its measured idle turn is shorter than its wake (A-387's predicate, the runtime's own decision on
+> every host: a macOS shard, whose `kevent` naps, declines). Counted `fleet.live.hold.{answer,exchange,dispatches,
+> entries}` (asked) and `fleet.live.hold.declined`; held by
+> `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`. Prototype and first A/B figures
+> in A-396; the supervisor's A/B (main, these holds, the answer holds alone) decides the landing.
 >
 > **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
 > live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
@@ -29517,12 +29519,13 @@ code below.
 ### A-396 — A live write parks no shard on its path where a held shard polls: the owner holds its idle window while a reply waits for durability, its control shard through an exchange and for its next dispatch, a holder for the owner's next entry; each window learned from the traffic it waits on (2026-11-18, goal g076b: a live write under 50 µs at the median and 1 ms at p999; §4.10 "Live shipping", §4.7 "Wake strategy"; A-200, A-326, A-387)
 
 Applied in the same change to: §4.10 (a status), GAPS (the live entry), `crates/transport/src/rtt.rs`
-(`RttEstimator::expected_within`), `crates/server/src/live_hold.rs` (new: `AnswerWindow`, `StreamWindow`, `remaining`,
-`hold` paired per platform), `crates/server/src/live_ship.rs` (`hold_for_answer` from `done_or_park` and `defer`;
-`hold_for_exchange` and the exchange's learning in `ship_lane`; the dispatch stream in `send_from_control`; the entry
-stream in `serve_taken`; the answer window learned in `count_hops`; `LiveVolume::answers`, `Held::arrivals`,
-`LiveState::dispatches`; `fleet.live.hold.*`), `crates/server/src/state.rs` (`RecordLink::live_answers`),
-`crates/server/tests/fleet.rs` (`a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`).
+(`RttEstimator::expected_within`), `crates/rt/src/shard.rs` (`ShardContext::hold_idle_window` says whether it kept the
+hold), `crates/server/src/live_hold.rs` (new: `AnswerWindow`, `StreamWindow`, `remaining`, `hold`),
+`crates/server/src/live_ship.rs` (`hold_for_answer` from `done_or_park` and `defer`; `hold_for_exchange` and the
+exchange's learning in `ship_lane`; the dispatch stream in `send_from_control`; the entry stream in `serve_taken`; the
+answer window learned in `count_hops`; `LiveVolume::answers`, `Held::arrivals`, `LiveState::dispatches`;
+`count_hold`, `fleet.live.hold.*`), `crates/server/src/state.rs` (`RecordLink::live_answers`),
+`crates/server/tests/fleet.rs` (`a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`).
 - **What the round cost.** A stable write to a live-shipped volume is answered once a candidate holds it (A-200), so its
   path runs through four shards on three nodes: the owner shard builds and appends the entry, its node's control shard
   sends it and hands the answer back, the holder's control shard keeps it and answers. Each parked in its driver between
@@ -29549,16 +29552,22 @@ stream in `serve_taken`; the answer window learned in `count_hops`; `LiveVolume:
     from one owner's log. A gap within the bound continues the run, a longer one begins a new run; the hold is the
     bound, never longer than the run has lasted, and nothing for a run's first message (A-326's ski-rental rule), so a
     paced sender starts no run and a run's end costs at most the spin the run took.
-  Nothing is held before a window is learned. A hold pays only where a held shard polls without sleeping: Linux's epoll
-  and Windows' completion port. On macOS no shard is held (A-387: a held macOS shard naps 12–15 µs a turn in its
-  zero-timeout `kevent`, where a parked one is kicked awake in 3–6 µs); the windows are learned there all the same.
+  Nothing is held before a window is learned. A hold pays only while a held shard sees a message sooner than a kicked
+  park would wake for it, and every hold is asked of the runtime, which decides that from the shard's own measurements
+  (A-387's predicate, cfg-free since 2026-11-18): it keeps the hold while the idle turn a message lands in is shorter
+  than the shard's wake estimate, and declines it otherwise, counted (`fleet.live.hold.declined`). Linux's epoll and
+  Windows' completion port answer a zero-timeout poll at once, so their shards hold; a macOS shard's zero-timeout
+  `kevent` naps 12–15 µs a turn, longer than its 3–8 µs wake, so it declines; a shard a loaded machine preempts stops
+  holding until its turns are cheap again. The windows are learned wherever the holds are declined. The first form of
+  this amendment fixed the hold at none on macOS by `#[cfg]`, as A-387's first form did; it now follows A-387's.
 - **What was tried and lost.** The owner shipping over sessions of its own, with no hop to the control shard: its proxy
   (one shard a daemon) saved less than the holds, and it needs a session per shard a holder (the transport's
   demultiplexer keeps one session a peer's certificate), so it was not built. The owner and control holds alone, without
   the stream holds, measured as above.
 - **Tests.** `RttEstimator`'s bound and the windows' rules are unit-tested (`rtt::tests`, `live_hold::tests`: no window
   before an answer; a stream's first message holds nothing; a run holds no longer than it has lasted; a pause past the
-  bound begins a new run). `a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`: a closed loop of
-  32 writes, every one answered at durability; where a held shard polls, the owner, its control shard (through an
-  exchange and for a dispatch) and a holder each held; on macOS none. Owed: the supervisor's A/B (main, these holds, the
-  answer holds alone; quiet and loaded; Linux and the Studio) with the units' `nr_throttled`, which decides the landing.
+  bound begins a new run). `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`: a
+  closed loop of 32 writes, every one answered at durability, and every site asked its shard to hold with a learned
+  window: the owner, its control shard (through an exchange and for a dispatch) and a holder; whether each shard kept
+  its holds is A-387's decision, printed with the declines. Owed: the supervisor's A/B (main, these holds, the answer
+  holds alone; quiet and loaded; Linux and the Studio) with the units' `nr_throttled`, which decides the landing.

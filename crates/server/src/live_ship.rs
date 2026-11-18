@@ -1299,10 +1299,11 @@ pub(crate) fn defer(
   None
 }
 
-/// Holds this (the owner) shard's idle window until the newest entry of `volume` is expected durable (A-396): a reply
-/// held for it then finds the shard polling when the holders' answer is folded in, not parked behind a wake. The window
-/// is the volume's own, learned from its entries' rounds, publication to durability on the host's clock
-/// ([`LiveVolume::answers`], [`count_hops`]); nothing before the first is timed.
+/// Asks this (the owner) shard to hold its idle window until the newest entry of `volume` is expected durable (A-396): a
+/// reply held for it then finds the shard polling when the holders' answer is folded in, not parked behind a wake. The
+/// window is the volume's own, learned from its entries' rounds, publication to durability on the host's clock
+/// ([`LiveVolume::answers`], [`count_hops`]); nothing before the first is timed. The shard keeps the hold only where it
+/// pays (A-387, [`crate::live_hold::hold`]).
 fn hold_for_answer(state: &mut ShardState, volume: [u8; 16]) {
   let Some(live) = state.live.shipping.get(&volume) else {
     return;
@@ -1312,23 +1313,37 @@ fn hold_for_answer(state: &mut ShardState, volume: [u8; 16]) {
   };
   let left =
     crate::live_hold::remaining(published_ns, window, slates_machine::clock::monotonic_ns());
-  if crate::live_hold::hold(left) {
-    state.count(LIVE_HOLD_ANSWER, 1);
+  count_hold(state, LIVE_HOLD_ANSWER, crate::live_hold::hold(left));
+}
+
+/// Counts a live hold asked at `site` (A-396) by what the shard did with it (`held`, [`crate::live_hold::hold`]): the
+/// site's counter for a hold asked of the shard, and [`LIVE_HOLD_DECLINED`] as well when the shard declined it, its
+/// measured idle turn no shorter than its wake (A-387). Nothing for nothing asked.
+fn count_hold(state: &mut ShardState, site: &'static str, held: Option<bool>) {
+  let Some(kept) = held else {
+    return;
+  };
+  state.count(site, 1);
+  if !kept {
+    state.count(LIVE_HOLD_DECLINED, 1);
   }
 }
 
-/// Counter: a reply held for a live volume's durability held its owner shard's idle window until the answer was expected
-/// (A-396, [`hold_for_answer`]).
+/// Counter: a reply held for a live volume's durability asked its owner shard to hold its idle window until the answer
+/// was expected (A-396, [`hold_for_answer`]).
 const LIVE_HOLD_ANSWER: &str = "fleet.live.hold.answer";
-/// Counter: the control shard held its idle window through a lane's exchange until its holder's answer was expected
-/// (A-396, [`ship_lane`]).
+/// Counter: the control shard was asked to hold its idle window through a lane's exchange until its holder's answer was
+/// expected (A-396, [`ship_lane`]).
 const LIVE_HOLD_EXCHANGE: &str = "fleet.live.hold.exchange";
-/// Counter: the control shard held its idle window after a dispatch for the next one of its stream (A-396,
+/// Counter: the control shard was asked to hold its idle window after a dispatch for the next one of its stream (A-396,
 /// [`send_from_control`]).
 const LIVE_HOLD_DISPATCHES: &str = "fleet.live.hold.dispatches";
-/// Counter: a holder held its idle window after an entry for the next one of its owner's stream (A-396,
+/// Counter: a holder was asked to hold its idle window after an entry for the next one of its owner's stream (A-396,
 /// [`serve_taken`]).
 const LIVE_HOLD_ENTRIES: &str = "fleet.live.hold.entries";
+/// Counter: of the live holds asked (every `fleet.live.hold.*` site), those the shard declined, its measured idle turn no
+/// shorter than its wake estimate (A-387's predicate; A-396): the holds kept are the sites' sum less these.
+const LIVE_HOLD_DECLINED: &str = "fleet.live.hold.declined";
 
 /// A retry of a verb whose reply still waits for durability joins the wait, answered with the same reply when it comes.
 pub(crate) fn join(
@@ -3575,9 +3590,8 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
       every(lanes).await;
       let left =
         crate::live_hold::remaining(began_ns, window, slates_machine::clock::monotonic_ns());
-      if crate::live_hold::hold(left) {
-        let _ = state::with_state(|s| s.count(LIVE_HOLD_DISPATCHES, 1));
-      }
+      let held = crate::live_hold::hold(left);
+      let _ = state::with_state_counted(|s| count_hold(s, LIVE_HOLD_DISPATCHES, held));
     },
     deadline,
   )
@@ -3634,17 +3648,16 @@ async fn ship_to_holder(
   });
 }
 
-/// Holds this (the control) shard's idle window through an exchange with `holder` until its answer is expected (A-396):
-/// the window its record link learned from that holder's answers; nothing before the first is timed.
+/// Asks this (the control) shard to hold its idle window through an exchange with `holder` until its answer is expected
+/// (A-396): the window its record link learned from that holder's answers; nothing before the first is timed. The shard
+/// keeps the hold only where it pays (A-387, [`crate::live_hold::hold`]).
 fn hold_for_exchange(state: &mut ShardState, holder: HostId) {
   let window = state
     .record_sessions
     .get(&holder)
     .and_then(|link| link.live_answers.window())
     .unwrap_or(0);
-  if crate::live_hold::hold(window) {
-    state.count(LIVE_HOLD_EXCHANGE, 1);
-  }
+  count_hold(state, LIVE_HOLD_EXCHANGE, crate::live_hold::hold(window));
 }
 
 /// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent. The entries
@@ -4395,9 +4408,8 @@ fn serve_taken(
       let answer = acknowledged(state, encode_reply(&reply));
       let now = slates_machine::clock::monotonic_ns();
       count_hop(state, HOP_HOLDER, now.saturating_sub(arrived_ns));
-      if crate::live_hold::hold(crate::live_hold::remaining(arrived_ns, window, now)) {
-        state.count(LIVE_HOLD_ENTRIES, 1);
-      }
+      let held = crate::live_hold::hold(crate::live_hold::remaining(arrived_ns, window, now));
+      count_hold(state, LIVE_HOLD_ENTRIES, held);
       answer
     }
   }

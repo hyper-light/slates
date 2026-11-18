@@ -14549,28 +14549,34 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   );
 }
 
-/// Shape: the writes of [`a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`]'s closed loop:
-/// enough for every stream to run past its first message and every answer window to be timed, with room to spare.
+/// Shape: the writes of [`a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`]'s closed
+/// loop: enough for every stream to run past its first message and every answer window to be timed, with room to spare.
 const HELD_LOOP_WRITES: usize = 32;
-/// Format: the owner's count of replies held for durability that held its shard's idle window (`live_ship`, A-396).
+/// Format: the owner's count of replies held for durability that asked its shard to hold its idle window (`live_ship`,
+/// A-396).
 const LIVE_HOLD_ANSWER: &str = "fleet.live.hold.answer";
-/// Format: the owner's count of exchanges its control shard held its idle window through (A-396).
+/// Format: the owner's count of exchanges its control shard was asked to hold its idle window through (A-396).
 const LIVE_HOLD_EXCHANGE: &str = "fleet.live.hold.exchange";
-/// Format: the owner's count of dispatches after which its control shard held its window for the next (A-396).
+/// Format: the owner's count of dispatches after which its control shard was asked to hold its window for the next
+/// (A-396).
 const LIVE_HOLD_DISPATCHES: &str = "fleet.live.hold.dispatches";
-/// Format: a holder's count of entries after which it held its window for the owner's next (A-396).
+/// Format: a holder's count of entries after which it was asked to hold its window for the owner's next (A-396).
 const LIVE_HOLD_ENTRIES: &str = "fleet.live.hold.entries";
+/// Format: a node's count of the live holds asked of its shards that they declined, a shard's measured idle turn no
+/// shorter than its wake (A-387's predicate).
+const LIVE_HOLD_DECLINED: &str = "fleet.live.hold.declined";
 
 /// A-396 (§4.10 "Live shipping", §4.7): do write a live-shipped volume over and over from one client, each write sent as
-/// soon as the last was answered (a closed loop). Expect every write answered at durability; and where a held shard
-/// polls its driver without sleeping (Linux, Windows), each shard on the write's path to have held its idle window rather
-/// than parked: the owner while a reply waited for durability, its node's control shard through an exchange and for the
-/// next dispatch, and the holders for the owner's next entry. These counts are the holds' non-vacuity check; parked, each
-/// of those steps cost a thread's wake (the contract command measured live shipping adding 136-291 µs to a stable write at
-/// the median on main and 63-120 µs held, adacachy, 2026-11-18). On macOS no shard is held (A-387: a held macOS shard
-/// naps in its driver poll), so every count stays zero there.
+/// soon as the last was answered (a closed loop). Expect every write answered at durability, and each shard on the
+/// write's path to have been asked to hold its idle window rather than park, with a window learned from the traffic: the
+/// owner while a reply waited for durability, its node's control shard through an exchange and for the next dispatch, and
+/// the holders for the owner's next entry. These counts are the holds' non-vacuity check: parked, each of those steps cost
+/// a thread's wake (the contract command measured live shipping adding 136-291 µs to a stable write at the median on main
+/// and 63-120 µs held, adacachy, 2026-11-18). Whether a shard keeps a hold is the runtime's decision from its own
+/// measurements (A-387: a shard whose idle turn naps, as a macOS shard's `kevent` does, declines), so the test asks only
+/// that every site asked, and prints the declines.
 #[test]
-fn a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows() {
+fn a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
   let owner = daemons[0].instance().to_owned();
@@ -14610,11 +14616,14 @@ fn a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows
     .map(|kind| refusal_count(&daemons[0], kind).unwrap());
   let holders =
     [&daemons[1], &daemons[2]].map(|holder| refusal_count(holder, LIVE_HOLD_ENTRIES).unwrap());
+  let declined = [&daemons[0], &daemons[1], &daemons[2]]
+    .map(|daemon| refusal_count(daemon, LIVE_HOLD_DECLINED).unwrap());
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "held loop: the owner's answer, exchange and dispatch holds {owners:?}; the holders' entry holds {holders:?}"
+    "held loop: the owner's answer, exchange and dispatch holds asked {owners:?}; the holders' entry holds asked \
+     {holders:?}; declined by each node's shards {declined:?}"
   );
   assert!(
     replies
@@ -14622,36 +14631,28 @@ fn a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows
       .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
     "every write of the loop is answered at durability: {replies:?}"
   );
-  held_loop_verdict(owners, holders);
-}
-
-/// [`a_live_write_loop_holds_the_owners_the_control_shards_and_the_holders_windows`]'s verdict where a held shard polls:
-/// the owner, its control shard (through an exchange and for the next dispatch) and a holder each held.
-#[cfg(not(target_os = "macos"))]
-fn held_loop_verdict(owners: [u64; 3], holders: [u64; 2]) {
   assert!(
     owners[0] > 0,
-    "a reply held for durability held the owner's window"
+    "a reply held for durability asked the owner's shard to hold: {owners:?}"
   );
   assert!(
     owners[1] > 0,
-    "the control shard held its window through an exchange"
+    "the control shard was asked to hold through an exchange: {owners:?}"
   );
   assert!(
     owners[2] > 0,
-    "the control shard held its window for its next dispatch"
+    "the control shard was asked to hold for its next dispatch: {owners:?}"
   );
   assert!(
-    holders.iter().any(|held| *held > 0),
-    "a holder held its window for the owner's next entry: {holders:?}"
+    holders.iter().any(|asked| *asked > 0),
+    "a holder was asked to hold for the owner's next entry: {holders:?}"
   );
-}
-
-/// The verdict on macOS: no shard held (A-387), every count zero.
-#[cfg(target_os = "macos")]
-fn held_loop_verdict(owners: [u64; 3], holders: [u64; 2]) {
-  assert_eq!(owners, [0; 3], "no owner-node shard is held on macOS");
-  assert_eq!(holders, [0; 2], "no holder is held on macOS");
+  assert!(
+    declined[0] <= owners.iter().sum::<u64>()
+      && declined[1] <= holders[0]
+      && declined[2] <= holders[1],
+    "no node declined more holds than its shards were asked: {declined:?} of {owners:?}, {holders:?}"
+  );
 }
 
 /// The volume of `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume` before its burst. Do: write
