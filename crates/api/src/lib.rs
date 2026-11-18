@@ -107,8 +107,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// launcher's own secret: `LauncherSecret`, `StartSpec::launcher` and `with_launcher`, `Issuer::from_launcher_secret`,
 /// `StartSpec::anchor_command` fallible (`StartFault::Launcher`), `IssuerFault::LauncherCannotRecover`,
 /// `Unsupported::SecureRandom`; and, from A-285's owner the same hour, `Stale::Policy`, a policy setting that raced
-/// another (`set_write_policy` names the version it read) (the same day).
-pub const CONTRACT: u32 = 7;
+/// another (`set_write_policy` names the version it read) (the same day). 8: an overlay's drift read from the status
+/// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
+/// read with no base (it failed as a protocol fault before) (the same day).
+pub const CONTRACT: u32 = 8;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

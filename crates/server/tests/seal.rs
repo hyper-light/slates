@@ -20,7 +20,9 @@ use slates_cluster::sealed::{SealedChunk, SealedError, open_chunk, seal_chunk};
 use slates_db::catalog::VolumeId;
 use slates_ipc::HeldRendezvous;
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
-use slates_server::seal_keys::{lineage, namer};
+use slates_server::seal_keys::{
+  adopt_lineage, lineage, lineage_recorded, namer, recorded_lineage, recorded_namer,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the per-probe budget of the test's machine profile (a quick measurement, no codecs or core matrix).
@@ -238,5 +240,53 @@ fn destroying_a_volume_erases_its_sealed_content() {
   assert_eq!(
     opened,
     Err(SealedError::Seal(hyper_seal::SealError::Unwrap))
+  );
+}
+
+/// A-271: a successor that reads a volume's keys before they reach it records none, and adopts the right one when it
+/// arrives. Do ask a daemon whose partition holds no keys for a volume for its recorded lineage and namer, then hand it
+/// a lineage wrapped under its root, as `successor_lineage` does. Expect nothing read and nothing recorded by the reads,
+/// and the handed key's id recorded after. Before, the read path made a key: a live takeover's successor that could not
+/// unwrap the log's key made one, failed to open the log under it, and kept it, so the right key was never adopted.
+#[test]
+fn a_reader_without_the_key_records_none_and_adopts_the_right_one() {
+  let instance = format!("seal-reader-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile(), &instance, Some(SHARDS));
+  let anchor = played_anchor(&config, "seal-reader");
+  let daemon = start_over(&config, &anchor);
+  let owner = slates_db::catalog::Principal::Uid {
+    host: slates_db::HostId(1),
+    uid: 501,
+  };
+  let account = owner.tenant();
+  let handed = [9; 16];
+  let (read, recorded_by_reads, adopted) = daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      let read = (
+        recorded_lineage(state, VOLUME, account).unwrap().is_some(),
+        recorded_namer(state, VOLUME, account).unwrap().is_some(),
+      );
+      let recorded_by_reads = lineage_recorded(state, VOLUME);
+      let root = state.seal_root.as_ref().unwrap();
+      let (secret, _) = root.make_child().unwrap();
+      let wrapped = root.wrap(&secret).unwrap().encode().to_vec();
+      adopt_lineage(state, VOLUME, &owner, (handed, wrapped), None).unwrap();
+      let adopted = recorded_lineage(state, VOLUME, account)
+        .unwrap()
+        .map(|key| key.id().0);
+      (read, recorded_by_reads, adopted)
+    })
+    .unwrap();
+  daemon.stop();
+  assert_eq!(
+    read,
+    (false, false),
+    "no lineage or namer recorded: none read"
+  );
+  assert!(!recorded_by_reads, "and none made by the reads");
+  assert_eq!(
+    adopted,
+    Some(handed),
+    "the key handed over is the one recorded"
   );
 }

@@ -26,6 +26,9 @@
 //! A device presents what its [`GuestView`] names (AUD-29-76): the head, one directory of it (served through
 //! `ScopedBridge`, so nothing outside is reached), or a snapshot read-only (its own view, admitted with no
 //! write, closed with the device).
+//!
+//! A device is a guest kernel's route (A-290): its guest reads and writes its own attribute namespaces, `trusted.` and
+//! `security.`, besides `user.`, kept in the volume as its data and shown to no host's mount.
 
 use std::future::Future;
 
@@ -190,7 +193,8 @@ impl BridgeAccess for ShardBridge {
             .map(|host| host as &mut dyn slates_vfs::host::HostFs),
         )
       };
-      let mut bridge = bridge.offering_dax(offer);
+      // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
+      let mut bridge = bridge.offering_dax(offer).serving_a_guest();
       let mut scoped;
       let served: &mut dyn Bridge = match scope {
         Some(scope) => {
