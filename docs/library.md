@@ -193,6 +193,17 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   depend on this crate.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
+- The chosen-path launcher (`slates_api::exec`, Linux, A-370): a volume shown at an existing directory
+  for one command, in a namespace of its own, served by the host's own executable as `role::main`
+  serves the roles. `exec::command(&spec, host_exe, &["slates-role".into()])` builds the command
+  (`HOST_EXE slates-role exec --volume=V --at=PATH [--apparmor-profile] -- CMD`); the host spawns it
+  with `SLATES_ROOT` set and awaits it. `ExecSpec::apparmor` is the AppArmor option, `AppArmor::Off`
+  unless the user opts in: on a host whose AppArmor restricts unprivileged user namespaces (Ubuntu
+  24.04 and later) `AppArmor::Profile` makes the namespace under slates' profile for the host's
+  executable, which an administrator renders with `slates_client::exec::profile(host_exe)` and loads
+  as root; off, the launcher never uses it. `exec::check()` answers the host's `Readiness`
+  (`Unrestricted`, `ProfileLoaded`, `ProfileMissing`, `Unsupported`), and every refusal is an
+  `ExecFault` naming its remedy.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
 while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
