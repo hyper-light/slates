@@ -2162,9 +2162,6 @@ fn expects_reply(header: Option<&InHeader>) -> bool {
   takes_reply(header.and_then(|h| Opcode::from_wire(h.opcode)))
 }
 
-/// Copies the chain's readable ranges, in order, into one contiguous request buffer of `total`
-/// bytes (the walk proved the ranges lie in guest memory and sum to `total`).
-
 /// Whether a chain can hold its request's header and, unless it is the high-priority queue's (whose requests take no
 /// reply), its reply's header: a chain that cannot is refused before anything is gathered from it.
 fn chain_has_room(queue: u16, chain: &DescriptorChain) -> Result<(), DeviceError> {
@@ -2186,6 +2183,9 @@ fn chain_has_room(queue: u16, chain: &DescriptorChain) -> Result<(), DeviceError
   }
   Ok(())
 }
+
+/// Copies the chain's readable ranges, in order, into one contiguous request buffer of `total`
+/// bytes (the walk proved the ranges lie in guest memory and sum to `total`).
 fn gather(
   memory: &dyn GuestMemory,
   ranges: &[GuestRange],
