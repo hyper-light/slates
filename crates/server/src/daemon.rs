@@ -2910,6 +2910,18 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
+  /// (`fleet::make_live_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
+  /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
+  pub fn inject_live_turn_pause(&self, pause_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live_turn_pause_ns = pause_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: this node is superseded on `volume` at `epoch` (`live_ship::inject_superseded`, never reachable from
   /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts are told, or as a restart
   /// over a kept fence finds it, telling none (A-344). So a mount's answer to a takeover (A-346) is driven without a
@@ -4449,6 +4461,7 @@ async fn init_shard(
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
     seal_walk_quantum_ns: None,
+    live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
@@ -4527,6 +4540,7 @@ async fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
+    making_taken_over: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),

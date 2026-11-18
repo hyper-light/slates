@@ -4324,71 +4324,115 @@ fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static st
   Ok(())
 }
 
-/// The volume a live log describes, rebuilt as a takeover's archive on the volume's new owner shard (A-200): the
-/// lineage key adopted, every payload opened, the deltas applied in order to the whole image, and the result laid out
-/// as `materialize_taken_over` restores (directories and files, a symlink as a file of its target, as the export lays
-/// it out). Refused, counted, when the log cannot be rebuilt whole: the volume is then not served from it.
-pub(crate) fn archive_from_live(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
-  fetched: &Fetched,
-) -> Result<slates_archive::Archive, &'static str> {
-  let rebuilt = rebuild(state, id, owner, fetched);
-  match &rebuilt {
-    Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
-    Err(why) => {
-      // In total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals are counted: one counter for nine
-      // refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960, 42318867890: 1,512 refusals).
-      state.count(LIVE_TAKEOVER_REFUSED, 1);
-      state.count(why, 1);
-    }
-  }
-  rebuilt
+/// Counts a live takeover's rebuild refused, in total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals
+/// are counted: one counter for nine refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960,
+/// 42318867890: 1,512 refusals). The refusal, for its caller to return.
+pub(crate) fn rebuild_refused(state: &mut ShardState, why: &'static str) -> &'static str {
+  state.count(LIVE_TAKEOVER_REFUSED, 1);
+  state.count(why, 1);
+  why
 }
 
-fn rebuild(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
-  fetched: &Fetched,
-) -> Result<slates_archive::Archive, &'static str> {
-  if let Some(lineage) = fetched.lineage.clone() {
-    crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
-      .map_err(|_| REFUSED_LINEAGE)?;
+/// Counts a live volume taken over (`fleet.live.taken_over`): made from its rebuilt log and published, in the turn that
+/// makes it servable (A-343), so a count read means a volume a restart rebuilds.
+pub(crate) fn taken_over(state: &mut ShardState) {
+  state.count(LIVE_TAKEN_OVER, 1);
+}
+
+/// A live log's rebuild on its volume's new owner shard, its payloads opened, decoded and applied in order a slice at a
+/// time (g251, CLAUDE.md "Bounded work everywhere"). A takeover rebuilt the whole
+/// log inside the one owner-shard turn that made the volume: on a Mac Studio the nemesis's volumes, 16,737 to 27,430
+/// sealed payloads of 152 to 306 MB, took 0.24 to 0.62 s to open and 0.09 to 0.44 s to apply, and with the restore and
+/// the publication after them the turn ran past the watchdog's spin window, which ended the successor's process
+/// (`live_chaos`'s nemesis, seeds 17036665960917068132 and 2120743995065985386). Each payload is the unit: opened under
+/// the keys the rebuild began with, decoded, applied to the image a whole record began (a delta before any whole one is
+/// refused), and its content runs kept, a later run at the same place over an earlier one.
+pub(crate) struct Rebuilding {
+  /// The lineage key and namer the payloads are opened under, when the log is sealed.
+  keys: Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
+  /// The payloads not yet applied, in order.
+  payloads: std::vec::IntoIter<Vec<u8>>,
+  /// The image the payloads applied so far describe; `None` before the first whole record.
+  image: Option<slates_vfs::recover::VolumeImage>,
+  /// The content runs they name, by inode and offset.
+  runs: BTreeMap<(u64, u64), Vec<u8>>,
+  /// The volume's per-creator number, the archive header's field (`ObjectId::local`).
+  volume_local: u64,
+  /// The daemon's base page, the archive header's.
+  page: usize,
+}
+
+impl Rebuilding {
+  /// Begins the rebuild of the live log `payloads` of volume `id`, owned by `owner`: the lineage key adopted when the
+  /// takeover fetched one (`lineage`, with the head's `naming`), and the keys recorded here taken when the log is sealed.
+  /// Refused [`REFUSED_LINEAGE`] when the key will not adopt, and as [`keys_for_rebuild`] refuses a sealed log with no
+  /// key recorded.
+  pub(crate) fn begin(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    owner: &slates_db::catalog::Principal,
+    (lineage, naming): (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>),
+    payloads: Vec<Vec<u8>>,
+  ) -> Result<Rebuilding, &'static str> {
+    if let Some(lineage) = lineage {
+      crate::seal_keys::adopt_lineage(state, id, owner, lineage, naming.as_ref())
+        .map_err(|_| REFUSED_LINEAGE)?;
+    }
+    // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
+    let sealed = payloads
+      .first()
+      .is_some_and(|payload| sealed_body(payload).is_some());
+    let account = crate::seal_keys::tenant_of(owner);
+    let keys = if sealed {
+      crate::seal_keys::recorded_lineage(state, id, account)
+        .ok()
+        .flatten()
+        .zip(
+          crate::seal_keys::recorded_namer(state, id, account)
+            .ok()
+            .flatten(),
+        )
+    } else {
+      None
+    };
+    keys_for_rebuild(sealed, keys.is_some())?;
+    Ok(Rebuilding {
+      keys,
+      payloads: payloads.into_iter(),
+      image: None,
+      runs: BTreeMap::new(),
+      volume_local: ObjectId(id.bytes).local(),
+      page: state.config.page,
+    })
   }
-  // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
-  let sealed = fetched
-    .payloads
-    .first()
-    .is_some_and(|payload| sealed_body(payload).is_some());
-  let account = crate::seal_keys::tenant_of(owner);
-  let keys = if sealed {
-    crate::seal_keys::recorded_lineage(state, id, account)
-      .ok()
-      .flatten()
-      .zip(
-        crate::seal_keys::recorded_namer(state, id, account)
-          .ok()
-          .flatten(),
-      )
-  } else {
-    None
-  };
-  keys_for_rebuild(sealed, keys.is_some())?;
-  let mut publications = Vec::new();
-  for payload in &fetched.payloads {
-    publications.push(open_payload(keys.as_ref(), payload).ok_or(REFUSED_OPEN)?);
+
+  /// Applies the next payloads, one at least, until `spent` says the turn's share is spent; `Ok(true)` once every
+  /// payload is applied. Refused as the whole rebuild is: [`REFUSED_OPEN`], [`REFUSED_RECORD`], [`REFUSED_APPLY`],
+  /// [`REFUSED_NOT_WHOLE_FIRST`].
+  pub(crate) fn advance(&mut self, mut spent: impl FnMut() -> bool) -> Result<bool, &'static str> {
+    loop {
+      let Some(payload) = self.payloads.next() else {
+        return Ok(true);
+      };
+      self.apply(&payload)?;
+      if self.payloads.len() == 0 {
+        return Ok(true);
+      }
+      if spent() {
+        return Ok(false);
+      }
+    }
   }
-  let mut image = None;
-  let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
-  for publication in publications {
+
+  /// One payload opened, decoded and applied, its runs kept.
+  fn apply(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+    let publication = open_payload(self.keys.as_ref(), payload).ok_or(REFUSED_OPEN)?;
     let record =
       <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
-    match (record, image.as_mut()) {
+    match (record, self.image.as_mut()) {
       (VolumeRecord::Full { image: whole }, _) => {
-        image = Some(whole);
-        runs.clear();
+        self.image = Some(whole);
+        self.runs.clear();
       }
       (VolumeRecord::Delta { delta }, Some(image)) => {
         slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
@@ -4396,11 +4440,17 @@ fn rebuild(
       (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
     }
     for run in publication.runs {
-      runs.insert((run.inode, run.offset), run.bytes);
+      self.runs.insert((run.inode, run.offset), run.bytes);
     }
+    Ok(())
   }
-  let image = image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
-  archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
+
+  /// The rebuilt volume laid out as the archive `materialize_taken_over` restores; refused
+  /// [`REFUSED_NOT_WHOLE_FIRST`] when no whole record began the log.
+  pub(crate) fn archive(self) -> Result<slates_archive::Archive, &'static str> {
+    let image = self.image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
+    archive_of(&image, &self.runs, self.volume_local, self.page)
+  }
 }
 
 /// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes

@@ -401,6 +401,15 @@
 >   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+>   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
+>   spinning", seeds 17036665960917068132 and 2120743995065985386, both Linux arches and macOS) were a live takeover's
+>   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
+>   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
+>   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
+>   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
+>   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
+>   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
+>   volume's restore.
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
