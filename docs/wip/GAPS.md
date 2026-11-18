@@ -14902,8 +14902,12 @@ without a user namespace, which needs root.
     1 run of 18 at load 46–53 on the box, the guest's work done and flushed. The test accepts exit 1 only when the
     console shows the guest's restart and Firecracker's `Shutdown` line. Forced with `reboot=t`, that branch passed, and
     the merge after it held the guest's tree. 40 more runs at load 16 all exited 0.
-  - **Open sibling (found 2026-10-24 by reading `reconcile_unpublished_effects`, not yet reproduced): a clone whose
-    transaction fails after it recorded its volume keeps its pin.**
+  - **Fixed 2026-11-18 (g251), found 2026-10-24 by reading `reconcile_unpublished_effects`: a clone whose
+    transaction fails after it recorded its volume kept its pin.** Proven by
+    `a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot` (`crates/server/tests/recovery.rs`:
+    the clone refused `Unpublished`, then the snapshot's destroy refused `Pinned` before the fix). The rollback's
+    reconciliation now recounts the clone pins against the lineage the catalog still records
+    (`verbs::reconcile_clone_pins`, as a recovery does), whenever it tore an orphan down.
     When `Db::commit` fails after a clone verb recorded its volume (the log full or unpublishable), the rollback
     removes the record and `reconcile_unpublished_effects` tears down the orphaned slot. Nothing releases the pin
     `clone_of` put on the origin's snapshot, so that snapshot's destroy is refused `Pinned` until the next restart's
