@@ -41,7 +41,8 @@ a budget, and b's control shard held for one and a half budgets as soon as b has
 | --- | --- | --- | --- |
 | main's lane, the test alone (`diag-g255-lane-red-1`, run 44253485264) | failed 3 of 3 | failed 3 of 3 | failed 3 of 3 |
 | A-315's first form, the shard's waits alone (`-green-1`, run 44253484990; `-green-2`, run 44254220660) | passed 5 of 6 | passed 5 of 6 | passed 6 of 6 |
-| A-315 as landed, the lane's own empty queue (`-green-5`, run 44257173978) | passed 8 of 8 | queued at landing | passed 8 of 8 |
+| A-315's third form, a turn after the shard's waits that read its queue empty (`-green-5`, run 44257173978) | passed 8 of 8 | not run | passed 8 of 8 |
+| A-315 as landed, a turn begun after the silence that read its own socket empty, merged tree (`-green-7`, run 44260700333) | passed 8 of 8 | not run | passed 8 of 8 |
 
 On main every run gave up 7 of the 8 batches and resent them (`fleet.forward.batch_given_up` 7, `fleet.forward.retried`
 7, 15 forwards begun): every forwarder but the lane's driver, whose own turn reads first. With A-315 none was given up
@@ -59,26 +60,29 @@ sent, inside a's half-budget delay, and held it 1.500 to 1.649 s.
   bytes, since other forwards' bytes kept forwards an owner never answered open for good (the 298 forwards of
   2026-11-07).
 - Quiet for its stall budget before the bound, the batch is given up only once a driving turn of its lane, begun after
-  the lane's shard has waited in its driver twice since the silence was first seen (A-292's receiver rule,
-  `slates_rt::registry::Pulse::waits`), has left the session's receive queue empty (`forward_lane::left_empty`: its
-  drive took no datagram, or one more receive that does not wait took none; `Endpoint::datagrams_received`,
-  `Lane::drained_idles`), looking again every poll interval. A shard waits there only when nothing is ready to run, so by
-  then everything that reached it before the silence was seen is in the session's queue, and a turn that leaves the
-  queue empty has consumed it, settling the replies into the lane. Progress meanwhile ends the confirmation; a later
-  silence is confirmed afresh. A datagram count, not stream bytes: a datagram of acknowledgements alone, or of bytes
-  past a gap, consumes no stream byte.
-- The shard's waits alone were the first form, and they are not enough: the link's discovery page can hold the session
-  while the shard waits, the lane's replies unsettled. That form passed 16 of 18 runs on GitHub's three runners
-  (`diag-g255-lane-green-1` 9 of 9, run 44253484990; `-green-2` 7 of 9, run 44254220660), and in the other two
-  (ubuntu-latest and macos-latest of `-green-2`) gave all 7 waiting batches up silent, each run's lane having found its
-  session lent to the link once (`fleet.forward.session_out` 1, `fleet.lent_to.link` 1; a passing run prints no
-  counters).
-- A drive that waited and took nothing was the second form, and it is not enough either: a session busy with other
-  forwards' replies is never found so, and the 298 forwards' regression,
-  `a_silent_forward_gives_up_while_its_session_carries_others`, failed 2 of 3 runs on ubuntu-latest with it
-  (`diag-g255-lane-green-4`, run 44256299594: the silent forward never given up while the busy one's replies flowed).
-  An empty queue after the turn's reads is the proof: a busy session is found empty between its replies, and a backlog
-  only once it is read.
+  the silence was first seen, has read the session's own socket empty (`forward_lane::left_empty`: its drive took no
+  datagram, or one more receive that does not wait took none; `Endpoint::datagrams_received`, `Lane::drained_turn`),
+  looking again every poll interval. The record link's sessions read their own sockets (`Endpoint::client`;
+  `Endpoint::reads_its_own_socket`), so that turn has read every datagram that reached the socket before, its settles
+  putting the replies into the lane. Turns are ordered by the lane's own count (`Lane::turns_begun`), exact on the one
+  shard thread. Progress meanwhile ends the confirmation; a later silence is confirmed afresh. A datagram count, not
+  stream bytes: a datagram of acknowledgements alone, or of bytes past a gap, consumes no stream byte.
+- Three proofs came first, and the CI runs refused each:
+  - The control shard's two waits in its driver since the silence (A-292's receiver rule) alone. That form passed 16
+    of 18 runs on GitHub's three runners (`diag-g255-lane-green-1` 9 of 9, run 44253484990; `-green-2` 7 of 9, run
+    44254220660), and in the other two (ubuntu-latest and macos-latest of `-green-2`) gave all 7 waiting batches up
+    silent, each run's lane having found its session lent to the link once (`fleet.forward.session_out` 1,
+    `fleet.lent_to.link` 1; a passing run prints no counters): the shard waits while the link's discovery page holds the
+    session, the lane's replies unsettled.
+  - A turn begun after those waits whose drive took nothing. A session busy with other forwards' replies is never found
+    so, and the 298 forwards' regression, `a_silent_forward_gives_up_while_its_session_carries_others`, failed 2 of 3
+    runs on ubuntu-latest (`diag-g255-lane-green-4`, run 44256299594: the silent forward never given up while the busy
+    one's replies flowed).
+  - A turn begun after those waits that read its queue empty (the drive, then one receive that does not wait). The
+    held-origin test passed 16 of 16 on ubuntu-latest and windows-latest (`-green-5`, run 44257173978), but on the
+    merged tree the silent-forward test failed 1 of 6 on ubuntu-latest (`-green-6`, run 44258222430): its silence had
+    begun its confirmation (`fleet.forward.silence_awaited_receiver` 1) and was never given up while the lane carried
+    3,035 other replies, since a control shard that busy rarely waits in its driver.
 - Past the bound a quiet batch is given up at once, so a shard that never waits (always busy) and a lane that never
   begins a forward hold nothing past the operator's bound on a failover. A batch whose own forwards progress is never
   given up.
@@ -106,7 +110,7 @@ counted the same way on every platform, and the judge reads no clock but the wal
 ## Tests
 
 - `forward_lane::stall_tests`: the rule's unit tests
-  (`a_silence_is_given_up_only_once_its_lane_has_drained_after_two_waits_of_its_shard`,
+  (`a_silence_is_given_up_only_once_a_turn_begun_after_it_reads_the_socket_empty`,
   `progress_while_a_silence_awaits_its_receiver_starts_the_quiet_again`,
   `a_queued_forward_counts_its_lanes_progress_until_its_failover_bound`,
   `a_silence_past_its_bound_is_given_up_without_its_receiver`,
@@ -116,7 +120,8 @@ counted the same way on every platform, and the judge reads no clock but the wal
 - `crates/server/tests/fleet.rs` `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`.
 
 Red-checks of the rule's unit tests, each a mutation of `Stall` or the lane run in a copy of the tree on GitHub's
-ubuntu-latest (`diag-g255-mut-3`, run 44256299218; the six held their result on the first form too, `diag-g255-mut-1`):
+ubuntu-latest (`diag-g255-mut-4`, run 44260700876; the first five held their result on the earlier forms too, `-mut-1`
+and `-mut-3`):
 
 | Mutation | Unit tests red |
 | --- | --- |
@@ -125,7 +130,7 @@ ubuntu-latest (`diag-g255-mut-3`, run 44256299218; the six held their result on 
 | a confirmation kept across a later silence | 1: `progress_while_a_silence_awaits_its_receiver_starts_the_quiet_again` |
 | the lane's progress counted past the failover bound | 2, the model test among them |
 | no give-up past the bound unconfirmed | 3, the model test among them |
-| the shard's waits alone, the lane's drain ignored | 2, the model test among them |
+| a turn begun before the silence counted as its proof | 3, the model test among them |
 
 Unmutated, the ten lane tests pass. `left_empty`, the proof's half that reads the session, is held by the fleet tests,
 since it needs a session: without it (the shard's waits alone) the held-origin test failed 2 of 18 runs, and with a
@@ -133,12 +138,12 @@ drive that took nothing in its place the silent-forward test failed 2 of 3 (the 
 
 ## Siblings
 
-The other forward tests keep their results with the form that landed (`-green-5`, ubuntu-latest and windows-latest):
+The other forward tests keep their results with the form that landed (`-green-7`, ubuntu-latest and windows-latest):
 `an_unanswered_forward_is_sent_again_within_the_takeover_bound` (the test the poll clock failed on Windows) 6 of 6,
 `a_silent_forward_gives_up_while_its_session_carries_others` (the 298 forwards' regression: an open forward is still
 given up while other replies flow) 12 of 12, `a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one` and
-`a_read_through_a_dead_session_keeps_its_place_behind_a_burst` 6 of 6 each; with the first form, all four 9 of 9 on the
-three runners (`-green-2`).
+`a_read_through_a_dead_session_keeps_its_place_behind_a_burst` 6 of 6 each. The macOS runners' queue held their jobs past
+landing; the first form ran all four 9 of 9 on the three runners (`-green-2`).
 
 Waits on remote hosts that still run on a liveness budget of wall time (R3 class B, GAPS): the location round's wait
 for its silent peers (`owner_location::locate_round`), the forwarded owner location's own budget (A-317 owns it), the

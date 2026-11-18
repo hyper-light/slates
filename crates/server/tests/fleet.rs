@@ -5812,7 +5812,7 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
 /// eight clients, one read each, whose replies come back as many datagrams, so b's lane reads them over many turns.
 const UNREAD_READERS: usize = 8;
 /// Shape: the file each of those reads asks for: a mebibyte, so each reply is a read-ahead window of many datagrams.
-const UNREAD_FILE_BYTES: usize = 1 << 20;
+const UNREAD_FILE_BYTES: u32 = 1 << 20;
 /// Shape: the owner's delay before it answers each forwarded verb: half a liveness budget, so b's hold has taken its
 /// control shard before a answers, and a answers well inside the hold.
 const UNREAD_SERVE_DELAY_NS: u64 = LIVENESS_BUDGET_NS / 2;
@@ -5856,11 +5856,36 @@ fn a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held() {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
-  let instances: Vec<String> = daemons
-    .iter()
-    .map(|daemon| daemon.instance().to_owned())
-    .collect();
-  let mut raw = Client::connect(&instances[0]);
+  let read = unread_file_on_a(&daemons);
+  let run = read_through_a_held_origin(&daemons, &read);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  run.report();
+  run.assert_the_hold_left_replies_unread();
+  for (index, reply) in run.replies.iter().enumerate() {
+    assert!(
+      matches!(reply, ReplyBody::ReadPage { .. }),
+      "reader {index} was served: {reply:?}"
+    );
+  }
+  assert_eq!(
+    run.moved("fleet.forward.batch_given_up"),
+    0,
+    "b gave up no forward whose reply came while it was held: {:?}",
+    run.after
+  );
+  assert!(
+    run.moved("fleet.forward.silence_awaited_receiver") > 0,
+    "the hold brought a forward to its stall budget, and its silence waited for b to read what came: {:?}",
+    run.after
+  );
+}
+
+/// [`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`]'s volume: a mebibyte file written on a,
+/// shared with b's account; the read of it each of b's clients sends.
+fn unread_file_on_a(daemons: &[Daemon]) -> RequestBody {
+  let mut raw = Client::connect(daemons[0].instance());
   let ReplyBody::Created { id: volume } = raw.call(&RequestBody::Create {
     name: "unread".to_owned(),
     size: SizeClass::Bounded { limit: 16 << 20 },
@@ -5886,21 +5911,91 @@ fn a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held() {
   let file: Vec<u8> = (0..UNREAD_FILE_BYTES)
     .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
     .collect();
-  slates_client::Client::connect(&instances[0], deadlines)
+  slates_client::Client::connect(daemons[0].instance(), deadlines)
     .unwrap()
     .fs_write((volume, attachment), "/big", &file, 0o644)
     .unwrap();
-  let read = RequestBody::ReadRange {
+  RequestBody::ReadRange {
     volume,
     path: "/big".to_owned(),
     at: ReadAt::Head,
     offset: 0,
     max: u64::MAX,
-  };
-  let mut warm = Client::connect(&instances[1]);
+  }
+}
+
+/// What [`read_through_a_held_origin`] saw.
+struct UnreadRun {
+  warmed: bool,
+  delays: (Result<(), ObserveError>, Result<(), ObserveError>),
+  all_begun: bool,
+  held_after: Duration,
+  held_for: Result<u64, ObserveError>,
+  replies: Vec<ReplyBody>,
+  before: std::collections::BTreeMap<&'static str, u64>,
+  after: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl UnreadRun {
+  /// How far b's count `name` moved over the run.
+  fn moved(&self, name: &str) -> u64 {
+    count_of(&self.after, name).saturating_sub(count_of(&self.before, name))
+  }
+
+  /// Prints the run's figures.
+  fn report(&self) {
+    eprintln!(
+      "b's hold took its control shard {:?} after the reads were sent and held it {:?}; forwards begun {}, batches \
+       given up {} (silent {}, at the bound {}), silences awaiting the receiver {}, resent {}",
+      self.held_after,
+      self.held_for,
+      self.moved("fleet.forward.begun"),
+      self.moved("fleet.forward.batch_given_up"),
+      self.moved("fleet.forward.given_up_silent"),
+      self.moved("fleet.forward.given_up_at_bound"),
+      self.moved("fleet.forward.silence_awaited_receiver"),
+      self.moved("fleet.forward.retried"),
+    );
+  }
+
+  /// The run held what the test means: b read the file before, a's delay came and went, every forward was begun before
+  /// the hold, the hold took b's control shard before a answered, and it lasted past a stall budget.
+  fn assert_the_hold_left_replies_unread(&self) {
+    assert!(self.warmed, "b read a's file before the delay");
+    assert!(
+      self.delays.0.is_ok() && self.delays.1.is_ok(),
+      "a's serve delay was installed and lifted: {:?}",
+      self.delays
+    );
+    assert!(
+      self.all_begun,
+      "b began every read's forward before the hold"
+    );
+    assert!(
+      self.held_after < Duration::from_nanos(UNREAD_SERVE_DELAY_NS),
+      "b's control shard was held before a answered ({:?}): its replies were not left unread",
+      self.held_after
+    );
+    assert!(
+      self
+        .held_for
+        .as_ref()
+        .is_ok_and(|span| *span >= UNREAD_HOLD_NS),
+      "b's control shard was held past a stall budget: {:?}",
+      self.held_for
+    );
+  }
+}
+
+/// [`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`]'s measured part: b reads `read` once, so
+/// its route and session to a are warm; a delays each forwarded verb half a budget; [`UNREAD_READERS`] clients of b
+/// send `read` at once; once b has begun their forwards, b's control shard is held for [`UNREAD_HOLD_NS`]; the readers'
+/// replies are collected and a's delay lifted.
+fn read_through_a_held_origin(daemons: &[Daemon], read: &RequestBody) -> UnreadRun {
+  let mut warm = Client::connect(daemons[1].instance());
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let warmed = poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
-    Ok(matches!(warm.call(&read), ReplyBody::ReadPage { .. }))
+    Ok(matches!(warm.call(read), ReplyBody::ReadPage { .. }))
   });
   let delayed = daemons[0].inject_serve_delay(Some(UNREAD_SERVE_DELAY_NS));
   let before = daemons[1].fleet_refusals().unwrap_or_default();
@@ -5908,7 +6003,7 @@ fn a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held() {
   let sent = Instant::now();
   let readers: Vec<_> = (0..UNREAD_READERS)
     .map(|_| {
-      let mut reader = Client::connect(&instances[1]);
+      let mut reader = Client::connect(daemons[1].instance());
       let read = read.clone();
       std::thread::spawn(move || reader.call(&read))
     })
@@ -5927,49 +6022,16 @@ fn a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held() {
   let held_for = hold.and_then(|hold| hold.answer());
   let lifted = daemons[0].inject_serve_delay(None);
   let after = daemons[1].fleet_refusals().unwrap_or_default();
-  for daemon in daemons {
-    daemon.stop();
+  UnreadRun {
+    warmed,
+    delays: (delayed, lifted),
+    all_begun,
+    held_after,
+    held_for,
+    replies,
+    before,
+    after,
   }
-  let moved = |name: &str| count_of(&after, name).saturating_sub(count_of(&before, name));
-  eprintln!(
-    "b's hold took its control shard {held_after:?} after the reads were sent and held it {held_for:?}; forwards \
-     begun {}, batches given up {} (silent {}, at the bound {}), silences awaiting the receiver {}, resent {}",
-    moved("fleet.forward.begun"),
-    moved("fleet.forward.batch_given_up"),
-    moved("fleet.forward.given_up_silent"),
-    moved("fleet.forward.given_up_at_bound"),
-    moved("fleet.forward.silence_awaited_receiver"),
-    moved("fleet.forward.retried"),
-  );
-  assert!(warmed, "b read a's file before the delay");
-  assert!(
-    delayed.is_ok() && lifted.is_ok(),
-    "a's serve delay was installed and lifted"
-  );
-  assert!(all_begun, "b began every read's forward before the hold");
-  assert!(
-    held_after < Duration::from_nanos(UNREAD_SERVE_DELAY_NS),
-    "b's control shard was held before a answered ({held_after:?}): its replies were not left unread"
-  );
-  assert!(
-    held_for.as_ref().is_ok_and(|span| *span >= UNREAD_HOLD_NS),
-    "b's control shard was held past a stall budget: {held_for:?}"
-  );
-  for (index, reply) in replies.iter().enumerate() {
-    assert!(
-      matches!(reply, ReplyBody::ReadPage { .. }),
-      "reader {index} was served: {reply:?}"
-    );
-  }
-  assert_eq!(
-    moved("fleet.forward.batch_given_up"),
-    0,
-    "b gave up no forward whose reply came while it was held: {after:?}"
-  );
-  assert!(
-    moved("fleet.forward.silence_awaited_receiver") > 0,
-    "the hold brought a forward to its stall budget, and its silence waited for b to read what came: {after:?}"
-  );
 }
 
 /// Shape: how long [`fill_task_arena`] may go without a filler admitted before it calls the shard stuck. It bounds a

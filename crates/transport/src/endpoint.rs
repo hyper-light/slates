@@ -753,6 +753,13 @@ impl Endpoint {
     self.datagrams_received
   }
 
+  /// Whether this session reads its own socket ([`Endpoint::client`], [`Endpoint::server`]), rather than a queue its
+  /// shard's demultiplexer fills: so a receive that finds nothing proves the socket held nothing then, where a
+  /// demultiplexed session's empty queue proves only that the demultiplexer had handed it nothing yet.
+  pub fn reads_its_own_socket(&self) -> bool {
+    matches!(self.link, Link::Own(_))
+  }
+
   /// The peer's end-entity certificate, once the handshake authenticated it — how a server that
   /// accepted a session on a shared socket tells which peer dialed it.
   pub fn peer_certificate(&self) -> Option<CertificateDer<'static>> {

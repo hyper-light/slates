@@ -32,14 +32,14 @@
 //! never came.
 //!
 //! **A silence is judged in the shard's own time (A-315).** A batch quiet for its stall budget is given up only once
-//! the lane has read what came: a driving turn of the lane, begun after the lane's shard has waited in its driver twice
-//! since the silence was first seen (A-292's receiver rule), must have left the session's receive queue empty
-//! ([`left_empty`]). A shard waits there only when nothing is ready to run, so by then every datagram that reached it
-//! before the silence was seen is in the session's queue, and a turn that leaves the queue empty has consumed it and
-//! settled it into the lane. The shard's waits alone are not enough: while another borrower holds the session (the link's discovery page),
-//! the shard waits with the lane's replies unsettled. Before, a forwarder woken by its own timer judged at once: an
-//! origin kept off its CPU past a budget woke with its owner's replies unread in its socket, and its forwarders, run
-//! before the lane's driver, gave those replies' batches up to a live owner.
+//! the lane has read what came: a driving turn of the lane, begun after the silence was first seen, must have read the
+//! session's own socket empty ([`left_empty`]). The record link's sessions read their own sockets, so that turn has
+//! read everything that reached the socket before the silence was seen, and settled it into the lane. Before, a
+//! forwarder woken by its own timer judged at once: an origin kept off its CPU past a budget woke with its owner's
+//! replies unread in its socket, and its forwarders, run before the lane's driver, gave those replies' batches up to a
+//! live owner. The shard's waits in its driver (A-292's receiver rule) prove nothing here: the shard waits while
+//! another borrower (the link's discovery page) holds the session, and a shard busy with other forwards' replies rarely
+//! waits at all.
 //!
 //! A forward still queued counts its lane's progress as its own (a forward begun, a reply taken, bytes of a reply
 //! read), since nothing of it has been sent: before, a backlog longer than a budget gave every forward behind it up and
@@ -201,11 +201,12 @@ struct Lane {
   /// When the lane last moved, on the wall (0: never): a forward begun on its session, a reply taken, or bytes of a
   /// reply read. A forward still queued counts it as its own progress ([`Stall`], A-315).
   progress_ns: u64,
-  /// The lane shard's driver waits ([`receiver_idles`]) at the start of the latest driving turn that left the session's
-  /// receive queue empty ([`left_empty`]; 0: none yet). What a silence is confirmed by
-  /// ([`Stall`]): the lane itself read what came, not only its shard, which may wait while another borrower holds the
-  /// session.
-  drained_idles: u64,
+  /// The driving turns begun on the lane so far: each borrow of its session by its driver, counted as it begins.
+  turns_begun: u64,
+  /// The number ([`Lane::turns_begun`]) of the latest driving turn that read the session's own socket empty
+  /// ([`left_empty`]; 0: none yet). What a silence is confirmed by ([`Stall`]): a turn begun after the silence was seen
+  /// that read the socket empty has read everything that reached it before, and settled it into the lane.
+  drained_turn: u64,
 }
 
 /// Every peer's lane, in the control shard's state.
@@ -344,16 +345,14 @@ enum Look {
 /// Looks at `tickets`; when this forwarder should drive, marks the lane driven by it.
 fn look(peer: HostId, tickets: &[u64]) -> Option<Look> {
   state::with_state(|s| {
-    let receiver_idles = receiver_idles(s.shard);
     let lane = s.forward_lanes.lanes.get_mut(&peer)?;
-    Some(look_in(lane, tickets, receiver_idles))
+    Some(look_in(lane, tickets))
   })
   .flatten()
 }
 
-/// [`look`] within `lane`, its shard having waited `receiver_idles` times in its driver: the queue's view apart from the
-/// shard's state.
-fn look_in(lane: &mut Lane, tickets: &[u64], receiver_idles: u64) -> Look {
+/// [`look`] within `lane`: the queue's view apart from the shard's state.
+fn look_in(lane: &mut Lane, tickets: &[u64]) -> Look {
   let mut own_ns = 0;
   let mut queued = false;
   let mut done = Vec::with_capacity(tickets.len());
@@ -383,8 +382,8 @@ fn look_in(lane: &mut Lane, tickets: &[u64], receiver_idles: u64) -> Look {
     heard: Heard {
       own_ns,
       lane_ns: if queued { lane.progress_ns } else { 0 },
-      receiver_idles,
-      drained_idles: lane.drained_idles,
+      turns_begun: lane.turns_begun,
+      drained_turn: lane.drained_turn,
     },
   }
 }
@@ -398,13 +397,6 @@ pub(crate) fn failover_bound_from(first_send_ns: u64) -> u64 {
   )
 }
 
-/// The waits shard `shard` (the lane's, the control shard) has entered in its driver, each with nothing ready to run
-/// (`slates_rt::registry::Pulse::waits`), read off its registry pulse; 0 where its entry cannot be read, so a silence
-/// there is given up only at its failover bound.
-fn receiver_idles(shard: u16) -> u64 {
-  slates_rt::registry::with_entry(shard, |entry| entry.pulse.waits()).unwrap_or(0)
-}
-
 /// What a batch's stall is judged against at a look ([`Stall::judge`]): two instants on the wall and two counts, each
 /// of which only grows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -415,27 +407,17 @@ struct Heard {
   /// of other forwards' replies are not an open forward's progress (the 298 forwards of 2026-11-07), but a queued
   /// forward has sent nothing, and its lane moving is the only progress it can make.
   lane_ns: u64,
-  /// The waits the lane's shard has entered in its driver with nothing ready to run ([`receiver_idles`]).
-  receiver_idles: u64,
-  /// The same count at the start of the lane's latest driving turn that left its session's receive queue empty
-  /// ([`Lane::drained_idles`]).
-  drained_idles: u64,
+  /// The driving turns begun on the lane so far ([`Lane::turns_begun`]).
+  turns_begun: u64,
+  /// The latest of them that read the session's own socket empty ([`Lane::drained_turn`]).
+  drained_turn: u64,
 }
-
-/// Derived: the lane shard's driver waits after a moment past which a turn of the lane that finds its session with
-/// nothing to read proves everything that reached the shard before then has been read and settled into the lane: the
-/// first wait begins only once every ready task has run, and the second only once what the first's wake delivered has
-/// run too, so the socket's datagrams of before have reached the session's queue, and a drive that then finds the
-/// queue empty has consumed them. The same count and reasoning as A-292's receiver rule
-/// (`slates_bridge_core::durable_bound`): a shard waits in its driver only when nothing is ready to run, and each wait
-/// collects everything readable.
-const DRAINED_AFTER_IDLES: u64 = 2;
 
 /// Why a [`Stall`] gave its batch up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GaveUp {
-  /// Quiet for its stall budget, and a turn of its lane begun after its shard's waits since the quiet was first seen had
-  /// left the session's receive queue empty.
+  /// Quiet for its stall budget, and a turn of its lane begun after the quiet was first seen had read the session's own
+  /// socket empty.
   Silent,
   /// Quiet for its stall budget past its failover bound: given up without waiting for the receiver.
   AtTheBound,
@@ -466,12 +448,13 @@ struct Noted {
 ///   still queued, its lane's progress, the last counted only up to the failover bound. A lane that moves holds a
 ///   queued forward, and a lane that does not move for a stall budget gives it up as before.
 /// - **Confirmed against the receiver.** Quiet for its stall budget before the bound, the batch is given up only once
-///   a driving turn of its lane, begun after its shard has waited in its driver [`DRAINED_AFTER_IDLES`] times since the
-///   quiet was first seen, has left the session's receive queue empty ([`Lane::drained_idles`]), looking again every
-///   [`CONFIRM_LOOK_NS`]. The shard's waits alone do not do: while another borrower holds the session (the link's
-///   discovery page) the shard waits with the lane's replies unsettled, and the first form of this rule, which counted
-///   them alone, gave every waiting batch up so in 2 of 18 CI runs. Progress meanwhile ends the confirmation, and a later
-///   silence starts its own.
+///   a driving turn of its lane, begun after the quiet was first seen, has read the session's own socket empty
+///   ([`Lane::drained_turn`]), looking again every [`CONFIRM_LOOK_NS`]: that turn has read everything that reached the
+///   socket before and settled it into the lane. Its shard's waits in its driver (A-292's receiver rule) were the first
+///   proof tried, and are not one here: while another borrower holds the session (the link's discovery page) the shard
+///   waits with the lane's replies unsettled, which gave every waiting batch up in 2 of 18 CI runs, and a control shard
+///   kept busy by other forwards' replies rarely waits at all, which held a silence its owner never answered past its
+///   test's window in 1 of 6. Progress meanwhile ends the confirmation, and a later silence starts its own.
 /// - **Bounded.** Past the failover bound a quiet batch is given up at once, unconfirmed: a receiver that never waits
 ///   (always busy) cannot hold it past the operator's bound on a failover, and a queued forward behind a lane that keeps
 ///   moving is given up a stall budget after the bound. A batch whose own forwards progress is never given up: a long
@@ -484,7 +467,7 @@ struct Stall {
   stall_ns: u64,
   /// The failover bound on the wall, from the forward's first send.
   bound_ns: u64,
-  /// While a silence awaits its receiver: when that silence's quiet began, and the receiver's waits when the silence
+  /// While a silence awaits its receiver: when that silence's quiet began, and the lane's turns begun when the silence
   /// was first seen. A silence that began later (progress came between two looks) is a new one, confirmed afresh.
   confirming: Option<(u64, u64)>,
   /// Whether its lane's progress has already held it past its own budget ([`Noted::held_by_lane`]).
@@ -523,12 +506,12 @@ impl Stall {
     }
     match self.confirming {
       Some((quiet_since, seen)) if quiet_since == since => {
-        if heard.drained_idles >= seen.saturating_add(DRAINED_AFTER_IDLES) {
+        if heard.drained_turn > seen {
           return (Verdict::GiveUp(GaveUp::Silent), noted);
         }
       }
       _ => {
-        self.confirming = Some((since, heard.receiver_idles));
+        self.confirming = Some((since, heard.turns_begun));
         noted.awaited_receiver = true;
       }
     }
@@ -814,7 +797,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   else {
     return Turn::SessionOut;
   };
-  let began_at_idles = state::with_state(|s| receiver_idles(s.shard)).unwrap_or(0);
+  let this_turn = begin_turn(peer);
   let session = endpoint.connection_id().ok();
   apply_injected_deafness(peer, &mut endpoint);
   let mut any_reply = settle(peer, &mut endpoint, session);
@@ -827,8 +810,11 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   if progressed {
     mark_progress(peer, &mut endpoint, session);
   }
-  if drained {
-    mark_drained(peer, began_at_idles);
+  // Only a session that reads its own socket proves the socket empty by an empty read; the record link's sessions do
+  // (`Endpoint::client`). One behind a demultiplexer could read an empty queue while its socket held more, so its
+  // silences wait for the failover bound.
+  if drained && endpoint.reads_its_own_socket() {
+    mark_drained(peer, this_turn);
   }
   crate::fleet::return_sessions(vec![(peer, endpoint)]);
   match driven {
@@ -838,13 +824,13 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   }
 }
 
-/// Whether a turn's drive left the session's receive queue empty ([`Stall`]'s proof that the lane read what came), and
-/// whether finding out failed the session. A drive cut short by a newly queued forward, or failed, proves nothing. One
-/// that took no datagram (`Endpoint::datagrams_received` unchanged since `received`) found the queue empty; one that
-/// took a datagram is followed by one receive that does not wait, and the queue was empty if that took none. Stream
-/// bytes would not tell: a datagram of acknowledgements alone, or of bytes past a gap, consumes none. And a session
-/// busy with other forwards' replies is still found empty between them, so a silent forward on it is confirmed (the
-/// 298 forwards of 2026-11-07), while a backlog is found empty only once it has been read.
+/// Whether a turn's drive left the session's socket with nothing to read ([`Stall`]'s proof that the lane read what
+/// came), and whether finding out failed the session. A drive cut short by a newly queued forward, or failed, proves
+/// nothing. One that took no datagram (`Endpoint::datagrams_received` unchanged since `received`) found the socket
+/// empty; one that took a datagram is followed by one receive that does not wait, and the socket was empty if that took
+/// none. Stream bytes would not tell: a datagram of acknowledgements alone, or of bytes past a gap, consumes none. And a
+/// session busy with other forwards' replies is still found empty between them, so a silent forward on it is confirmed
+/// (the 298 forwards of 2026-11-07), while a backlog is found empty only once it has been read.
 async fn left_empty(
   endpoint: &mut Endpoint,
   driven: &Result<Option<Result<Ended, EndpointError>>, slates_rt::RtError>,
@@ -863,12 +849,23 @@ async fn left_empty(
   }
 }
 
-/// Records that `peer`'s lane drove its session through a turn begun at `began_at_idles` of its shard's driver waits and
-/// read nothing ([`Lane::drained_idles`]).
-fn mark_drained(peer: HostId, began_at_idles: u64) {
+/// Counts a driving turn of `peer`'s lane as begun ([`Lane::turns_begun`]): its number, 0 when the lane is gone.
+fn begin_turn(peer: HostId) -> u64 {
+  state::with_state(|s| {
+    s.forward_lanes.lanes.get_mut(&peer).map(|lane| {
+      lane.turns_begun = lane.turns_begun.saturating_add(1);
+      lane.turns_begun
+    })
+  })
+  .flatten()
+  .unwrap_or(0)
+}
+
+/// Records that `peer`'s lane read its session's own socket empty in its turn numbered `turn` ([`Lane::drained_turn`]).
+fn mark_drained(peer: HostId, turn: u64) {
   let _ = state::with_state(|s| {
     if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
-      lane.drained_idles = lane.drained_idles.max(began_at_idles);
+      lane.drained_turn = lane.drained_turn.max(turn);
     }
   });
 }
@@ -1488,8 +1485,8 @@ mod stall_tests {
   use slates_transport::endpoint::{CONNECTION_ID_BYTES, ConnectionId};
 
   use super::{
-    Answered, CONFIRM_LOOK_NS, DRAINED_AFTER_IDLES, ForwardLanes, GaveUp, Heard, Look, Place,
-    Stall, Verdict, answer_with, begin_queued_with, look_in,
+    Answered, CONFIRM_LOOK_NS, ForwardLanes, GaveUp, Heard, Look, Place, Stall, Verdict,
+    answer_with, begin_queued_with, look_in,
   };
 
   /// Shape: a batch's stall budget in these tests: one liveness budget, the path's tail near zero (loopback).
@@ -1505,30 +1502,29 @@ mod stall_tests {
   /// Shape: a lane bound no test reaches.
   const LANE_BOUND: usize = 1 << 16;
 
-  /// What a batch with no progress since its start hears, its receiver having waited `idles` times and its lane having
-  /// last found its session with nothing to read in a turn begun at `drained` of them.
-  fn heard(idles: u64, drained: u64) -> Heard {
+  /// What a batch with no progress since its start hears, its lane having begun `turns` driving turns, the latest that
+  /// read the session's socket empty numbered `drained`.
+  fn heard(turns: u64, drained: u64) -> Heard {
     Heard {
       own_ns: 0,
       lane_ns: 0,
-      receiver_idles: idles,
-      drained_idles: drained,
+      turns_begun: turns,
+      drained_turn: drained,
     }
   }
 
-  /// [`heard`] with the lane drained as late as it can be: in a turn begun at the receiver's latest wait.
-  fn idle(idles: u64) -> Heard {
-    heard(idles, idles)
+  /// [`heard`] with the lane's latest turn the one that read the socket empty.
+  fn idle(turns: u64) -> Heard {
+    heard(turns, turns)
   }
 
-  /// A-315, §4.8 "Lookup": do keep a batch silent from its start and judge it at its budget; then let its lane find its
-  /// session with nothing to read in a turn begun after one more wait of its shard, then let its shard wait twice more
-  /// while its lane does not drive (the session lent to another borrower), then let the lane drain in a turn begun after
-  /// those waits. Expect it kept until that last drained turn, and given up silent at the look that sees it. Before A-315
-  /// it was given up at the first look past its budget, whatever its lane had read: an origin held off its CPU past a
-  /// budget gave up batches whose replies sat unread.
+  /// A-315, §4.8 "Lookup": do keep a batch silent from its start and judge it at its budget; then let its lane begin two
+  /// turns that each read something, then none (its session lent to another borrower), then one that reads its socket
+  /// empty. Expect it kept until that last turn, and given up silent at the look that sees it. Before A-315 it was given
+  /// up at the first look past its budget, whatever its lane had read: an origin held off its CPU past a budget gave up
+  /// batches whose replies sat unread.
   #[test]
-  fn a_silence_is_given_up_only_once_its_lane_has_drained_after_two_waits_of_its_shard() {
+  fn a_silence_is_given_up_only_once_a_turn_begun_after_it_reads_the_socket_empty() {
     let mut stall = Stall::begin(0, STALL_NS, BOUND_NS);
     assert_eq!(
       stall.judge(idle(5), STALL_NS / 2).0,
@@ -1538,19 +1534,17 @@ mod stall_tests {
     assert_eq!(verdict, Verdict::LookBy(STALL_NS + CONFIRM_LOOK_NS));
     assert!(noted.awaited_receiver, "the silence waits for its receiver");
     assert_eq!(
-      stall.judge(heard(7, 6), STALL_NS + TENTH_NS).0,
+      stall.judge(heard(7, 5), STALL_NS + TENTH_NS).0,
       Verdict::LookBy(STALL_NS + TENTH_NS + CONFIRM_LOOK_NS),
-      "a lane drained after only one wait of its shard has not read all that came"
+      "turns that read something, and the drain of a turn begun before the silence, prove nothing"
     );
     assert_eq!(
-      stall.judge(heard(9, 6), STALL_NS + 2 * TENTH_NS).0,
+      stall.judge(heard(7, 5), STALL_NS + 2 * TENTH_NS).0,
       Verdict::LookBy(STALL_NS + 2 * TENTH_NS + CONFIRM_LOOK_NS),
-      "the shard's waits alone, its lane not driving, confirm nothing"
+      "a lane that does not drive (its session lent elsewhere) confirms nothing however long it waits"
     );
     assert_eq!(
-      stall
-        .judge(heard(9, 5 + DRAINED_AFTER_IDLES), STALL_NS + 3 * TENTH_NS)
-        .0,
+      stall.judge(heard(8, 8), STALL_NS + 3 * TENTH_NS).0,
       Verdict::GiveUp(GaveUp::Silent)
     );
   }
@@ -1592,8 +1586,8 @@ mod stall_tests {
       stall
         .judge(
           Heard {
-            receiver_idles: 9 + DRAINED_AFTER_IDLES,
-            drained_idles: 9 + DRAINED_AFTER_IDLES,
+            turns_begun: 10,
+            drained_turn: 10,
             ..progressed
           },
           late + TENTH_NS
@@ -1618,8 +1612,8 @@ mod stall_tests {
       let heard = Heard {
         own_ns: 0,
         lane_ns: now - TENTH_NS,
-        receiver_idles: 0,
-        drained_idles: 0,
+        turns_begun: 0,
+        drained_turn: 0,
       };
       let (verdict, noted) = stall.judge(heard, now);
       if noted.held_by_lane {
@@ -1635,8 +1629,8 @@ mod stall_tests {
     let after = Heard {
       own_ns: 0,
       lane_ns: BOUND_NS + STALL_NS,
-      receiver_idles: 0,
-      drained_idles: 0,
+      turns_begun: 0,
+      drained_turn: 0,
     };
     assert_eq!(
       stall.judge(after, BOUND_NS + STALL_NS - 1).0,
@@ -1689,8 +1683,8 @@ mod stall_tests {
       let heard = Heard {
         own_ns: now,
         lane_ns: 0,
-        receiver_idles: 0,
-        drained_idles: 0,
+        turns_begun: 0,
+        drained_turn: 0,
       };
       assert_eq!(stall.judge(heard, now).0, Verdict::LookBy(now + STALL_NS));
     }
@@ -1753,12 +1747,12 @@ mod stall_tests {
         );
       }
       open = begin_at(&mut lanes, 1, now, &mut exchanges);
-      // The receiver waits in its driver twice each half budget, and the lane's driver finds its session with nothing to
-      // read between replies, so a silence would be confirmed within a half budget.
-      let idles = 2 * now / (STALL_NS / 2);
+      // The lane's driver reads its session's socket empty between replies, so a silence would be confirmed within a
+      // half budget.
       let lane = lanes.lanes.get_mut(&PEER).unwrap();
-      lane.drained_idles = idles;
-      let Look::Waiting { heard, .. } = look_in(lane, &q_tickets, idles) else {
+      lane.turns_begun += 1;
+      lane.drained_turn = lane.turns_begun;
+      let Look::Waiting { heard, .. } = look_in(lane, &q_tickets) else {
         panic!("Q is not done");
       };
       if heard.lane_ns == 0 {
@@ -1777,7 +1771,7 @@ mod stall_tests {
     );
     // Begun, Q is judged by its own progress: the lane answering others no longer holds it.
     let lane = lanes.lanes.get_mut(&PEER).unwrap();
-    let Look::Waiting { heard, .. } = look_in(lane, &q_tickets, 0) else {
+    let Look::Waiting { heard, .. } = look_in(lane, &q_tickets) else {
       panic!("Q is open");
     };
     assert_eq!(heard.lane_ns, 0, "an open forward hears no lane progress");
@@ -1788,13 +1782,14 @@ mod stall_tests {
     );
   }
 
-  /// One look of a generated history: the clock's advance, what the batch heard then, and the receiver's new waits.
+  /// One look of a generated history: the clock's advance, what the batch heard then, the lane's turns begun since the
+  /// last look, and whether the latest of them read the session's socket empty.
   #[derive(Clone, Copy, Debug)]
   struct Step {
     advance_ns: u64,
     own_progress: bool,
     lane_progress: bool,
-    waits: u64,
+    turns: u64,
     drained: bool,
   }
 
@@ -1807,11 +1802,11 @@ mod stall_tests {
       prop::bool::weighted(0.5),
     )
       .prop_map(
-        |(advance_ns, own_progress, lane_progress, waits, drained)| Step {
+        |(advance_ns, own_progress, lane_progress, turns, drained)| Step {
           advance_ns,
           own_progress,
           lane_progress,
-          waits,
+          turns,
           drained,
         },
       )
@@ -1820,8 +1815,8 @@ mod stall_tests {
   /// The rule A-315 states, read off a whole history of looks (`looks`, each its instant and what it heard), for the
   /// last of them: the batch is quiet from the latest of its start, its own progress and its lane's (the lane's counted
   /// up to the bound); quiet for less than a budget it is kept; quiet past the bound it is given up; otherwise it is
-  /// given up silent only when its lane has drained in a turn begun after its receiver waited twice since the first look
-  /// of this same silence.
+  /// given up silent only when a turn of its lane begun after the first look of this same silence has read the session's
+  /// socket empty.
   fn model(looks: &[(u64, Heard)], stall_ns: u64, bound_ns: u64) -> Option<GaveUp> {
     let since = |heard: &Heard| heard.own_ns.max(heard.lane_ns.min(bound_ns));
     let (now, heard) = *looks.last()?;
@@ -1839,17 +1834,16 @@ mod stall_tests {
         since(heard) == quiet_since && *at >= quiet_since.saturating_add(stall_ns)
       })
       .last()?;
-    (heard.drained_idles >= first_of_silence.1.receiver_idles + DRAINED_AFTER_IDLES)
-      .then_some(GaveUp::Silent)
+    (heard.drained_turn > first_of_silence.1.turns_begun).then_some(GaveUp::Silent)
   }
 
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
     /// A-315, against the rule read off the whole history: do run generated histories of looks at one batch (the clock
-    /// advancing, its own progress and its lane's coming now and then, its receiver waiting or not, its lane draining
-    /// or not), judging each until one gives it up. Expect every judgment to equal the rule's: kept, given up silent,
-    /// or given up at the bound.
+    /// advancing, its own progress and its lane's coming now and then, its lane's turns begun and reading its socket
+    /// empty or not), judging each until one gives it up. Expect every judgment to equal the rule's: kept, given up
+    /// silent, or given up at the bound.
     #[test]
     fn a_stall_judges_every_history_as_the_rule_reads_it(
       steps in proptest::collection::vec(step(), 1..96),
@@ -1868,9 +1862,9 @@ mod stall_tests {
         if step.lane_progress {
           heard.lane_ns = now;
         }
-        heard.receiver_idles += step.waits;
-        if step.drained {
-          heard.drained_idles = heard.receiver_idles;
+        heard.turns_begun += step.turns;
+        if step.drained && step.turns > 0 {
+          heard.drained_turn = heard.turns_begun;
         }
         looks.push((now, heard));
         let (verdict, _) = stall.judge(heard, now);
