@@ -13,7 +13,11 @@
 //! (`merge_service::inputs_of`) and a holder and a successor judge them afresh (§4.16 "Apply on holders"). Then each
 //! [`Applied`] effect: content by reference to the increment's post-state (the mapped ops of a splice, the declared ops
 //! of a create, the source path of a rename), so no file's bytes are recorded twice; every other dimension by value.
-//! Then the green's head identity at this version where one was computed, and a digest of everything before it.
+//! Then the completion key of the submit that made the version, where one did, with the work it was submitted from when
+//! its client was on another node (A-255: its merge record carries both, so a green's successor answers the submit's
+//! resend after a takeover and keeps the work's route only while it holds such a completion, A-288; and a restarted owner
+//! rebuilds that record byte for byte from this entry), the green's head identity at this version where one was
+//! computed, and a digest of everything before it.
 //!
 //! **The encoding** follows the origin's and the checkpoint's: magic and version, little-endian, every count checked
 //! against the bytes that remain before anything is allocated, any malformation refused typed ([`DocDecodeError`]).
@@ -26,19 +30,26 @@ use crate::special::SpecialNode;
 /// Format: the chain entry encoding's magic, "GCHN" little-endian, so bytes of another kind (a bare increment written by
 /// an earlier layout) are refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
-/// Format: the chain entry encoding's version; a decoder refuses any other.
-const VERSION: u32 = 1;
+/// Format: the chain entry encoding's version; a decoder refuses any other. 2 since A-255 added the completion key, 3
+/// since A-288 added the submitting work beside it.
+const VERSION: u32 = 3;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;
-/// Format: the byte that marks a head identity present.
+/// Format: the byte that marks a head identity, a completion key or a submitting work present.
 const PRESENT: u8 = 1;
-/// Format: the byte that marks a head identity absent.
+/// Format: the byte that marks a head identity, a completion key or a submitting work absent.
 const ABSENT: u8 = 0;
 /// Format: an op's fixed record, as [`crate::ops_doc::OpsDoc::encode`] writes it.
 const OP_BYTES: usize = 28;
+/// Format: a work volume's id.
+const WORK_BYTES: usize = 16;
+/// Format: a completion key and its work: the origin host, the client, the sequence, and the submitting work's marker
+/// and id.
+const COMPLETION_BYTES: usize = 8 + 4 + 4 + 1 + WORK_BYTES;
 /// Format: the fixed bytes of an entry around its parts: magic, version, the increment's length, the effect count, the
-/// identity's marker and hash, and the digest.
-const ENTRY_OVERHEAD_BYTES: usize = 4 + 4 + 4 + 4 + 1 + HASH_BYTES + HASH_BYTES;
+/// completion's marker and key, the identity's marker and hash, and the digest.
+const ENTRY_OVERHEAD_BYTES: usize =
+  4 + 4 + 4 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + HASH_BYTES;
 /// Format: an effect's largest fixed part: its tag and three length prefixes or counts.
 const EFFECT_OVERHEAD_BYTES: usize = 1 + 3 * 4;
 /// Format: the smallest an effect can encode to: its tag and one length prefix.
@@ -96,8 +107,28 @@ pub struct ChainEntry {
   pub increment: Increment,
   /// What its verdict resolved it to.
   pub applied: Vec<Applied>,
+  /// The completion key of the submit that made this version, where a request made it (module docs).
+  pub completion: Option<Completion>,
   /// The green's head identity at this version, where one was computed.
   pub identity: Option<[u8; 32]>,
+}
+
+/// A submit's completion key (§4.9 RIFL): the host its client is on, the client and the request's sequence, with the
+/// work the submit was made from when that host was not the work's owner. Opaque here: the merge plane carries it so the
+/// request's completion moves with the green it changed (RIFL §3, A-255), and the green's successor keeps the work's route
+/// only while it holds a completion a resend can reach only through that route (A-288).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completion {
+  /// The client's host (`HostId.0`).
+  pub origin: u64,
+  /// The client.
+  pub client: u32,
+  /// The request's sequence within the client.
+  pub sequence: u32,
+  /// The work the submit was made from (its volume id), when the client was on another node than the work's owner: not
+  /// part of the key, the route a resend under it takes. `None` for a client of the owner's own node, whose resend the
+  /// owner's own records answer.
+  pub work: Option<[u8; WORK_BYTES]>,
 }
 
 /// Format: an [`Applied`] variant's tag.
@@ -170,6 +201,7 @@ pub fn encode(
   increment_bytes: &[u8],
   increment: &Increment,
   applied: &[Applied],
+  completion: Option<Completion>,
   identity: Option<[u8; 32]>,
 ) -> Vec<u8> {
   let mut out = Vec::with_capacity(increment_bytes.len().saturating_add(ENTRY_OVERHEAD_BYTES));
@@ -179,6 +211,22 @@ pub fn encode(
   put_count(&mut out, applied.len());
   for effect in applied {
     put_applied(&mut out, increment, effect);
+  }
+  match completion {
+    Some(key) => {
+      out.push(PRESENT);
+      out.extend_from_slice(&key.origin.to_le_bytes());
+      out.extend_from_slice(&key.client.to_le_bytes());
+      out.extend_from_slice(&key.sequence.to_le_bytes());
+      match key.work {
+        Some(work) => {
+          out.push(PRESENT);
+          out.extend_from_slice(&work);
+        }
+        None => out.push(ABSENT),
+      }
+    }
+    None => out.push(ABSENT),
   }
   match identity {
     Some(hash) => {
@@ -211,6 +259,29 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
   for _ in 0..count {
     applied.push(take_applied(&mut reader, &increment)?);
   }
+  let completion = match reader.u8()? {
+    PRESENT => {
+      let origin = reader.u64()?;
+      let client = reader.u32()?;
+      let sequence = reader.u32()?;
+      let work = match reader.u8()? {
+        PRESENT => Some(
+          <[u8; WORK_BYTES]>::try_from(reader.bytes(WORK_BYTES)?)
+            .map_err(|_| DocDecodeError::Truncated)?,
+        ),
+        ABSENT => None,
+        _ => return Err(DocDecodeError::BadKind),
+      };
+      Some(Completion {
+        origin,
+        client,
+        sequence,
+        work,
+      })
+    }
+    ABSENT => None,
+    _ => return Err(DocDecodeError::BadKind),
+  };
   let identity = match reader.u8()? {
     PRESENT => {
       let mut hash = [0u8; HASH_BYTES];
@@ -226,6 +297,7 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
   Ok(ChainEntry {
     increment,
     applied,
+    completion,
     identity,
   })
 }

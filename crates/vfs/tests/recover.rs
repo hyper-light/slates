@@ -2245,13 +2245,24 @@ fn streamed_shard(store: &mut Store) -> StreamedShard {
       reply: b"r4".to_vec(),
     },
   ];
-  (volumes, b"held replica image bytes".to_vec(), replies)
+  // Two held pieces (A-270), out of key order, so the streamed encoder's sort is compared too.
+  let held = vec![
+    slates_vfs::recover::HeldPiece {
+      key: [7; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"a later held piece".to_vec(),
+    },
+    slates_vfs::recover::HeldPiece {
+      key: [2; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"an earlier held piece".to_vec(),
+    },
+  ];
+  (volumes, held, replies)
 }
 
-/// A streamed shard's volumes by key, its held bytes and its replies.
+/// A streamed shard's volumes by key, its held pieces and its replies.
 type StreamedShard = (
   Vec<([u8; 16], Volume)>,
-  Vec<u8>,
+  Vec<slates_vfs::recover::HeldPiece>,
   Vec<slates_vfs::recover::HeldReply>,
 );
 
@@ -2267,7 +2278,7 @@ fn stream_into(
   slots: &mut Vec<u8>,
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -2294,7 +2305,7 @@ fn stream_into(
 fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &[slates_vfs::recover::HeldPiece],
   (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
@@ -2395,7 +2406,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &mut slots,
     &store,
     &volumes,
-    &held,
+    &mut held.clone(),
     (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
@@ -2437,7 +2448,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &mut slots,
     &store,
     &small_sorted,
-    &[],
+    &mut Vec::new(),
     (
       &mut Vec::new(),
       &mut Vec::new(),
@@ -2558,7 +2569,7 @@ fn a_writes_accounting_equals_a_recount_after_every_step() {
 
 /// A-262. Do: create a file (the volume marks it `ARCHIVE`, as NTFS does), set `HIDDEN | SYSTEM` on a second and
 /// `READONLY | HIDDEN` on a directory, ask for a third file's `READONLY` (dropped: a file's read-only state is its
-/// mode), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
+/// mode), and `HIDDEN | DIRECTORY` on a symlink (a Windows directory link, A-275), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
 /// carries each inode's bits at Windows' values, and the rebuilt volume reports the same bits.
 #[test]
 fn windows_attributes_survive_an_image_and_a_rebuild() {
@@ -2575,6 +2586,7 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
     .create_file_no(&mut store, root, "readonly", 0o644)
     .unwrap();
   let dir = vol.mkdir_no(&mut store, root, "dir", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "link", "dir").unwrap();
   let set = |bits: u32, kind| WindowsAttributes::kept(bits, kind);
   let file = slates_vfs::inode::Kind::File;
   vol
@@ -2590,11 +2602,19 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
       set(0x1 | 0x2 | 0x10, slates_vfs::inode::Kind::Dir),
     )
     .unwrap();
+  vol
+    .set_windows_attributes(
+      &mut store,
+      link,
+      set(0x2 | 0x10 | 0x400, slates_vfs::inode::Kind::Symlink),
+    )
+    .unwrap();
   let expected = [
     (archived, 0x20),
     (hidden, 0x2 | 0x4),
     (readonly, 0x20),
     (dir, 0x1 | 0x2),
+    (link, 0x2 | 0x10),
     (root, 0),
   ];
   let image = vol.to_image(&store, None).unwrap();

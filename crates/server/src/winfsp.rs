@@ -92,8 +92,9 @@ const BARRIER_REFUSED: &str = "winfsp.barrier_refused";
 const REPLY_UNDELIVERED: &str = "winfsp.reply_undelivered";
 /// Counter: flush replies held until their live-shipped volume was durable (A-200).
 const LIVE_FLUSH_HELD: &str = "winfsp.live_flush_held";
-/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait passed, the volume was destroyed or its
-/// owner superseded, or the mount already held its bound of them.
+/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait gave up (a window with nothing heard, or
+/// its total bound; `slates_bridge_core::durable_bound`), the volume was destroyed or its owner superseded, or the mount
+/// already held its bound of them.
 const LIVE_FLUSH_REFUSED: &str = "winfsp.live_flush_refused";
 /// Format: see [`MOUNT_REFUSED`] — a mount's thread ended without being asked (its file system is gone).
 const MOUNT_LOST: &str = "winfsp.mount_lost";
@@ -218,11 +219,14 @@ impl Drop for OwnVolumeRecord {
   }
 }
 
-/// A flush's reply held for durability (A-200): the reply, the log position it waits for and when it gives up.
+/// A flush's reply held for durability (A-200): the reply, the log position it waits for, when it was held, and its wait.
 struct HeldFlush {
   served: slates_bridge_winfsp::host::Served,
   target: u64,
-  deadline_ns: u64,
+  held_at_ns: u64,
+  /// When it gives up: a window with nothing heard on the volume's durability path, or its total bound
+  /// (`slates_bridge_core::durable_bound`, the rule every transport's held durable reply is judged by).
+  bound: slates_bridge_core::durable_bound::DurableBound,
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -1399,8 +1403,9 @@ fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
 }
 
 /// Answers each held flush of `mount` that is settled: as served once its volume is durable at its position,
-/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has passed or it never will be (destroyed, superseded). The rest stay
-/// held, the mount's task parked on the volume: how long until the soonest gives up, if one is held.
+/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has given up (`slates_bridge_core::durable_bound`) or it never will be
+/// (destroyed, superseded). The rest stay held, the mount's task parked on the volume: how long until the soonest's open
+/// window ends, if one is held, when its wait is judged again.
 fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
   let now = futures::now_ns();
   let mut kept = VecDeque::new();
@@ -1409,7 +1414,23 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
     let refuse = match settled {
       crate::live_ship::Durability::Durable => false,
       crate::live_ship::Durability::Never => true,
-      crate::live_ship::Durability::Pending if now >= held.deadline_ns => true,
+      crate::live_ship::Durability::Pending
+        if let Some(why) =
+          crate::live_ship::judge_durable_bound(s, mount.volume, &mut held.bound, now) =>
+      {
+        // What durability still lacked when the wait gave up: logged, since the error tells the application its data
+        // may be lost (as the FUSE `fsync`'s, `crate::fuse`).
+        slates_machine::log_line!(
+          "slates-server: a held WinFsp flush gave up after {} ms and {} windows of {} ms, {} (shard {}): {}",
+          now.saturating_sub(held.held_at_ns) / crate::live_ship::NS_PER_MS,
+          held.bound.windows(),
+          crate::live_ship::durable_wait_ns() / crate::live_ship::NS_PER_MS,
+          why.named(),
+          s.shard,
+          crate::live_ship::durability_report(s, mount.volume, held.target)
+        );
+        true
+      }
       crate::live_ship::Durability::Pending => {
         kept.push_back(held);
         continue;
@@ -1427,7 +1448,7 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
   mount
     .held
     .iter()
-    .map(|held| held.deadline_ns.saturating_sub(now))
+    .map(|held| held.bound.next_look_ns().saturating_sub(now))
     .min()
 }
 
@@ -1458,10 +1479,12 @@ fn answer(
     && let Some(target) = crate::live_ship::durable_target(s, mount.volume)
   {
     if mount.held.len() < crate::live_ship::reply_hold_bound(s) {
+      let now = futures::now_ns();
       mount.held.push_back(HeldFlush {
         served,
         target,
-        deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+        held_at_ns: now,
+        bound: crate::live_ship::begin_durable_bound(s, mount.volume, now),
       });
       s.count(LIVE_FLUSH_HELD, 1);
       return;

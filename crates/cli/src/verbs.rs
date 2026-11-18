@@ -2,17 +2,14 @@
 
 use std::ffi::{OsStr, OsString};
 
+use slates_api::{Instance, Issuer};
 use slates_client::{
   AttachRequest, AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport,
-  Deadlines, Digest, Established, GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal,
-  Rebased, Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId,
-  VolumeSummary,
+  Digest, Established, GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal, Rebased,
+  Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId, VolumeSummary,
 };
-use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_ipc::delivery::{Delivery, Output};
 use slates_ipc::rendezvous::ENV_ENDPOINT;
-use slates_server::daemon::LIVENESS_BUDGET_NS;
-use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
 use crate::args::{
@@ -101,9 +98,11 @@ fn emit_recovery(
   json: bool,
 ) -> Result<(), Failure> {
   use slates_ipc::protocol::{ReplyBody, RequestBody};
-  let proof = match crate::recovery_key::load()? {
+  let proof = match slates_api::role::recovery_key()? {
     Some(key) => key.proof(&plan),
-    None => slates_server::recovery_proof(&issuer_secret()?, &plan),
+    None => issuer()?
+      .recovery_proof(&plan)
+      .map_err(|e| failure_of_api(e, "recover"))?,
   };
   let reply = client
     .call(&RequestBody::Recover {
@@ -163,7 +162,7 @@ fn export_verb(
         .to_owned(),
     ));
   };
-  let path = crate::mount::export_path(&report.name, (attachment.attachment, token));
+  let path = slates_api::mount::export_path(&report.name, (attachment.attachment, token));
   // The port the export is served on, beside the path: an NFS volume made from it (a Docker `type=nfs` volume, a
   // PersistentVolume) names both (A-73). `None` only where the daemon serves no NFS (Windows mounts through WinFsp).
   if json {
@@ -180,194 +179,96 @@ fn export_verb(
   Ok(())
 }
 
-/// `mount` over the loopback NFS bridge (macOS and the BSDs; §4.6): the mount's own attachment and capability,
-/// then `mount_nfs` with the capability in the export path — no privilege, no kernel extension, no Apple
-/// entitlement.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// `mount` (§4.6): the volume at `path` through the platform's own mechanism — the loopback NFS bridge with the
+/// capability in `mount(2)`'s arguments on macOS, FUSE through the daemon's `fusermount3` on Linux, a WinFsp drive on
+/// Windows — by the library's one mount (`slates_api::Instance::mount`), which an embedding host calls too. The client
+/// is the instance's for the one verb.
 fn mount_verb(
-  client: &mut Client,
+  client: Client,
   instance: &str,
   volume: VolumeId,
   path: &str,
   (read_only, subtree, shared): (bool, Option<&str>, bool),
 ) -> Result<(), Failure> {
-  // A container runtime reaches a macOS host mount through Docker Desktop's file sharing, as the mounting
-  // user (the runtime profile's identity rule), so nothing need be shared with other local users.
-  if shared {
-    return Err(Failure::Refused(
-      "--shared: a macOS host mount reaches a container through Docker Desktop's file sharing as the mounting \
-       user; --shared is the Linux FUSE mount's allow_other"
-        .to_owned(),
-    ));
-  }
-  // The mount point as the kernel records it (a read, never a write), as on Linux: the daemon finds the mount it binds
-  // and the mounts it keeps across a restart in the kernel's table by exactly this path (A-227).
-  let real = std::fs::canonicalize(path)
-    .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
-  let real = real.to_string_lossy().into_owned();
-  let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
-  // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
-  // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
-  // (D-16); `--read-only` takes none and gets a read-only capability.
-  let intent = if read_only {
-    Intent::Read
-  } else {
-    Intent::Write
+  let mut instance = Instance::from_client(instance, client);
+  let options = slates_api::MountOptions {
+    read_only,
+    subtree: subtree.map(str::to_owned),
+    shared,
   };
-  let attachment = match subtree {
-    Some(subtree) => client.attach_scoped_mount(volume, intent, subtree),
-    None => client.attach_mount(volume, intent),
-  }
-  .map_err(|e| failure_of(e, instance))?;
-  let Some(token) = attachment.token else {
-    return Err(Failure::Refused(
-      "the daemon issued no mount capability for this attachment; the volume cannot be mounted"
-        .to_owned(),
-    ));
-  };
-  let mounted = crate::mount::establish(&report, (attachment.attachment, token), &real, read_only)?;
-  // The established mount point is reported back (§4.4 `Binding → Bound`), so the record names it
-  // and `status` shows it; a bind the daemon refuses takes the mount down again rather than leave a
-  // mount whose record says it is bound nowhere.
-  if let Err(e) = client.bind_mount(attachment.attachment, &mounted) {
-    let unmounted = crate::mount::unmount(&mounted);
-    let bind = failure_of(e, instance);
-    return Err(match unmounted {
-      Ok(()) => bind,
-      Err(unmount) => Failure::Failed(format!(
-        "{}; and unmounting it again: {}",
-        failure_text(&bind),
-        failure_text(&unmount)
-      )),
-    });
-  }
-  slates_machine::out_line!("mounted: {mounted}");
+  let mounted = instance
+    .mount(volume, path, &options)
+    .map_err(|e| failure_of_api(e, instance.name()))?;
+  slates_machine::out_line!("mounted: {}", mounted.path);
   Ok(())
 }
 
-/// `mount` on Linux (§4.6 "Linux"; AUD-29-64): the daemon mounts the volume through the OS's `fusermount3`
-/// at the path — resolved here, in the client, to the real path the kernel records (a read, never a write) —
-/// and serves it; the attachment is the mount's, ending with `slates unmount` (`fusermount3 -u`), a
-/// `detach`, or the volume's destroy. A read-only mount takes no write lease and is served read-only.
-#[cfg(target_os = "linux")]
-fn mount_verb(
-  client: &mut Client,
-  instance: &str,
-  volume: VolumeId,
-  path: &str,
-  (read_only, subtree, shared): (bool, Option<&str>, bool),
-) -> Result<(), Failure> {
-  let real = std::fs::canonicalize(path)
-    .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
-  let real = real.to_string_lossy().into_owned();
-  let intent = if read_only {
-    Intent::Read
-  } else {
-    Intent::Write
-  };
-  // `--subtree` presents one directory of the volume, held to it by the daemon on every request (AUD-29-76).
-  // `--shared` lets other local users' processes (a container runtime's) reach the mount (`allow_other`).
-  let attachment = match (subtree, shared) {
-    (subtree, true) => client.attach_shared_fuse(volume, intent, &real, subtree),
-    (Some(subtree), false) => client.attach_scoped_fuse(volume, intent, &real, subtree),
-    (None, false) => client.attach_fuse(volume, intent, &real),
-  }
-  .map_err(|e| failure_of(e, instance))?;
-  slates_machine::out_line!("mounted: {}", attachment.path.unwrap_or(real));
-  Ok(())
-}
-
-/// `mount` on Windows (§4.6 "Windows"): the daemon mounts the volume through WinFsp at the drive letter `path` (`S:`)
-/// and serves it; the attachment is the mount's, ending with `slates unmount S:` (a `detach` of it), the volume's
-/// destroy, or the daemon's process. A read-only mount takes no write lease and is a read-only WinFsp volume.
-#[cfg(windows)]
-fn mount_verb(
-  client: &mut Client,
-  instance: &str,
-  volume: VolumeId,
-  path: &str,
-  (read_only, subtree, shared): (bool, Option<&str>, bool),
-) -> Result<(), Failure> {
-  if subtree.is_some() || shared {
-    return Err(Failure::Refused(
-      "--subtree and --shared are the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
-        .to_owned(),
-    ));
-  }
-  let intent = if read_only {
-    Intent::Read
-  } else {
-    Intent::Write
-  };
-  let attachment = client
-    .attach_winfsp(volume, intent, path)
-    .map_err(|e| failure_of(e, instance))?;
-  slates_machine::out_line!(
-    "mounted: {}",
-    attachment.path.unwrap_or_else(|| path.to_owned())
-  );
-  Ok(())
-}
-
-/// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so it is unmounted by
-/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive. Every volume
-/// is asked: one whose status is refused (a volume recovery could not rebuild answers `NotFound`) cannot report its
-/// mounts, so it is passed over and named on standard error by its refusal, and the drive is still released when
-/// another volume reports it. Only when no volume that answered reports the drive is the unmount refused, naming the
-/// volumes that did not answer. A channel or daemon failure ends the scan, since no later volume can be asked either.
+/// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so the library finds
+/// its attachment among the volumes' reported mounts and detaches it; a volume whose status was refused cannot report
+/// its mounts and is named on standard error, and the drive is still released when another volume reports it.
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
-  let mut client = connect(instance)?;
-  let volumes = client.list().map_err(|e| failure_of(e, instance))?;
-  let mut found = None;
-  let mut unreported = Vec::new();
-  for summary in volumes {
-    match client.status(summary.id) {
-      Ok(report) => {
-        if found.is_none() {
-          found = report
-            .mounts
-            .iter()
-            .find(|mount| mount.path.eq_ignore_ascii_case(path))
-            .map(|mount| mount.attachment);
-        }
+  let mut attached = Instance::from_client(instance, connect(instance)?);
+  match attached.unmount(path) {
+    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }))
+      if !unreported.is_empty() =>
+    {
+      for volume in &unreported {
+        slates_machine::log_line!(
+          "slates: volume {} ({}) refused {}: its mounts are unknown",
+          volume.name,
+          slates_api::volume_id_text(volume.volume),
+          volume.refusal
+        );
       }
-      Err(ClientError::Refused(refusal)) => unreported.push(format!(
-        "volume {} ({}) refused {refusal:?}",
-        summary.name,
-        volume_id_text(summary.id)
-      )),
-      Err(other) => return Err(failure_of(other, instance)),
+      Err(failure_of_api(
+        slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
+        instance,
+      ))
     }
-  }
-  for volume in &unreported {
-    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
-  }
-  match found {
-    Some(attachment) => client
-      .detach(attachment)
-      .map_err(|e| failure_of(e, instance)),
-    None if unreported.is_empty() => Err(Failure::Refused(format!(
-      "no slates volume is mounted at {path}"
-    ))),
-    None => Err(Failure::Refused(format!(
-      "no slates volume that reported its mounts is mounted at {path}; {} did not report: {}",
-      unreported.len(),
-      unreported.join("; ")
-    ))),
+    other => other.map_err(|e| failure_of_api(e, instance)),
   }
 }
 
 /// `unmount` off Windows is the OS's own (`umount`, `fusermount3 -u`): it needs no daemon, so a stale mount is
 /// unmountable even after its daemon has gone.
 #[cfg(not(windows))]
-fn unmount_verb(_instance: &str, path: &str) -> Result<(), Failure> {
-  crate::mount::unmount(path)
+fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
+  slates_api::mount::unmount(path)
+    .map_err(|fault| failure_of_api(slates_api::Error::Mount(fault), instance))
+}
+
+/// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy).
+fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
+  use slates_api::Error as E;
+  match error {
+    E::Unavailable { cause, .. } => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: cause.to_string(),
+    },
+    E::Mount(
+      fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
+    ) => Failure::Refused(fault.to_string()),
+    refused @ (E::NotFound(_)
+    | E::AlreadyExists(_)
+    | E::Denied(_)
+    | E::Exhausted(_)
+    | E::Busy(_)
+    | E::Stale(_)
+    | E::Retry { .. }
+    | E::Unsupported(_)
+    | E::Invalid(_)
+    | E::Unusable(_)
+    | E::Elsewhere(_)) => Failure::Refused(refused.to_string()),
+    other @ (E::Host(_) | E::Mount(_) | E::Start(_) | E::Protocol(_)) => {
+      Failure::Failed(other.to_string())
+    }
+  }
 }
 
 fn connect(instance: &str) -> Result<Client, Failure> {
-  let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
-  Client::connect(instance, deadlines).map_err(|e| failure_of(e, instance))
+  Client::connect(instance, slates_api::deadlines()).map_err(|e| failure_of(e, instance))
 }
 
 /// Runs one client verb.
@@ -391,11 +292,9 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   } = &request.verb
   {
     return emit_grant(
-      &mut client,
-      *landing,
-      *manifest,
-      *scope,
-      *term_ns,
+      Instance::from_client(&request.instance, client),
+      (*landing, *manifest),
+      (*scope, *term_ns),
       request.json,
     );
   }
@@ -430,18 +329,24 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     };
   }
   if let Verb::Enroll { account } = &request.verb {
-    return emit_enroll(&mut client, *account, request.json);
+    return emit_enroll(
+      Instance::from_client(&request.instance, client),
+      *account,
+      request.json,
+    );
   }
   if let Verb::Revoke { consumer } = &request.verb {
-    return emit_revoke(&mut client, *consumer, request.json);
+    return emit_revoke(
+      Instance::from_client(&request.instance, client),
+      *consumer,
+      request.json,
+    );
   }
-  // `mount` reads the volume's name and the daemon's NFS port through the client, **attaches** for the
-  // host mount — the access-list-checked `attach` returns the mount capability the loopback edge
-  // authorizes every request's file handle against (§4.13; AUD-01: a supplied uid and loopback
-  // reachability are not authority, the capability is) — then runs `mount_nfs` to mount it over the
-  // loopback NFS bridge (§4.6) with that capability in the export path: no privilege, no kernel
-  // extension, no Apple entitlement. Its failure is a `Failure` (a mount refusal, not a client error),
-  // so it is handled here rather than in [`serve`].
+  // `export` and `mount` attach for the host mount — the access-list-checked `attach` returns the mount capability the
+  // loopback edge authorizes every request's file handle against (§4.13; AUD-01: a supplied uid and loopback
+  // reachability are not authority, the capability is). `export` prints the capability's path for a mount elsewhere;
+  // `mount` mounts it here through the library (`slates_api::Instance::mount`). Their failures are `Failure`s (a
+  // mount refusal, not a client error), so they are handled here rather than in [`serve`].
   if let Verb::Export {
     volume,
     read_only,
@@ -466,7 +371,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   } = &request.verb
   {
     return mount_verb(
-      &mut client,
+      client,
       &request.instance,
       *volume,
       path,
@@ -524,7 +429,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
   use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
   let mcp =
     |what: &str, e: &dyn std::fmt::Display| Failure::Failed(format!("mcp http {what}: {e}"));
-  let profile = crate::daemon::measure(true)?;
+  let profile = slates_api::role::measure(true)?;
   let config = slates_server::config::DaemonConfig::derive(&profile, instance, Some(1));
   let runtime =
     slates_rt::runtime::LocalRuntime::new(&config.runtime).map_err(|e| mcp("runtime", &e))?;
@@ -537,9 +442,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
   let edge = slates_mcp::http::HttpEdge {
     port: bound,
     bearer,
-    deadline_ns: Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS)
-      .get()
-      .reply_ns,
+    deadline_ns: slates_api::deadlines().reply_ns,
     connections: config.clients_per_shard,
   };
   slates_machine::log_line!(
@@ -743,6 +646,9 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         match outcome {
           Submitted::Accepted(version) => slates_machine::out_line!("accepted: {version}"),
           Submitted::Conflict(windows) => print_windows(&windows),
+          Submitted::ApprovalRequired { identity, paths } => {
+            slates_machine::out_line!("approval required: {} ({paths} paths)", hex32(&identity))
+          }
         }
       }
     }
@@ -771,6 +677,12 @@ fn submit_json(outcome: &Submitted) -> serde_json::Value {
     Submitted::Conflict(windows) => {
       serde_json::json!({ "accepted": false, "conflicts": slates_mcp::windows_json(windows) })
     }
+    Submitted::ApprovalRequired { identity, paths } => serde_json::json!({
+      "accepted": false,
+      "approval_required": true,
+      "identity": hex32(identity),
+      "paths": paths,
+    }),
   }
 }
 
@@ -860,15 +772,6 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
-/// A failure's text for a message that reports two of them at once (the NFS mount's bind-then-unmount).
-#[cfg(all(unix, not(target_os = "linux")))]
-fn failure_text(failure: &Failure) -> String {
-  match failure {
-    Failure::Refused(text) | Failure::Failed(text) => text.clone(),
-    other => format!("{other:?}"),
-  }
-}
-
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
   let (snapshot, coverage) = client.snapshot_with_coverage(volume)?;
   // What the barrier could claim (§4.6 "Writeback and snapshot barrier"): `complete` when every write
@@ -1537,12 +1440,12 @@ fn current_account() -> u32 {
 /// `enroll`: the human surface enrolls a consumer under the account (§4.13 "Principals"), proving
 /// issuer authority as `grant` does. The capability is shown once, here, and never again: a harness
 /// delivers it to the workload on an inherited descriptor (`slates run` does both in one step).
-fn emit_enroll(client: &mut Client, account: Option<u32>, json: bool) -> Result<(), Failure> {
-  let secret = issuer_secret()?;
+fn emit_enroll(mut instance: Instance, account: Option<u32>, json: bool) -> Result<(), Failure> {
+  let issuer = issuer()?;
   let account = account.unwrap_or_else(current_account);
-  let (consumer, capability) = client
-    .enroll(account, enroll_proof(&secret, account))
-    .map_err(|e| failure_of(e, "enroll"))?;
+  let (consumer, capability) = issuer
+    .enroll(&mut instance, account)
+    .map_err(|e| failure_of_api(e, "enroll"))?;
   if json {
     slates_machine::out_line!(
       "{}",
@@ -1558,11 +1461,10 @@ fn emit_enroll(client: &mut Client, account: Option<u32>, json: bool) -> Result<
 
 /// `revoke CONSUMER`: the human surface revokes an enrollment; every later verb from a channel bound
 /// to it refuses `ConsumerRevoked`.
-fn emit_revoke(client: &mut Client, consumer: u64, json: bool) -> Result<(), Failure> {
-  let secret = issuer_secret()?;
-  client
-    .revoke(consumer, revoke_proof(&secret, consumer))
-    .map_err(|e| failure_of(e, "revoke"))?;
+fn emit_revoke(mut instance: Instance, consumer: u64, json: bool) -> Result<(), Failure> {
+  issuer()?
+    .revoke(&mut instance, consumer)
+    .map_err(|e| failure_of_api(e, "revoke"))?;
   emit_ok("revoked", json);
   Ok(())
 }
@@ -1629,16 +1531,15 @@ struct Ran {
 /// instance, wait for it, and revoke the consumer unless the enrollment is kept. Volumes the workload
 /// created stay owned by the consumer; a kept enrollment is the human's to `revoke` later.
 fn spawn_as_ephemeral_consumer(
-  client: &mut Client,
-  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  (instance, issuer): (&mut Instance, &Issuer),
   account: u32,
   workload: &Workload,
   extra_environment: &[(&OsStr, &OsStr)],
   announce: impl FnOnce(u64),
 ) -> Result<Ran, Failure> {
-  let (consumer, capability) = client
-    .enroll(account, enroll_proof(secret, account))
-    .map_err(|e| failure_of(e, "run"))?;
+  let (consumer, capability) = issuer
+    .enroll(instance, account)
+    .map_err(|e| failure_of_api(e, "run"))?;
   let delivery = Delivery::prepare(consumer, &capability)
     .map_err(|e| Failure::Failed(format!("run: preparing the delivery: {e}")))?;
   announce(consumer);
@@ -1663,9 +1564,9 @@ fn spawn_as_ephemeral_consumer(
     .wait_with_output(WORKLOAD_OUTPUT_CAP)
     .map_err(|e| Failure::Failed(format!("run: waiting for the workload: {e}")))?;
   if !workload.keep {
-    client
-      .revoke(consumer, revoke_proof(secret, consumer))
-      .map_err(|e| failure_of(e, "run"))?;
+    issuer
+      .revoke(instance, consumer)
+      .map_err(|e| failure_of_api(e, "run"))?;
   }
   Ok(Ran {
     consumer,
@@ -1692,8 +1593,8 @@ fn announce_consumer(consumer: u64, json: bool) {
 /// for its lifetime, with the capability delivered on an inherited descriptor and nowhere else; its
 /// standard streams are this command's; its exit code is this command's.
 pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
-  let secret = issuer_secret()?;
-  let mut client = connect(&request.instance)?;
+  let issuer = issuer()?;
+  let mut instance = Instance::from_client(&request.instance, connect(&request.instance)?);
   let (program, args) = request
     .command
     .split_first()
@@ -1706,8 +1607,7 @@ pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
     output: Output::Inherit,
   };
   let ran = spawn_as_ephemeral_consumer(
-    &mut client,
-    &secret,
+    (&mut instance, &issuer),
     current_account(),
     &workload,
     &[],
@@ -2185,22 +2085,29 @@ fn announce_attachment(attachment: u64, json: bool) {
 /// `grant`: the human surface (§4.13 "Grants"). The command runs as the user who started the anchor and
 /// attaches the anchor segment from its environment — the handoff only the supervisor's children and its
 /// user's shell inherit — reads the issuer secret the daemon minted at start, proves the exact landing
-/// under it, and asks the daemon to issue. With no anchor in the environment there is no authority to
-/// prove, and the command refuses before asking: an agent driving the ring, the MCP server or an SDK
-/// never inherits the handoff, which is what makes this the human's surface and not theirs.
+/// under it (`slates_api::Issuer`, a `GrantAuthority`), and asks the daemon to issue through the library's
+/// one grant call, which an embedding host's confirmation surface uses too. With no anchor in the environment
+/// there is no authority to prove, and the command refuses before asking: an agent driving the ring, the MCP
+/// server or an SDK never inherits the handoff, which is what makes this the human's surface and not theirs.
 fn emit_grant(
-  client: &mut Client,
-  landing: u64,
-  manifest: [u8; 32],
-  scope: GrantScope,
-  term_ns: u64,
+  mut instance: Instance,
+  (landing, manifest): (u64, [u8; 32]),
+  (scope, term_ns): (GrantScope, u64),
   json: bool,
 ) -> Result<(), Failure> {
-  let secret = issuer_secret()?;
-  let proof = slates_server::landing::grant_proof(&secret, landing, &manifest, scope, term_ns);
-  let grant = client
-    .grant(landing, manifest, scope, term_ns, proof)
-    .map_err(|e| failure_of(e, "grant"))?;
+  use slates_api::GrantAuthority;
+  let claim = slates_api::GrantClaim {
+    landing,
+    manifest,
+    scope,
+    term_ns,
+  };
+  let proof = issuer()?
+    .prove(&claim)
+    .map_err(|e| failure_of_api(e, "grant"))?;
+  let grant = instance
+    .grant(&claim, &proof)
+    .map_err(|e| failure_of_api(e, "grant"))?;
   if json {
     slates_machine::out_line!("{}", serde_json::json!({ "grant": grant }));
   } else {
@@ -2209,32 +2116,12 @@ fn emit_grant(
   Ok(())
 }
 
-/// The daemon's issuer secret, read from the anchor segment this command runs under — the authority of
-/// `grant`, `enroll`, `revoke` and `run`; refused typed when no anchor is in the environment (the
-/// command was not run by the anchor's user from the anchor's session: the anchor prints the
-/// variables to export on macOS and Windows; on Linux only its children hold the descriptor) or the
-/// daemon has not published one yet (an all-zero secret is no authority).
-fn issuer_secret() -> Result<[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], Failure> {
-  if std::env::var_os(slates_anchor::segment::ENV_HANDOFF).is_none() {
-    return Err(Failure::Failed(
-      "no anchor in this environment — recover, grant, enroll, revoke and run are the anchor user's surface; \
-       run them from the session that started the daemon, with the variables `slates anchor` printed \
-       exported (the MCP server and the SDKs cannot issue grants or enrollments)"
-        .to_owned(),
-    ));
-  }
-  let identity = slates_machine::facts::Facts::query().identity;
-  let segment = slates_anchor::AnchorSegment::attach_from_env(&identity)
-    .map_err(|e| Failure::Failed(format!("attaching the anchor: {e}")))?;
-  let secret = segment
-    .issuer_secret()
-    .map_err(|e| Failure::Failed(format!("reading the issuer secret: {e}")))?;
-  if secret.iter().all(|byte| *byte == 0) {
-    return Err(Failure::Failed(
-      "the daemon has published no issuer secret yet".to_owned(),
-    ));
-  }
-  Ok(secret)
+/// The issuer authority in this command's environment — the authority of `grant`, `enroll`, `revoke`, `run` and
+/// `recover`; refused typed when no anchor is in the environment (the command was not run by the anchor's user from
+/// the anchor's session: the anchor prints the variables to export on macOS and Windows; on Linux only its children
+/// hold the descriptor).
+fn issuer() -> Result<Issuer, Failure> {
+  Issuer::from_environment().map_err(|e| failure_of_api(e, "issuer"))
 }
 
 /// Prints a landing's outcome, or the grant it needs.
@@ -2759,7 +2646,7 @@ fn id_list_text(ids: &[u64]) -> String {
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.
 pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
-  let profile = crate::daemon::measure(options.quick)?;
+  let profile = slates_api::role::measure(options.quick)?;
   if options.json {
     let json = profile
       .to_json()
@@ -2815,7 +2702,7 @@ mod harness_tests {
   const TEST_SHARDS: u16 = 2;
 
   /// The machine profile this binary's test daemons derive from, measured **once per process** (§4.1), as
-  /// production measures once at the anchor's boot — `crate::daemon::measure` itself is per-invocation and
+  /// production measures once at the anchor's boot — `slates_api::role::measure` itself is per-invocation and
   /// right to be, which is why this wrapper exists only for the tests.
   ///
   /// Measured afresh per test, the wake probe runs beside the other tests' probes and daemons, measures their
@@ -2829,7 +2716,7 @@ mod harness_tests {
     static PROFILE: std::sync::OnceLock<Result<slates_machine::MachineProfile, String>> =
       std::sync::OnceLock::new();
     PROFILE
-      .get_or_init(|| crate::daemon::measure(true).map_err(|e| format!("{e:?}")))
+      .get_or_init(|| slates_api::role::measure(true).map_err(|e| format!("{e:?}")))
       .clone()
       .expect("the machine profile measures")
   }
@@ -2838,7 +2725,7 @@ mod harness_tests {
   /// clock that calls a live daemon stalled
   /// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
   fn deadlines() -> Deadlines {
-    Deadlines::derive(super::LIVENESS_BUDGET_NS, super::RECOVERY_BUDGET_NS).get()
+    slates_api::deadlines()
   }
 
   fn connect_retrying(instance: &str) -> Client {
@@ -2923,15 +2810,13 @@ mod harness_tests {
   /// Runs the core once and returns the consumer it announced, the workload's report, and the volume
   /// the workload made, after checking its exit and that it ran as the announced consumer.
   fn run_once(
-    client: &mut Client,
-    secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+    (human, issuer): (&mut slates_api::Instance, &slates_api::Issuer),
     instance: &str,
     keep: bool,
   ) -> (u64, [u8; 32], VolumeId) {
     let mut announced = None;
     let ran = spawn_as_ephemeral_consumer(
-      client,
-      secret,
+      (human, issuer),
       current_account(),
       &workload(instance, keep),
       &[(
@@ -2977,13 +2862,14 @@ mod harness_tests {
     daemon
       .bootstrap(true)
       .expect("the fixture explicitly creates its local consensus group");
-    let secret = daemon.segment().issuer_secret().unwrap();
-    let mut human = connect_retrying(&instance);
+    let issuer =
+      slates_api::Issuer::from_handoff(&daemon.segment().handoff_env().unwrap()).unwrap();
+    let mut human = slates_api::Instance::from_client(&instance, connect_retrying(&instance));
 
-    let (consumer, capability, volume) = run_once(&mut human, &secret, &instance, false);
+    let (consumer, capability, volume) = run_once((&mut human, &issuer), &instance, false);
     assert!(
       matches!(
-        human.status(volume),
+        human.client().status(volume),
         Err(ClientError::Refused(Refusal::Forbidden { .. }))
       ),
       "the workload's volume is the consumer's, not the account's"
@@ -2997,7 +2883,7 @@ mod harness_tests {
       "the ephemeral enrollment is revoked once the workload ends"
     );
 
-    let (kept, capability, _) = run_once(&mut human, &secret, &instance, true);
+    let (kept, capability, _) = run_once((&mut human, &issuer), &instance, true);
     assert_ne!(kept, consumer, "a fresh enrollment per run");
     later
       .attest(kept, &capability)

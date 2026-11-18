@@ -1,5 +1,5 @@
-//! `slates anchor` (§2.5 "The anchor process", §2.6 step 1, §4.14 `daemon.alive`): measure
-//! the profile, create the segment, publish the profile, supervise the daemon.
+//! The anchor role, `slates anchor` or a host's own executable (§2.5 "The anchor process", §2.6 step 1, §4.14
+//! `daemon.alive`, A-278): measure the profile, create the segment, publish the profile, supervise the daemon.
 //!
 //! The loop is the supervisor's `step` at the heartbeat cadence with two observations the
 //! supervisor itself does not make: a starting daemon that stops making progress before its
@@ -26,9 +26,8 @@ use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
 use slates_server::watchdog::{Look, ShardWatch, Verdict};
 use slates_vfs::clock::{Clock, HostClock};
 
-use crate::args::ProcessOptions;
-use crate::daemon::{measure, segment_name};
-use crate::{Failure, signal};
+use super::daemon::{measure, segment_name};
+use super::{Failure, ProcessOptions, Role, signal};
 
 /// What the anchor waits between observations: the daemon's heartbeat cadence, so a lapse
 /// is seen within one beat of the budget.
@@ -134,9 +133,9 @@ fn hold_nfs_listener(supervisor: &mut Supervisor) {
 #[cfg(unix)]
 fn hold_fleet_serve(
   supervisor: &mut Supervisor,
-  selection: &crate::args::FleetSelection,
+  selection: &super::FleetSelection,
 ) -> Result<(), Failure> {
-  let plan = crate::fleet::load(selection)?;
+  let plan = super::fleet::load(selection)?;
   let serve = plan
     .transport
     .serve
@@ -178,43 +177,31 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
 
-/// Runs the anchor until a stop is requested or the daemon loops: [`supervise`] over the `slates daemon` arguments
-/// `options` name.
-pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
-  let mut args = vec![
-    "--instance".to_owned(),
-    options.instance.clone(),
-    "daemon".to_owned(),
-  ];
-  if options.quick {
-    args.push("--quick".to_owned());
-  }
-  if let Some(shards) = options.shards {
-    args.push("--shards".to_owned());
-    args.push(shards.to_string());
-  }
-  // A fleet node's daemon joins the fleet; the anchor only passes the selection through (the daemon
-  // reads the manifest, so a restart re-reads an operator's edit).
-  if let Some(fleet) = &options.fleet {
-    args.push("--fleet".to_owned());
-    args.push(fleet.manifest.clone());
-    args.push("--node".to_owned());
-    args.push(fleet.node.clone());
-  }
+/// Runs the anchor until a stop is requested or the daemon loops: [`supervise`] over this executable's `prefix`, then the
+/// daemon role's arguments for the same options ([`Role::args`]): `slates --instance NAME daemon ...`, or
+/// `kiln slates-role --instance NAME daemon ...` (A-278).
+pub(crate) fn run(prefix: &[String], options: &ProcessOptions) -> Result<(), Failure> {
+  let mut args = prefix.to_vec();
+  args.extend(Role::Daemon(options.clone()).args());
   supervise(options, &args)
 }
 
 /// The anchor itself: measure, create the segment, publish the profile, and supervise this very executable started
-/// with `daemon_args` until a stop is requested. [`run`] passes the `slates daemon` arguments; a test of this crate
-/// passes its own binary's role arguments (`crate::liveness_tests`), so the anchor that judges the daemon there is this
-/// one, not a copy.
+/// with `daemon_args` until a stop is requested. [`run`] passes the daemon role's arguments after the executable's
+/// prefix; a test of this crate passes its own binary's role arguments (`super::liveness_tests`), so the anchor that
+/// judges the daemon there is this one, not a copy.
 pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Result<(), Failure> {
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;
   // Before the segment holds a byte: no core dump may carry it (AUD-29-41).
-  crate::dumps::exclude_from_dumps()?;
+  super::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;
+  // The launcher's secret (A-299): what the starter handed on standard input, read first, so a starter that meant to
+  // hand one and failed is refused by its fault before anything is measured, held or created — never left running an
+  // instance it can never approve for.
+  let launcher = crate::launcher::from_standard_input()
+    .map_err(|fault| Failure::Refused(format!("the launcher's secret: {fault}")))?;
   let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
@@ -242,6 +229,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   segment
     .publish(RegionKind::Profile, json.as_bytes())
     .map_err(|e| failed("publish", e))?;
+  // The launcher's secret (A-299), published before any daemon reads the segment.
+  if let Some(secret) = &launcher {
+    segment
+      .publish_launcher_secret(secret.bytes())
+      .map_err(|e| failed("launcher secret", e))?;
+  }
   // Until a start is measured, the budget holds one start: a daemon that fails once
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);

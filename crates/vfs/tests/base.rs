@@ -1882,6 +1882,56 @@ fn a_clone_of_an_overlay_snapshot_reads_the_same_base() {
   let _ = HostKind::File;
 }
 
+/// The clone's volume config the base-binding test makes its clones with.
+fn clone_config(prefix: u16) -> VolumeConfig {
+  VolumeConfig {
+    prefix,
+    names: NameEquivalence::Exact,
+    quota: Quota::Bounded { limit: 1 << 30 },
+    journal_bytes: 1 << 20,
+    clock: Box::new(StepClock::new(0, 1)),
+  }
+}
+
+/// AC-1.16 (a clone keeps its origin's complete base reference, and its untouched entries stay live). Do: an overlay over
+/// `/f` and `/sub/g`, with `/f` written through it, so the root's listing, `sub` among it, is loaded; snapshot and clone;
+/// then put `/late` on the disk. Expect the clone to read the snapshot's `Base`, the disk's `under` beneath the base
+/// subdirectory its snapshot already held, and `late` from the disk. Before 2026-11-18 a clone kept only a root listing,
+/// keyed by its own root number where its root directory keeps its origin's, so `/sub/g` refused `NotOverlay`.
+#[test]
+fn a_clones_base_subdirectory_reads_as_the_disk_holds_it() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"base");
+  host.mkdir("/sub");
+  host.replace_file("/sub/g", b"under");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/f")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .write(&mut store, f, 0, b"B")
+    .unwrap();
+  let s = vol.snapshot(&mut store).unwrap();
+  let mut clone = Volume::clone_of(&store, &mut vol, s, clone_config(8)).unwrap();
+  host.replace_file("/late", b"late");
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/f").unwrap(),
+    b"Base"
+  );
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/sub/g").unwrap(),
+    b"under"
+  );
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/late").unwrap(),
+    b"late"
+  );
+}
+
 /// A-38: an outsider's edit beneath an overlay moves the file's change counter when a stat takes the
 /// disk's new attributes, and a stat of an unchanged file leaves it where it is, so a client caching
 /// by the counter sees the edit and keeps its cache otherwise.

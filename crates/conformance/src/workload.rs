@@ -9,10 +9,18 @@
 //! roster names per workload with the reason (`EQUIVALENCE.md` §2: timestamps and inode numbers
 //! are not compared; the exclusions here are the files that embed a timestamp or an absolute
 //! path by the tool's own design).
+//!
+//! On Windows (A-300) the lane runs the version-control workloads ([`Workload::runs_on_windows`]) with Git for
+//! Windows' POSIX shell, in an NTFS folder and on the WinFsp drive. Windows tools print a directory in several
+//! spellings (`D:\a`, `D:/a`, the shell's `/d/a`), each of which becomes the root token ([`normalize_output`]). And a
+//! route may state a difference from its host that is a property of the route, never a defect: the drive makes no hard
+//! link, since WinFsp's driver refuses one, so a local clone copies there where NTFS links. Those lines are named per
+//! route ([`stated_differences`]) and recorded with both sides ([`WorkloadStatus::Stated`]); every other byte is
+//! compared as on every other leg, and a stated line that no longer differs fails, so the list only shrinks.
 
 use serde::{Deserialize, Serialize};
 
-use crate::record::{WorkloadStatus, detail};
+use crate::record::{Transport, WorkloadStatus, detail};
 
 /// One workload of the roster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +33,11 @@ pub struct Workload {
   pub script: &'static str,
   /// Path prefixes excluded from the manifest comparison, each with its reason.
   pub excluded: &'static [(&'static str, &'static str)],
+  /// Whether the Windows lane runs it over the WinFsp drive (A-300): the version-control workloads, whose tools a
+  /// Windows runner carries (Git for Windows with its shell, Mercurial's wheel, Subversion's command-line build). The
+  /// others are owed a Windows form: their scripts lean on POSIX tools and behaviour a Windows runner lacks (rsync, a
+  /// watcher's inotify or FSEvents, rg, sqlite3, vim) or have not been run there (cargo, npm, python).
+  pub runs_on_windows: bool,
 }
 
 /// The git workload: a repository with files, a directory, a symlink, a mode change and two
@@ -51,6 +64,217 @@ git log --format='%H %T %P'
 git ls-files -s
 git fsck --strict --no-progress
 git count-objects -v | grep '^count:'
+"#;
+
+/// The git history workload: the operations an agent's repository lives by, over a bare upstream and two clones
+/// (the goal of 2026-11-18). A local clone links the upstream's loose objects rather than copying them (`git clone`'s
+/// `--local`, the default for a path), so the output counts the clone's objects with two names: a mount that cannot
+/// link, or reports the wrong link count, differs there. Then a branch, a merge, a rebase, a stash and its pop, a
+/// second worktree (made, committed in and removed, so no file names an absolute path), an annotated tag, a push and
+/// a pull, and the maintenance that rewrites every object file: `gc`, a full `repack`, the upstream's `gc` (a bare
+/// repository writes a reachability bitmap too), `verify-pack` and `fsck`. `pack.threads=1` makes the packs
+/// byte-identical between runs: with more threads the delta search hands work between threads by timing. The clone's
+/// origin is set back to the relative path, since `git clone` records a local source by its absolute path.
+/// `count-objects` prints its counts only, not its kilobytes (the `git` workload's reason).
+const GIT_HISTORY: &str = r#"
+git init -q --bare -b main upstream.git
+git init -q -b main seed
+cd seed
+printf 'one\n' > a.txt
+mkdir -p d
+printf 'two\n' > d/b.txt
+git add -A
+git commit -q -m base
+git remote add origin ../upstream.git
+git push -q origin main
+cd ..
+git clone -q upstream.git work
+cd work
+git remote set-url origin ../upstream.git
+echo "objects with two names after the clone: $(find .git/objects -type f -links 2 | wc -l | tr -d ' ') of $(find .git/objects -type f | wc -l | tr -d ' ')"
+git switch -q -c feature
+printf 'feature\n' > f.txt
+git add f.txt
+git commit -q -m feature
+git switch -q main
+printf 'main\n' >> a.txt
+git commit -q -am 'main change'
+git merge -q --no-ff -m 'merge feature' feature
+git switch -q -c topic HEAD~1
+printf 'topic\n' > t.txt
+git add t.txt
+git commit -q -m topic
+git rebase -q main
+git switch -q main
+git merge -q --ff-only topic
+printf 'wip\n' >> d/b.txt
+git stash -q
+git status --porcelain
+git stash pop -q
+git status --porcelain
+git checkout -q -- d/b.txt
+git worktree add -q -b hotfix ../wt main~1
+cd ../wt
+printf 'fix\n' > fix.txt
+git add fix.txt
+git commit -q -m fix
+cd ../work
+git worktree list --porcelain
+git merge -q --no-ff -m 'merge hotfix' hotfix
+git worktree remove ../wt
+git tag -a -m 'release one' v1
+git push -q origin main topic v1
+cd ../seed
+git pull -q --ff-only origin main
+git log --format='%H %T %P %s'
+cd ../work
+git -c pack.threads=1 -c gc.autoDetach=false gc -q --prune=now
+git -c pack.threads=1 repack -q -a -d -f
+git -C ../upstream.git -c pack.threads=1 -c gc.autoDetach=false gc -q --prune=now
+git count-objects -v | grep -E '^(count|in-pack|packs|prune-packable|garbage):'
+git verify-pack -v .git/objects/pack/pack-*.idx | grep -v '^chain length'
+git fsck --full --strict --no-progress
+git -C ../upstream.git fsck --full --strict --no-progress
+git log --graph --all --format='%H %T %P%d %s'
+git status --porcelain=v2 --branch
+"#;
+
+/// The Mercurial workload (the goal of 2026-11-18): a repository with a named branch, a merge, a tag and a bookmark;
+/// a local clone, whose store files are hard links to the source's (`hg clone` links a local store when it can); a
+/// commit in the clone, before which Mercurial copies each store file it appends to and still shares, judging that by
+/// the file's link count; a rebase (an extension shipped with Mercurial; it strips the old commit into a backup
+/// bundle); a push back; a share of the source's store (`hg share --relative`, so no file names an absolute path);
+/// then `verify` of all three. The output counts the store files with two names after the clone and after the
+/// clone's commit, so a mount that cannot link, or reports a stale or wrong link count, differs there; and one that
+/// let the clone append into a store file it still shared would fail the source's `verify`. Every commit carries one
+/// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
+/// since `hg clone` records a local source by its absolute path.
+const MERCURIAL: &str = r#"
+d='2026-09-14 00:00:00 +0000'
+hg init src
+cd src
+printf 'one\n' > a.txt
+mkdir -p d
+printf 'two\n' > d/b.txt
+hg add -q
+hg commit -q -d "$d" -m base
+hg branch -q feature
+printf 'feature\n' > f.txt
+hg add -q f.txt
+hg commit -q -d "$d" -m feature
+hg update -q default
+printf 'main\n' >> a.txt
+hg commit -q -d "$d" -m 'main change'
+hg merge -q feature
+hg commit -q -d "$d" -m 'merge feature'
+hg tag -d "$d" v1
+hg bookmark -r 'desc("main change")' stable
+hg status --all
+cd ..
+hg clone -q src clone
+echo "store files with two names after the clone: $(find clone/.hg/store -type f -links 2 | wc -l | tr -d ' ') of $(find clone/.hg/store -type f | wc -l | tr -d ' ')"
+cd clone
+printf '[paths]\ndefault = ../src\n' > .hg/hgrc
+hg update -q stable
+printf 'clone\n' > c.txt
+hg add -q c.txt
+hg commit -q -d "$d" -m 'clone change'
+echo "store files with two names after the clone's commit: $(find .hg/store -type f -links 2 | wc -l | tr -d ' ')"
+hg --config extensions.rebase= rebase -q -d 'children(v1)'
+hg log -G -T '{rev} {node} {branch} {bookmarks} {desc}\n'
+hg push -q -r . ../src
+cd ../src
+hg update -q tip
+hg --config extensions.share= share -q --relative . ../shared
+cd ../shared
+printf 'shared\n' > s.txt
+hg add -q s.txt
+hg commit -q -d "$d" -m 'shared change'
+cd ../src
+hg update -q tip
+hg diff --git -r 'desc("base")' -r tip
+hg log -G -T '{rev} {node} {branch} {p1node} {p2node} {tags} {bookmarks} {desc}\n'
+hg annotate a.txt
+hg verify -q
+hg -R ../clone verify -q
+hg -R ../shared verify -q
+hg -R ../clone status --all
+hg -R ../shared status --all
+"#;
+
+/// The Subversion workload (the goal of 2026-11-18): an FSFS repository made with a fixed UUID; a working copy of its
+/// trunk, whose state is SQLite (`.svn/wc.db`, journalled and locked as SQLite does over the file system under it);
+/// a commit, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on trunk,
+/// an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own merge,
+/// recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository verified
+/// and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
+/// setrevprop`, which runs no hook), as the git and Mercurial workloads fix theirs; the client's configuration is the
+/// workload's own (`--config-dir`), so nothing outside the tree is read or written. Every repository URL holds the
+/// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
+/// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
+/// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
+/// carriage return there, which the revision loop's count must not carry.
+const SUBVERSION: &str = r#"
+top=$(pwd -W 2>/dev/null || pwd)
+case $top in
+  /*) url="file://$top/repo" ;;
+  *) url="file:///$top/repo" ;;
+esac
+svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+printf '2026-09-14T00:00:00.000000Z' > date
+svnadmin create repo
+svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
+svn mkdir -q -m layout "$url/trunk" "$url/branches" "$url/tags"
+svn checkout -q "$url/trunk" wc
+cd wc
+printf 'one\n' > a.txt
+mkdir d
+printf 'two\n' > d/b.txt
+svn add -q a.txt d
+svn commit -q -m base
+svn copy -q -m 'branch feature' '^/trunk' '^/branches/feature'
+svn switch -q '^/branches/feature'
+printf 'feature\n' > f.txt
+svn add -q f.txt
+svn commit -q -m feature
+svn switch -q '^/trunk'
+printf 'main\n' >> a.txt
+svn commit -q -m 'main change'
+svn update -q -r 2
+cat a.txt
+svn update -q
+svn merge -q '^/branches/feature'
+svn status
+svn commit -q -m 'merge feature'
+svn update -q
+svn copy -q -m 'tag v1' '^/trunk' '^/tags/v1'
+svn update -q
+svn cleanup
+svn status
+cd ..
+svn checkout -q "$url/branches/feature" other
+svn status other
+youngest=$(svnlook youngest repo | tr -d '\r')
+rev=0
+while [ "$rev" -le "$youngest" ]; do
+  svnadmin setrevprop repo -r "$rev" svn:date date
+  rev=$((rev + 1))
+done
+cd wc
+svn info --show-item revision
+svn info --show-item last-changed-revision
+svn info --show-item url
+svn info --show-item repos-uuid
+svn log -v -r 1:HEAD '^/'
+svn diff -c 5 '^/'
+svn propget svn:mergeinfo .
+svn cat -r 2 a.txt
+svn list -R '^/'
+cd ..
+svnadmin verify repo
+svnlook tree repo
+svnlook changed -r 6 repo
+svnadmin dump -q repo | cksum
 "#;
 
 /// The cargo workload: a dependency-free crate built twice; the second build must report the
@@ -208,6 +432,58 @@ wait $watcher || true
 if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
 "#;
 
+/// Format: the environment every leg runs a workload under, on both of its sides (the host and the mount, a container
+/// and the guest), so the two runs of a script differ only by the file system under them:
+/// - the one identity and date every git commit is made with, and none of the configuration a parent passes (kiln's
+///   agent sessions sign every commit through `GIT_CONFIG_COUNT`, and a signature carries its signing time);
+/// - Mercurial reading no configuration but a repository's own (`HGRCPATH` empty, per `hg help environment`), its
+///   plain output (`HGPLAIN`) and one committer; its commits' dates are the script's own `-d`;
+/// - one Python hash seed: Mercurial writes its store's file list (`fncache`) from a set, in the order the
+///   interpreter's string hashing gives, which is drawn afresh in every process unless fixed (measured 2026-11-17:
+///   two runs of the Mercurial workload wrote one list in two orders);
+/// - one time zone and locale, and npm with no update check, funding or audit messages and no log files (their path,
+///   in the cache, would be the one line that differs between runs);
+/// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
+///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
+///   whether the drive makes links (A-275). Every other shell ignores the variable.
+pub const ENVIRONMENT: &[(&str, &str)] = &[
+  ("GIT_AUTHOR_NAME", "slates"),
+  ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
+  ("GIT_COMMITTER_NAME", "slates"),
+  ("GIT_COMMITTER_EMAIL", "slates@example.invalid"),
+  ("GIT_AUTHOR_DATE", "2026-09-14T00:00:00Z"),
+  ("GIT_COMMITTER_DATE", "2026-09-14T00:00:00Z"),
+  ("GIT_CONFIG_GLOBAL", "/dev/null"),
+  ("GIT_CONFIG_NOSYSTEM", "1"),
+  ("GIT_CONFIG_COUNT", "0"),
+  ("HGRCPATH", ""),
+  ("HGPLAIN", "1"),
+  ("HGUSER", "slates <slates@example.invalid>"),
+  ("PYTHONHASHSEED", "0"),
+  ("TZ", "UTC"),
+  ("LC_ALL", "C"),
+  ("npm_config_update_notifier", "false"),
+  ("npm_config_fund", "false"),
+  ("npm_config_audit", "false"),
+  ("npm_config_logs_max", "0"),
+  ("MSYS", "winsymlinks:nativestrict"),
+];
+
+/// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
+/// guest's).
+pub fn environment_exports() -> String {
+  ENVIRONMENT
+    .iter()
+    .map(|(key, value)| export_line(key, value))
+    .collect()
+}
+
+/// One POSIX shell `export` line with the value single-quoted, so the shell takes every byte as it is; a single quote
+/// in the value closes the quoting, is escaped, and reopens it (`'\''`).
+pub fn export_line(key: &str, value: &str) -> String {
+  format!("export {key}='{}'\n", value.replace('\'', "'\\''"))
+}
+
 /// Format: the environment variable the sqlite script reads its busy timeout from, in
 /// milliseconds; the harness sets it from its recorded bound.
 pub const ENV_SQLITE_BUSY_MS: &str = "SLATES_SQLITE_BUSY_MS";
@@ -240,6 +516,102 @@ pub const ROSTER: &[Workload] = &[
       (".git/COMMIT_EDITMSG", "a scratch file of the last commit"),
       (".git/ORIG_HEAD", "a scratch ref"),
     ],
+    runs_on_windows: true,
+  },
+  Workload {
+    name: "git-history",
+    tool: "git",
+    script: GIT_HISTORY,
+    excluded: &[
+      (
+        "seed/.git/index",
+        "the index caches stat data (mtime, inode, device) by design",
+      ),
+      (
+        "work/.git/index",
+        "the index caches stat data (mtime, inode, device) by design",
+      ),
+      (
+        "seed/.git/logs/",
+        "a clone's reflog names its source by absolute path, and gc expires entries by their age against the clock",
+      ),
+      (
+        "work/.git/logs/",
+        "a clone's reflog names its source by absolute path, and gc expires entries by their age against the clock",
+      ),
+    ],
+    runs_on_windows: true,
+  },
+  Workload {
+    name: "mercurial",
+    tool: "hg",
+    script: MERCURIAL,
+    excluded: &[
+      (
+        "src/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "clone/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "shared/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "src/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "clone/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "shared/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "src/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "clone/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "shared/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "clone/.hg/undo.desc",
+        "the last transaction's description names the repository a push answered by its absolute URL",
+      ),
+    ],
+    runs_on_windows: true,
+  },
+  Workload {
+    name: "subversion",
+    tool: "svn",
+    script: SUBVERSION,
+    excluded: &[
+      (
+        "wc/.svn/wc.db",
+        "the working copy's database (and its journal) caches each file's size and modification time and each \
+         commit's server time by design; `svn status` and `svn info` print what it holds",
+      ),
+      (
+        "other/.svn/wc.db",
+        "the working copy's database (and its journal) caches each file's size and modification time and each \
+         commit's server time by design; `svn status` prints what it holds",
+      ),
+      (
+        "repo/db/uuid",
+        "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
+         the UUID itself is printed (`svn info --show-item repos-uuid`)",
+      ),
+    ],
+    runs_on_windows: true,
   },
   Workload {
     name: "cargo",
@@ -249,12 +621,14 @@ pub const ROSTER: &[Workload] = &[
       "mini/target/",
       "fingerprints and dep-info embed the absolute source path and mtimes by cargo's design",
     )],
+    runs_on_windows: false,
   },
   Workload {
     name: "npm",
     tool: "npm",
     script: NPM,
     excluded: &[],
+    runs_on_windows: false,
   },
   Workload {
     name: "python",
@@ -267,18 +641,21 @@ pub const ROSTER: &[Workload] = &[
       ),
       ("__pycache__/", "same"),
     ],
+    runs_on_windows: false,
   },
   Workload {
     name: "rg",
     tool: "rg",
     script: RIPGREP,
     excluded: &[],
+    runs_on_windows: false,
   },
   Workload {
     name: "rsync",
     tool: "rsync",
     script: RSYNC,
     excluded: &[],
+    runs_on_windows: false,
   },
   Workload {
     name: "sqlite",
@@ -288,12 +665,14 @@ pub const ROSTER: &[Workload] = &[
       "db.sqlite",
       "the database file's bytes embed the journal mode and page-allocation history, which the mount's WAL fallback changes; the six rows and the integrity check are verified in the output",
     )],
+    runs_on_windows: false,
   },
   Workload {
     name: "editor",
     tool: "vim",
     script: EDITOR,
     excluded: &[],
+    runs_on_windows: false,
   },
   Workload {
     name: "watcher",
@@ -303,6 +682,7 @@ pub const ROSTER: &[Workload] = &[
       "events.txt",
       "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
     )],
+    runs_on_windows: false,
   },
   Workload {
     name: "watcher",
@@ -312,6 +692,7 @@ pub const ROSTER: &[Workload] = &[
       "events.txt",
       "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
     )],
+    runs_on_windows: false,
   },
 ];
 
@@ -391,18 +772,54 @@ const ROOT_TOKEN: &str = "<dir>";
 /// The output with the run's directory replaced by one token, in each spelling a tool prints it:
 /// as given, with its `/private` twin on macOS, and with every UUID-shaped path segment as `***`,
 /// which is how npm prints a path (it redacts UUIDs from its output; seen 2026-09-26 when the scratch
-/// directory's name was a UUID: `app@1.0.0 /private/tmp/.../***/scratchpad/...`).
+/// directory's name was a UUID: `app@1.0.0 /private/tmp/.../***/scratchpad/...`). A Windows drive path
+/// is replaced in each spelling Windows tools print it too ([`windows_spellings`], A-300).
 pub fn normalize_output(output: &str, directory: &str) -> String {
-  let trimmed = directory.trim_end_matches('/');
+  let trimmed = directory.trim_end_matches(['/', '\\']);
   let redacted = redact_uuids(trimmed);
-  let mut spellings = vec![format!("/private{trimmed}"), trimmed.to_owned()];
+  let mut spellings = windows_spellings(trimmed);
   if redacted != trimmed {
-    spellings.insert(0, format!("/private{redacted}"));
-    spellings.insert(1, redacted);
+    spellings.extend([format!("/private{redacted}"), redacted]);
   }
-  spellings.iter().fold(output.to_owned(), |text, spelling| {
-    text.replace(spelling, ROOT_TOKEN)
-  })
+  spellings.extend([format!("/private{trimmed}"), trimmed.to_owned()]);
+  spellings
+    .iter()
+    .filter(|spelling| !spelling.is_empty())
+    .fold(output.to_owned(), |text, spelling| {
+      text.replace(spelling, ROOT_TOKEN)
+    })
+}
+
+/// The spellings Windows tools print a drive path in (A-300), for a directory given as `D:\a\b` or in its verbatim form
+/// `\\?\D:\a\b`, longest first so none is replaced inside another: the verbatim form; the drive form with `\`
+/// separators (Python's and Mercurial's) and with `/` (git's, and a Subversion file URL's `file:///D:/a/b`), each with
+/// its letter in either case; and the MSYS shell's `/d/a/b` (Git for Windows' `pwd`). Empty for any other directory,
+/// and for a drive's root, whose shell spelling (`/d`) would match inside unrelated text; so a POSIX directory is
+/// normalized as it always was.
+fn windows_spellings(directory: &str) -> Vec<String> {
+  let plain = directory.strip_prefix(r"\\?\").unwrap_or(directory);
+  let mut characters = plain.chars();
+  let (Some(letter), Some(':')) = (characters.next(), characters.next()) else {
+    return Vec::new();
+  };
+  let rest = characters.as_str();
+  let below_the_root = rest
+    .strip_prefix(['\\', '/'])
+    .is_some_and(|below| !below.is_empty());
+  if !letter.is_ascii_alphabetic() || !below_the_root {
+    return Vec::new();
+  }
+  let backslashed = rest.replace('/', "\\");
+  let slashed = rest.replace('\\', "/");
+  let mut spellings = Vec::new();
+  for drive in [letter.to_ascii_uppercase(), letter.to_ascii_lowercase()] {
+    spellings.push(format!(r"\\?\{drive}:{backslashed}"));
+    spellings.push(format!("{drive}:{backslashed}"));
+    spellings.push(format!("{drive}:{slashed}"));
+  }
+  spellings.push(format!("/{}{slashed}", letter.to_ascii_lowercase()));
+  spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+  spellings
 }
 
 /// A path with every UUID-shaped segment (8-4-4-4-12 hexadecimal digits) replaced by `***`.
@@ -424,24 +841,99 @@ fn redact_uuids(path: &str) -> String {
     .join("/")
 }
 
-/// The first differing line of two texts, as a bounded detail.
-fn first_output_difference(host: &str, mount: &str) -> Option<String> {
+/// A line of a workload's output that a route prints otherwise than its host by a property of the route the design
+/// states, never a defect (A-300). It is matched by the start the line has on both sides, and judged only on its route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatedDifference {
+  /// The workload whose output holds the line.
+  pub workload: &'static str,
+  /// What the line starts with, on both sides.
+  pub line_start: &'static str,
+  /// Why the route prints it otherwise.
+  pub reason: &'static str,
+}
+
+/// Why the WinFsp drive's link counts are not NTFS's (A-300).
+const NO_HARD_LINK_ON_THE_DRIVE: &str = "the WinFsp drive makes no hard link: WinFsp's driver answers \
+  FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS \
+  compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes \
+  are the same (A-300)";
+
+/// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
+/// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on
+/// NTFS and none on the drive; every other line, and every byte of the trees, is compared.
+const WINFSP_STATED: &[StatedDifference] = &[
+  StatedDifference {
+    workload: "git-history",
+    line_start: "objects with two names after the clone: ",
+    reason: NO_HARD_LINK_ON_THE_DRIVE,
+  },
+  StatedDifference {
+    workload: "mercurial",
+    line_start: "store files with two names after the clone: ",
+    reason: NO_HARD_LINK_ON_THE_DRIVE,
+  },
+  StatedDifference {
+    workload: "mercurial",
+    line_start: "store files with two names after the clone's commit: ",
+    reason: NO_HARD_LINK_ON_THE_DRIVE,
+  },
+];
+
+/// The lines a route's workloads may print otherwise than its host (A-300): the WinFsp drive's link counts, and none
+/// on any other route.
+pub fn stated_differences(transport: Transport) -> &'static [StatedDifference] {
+  match transport {
+    Transport::NativeWindowsWinfsp => WINFSP_STATED,
+    _ => &[],
+  }
+}
+
+/// The output lines of a host and a mounted run compared in order, under the stated differences of the run's
+/// workload: the stated lines that differed, each as its start and a bounded detail, or the first other differing line
+/// as a bounded detail. A pair of lines is stated only when both start with one stated start, so a stated line never
+/// excuses a missing or an extra one.
+fn output_difference(
+  host: &str,
+  mount: &str,
+  stated: &[&StatedDifference],
+) -> Result<Vec<(&'static str, String)>, String> {
   let mut host_lines = host.lines();
   let mut mount_lines = mount.lines();
+  let mut stated_lines = Vec::new();
   let mut number = 0usize;
   loop {
     number = number.saturating_add(1);
     match (host_lines.next(), mount_lines.next()) {
-      (None, None) => return None,
+      (None, None) => return Ok(stated_lines),
       (h, m) if h == m => {}
-      (h, m) => {
-        return Some(detail(&format!(
-          "output line {number}: host {:?}, mount {:?}",
-          h.unwrap_or("<end>"),
-          m.unwrap_or("<end>")
-        )));
-      }
+      (h, m) => stated_lines.push(stated_line(number, h, m, stated)?),
     }
+  }
+}
+
+/// A differing pair of output lines judged against the stated differences: the stated start both lines share with its
+/// bounded detail, or the bounded detail as the difference it is.
+fn stated_line(
+  number: usize,
+  host: Option<&str>,
+  mount: Option<&str>,
+  stated: &[&StatedDifference],
+) -> Result<(&'static str, String), String> {
+  let line = detail(&format!(
+    "output line {number}: host {:?}, mount {:?}",
+    host.unwrap_or("<end>"),
+    mount.unwrap_or("<end>")
+  ));
+  let (Some(host), Some(mount)) = (host, mount) else {
+    return Err(line);
+  };
+  match stated
+    .iter()
+    .find(|entry| host.starts_with(entry.line_start) && mount.starts_with(entry.line_start))
+  {
+    Some(entry) => Ok((entry.line_start, line)),
+    None => Err(line),
   }
 }
 
@@ -486,8 +978,23 @@ fn describe(entry: &Entry) -> String {
   )
 }
 
-/// Compares a workload's host run with its mounted run.
+/// Compares a workload's host run with its mounted run on a route with no stated difference ([`compare_with`]).
 pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
+  compare_with(workload, host, mount, &[])
+}
+
+/// Compares a workload's host run with its mounted run, under the stated differences of the route the mounted run took
+/// ([`stated_differences`]). Exit codes come first: differing ones are a difference, and one nonzero code on both sides
+/// is a failed workload, never an identical one, since a script that stopped early on both sides (a refused option, a
+/// missing extension) proves nothing about the mount. Then the outputs, line by line, where a pair of lines that differ
+/// and both start with one of the workload's stated starts is recorded rather than refused; a stated start none of
+/// whose lines differed is a difference, so a route's list only shrinks. Then the trees, under the exclusions.
+pub fn compare_with(
+  workload: &Workload,
+  host: &Run,
+  mount: &Run,
+  stated: &[StatedDifference],
+) -> WorkloadStatus {
   if host.exit_code != mount.exit_code {
     return WorkloadStatus::Differs {
       detail: detail(&format!(
@@ -498,16 +1005,55 @@ pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
       )),
     };
   }
-  let host_output = normalize_output(&host.output, &host.directory);
-  let mount_output = normalize_output(&mount.output, &mount.directory);
-  if let Some(difference) = first_output_difference(&host_output, &mount_output) {
-    return WorkloadStatus::Differs { detail: difference };
+  if host.exit_code != 0 {
+    return WorkloadStatus::Failed {
+      exit_code: host.exit_code,
+      detail: crate::exerciser::tail(&normalize_output(&host.output, &host.directory)),
+    };
   }
+  let stated_lines = match judged_output(workload, host, mount, stated) {
+    Ok(lines) => lines,
+    Err(difference) => return WorkloadStatus::Differs { detail: difference },
+  };
   let host_tree = host.manifest.without(workload.excluded);
   let mount_tree = mount.manifest.without(workload.excluded);
   match first_manifest_difference(&host_tree, &mount_tree) {
     Some(difference) => WorkloadStatus::Differs { detail: difference },
-    None => WorkloadStatus::Identical,
+    None if stated_lines.is_empty() => WorkloadStatus::Identical,
+    None => WorkloadStatus::Stated {
+      lines: stated_lines,
+    },
+  }
+}
+
+/// Two runs' outputs, each with its directory as the root token, judged under the workload's own stated differences:
+/// the stated lines that differed, each a bounded detail, or the difference that fails the workload. That is the first
+/// line differing otherwise, or a stated start none of whose lines differed.
+fn judged_output(
+  workload: &Workload,
+  host: &Run,
+  mount: &Run,
+  stated: &[StatedDifference],
+) -> Result<Vec<String>, String> {
+  let mine: Vec<&StatedDifference> = stated
+    .iter()
+    .filter(|entry| entry.workload == workload.name)
+    .collect();
+  let stated_lines = output_difference(
+    &normalize_output(&host.output, &host.directory),
+    &normalize_output(&mount.output, &mount.directory),
+    &mine,
+  )?;
+  match mine.iter().find(|entry| {
+    !stated_lines
+      .iter()
+      .any(|(start, _)| *start == entry.line_start)
+  }) {
+    Some(unmet) => Err(detail(&format!(
+      "a stated difference no longer differs: no line starting {:?} differed, so it comes off the route's list ({})",
+      unmet.line_start, unmet.reason
+    ))),
+    None => Ok(stated_lines.into_iter().map(|(_, line)| line).collect()),
   }
 }
 
@@ -551,11 +1097,19 @@ mod tests {
     }
   }
 
+  /// The roster's workload named `name`.
+  fn named(name: &str) -> Workload {
+    *ROSTER
+      .iter()
+      .find(|workload| workload.name == name)
+      .unwrap_or_else(|| panic!("no workload named {name}"))
+  }
+
   /// Identical runs whose outputs differ only by their directory roots (including macOS's
   /// `/private` twin) compare identical; an excluded prefix hides a difference by design.
   #[test]
   fn identical_runs_compare_identical_under_the_exclusions() {
-    let workload = ROSTER[0];
+    let workload = named("git");
     let host = run(
       "/h/git",
       "app /h/git\nok\n",
@@ -580,7 +1134,7 @@ mod tests {
   /// A differing exit code is named first, with the mounted output's tail.
   #[test]
   fn a_differing_exit_code_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mut mount = run("/m", "same\n", vec![file("a", "aa")]);
     mount.exit_code = 1;
@@ -588,21 +1142,185 @@ mod tests {
     assert!(detail.starts_with("exit code: host 0, mount 1"), "{detail}");
   }
 
+  /// Part 6 "Real workloads" ("Exit codes 0"): do compare a host run and a mounted run that both exit 129 with the
+  /// same output and the same tree, as a script does when its tool refuses an option on both sides; expect the
+  /// workload judged failed, with the exit code and the host output's tail (its directory as the root token). Before
+  /// 2026-11-17 it was judged identical: `compare` asked only that the two exit codes be equal.
+  #[test]
+  fn a_workload_that_fails_alike_on_both_sides_is_failed_not_identical() {
+    let workload = named("git");
+    let mut host = run("/h", "fatal: /h/x: no such option\n", vec![file("a", "aa")]);
+    let mut mount = run("/m", "fatal: /m/x: no such option\n", vec![file("a", "aa")]);
+    host.exit_code = 129;
+    mount.exit_code = 129;
+    assert_eq!(
+      compare(&workload, &host, &mount),
+      WorkloadStatus::Failed {
+        exit_code: 129,
+        detail: "fatal: <dir>/x: no such option".to_owned(),
+      }
+    );
+  }
+
   /// A differing output line is named with its number.
   #[test]
   fn a_differing_output_line_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run("/m", "other\n", vec![file("a", "aa")]);
     let detail = difference(compare(&workload, &host, &mount));
     assert!(detail.contains("output line 1"), "{detail}");
   }
 
+  /// A-300 (the Windows lane). Do: normalize what Windows tools print about a workload directory given in its verbatim
+  /// form, as the harness's canonical scratch is: Python's and Mercurial's `D:\…`, git's `D:/…`, a Subversion file URL,
+  /// Git for Windows' shell `pwd` (`/d/…`), a lowercase drive letter, and the verbatim form itself. Expect each to be
+  /// the root token, the drive's other folders left alone, and a trailing separator on the directory ignored. A POSIX
+  /// directory and a drive's root gain no Windows spelling.
+  #[test]
+  fn a_windows_directory_is_the_root_token_in_every_spelling_its_tools_print() {
+    let directory = r"\\?\D:\a\scratch\workloads-host\subversion";
+    let printed = [
+      r"repo D:\a\scratch\workloads-host\subversion\repo",
+      "worktree D:/a/scratch/workloads-host/subversion/wt",
+      "url file:///D:/a/scratch/workloads-host/subversion/repo/trunk",
+      "pwd /d/a/scratch/workloads-host/subversion",
+      r"lower d:\a\scratch\workloads-host\subversion\x",
+      r"verbatim \\?\D:\a\scratch\workloads-host\subversion\y",
+      r"other D:\a\scratch\elsewhere",
+    ]
+    .join("\n");
+    assert_eq!(
+      normalize_output(&printed, directory),
+      [
+        r"repo <dir>\repo",
+        "worktree <dir>/wt",
+        "url file:///<dir>/repo/trunk",
+        "pwd <dir>",
+        r"lower <dir>\x",
+        r"verbatim <dir>\y",
+        r"other D:\a\scratch\elsewhere",
+      ]
+      .join("\n")
+    );
+    assert_eq!(
+      normalize_output(
+        r"E:\conformance-7\workloads\git\.git",
+        r"E:\conformance-7\workloads\git\"
+      ),
+      r"<dir>\.git"
+    );
+    assert!(windows_spellings("/h/git").is_empty());
+    assert!(windows_spellings(r"D:\").is_empty() && windows_spellings("D:").is_empty());
+    assert_eq!(normalize_output("/d/x /h/git", "/h/git"), "/d/x <dir>");
+  }
+
+  /// A host run and a WinFsp drive run of the git history workload: the drive's clone copied what NTFS's linked, so
+  /// only its link count differs (A-300).
+  fn clone_runs(mount_count: &str) -> (Run, Run) {
+    let host = run(
+      r"D:\h\git-history",
+      "objects with two names after the clone: 9 of 9\nmerged D:/h/git-history/work\n",
+      vec![file("work/a.txt", "aa")],
+    );
+    let mount = run(
+      r"E:\m\git-history",
+      &format!(
+        "objects with two names after the clone: {mount_count} of 9\nmerged E:/m/git-history/work\n"
+      ),
+      vec![file("work/a.txt", "aa")],
+    );
+    (host, mount)
+  }
+
+  /// A-300. Do: compare the git history workload's NTFS run with its drive run, whose clone copied every object NTFS
+  /// linked (`0 of 9` against `9 of 9`): on the drive's route, then as if on a route that states nothing. Expect the
+  /// first identical but for the stated line, recorded with both sides, and the second a difference naming that line.
+  #[test]
+  fn the_drives_link_count_is_a_stated_difference_on_its_route_alone() {
+    let workload = named("git-history");
+    let (host, mount) = clone_runs("0");
+    let on_the_drive = compare_with(
+      &workload,
+      &host,
+      &mount,
+      stated_differences(Transport::NativeWindowsWinfsp),
+    );
+    match &on_the_drive {
+      WorkloadStatus::Stated { lines } => {
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+          lines[0].contains("9 of 9") && lines[0].contains("0 of 9"),
+          "{lines:?}"
+        );
+      }
+      other => panic!("expected the stated difference, got {other:?}"),
+    }
+    assert!(!on_the_drive.fails_the_suite());
+    assert!(
+      on_the_drive
+        .stated_note("git-history")
+        .is_some_and(|note| note.contains("0 of 9"))
+    );
+    let elsewhere = difference(compare_with(
+      &workload,
+      &host,
+      &mount,
+      stated_differences(Transport::NativeLinuxFuse),
+    ));
+    assert!(elsewhere.contains("output line 1"), "{elsewhere}");
+  }
+
+  /// A-300. Do: on the drive's route, compare runs that differ beyond the stated line: another line, a line missing on
+  /// the drive, a tree entry, and a stated line on one side only. Expect each a difference: a stated line excuses only
+  /// a pair of lines that both start with its start, and never the trees.
+  #[test]
+  fn a_stated_line_excuses_nothing_else() {
+    let workload = named("git-history");
+    let stated = stated_differences(Transport::NativeWindowsWinfsp);
+    let (host, mut mount) = clone_runs("0");
+    mount.output = mount.output.replace("merged", "MERGED");
+    assert!(difference(compare_with(&workload, &host, &mount, stated)).contains("output line 2"));
+    let (host, mut mount) = clone_runs("0");
+    mount.output = "objects with two names after the clone: 0 of 9\n".to_owned();
+    assert!(difference(compare_with(&workload, &host, &mount, stated)).contains("<end>"));
+    let (host, mut mount) = clone_runs("0");
+    mount.manifest = Manifest {
+      entries: vec![file("work/a.txt", "bb")],
+    };
+    assert!(difference(compare_with(&workload, &host, &mount, stated)).starts_with("tree entry"));
+    let (host, mut mount) = clone_runs("0");
+    mount.output = mount
+      .output
+      .replace("objects with two names", "objects with one name");
+    assert!(difference(compare_with(&workload, &host, &mount, stated)).contains("output line 1"));
+  }
+
+  /// A-300 ("the list only shrinks"). Do: on the drive's route, compare runs whose stated line did not differ, as when
+  /// a drive makes links. Expect a difference saying the stated difference no longer differs, so it is struck from
+  /// the list rather than left to excuse a later regression.
+  #[test]
+  fn a_stated_difference_that_no_longer_differs_fails() {
+    let workload = named("git-history");
+    let (host, mount) = clone_runs("9");
+    let detail = difference(compare_with(
+      &workload,
+      &host,
+      &mount,
+      stated_differences(Transport::NativeWindowsWinfsp),
+    ));
+    assert!(
+      detail.starts_with("a stated difference no longer differs"),
+      "{detail}"
+    );
+    assert_eq!(compare(&workload, &host, &mount), WorkloadStatus::Identical);
+  }
+
   /// AC-3.2 / AC-4.2: every visible name participates in the comparison, including `._` names.
   /// A transport-created sidecar changes the tree; an application can also own such a name.
   #[test]
   fn dot_underscore_names_are_compared_like_other_visible_files() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run(
       "/m",
@@ -626,7 +1344,7 @@ mod tests {
   /// A differing tree entry, or an extra one, is named with both sides.
   #[test]
   fn a_differing_tree_entry_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run("/m", "same\n", vec![file("a", "bb")]);
     let detail = difference(compare(&workload, &host, &mount));
@@ -656,9 +1374,49 @@ mod tests {
     }
     let names: Vec<&str> = ROSTER.iter().map(|w| w.name).collect();
     for expected in [
-      "git", "cargo", "npm", "python", "rg", "rsync", "sqlite", "editor", "watcher",
+      "git",
+      "git-history",
+      "mercurial",
+      "subversion",
+      "cargo",
+      "npm",
+      "python",
+      "rg",
+      "rsync",
+      "sqlite",
+      "editor",
+      "watcher",
     ] {
       assert!(names.contains(&expected), "{expected}");
     }
+  }
+
+  /// The goal of 2026-11-18 (the guest's environment): do source [`environment_exports`] in a real POSIX shell and
+  /// print each variable back; expect every value exactly as [`ENVIRONMENT`] holds it, the empty `HGRCPATH` set but
+  /// empty, and `HGUSER`'s spaces and angle brackets intact. A value with a single quote, double quotes and a `$`
+  /// survives [`export_line`] too.
+  #[cfg(unix)]
+  #[test]
+  fn the_environment_exports_reach_a_shell_exactly() {
+    let mut script = environment_exports();
+    script.push_str(&export_line("QUOTED", "it's \"here\" $HOME"));
+    for (key, _) in ENVIRONMENT {
+      script.push_str(&format!("printf '%s=[%s]\\n' {key} \"${{{key}-unset}}\"\n"));
+    }
+    script.push_str("printf 'QUOTED=[%s]\\n' \"$QUOTED\"\n");
+    let output = std::process::Command::new("sh")
+      .args(["-c", &script])
+      .env_clear()
+      .output()
+      .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let mut expected: String = ENVIRONMENT
+      .iter()
+      .map(|(key, value)| format!("{key}=[{value}]\n"))
+      .collect();
+    expected.push_str("QUOTED=[it's \"here\" $HOME]\n");
+    assert_eq!(printed, expected);
+    assert!(printed.contains("HGRCPATH=[]\n"), "{printed}");
   }
 }

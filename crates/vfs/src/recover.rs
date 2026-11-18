@@ -77,13 +77,19 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
-/// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
+/// 22 (A-231, 2026-11-05) the held connections' byte states. 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
 /// 25 (A-251, 2026-11-09) each held register carries the acceptor's whole persisted state, the retired owner an install
 /// last moved its authority from too (`slates_db::register::PersistedAcceptor`), so a warm restart keeps the move.
-/// Format: the image layout version, bumped with any change to the types below or to the held replicas'
-/// image they carry.
-const IMAGE_VERSION: u16 = 25;
+/// 26 (A-275, built 2026-11-09, landed 2026-11-17 in landing order) a symlink's Windows bits may hold
+/// `FILE_ATTRIBUTE_DIRECTORY` (a Windows directory link): the bytes are laid out as 25's, but a reader of an earlier
+/// version would drop the bit without a word and show a directory link as a file link, so it refuses this version.
+/// 27 (A-270, built 2026-11-09 as 26, landed 2026-11-18 after A-275, so it takes the next) what the shard holds for
+/// other owners is keyed pieces ([`HeldPiece`]) instead of one opaque image, so a delta carries only the pieces that
+/// changed.
+/// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
+/// replicas' image they carry.
+pub const IMAGE_VERSION: u16 = 27;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -517,10 +523,10 @@ pub struct ShardImage {
   pub version: u16,
   /// The volumes, in key order.
   pub volumes: Vec<KeyedImage>,
-  /// The content this shard holds for other owners as their candidate holder (AUD-29-59): the hold's own
-  /// canonical image, opaque here (the cluster plane encodes and decodes it), empty when nothing is held.
-  /// A holder acknowledges a content put only once an image carrying it is committed.
-  pub held: Vec<u8>,
+  /// What this shard holds for other owners as their candidate holder (AUD-29-59, A-270): keyed pieces in key order,
+  /// opaque here (the server cuts and joins them), none when nothing is held. A holder acknowledges what it holds only
+  /// once an image or a delta carrying it is committed.
+  pub held: Vec<HeldPiece>,
   /// The replies a barrier published with its effect and had not yet delivered (A-61): at most one per FUSE
   /// mount, opaque here (the transport encodes them).
   pub replies: Vec<HeldReply>,
@@ -611,6 +617,21 @@ pub struct HeldReply {
   pub reply: Vec<u8>,
 }
 
+/// Format: the bytes of a held piece's key (A-270): the server's kind byte, an object id (16 bytes), and a position (a
+/// big-endian word, so key order within an object is position order). Opaque here beyond its width.
+pub const HELD_PIECE_KEY_BYTES: usize = 1 + 16 + size_of::<u64>();
+
+/// One piece of what a shard holds for other owners (A-270): a key and its bytes, both opaque here. An image carries
+/// every piece; a delta carries the pieces put and the keys removed since the last publication, so what a holder's
+/// acknowledgement costs its publication is the piece it changed, not everything it holds.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldPiece {
+  /// The piece's key.
+  pub key: [u8; HELD_PIECE_KEY_BYTES],
+  /// The piece's bytes.
+  pub bytes: Vec<u8>,
+}
+
 /// Format: the bytes of a held call record's key: an NFSv4.1 session id (16 bytes) and its slot (a big-endian word).
 pub const HELD_CALL_KEY_BYTES: usize = 16 + size_of::<u32>();
 
@@ -622,6 +643,14 @@ pub struct HeldCall {
   pub key: [u8; HELD_CALL_KEY_BYTES],
   /// The record's bytes.
   pub record: Vec<u8>,
+}
+
+/// Format: a recovery image's or a journal frame's leading magic and version, as `Wire` writes a `u32` then a `u16`
+/// (little endian): read alone, so a refusal by version decodes nothing after it. `None` when fewer bytes arrived.
+pub(crate) fn read_header(bytes: &[u8]) -> Option<(u32, u16)> {
+  let (magic, rest) = bytes.split_first_chunk::<{ size_of::<u32>() }>()?;
+  let (version, _) = rest.split_first_chunk::<{ size_of::<u16>() }>()?;
+  Some((u32::from_le_bytes(*magic), u16::from_le_bytes(*version)))
 }
 
 impl ShardImage {
@@ -641,7 +670,7 @@ impl ShardImage {
   /// .with_nfs_replies(nfs).with_nfs_states(states)`'s `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
-    held: &[u8],
+    held: &mut Vec<HeldPiece>,
     (replies, calls, nfs_replies, nfs_states): (
       &mut Vec<HeldReply>,
       &mut Vec<HeldCall>,
@@ -649,8 +678,8 @@ impl ShardImage {
       &mut Vec<HeldNfsStates>,
     ),
   ) {
-    slates_wire::codec::encode_len(held.len(), out);
-    out.extend_from_slice(held);
+    held.sort_by_key(|piece| piece.key);
+    held.encode(out);
     replies.sort_by_key(|reply| reply.attachment);
     replies.encode(out);
     calls.sort_by_key(|call| call.key);
@@ -676,8 +705,9 @@ impl ShardImage {
     }
   }
 
-  /// This image carrying `held`, the shard's held replicas' canonical image (AUD-29-59).
-  pub fn with_held(self, held: Vec<u8>) -> ShardImage {
+  /// This image carrying `held`, the pieces of what the shard holds for other owners (AUD-29-59, A-270), in key order.
+  pub fn with_held(self, mut held: Vec<HeldPiece>) -> ShardImage {
+    held.sort_by_key(|piece| piece.key);
     ShardImage { held, ..self }
   }
 
@@ -708,9 +738,20 @@ impl ShardImage {
     ShardImage { nfs_states, ..self }
   }
 
-  /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
-  /// or any malformed field with [`VfsError::RecoveryIncomplete`].
+  /// Decodes a shard image from content-object bytes, refusing a foreign magic or any malformed field with
+  /// [`VfsError::RecoveryIncomplete`], and another build's version, read before any field after it, with
+  /// [`VfsError::RecoveryVersion`]: a layout this build does not know is never decoded as this one.
   pub fn from_content(bytes: &[u8]) -> Result<ShardImage, VfsError> {
+    match read_header(bytes) {
+      Some((magic, version)) if magic == SHARD_MAGIC && version != IMAGE_VERSION => {
+        return Err(VfsError::RecoveryVersion {
+          found: version,
+          expected: IMAGE_VERSION,
+        });
+      }
+      Some((magic, _)) if magic == SHARD_MAGIC => {}
+      _ => return Err(VfsError::RecoveryIncomplete),
+    }
     let shard = ShardImage::from_bytes(bytes).map_err(|_| VfsError::RecoveryIncomplete)?;
     if shard.magic != SHARD_MAGIC || shard.version != IMAGE_VERSION {
       return Err(VfsError::RecoveryIncomplete);
@@ -3338,7 +3379,7 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
     .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
-  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows);
+  inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows, inode.kind);
 }
 
 fn child_for(
