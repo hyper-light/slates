@@ -51,6 +51,11 @@ windows-sys = { workspace = true }
 # also read `notify::MAX_PATH_UNITS`, the name reserve the live ladder holds equal to the limit it measures (A-206).
 slates-bridge-winfsp = { workspace = true }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Another local account for the WinFsp drive's access-list test (A-368): `NetUserAdd` and `NetUserDel`, which never
+# prompt, where `net user` stops to ask about a password longer than fourteen characters.
+windows-sys = { workspace = true, features = ["Win32_NetworkManagement_NetManagement"] }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The names of the status counters slates' own virtio-fs device adds while a guest uses its DAX window, which the real
 # guest test holds non-vacuous (`tests/guest_vhost.rs`, A-168).

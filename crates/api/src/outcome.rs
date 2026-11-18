@@ -250,8 +250,10 @@ pub struct LandingReport {
   pub held: u64,
   /// The durability the landing achieved (§4.15 step 8).
   pub durability: LandingDurability,
-  /// Every degraded cell met, in order.
+  /// Every degraded cell met, in order, as many as one reply holds (A-267).
   pub degraded: Vec<LandingDegradation>,
+  /// Degraded cells past what one reply holds (A-267).
+  pub degraded_elided: u32,
   /// The batch barriers taken (A-130).
   pub barriers: u64,
   /// How the landing's signature was judged against the manifest it wrote (A-321), as its finished audit record keeps
@@ -309,6 +311,7 @@ pub(crate) fn report_of(outcome: LandingOutcome) -> Result<LandingReport, Error>
     held: outcome.held,
     durability: outcome.durability,
     degraded: outcome.degraded,
+    degraded_elided: outcome.degraded_elided,
     barriers: outcome.barriers,
     verification: Verification::of_wire(outcome.verification),
   })

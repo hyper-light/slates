@@ -100,6 +100,19 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Versioned<K, V> {
     }
   }
 
+  /// Every key the head holds past `after` (from the first when `None`), with its value, in key order: a range, so a
+  /// walk that resumes from a key costs what it passes (a page of an overlay's drift, A-267).
+  pub(crate) fn iter_head_after(&self, after: Option<&K>) -> impl Iterator<Item = (&K, &V)> {
+    let from = match after {
+      Some(key) => std::ops::Bound::Excluded(key),
+      None => std::ops::Bound::Unbounded,
+    };
+    self
+      .keys
+      .range((from, std::ops::Bound::Unbounded))
+      .filter_map(|(key, versions)| versions.last()?.value.as_ref().map(|value| (key, value)))
+  }
+
   /// Every key the head holds, with its value, in key order.
   pub(crate) fn iter_head(&self) -> impl Iterator<Item = (&K, &V)> {
     self

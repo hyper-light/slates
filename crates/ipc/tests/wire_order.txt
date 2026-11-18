@@ -215,6 +215,7 @@ Refusal 68 Volume
 Refusal 69 Database
 Refusal 70 Target
 Refusal 71 DurabilityPending
+Refusal 72 VerdictReplaced
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -281,6 +282,9 @@ ReplyBody 62 MergeApprovalRequired
 ReplyBody 63 SubmittedSigned
 ReplyBody 64 SignersSet
 ReplyBody 65 MergeRecord
+ReplyBody 66 Drifted
+ReplyBody 67 Conflicts
+ReplyBody 68 Renewed
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -356,6 +360,9 @@ RequestBody 71 SubmitApproved
 RequestBody 72 SubmitSigned
 RequestBody 73 SetSigners
 RequestBody 74 MergeRecord
+RequestBody 75 Drifted
+RequestBody 76 Conflicts
+RequestBody 77 Renew
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -394,6 +401,9 @@ TargetRefusal 11 MountRefused
 TargetRefusal 12 NotADriveLetter
 TargetRefusal 13 AnchorHold
 TargetRefusal 14 DetachPending
+TargetRefusal 15 MountManagerNotAllowed
+TargetRefusal 16 DriveLetterTaken
+TargetRefusal 17 TooLong
 UnsupportedReason 0 HostPlatform
 UnsupportedReason 1 ListenerNotBound
 UnsupportedReason 2 MountNeedsPrivilege
