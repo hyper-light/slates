@@ -380,7 +380,6 @@ fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
     let mut values = entry.values.into_iter();
     let inherited = Inherited {
       volume: inherited_handle(values.next().unwrap()),
-      link: inherited_handle(values.next().unwrap()),
       ledger: inherited_handle(values.next().unwrap()),
       record: Record::decode(&entry.record).unwrap(),
     };
