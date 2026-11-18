@@ -53,5 +53,11 @@ slates-seal = { workspace = true }
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true }
 
+# The many-client load test's pacing (its exponential pauses) and its account of the clients' time are unit-tested in
+# the example itself, so `cargo test -p slates-client` runs them.
+[[example]]
+name = "load_bench"
+test = true
+
 [lints]
 workspace = true

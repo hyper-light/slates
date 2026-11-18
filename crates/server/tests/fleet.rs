@@ -15150,6 +15150,135 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// §4.16 failure matrix ("Green owner loss in a fleet: Degraded for the membership horizon, then Masked after takeover
+/// on a candidate that holds the ledger"; AUD-14; GAP-A9-7's input half; GAPS 2026-11-09): a successor one version
+/// behind the quorum takes the green over. Do: three nodes at `f = 1`; on a, a green advanced to version 2 and recomputed
+/// by both holders; the survivor rendezvous ranks first for the green then refusing every content put, so version 3
+/// commits at a and the other holder alone; a dies. Expect the successor at version 2 and the other holder at 3 when a
+/// dies; the successor to fetch version 3's inputs from the other holder (counted `merge.takeover_inputs_fetched`) and
+/// place the green at version 3 without giving it up, with the owner's chain, serving version 1 and the head's bytes.
+/// Its refusal of content puts stands throughout, so nothing but its own fetch can bring it version 3's inputs. Before
+/// 2026-11-18 the successor waited on its chain every period: without end, then, once bounded, until it gave the green
+/// up `TakeoverIncomplete { waited_on: "chain" }`, as 2 of 10 arm64 runs of the share test did under spinners
+/// (diag-clients-green-1).
+#[test]
+fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "lagging-successor", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusal of content puts installs");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let other_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let owner_chain = daemons[0].merge_chain_identities(green).unwrap();
+
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let given_up = |daemon: &Daemon| {
+    daemon.refusals_on_every_shard().map(|counted| {
+      counted
+        .get("merge.takeover_given_up")
+        .is_some_and(|count| *count > 0)
+    })
+  };
+  // The daemon's own verdict ends the wait: the green placed at version 3, or given up at its bound.
+  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemons[successor_index].merge_record_placed(green, 3)?
+        || given_up(&daemons[successor_index])?,
+    )
+  });
+  let placed = daemons[successor_index].merge_record_placed(green, 3);
+  let counted = daemons[successor_index].refusals_on_every_shard();
+  let successor_chain = daemons[successor_index].merge_chain_identities(green);
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let counted = counted.expect("the successor's counters are read");
+  let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_three, "the other holder recomputed version 3");
+  assert_eq!(
+    successor_at_death.map(|state| state.version),
+    Ok(Some(2)),
+    "the successor was one version behind when the owner died"
+  );
+  assert_eq!(
+    placed,
+    Ok(true),
+    "the successor placed the taken-over green at version 3 (given up {}, fetched {}, waited on its chain {}, waited on \
+     its inputs {})",
+    count_of("merge.takeover_given_up"),
+    count_of("merge.takeover_inputs_fetched"),
+    count_of("merge.takeover_incomplete"),
+    count_of("merge.takeover_waits_inputs")
+  );
+  assert_eq!(
+    count_of("merge.takeover_given_up"),
+    0,
+    "the green was never given up"
+  );
+  assert!(
+    count_of("merge.takeover_inputs_fetched") >= 1,
+    "the successor fetched version 3's inputs from the other holder"
+  );
+  assert_eq!(
+    successor_chain,
+    Ok(owner_chain),
+    "the successor's chain carries the owner's increment identities, in order"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
 /// The green's head as a client must read it from an owner that has just restarted or taken the green over (§4.8
 /// "Leases and reads", AUD-08): the owner parks the read until its lease confirms and refuses it `LeaseUnconfirmed`
 /// if the lease bound passes first, a refusal retryable by design. So the read is sent again while it is refused so,
@@ -16499,31 +16628,36 @@ fn green_with_work(client: &mut Client, name: &str, fleet: &[Daemon]) -> (Volume
 /// Submits three versions from `work` on its owner: each acceptance resolves within the placement
 /// deadline once the version commits at the quorum (AUD-11) and answers the expected version.
 fn commit_three_versions(client: &mut Client, work: VolumeId) {
-  for (version, (at, bytes)) in [(0u64, "hello"), (5, " world"), (11, "!")]
+  for (version, edit) in [(0u64, "hello"), (5, " world"), (11, "!")]
     .into_iter()
     .enumerate()
   {
-    edit_work(client, work, at, bytes);
-    let started = Instant::now();
-    let submitted = client
-      .try_call(
-        &RequestBody::Submit {
-          work,
-          evidence: Vec::new(),
-        },
-        u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
-      )
-      .expect("the acceptance resolves once the version commits at the quorum");
-    let expected = u64::try_from(version).unwrap() + 1;
-    assert!(
-      started.elapsed() < PLACEMENT_DEADLINE,
-      "version {expected}'s acceptance resolved within the placement deadline"
-    );
-    assert!(
-      matches!(submitted, ReplyBody::Submitted { version: Some(v), .. } if v == expected),
-      "version {expected}: {submitted:?}"
-    );
+    commit_version(client, work, edit, u64::try_from(version).unwrap() + 1);
   }
+}
+
+/// Inserts `bytes` at `at` in `work`'s file `f` and submits it on its owner: the acceptance resolves within the
+/// placement deadline once the version commits at the quorum (AUD-11) and answers version `expected`.
+fn commit_version(client: &mut Client, work: VolumeId, (at, bytes): (u64, &str), expected: u64) {
+  edit_work(client, work, at, bytes);
+  let started = Instant::now();
+  let submitted = client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+    )
+    .expect("the acceptance resolves once the version commits at the quorum");
+  assert!(
+    started.elapsed() < PLACEMENT_DEADLINE,
+    "version {expected}'s acceptance resolved within the placement deadline"
+  );
+  assert!(
+    matches!(submitted, ReplyBody::Submitted { version: Some(v), .. } if v == expected),
+    "version {expected}: {submitted:?}"
+  );
 }
 
 /// Before the owner dies: whether both holders recomputed version 3 (the successor's own prefix is
@@ -17443,6 +17577,245 @@ fn issue_with(
     cert.der().clone(),
     rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
   )
+}
+
+/// Shape: the failover SLO the bounded-green fixture runs under: a second, ten of the fleet's periods, so a green the
+/// fixture plants is given up on after ten attempts.
+const SHORT_FAILOVER_SLO_NS: u64 = 1_000_000_000;
+/// Shape: the planted green's object id: a volume-class id (byte 10, the register-class byte, clear) whose partition
+/// (bytes 8 and 9, `verbs::owner_of`) is the node's first, so its owner shard is here.
+const PLANTED_GREEN: [u8; 16] = [
+  0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0, 0, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21,
+];
+
+/// A one-node fleet daemon at `f = 0`, bootstrapped, admitting enrolled members under its own certificate, with the
+/// failover SLO cut to [`SHORT_FAILOVER_SLO_NS`]: its record plane, and with it the materialization of taken-over
+/// objects, runs each period as a fleet's does (R8).
+fn lone_fleet_node(tag: &str) -> Daemon {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+  let anchor = slates_server::deploy::host_id_of_certificate(cert.der());
+  let (_lease, [probe, record, _, _]) = four_free_ports();
+  let profile = profile(tag);
+  let instance = format!("{tag}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1))
+    .with_fleet(FleetMembership {
+      quorum: Quorum { f: 0 },
+      peers: Vec::new(),
+      host: member_id(anchor, 0),
+      origin_anchor: anchor,
+      domains: std::collections::BTreeMap::new(),
+      regions: std::collections::BTreeMap::new(),
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+    })
+    .with_failover_slo(SHORT_FAILOVER_SLO_NS);
+  let daemon = Daemon::start_with_fleet(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &instance),
+    },
+    Some(FleetTransport {
+      identity: Identity::from_der(
+        cert.der().clone(),
+        PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+      ),
+      name: NAME.to_owned(),
+      advertise: loopback(probe).into(),
+      serve: held_serve_sockets(loopback(probe), loopback(record)),
+      peers: Vec::new(),
+      resolver: None,
+      // A node with no peers and no enrollment roots runs no membership plane, and with it no record plane to
+      // materialize a takeover (`fleet::run_membership`); one that admits enrolled members does, as a fleet's first
+      // node does before its peers enroll.
+      enrollment_roots: vec![cert.der().clone()],
+    }),
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  daemon
+}
+
+/// What a taken-over green's adopted merge record says, for a green this fixture plants: version 3 of a green owned by
+/// uid 0 of `anchor`.
+fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRecordValue {
+  slates_server::merge_service::MergeRecordValue {
+    version: 3,
+    increment: [3; 32],
+    base: 2,
+    inputs: Some([4; 32]),
+    identity: [5; 32],
+    evidence: Vec::new(),
+    name: "planted-green".to_owned(),
+    require_evidence: false,
+    owner: slates_db::catalog::Principal::Uid {
+      host: anchor,
+      uid: 0,
+    },
+    // No request made the planted version (A-255's completion key is for a submit's resend).
+    completion: None,
+  }
+}
+
+/// Plants on `daemon`'s control shard a taken-over green awaiting materialization, as a takeover's adoption leaves one
+/// (`takeover::adopt`): its merge record, and, when `with_catalog`, its catalog register and that register's placement,
+/// so its next attempt waits on its chain instead.
+fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let object = ObjectId(PLANTED_GREEN);
+        let anchor = HostId(1);
+        let merge = planted_merge_record(anchor);
+        if with_catalog {
+          let catalog = slates_server::catalog::CatalogValue {
+            name: merge.name.clone(),
+            size: slates_db::catalog::SizeClass::Bounded { limit: 1 << 20 },
+            names: slates_db::catalog::NamePolicy::Exact,
+            owner: merge.owner.clone(),
+            require_locked: false,
+            access: Vec::new(),
+            live_shipped: false,
+            live_holders: None,
+            // A green, not a work's volume (A-255's route is a work's catalog naming its green).
+            work_of: None,
+          };
+          s.pending_catalogs.insert(object, (1, catalog));
+          s.placed_heads.insert(
+            object.catalog(),
+            slates_server::head::PlacedHead {
+              sequence: 1,
+              epoch: slates_db::register::HostEpoch(1),
+              placement: slates_db::register::Placement {
+                candidates: Vec::new(),
+                acked: Vec::new(),
+                mirror_acked: None,
+                joint: Vec::new(),
+              },
+            },
+          );
+        }
+        s.pending_green_materializations.insert(
+          object,
+          // No survivor reported its version: a planted green has no sources to fetch from.
+          slates_server::state::PendingGreen::adopted(merge, Vec::new()),
+        );
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// Asks `daemon` the status of the planted green each fleet period until it answers `NotRecovered`, for at most `periods`
+/// periods of wall time; the refusal it answered last.
+fn status_of_planted_green(daemon: &Daemon, periods: u64) -> Option<Refusal> {
+  let mut client = common::client::connect(daemon.instance());
+  let mut last = None;
+  // A channel nobody sends on paces the asks, as the lint wall wants.
+  let (_held, pace) = std::sync::mpsc::channel::<()>();
+  let started = Instant::now();
+  while started.elapsed() < Duration::from_nanos(HEARTBEAT_NS.saturating_mul(periods)) {
+    match client.status(VolumeId {
+      bytes: PLANTED_GREEN,
+    }) {
+      Err(slates_client::ClientError::Refused(refusal)) => {
+        let given_up = matches!(refusal, Refusal::NotRecovered { .. });
+        last = Some(refusal);
+        if given_up {
+          break;
+        }
+      }
+      other => panic!("the planted green's status answered {other:?}"),
+    }
+    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+  }
+  last
+}
+
+/// What `daemon`'s control shard counted of its taken-over greens (`merge.takeover*`), and whether the planted green is
+/// still pending there: for a failure's message.
+fn green_takeover_record(daemon: &Daemon) -> String {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      |s: &mut slates_server::state::ShardState| {
+        let counted: Vec<(String, u64)> = s
+          .refusals
+          .iter()
+          .filter(|(name, _)| name.starts_with("merge.takeover"))
+          .map(|(name, count)| ((*name).to_owned(), *count))
+          .collect();
+        let pending = s
+          .pending_green_materializations
+          .get(&ObjectId(PLANTED_GREEN))
+          .map(|pending| pending.attempts);
+        format!(
+          "counted {counted:?}; pending with attempts {pending:?}; coordinator periods {}",
+          s.merge.coordinator_period
+        )
+      },
+    )
+    .ok()
+    .and_then(|observation| observation.wait().ok())
+    .unwrap_or_else(|| "the control shard could not be asked".to_owned())
+}
+
+/// Shape: how many of the fleet's periods, as wall time, the bounded-green tests wait for the refusal: ten times the
+/// green's ten attempts, room for a loaded machine's late periods.
+const GIVE_UP_WITHIN_PERIODS: u64 = 100;
+
+/// The supervisor's order (2026-11-09): a taken-over green whose materialization waits on its catalog register, which
+/// is never adopted, is not retried without end. Do: on a one-node fleet with a one-second failover SLO, plant a
+/// taken-over green with its merge record adopted and no catalog register, as a round that lost the register would
+/// leave it; ask its status each period. Expect, within a hundred periods, `NotRecovered` naming `catalog`: the green given
+/// up on after its ten attempts. Before, every period counted `merge.takeover_waits_catalog` and retried, and its status
+/// answered no more than `NotFound`, for as long as the daemon ran.
+#[test]
+fn a_taken_over_green_whose_catalog_never_comes_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("green-no-catalog");
+  plant_taken_over_green(&daemon, false);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "catalog".to_owned()
+      }
+    }),
+    "the green is given up on within its bound, naming what it waited on ({record})"
+  );
+}
+
+/// The same order's second branch: a taken-over green whose chain is short of its adopted version (GAP-A9-7's
+/// ledger-prefix transfer, still owed) is not retried without end. Do: plant the green with its catalog register and
+/// that register's placement adopted, and none of its chain accepted here. Expect, within a hundred periods, `NotRecovered`
+/// naming `chain`. Before, every period counted `merge.takeover_incomplete` and retried for as long as the daemon ran.
+#[test]
+fn a_taken_over_green_whose_chain_is_short_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("green-short-chain");
+  plant_taken_over_green(&daemon, true);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "chain".to_owned()
+      }
+    }),
+    "the green is given up on within its bound, naming what it waited on ({record})"
+  );
 }
 
 /// A one-node fleet daemon whose transport holds an export listener and the operator's issuer (§4.6

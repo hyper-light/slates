@@ -1297,6 +1297,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-api"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "slates-anchor",
+ "slates-bridge-fuse",
+ "slates-bridge-nfs",
+ "slates-client",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-server",
+]
+
+[[package]]
 name = "slates-archive"
 version = "0.1.0"
 dependencies = [
@@ -1431,6 +1448,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "slates-anchor",
+ "slates-api",
  "slates-archive",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
