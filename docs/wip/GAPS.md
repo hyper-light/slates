@@ -354,6 +354,15 @@
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
 >   a reader).
 
+> **Every delta behind a whole state in flight was refused for credit, and each refusal shipped the volume whole again:
+> fixed (2026-11-18, A-371, §4.10 "Live shipping", AC-8.9; g230).** The live credit counted the whole entry the owner had
+> just appended, and the owner sets the credit from that entry's size, so deltas behind it were refused `NoCredit` until
+> it was durable and every refusal owed a whole state: the measurer's 32 writers on a 128 MiB volume saw two extra
+> whole records of about 135.5 MB a run. The credit now holds the deltas alone; a whole state rides one past it. Test:
+> `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+> - **Owed (the measurer's):** the 32-writer, 128 MiB run again (diag-measurer-7's harness): expect `fleet.live.whole`
+>   to stay 1 and fewer one-second steps.
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,

@@ -7322,6 +7322,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > was caught up in batches of several entries an exchange (`fleet.live.batches`, `fleet.live.batched`), where it had
 > been sent one entry an exchange.
 >
+> **A whole state in flight is not counted against the deltas (A-371, 2026-11-18; g230).** The credit counted every entry
+> not yet durable, the whole state the owner had just appended among them, and the owner sets the credit from that very
+> entry's size: so until a whole entry was durable every delta behind it was refused `NoCredit`, each refusal owed a
+> whole state again, and the volume shipped whole once more as soon as the credit freed. The measurer's 32 writers on one
+> 128 MiB live volume saw it as two extra whole records of about 135.5 MB in every completed run (1 became 3), each an
+> O(volume) build in one turn of the owner shard. A whole state now rides one past the credit as `append_checkpoint`
+> always said, and the credit a delta is held to counts the unsettled deltas alone (`Shipper::unsettled_whole_bytes`);
+> a whole state is still admitted only while everything in flight is within the credit, so at most the credit's deltas
+> and the whole states admitted past it are in flight. Held by `deltas_behind_a_whole_state_in_flight_are_admitted_within_
+> the_credit` (`crates/db/tests/live.rs`: a whole state of 64 KiB appended as the daemon appends it, then 4 KiB deltas
+> with nothing acknowledged: every delta within the credit admitted, the next refused, no second whole state, all settled
+> by the acknowledgement), red with the whole state counted. Owed (measurement): the 32-writer run's whole records and
+> step lengths again.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
@@ -26658,3 +26672,19 @@ Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crate
   "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
   daemon served) and `crates/api/tests/start.rs`
   (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
+
+### A-371 — A whole state in flight rides one past the live credit and never counts against the deltas behind it (2026-11-18, g230, scale-out; §4.10 "Live shipping"; AC-8.9; amends A-200's credit of 2026-11-17)
+Applied in the same change to:
+- §4.10 "Live shipping": A-371's status beside the credit in bytes.
+- `crates/db/src/live.rs`: `Shipper::unsettled` records whether each entry is a whole state;
+  `Shipper::unsettled_whole_bytes`; `Shipper::append` holds the deltas in flight, a whole state's bytes left out, to
+  the credit; the docs of `Bounds::credit`, `append` and `in_flight_bytes`.
+- Tests: `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** The credit counted every unsettled entry. The daemon appends a whole state past the credit and
+  then sets the credit from that state's size, so the whole state alone filled it: every delta until the whole state was
+  durable was refused, each refusal owed another whole state, and under sustained writes a large live volume shipped
+  whole again and again, each build one turn of the owner shard.
+- **The rule.** The credit holds the deltas in flight; a whole state rides one past it, admitted only while everything in
+  flight is within the credit, and is never counted against the deltas behind it.
+
