@@ -2759,7 +2759,8 @@ renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
-setting needed. Base files: a read-only `open` of an untouched base file is answered from
+setting needed, and, where its caller opts in, makes its namespace under slates' AppArmor profile for its
+executable, which an administrator loads (A-370, "The launcher on a restricted host" below). Base files: a read-only `open` of an untouched base file is answered from
 the daemon's descriptor on the backing file; `read` copies from the page cache into arena pages
 once and replies by reference, with splice where the kernel allows it; `mmap` of an untouched
 base file is served through the same pages. FUSE passthrough is not used: it requires
@@ -4616,12 +4617,64 @@ FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (D
 Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy. That includes
 a host whose AppArmor confines them (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`): `unshare`
 succeeds there, but the namespace gets no capability, so the launcher names that sysctl, or an AppArmor profile
-granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`).
+granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`). Since A-370 slates
+ships that profile and the launcher uses it only when its caller asks: asked and loaded, the namespace is made under
+it and the command runs outside it; not asked, the launcher leaves a loaded profile first and the refusal is the one
+above; asked and not loaded, the refusal names the profile's file and the command that loads it (below).
 `allow_other` requested but not permitted: Refused with the `/etc/fuse.conf` line. FSKit module
 not enabled: Refused with the exact System Settings path. Any separately selected limited
 NFS form reports its weaker semantics and cannot satisfy a full-POSIX request. Base
 file unreadable (permissions changed, base unmounted): Refused (`EIO` at the mount, `BaseUnavailable`
 in `status`) for that entry only.
+
+**The launcher on a restricted host (A-370).** Ubuntu 24.04 and 26.04 confine every unprivileged user namespace through
+AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`): `unshare` succeeds, then the process moves into the
+`unprivileged_userns` profile, which denies the namespace every capability, so the launcher can neither write its maps
+nor bind, whoever writes the maps (GAPS `8a-launcher-ci`). An AppArmor profile attached to the launcher's executable
+that grants `userns,` lifts this for that executable alone. Loading it needs root, so slates never loads it (R10) and
+never writes `/etc/apparmor.d` (R1). Ada's decision, 2026-11-18: "Ship the profile but feature flag it so whether via
+SDK (Node/Python), API, or CLI it is user enabled."
+- *The profile* (`slates_client::exec::profile`) is `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) {
+  userns, }`:
+  - It is named by the executable's real path, AppArmor's own convention. So it attaches to that path alone, two
+    executables on one host never share a name, and the launcher knows its own profile by its label.
+  - `flags=(unconfined)` mediates nothing else, the form Ubuntu's own `userns,` profiles take (`/etc/apparmor.d/chrome`
+    on the runners).
+  - A path the profile cannot name exactly is refused: one holding a character outside ASCII letters, digits and
+    `/ . _ - +` (AppArmor reads several as patterns, quotes, variables or separators), or an empty, `.` or `..`
+    component.
+  - It ships inside every release binary and SDK package, rendered for the executable's own path
+    (`slates apparmor profile`, `apparmor_profile(path)`, `apparmorProfile(path)`), not as a file naming one path: the
+    profile must name wherever the binary was put. `slates apparmor check` prints the root commands that save it as
+    `/etc/apparmor.d/<the path, each / a .>` and load it with `apparmor_parser -r`.
+- *The flag* is `AppArmor`, off unless the user opts in: `slates exec --apparmor-profile`, slates-api's
+  `ExecSpec::apparmor`, the SDKs' `apparmor_profile=True` and `{ apparmorProfile: true }`.
+  - **Off:** a launcher whose thread runs under its own profile writes `changeprofile unconfined` to
+    `/proc/thread-self/attr/apparmor/current` first. Its namespace then meets the host's restriction exactly as with no
+    profile, and the refusal names the switch.
+  - **On:** the namespace is made under the profile, then the launcher writes `exec unconfined` to
+    `/proc/thread-self/attr/apparmor/exec`. So the command runs unconfined, and a namespace the command makes itself is
+    restricted as any process's is. A refused write is a typed refusal, never a command run holding the grant.
+- *Who is restricted.* The restriction exempts a process holding `CAP_SYS_ADMIN` in its user namespace (root), whose
+  namespaces get their capabilities whatever the setting, so the launcher judges a refusal, and `slates apparmor check`
+  its readiness, by the restriction applying to it (`Confinement::restricted_here`), not by the setting alone.
+- *Who holds the grant.* A loaded profile labels every process of its executable. slates' own code uses the grant in
+  the launcher alone, there only when asked, and never in the command it runs. But any user who may run the executable
+  may use the grant through it (a preload or a debugger runs their code under its label), and on Ubuntu 24.04 any
+  unconfined process may enter a loaded profile by `change_profile` without running it at all, as it may enter the
+  user-namespace profiles Ubuntu itself loads (measured below). So loading the profile is an administrator's decision
+  that every user of the host may create user namespaces, as on a host without the restriction; the profile's header
+  and `docs/cli.md` say so.
+- *Rejected:*
+  - Entering a named profile with `change_profile` from unconfined (the `aa-exec` route). Ubuntu treats it as a bypass
+    of the restriction and closes it where `kernel.apparmor_restrict_unprivileged_unconfined=1`, Ubuntu 26.04's
+    default. Measured, diagnostics run 44349241634: on 26.04 the kernel logs "change_profile unprivileged unconfined
+    converted to stacking", the label is `slates-probe//&unconfined`, and the namespace is refused; on 24.04 (the
+    setting 0) any unconfined process enters the profile and maps itself root. Path attachment needs no such
+    permission.
+  - A profile in enforce mode, allowing the binary what it needs and moving its children into a capability-free
+    profile, as Ubuntu's `bwrap` profile does. It would confine the daemon and every verb too, and any mediation class it
+    missed would break them; the exec-time `exec unconfined` gives the command the same outcome without it.
 
 **Derived constants.** NFS fallback `actimeo` for writable volumes = k × measured GETATTR RTT
 (k from the multi-process coherence test); FUSE `max_background` and congestion threshold = shard
@@ -8249,7 +8302,8 @@ and `scripts/`; published raw by `slates skills install` into `.agents/skills/` 
 guidance.
 
 **CLI.** `slates daemon`, `slates status [--drift <volume>]`, `slates volume ...` (including
-`create --base <dir>`), `slates attach ...`, `slates exec` (Linux launcher), `slates archive ...`,
+`create --base <dir>`), `slates attach ...`, `slates exec` (Linux launcher; `--apparmor-profile`, A-370),
+`slates apparmor profile|check` (the launcher's AppArmor profile and the host's readiness, A-370), `slates archive ...`,
 `slates base rewitness|pin|read <volume> [paths]`, `slates land <snapshot> --to <dir> [--filter ...]`
 (plans and prints the landing manifest summary, then waits for a grant), `slates grant
 <request-id> [--session]` and `slates grant --watch` (the terminal confirmation surface: prints
@@ -10278,7 +10332,8 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 3. The `Bridge` trait implementation in the core; inode `(no, gen)`; invalidation on every
    mutation visible through another attachment; `fsync` semantics; `statfs`.
 4. `slates exec`: user+mount namespace, recursive-private root, bind mount, exec; AppArmor
-   detection and the exact remedy message.
+   detection and the exact remedy message; slates' AppArmor profile for a restricted host, used only when the caller
+   asks (A-370).
 5. Conformance: pjdfstest, fsx, fsstress in CI; xfstests generic and LTP nightly; the reviewed
    expected-failure list.
 6. Workloads: git, cargo, npm, python/pytest, rg, rsync, sqlite, editor patterns, inotify.
@@ -11553,7 +11608,7 @@ requested form. The virtio-fs backend, device residency and mapping matrix are P
 | macOS arm64 | 16 KiB pages; no superpages; `os_sync_wait_on_address` needs 14.4 (minimum version); thread affinity is a hint; QoS steers P/E |
 | macOS FSKit | 15.4+ for the framework; URL resources 26+ (15.x needs a block resource); one-time user enablement; sandboxed extension (app-group IPC only); Swift entry point; Operations (15.4–26) and Handler (27+) protocol generations; app-bundle packaging and signing |
 | macOS NFS fallback | no xattrs by default; no "forget"; weak close-to-open; `.nfs` temp files on delete-while-open; documented Degraded cells |
-| Linux kernel floors | 5.10 baseline through epoll; io_uring requires synchronous cancellation (6.0), with single-issuer deferred work on 6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+) |
+| Linux kernel floors | 5.10 baseline through epoll; io_uring requires synchronous cancellation (6.0), with single-issuer deferred work on 6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+; lifted for the launcher by slates' profile when asked, A-370, which needs the per-module `/proc/thread-self/attr/apparmor` of 5.8) |
 | Windows | `WaitOnAddress` process-local (named Events across processes); asyncio needs sockets; AF_UNIX creates NTFS reparse points (not used); directory mounts are reparse points (refused); large pages need `SeLockMemoryPrivilege` |
 | Stable Rust 1.98 | no nightly features; `RawWakerVTable` encodings; `std::thread::scope`; `OnceLock` |
 | Containers | io_uring may be blocked by seccomp: epoll fallback is first-class; `mlock` may be limited: probed and reported |
@@ -26658,3 +26713,52 @@ Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crate
   "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
   daemon served) and `crates/api/tests/start.rs`
   (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
+
+### A-370 — The launcher makes its namespace under slates' AppArmor profile where its caller asks, on a host that restricts unprivileged user namespaces (2026-11-18, goal g078 / kiln 7d8d1280; §4.6 "The launcher", "Failure matrix"; Ada's decision of 2026-11-18; GAPS `8a-launcher-ci`)
+
+- **What was wrong.** On Ubuntu 24.04 and 26.04 AppArmor confines every unprivileged user namespace
+  (`kernel.apparmor_restrict_unprivileged_userns=1`), so `slates exec` could not run unprivileged there: since
+  2026-11-05 it refused naming the setting and the two ways an administrator lifts it. Ada, 2026-11-18: "Ship the
+  profile but feature flag it so whether via SDK (Node/Python), API, or CLI it is user enabled."
+- **The rule.**
+  - slates renders an AppArmor profile for the launcher's executable that grants `userns,` and nothing else
+    (`flags=(unconfined)`), named by the executable's real path. An administrator loads it, as root: slates never does
+    (R10) and never writes `/etc/apparmor.d` (R1).
+  - The launcher uses it only when its caller sets the AppArmor option, off unless set, in every surface.
+  - Off, a launcher under its own profile leaves it before the namespace (`changeprofile unconfined`), so the host's
+    restriction applies as with no profile.
+  - On, the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so slates'
+    code uses the grant in the launcher alone.
+  - The refusals are typed (`ExecFault`); without the option and with no profile loaded, the refusal reads word for word
+    as before.
+- **Evidence.** Diagnostics run 44344947954 (2026-11-18, the launcher's sequence by a probe on `ubuntu-24.04`, AppArmor
+  4.0.1, and Ubuntu 26.04.1, AppArmor 5.0.2): the profile lets the sequence bind; the step-out restores the refusal;
+  the exec-time change leaves the command `unconfined` with its own `unshare -Ur` refused; a copy at another path is not
+  covered. Through the real binary, diagnostics run 44350784102 (`ubuntu-24.04` x86_64 and arm64, Ubuntu 26.04.1
+  x86_64): with no profile loaded the refusals, without the option word for word as before; with the binary's profile
+  loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
+  refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
+  loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+- **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
+  whole binary (§4.6, "The launcher on a restricted host", says why).
+- **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
+  carries the profile inside its binaries and the SDK packages, rendered for the executable's own path, not as a file
+  of its own naming one path.
+- **Applied in the same change to**
+  - `crates/client/src/exec.rs` (new: `ExecSpec` and its arguments, `AppArmor`, `profile`, `profile_file`,
+    `load_command`, `unload_command`, `label_name`), `crates/client/src/lib.rs`;
+  - `crates/api/src/exec.rs` (the launcher, moved from `crates/cli/src/exec.rs`: `run`, `confinement`, `check`,
+    `Readiness`, `ExecFault`, `judge_map_refusal`, `command`), `crates/api/src/role/mod.rs` (`role::main` serves `exec`),
+    `crates/api/src/lib.rs` (CONTRACT 24);
+  - `crates/cli/src/{args,main,apparmor}.rs` (`exec --apparmor-profile`, `apparmor profile [--executable PATH]`,
+    `apparmor check [--json]`), `crates/cli/src/exec.rs` removed;
+  - `crates/sdk-python/src/lib.rs` (`exec_command`, `apparmor_profile`), `crates/sdk-node/src/lib.rs`, `index.d.ts`,
+    `index.mjs` (`execCommand`, `apparmorProfile`);
+  - `unsafe-budget.toml` (the launcher's one block moved: slates-api 4 → 5, slates-cli 3 → 2);
+  - `.github/workflows/ci.yml` (the gates job's AppArmor step: both regimes on the runner);
+  - §4.6 (the launcher, the failure matrix, "The launcher on a restricted host"), §4.12 "CLI", Phase 3 task 4, Appendix
+    C, GAPS (`8a-launcher-ci` closed; the launcher row), `docs/cli.md`, `docs/library.md`, both SDK READMEs;
+  - tests: `crates/client/src/exec.rs`, `crates/api/src/exec.rs` and `crates/cli/src/args.rs` (the flag's plumbing and
+    judgement), `crates/cli/tests/cli.rs` (`the_launcher_uses_slates_apparmor_profile_only_when_asked`,
+    `apparmor_prints_the_profile_and_checks_the_host`), `crates/sdk-python/tests/test_exec.py`,
+    `crates/sdk-node/tests/sdk.test.mjs`.
