@@ -721,8 +721,10 @@
 > 2026-11-18, g083):** the green's content in sealed blocks (`slates_mem::sealed`), current files and history chunks
 > alike: a replica is made from the owner whole and reads the owner's blocks in place, holding no content of its own
 > (its current bytes are the owner's memory, by pointer, in the oracle); its replay adopts the owner's blocks in order,
-> checked byte for byte; the owner frees a released block once every replica has passed its release. **Owed, in
-> order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
+> checked byte for byte; the owner frees a released block once every replica has passed its release. A replica's
+> lifetime is bounded by its owner's: the owner's holder makes every replica leave before it gives the owner up
+> (`SealedBlocks::end`), and an owner dropped with one still registered frees nothing and is counted (Miri found a
+> test that never made its reader leave; the bug record of 2026-11-18). **Owed, in order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with

@@ -24992,8 +24992,12 @@ released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothi
 (`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
 (a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
 joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
-oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
-use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+oracle, which now holds every current file's bytes to be the owner's own memory. A replica's lifetime is bounded by
+its owner's (2026-11-18, found by Miri): the owner's holder makes every replica leave before it gives the owner up
+(`SealedBlocks::end`, refused while a reader is registered); an owner dropped with a replica still registered frees
+nothing, since the replica may still read, and is counted (`sealed::dropped_with_readers`; the bug record of
+2026-11-18, "a sealed-block writer dropped with a reader kept its blocks"). Its bounds (step 4) and the shards' use of
+it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
