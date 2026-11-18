@@ -413,7 +413,17 @@
 > the give-up existed), and at load 42 to 47 merged with main 58a37794c (given up after 100 attempts, the last waiting
 > on its chain). In both, d owned the green, and no node retired a work route (`fleet.work_route.retired` absent). Host
 > ids are drawn fresh each run, so it passes whenever another survivor is the successor (5 s at load 104, merged with
-> b7c294959). **Owed:** a deafened node that cannot be the green's successor.
+> b7c294959). **Fixed in the test 2026-11-18 (g251):** reproduced on main 3bfc4dd8a alone, 1 of 3 runs at load 8
+> (Adas-Mac-Studio, r906: d counted `merge.takeover_given_up` 1 after 100 attempts "waiting on its chain", and the
+> resend ended `OwnerUnreachable` after 467 s), the test now creates greens until one's successor is another survivor
+> (`green_not_taken_over_by`: rendezvous first among the owner's other candidates for the green, the configuration's
+> successor rule), so the round under test is d's location round, never GAP-A9-7's record half. **Sibling, open (a
+> product refusal):** in that run d, the successor that gave the green up, answered its own client's resend
+> `OwnerUnreachable` for the rest of the run (405 s), never the give-up's `NotRecovered`: its control shard routes the
+> green to itself as owned and unmaterialized (`verbs::owned_unmaterialized`, counted 65,460 times in 405 s, with 65,460
+> forwards bounced through the other four nodes), and the record of the give-up lives on the green's owner shard, which
+> that path never asks. A-304 answers a given-up volume on its owner shard; a verb that reaches a given-up green through
+> a work's location round still loops. Reproduction: the same test with the green chosen so that d is its successor.
 
 > **`slates land` keeps every `--include` and `--exclude` it is given (2026-11-17, §4.15 step 1).** The command line
 > kept the last value of each flag, so `--exclude /.git --exclude /target` landed `/.git` without a word, while the
