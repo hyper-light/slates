@@ -4265,15 +4265,19 @@ fn frozen_for_a_move(state: &mut ShardState, body: &RequestBody) -> Option<Reply
   Some(refused(Refusal::Overloaded { shard: state.shard }))
 }
 
-/// The gates a verb passes before it runs: the owner's lease, and for a work whose green lives on another shard its
-/// owner for a base or a verdict (A-247): the verb is parked until the answer comes, and its later verbs park behind
-/// it (`crate::work_home`).
+/// The gates a verb passes before it runs: its volume not frozen for a planned move (A-291), the owner's lease, and for
+/// a work whose green lives on another shard its owner for a base or a verdict (A-247): the verb is parked until the
+/// answer comes, and its later verbs park behind it (`crate::work_home`).
 fn gates(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
   body: RequestBody,
 ) -> LeaseGate {
+  // A volume frozen for a planned move answers only its status and the move itself (A-291).
+  if let Some(come_back) = frozen_for_a_move(state, &body) {
+    return LeaseGate::Answer(come_back);
+  }
   let body = match lease_gate(state, client_id, principal, body) {
     LeaseGate::Run(body) => body,
     answered @ LeaseGate::Answer(_) => return answered,
@@ -4338,9 +4342,6 @@ pub(crate) fn dispatch(
   if fenced.is_some() && !destroying {
     state.count(GREEN_FENCED, 1);
     return refused(Refusal::ContentUnavailable);
-  }
-  if let Some(come_back) = frozen_for_a_move(state, &body) {
-    return come_back;
   }
   let reply = dispatch_inner(state, client_id, principal, body);
   if let Some(volume) = fenced
