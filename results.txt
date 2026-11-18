@@ -1,0 +1,33 @@
+record dial late-start sweep (diag: the pinning test swept over how late the second and third nodes start -- diagnostics only, never on main: at one p) on Linux aarch64, 4 CPUs; 7.0.0-1017-azure
+commit 7d6fcd3294ea8d275ac283cc26e66bc4afc6133e, parent c27d323161abeb6c7ac220e0053714a35e248005
+== build: exit 0 in 81 s (build.log)
+late 667 ms run 1: pass in 2 s
+late 667 ms run 2: pass in 2 s
+late 667 ms run 3: pass in 2 s
+late 667 ms run 4: pass in 2 s
+late 667 ms run 5: pass in 2 s
+== late start 667 ms: 5 passed, 0 failed of 5
+late 2000 ms run 1: pass in 3 s
+late 2000 ms run 2: pass in 4 s
+late 2000 ms run 3: pass in 3 s
+late 2000 ms run 4: pass in 4 s
+late 2000 ms run 5: pass in 3 s
+== late start 2000 ms: 5 passed, 0 failed of 5
+late 5000 ms run 1: pass in 6 s
+late 5000 ms run 2: pass in 7 s
+late 5000 ms run 3: pass in 6 s
+late 5000 ms run 4: pass in 7 s
+late 5000 ms run 5: pass in 6 s
+== late start 5000 ms: 5 passed, 0 failed of 5
+late 10000 ms run 1: pass in 11 s
+late 10000 ms run 2: pass in 12 s
+late 10000 ms run 3: pass in 11 s
+late 10000 ms run 4: pass in 12 s
+late 10000 ms run 5: pass in 11 s
+== late start 10000 ms: 5 passed, 0 failed of 5
+late 15000 ms run 1: pass in 17 s
+late 15000 ms run 2: pass in 16 s
+late 15000 ms run 3: pass in 16 s
+late 15000 ms run 4: pass in 17 s
+late 15000 ms run 5: pass in 16 s
+== late start 15000 ms: 5 passed, 0 failed of 5
