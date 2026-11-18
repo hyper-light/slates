@@ -9347,13 +9347,18 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     sequence, and the named holder stayed empty while the head named it.
   - **A departed holder stayed named** (live-fixes, 2026-11-09): a head is never rewritten at its sequence, and a
     replacement put there is refused by the cohort members holding the head; a heal had no bound.
+  - **The first round's dispatch was stamped on another clock** (on main since the p95 hedge trigger; found by this
+    change's first green run): `first_round_at_ns` came from the dispatching shard's runtime-driver clock, which counts
+    from that shard's start, and the owner judged it by its host clock since boot. The hedge round was never held for
+    the measured p95, and with the heal's bound every heal unfinished after its first round ended at the next period.
 - **Fixed (A-276).** A heal restores exactly the named holders, all at once, and records nothing; a repair counts when
   its acknowledgement is folded, in its round or late (`fleet.heal.repaired_late`,
   `fleet.heal.refill_outlasted_round`); a named holder that left, or a placement naming fewer than `f + 1`, is replaced
   on the current cohort at the next sequence, its placement and the republished head one transaction
-  (`record_replacement`), and at `f = 0` nothing is healed (`heal_decision`); every heal ends at the membership
-  horizon (`fleet.heal.unfinished`); a round's and a straggler's acknowledgements fold only into the job put at their
-  sequence. Test support `Daemon::inject_content_ack_delay` makes the late acknowledgement deterministic. Bug record:
+  (`record_replacement`), and at `f = 0` nothing is healed (`heal_decision`); every heal ends once its content round's
+  whole span and a period have passed since its first round (`heal_bound_ns`, `fleet.heal.unfinished`), the first
+  round's dispatch stamped on the owner's clock; a round's and a straggler's acknowledgements fold only into the job put
+  at their sequence. Test support `Daemon::inject_content_ack_delay` makes the late acknowledgement deterministic. Bug record:
   `docs/bugs/2026-11-17-a-heal-miscounted-repairs-and-left-heads-naming-holders-without-the-content.md`.
 - **Open, reported and not changed:**
   - A named holder that is still a member but outside the object's current candidates (a neighbourhood change moved

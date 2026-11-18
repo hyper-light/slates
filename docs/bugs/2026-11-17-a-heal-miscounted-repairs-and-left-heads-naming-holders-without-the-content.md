@@ -18,12 +18,13 @@ The message did not say whether the holder held the content again. live-fixes' a
 first-ranked candidate first and placed there, a "two-loss" mechanism) was read from the code, never measured, and
 retracted on 2026-11-09: on three nodes every member holds the head, so the door refuses that candidate's put
 (`content_retention::admits`), and the test passed 3 of 3 on the old code (diag-live-fixes-66). Goal g248 found the
-cause by reading the round's collection rule and measured it; two siblings were found on the way, and live-fixes'
-unlanded replace (A-276, 6ec41144a, `origin/agents/live-fixes-1`) was taken over.
+cause by reading the round's collection rule and measured it; three siblings were found on the way (the last, a
+clock mismatch on main, by this change's first green run), and live-fixes' unlanded replace (A-276, 6ec41144a,
+`origin/agents/live-fixes-1`) was taken over.
 
 ## Root cause
 
-Three faults in the healer.
+Three faults in the healer, and a fourth under it.
 
 1. **A repair acknowledged after its round stopped collecting was never counted.** A content round's collection is
    bounded by its budget, whose base deadline is the hedge delay (the p95 of the owner's put readings) with one
@@ -48,6 +49,18 @@ Three faults in the healer.
    replace left the healer skipping the volume for good. Its cut recorded the placement and advanced the head as two
    records, the placement first: a refused advance or a kill between the two left the placement naming the new holders
    at the old sequence, a head value the holders refuse for good; found by reading this change.
+4. **The first round's dispatch was stamped on another clock** (a sibling on main, found by this change's first green
+   run). `put_seal_content` stamped `SealJob::first_round_at_ns` from `futures::now_ns()`, the dispatching shard's
+   runtime-driver clock, which counts from that shard's start (`nanos_since(epoch)` in each driver). `content_work`
+   judges it by the owner shard's `ShardState::clock`, the host's monotonic clock since boot. The owner's clock read
+   every first round as long past, so on main the hedge round to the remaining candidates was never held for the
+   measured p95 (`hedge_delay_ns`; §4.8 "hedged to the remaining candidates after the measured p95"), and it went out at
+   the next period whatever the p95. In this change's first cut every heal that did not finish in its first round
+   ended at the next period as unfinished, so the first round's late acknowledgement found no job and its repair was
+   never counted: the green arm of `a_repair_whose_acknowledgement_outlasts_its_round_is_counted` failed with
+   `fleet.heal.unfinished 4`, `fleet.heal.refill_outlasted_round 1` and `repairs Ok(0) → Ok(0)` (the Studio,
+   2026-11-17). live-fixes' bound, the membership horizon (900 ms at the default beat), was also shorter than the span
+   a round's own replies may take (1.1 s at least).
 
 ## Impact
 
@@ -55,6 +68,9 @@ Three faults in the healer.
    the test failed under load though the holder was restored.
 2. and 3. A head named a holder without the content. After the owner's death a successor fetches from the holders the
    head names, so the volume had one copy fewer than `f + 1` named, and one further loss lost it.
+4. On main, every seal hedged to all remaining candidates one period after its first round, however slow the measured
+   puts: more puts than the design's trigger sends whenever the p95 exceeds a period (a mirror over a long path, a
+   loaded fleet), never fewer copies.
 
 ## Evidence
 
@@ -74,8 +90,11 @@ on one machine, for each test; and the original test under CPU contention.
   - `start_seal`: a restore's placement is the named holders (`Placement::of`); a replace puts at the head's sequence
     plus one (`SealJob::put_sequence`; `fleet.heal.epoch_exhausted` at the largest).
   - `seal_complete`, `restoring`: a restore is complete once every holder it restores holds the content.
-  - `content_work`: a restore offers to every named holder at once; a complete job waits for its record; every heal is
-    bounded by the membership horizon (`fleet.heal.unfinished`).
+  - `content_work`, `heal_bound_ns`: a restore offers to every named holder at once; a complete job waits for its
+    record; every heal is bounded by its content round's whole span and a period from its first round
+    (`fleet.heal.unfinished`), so the first round's every acknowledgement is folded before it can end.
+  - `put_seal_content`: the first round's dispatch is stamped on the owner shard's clock, the one `content_work` judges
+    by (see root cause 4).
   - `put_seal_content`, `fold_round`, `fold_content_ack`, `fold_late_content`: a restore's refilled holders are kept on
     the job, and a holder's first acknowledgement after a refill is one repair however it arrives
     (`fleet.heal.repaired_late`; `fleet.heal.refill_outlasted_round` for the refills a round did not collect); a round's
@@ -100,6 +119,14 @@ on one machine, for each test; and the original test under CPU contention.
 - The mirror has no healer (AC-8.15; GAPS, open).
 - A takeover's re-commit and a neighbourhood change re-place content under a new holder set (GAPS, open; owed a test of
   this shape).
+- The two clocks, swept 2026-11-17 over `crates/server/src` (110 runtime-driver readings, 133 host-clock readings). A
+  runtime driver's clock counts from its own shard's start, the host clock from boot. Every other stored driver stamp is
+  written and judged in one shard's own state on that shard: the death watch and death reports
+  (`death_watch_started_ns`, `death_reports`), a dropped record session (`dead_session_dropped_at`), the learner
+  fetch's ask (`learner_fetch.asked_at_ns`), a live volume's lanes, the FUSE and WinFSP told-waits, and the NFSv4
+  recalls. A content round's late acknowledgement is timed from `LateReplies::Content::dispatched_ns` on the
+  dispatching shard, where the round's dispatch settles. The database is handed the host clock throughout. Only
+  `first_round_at_ns` crossed shards and clocks.
 - The other straggler folds, read 2026-11-17. A late council, root or configuration-fetch reply folds through the same
   function as one collected in its round (`fold_late_replies`: `fold_reply`, `adopt_fetch`). A mirror shipment's late
   acknowledgement is folded and counted apart (`mirror::fold_late_acks`, `fleet.mirror.records_acked_late`), and

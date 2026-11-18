@@ -6048,9 +6048,10 @@ head's sequence plus one, which every holder's door admits as ahead of its recor
 (`content_retention::admits`), and records that placement together with the same head snapshot
 advanced to that sequence, as one record; the next record period ships a head there naming holders
 that hold the content. A placement naming fewer than f+1 holders is replaced the same way; at f = 0
-the owner's own copy is the whole placement, and there is nothing to heal. Every heal is bounded by
-the membership horizon from its first round; one that has not finished by then ends, counted, and a
-later step heals the volume again. Cold sealed content (a
+the owner's own copy is the whole placement, and there is nothing to heal. Every heal is bounded from
+its first round by its content round's whole span and one period, so its first round's every
+acknowledgement is folded first; one that has not finished by then ends, counted, and a later step
+heals the volume again. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
@@ -20575,9 +20576,17 @@ Applied in the same change to:
     placement. The decision is one pure function (`heal_decision`), unit-tested at `f = 0` and on a fleet. live-fixes'
     cut replaced any placement naming no remote holder, which on a one-node fleet (`f = 0`, a supported configuration)
     would have advanced the head's sequence by one at every healer step, for good; found by reading this change.
-  - **Bound.** Every heal is bounded by the membership horizon (`lease::horizon_ns`) from its first round, judged only
-    once its content is not yet where it must be. One past it ends, counted `fleet.heal.unfinished`, and a later step
-    takes the volume up again.
+  - **Bound.** Every heal is bounded from its first round by its content round's whole span (the longest deadline each
+    holder task of a round waits under, derived from the measured round-trip tails) and one period, in which a reply
+    that came at the span's end is folded (`heal_bound_ns`), judged only once its content is not yet where it must be.
+    One past it ends, counted `fleet.heal.unfinished`, and a later step takes the volume up again. live-fixes' cut
+    bounded it by the membership horizon (`lease::horizon_ns`, 900 ms at the default beat), shorter than the span its own
+    rounds' replies may take (1.1 s at least), so a first round's late repair could be lost with its job.
+  - **One clock.** The first round's dispatch is stamped on the owner shard's clock (`ShardState::clock`), the one the
+    hedge delay and the bound are judged by. It was stamped from the dispatching shard's runtime-driver clock, which
+    counts from that shard's start, so the owner's clock read every first round as long past: the hedge round was never
+    held for the measured p95 (a pre-existing fault since the p95 trigger, here a sibling found and fixed), and every
+    heal that did not finish in its first round ended at the next period, unfinished, its late repair uncounted.
   - **Folds.** A round's acknowledgements, and a straggler's, fold only into the job they were put for: the same
     snapshot at the same put sequence.
 - **Why one record for the replace.** Recorded apart (live-fixes' cut), the placement was recorded first and the

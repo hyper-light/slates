@@ -161,7 +161,8 @@ content in the named holder's place; and a holder that left stayed named, since 
 sequence. Now a heal **restores** exactly the holders the placement names that are candidates, all at once, ends once
 each holds the content and records nothing; a repair counts whenever its acknowledgement is folded; a placement naming a
 departed holder, or fewer than `f + 1`, is **replaced** on the current cohort at the next sequence and recorded with the
-head republished there, as one transaction; and every heal ends at the membership horizon. §4.10 and A-276 in
+head republished there, as one transaction; and every heal ends once its content round's whole span and a period have
+passed since its first round. §4.10 and A-276 in
 `SLATES_DESIGN.md` hold the rule and its measurements.
 
 **Probation** (the design's "puts a repeatedly late candidate on probation for the group to replace";

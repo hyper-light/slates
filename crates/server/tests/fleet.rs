@@ -10719,8 +10719,8 @@ fn heal_republishes_once_a_named_holder_has_left(live: bool) {
 }
 
 /// §4.10 "the healer"; banned item 8 (every retry loop bounded): a heal that replaces a departed holder and whose every
-/// put is refused ends at the membership horizon, counted, and the volume is healed on a later step once the refusal
-/// lifts. Do seal a snapshot on a five-node `f = 1` fleet, have every member but the owner refuse content puts, stop the
+/// put is refused ends at its bound (its content round's whole span and a period), counted, and the volume is healed on
+/// a later step once the refusal lifts. Do seal a snapshot on a five-node `f = 1` fleet, have every member but the owner refuse content puts, stop the
 /// remote holder the head names and let the survivors retire it; then lift the refusal. Expect the owner to count
 /// `fleet.heal.unfinished` while the refusal holds, and after it lifts to republish the head naming members that hold
 /// the content. Before, a replace that could not place stayed open for good and the healer skipped the volume while it

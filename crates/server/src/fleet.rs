@@ -3154,9 +3154,9 @@ const HEAL_NAMED_SHORT: &str = "fleet.heal.named_short";
 /// Format: a refusal name in the daemon's status report.
 const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates";
 
-/// The status count under which the healer records a heal that ran the membership horizon without finishing (every
-/// put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later step,
-/// so one stuck heal never leaves the healer skipping the volume (banned item 8; A-276).
+/// The status count under which the healer records a heal that ran its bound ([`heal_bound_ns`]) without finishing
+/// (every put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later
+/// step, so one stuck heal never leaves the healer skipping the volume (banned item 8; A-276).
 /// Format: a refusal name in the daemon's status report.
 const HEAL_UNFINISHED: &str = "fleet.heal.unfinished";
 
@@ -3558,6 +3558,19 @@ fn content_budget_at(hedge_delay: u64, round: CommitBudget) -> CommitBudget {
   )
 }
 
+/// Derived: how long a heal may run from its first round before it ends unfinished ([`content_work`]): its content
+/// round's whole span (`budget`'s longest deadline, the bound each holder task of a round waits for its reply under) and
+/// one coordinator period, in which a reply that came at the span's end is folded (the coordinator settles its rounds'
+/// stragglers once a period). So every acknowledgement of the first round is folded into the job before the job can
+/// end, a repair among them, while a heal that cannot finish (every put refused, a holder unreachable) still ends and a
+/// later healer step takes the volume up again (banned item 8). The span follows the measured round-trip tails the
+/// round budget is derived from, so the bound stretches with load as the rounds do. live-fixes' cut bounded a heal by
+/// the membership horizon (`lease::horizon_ns`, 900 ms at the default beat), a liveness bound shorter than the span its
+/// own rounds' replies may take (1.1 s at least).
+fn heal_bound_ns(budget: &CommitBudget) -> u64 {
+  budget.max_deadline_ns().saturating_add(HEARTBEAT_NS)
+}
+
 /// Folds one holder's bound content acknowledgement into `job` — the same merge whether it arrived in the
 /// round that dispatched it or later, as a straggler ([`LateReplies::Content`]); the placement is the
 /// distinct acknowledging candidates, so a repeat is inert. Returns whether the fold is a **repair**: the first
@@ -3621,15 +3634,15 @@ fn content_work(
   if seal_complete(job, quorum) {
     return None;
   }
-  // Every heal is bounded by the membership horizon from its first round, judged between rounds (its archive home), so
-  // no round in flight loses its job. A heal past it ends unfinished and is counted: the job is dropped, so a later
-  // healer step comes back to the volume rather than skipping it while a job that cannot finish stays open (a replace
-  // whose every put was refused stayed open for good, 2026-11-09; A-276).
+  // Every heal is bounded from its first round ([`heal_bound_ns`]), judged between rounds (its archive home), so no
+  // round in flight loses its job. A heal past it ends unfinished and is counted: the job is dropped, so a later healer
+  // step comes back to the volume rather than skipping it while a job that cannot finish stays open (a replace whose
+  // every put was refused stayed open for good, 2026-11-09; A-276).
   let overdue = job.healing
     && job.archive.is_some()
     && job
       .first_round_at_ns
-      .is_some_and(|first| now.saturating_sub(first) > crate::lease::horizon_ns());
+      .is_some_and(|first| now.saturating_sub(first) > heal_bound_ns(&budget));
   if overdue {
     seal_jobs(state, track).remove(&object);
     state.count(HEAL_UNFINISHED, 1);
@@ -3785,7 +3798,14 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     quorum,
     ..
   } = work;
+  // How long the round has been out, on this shard's own clock: the owner stamps the dispatch on its clock from it.
+  // A runtime driver's clock counts from that shard's own start, while the owner judges the hedge delay and a heal's
+  // bound by its `ShardState::clock` (`content_work`), the host's monotonic clock. Until 2026-11-17 this shard's driver
+  // reading was stamped as it was, the owner's clock read every first round as long past, so the hedge round was never
+  // held for the measured p95, and a heal that did not finish in its first round ended at the next period.
+  let outstanding_ns = futures::now_ns().saturating_sub(dispatched_ns);
   crate::xshard::run_on_counted(origin, shard, move |s| {
+    let dispatched_on_owner_ns = s.clock.monotonic_ns().saturating_sub(outstanding_ns);
     for (_, latency_ns) in &latencies_ns {
       match track {
         Track::Home => s.put_latency.record(*latency_ns),
@@ -3803,7 +3823,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     }
     job.archive = Some(archive);
     if round == 0 && job.first_round_at_ns.is_none() {
-      job.first_round_at_ns = Some(dispatched_ns);
+      job.first_round_at_ns = Some(dispatched_on_owner_ns);
     }
     let Some(fold) = fold_round(job, placement, &refilled, quorum) else {
       return;
