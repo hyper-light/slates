@@ -1,0 +1,32 @@
+# DIAG (not for main): live_chaos every flow capped, then the nemesis at three seeds, on Linux x86_64 and arm64 (after A-343,
+# A-344, A-346), release, one flow at a time.
+name: diag-integrator-chaos4
+on:
+  push:
+    branches: ['diag-integrator-chaos4-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  chaos-flows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: Every flow, capped, then the nemesis seeds
+        run: bash .github/diag-integrator-chaos4.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-results-${{ matrix.os }}
+          path: target/chaos-*
