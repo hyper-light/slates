@@ -2502,9 +2502,10 @@ extern "C" fn rename(
 }
 
 /// Serves a hard link the patched driver forwards (A-360) on the receive worker, which takes it before WinFsp's DLL: the
-/// DLL has no case for `FileLinkInformation` (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`). Every access
-/// check a rename's replace makes in the DLL (`FspFileSystemRenameCheck`) passes on this drive, whose objects all carry
-/// [`EVERYONE_SDDL`]'s descriptor, so none is made here either.
+/// DLL has no case for `FileLinkInformation` (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`). The drive's
+/// objects all carry one descriptor (A-350, `drive_security_descriptor`), so a caller that opened the file holds the
+/// same access over the new name's directory and the name it replaces, and none of the checks a rename's replace makes
+/// in the DLL (`FspFileSystemRenameCheck`) is made here.
 ///
 /// # Safety
 ///
