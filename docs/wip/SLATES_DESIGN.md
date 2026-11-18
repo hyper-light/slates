@@ -9645,6 +9645,122 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > (stage 2); a name whose kind changed lands as a removal and a making that the class order meets as `TypeChanged`;
 > a symlink pointed elsewhere does not land over the old one, as an overlay's does not (GAPS, g267).
 
+**An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
+of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
+stores, and an agent's workspace over such a tree needs no copy of it on the runner's disk. The base is read-only,
+live, and judged as a host directory's base is; a landing never writes S3 (a landing's target is a host directory
+under a grant, as ever). Part 1, this design and its pure core, is built; the network client (part 2) and the base
+host with its simulated oracle (part 3) follow, each its own piece (GAPS A-464).
+
+*Sources* (primary, fetched 2026-11-18; tier B): S3's API reference for `ListObjectsV2`, `GetObject`, `HeadObject` and
+the `Object` type (`docs.aws.amazon.com/AmazonS3/latest/API/API_<Action>.html`); S3's user guide for object keys
+(`userguide/object-keys`) and its consistency model (`userguide/Welcome`, "Amazon S3 data consistency model"); S3's
+SigV4 page (`developerguide/sig-v4-header-based-auth`, with its four worked examples) and IAM's
+(`IAM/latest/UserGuide/reference_sigv-create-signed-request`). AWS's SDK behaviour is tier C and flagged where used.
+
+*What S3 promises, and what the base takes from it.*
+- **Listing.** `ListObjectsV2` (`GET /?list-type=2`) returns up to 1,000 entries a page (`max-keys`' ceiling and
+  default). With `delimiter=/` and a directory's prefix, a page's `Contents` are the files directly in that directory
+  and its `CommonPrefixes` its subdirectories, which is the host's `list(dir)` exactly, so a directory is listed when it
+  is first looked up, never the whole bucket at creation (§4.15 "Live source": a live overlay identifies its source
+  without walking it). A page with `IsTruncated` true names a `NextContinuationToken`, which the next request sends as
+  `continuation-token` until a page is not truncated. Keys are asked `encoding-type=url`, since XML 1.0 cannot carry
+  every character a key may hold (the API reference's own reason), and decoded as form values (`+` a space: AWS's SDKs
+  decode so, botocore's `unquote_plus`, tier C). Keys come in UTF-8 binary order.
+- **Reading.** `GetObject` with `Range: bytes=first-last` answers `206` with the bytes and `Content-Range`; S3 serves
+  one range a request. `If-Match: <ETag>` answers `412 Precondition Failed` when the object's ETag is another, and
+  `versionId` names one version of a versioned bucket. `HeadObject` answers the size, the ETag, `Last-Modified` and
+  `x-amz-version-id` without the bytes. A key that does not exist answers `404` (`NoSuchKey`).
+- **Identity.** "The ETag reflects changes only to the contents of an object, not its metadata", and may or may not be
+  an MD5 digest (the `Object` type), so the base treats it as opaque: equal ETags mean equal content, a changed ETag a
+  replaced object. `LastModified` is "the creation date of the object": an object is never changed in place, only
+  replaced whole ("updates to a single key are atomic", the consistency model).
+- **Consistency.** S3 gives "strong read-after-write consistency for PUT and DELETE requests", listings included: a
+  read or a listing after a successful write sees it.
+- **Keys.** A key is up to 1,024 bytes of UTF-8, case-sensitive, and may hold `.` and `..` segments, which S3 itself
+  warns are resolved differently by different tools (the object key guide).
+
+*The base plane's promise over S3.*
+- **Read-only.** The base host reads (list, head, get); nothing in it can put or delete an object.
+- **A key is a path or is refused.** The keys under the base's prefix are mapped to a POSIX tree by `/`
+  (`slates_base::s3::keys`): a key ending in `/` is a directory of its own and the prefix's own key the root's; a key
+  with an empty, `.` or `..` component, a NUL, a component past `NAME_MAX` or a length past S3's 1,024 bytes is refused
+  by its kind; a file whose path a directory takes (the key `a` beside `a/b`, which S3 allows and a tree cannot) is
+  refused `Shadowed`, the directory standing, whichever was listed first. A refused key is counted and named in the
+  base's report, never dropped in silence, never renamed into another path, so no key leaves the base or aliases
+  another.
+- **An outsider's change is seen as on a disk.** An untouched base file is bound to the object it was made from (A-151):
+  its fingerprint carries the base's identity (`dev`), the inode number the base plane gives the key, the size,
+  `Last-Modified` as its times, and the object's identity as its birth (its version id where the bucket is versioned,
+  else its ETag), so a replaced object is a new file, as a replaced disk file is, and its inode is never refreshed onto
+  the new bytes. Every ranged read of a base file carries `If-Match` with the ETag it was made from (or names its
+  version), so a replacement between reads answers `412` and never mixes two objects' bytes in one file: the 412 is the
+  base plane's drift, adopted as A-151 adopts a replaced file, and adopting it marks every copy a client maps stale
+  (A-163: every way the served bytes change without a write must reach the copy). A relist of a directory (on its next
+  lookup, as the host's fingerprint of a directory decides) finds new and deleted keys. A deleted object is a missing
+  base entry: absent from its listing, `404` on a read, as a deleted disk file is `ENOENT`.
+- **Pinning and capture.** `pin` and `capture_base` work as over a directory: a captured file's witness is the BLAKE3 of
+  the bytes read under one ETag, so a capture is consistent per object; across objects it is as a directory's, the
+  caller's quiescence (`capture_base`).
+
+*Signing.* Every request is signed with AWS Signature Version 4 (`slates_base::s3::sigv4`): the canonical request
+(the method; the key's path encoded once and never normalized, `/` kept; the query's names and values encoded and
+sorted; the headers lower-cased, trimmed, their runs of spaces made one, sorted; the names signed; the payload's
+SHA-256), the string to sign (the algorithm, the time, the scope `YYYYMMDD/region/s3/aws4_request`, the canonical
+request's SHA-256), the HMAC-SHA256 key chain and the signature, held to the S3 page's four worked examples as golden
+vectors. A temporary credential's session token rides `x-amz-security-token` and is signed with the rest. SHA-256 and
+HMAC are aws-lc-rs's, the workspace's one cryptographic library.
+
+*Credentials.* They come only from where Mantle hands them, through kiln and the library, at the volume's creation and
+again when they are rotated. They are held in RAM by the volume's owner shard and, across a daemon's restart, by the
+anchor as it holds the launcher's secret: never in a catalog or completion record, an audit record, a log line or a
+core dump (the roles exclude themselves from dumps), never on disk. A credential's `Debug` shows its access key id
+alone. An expired or refused credential (`403`) makes base reads refuse typed until a fresh one is handed; the
+overlay's own entries are served meanwhile.
+
+*Runtime and network (D-9, R6).* No external runtime: the S3 client is a task of the volume's owner shard on slates'
+runtime, over its TCP and TLS (rustls over aws-lc-rs, as the transport's handshake), the server's certificate verified
+against the platform's trust roots, an endpoint over plain HTTP allowed only on loopback for a test's store. HTTP/1.1
+is slates' own bounded codec, a response's head and body each checked against their caps before they are held. It
+lives in the base crate, which the lint wall lets read the network and links no write call. The `HostFs` seam is
+synchronous; the S3 host answers it from a RAM cache of listings and fetched ranges, and a miss is a typed pending
+answer on which the request is parked and run again when its fetch lands, by the deferred replies the image verbs and
+the direct map already use (part 3, with its oracle).
+
+*Bounds, each derived (R3).*
+- A listing page is refused past `page_cap(max_keys)` before it is parsed: each entry a key at its longest encoding
+  (1,024 bytes × 3) and an entry's markup, the page's own markup and its long fields (`slates_base::s3::list`), 4.9 MiB
+  for a thousand keys.
+- A range is the volume's chunk (the copy-on-write unit, §4.5), so a fetched range lands as one window; read-ahead is
+  the measured bandwidth-delay product, as the transport's windows are (part 2 measures it).
+- The cache of fetched ranges and listings is RAM the shard holds and is charged and shed as content is, under the
+  shard's admittable room.
+- A retry follows only S3's retryable answers (`500`, `503` `SlowDown`), with jittered exponential backoff, within the
+  liveness budget (`LIVENESS_BUDGET_NS`); past it the read is refused `BaseUnavailable`, and every other answer is typed
+  at once (`404` missing, `403` denied, `412` drift).
+- Connections are at most one per fetch in flight on the shard, and fetches at most the shard's parked requests.
+
+*Laptop ≡ fleet (R8).* One code path. The base's identity (endpoint, region, bucket, prefix, addressing style) is in
+the volume's catalog record and travels with it; a credential never does: each node holds the one its own hand-off
+gave it, kiln handing it to every runner that may own the volume. A node that holds none serves the overlay's own
+entries and refuses base reads typed. The N=1 differential covers the S3 host through its simulated store (part 3:
+`SimS3`, an in-RAM bucket with an outsider's put and delete and a controllable clock, as `SimHost` is a directory's).
+
+*Nothing is written to disk (R1).* No cache file, no temporary file, no credential file; TLS session state is RAM.
+
+> **Status (2026-11-18, A-464 part 1: the design and its pure core).** Built in `crates/base/src/s3` (cfg-free, no I/O):
+> `sigv4` (the signing, held to the S3 page's four worked examples, IAM's header rules, `UriEncode`'s classes, a session
+> token signed and never shown, a malformed time or region refused), `list` (a `ListObjectsV2` page: the API reference's
+> sample pages, an encoded truncated page, and every hostile shape refused by its kind: past its cap, not UTF-8, a
+> document type, a comment, CDATA, a stray processing instruction, nesting past the syntax, a foreign root, mismatched
+> tags, text outside the root, bad entities, bad numbers, a missing or doubled field, too many entries, a truncated page
+> without its token, a bad encoding; cut short anywhere it is refused; any bytes, never a panic) and `keys` (the tree
+> and one directory's delimited listing: escapes, aliases, a NUL, long names and keys, outsiders and shadowed files
+> refused by kind, whatever the order). Owed: part 2, the network client over the shard's runtime (TCP, TLS, HTTP/1.1,
+> the retry and the measured read-ahead) with its real-store run against a local S3-compatible store; part 3, the
+> `HostFs` implementation, its parked misses and `SimS3`, its oracle, and the library's way to name an S3 base and hand
+> its credential.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -31669,3 +31785,49 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
 - **Owed.** Step 5b: a work's rebases and named-version reads served from its shard's replica, and a refused or
   evicted replica's routed to the owner, counted; then an idle replica's give-back; then the supervisor's A/B at 1,000
   clients and more. Main's runs: the server's green suites and the merge crate whole.
+
+### A-464 — An overlay's base read from S3 objects: the design and its pure core (2026-11-18, goal g268; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.9 hostile input; D-9, R1, R3, R6, R8; A-151, A-163)
+Applied in the same change to: §4.15 (the subsection "An S3 base" and its status); `crates/base` (the module `s3`:
+`sigv4`, `list` and `keys`, each with its tests; `aws-lc-rs` a dependency, for SHA-256 and HMAC-SHA256); GAPS
+(2026-11-18).
+
+- **Why.** Kiln keeps every byte it holds on Mantle, and Mantle keeps them in S3-compatible object stores (CP-T10.5).
+  An agent's workspace over such a tree was an overlay over a host directory, so the tree had to be copied to the
+  runner's disk first. An overlay whose base is the objects themselves needs no copy.
+- **The shape.** §4.15's base plane over S3: a directory listed lazily by a delimited `ListObjectsV2`, a file read by
+  ranged `GetObject` bound to the object it was made from by `If-Match` (or its version id), a replaced object a new
+  file (A-151) and its drift reaching every mapped copy (A-163), a deleted object a missing entry, a key that names no
+  POSIX path refused by its kind. Every request signed with SigV4; credentials Mantle's, in RAM, never logged or
+  recorded or written; no external runtime (rt's TCP, rustls over aws-lc-rs, slates' own HTTP/1.1); every bound derived.
+- **Why from the sources.** Each rule above cites the page it rests on (fetched 2026-11-18, tier B): the listing's
+  pagination and encoding, the read's range and precondition, the ETag's meaning ("reflects changes only to the
+  contents"), the creation-time meaning of `LastModified`, the strong consistency of reads and listings after a write,
+  the key's 1,024 bytes and its `.` and `..` segments, and SigV4's canonical form and key chain. The one tier-C rule is
+  flagged where it is used: a listing's encoded keys are decoded as form values, as AWS's SDKs do.
+- **Built (part 1).** The pure core, cfg-free, every host alike: the signing held to the S3 page's four worked examples
+  (GET Object with a range, PUT Object with a `$` in its key, GET Bucket Lifecycle's subresource, List Objects' sorted
+  query: canonical request, string to sign, signature and `Authorization` header, character for character); the
+  `ListObjectsV2` page reader (a small iterative XML reader for what S3 sends, no document type, entity declaration,
+  comment, CDATA or stray processing instruction honoured, every field typed, the page's length checked against its
+  derived cap before a byte is parsed); and the keys' tree.
+- **Rejected.** An XML library: S3's listing is a fixed shape of a handful of elements, and a general reader brings
+  document types and entity expansion that a hostile page could use; the reader here refuses both outright, and its
+  every refusal is tested. Mapping a refused key to an escaped name: it would make a path S3 never named and that a
+  landing or a later listing could collide with; a refused key is named in the base's report instead.
+- **Owed.** Part 2: the network client over the shard's runtime (TCP, TLS with the platform's roots, HTTP/1.1 with
+  bounded heads and bodies, S3's error documents read by the same rules, the retry within the liveness budget, the
+  read-ahead from the measured bandwidth-delay product) and its run against a local S3-compatible store. Part 3: the
+  `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and the N=1
+  differential, the library's way to name an S3 base and hand its credential, and the anchor's hold of the credential
+  across a restart. A page's continuation tokens are assumed no longer than an encoded key in its cap (S3 calls them
+  obfuscated and states no length); part 2's run measures them.
+- **Evidence (Mac Studio, 2026-11-18, debug, kiln r389 and the red check after it).**
+  - `cargo test --locked -p slates-base --lib -- s3`: 14 of 14 in 0.08 s. The four worked examples sign as the S3 page
+    gives, character for character. IAM's header rules, `UriEncode`'s classes and a session token sign as stated, and
+    the secret and token never show. A malformed time or region is refused. The API reference's sample pages read as
+    they say; an encoded, truncated page decodes its keys and keeps its token; twenty hostile pages are each refused
+    by their kind; a page cut short anywhere is refused, and arbitrary bytes never panic (proptest). The keys' tree and
+    one directory's listing place what names a path and refuse the rest by kind, whatever the order.
+  - Red once each: with `$` taken for unreserved, the PUT example's canonical request differed from the page's (the
+    golden vectors); with `<!` passed over, the hostile pages' document type was not refused as unsupported; with
+    `..` taken for a name, the escape `../etc/passwd` was placed.

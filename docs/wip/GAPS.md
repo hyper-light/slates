@@ -11352,6 +11352,31 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; parts 2 and 3 owed)
+
+> - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
+>   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
+>   reaches every mapped copy (A-163), a deleted object a missing entry, every request SigV4-signed, credentials in RAM
+>   only, no external runtime, every bound derived, laptop ≡ fleet. From S3's API reference and guides, fetched
+>   2026-11-18.
+> - **Built (part 1, the pure core in `crates/base/src/s3`).** `sigv4` (held to the S3 signing page's four worked
+>   examples), `list` (a `ListObjectsV2` page, its cap checked before parsing, every hostile shape refused by kind) and
+>   `keys` (the tree and one directory's listing, every key that names no path refused by kind). Proven (Mac Studio,
+>   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
+>   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
+>   passed over, `..` a name).
+> - **Owed.**
+>   - Part 2: the network client over the shard's runtime (rt TCP, rustls over aws-lc-rs with the platform's roots,
+>     HTTP/1.1 with bounded heads and bodies, S3 error documents, the retry within `LIVENESS_BUDGET_NS`, the
+>     read-ahead from the measured bandwidth-delay product), run against a local S3-compatible store.
+>   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
+>     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
+>     credential across a restart.
+>   - The listing page cap assumes a continuation token no longer than an encoded key (S3 states no length): measured
+>     in part 2.
+>   - The cross-target lint of `slates-base` with its new `aws-lc-rs` dependency (Windows through `cargo xwin`, the
+>     Linux targets): main's.
+
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 
 > - **Built.** `Instance::import_archive` (contract 40): a new volume holding the tree of the archive a volume of the
