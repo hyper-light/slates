@@ -545,3 +545,9 @@ slates daemon: instance fsb-1105-1-nowake serving on 1 shards under the anchor
 slates-server: shard 0 initialized in 3288 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 2321 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 73 µs yielding)
 slates-winfsp: reply spin window = 17700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 1 of 10 FAILED (stalled), 2026-11-18T09:40:28Z
+remote: 
+remote: Create a pull request for 'diag-results/g258-44271751211-nowake-x86' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-results/g258-44271751211-nowake-x86        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      c0f974868a51ca9c4420111b547f7e8694904b0d -> diag-results/g258-44271751211-nowake-x86
