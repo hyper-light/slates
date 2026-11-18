@@ -1,5 +1,42 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A holder's return was one turn of every live volume on each shard: in turns (2026-11-18, A-324, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230, the sibling the seal walk's entry named).** `live_ship::holder_reached` ran
+> `send_to_reached` on every shard as one closure, visiting every live volume the shard owns and building every message
+> the returned holder lacked (an install a copy of the whole volume each) in one turn. It now walks each shard in turns of
+> the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
+> `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
+> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
+> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
+> well as by the walk (a design change to §4.8's install, with its model).
+
+> **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
+> A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
+> walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
+> so a seal of a GiB volume ended its owner, and every restart sealed it again). It now runs in turns of the shard's
+> clock, a chunk at least (`fleet::wrap_slice`, `slates_cluster::envelope::Wrapping`), making the very envelope a whole
+> wrap makes. And a refused envelope left its job with its walk spent and no archive: every later period found nothing to
+> put, and its head never placed while that snapshot was the head (a heal kept that way shut the healer out of the
+> volume); the job is now dropped and started again the next period, as A-92 piece 3b always said. Tests:
+> `a_seals_envelope_is_wrapped_in_turns_and_places`, `a_seal_whose_envelope_was_refused_is_started_again_and_places`
+> (`crates/server/tests/fleet.rs`), `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte`,
+> `a_wrap_ends_at_its_envelope_or_its_refusal` (`crates/cluster/tests/envelope.rs`). Bug record
+> `docs/bugs/2026-11-18-a-refused-envelope-left-its-seal-with-nothing-to-do.md`.
+> - **Owed (measurement, the supervisor's):** the owner shard's longest step while a GiB volume seals, before and after.
+> - **Owed:** a seal's archive walk and its wrap each advance one slice a record period (100 ms), so a large volume takes
+>   many periods to place: at a walk slice of half a 20 µs quantum at 5 GB/s, about 50 KB a period, a GiB takes hours.
+>   The turns are bounded; their pace is not derived from the loss window a seal serves.
+> - **Owed (siblings, one-turn walks of a whole volume):** a takeover's open of a sealed envelope
+>   (`fleet::opened_archive`'s `envelope::open`) and a live log's whole record (`live_ship::payload` seals the volume's
+>   whole image in one turn) are each one turn of the whole volume, the first on the successor, the second at every
+>   whole entry and install image.
+> - **Owed (sibling, a seal left with nothing to do):** a content round's archive is carried back to the owner shard by
+>   `xshard::run_on_counted` (`fleet::put_seal_content`); a full control channel drops it, counted `xshard.run_refused`,
+>   and leaves the job with no archive as A-322's did, until a newer snapshot supersedes it.
+
 > **A volume reported no loss window: built (2026-11-17, AC-8.3, §4.10 "Auto-seal"; g230).** Nothing told an agent
 > what an owner loss would cost it, or a successor's client what one had cost: the status promised
 > `last_placed_snapshot_age` and carried nothing. `status` now carries `LossReport`: `at_risk_ns` (zero at a placed,
@@ -20,8 +57,7 @@
 > the open on a takeover's path (the recovery budget is 1 s) and the wrap in one turn of the owner shard. Now a set and
 > an index. Test: `an_envelope_of_thousands_of_chunks_opens_to_the_very_archive` (`crates/cluster/tests/envelope.rs`).
 > **Owed (measurement, the supervisor's):** `cargo run --release -p slates-cluster --example envelope_bench` at 16,384
-> chunks, before and after. **Still owed:** the wrap runs whole in one owner-shard turn at a seal's end (64 MiB took
-> 98 ms, 2026-10-05); slicing it is the seal walk's next piece.
+> chunks, before and after. The wrap's one owner-shard turn at a seal's end is in turns since A-323 (2026-11-18, above).
 
 > **The seal walk held its shard for every seal at once: in turns (2026-11-17, §4.10 "Content replication", CLAUDE.md
 > "Bounded work everywhere"; g230, the sibling of the live period's slicing below).** Each record period the owner
@@ -31,9 +67,8 @@
 > (`fleet::seal_walk_slice`, counted `fleet.seal.walk_slices` against `fleet.seal.walks`), each turn's content puts
 > dispatched before the next. Test: `a_shards_seals_are_walked_in_turns_and_every_one_places` (the turn injected to one
 > volume, `Daemon::inject_seal_walk_quantum`). **Owed:** the owner shard's longest step with hundreds of volumes sealing
-> at once (measurement, the supervisor's); and the envelope wrap at a seal's end (`fleet::envelope_of`) still seals the
-> archive's new chunks in one turn (64 MiB took 98 ms, 2026-10-05): a seal of a large new volume holds its shard for
-> the whole wrap.
+> at once (measurement, the supervisor's). The envelope wrap at a seal's end, one turn of the whole archive then, is in
+> turns since A-323 (2026-11-18, above).
 
 > **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
 > `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
