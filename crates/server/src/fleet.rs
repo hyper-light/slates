@@ -6383,9 +6383,8 @@ async fn refresh_discovery(
         if session.peer_reset() {
           state.count(LINK_PEER_RESET, 1);
         }
-        state
-          .dead_session_dropped_at
-          .insert(peer_host, futures::now_ns());
+        let dropped = crate::state::WallAndPeriods::now(state);
+        state.dead_session_dropped_at.insert(peer_host, dropped);
       }
     });
   }
@@ -9626,7 +9625,8 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          let dropped = crate::state::WallAndPeriods::now(s);
+          s.dead_session_dropped_at.insert(host, dropped);
         }
         Some(link)
           if link.endpoint.is_none()
@@ -9644,7 +9644,8 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
               .max(crate::daemon::LIVENESS_BUDGET_NS)
               / NS_PER_MS
           );
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          let dropped = crate::state::WallAndPeriods::now(s);
+          s.dead_session_dropped_at.insert(host, dropped);
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
@@ -9682,7 +9683,7 @@ pub(crate) async fn forward_over_leader_session(
     peer,
     &[request],
     deadline_ns,
-    crate::forward_lane::failover_bound_from(slates_rt::futures::now_ns()),
+    &mut crate::forward_lane::FailoverBound::from_now(),
     &mut crate::forward_lane::Place::default(),
   )
   .await
@@ -9700,8 +9701,8 @@ pub(crate) async fn forward_over_leader_session(
 /// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
 /// keeps delivering is never cut off for its size. A stretch with no progress is given up once the lane's shard has
-/// read what came, or at once past `bound_ns`, the failover bound on the wall from the forward's first send
-/// ([`crate::forward_lane`]'s stall, A-315). Returns the replies in order (`None` for one not answered) with how they
+/// read what came, or at once past `bound`, the failover bound from the forward's first send, held to the floor of the
+/// path to `peer` where that is longer ([`crate::forward_lane`]'s stall, A-315, A-352). Returns the replies in order (`None` for one not answered) with how they
 /// streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the budget. The
 /// batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
 /// ([`crate::forward_lane::Place`]).
@@ -9709,10 +9710,10 @@ pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
-  bound_ns: u64,
+  bound: &mut crate::forward_lane::FailoverBound,
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound_ns, place).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound, place).await
 }
 
 #[cfg(test)]

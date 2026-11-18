@@ -1690,9 +1690,8 @@ pub(crate) async fn resolve_and_forward(
   // which the owner's completion record answers exactly once (§4.9 RIFL); the client waits for a forwarded verb while
   // the daemon lives (`RequestBody::defers_reply`). Until 2026-10-09 one unanswered forward refused the client at once:
   // one cross-region read in nine was refused mid-file on a 200 ms path with 3% loss.
-  let began = slates_rt::futures::now_ns();
-  let bound = crate::state::with_state(|state| state.config.failover_slo_ns)
-    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  // The failover bound, from the first send: the SLO, or the floor of the path to the owner where that is longer (A-352).
+  let mut bound = crate::forward_lane::FailoverBound::from_now();
   let owner = match known {
     Some(owner) => {
       crate::state::with_state(|state| {
@@ -1723,11 +1722,11 @@ pub(crate) async fn resolve_and_forward(
   };
   // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
   // never go ahead of it however often it is sent again. Every send is judged against the same failover bound, from
-  // the first: the lane's progress holds a forward still queued only until then (A-315).
+  // the first: the lane's progress holds a forward still queued only until then (A-315), and the bound is held to the
+  // longest floor the path to the owner has measured, so no resend is refused below it (A-352).
   let mut place = crate::forward_lane::Place::default();
-  let bound_at = began.saturating_add(bound);
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests, bound_at, &mut place).await;
+    let (decoded, later) = forward_once(owner, &requests, &mut bound, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1745,8 +1744,7 @@ pub(crate) async fn resolve_and_forward(
       })
       .unwrap_or(false)
     });
-    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
-    if !unanswered || !alive || elapsed >= bound {
+    if !unanswered || !alive || slates_rt::futures::now_ns() >= bound.at_ns() {
       break (decoded, later);
     }
     crate::state::with_state_counted(|state| state.count(FORWARD_RETRIED, 1));
@@ -1776,7 +1774,7 @@ const FORWARD_RETRIED: &str = "fleet.forward.retried";
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
-  bound_at: u64,
+  bound: &mut crate::forward_lane::FailoverBound,
   place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
@@ -1796,7 +1794,7 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
-    bound_at,
+    bound,
     place,
   )
   .await;

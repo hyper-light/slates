@@ -1927,6 +1927,12 @@
 >     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
 >     and a model test, both red with the place ignored
 >     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
+>   - **Both tests under starvation (2026-11-18, A-352, goal g255).** At nice 19 beside two spinners a CPU both failed
+>     10 of 10 on x86_64 and arm64 (the integrator's run 44274886122) on their wall bounds: the recovery's 1.1 s (2.31 to
+>     13.67 s), the burst's 8 s wait for its 256 connects, the probe's 11 s call. No live session was dropped and no
+>     forward given up silent or at its bound. They now wait in the daemons' own periods, the recovery bounded in b's
+>     periods (11), and the probe can no longer be refused below its path's floor. Owed: the integrator's starved lane
+>     over both again, the recovery bound's evidence (about 3 to 15 of b's periods by the starved runs' rates).
 >   - **Fixed (2026-11-18, A-315, goal g255): a forward still queued was given up at its stall budget while its lane
 >     moved.** Nothing of it was sent, and with its place kept its resend lost nothing, but each one cost its forwarder
 >     a give-up and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the
@@ -2515,7 +2521,13 @@
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
 >   before it calls the owner silent, and the failover bound from the forward's first send caps it
 >   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
->   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane
+>   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). Under starvation (nice 19
+>   beside two spinners a CPU; the integrator's run 44274886122, 20 runs) that rule gave up no live owner's forward, but
+>   the lane's count of its recovery after a dropped session and a forward's failover bound were still judged on the
+>   wall; now the recovery is counted in the control shard's own periods, and a forward is never refused below the floor
+>   its path measures (the transport's silence window, a borrower's hold, the redial and four probe timeouts), the lane
+>   reporting a floor past the SLO (A-352, `a_forward_is_never_refused_below_its_paths_floor`;
+>   `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`). loadtest-scale's lane
 >   poll clock (`6da9670d`, CPU-credited turns of a 10 ms pace) did not land: it assumed an idle shard's timer fires on
 >   time, and Windows' 15.6 ms tick broke it (reverted from the B13 stack, `b458723c9`). C+D (A-232): the client's part
 >   is done, since a call waits while its daemon lives (2026-11-14,
@@ -2537,6 +2549,11 @@
 >   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
 >   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
 >   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
+>   Class C siblings found by A-352's starved runs, each a wait on a live daemon's answer on the wall: the rendezvous
+>   claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`, a second; a starved burst's connect met it in 1 of 20 runs) and
+>   the fleet tests' `CREDIT_WAIT` (5 s), which every fleet test's `Client::connect` and `send_burst` keep; the two
+>   dead-session tests now wait in the daemons' own periods instead (`Client::connect_for_periods`,
+>   `Client::try_call_for_periods`, `Client::send_burst_while_room`).
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
