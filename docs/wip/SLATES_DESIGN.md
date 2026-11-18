@@ -6060,6 +6060,22 @@ version.
 > lane, and `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (`crates/server/tests/fleet.rs`;
 > `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`).
 
+> **Status (2026-11-18, A-352: the lane under starvation, and a forward never refused below its path's floor).** At
+> nice 19 beside two spinners a CPU, the two dead-session tests failed every run, and no live session was dropped and
+> no forward given up silent or at its bound in any of the 20: the lane judges a silence in its own time, and what
+> failed was judged on the wall. The tests now wait in the daemons' own periods, and the lane's recovery after a
+> dropped session is counted in the control shard's own periods: owed within the link's redial pace and a forward's
+> stall budget (`REPLACEMENT_ANSWER_PERIODS`, `state::WallAndPeriods`). And a forward's failover bound is the SLO from
+> its first send, or the longest floor its path has measured where that is longer (`forward_lane::FailoverBound`,
+> `path_floor_ns`): the transport's silence window, a borrower's hold, the link's redial and four probe timeouts. A
+> forward through a session gone silent is answered only after the transport judges it dead and the link replaces it,
+> and on a path a starved process stretched (about 9 s of silence window at a 3 s probe timeout) the 10 s SLO refused it
+> first. Where the floor passes the SLO the forward runs at the floor, and the lane reports it
+> (`fleet.forward.floor_past_slo`, `fleet.forward.held_past_slo`). Test:
+> `a_forward_is_never_refused_below_its_paths_floor` (a 1 s SLO, below any path's silence window: answered after 2.04 s,
+> refused at 1.004 s with the floor removed;
+> `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -25640,6 +25656,62 @@ Applied in the same change to:
   Linux (GitHub's ubuntu runner, run 44327865763): the same focused tests and A-316's restart test pass.
 - **Owed** (GAPS): the successor's half on macOS (the write log there, recovery keeping a stream whose resync end the
   anchor held, the fresh stream handed over it); the rest as A-316 says.
+
+### A-352 — A forward lane is judged in the daemon's own time under starvation: its recovery counted in periods, and a forward never refused below its path's measured floor (2026-11-18, built for goal g255; the integrator's starved runs of goal g245's tests; the supervisor's rule "run at the measured floor and report it, never refuse below the floor")
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-352).
+- `crates/server/src/state.rs`: `WallAndPeriods` (an instant or a span on the wall and in the control shard's coordinator
+  periods); `ShardState::dead_session_dropped_at` and `dead_session_recovered` (was `dead_session_recovered_ns`) carry
+  both. `crates/server/src/fleet.rs`: the three places a record session is dropped record both.
+- `crates/server/src/forward_lane.rs`: `REPLACEMENT_ANSWER_PERIODS` judges the lane's first answer on a replacement in
+  periods; `FailoverBound` (replacing `failover_bound_from`), `path_floor_ns`, `FLOOR_ROUND_TRIPS`, `note_floor`,
+  `Lane::floor_ns`, `Stall::extend_to`, `hold_bound`; the counts `fleet.forward.floor_past_slo` and
+  `fleet.forward.held_past_slo`. `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes the bound,
+  `forward_over_leader_session` makes one from its send) and `crates/server/src/verbs.rs` (`resolve_and_forward` keeps
+  one across its resends and refuses only past it; `forward_once` passes it).
+- Tests: `crates/server/tests/fleet.rs`: `a_forward_is_never_refused_below_its_paths_floor` (new, with the
+  `MeshFailoverSlo` fixture); the two dead-session tests' waits in the daemons' own periods
+  (`dead_session_watch_periods`, `DEAD_SESSION_RECOVERY_PERIODS`, `Client::try_call_for_periods`,
+  `Client::connect_for_periods`, `Client::send_burst_while_room`). In `forward_lane.rs`:
+  `a_forwards_bound_is_its_slo_until_its_path_measures_a_longer_floor_and_never_falls_back` and
+  `a_silence_is_held_past_its_slo_to_its_paths_floor`.
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the forward lane) and the load test's dead-record-session entry.
+  The bug record: `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`.
+- **What was there.** The integrator ran goal g245's two dead-session tests ten times each on GitHub's x86_64 and arm64
+  runners at nice 19 beside two spinners a CPU (run 44274886122): 0 of 10 each. In every run the injected session was
+  the only one judged dead and no forward was given up silent or at its bound, so the lane had judged no live owner
+  silent. Three things were judged on the wall. The tests' own bounds: 1.1 s for the lane's first answer after the drop
+  (recoveries took 2.31 to 13.67 s), 8 s for the burst's 256 connects, and 11 s for the probe's call. The lane's own
+  count of an answer in budget, a liveness budget of wall time. And a forward's failover bound: the SLO from its first
+  send, though a forward through a session gone silent is answered only after the transport judges the session dead
+  (silent for the longer of a liveness budget and three probe timeouts, RFC 9002 §7.6.1) and the link replaces it; a
+  starved process's probe timeouts (about 3 s) made that window alone about 9 s, near the 10 s SLO, and the probes were
+  refused or cut off at their bound.
+- **The rule.** A span the lane owes is counted in the control shard's own coordinator periods, as the fleet's tests
+  charge their waits (A-228: a starved daemon is judged by what it did): its first answer on a dropped session's
+  replacement is owed within the link's redial pace and a forward's stall budget, `(W + h) / h` periods (11 at today's
+  `W` and heartbeat `h`). A forward's failover bound is the operator's SLO from its first send, or, where longer, the
+  longest floor the path to its owner has measured in the forward's life: `max(W, PCD) + W + h + 4 × PTO`, the silence
+  window (`PCD` the session's persistent-congestion duration), a borrower's hold before the return that judges it (a
+  stall budget), the link's redial pace, and four probe timeouts (the stall budget's tail, the replacement's handshake,
+  its first discovery page, and the forward's exchange). Each driving turn measures it on the session it borrowed. The
+  floor never lowers a forward's bound: a replacement's fresh estimator measures a shorter one than the silent session
+  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log once a crossing
+  and counts it (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
+  as A-129 runs the fleet's timers at their measured floors and reports the overrun.
+- **Why the floor and not a longer SLO.** The SLO is the operator's; the floor is the path's, and only the path knows
+  it. On loopback, quiet, the floor is about 3.1 s (the window floored at three initial probe timeouts, about 2 s), inside
+  the 10 s default, so nothing changes there; it passes the SLO only where the path is slower than the operator's bound
+  allows, and there refusing first only turns a forward the replacement would answer into a refusal its client resends.
+- **Evidence.** On adas-mac-studio.local-2 (32 CPUs, load 13 to 20, 2026-11-18): `a_forward_is_never_refused_below_its_paths_floor`
+  (a 1 s SLO, b's session to a deaf, discovery held) answered its probe 2.04 s and 21 of b's periods after its send;
+  with the floor removed from the bound it was refused `OwnerUnreachable` at 1.004 s. The deaf-session test answered on
+  the replacement 21 ms and 101 ms, 1 period, after the drop; the probe behind the burst 2.59 s and 2.73 s, 23 periods,
+  after its send; the held-origin and resend tests unchanged; the module's 12 unit tests pass.
+- **Owed.** The integrator's starved lane over both dead-session tests again: the recoveries it measured were about 3 to
+  15 of b's periods (by the periods b ran over each run's watch), against the bound's 11, so that run is the bound's
+  evidence. Siblings found, each a wait on a live daemon's answer judged on the wall: the rendezvous claim wait
+  (`slates_ipc::rendezvous::CLAIM_WAIT_NS`) and the fleet tests' `CREDIT_WAIT` (GAPS).
 
 ### A-334 — A host admitted again under its own id yields the volumes it catalogued (2026-11-18, goal g229, the SIGSTOP owner flow's ReadSafety finding; realizes §4.8 "Authority scope" for a re-admission)
 Applied in the same change to: §4.8 "Leases and reads" (its status), §4.10 live shipping (the chaos flows' status, A-346's
