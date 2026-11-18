@@ -616,3 +616,201 @@ impl Db {
     self.log.usage(segment)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::HostId;
+  use crate::catalog::{
+    BaseRecord, NamePolicy, PolicyRecord, Principal, Role, SizeClass, SnapshotId, VolumeId,
+    VolumeRecord, VolumeState,
+  };
+  use slates_anchor::Geometry;
+  use slates_machine::facts::Identity;
+
+  /// Shape: the segment page.
+  const PAGE: u64 = 4096;
+  /// Shape: a log ring with room for the whole tail (about 5 KiB a record), so no full ring forces a snapshot.
+  const LOG_BYTES: u64 = 4 << 20;
+  /// Shape: a snapshot slot: room for the one volume the test makes.
+  const SNAPSHOT_BYTES: u64 = 1 << 20;
+  /// Shape: the keys of each record, one byte each: a record whose decode allocates every key while its encode only
+  /// copies each key's five bytes into one buffer, so a measure that times the encode in the decode's place falls
+  /// short of the replay by most of the decode.
+  const KEYS: usize = 1 << 10;
+  /// Shape: the records whose measured work is compared with their replay: a tail whose replay is milliseconds in a
+  /// debug build, far past the clocks' resolution.
+  const RECORDS: usize = 64;
+  /// Shape: the timed recoveries of a segment, the median judged and the inner quartiles' spread its noise: five, so
+  /// the quartiles are the second and the fourth and the fastest and the slowest stand outside the spread.
+  const RECOVERIES: usize = 5;
+
+  fn segment() -> AnchorSegment {
+    AnchorSegment::create(
+      &format!("slates-db-replay-unit-{}", std::process::id()),
+      &Identity {
+        cpu: "test".into(),
+        os: "test".into(),
+        arch: "test".into(),
+        cores: 4,
+        memory: 1,
+        page: PAGE,
+      },
+      Geometry {
+        partitions: 1,
+        page: PAGE,
+        profile_bytes: PAGE,
+        log_bytes: LOG_BYTES,
+        snapshot_bytes: SNAPSHOT_BYTES,
+        landing_slots: 1,
+        landing_slot_bytes: PAGE,
+      },
+    )
+    .unwrap()
+  }
+
+  fn caps() -> PartitionCaps {
+    PartitionCaps {
+      volumes: 1 << 4,
+      snapshots: 1 << 4,
+      attachments: 1 << 4,
+      segment_slots: 4,
+      timers: 1 << 4,
+      tick_ns: 1_000,
+      green_chain_bytes: 1 << 20,
+      audit_records: 1 << 4,
+    }
+  }
+
+  fn volume() -> VolumeRecord {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 1;
+    VolumeRecord {
+      id: VolumeId { bytes },
+      name: "signed".to_owned(),
+      owner_shard: 0,
+      policy: PolicyRecord {
+        size: SizeClass::Bounded { limit: 1 << 30 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
+      },
+      base: BaseRecord::Scratch,
+      head: SnapshotId { value: 0 },
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner: Principal::Uid {
+        host: HostId(0),
+        uid: 1000,
+      },
+      access: vec![],
+      created_ns: 0,
+      catalog_version: 0,
+      taken_over: None,
+    }
+  }
+
+  /// A recovery and its cost as the calling thread's CPU time: the work the replay did, which a loaded machine does not
+  /// stretch (the cadence tests' measure, `crates/db/tests/snapshot_cadence.rs`).
+  #[cfg(unix)]
+  fn recovery_cost_ns(segment: &mut AnchorSegment) -> u64 {
+    let before = slates_rt::registry::calling_thread_cpu().unwrap();
+    let recovered = recover(segment, 0, caps(), 0).unwrap().1;
+    let after = slates_rt::registry::calling_thread_cpu().unwrap();
+    assert!(!recovered.torn, "the tail verifies");
+    after.spent_ns.saturating_sub(before.spent_ns)
+  }
+
+  /// [`recovery_cost_ns`] on Windows, by wall time: the thread's CPU time is charged a scheduler tick at a time there
+  /// (15.6 ms by default), too coarse for a span this short.
+  #[cfg(not(unix))]
+  fn recovery_cost_ns(segment: &mut AnchorSegment) -> u64 {
+    let recovered = recover(segment, 0, caps(), 0).unwrap().1;
+    assert!(!recovered.torn, "the tail verifies");
+    recovered.replay_ns
+  }
+
+  /// `RECOVERIES` recoveries of the segment as it stands: their median cost and the spread of their inner quartiles.
+  fn recoveries(segment: &mut AnchorSegment) -> (u64, u64) {
+    let mut costs: Vec<u64> = (0..RECOVERIES).map(|_| recovery_cost_ns(segment)).collect();
+    costs.sort_unstable();
+    let quartile = RECOVERIES / 4;
+    (
+      costs[RECOVERIES / 2],
+      costs[RECOVERIES - 1 - quartile] - costs[quartile],
+    )
+  }
+
+  /// A-420 (A-243's open line), §4.8. Do: set a volume's signers again and again to a thousand one-byte keys, with no
+  /// snapshot, and compare the replay work the commits measured for those records with what a recovery spends
+  /// replaying them (the median of five recoveries past a baseline recovery of the segment before them, as the calling
+  /// thread's CPU time). Expect: the measured work covers the replay's, within the recoveries' own noise, since the
+  /// snapshot trigger fires on the measure and holds a recovery to its budget only if the measure is at least the
+  /// replay. The commits timed each record's encode, checksum, copy and apply, and the replay's decode allocates every
+  /// key where the encode copies its bytes into one buffer, so the measure fell short of the replay (A-243's open
+  /// line: the commits measured 0.4x to 1.25x the replay on CI's macOS runner, 2026-11-18).
+  #[test]
+  fn a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode()
+   {
+    let mut segment = segment();
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    db.set_policy(SnapshotPolicy {
+      bytes_between_snapshots: u64::MAX,
+    });
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let keys: Vec<Vec<u8>> = (0..KEYS)
+      .map(|n| vec![u8::try_from(n % 251).unwrap()])
+      .collect();
+    // The first set sizes the volume's key list, so every later apply reuses it at the commit and in the replay alike.
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: keys.clone(),
+      },
+      0,
+    )
+    .unwrap();
+    let (baseline_ns, baseline_spread_ns) = recoveries(&mut segment);
+    let before = db.stats().tail;
+    for _ in 0..RECORDS {
+      db.mutate(
+        &mut segment,
+        &Op::VolumeSignersSet {
+          id,
+          keys: keys.clone(),
+        },
+        0,
+      )
+      .unwrap();
+    }
+    let after = db.stats().tail;
+    let measured_ns = after.replay_ns - before.replay_ns;
+    let (tail_ns, tail_spread_ns) = recoveries(&mut segment);
+    let replay_ns = tail_ns.saturating_sub(baseline_ns);
+    let noise_ns = tail_spread_ns + baseline_spread_ns;
+    println!(
+      "{RECORDS} records of {KEYS} keys, {} bytes: the commits measured {measured_ns} ns of replay work; a recovery \
+       replayed them in {replay_ns} ns past a {baseline_ns} ns baseline (noise {noise_ns} ns), {} per mille of the \
+       measure",
+      after.bytes - before.bytes,
+      replay_ns * 1_000 / measured_ns.max(1)
+    );
+    assert!(
+      replay_ns <= measured_ns + noise_ns,
+      "a tail the commits measured at {measured_ns} ns of replay work replayed in {replay_ns} ns past the baseline \
+       ({noise_ns} ns of noise): the trigger would let it run past its budget"
+    );
+  }
+}
