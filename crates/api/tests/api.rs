@@ -32,7 +32,7 @@ use slates_api::{
 #[cfg(unix)]
 use slates_api::{
   AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, GrantState, LandOutcome,
-  LandingApproval, LandingConflict, LandingStage, LandingState,
+  LandingApproval, LandingConflict, LandingStage, LandingState, Unsupported,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};

@@ -554,7 +554,14 @@
 >   outsider's change to a file the agent never touched. Kiln lands an agent's workspace into the repository (W6), so
 >   the switch needs a landing judged against the captured snapshot: the manifest of what changed since it, each entry
 >   compared by content with what the capture read (the target is another folder, so fingerprints cannot match).
->   Until then a captured clone moves and serves whole but does not land as an overlay does.
+>   Until then a captured clone moves and serves whole but does not land as an overlay does. The plan, as read on
+>   2026-11-18 (g267): the capture already records a witness (fingerprint and identity) for every file it copies up
+>   (`Overlay::capture_file`), and a clone made with `CloneBase::Drop` drops them with the base plane. The clone keeps
+>   them instead, as a witness-only base that never reads a host, so its diverged walk (`PlanWalk`) names exactly
+>   what changed since the capture; the verdict judges such an entry by content alone (`slates_land::verdict`: the
+>   disk's identity against the witness's, every file hashed, its fingerprint ignored); and the witnesses travel with
+>   the clone through a move (the archive and the takeover's restore carry them), since a moved clone's origin snapshot
+>   stays on the node that captured it.
 > - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
 >   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
 >   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is
