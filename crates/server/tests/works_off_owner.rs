@@ -1391,7 +1391,7 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     (identity, other),
   );
 
-  expect_the_greens_ask_to_hold_an_edit_and_submit(&mut client, &secret);
+  expect_the_greens_ask_to_hold_an_edit_and_submit(&mut client, &instance, &secret);
   // The agent's own session asks (A-285's consumer policy): its merge of its own work off the green's shard is held
   // there too, with nothing merged, though both volumes would merge at once.
   merging(
@@ -1475,8 +1475,12 @@ fn expect_a_forged_proof_refused_and_the_launchers_accepted(
 /// The green's ask in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`. Do: set a green's merges to ask
 /// with `secret`'s authority, edit-and-submit a work of it, then approve the increment asked. Expect the submit
 /// answered with its identity, nothing merged and the edit kept in the work; then the approval accepted.
-fn expect_the_greens_ask_to_hold_an_edit_and_submit(client: &mut Client, secret: &[u8; 32]) {
-  let (green, work) = green_and_edited_work(client, "policy-green-ask");
+fn expect_the_greens_ask_to_hold_an_edit_and_submit(
+  client: &mut Client,
+  instance: &str,
+  secret: &[u8; 32],
+) {
+  let (green, work) = green_and_edited_work(client, instance, "policy-green-ask");
   merging(
     client,
     secret,
