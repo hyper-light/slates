@@ -7240,7 +7240,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > turn's messages dispatched before the next; a turn the shard does not answer ends the walk, and the period sends the
 > rest. Counted `fleet.live.reached_slices`. Held by `a_holders_return_is_walked_in_turns_and_it_takes_every_log`
 > (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
-> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
+> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume; held again,
+> up to four times, until the owner has dialed the holder afresh, since an owner judging its lanes in its own time under
+> load need not end the link in one hold: "0 turns for 12 volumes" under a full suite, 2026-11-18). Owed
 > (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
 > Until A-347 the turns over the control shard's own volumes ran in one poll (an inline call; `xshard::Turns`, §4.10's
 > A-347 status): the measurer's longest steps of at most 12.0 and 42.0 ms over 1,000 and 4,000 volumes grew with the
