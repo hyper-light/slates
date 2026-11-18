@@ -109,6 +109,8 @@ const MOVE_FOLLOWED: &str = "fleet.move.followed";
 const MOVE_RECLAIMED: &str = "fleet.move.reclaimed";
 /// Counter: move questions a holder refused (malformed, or not from the session's peer).
 const MOVE_PREPARE_REFUSED: &str = "fleet.move.prepare_refused";
+/// Counter: move questions a holder left unanswered under a test's injected silence toward their asker.
+const MOVE_SILENCED_BY_FAULT: &str = "fleet.move.silenced_by_fault";
 /// Counter: named objects a holder refused to answer (the configuration did not move them to the asker).
 const MOVE_NAMED_REFUSED: &str = "fleet.move.named_refused";
 /// Counter: answers held back because the shard's publish of their raised fences was refused.
@@ -784,6 +786,12 @@ pub(crate) fn serve_move_prepare(
   };
   if prepare.owner != peer_host || prepare.departed != peer_host || prepare.named.is_empty() {
     state.count(MOVE_PREPARE_REFUSED, 1);
+    return Vec::new();
+  }
+  // A test's injected silence toward this asker (`Daemon::inject_takeover_silence`): a move's question by name is a
+  // phase one as a takeover's is, so a holder cut off from a new owner answers neither.
+  if state.injected_takeover_silence.contains(&peer_host) {
+    state.count(MOVE_SILENCED_BY_FAULT, 1);
     return Vec::new();
   }
   let installed = state.fleet.configuration().version;

@@ -5280,15 +5280,18 @@ fn a_move_completes_when_its_old_owner_dies_at_the_switch() {
   assert_eq!(adopted, Ok(1), "b adopted the volume");
 }
 
-/// A-291 (§4.10, the failure matrix's "migration in flight when the new host dies"): the new owner dies at the switch.
-/// Three daemons at `f = 1`. Do: on a, write two files into a volume and move it to b until the move is done; stop b at
-/// once; wait until the survivors retire it; read both files through a's client. Expect the move to have handed over a
-/// head held by two hosts besides a (`fleet.move.handoff_begun`: a's seal leaves its head held by a and one other, and
-/// a frozen copy serves no fetch); and the volume served whole by b's takeover successor, whichever survivor that is:
-/// when it is a itself, its takeover's adoption supersedes the copy it froze for the move (`fleet.move.superseded`);
-/// when it is c, a releases its copy (`fleet.move.released`); either way a's frozen copy is gone and never thawed.
-/// Before the handoff (red 3 of 3 on the Mac Studio, 2026-11-18) a was the successor, the head named a and b alone, and
-/// a's takeover fetched only from b, dead, until it gave the volume up (`fleet.materialize.given_up` 1).
+/// A-291 (§4.10, the failure matrix's "migration in flight when the new host dies"): the new owner dies at the switch,
+/// never having adopted the volume. Three daemons at `f = 1`. Do: on a, write two files into a volume and seal its head
+/// while c refuses every content put, so the head is held by a and b alone (the shape a seal leaves when the target
+/// acknowledged first); let c take puts again; silence a's and c's answers to b's move questions, so b cannot adopt;
+/// move the volume to b until the move is done; stop b at once; wait until the survivors retire it; read both files
+/// through a's client. Expect the move to have handed over a head held by two hosts besides a
+/// (`fleet.move.handoff_begun`: a frozen copy serves no fetch); and the volume served whole by b's takeover successor,
+/// whichever survivor that is: when it is a itself, its takeover's adoption supersedes the copy it froze for the move
+/// (`fleet.move.superseded`); when it is c, a releases its copy (`fleet.move.released`); either way a's frozen copy is
+/// gone and never thawed. Without the handoff the head names a and b alone, and b's successor fetches only from b,
+/// dead, until it gives the volume up (red on the Mac Studio, 2026-11-18: `fleet.fetch.no_holder_session` 100,
+/// `fleet.materialize.given_up` 1, every read `NotRecovered`).
 #[test]
 fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
   let _serial = serialize_fleet_tests();
@@ -5310,12 +5313,12 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
     .map(|daemon| daemon.instance().to_owned())
     .collect();
   let mut client_a = Client::connect(&instances[0]);
-  let MovedTwoFiles {
-    id,
-    files,
-    moved,
-    answers,
-  } = move_two_files(&daemons, &mut client_a, "stranded-move", hosts[1]);
+  let (id, files) = sealed_on_owner_and_target(&daemons, &mut client_a, "stranded-move");
+  for holder in [&daemons[0], &daemons[2]] {
+    holder.inject_takeover_silence(&[hosts[1]]).unwrap();
+  }
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let (moved, answers) = move_until_done(&everyone, &mut client_a, id, hosts[1]);
   let target = daemons.remove(1);
   target.stop();
   let retired = moved && poll_survivors_retire(&daemons, hosts[1]);
@@ -5357,6 +5360,48 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
     let_go,
     "a let its frozen copy go: superseded by its own takeover's adoption, or released to c; {described}"
   );
+}
+
+/// The volume the target-dies test moves (A-291): created on `daemons[0]` (a) through `client`, two files written through a
+/// write attachment that is then ended, and its head sealed while `daemons[2]` (c) refuses every content put, so the
+/// head is held by a and b alone; c then takes puts again, and every other node's account is given the volume.
+fn sealed_on_owner_and_target(
+  daemons: &[Daemon],
+  client: &mut Client,
+  name: &str,
+) -> (VolumeId, [(&'static str, &'static [u8]); 2]) {
+  let files: [(&'static str, &'static [u8]); 2] = [
+    ("/one", b"the first file"),
+    ("/two", b"the second, longer file"),
+  ];
+  let refusing = slates_server::merge_service::MergeFault {
+    refuse_content_puts: true,
+    ..slates_server::merge_service::MergeFault::default()
+  };
+  daemons[2].inject_merge_fault(refusing).unwrap();
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create {name} on node {}", daemons[0].instance());
+  };
+  write_files_then(client, id, &files, |_| ReplyBody::Detached);
+  let snapshotted = client.call(&RequestBody::Snapshot { volume: id });
+  assert!(
+    matches!(snapshotted, ReplyBody::Snapshotted { .. }),
+    "snapshot {name}: {snapshotted:?}"
+  );
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let sealed = poll_until(&fleet, SERVE_DEADLINE, || {
+    daemons[0]
+      .fleet_sealed_manifest(ObjectId(id.bytes))
+      .map(|manifest| manifest.is_some())
+  });
+  assert!(sealed, "a sealed the head with c refusing its content");
+  daemons[2]
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .unwrap();
+  for node in &daemons[1..] {
+    share_with_node(client, id, node, ALL_RIGHTS);
+  }
+  (id, files)
 }
 
 /// A-291 (§4.15 `capture_base`, §4.10 "Ownership follows the writer"; the supervisor's decision of 2026-11-18): a kiln

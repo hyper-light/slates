@@ -3244,7 +3244,8 @@ impl Daemon {
   }
 
   /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
-  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), and every planned move's question by name
+  /// (A-291; counted `fleet.move.silenced_by_fault`), while it answers everything else on the same
   /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
   /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
   /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
