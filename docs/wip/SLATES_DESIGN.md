@@ -32218,6 +32218,32 @@ a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.r
   overlay's witness's owner, birth time and Windows bits are judged (the verdict compares whole fingerprints) and not
   bound (the encoding holds the device, inode, size, times and mode).
 
+### A-470 — A late beat is judged against the control shard's own window; the reap cadence moves to an event-driven reaper (2026-11-18, built for goal g255; R3's class D, item D-c part 1; §4.14 `daemon.alive`; A-228, A-455)
+- **What was there.** The control shard's beat task logged a near miss (`log_late_beat`) for every gap of half the
+  liveness window or more, whatever window the watchdog judged that shard by. Since A-455 the watchdog judges a shard by
+  its own window, the liveness window raised to the overrun the shard measures, so on a host that holds the shard off
+  its CPU longer than the liveness window every turn the host delayed was logged as a near miss against a window the
+  watchdog no longer judged by.
+- **The rule (`daemon::beat_is_late`).** A beat is late once its gap is half the control shard's own window (A-455,
+  `watchdog::watch_window_ns` over the overrun the shard's counters carry), and the line names that window. A quiet
+  shard's window is the liveness window, so nothing changes there.
+- **The reap cadence, not here.** The reap loop's tick (`daemon::reap_loop`, one liveness window) was to become a
+  shard window with early wakes for owed terms (kept on the branch `agents/g255-reap-cadence`, never on main). Ada asked
+  whether the reaper could be event-driven instead, and it can: each of the loop's polled jobs leaves it in its own
+  amendment, woken by what it waits for (a client's hang-up through the shard's readiness wait, A-149; a deadline on one
+  per-shard timing wheel; a watcher's descriptor; the answering party; an aging bucket; a watermark crossing; a timer
+  armed only while a placement is declined), and once the last job has left, the loop and its tick are deleted, with no
+  fallback tick kept.
+- **Tests.** `a_beat_is_late_against_the_shards_own_window` (`crates/server/src/daemon.rs`: a quiet shard, one held two
+  and a half windows, and a runaway reading).
+- **Evidence.** Built and run on the Mac Studio (kiln r411, 2026-11-18, load 8.5-13.8, debug build): `cargo test
+  --locked -p slates-server --lib -- late_beat watchdog` 28 of 28. Red-checked once with the old rule, the line at half
+  the bare liveness window: a gap of three fifths of a window on a shard held two and a half windows was late.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry), `crates/server/src/daemon.rs`, and
+`docs/bugs/2026-11-18-the-anchor-never-found-a-wedged-daemon-once-its-own-waits-ran-a-window-late.md` (A-467's bug,
+recorded).
+
 ### A-473 — A replica no work on its shard has used for its idle window is given back, and made again when work there asks for it; the window is the green's own use there, and only a recorded use arms the check (2026-11-18, goal 87 via g083; A-273's idle give-back; §4.16 "Rebase off the owner"; A-457, A-465)
 
 Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and

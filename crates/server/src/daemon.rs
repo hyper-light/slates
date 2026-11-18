@@ -6410,9 +6410,10 @@ pub(crate) struct StopWatch {
   wake: std::sync::mpsc::SyncSender<()>,
 }
 
-/// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14
-/// `daemon.alive`): the shard went that long without running its heartbeat task, and past the budget the anchor
-/// kills it. With the gap goes what the shard did in it, from its counters `before` and `after`: its steps and
+/// Logs a beat that came late, [`LATE_BEAT_SHARE`] of the window the watchdog judges the control shard by or more after
+/// the one before ([`beat_is_late`], A-470; §4.14 `daemon.alive`): the shard went that long without running its heartbeat
+/// task, and past its window the watchdog judges it. With the gap goes what the shard did in it, from its counters
+/// `before` and `after`: its steps and
 /// polls, each long poll by what held it (a task's own CPU past the quantum, the thread blocked in the kernel,
 /// the host keeping a runnable thread off the CPU, or unattributed), the timers it fired, the times it waited,
 /// the tasks it spawned and finished and those live, its longest poll and its measured timer overrun. So a near
@@ -6424,19 +6425,19 @@ fn log_late_beat(
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
 ) {
-  if gap < LIVENESS_BUDGET_NS / LATE_BEAT_SHARE {
+  if !beat_is_late(gap, after.scheduler_overrun_ns) {
     return;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   slates_machine::log_line!(
-    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against a {} ms window; \
+    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against its {} ms window; \
      the anchor's beat is the watchdog's now): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
      longest poll is {} ms and its timer overrun {} ms",
     gap / NS_PER_MS,
-    LIVENESS_BUDGET_NS / NS_PER_MS,
+    crate::watchdog::watch_window_ns(after.scheduler_overrun_ns) / NS_PER_MS,
     delta(|c| c.steps),
     delta(|c| c.polls),
     delta(|c| c.long_steps),
@@ -6453,10 +6454,59 @@ fn log_late_beat(
   );
 }
 
-/// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A scatter's part
+/// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
+/// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part
 /// waits for room a window of that share at a time (`crate::verbs::PART_ROOM_BUDGET_NS`, A-426).
 pub(crate) const LATE_BEAT_SHARE: u64 = 2;
+
+/// Whether the control shard's beat task, run `gap_ns` after its last turn, ran late ([`log_late_beat`], A-470): a
+/// [`LATE_BEAT_SHARE`] or more of the window the watchdog judges that shard by now (A-455,
+/// `crate::watchdog::watch_window_ns` over `overrun_ns`, the scheduler overrun the shard measured). A gap is a near miss
+/// against the verdict the watchdog would reach, and the watchdog reaches it at the shard's own window: on a host that
+/// holds the shard off its CPU longer than the liveness window, a gap that window explains is no near miss, and before
+/// A-470 every such turn was logged as one, against a window the watchdog no longer judged the shard by. Pure, so the
+/// rule is tested on every host.
+pub(crate) fn beat_is_late(gap_ns: u64, overrun_ns: u64) -> bool {
+  gap_ns >= crate::watchdog::watch_window_ns(overrun_ns) / LATE_BEAT_SHARE
+}
+
+#[cfg(test)]
+mod late_beat_tests {
+  use super::{LIVENESS_BUDGET_NS, beat_is_late};
+
+  /// A-470, A-455, §4.14. Do: judge the control shard's beat gaps against the shard's own window, on a quiet shard (no
+  /// overrun measured), on one the host held off its CPU two and a half liveness windows, and on one whose reading ran
+  /// away (an hour, a process stopped whole and continued). Expect: on the quiet shard a gap of three fifths of the
+  /// liveness window late and two fifths not, as before; on the held one three fifths not late, since its window is two
+  /// and a half and the watchdog judges it there, and thirteen tenths late; on the runaway one the ceiling's half the
+  /// line, four windows not late and five late. Before A-470 every gap past half the liveness window was logged as a
+  /// near miss, whatever window the watchdog judged the shard by.
+  #[test]
+  fn a_beat_is_late_against_the_shards_own_window() {
+    let window = LIVENESS_BUDGET_NS;
+    let quiet = 0;
+    assert!(beat_is_late(3 * window / 5, quiet), "a quiet shard's gap");
+    assert!(
+      !beat_is_late(2 * window / 5, quiet),
+      "a quiet shard's short gap"
+    );
+    let held = 5 * window / 2;
+    assert!(
+      !beat_is_late(3 * window / 5, held),
+      "a gap the held shard's window explains"
+    );
+    assert!(
+      beat_is_late(13 * window / 10, held),
+      "past half the held shard's window"
+    );
+    let runaway = 3_600 * window;
+    assert!(
+      !beat_is_late(4 * window, runaway),
+      "under the ceiling's half"
+    );
+    assert!(beat_is_late(5 * window, runaway), "at the ceiling's half");
+  }
+}
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;

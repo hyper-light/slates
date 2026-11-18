@@ -3752,7 +3752,12 @@
 > runaway reading cannot blind it, and its observation gap is the bound less its lateness p99 and a beat, at least a
 > beat (`Lateness::observation_gap_ns`), where half the bound let every gap pass the bound once the anchor ran a window
 > late, each look then taken for a sleep and a wedged daemon never found lapsed.
-> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
+> **Since A-470 a late beat is judged against the control shard's own window** (`daemon::beat_is_late`, A-455's window),
+> and the reap loop's tick is to go entirely: an event-driven reaper replaces it a polled job at a time (dead clients by
+> hang-up, deadlines on a per-shard wheel, hints by descriptor readiness, retries woken by the awaited party, idle seal
+> and purge by aging buckets, pressure at watermark crossings, the huge-page re-arm on a timer), then the loop and its
+> tick are deleted with no fallback tick (owed, a series of its own).
+> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
