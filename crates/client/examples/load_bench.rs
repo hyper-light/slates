@@ -26,9 +26,25 @@
 //! before the submit was sent and those sent before its reply came back. And the green's head bytes of every file the
 //! run touched must equal the version-ordered replay of the accepted submits over the files' bytes before the level.
 //!
-//! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then `oracle\t<n>\t…` lines;
-//! a nonzero `oracle_failures` exits 1. Last, the daemon's own counts of what it lost and of its waits for room, read
-//! from its report at the end of the run: `lost\t<counter>\t<count>` and `room\t<counter>\t<count>`.
+//! **The offered load (`--think-us <mean>`).** A client waits for each reply before its next request, as an agent does,
+//! and then thinks: a pause drawn afresh after every reply from the exponential distribution of the stated mean, and
+//! one draw before its first request, so no two clients start or stay in step. Many independent clients' requests
+//! together approach a Poisson stream whatever each one's own pauses (the Palm–Khintchine theorem), so this is the
+//! stream a fleet of independent agents offers. The fixed pause it replaced sent every client's first request at the
+//! same instant and kept the clients bunched after, which no fleet of independent agents does. A mean of 0 is the
+//! closed loop at capacity: every client always waits on a request or is ready to send one, so its latency is the
+//! clients over the throughput (Little's law), not a service time.
+//!
+//! **Where each client's time went.** A client not yet done is at each instant in flight (a request sent, its reply
+//! not yet taken), thinking, pausing after a refusal for now, or held: due to send and not yet sent, by the harness's
+//! sweep or by its connection's ring or in-flight bound. Each is summed where it happens (a held client's wait at its
+//! send, from the instant it was due), and the `offered` row gives each as the time-averaged number of clients, with
+//! the replies and verdicts a second. A latency is stamped at the send, so time a client is held is in no latency row:
+//! a level with clients held measures less than its clients wait, and says so here.
+//!
+//! Rows: `offered\t<n>\t…` (above), `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then
+//! `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1. Last, the daemon's own counts of what it lost and of its
+//! waits for room, read from its report at the end of the run: `lost\t<counter>\t<count>` and `room\t<counter>\t<count>`.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -143,6 +159,9 @@ struct Agent {
   /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
   /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
   pause_ns: u64,
+  /// When the request in flight was sent, this attempt alone (a retry under its id keeps its first send in `inflight`
+  /// for its latency): the start of the client's time in flight.
+  attempt_sent_ns: u64,
 }
 
 /// What a worker brings back.
@@ -171,10 +190,36 @@ struct Tally {
   /// The longest wait between two drains of one connection's completion ring: the resolution of every latency here,
   /// since a reply's arrival is stamped when its ring is drained.
   max_drain_gap_ns: u64,
+  /// Where the clients' time went, summed over clients in client-nanoseconds: in flight, thinking (the pauses drawn),
+  /// pausing after a refusal for now, and held (due to send and not yet sent, [`Worker::send_ready`]). A request given
+  /// up while in flight is counted in none.
+  in_flight_ns: u64,
+  thinking_ns: u64,
+  paused_ns: u64,
+  held_ns: u64,
+}
+
+impl Tally {
+  /// Adds `other`'s replies taken and its sums of the clients' time into this tally's.
+  fn add_load(&mut self, other: &Tally) {
+    self.answered = self.answered.saturating_add(other.answered);
+    self.in_flight_ns = self.in_flight_ns.saturating_add(other.in_flight_ns);
+    self.thinking_ns = self.thinking_ns.saturating_add(other.thinking_ns);
+    self.paused_ns = self.paused_ns.saturating_add(other.paused_ns);
+    self.held_ns = self.held_ns.saturating_add(other.held_ns);
+  }
 }
 
 /// splitmix64: a reproducible plan without a dependency.
 struct Rng(u64);
+
+/// Format: the uniform draws behind a think: a draw's high 32 bits, offset by half a step and divided by 2³², is
+/// uniform on (0, 1) and never 0, so its logarithm is finite.
+const UNIFORM_STEPS: f64 = 4_294_967_296.0;
+/// Format: half of one uniform step (above).
+const HALF_STEP: f64 = 0.5;
+/// Format: the bits a 64-bit draw is shifted down by to keep its high 32.
+const HIGH_HALF: u32 = 32;
 
 impl Rng {
   fn next(&mut self) -> u64 {
@@ -186,6 +231,21 @@ impl Rng {
   }
   fn below(&mut self, n: u64) -> u64 {
     self.next() % n.max(1)
+  }
+
+  /// A draw from the exponential distribution of mean `mean_ns`, in nanoseconds, by inversion (`-mean · ln U`, `U`
+  /// uniform on (0, 1)); 0 for a mean of 0. The largest draw is `mean · ln 2³³`, about 23 means, past which the
+  /// distribution holds e⁻²³ of its mass, about 10⁻¹⁰.
+  fn exponential_ns(&mut self, mean_ns: u64) -> u64 {
+    if mean_ns == 0 {
+      return 0;
+    }
+    let high = u32::try_from(self.next() >> HIGH_HALF).unwrap_or(u32::MAX);
+    let uniform = (f64::from(high) + HALF_STEP) / UNIFORM_STEPS;
+    let seconds = Duration::from_nanos(mean_ns).as_secs_f64() * -uniform.ln();
+    Duration::try_from_secs_f64(seconds).map_or(u64::MAX, |pause| {
+      u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX)
+    })
   }
 }
 
@@ -681,10 +741,12 @@ fn conn_reconnect_ns(conns: &[Connection], c: usize) -> u64 {
     .map_or(0, |conn| conn.client.deadlines().reconnect_ns)
 }
 
-/// The pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a closed loop
-/// with no think time, every client always waiting on a request). An agent between its requests thinks, reads its
-/// tree or runs a build: the offered load the latency bound is stated for. A latency never includes the pause.
-fn think_ns() -> u64 {
+/// The mean of the pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a
+/// closed loop with no think time, every client always waiting on a request). Each pause is drawn from the exponential
+/// distribution of this mean ([`Rng::exponential_ns`]), and so is a pause before each client's first request. An agent
+/// between its requests thinks, reads its tree or runs a build: the offered load the latency bound is stated for. A
+/// latency never includes the pause.
+fn think_mean_ns() -> u64 {
   arg("--think-us").map_or(0, |us| {
     us.parse::<u64>()
       .expect("--think-us µs")
@@ -764,10 +826,39 @@ struct Worker {
   /// Clients with nothing in flight and a step to send, by when each may send: its last reply plus the think time
   /// (`--think-us`), earliest first.
   ready: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>>,
-  /// The pause a client takes after each reply before its next request (`--think-us`), nanoseconds.
-  think_ns: u64,
+  /// The mean pause a client takes after each reply before its next request (`--think-us`), nanoseconds, and the
+  /// worker's own draws of it.
+  think: Think,
   tally: Tally,
   epoch: Instant,
+}
+
+/// The clients' pauses between requests: each drawn from the exponential distribution of the stated mean, and each
+/// counted in the tally's thinking time.
+struct Think {
+  mean_ns: u64,
+  draws: Rng,
+}
+
+impl Think {
+  /// The pause before a client's next request, counted.
+  fn draw(&mut self, tally: &mut Tally) -> u64 {
+    let pause = self.draws.exponential_ns(self.mean_ns);
+    tally.thinking_ns = tally.thinking_ns.saturating_add(pause);
+    pause
+  }
+}
+
+/// Shape: the seed of a worker's think draws, apart from the plan's (`SEED`), so the plan is the same whatever the
+/// pacing: worker `w` at level `n` draws from `THINK_SEED ^ n ^ (w << 32)`.
+const THINK_SEED: u64 = 0x7a1c_0ff5_e7ba_c0de;
+
+/// The pause after a refusal for now (or a refusal retryable under its id): the client's own doubling pause, counted in
+/// the tally's paused time.
+fn refusal_pause(client: &Client, last_pause_ns: u64, tally: &mut Tally) -> u64 {
+  let pause = client.retry_pause_ns(last_pause_ns);
+  tally.paused_ns = tally.paused_ns.saturating_add(pause);
+  pause
 }
 
 impl Worker {
@@ -787,6 +878,7 @@ impl Worker {
         Ok(true) => {
           agent.retry = None;
           agent.inflight = Some((word, first_sent_ns, retried_kind));
+          agent.attempt_sent_ns = ns_since(self.epoch);
           conn.inflight.insert(word, a);
           self.tally.retried += 1;
           true
@@ -805,7 +897,9 @@ impl Worker {
     }
     match conn.client.begin(&body) {
       Ok(id) => {
-        agent.inflight = Some((id.word(), ns_since(self.epoch), kind));
+        let sent_ns = ns_since(self.epoch);
+        agent.inflight = Some((id.word(), sent_ns, kind));
+        agent.attempt_sent_ns = sent_ns;
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -827,7 +921,8 @@ impl Worker {
   }
 
   /// Sends for every ready client, in order, until one cannot go (each connection's ring and bound are its own, so
-  /// a client that cannot go is kept and the rest are tried).
+  /// a client that cannot go is kept and the rest are tried). Each due client's wait past the instant it was due (or
+  /// was last kept) is counted held: the harness's sweep or its connection's bound kept it back.
   fn send_ready(&mut self) {
     let now = ns_since(self.epoch);
     let mut kept = Vec::new();
@@ -839,6 +934,7 @@ impl Worker {
       if self.agents[a].step == Step::Done || self.agents[a].inflight.is_some() {
         continue;
       }
+      self.tally.held_ns = self.tally.held_ns.saturating_add(now.saturating_sub(due));
       if !self.send(a) {
         kept.push(std::cmp::Reverse((now, a)));
       }
@@ -881,6 +977,10 @@ impl Worker {
       let Some((_, sent_ns, kind)) = agent.inflight.take() else {
         continue;
       };
+      self.tally.in_flight_ns = self
+        .tally
+        .in_flight_ns
+        .saturating_add(now.saturating_sub(agent.attempt_sent_ns));
       if let ReplyBody::Refused { refusal } = &reply
         && retryable_under_its_id(refusal)
       {
@@ -898,7 +998,11 @@ impl Worker {
           continue;
         }
         agent.retry = Some((word, sent_ns, kind));
-        agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+        agent.pause_ns = refusal_pause(
+          &self.conns[agent.conn].client,
+          agent.pause_ns,
+          &mut self.tally,
+        );
         self
           .ready
           .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
@@ -913,11 +1017,15 @@ impl Worker {
       agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
       if agent.step != Step::Done {
         let wait = if for_now {
-          agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+          agent.pause_ns = refusal_pause(
+            &self.conns[agent.conn].client,
+            agent.pause_ns,
+            &mut self.tally,
+          );
           agent.pause_ns
         } else {
           agent.pause_ns = 0;
-          self.think_ns
+          self.think.draw(&mut self.tally)
         };
         self
           .ready
@@ -1090,10 +1198,18 @@ impl Worker {
 /// is done. A sweep drains every connection's ring first (stamping each reply's arrival, so a latency here is the
 /// daemon's and the ring's, not the time the harness took to reach the client), moves each answered client on and
 /// sends its next request at once, then sends for clients still waiting for room. Every `PROGRESS_EVERY` it prints how
-/// many of its clients are done and the submits it has seen.
-fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
+/// many of its clients are done and the submits it has seen. Each client first waits one pause drawn from `think`, as
+/// it does after every reply, so the clients start apart as independent agents do.
+fn drive(
+  conns: Vec<Connection>,
+  agents: Vec<Agent>,
+  epoch: Instant,
+  worker: usize,
+  mut think: Think,
+) -> Tally {
+  let mut tally = Tally::default();
   let ready = (0..agents.len())
-    .map(|a| std::cmp::Reverse((0, a)))
+    .map(|a| std::cmp::Reverse((think.draw(&mut tally), a)))
     .collect();
   let check_every = conns.first().map_or(1, |conn| {
     (conn.client.deadlines().reply_ns / OVERDUE_CHECKS_PER_DEADLINE).max(1)
@@ -1102,8 +1218,8 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
     conns,
     agents,
     ready,
-    think_ns: think_ns(),
-    tally: Tally::default(),
+    think,
+    tally,
     epoch,
   };
   let mut reported = Instant::now();
@@ -1257,6 +1373,57 @@ fn report(n: usize, tally: &mut Tally) {
     tally.retried,
     tally.unconfirmed
   );
+}
+
+/// Format: nanoseconds a second.
+const NS_PER_S: u128 = 1_000_000_000;
+/// Format: tenths in a unit, the `offered` row's one decimal place.
+const TENTHS: u128 = 10;
+
+/// `part` over `whole` to one decimal place: a time-averaged number of clients from their summed time and the wall.
+fn tenths(part: u64, whole: u64) -> String {
+  let scaled = (u128::from(part) * TENTHS)
+    .checked_div(u128::from(whole))
+    .unwrap_or(0);
+  format!("{}.{}", scaled / TENTHS, scaled % TENTHS)
+}
+
+/// `count` events over `wall_ns` as a rate a second.
+fn per_second(count: u64, wall_ns: u64) -> u128 {
+  u128::from(count)
+    .saturating_mul(NS_PER_S)
+    .checked_div(u128::from(wall_ns))
+    .unwrap_or(0)
+}
+
+/// The level's offered load and where its clients' time went: the think's stated mean; the replies taken, the verdicts
+/// (submits answered, accepted or in conflict) and the rebases a second; and the time-averaged number of clients in
+/// flight, thinking, pausing after a refusal for now, and held, with their sum, the clients not yet done. In the closed
+/// loop that sum is the throughput times each operation's cycle, request and pause together (Little's law), so `held`
+/// is the share of the clients the harness or a connection's bound kept back: their wait is in no latency row.
+fn offered_row(n: usize, think_mean_ns: u64, wall_ns: u64, tally: &Tally) -> String {
+  let count = |kind: Kind| {
+    tally.latencies.get(&kind).map_or(0, |samples| {
+      u64::try_from(samples.len()).unwrap_or(u64::MAX)
+    })
+  };
+  let verdicts = count(Kind::SubmitAccepted).saturating_add(count(Kind::SubmitConflict));
+  let alive = tally
+    .in_flight_ns
+    .saturating_add(tally.thinking_ns)
+    .saturating_add(tally.paused_ns)
+    .saturating_add(tally.held_ns);
+  format!(
+    "offered\t{n}\tthink_mean_ns\t{think_mean_ns}\treplies_per_s\t{}\tverdicts_per_s\t{}\trebases_per_s\t{}\talive\t{}\tin_flight\t{}\tthinking\t{}\tpaused\t{}\theld\t{}",
+    per_second(tally.answered, wall_ns),
+    per_second(verdicts, wall_ns),
+    per_second(count(Kind::Rebase), wall_ns),
+    tenths(alive, wall_ns),
+    tenths(tally.in_flight_ns, wall_ns),
+    tenths(tally.thinking_ns, wall_ns),
+    tenths(tally.paused_ns, wall_ns),
+    tenths(tally.held_ns, wall_ns),
+  )
 }
 
 /// Judges the level (the rule is `support/load_oracle.rs`'s): every submit over `base`, the touched files' bytes before
@@ -1445,6 +1612,7 @@ fn spread(
       inflight: None,
       retry: None,
       pause_ns: 0,
+      attempt_sent_ns: 0,
     });
   }
   groups
@@ -1520,6 +1688,7 @@ fn level(
     per_connection <= limit,
     "--per-connection {per_connection} exceeds the connection's in-flight bound {limit}"
   );
+  let think_mean = think_mean_ns();
   let epoch = Instant::now();
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
     let handles: Vec<_> = groups
@@ -1531,7 +1700,11 @@ fn level(
             .into_iter()
             .map(|client| Connection::new(client, epoch))
             .collect();
-          drive(conns, agents, epoch, worker)
+          let think = Think {
+            mean_ns: think_mean,
+            draws: Rng(THINK_SEED ^ (n as u64) ^ ((worker as u64) << HIGH_HALF)),
+          };
+          drive(conns, agents, epoch, worker, think)
         })
       })
       .collect();
@@ -1543,6 +1716,7 @@ fn level(
   let wall = epoch.elapsed();
   let mut total = Tally::default();
   for mut tally in tallies {
+    total.add_load(&tally);
     for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
       total
         .latencies
@@ -1568,6 +1742,15 @@ fn level(
   println!(
     "level\t{n}\twall_ns\t{}\tworkers\t{workers}",
     wall.as_nanos()
+  );
+  println!(
+    "{}",
+    offered_row(
+      n,
+      think_mean,
+      u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
+      &total
+    )
   );
   report(n, &mut total);
   // Version numbers in the events are absolute; rebase them to this level's first version for the oracle.
@@ -1767,5 +1950,119 @@ fn main() {
   }
   if failures > 0 {
     std::process::exit(1);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: the draws each distribution test takes: enough that five standard errors are about 1% of the mean.
+  const DRAWS: u64 = 200_000;
+  /// Shape: the stated mean the tests draw at, a millisecond.
+  const MEAN_NS: u64 = 1_000_000;
+  /// Shape: the standard errors a sample statistic may stray before a test fails (about one false failure in 1.7
+  /// million runs for a normal statistic).
+  const STANDARD_ERRORS: u64 = 5;
+
+  /// AC-9.1 (the load test's stated offered load): a level at a mean of 0 draws no pause, so it stays the closed loop
+  /// at capacity, every client always waiting on a request.
+  #[test]
+  fn a_mean_of_zero_draws_no_pause() {
+    let mut draws = Rng(THINK_SEED);
+    assert!((0..DRAWS).all(|_| draws.exponential_ns(0) == 0));
+  }
+
+  /// AC-9.1: the pauses follow the exponential distribution of the stated mean: draw 200,000 at a mean of 1 ms, and
+  /// their mean is the stated mean, the share of them past the mean is e⁻¹ and the share past twice the mean e⁻²
+  /// (the memoryless distribution's own shares; a fixed pause would put all or none past), each within five standard
+  /// errors.
+  #[test]
+  fn pauses_follow_the_exponential_distribution_of_the_stated_mean() {
+    let mut draws = Rng(THINK_SEED);
+    let pauses: Vec<u64> = (0..DRAWS).map(|_| draws.exponential_ns(MEAN_NS)).collect();
+    let sum: u128 = pauses.iter().map(|pause| u128::from(*pause)).sum();
+    let mean = u64::try_from(sum / u128::from(DRAWS)).unwrap();
+    // The exponential's standard deviation is its mean, so the sample mean's standard error is the mean over √n.
+    let tolerance = STANDARD_ERRORS * MEAN_NS / DRAWS.isqrt();
+    assert!(
+      mean.abs_diff(MEAN_NS) <= tolerance,
+      "the draws' mean is {mean} ns against a stated {MEAN_NS} ± {tolerance}"
+    );
+    for multiple in [1u64, 2] {
+      let past = pauses
+        .iter()
+        .filter(|pause| **pause > multiple * MEAN_NS)
+        .count();
+      let share =
+        f64::from(u32::try_from(past).unwrap()) / f64::from(u32::try_from(DRAWS).unwrap());
+      let expected = (-f64::from(u32::try_from(multiple).unwrap())).exp();
+      let error = (expected * (1.0 - expected) / f64::from(u32::try_from(DRAWS).unwrap())).sqrt();
+      assert!(
+        (share - expected).abs() <= f64::from(u32::try_from(STANDARD_ERRORS).unwrap()) * error,
+        "{share} of the pauses run past {multiple} means against e^-{multiple} = {expected}"
+      );
+    }
+  }
+
+  /// AC-9.1: two workers draw their own pauses, so clients on different workers do not keep step: of the first 1,000
+  /// draws of workers 0 and 1 at one level, fewer than 1% fall on the same nanosecond at the same position.
+  #[test]
+  fn two_workers_draw_their_own_pauses() {
+    let draws = |worker: u64| {
+      let mut rng = Rng(THINK_SEED ^ 1_000 ^ (worker << HIGH_HALF));
+      (0..1_000)
+        .map(|_| rng.exponential_ns(MEAN_NS))
+        .collect::<Vec<u64>>()
+    };
+    let same = draws(0)
+      .iter()
+      .zip(draws(1).iter())
+      .filter(|(first, second)| first == second)
+      .count();
+    assert!(
+      same < 10,
+      "{same} of 1,000 draws fell on the same nanosecond"
+    );
+  }
+
+  /// AC-9.1: a level's clients' time is reported whole: over a 2 s wall, clients on average 600 in flight, 300
+  /// thinking, 50 pausing and 50 held are 1,000 not yet done, beside 20,000 replies a second, so a level whose harness
+  /// kept clients back from sending shows it next to latencies that cannot.
+  #[test]
+  fn the_offered_row_reports_each_state_of_the_clients_and_their_sum() {
+    const WALL_NS: u64 = 2_000_000_000;
+    let tally = Tally {
+      answered: 40_000,
+      in_flight_ns: 600 * WALL_NS,
+      thinking_ns: 300 * WALL_NS,
+      paused_ns: 50 * WALL_NS,
+      held_ns: 50 * WALL_NS,
+      ..Tally::default()
+    };
+    let row = offered_row(1_000, MEAN_NS, WALL_NS, &tally);
+    for field in [
+      "\treplies_per_s\t20000\t",
+      "\talive\t1000.0\t",
+      "\tin_flight\t600.0\t",
+      "\tthinking\t300.0\t",
+      "\tpaused\t50.0\t",
+    ] {
+      assert!(row.contains(field), "{row:?} lacks {field:?}");
+    }
+    assert!(row.ends_with("\theld\t50.0"), "{row:?}");
+  }
+
+  /// AC-9.1: a level that ended before any time passed reports rates and clients of 0, never a division by zero.
+  #[test]
+  fn a_level_of_no_wall_time_reports_zeroes() {
+    let tally = Tally {
+      answered: 7,
+      held_ns: 3,
+      ..Tally::default()
+    };
+    let row = offered_row(1, 0, 0, &tally);
+    assert!(row.contains("\treplies_per_s\t0\t"), "{row:?}");
+    assert!(row.ends_with("\theld\t0.0"), "{row:?}");
   }
 }
