@@ -463,11 +463,13 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
-With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux): a message socket
-whose first message names the attachment and a secret token, and over which, if the daemon dies and its successor
-recovers the attachment, the successor hands a fresh stream end naming the same token. Reading the channel's end means
-no such stream will come (the attachment ended, or the daemon could not keep it); a platform that makes no channel yet
-hands one already ended.
+With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux and macOS): a
+socket whose first message, 28 bytes, names the attachment and a secret token, and over which, if the daemon dies and
+its successor recovers the attachment, the successor hands a fresh stream end naming the same token. On Linux each
+message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
+channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
+makes no channel yet hands one already ended. On macOS today the daemon's successor cannot yet recover the attachment,
+so the end comes at the daemon's death.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.

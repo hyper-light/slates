@@ -180,9 +180,10 @@ pub struct ShardsStream {
   /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
   /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
   pub stream: StreamEnd,
-  /// The device's end of the stream's resync channel (A-316; `slates_bridge_fuse::shards_resync`), close-on-exec, to
-  /// hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor daemon hands the
-  /// device a fresh stream after this one's daemon dies. None where the daemon hands none (macOS and Windows yet).
+  /// The device's end of the stream's resync channel (A-316, A-339; `slates_bridge_fuse::shards_resync`),
+  /// close-on-exec, to hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor
+  /// daemon hands the device a fresh stream after this one's daemon dies. None where the daemon hands none (Windows
+  /// yet), or made no channel.
   pub resync: Option<StreamEnd>,
 }
 
@@ -1586,8 +1587,9 @@ impl Client {
   /// daemon serves the attachment on its end of a socket pair, on the volume's owner shard, and hands this client the
   /// other end, to pass to the VMM. With `subtree`, only that directory; with `Intent::Read`, every change refused.
   /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy). Linux
-  /// receives the end over the control socket, sent before the reply; macOS claims it on the daemon's socket route
-  /// with the secret the reply carries (`slates_ipc::route`), each socket step bounded by the reply deadline. Windows
+  /// receives the end, and its resync end after it, over the control socket, sent before the reply; macOS claims both
+  /// on the daemon's socket route with the secret the reply carries (`slates_ipc::route`, A-339), each socket step
+  /// bounded by the reply deadline. Windows
   /// adopts the handle the daemon duplicated into this process, whose value the reply names (A-179); a reply naming
   /// none (its hand-off refused, or replayed from the record after a restart) is refused `Ipc(Layout)`.
   pub fn attach_shards(
@@ -1652,19 +1654,22 @@ impl Client {
         lease_epoch,
         capability,
         secret,
-      } => Ok(ShardsStream {
-        stream: self.claim_offer(attachment, &secret)?,
-        resync: None,
-        attachment: Attachment {
-          attachment,
-          lease_epoch,
-          path: None,
-          version: None,
-          established: Established::Record,
-          capability,
-          token: None,
-        },
-      }),
+      } => {
+        let (stream, resync) = self.claim_offer(attachment, &secret)?;
+        Ok(ShardsStream {
+          stream,
+          resync,
+          attachment: Attachment {
+            attachment,
+            lease_epoch,
+            path: None,
+            version: None,
+            established: Established::Record,
+            capability,
+            token: None,
+          },
+        })
+      }
       _ => Err(ClientError::UnexpectedReply {
         verb: "attach_shards",
       }),
@@ -1781,9 +1786,14 @@ impl Client {
   }
 
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
-  /// A-161), each socket step bounded by the client's reply deadline.
+  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step bounded by the client's
+  /// reply deadline.
   #[cfg(target_os = "macos")]
-  fn claim_offer(&self, attachment: u64, secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
+  fn claim_offer(
+    &self,
+    attachment: u64,
+    secret: &[u8; 32],
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
     slates_ipc::route::claim(
       &self.instance,
       (slates_ipc::route::OfferKind::Stream, attachment),
@@ -1791,13 +1801,18 @@ impl Client {
       std::time::Duration::from_nanos(self.deadlines.reply_ns),
       &mut || !self.end.daemon_gone(),
     )
+    .map(|claimed| (claimed.descriptor, claimed.resync))
     .map_err(ClientError::Ipc)
   }
 
   /// No socket route here: a Linux daemon answers the Shards form with the end on the control socket and a Windows
   /// daemon with a handle duplicated into this process, so an offer is not one of their replies.
   #[cfg(not(target_os = "macos"))]
-  fn claim_offer(&self, _attachment: u64, _secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
+  fn claim_offer(
+    &self,
+    _attachment: u64,
+    _secret: &[u8; 32],
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })
@@ -1818,6 +1833,7 @@ impl Client {
       std::time::Duration::from_nanos(self.deadlines.reply_ns),
       &mut || !self.end.daemon_gone(),
     )
+    .map(|claimed| claimed.descriptor)
     .map_err(ClientError::Ipc)
   }
 

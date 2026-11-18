@@ -2220,6 +2220,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
       },
       degraded: Vec::new(),
       barriers: 0,
+      stage: slates_ipc::protocol::LandingStage::Planning,
       verification: slates_ipc::protocol::Verification::Unsigned,
     },
   }
@@ -2564,6 +2565,7 @@ fn finish(
     outcome: LandingOutcome {
       landing: landing_id,
       state: landing_state_name(db_state),
+      stage: wire_landing_stage(db_state),
       written: report.written as u64,
       skipped: report.skipped as u64,
       conflicts: report.conflicts as u64,
@@ -3254,6 +3256,7 @@ pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
       manifest: g.manifest,
       scope: wire_grant_scope(&g.scope),
       state: grant_state_name(g.state),
+      grant_state: wire_grant_state(g.state),
     })
     .collect();
   ReplyBody::Grants { grants }
@@ -3275,6 +3278,8 @@ pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
       landing: r.landing,
       manifest: r.manifest,
       outcome: r.outcome.map(landing_state_name),
+      audit_kind: wire_audit_kind(r.kind),
+      stage: r.outcome.map(wire_landing_stage),
       // A record of a landing as a whole — its presentation, a granted run's plan, its finish — says how the landing's
       // signature was judged (A-321), unsigned when it carried none; no other record judges one. A verdict this build
       // names no code for (a newer build's record) reads as none.
@@ -3326,7 +3331,30 @@ fn summary_of(manifest: &Manifest) -> LandingSummary {
       .collect(),
     bytes: manifest.summary.bytes,
     filtered_out: manifest.summary.filtered_out as u64,
+    actions: tally_of(manifest),
   }
+}
+
+/// A manifest's entries per action, typed (A-299): counted from its entries' actions, one exhaustive match, so a new
+/// action does not compile until it is counted.
+#[cfg(unix)]
+fn tally_of(manifest: &Manifest) -> slates_ipc::protocol::ActionTally {
+  use slates_land::manifest::Action;
+  let mut tally = slates_ipc::protocol::ActionTally::default();
+  for entry in &manifest.entries {
+    let count = match &entry.action {
+      Action::Create => &mut tally.create,
+      Action::Replace => &mut tally.replace,
+      Action::Delete => &mut tally.delete,
+      Action::Rename { .. } => &mut tally.rename,
+      Action::Mkdir => &mut tally.mkdir,
+      Action::Rmdir => &mut tally.rmdir,
+      Action::Symlink { .. } => &mut tally.symlink,
+      Action::Clear => &mut tally.clear,
+    };
+    *count = count.saturating_add(1);
+  }
+  tally
 }
 
 #[cfg(unix)]
@@ -3361,6 +3389,23 @@ fn db_landing_state(state: &slates_land::engine::LandingState) -> DbLandingState
     L::Partial => DbLandingState::Partial,
     L::Refused => DbLandingState::Refused,
     L::Aborted => DbLandingState::Aborted,
+  }
+}
+
+/// A landing's state on the wire, typed (A-299).
+fn wire_landing_stage(state: DbLandingState) -> slates_ipc::protocol::LandingStage {
+  use slates_ipc::protocol::LandingStage as Stage;
+  match state {
+    DbLandingState::Planning => Stage::Planning,
+    DbLandingState::AwaitingGrant => Stage::AwaitingGrant,
+    DbLandingState::Validating => Stage::Validating,
+    DbLandingState::Writing => Stage::Writing,
+    DbLandingState::Syncing => Stage::Syncing,
+    DbLandingState::Advancing => Stage::Advancing,
+    DbLandingState::Done => Stage::Done,
+    DbLandingState::Partial => Stage::Partial,
+    DbLandingState::Refused => Stage::Refused,
+    DbLandingState::Aborted => Stage::Aborted,
   }
 }
 
@@ -3418,6 +3463,20 @@ fn db_audit_kind(kind: AuditKind) -> DbAuditKind {
   }
 }
 
+/// An audit record's kind on the wire, typed (A-299).
+fn wire_audit_kind(kind: DbAuditKind) -> slates_ipc::protocol::AuditKind {
+  use slates_ipc::protocol::AuditKind as Kind;
+  match kind {
+    DbAuditKind::GrantIssued => Kind::GrantIssued,
+    DbAuditKind::GrantRevoked => Kind::GrantRevoked,
+    DbAuditKind::LandingPlanned => Kind::LandingPlanned,
+    DbAuditKind::LandingValidated => Kind::LandingValidated,
+    DbAuditKind::EntryWritten => Kind::EntryWritten,
+    DbAuditKind::EntryRefused => Kind::EntryRefused,
+    DbAuditKind::LandingFinished => Kind::LandingFinished,
+  }
+}
+
 fn audit_kind_name(kind: DbAuditKind) -> String {
   match kind {
     DbAuditKind::GrantIssued => "grant_issued",
@@ -3442,6 +3501,17 @@ fn wire_grant_scope(scope: &DbGrantScope) -> GrantScope {
   match scope {
     DbGrantScope::Once => GrantScope::Once,
     DbGrantScope::Session { .. } => GrantScope::Session,
+  }
+}
+
+/// A grant's state on the wire, typed (A-299).
+fn wire_grant_state(state: DbGrantState) -> slates_ipc::protocol::GrantState {
+  use slates_ipc::protocol::GrantState as Wire;
+  match state {
+    DbGrantState::Issued => Wire::Issued,
+    DbGrantState::Consumed => Wire::Consumed,
+    DbGrantState::Expired => Wire::Expired,
+    DbGrantState::Revoked => Wire::Revoked,
   }
 }
 
