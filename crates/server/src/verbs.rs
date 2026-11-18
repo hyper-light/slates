@@ -4019,6 +4019,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
     Refusal::PolicyForbids { .. } => "policy_forbids",
+    Refusal::PolicyChanged { .. } => "policy_changed",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4513,8 +4514,9 @@ fn dispatch_inner(
     RequestBody::SetPolicy {
       subject,
       policy,
+      version,
       proof,
-    } => crate::landing::set_policy_verb(state, principal, subject, policy, proof),
+    } => crate::landing::set_policy_verb(state, principal, (subject, policy, version), proof),
     RequestBody::Policy { subject } => crate::landing::policy_verb(state, principal, subject),
     RequestBody::Share {
       volume,
@@ -4538,8 +4540,11 @@ fn dispatch_inner(
 /// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
 /// not verify: an agent cannot enroll itself.
 fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
-  let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::enroll_proof(secret, account),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
@@ -4586,8 +4591,11 @@ fn revoke_on_channel(
   consumer: u64,
   proof: Capability,
 ) -> Served {
-  let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::revoke_proof(secret, consumer),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
   }
@@ -5192,6 +5200,7 @@ fn create(
       live_shipped: false,
       live_holders: None,
       write: None,
+      write_version: 0,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5900,6 +5909,7 @@ fn found_green(
       live_shipped: false,
       live_holders: None,
       write: None,
+      write_version: 0,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6194,6 +6204,7 @@ fn create_work(
       live_shipped: false,
       live_holders: None,
       write: None,
+      write_version: 0,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6858,8 +6869,11 @@ fn submit_approved(
     state.count("merge_approved_by_consumer", 1);
     return forbidden("submit_approved");
   }
-  let expected = crate::landing::merge_approval_proof(&state.issuer_secret, work, &identity);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::merge_approval_proof(secret, work, &identity),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
@@ -9767,6 +9781,7 @@ pub(crate) fn materialize_taken_over_green(
         live_shipped: false,
         live_holders: None,
         write: None,
+        write_version: 0,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -10146,6 +10161,7 @@ pub(crate) fn materialize_taken_over(
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
       write: None,
+      write_version: 0,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -13379,6 +13395,7 @@ mod tests {
         live_shipped: false,
         live_holders: None,
         write: None,
+        write_version: 0,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),

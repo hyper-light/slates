@@ -85,7 +85,8 @@
 > **Write permission follows the mode the user gave the agent (2026-11-18, R10, D-22, §4.13; A-285, Ada's decisions,
 > revised the same day).** Bypass merges and lands at once; ask answers a typed approval request bound to the
 > manifest, which the harness presents; a forbidding mode is refused. The launcher (kiln passes each agent's mode) or
-> the harness sets the policy, the stricter of consumer and volume governs, unset is ask, and an agent never raises
+> the harness sets the policy, the stricter of consumer and volume governs, unset merges at once and lands under
+> approval, and an agent never raises
 > its own. Signed work is provenance, not permission. This closes, once built, "No grant can be issued on Linux from
 > the CLI" (A-201's entry): under bypass the daemon grants its own landing. The first reading (a human-only proof,
 > fs-server's options A–E) is withdrawn by Ada; its piece 2 (the presentation nonce and the signed `Grant`,
@@ -101,7 +102,11 @@
 > - **built (2026-11-18):** `Present` (never writes, whatever the mode) and merges under the policy (forbid refused,
 >   ask `MergeApprovalRequired` then `SubmitApproved` of exactly that increment, unset merges at once); 7 of 7 in
 >   `write_policy.rs`, the presentation test red with present-only broken;
-> - the launcher secret (g262) and launcher-class proofs verifying under it, with a policy version against replay;
+> - **built (2026-11-18):** launcher-class proofs (grant, policy, merge approval, enroll, revoke) verify under the
+>   issuer secret or the launcher secret the anchor holds (g262's region, A-299), and a policy names the version it
+>   replaces, so a captured proof sets nothing once the policy moved (`Refusal::PolicyChanged`);
+>   `launcher_secret.rs` 1 of 1 (red with the launcher secret ignored), `write_policy.rs` 8 of 8 (the replay test red
+>   with the version check removed);
 > - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
 > - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,

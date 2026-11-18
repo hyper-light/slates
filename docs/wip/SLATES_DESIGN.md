@@ -21361,9 +21361,12 @@ never landed whatever the mode (a reviewer's read of a bypass volume's changes w
 the stricter of the work's and the green's merge mode, forbid refused before the seal, ask answered
 `MergeApprovalRequired` with the increment's identity and its path count and merged by `SubmitApproved` under the
 launcher's proof of exactly that identity (`landing::merge_approval_proof`), a volume with no merge mode set merging at
-once as every merge did before policies. Owed, in order: the launcher secret (g262's, steps 1-4) and launcher-class
-proofs under it with a policy version against replay (mine), a consumer's own policy, the MCP and SDK land verb gated by
-the policy, then signed work. The
+once as every merge did before policies. Built the same day: every launcher-class proof (grant, policy, merge
+approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
+(`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
+`SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
+MCP and SDK land verb gated by the policy, then signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no

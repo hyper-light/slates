@@ -532,6 +532,10 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The launcher secret its starter handed the anchor (A-285): a launcher-class proof verifies under it as under the
+  /// issuer secret, so a launcher keeps its authority across its own restarts and the daemon's. `None` while the anchor
+  /// publishes none.
+  pub launcher_secret: Option<[u8; slates_anchor::layout::LAUNCHER_SECRET_BYTES]>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],

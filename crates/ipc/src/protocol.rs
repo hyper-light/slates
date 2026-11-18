@@ -860,7 +860,9 @@ pub enum RequestBody {
     subject: PolicySubject,
     /// The policy.
     policy: WritePolicy,
-    /// The keyed hash under the issuer secret.
+    /// The policy version the setter read (`Policy`'s `version`): refused `PolicyChanged` once the policy has moved.
+    version: u64,
+    /// The keyed hash under the launcher's secret, over the subject, the policy and the version.
     proof: [u8; 32],
   },
   /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
@@ -3304,6 +3306,12 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
+  /// Read the policy again and set it from there. Appended.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3805,6 +3813,8 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+    /// The policy's version: how many times it was set, which a `SetPolicy` names.
+    version: u64,
   },
   /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
   /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval

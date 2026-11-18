@@ -166,11 +166,13 @@ impl Issuer {
     &self,
     subject: &slates_ipc::protocol::PolicySubject,
     policy: &slates_ipc::protocol::WritePolicy,
+    version: u64,
   ) -> Result<[u8; 32], Error> {
     Ok(slates_server::landing::policy_proof(
       &self.secret()?,
       subject,
       policy,
+      version,
     ))
   }
 

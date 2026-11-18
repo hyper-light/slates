@@ -327,6 +327,11 @@ pub enum Stale {
   Bootstrap,
   /// The reviewed state or the daemon's authority changed before a recovery was authorized.
   Recovery,
+  /// A write policy moved after it was read (A-285): read it again and set it from there.
+  Policy {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why a call is refused for now.
@@ -692,6 +697,7 @@ impl Error {
       Refusal::UnknownBase { green, version } => Error::Stale(Stale::Base { green, version }),
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
+      Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
       Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
