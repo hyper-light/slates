@@ -13533,9 +13533,13 @@ not the cause: window100 reads as main. The true spin would make a hold pay (p50
 invocations), but at 3.5–10 cores quiet; A-218 measured and rejected it for its tails once the host has no idle core,
 and it stays rejected.
 
-**Decision (A-387).** macOS holds no shard for a closed loop (`config::closed_loop_hold`); Linux and Windows, whose held
-shards poll without sleeping, keep A-326's hold. The one adverse number is the quiet nine-shard p999, 108.6 against
-128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs).
+**Decision (A-387).** A hold is kept only where a held shard sees a request sooner than a parked one: its first form
+fixed the hold at none on macOS, and the rule now learns it per shard (the idle turn a request meets, E[T²]/E[T] over
+every idle turn, against the shard's wake estimate, `slates_rt::held_turn`), so a macOS shard's napping turns decline
+and Linux's and Windows' polling ones hold. The one adverse number in these rows is the quiet nine-shard p999, 108.6
+against 128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs). The learned rule's own
+A/B against main is owed (run request of 2026-11-18); `provision_bench` now prints each shard's learned turn beside its
+wake.
 
 **At 23 shards on the 32-CPU Studio** (d1323898, Apple M3 Ultra, 32 CPUs of which 24 performance, macOS 26.4; the same
 main and holdoff binaries; 18:09–18:31 UTC; `studio23-ab.sh` beside the other scripts, log `~/.cache/g234-ab/studio23.log`
