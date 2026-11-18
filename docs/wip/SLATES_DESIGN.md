@@ -1674,7 +1674,10 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   > **Status (2026-11-08, paged, A-263).** The whole listing was one reply, refused "reply too large for the bulk area" from
   > 100 volumes on a two-shard daemon (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
 - read_base(volume, path) → bytes: the entry as the disk holds it right now, for an agent that
-  wants to reconcile a drifted entry itself; a read, never a write.
+  wants to reconcile a drifted entry itself; a read, never a write. Answered a reply at a time (`ReadBase { offset }`
+  → `BaseBytes { bytes, total, stamp }`, A-267), the stamp a fold of the file's fingerprint, so a client walks the
+  pages and refuses a file that changed between them (`ChangedWhileRead`); neither a reply nor the daemon holds more
+  than a page of a base file.
 - rewitness(volume, paths?) → Rewitnessed: re-witness the named drifted entries (default: all) to the
   disk as it is now, after the agent has rewritten its copies; the agent's content is untouched;
   the drift records for those entries clear. This is the explicit "a resolution is itself a
@@ -22327,3 +22330,12 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
   `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
   `Stale::Verdict` (`CONTRACT` = 12).
+- **The byte lists (2026-11-17, goal g247):** `read_base` read the whole base file into the daemon's memory and
+  answered it in one reply, refused past about four kilobytes (`crates/server/tests/base_read_pages.rs`), so an agent
+  reconciling a drifted entry could read no real file. It is answered a page at a time from the volume core's
+  `Overlay::read_base_range` (the bytes from an offset, the file's size and a stamp of its fingerprint: device,
+  inode, size, modification, change and birth times, folded by BLAKE3), and the client walks the pages as `read` walks
+  `ReadRange`'s, refusing a mix of two states. The whole-file `Read` verb, a second read path beside the paged
+  `ReadRange` that read a whole file into memory and answered it in one reply, is removed (replaced, not kept beside:
+  no caller used it but the client's unused `read_begin`, `read_spin` and `read_poll`, removed with it, and tests,
+  which read through `ReadRange`).

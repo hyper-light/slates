@@ -1168,14 +1168,6 @@ fn extract_advanced(body: ReplyBody) -> Result<Advanced, ClientError> {
   }
 }
 
-/// Extracts a read's bytes, or a typed mismatch.
-fn extract_read(body: ReplyBody) -> Result<Vec<u8>, ClientError> {
-  match body {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
-    _ => Err(ClientError::UnexpectedReply { verb: "read" }),
-  }
-}
-
 /// Extracts a green's head version from its reply, or a typed mismatch.
 fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
   match body {
@@ -3120,30 +3112,6 @@ impl Client {
     self.poll_as(word, extract_advanced)
   }
 
-  /// Begins a read of a file at a view (§4.12 `read`), returning its request id.
-  pub fn read_begin(
-    &mut self,
-    volume: VolumeId,
-    path: &str,
-    at: ReadAt,
-  ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Read {
-      volume,
-      path: path.to_owned(),
-      at,
-    })
-  }
-
-  /// Takes a read's bytes within `spin_ns`.
-  pub fn read_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<Vec<u8>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_read)
-  }
-
-  /// Takes a read's bytes by id word once the completion fd signals.
-  pub fn read_poll(&mut self, word: u64) -> Result<Option<Vec<u8>>, ClientError> {
-    self.poll_as(word, extract_read)
-  }
-
   /// Takes a submit's outcome within `spin_ns`.
   pub fn submit_spin(
     &mut self,
@@ -4858,14 +4826,42 @@ impl Client {
     self.acknowledge(up_to)
   }
 
-  /// The base entry's bytes as the disk holds them now.
+  /// The base entry's bytes as the disk holds them now, read a page at a time (A-267); refused
+  /// [`ClientError::ChangedWhileRead`] when the file changed on the disk between two pages.
   pub fn read_base(&mut self, volume: VolumeId, path: &str) -> Result<Vec<u8>, ClientError> {
-    match self.call(&RequestBody::ReadBase {
-      volume,
-      path: path.to_owned(),
-    })? {
-      ReplyBody::BaseBytes { bytes } => Ok(bytes),
-      _ => Err(ClientError::UnexpectedReply { verb: "read_base" }),
+    // A reply rides one bulk chunk, so the base file comes in pages (A-267), as `read` takes a volume's; every page
+    // must carry the first one's stamp, or the file changed on the disk between them and the bytes would mix two
+    // states of it.
+    let mut bytes = Vec::new();
+    let mut first_stamp = None;
+    loop {
+      let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let ReplyBody::BaseBytes {
+        bytes: page,
+        total,
+        stamp,
+      } = self.call(&RequestBody::ReadBase {
+        volume,
+        path: path.to_owned(),
+        offset,
+      })?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "read_base" });
+      };
+      if *first_stamp.get_or_insert(stamp) != stamp {
+        return Err(ClientError::ChangedWhileRead {
+          path: path.to_owned(),
+        });
+      }
+      let done = offset.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX)) >= total;
+      if page.is_empty() && !done {
+        // A page that makes no progress short of the end would loop forever.
+        return Err(ClientError::UnexpectedReply { verb: "read_base" });
+      }
+      bytes.extend_from_slice(&page);
+      if done {
+        return Ok(bytes);
+      }
     }
   }
 

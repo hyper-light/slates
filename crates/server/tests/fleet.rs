@@ -4890,13 +4890,15 @@ fn a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_
   let mut last = None;
   let served = promoted
     && poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
-      let reply = client_x.call(&RequestBody::Read {
+      let reply = client_x.call(&RequestBody::ReadRange {
         volume: id,
         path: "/hello".to_owned(),
         at: ReadAt::Head,
+        offset: 0,
+        max: u64::MAX,
       });
       let served =
-        matches!(&reply, ReplyBody::ReadBytes { bytes } if bytes == b"hello across regions");
+        matches!(&reply, ReplyBody::ReadPage { bytes, .. } if bytes == b"hello across regions");
       last = Some(reply);
       Ok(served)
     });
@@ -16706,16 +16708,18 @@ fn read_green_file(
 ) -> Result<Vec<u8>, Box<ReplyBody>> {
   match client
     .try_call(
-      &RequestBody::Read {
+      &RequestBody::ReadRange {
         volume: green,
         path: "f".to_owned(),
         at,
+        offset: 0,
+        max: u64::MAX,
       },
       *DEADLINE_NS,
     )
     .unwrap_or_else(|e| refused_placeholder(&e))
   {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    ReplyBody::ReadPage { bytes, .. } => Ok(bytes),
     other => Err(Box::new(other)),
   }
 }

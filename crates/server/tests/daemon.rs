@@ -2833,14 +2833,8 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     ReplyBody::Versions { head: 1 }
   );
   assert_eq!(
-    sharer.call(&RequestBody::Read {
-      volume: green,
-      path: "f".to_owned(),
-      at: ReadAt::Head,
-    }),
-    ReplyBody::ReadBytes {
-      bytes: b"owned".to_vec()
-    }
+    read(&mut sharer, green, "f", ReadAt::Head),
+    Ok(b"owned".to_vec())
   );
   let ReplyBody::WorkCreated { id: own, base } = sharer.call(&RequestBody::CreateWork {
     green,
@@ -3678,12 +3672,22 @@ fn read(
   path: &str,
   at: ReadAt,
 ) -> Result<Vec<u8>, Refusal> {
-  match client.call(&RequestBody::Read {
+  // One page from the start: every file these tests read fits one (`ReadRange`; the whole-file `Read` is gone, A-267).
+  match client.call(&RequestBody::ReadRange {
     volume,
     path: path.to_owned(),
     at,
+    offset: 0,
+    max: u64::MAX,
   }) {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    ReplyBody::ReadPage { bytes, total, .. } => {
+      assert_eq!(
+        u64::try_from(bytes.len()).unwrap(),
+        total,
+        "{path} fits one page"
+      );
+      Ok(bytes)
+    }
     ReplyBody::Refused { refusal } => Err(refusal),
     other => panic!("read: {other:?}"),
   }
@@ -4579,16 +4583,9 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
     ),
     "an edit the budget cannot hold is refused: {refused:?}"
   );
-  let read = client.call(&RequestBody::Read {
-    volume: work,
-    path: "f.txt".to_owned(),
-    at: ReadAt::Head,
-  });
   assert_eq!(
-    read,
-    ReplyBody::ReadBytes {
-      bytes: b"before".to_vec()
-    },
+    read_f(&mut client, work),
+    b"before".to_vec(),
     "the refused edit changed nothing"
   );
   let second = a_new_work_under_the_hold(&mut client, green);
@@ -4611,12 +4608,8 @@ fn edit_first_byte(client: &mut Client, work: slates_ipc::protocol::VolumeId) ->
 }
 
 /// `f.txt` as `work` sees it.
-fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
-  client.call(&RequestBody::Read {
-    volume: work,
-    path: "f.txt".to_owned(),
-    at: slates_ipc::protocol::ReadAt::Head,
-  })
+fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> Vec<u8> {
+  read(client, work, "f.txt", slates_ipc::protocol::ReadAt::Head).unwrap()
 }
 
 /// Under the pressure hold: a new work of `green` is created (it holds nothing of its own), and its first edit of the
@@ -4643,9 +4636,7 @@ fn a_new_work_under_the_hold(
   );
   assert_eq!(
     read_f(client, second),
-    ReplyBody::ReadBytes {
-      bytes: b"before".to_vec()
-    },
+    b"before".to_vec(),
     "the new work sees the green's file, unchanged by the refused edit"
   );
   second
@@ -4656,9 +4647,7 @@ fn the_new_works_edit_once_released(client: &mut Client, second: slates_ipc::pro
   assert_eq!(edit_first_byte(client, second), ReplyBody::Edited);
   assert_eq!(
     read_f(client, second),
-    ReplyBody::ReadBytes {
-      bytes: b"xbefore".to_vec()
-    },
+    b"xbefore".to_vec(),
     "the new work's edit spliced the green's file"
   );
 }

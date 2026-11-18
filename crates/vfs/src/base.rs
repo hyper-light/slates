@@ -155,6 +155,20 @@ pub enum DriftKind {
   TypeChanged,
 }
 
+/// One range of a base entry as the disk holds it now ([`Overlay::read_base_range`]; §4.4 `read_base`,
+/// A-267): the bytes, the file's size, and a stamp of its fingerprint, so a reader joining ranges knows each is of one
+/// state of the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseRange {
+  /// The bytes from the range's offset: as many as asked, fewer at the file's end, none past it.
+  pub bytes: Vec<u8>,
+  /// The file's size when the range was read.
+  pub total: u64,
+  /// The file's fingerprint when the range was read, folded to a word (its device, inode number, size, times and
+  /// birth): a file changed or replaced between two ranges stamps them differently.
+  pub stamp: u64,
+}
+
 /// What `status` reports for an overlay volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseStatus {
@@ -781,6 +795,24 @@ fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
     .dirs
     .get(dir)
     .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
+}
+
+/// A fingerprint folded to a word ([`BaseRange::stamp`]): BLAKE3 over the fields a change or a replacement of the file
+/// moves (its device, inode number, size, modification, change and birth times), its first eight bytes.
+fn fingerprint_stamp(fp: &Fingerprint) -> u64 {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&fp.dev.to_le_bytes());
+  hasher.update(&fp.ino.to_le_bytes());
+  hasher.update(&fp.size.to_le_bytes());
+  hasher.update(&fp.mtime_ns.to_le_bytes());
+  hasher.update(&fp.ctime_ns.to_le_bytes());
+  hasher.update(&fp.birth_ns.to_le_bytes());
+  let digest = hasher.finalize();
+  let mut word = [0u8; 8];
+  for (to, from) in word.iter_mut().zip(digest.as_bytes()) {
+    *to = *from;
+  }
+  u64::from_le_bytes(word)
 }
 
 fn host_refusal(e: HostError) -> VfsError {
@@ -3716,8 +3748,62 @@ impl Overlay<'_> {
 
   // ---------------------------------------------------------------- verbs
 
+  /// One range of `read_base` (§4.4, A-267): up to `max` bytes of the entry at `path` from `offset`, as the disk holds
+  /// it right now, with its size and its fingerprint's stamp ([`BaseRange`]); a read, never a write. The daemon answers
+  /// `read_base` a reply at a time from it, so neither a reply nor the daemon's memory holds more than a page of a base
+  /// file however large; reading the whole file in one call held all of it and answered past a reply's room with
+  /// "reply too large for the bulk area".
+  pub fn read_base_range(
+    &mut self,
+    path: &str,
+    offset: u64,
+    max: usize,
+  ) -> Result<BaseRange, VfsError> {
+    let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+      return Err(VfsError::IsDirectory);
+    };
+    let mut opened = Vec::new();
+    let mut dir = root;
+    let result = (|| {
+      for d in dirs {
+        dir = self.host.open_dir(dir, d).map_err(host_refusal)?;
+        opened.push(dir);
+      }
+      let file = self.host.open_file(dir, name).map_err(host_refusal)?;
+      let ranged = self.host.fstat(file).map_err(host_refusal).and_then(|fp| {
+        let left = fp.size.saturating_sub(offset);
+        let len = usize::try_from(left).unwrap_or(usize::MAX).min(max);
+        let mut bytes = vec![0u8; len];
+        let mut done = 0usize;
+        while let Some(unread) = bytes.get_mut(done..).filter(|unread| !unread.is_empty()) {
+          let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+          let n = self.host.read_at(file, at, unread).map_err(host_refusal)?;
+          if n == 0 {
+            break;
+          }
+          done = done.saturating_add(n);
+        }
+        bytes.truncate(done);
+        Ok(BaseRange {
+          bytes,
+          total: fp.size,
+          stamp: fingerprint_stamp(&fp),
+        })
+      });
+      self.host.close_file(file);
+      ranged
+    })();
+    for d in opened {
+      self.host.close_dir(d);
+    }
+    result
+  }
+
   /// `read_base`: the entry as the disk holds it right now, through the base's directories by
-  /// name; a read, never a write.
+  /// name; a read, never a write. The whole file in memory: the volume core's own callers and its tests; the daemon
+  /// answers `read_base` a range at a time ([`Self::read_base_range`]).
   pub fn read_base(&mut self, path: &str) -> Result<Vec<u8>, VfsError> {
     let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

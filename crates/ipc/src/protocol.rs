@@ -180,7 +180,7 @@ pub struct GreenBase {
   pub snapshot: SnapshotId,
 }
 
-/// Which view of a volume a [`RequestBody::Read`] reads (§4.16 "Attachments and versions"; §4.12
+/// Which view of a volume a [`RequestBody::ReadRange`] reads (§4.16 "Attachments and versions"; §4.12
 /// `slates.fs.read`).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadAt {
@@ -358,12 +358,16 @@ pub enum RequestBody {
     /// records stay: at most the ring's slots and the client's hold.
     owed: Vec<u32>,
   },
-  /// The base entry as the disk holds it now (§4.4 `read_base`).
+  /// One page of the base entry as the disk holds it now (§4.4 `read_base`, A-267): its bytes from `offset`, as many as
+  /// one reply holds, with the file's size and its fingerprint's stamp; a client walks the pages to the size and
+  /// refuses a file whose stamp moved between them. Neither a reply nor the daemon holds more than a page.
   ReadBase {
     /// The volume.
     volume: VolumeId,
     /// The path.
     path: String,
+    /// Where the page starts: 0, then the bytes read so far.
+    offset: u64,
   },
   /// Re-witness drifted entries (§4.4 `rewitness`).
   Rewitness {
@@ -515,17 +519,6 @@ pub enum RequestBody {
     attachment: u64,
     /// The version to pin, or the head.
     version: Option<u64>,
-  },
-  /// Read a file's bytes from a volume at a view (§4.12 `slates.fs.read`): a green's head or a named
-  /// version, the version an attachment pins, or a work's or plain volume's live tree. A read; never
-  /// recorded. Appended at the end for append-only evolution.
-  Read {
-    /// The volume.
-    volume: VolumeId,
-    /// The file.
-    path: String,
-    /// The view.
-    at: ReadAt,
   },
   /// Explicitly create a configuration group through an authenticated local account (AUD-07).
   /// Binding the request to this start prevents a client retry from resetting a replacement.
@@ -1617,7 +1610,6 @@ impl RequestBody {
       | RequestBody::Rewitness { volume, .. }
       | RequestBody::Pin { volume, .. }
       | RequestBody::AwaitPlaced { volume, .. }
-      | RequestBody::Read { volume, .. }
       | RequestBody::MapRead { volume, .. }
       | RequestBody::MapWrite { volume, .. }
       | RequestBody::MapSync { volume, .. }
@@ -1729,7 +1721,6 @@ impl RequestBody {
         | RequestBody::Conflicts { .. }
         | RequestBody::Versions { .. }
         | RequestBody::ChangedSince { .. }
-        | RequestBody::Read { .. }
         | RequestBody::ReadRange { .. }
         | RequestBody::ReadWindow { .. }
         | RequestBody::ReadDir { .. }
@@ -3360,7 +3351,7 @@ pub enum Refusal {
   /// A `MapRead` (§4.6, A-171) could not be served as a direct map — a different-uid, non-plain or non-head request,
   /// an overlay, a client served by another shard, a platform with no route yet, or a copy the daemon's budget or the
   /// OS refused — so the client reads the file by its normal paged read instead. The bytes are identical; only the
-  /// copy per read is paid, and the reply is never a single oversized `ReadBytes`. Appended.
+  /// copy per read is paid, and every reply is one page (`ReadPage`). Appended.
   MapUnavailable,
   /// An image could not be built or merged (§4.6, A-160): the image format refused the tree or the image (a name or a
   /// time it cannot hold, a capacity too small, a corrupt or hostile image), or the image holds what a volume cannot
@@ -3689,10 +3680,15 @@ pub enum ReplyBody {
   },
   /// Acknowledged.
   Acknowledged,
-  /// The base bytes.
+  /// One page of a base entry's bytes (`ReadBase`, A-267).
   BaseBytes {
-    /// The bytes.
+    /// The bytes from the request's offset: as many as one reply holds, fewer at the file's end.
     bytes: Vec<u8>,
+    /// The file's size when this page was read.
+    total: u64,
+    /// The file's fingerprint when this page was read, folded to a word: a file changed or replaced between two pages
+    /// stamps them differently, and a reader joining pages refuses the mix.
+    stamp: u64,
   },
   /// Re-witnessed.
   Rewitnessed {
@@ -3802,11 +3798,6 @@ pub enum ReplyBody {
     /// holder of the view's reads treats every path as invalidated (a superset is always safe), or reads a green's
     /// changes a page at a time (`ChangedSince`).
     invalidated_elided: u32,
-  },
-  /// A file's bytes at the requested view (§4.12 `read`). Appended for append-only evolution.
-  ReadBytes {
-    /// The bytes.
-    bytes: Vec<u8>,
   },
   /// The local copy and exact action proposed for operator-reviewed quorum-loss recovery.
   RecoveryPlan {

@@ -606,15 +606,6 @@ pub(crate) struct ForwardedRequest {
 /// wait instead) return `None` too.
 fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
   match body {
-    RequestBody::Read {
-      volume,
-      at: ReadAt::Head,
-      ..
-    } => Some(*volume),
-    RequestBody::Read {
-      at: ReadAt::Version { .. } | ReadAt::Attachment { .. },
-      ..
-    } => None,
     RequestBody::ReadRange {
       volume,
       at: ReadAt::Head,
@@ -4323,9 +4314,6 @@ fn dispatch_inner(
       attachment,
       version,
     } => crate::merge_service::advance(state, principal, attachment, version),
-    RequestBody::Read { volume, path, at } => {
-      crate::merge_service::read(state, principal, volume, &path, at)
-    }
     RequestBody::MapRead { volume, path, at } => {
       crate::direct_map::map_read(state, client_id, principal, volume, &path, at)
     }
@@ -4562,7 +4550,11 @@ fn dispatch_inner(
     }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
-    RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
+    RequestBody::ReadBase {
+      volume,
+      path,
+      offset,
+    } => read_base(state, principal, volume, &path, offset),
     RequestBody::Digest { volume, path } => digest(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
       rewitness(state, principal, volume, paths.as_deref())
@@ -11581,11 +11573,15 @@ fn base_of(
   Ok(handle)
 }
 
+/// `read_base` (§4.4, A-267): one page of the base entry as the disk holds it now, from `offset`, as many bytes as one
+/// reply holds, with the file's size and its fingerprint's stamp. The client walks the pages and refuses a file whose
+/// stamp moved between them; neither a reply nor this shard holds more than a page of a base file however large.
 fn read_base(
   state: &mut ShardState,
   principal: &Principal,
   volume: VolumeId,
   path: &str,
+  offset: u64,
 ) -> ReplyBody {
   let handle = match base_of(state, principal, volume, "read_base", false) {
     Ok(h) => h,
@@ -11597,8 +11593,21 @@ fn read_base(
   let Some(host) = slot.host.as_mut() else {
     return refused(Refusal::NotFound);
   };
-  match slot.volume.with_host(host).read_base(path) {
-    Ok(bytes) => ReplyBody::BaseBytes { bytes },
+  let room = reply_room(&ReplyBody::BaseBytes {
+    bytes: Vec::new(),
+    total: u64::MAX,
+    stamp: u64::MAX,
+  });
+  match slot
+    .volume
+    .with_host(host)
+    .read_base_range(path, offset, room)
+  {
+    Ok(range) => ReplyBody::BaseBytes {
+      bytes: range.bytes,
+      total: range.total,
+      stamp: range.stamp,
+    },
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
