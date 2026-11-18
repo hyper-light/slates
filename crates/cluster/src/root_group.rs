@@ -1319,24 +1319,7 @@ mod tests {
     );
 
     let survivors = [P0, P1];
-    assert!(
-      groups
-        .get_mut(&P0)
-        .is_some_and(|leader| leader.reconcile_regions(&[R0, R1], &BTreeMap::new()))
-    );
-    replicate_round(&mut groups, P0, &survivors);
-    replicate_round(&mut groups, P0, &survivors);
-    let representatives: BTreeMap<RegionId, HostId> = [(R0, P0), (R1, P1)].into_iter().collect();
-    for rounds in [1, 2] {
-      assert!(
-        groups
-          .get_mut(&P0)
-          .is_some_and(|leader| leader.reconcile_voters(&representatives))
-      );
-      for _ in 0..rounds {
-        replicate_round(&mut groups, P0, &survivors);
-      }
-    }
+    retire_region_two(&mut groups, &survivors);
     let second = record_root_voters(&mut groups, &survivors);
     assert_eq!(second, vec![P0, P1], "the seat change left P0 and P1");
     assert!(learner.adopt(groups[&P0].configuration().clone()));
@@ -1345,6 +1328,29 @@ mod tests {
       (second, false),
       "the learner names the changed voters"
     );
+  }
+
+  /// Retires region R2 at the root leader `P0` and drops its voter P2 by the voter change, each committed over
+  /// `survivors` (P0 and P1).
+  fn retire_region_two(groups: &mut BTreeMap<HostId, RootGroup>, survivors: &[HostId]) {
+    assert!(
+      groups
+        .get_mut(&P0)
+        .is_some_and(|leader| leader.reconcile_regions(&[R0, R1], &BTreeMap::new()))
+    );
+    replicate_round(groups, P0, survivors);
+    replicate_round(groups, P0, survivors);
+    let representatives: BTreeMap<RegionId, HostId> = [(R0, P0), (R1, P1)].into_iter().collect();
+    for rounds in [1, 2] {
+      assert!(
+        groups
+          .get_mut(&P0)
+          .is_some_and(|leader| leader.reconcile_voters(&representatives))
+      );
+      for _ in 0..rounds {
+        replicate_round(groups, P0, survivors);
+      }
+    }
   }
 
   /// Has the root leader `P0` record its voters and commits the record over `reachable`. Expect the record proposed and

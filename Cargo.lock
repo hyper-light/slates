@@ -1308,6 +1308,7 @@ dependencies = [
  "slates-anchor",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
+ "slates-bridge-virtiofs",
  "slates-bridge-winfsp",
  "slates-client",
  "slates-db",

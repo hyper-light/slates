@@ -317,6 +317,10 @@ pub struct ShardState {
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
+  /// Whether the last publication kept a record of a volume it left out, and so kept every deferred block the arena
+  /// holds (A-430, `verbs::keep_left_out_records_blocks`): until one that keeps none commits, a publication run only to
+  /// relieve the arena releases nothing, and is not run.
+  pub(crate) deferred_kept: bool,
   /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,
@@ -757,6 +761,9 @@ pub struct ShardState {
   /// The writers parked until every FUSE mount of their volume has been told of their change, and the replies held for
   /// them (AC-3.3; `crate::told`). Bounded by the tasks waiting and the shard's client credit.
   pub(crate) told_waiters: crate::told::ToldWaiters,
+  /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
+  /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
+  pub(crate) told_times: crate::told::ToldTimes,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,

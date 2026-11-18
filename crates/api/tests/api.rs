@@ -37,6 +37,18 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 #[allow(dead_code)]
 mod signer;
 
+/// The daemon's own test VMM (§4.6, G-vhost): a guest driver over real virtqueues and the vhost-user front end that
+/// speaks for it, shared with the server's virtio-fs suite and the CLI's live-shipping flow; not every helper is used
+/// here. Linux only, as the vhost-user form is.
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/guest.rs"]
+#[allow(dead_code)]
+mod guest;
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/vhost_front_end.rs"]
+#[allow(dead_code)]
+mod vhost_front_end;
+
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds); measured once per process.
 const PROBE_MS: u64 = 5;
 /// Shape: one shard per test daemon: the library's verbs are the subject, not placement.
@@ -1805,6 +1817,175 @@ mod shards {
     drop(device);
     daemon.stop();
   }
+}
+
+/// Format: what a guest writes through the vhost-user device the library served, and the file it names.
+#[cfg(target_os = "linux")]
+const FROM_THE_GUEST: &[u8] =
+  b"written by a guest through the device the library served, read by the library\n";
+#[cfg(target_os = "linux")]
+const GUEST_FILE: &str = "from-the-guest.txt";
+
+/// One FUSE request through the vhost-user guest: submitted on the request queue, kicked, its interrupt awaited, its
+/// reply read back (the server's virtio-fs suite's `through_vhost`).
+#[cfg(target_os = "linux")]
+fn through_vhost(
+  front: &vhost_front_end::FrontEnd,
+  driver: &mut guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  request: &[u8],
+) -> Vec<u8> {
+  let head = driver.submit(request, guest::REPLY_CAP);
+  front.kick_and_wait(1);
+  let (id, len) = driver.reap().expect("a used element after the interrupt");
+  assert_eq!(id, head);
+  driver.reply_of(head, len)
+}
+
+/// Waits within the suite's wait until `volume` holds `count` attachments: a device's ends after its end closes.
+#[cfg(target_os = "linux")]
+fn wait_for_attachments(instance: &mut Instance, volume: VolumeId, count: u32) {
+  let started = Instant::now();
+  while instance.status(volume).unwrap().attachments != count {
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the attachments never came to {count}"
+    );
+    std::thread::yield_now();
+  }
+}
+
+/// AC-5.12 / T-5.14 (A-278; §4.6, G-vhost: slates' own virtio-fs device for a VMM over vhost-user; the library audit's
+/// gap c): the library's own route, `Instance::serve_vhost_user`, by use. Do: serve a volume over vhost-user; check the
+/// record before any front end speaks; as the VMM, take the device's end, negotiate the guest's memory and configure the
+/// queues (the daemon's own test front end); as the guest, create, write and release a file; read it through the
+/// library; close the end. Then serve the volume again offering a DAX window of one range, and serve a volume no one
+/// made. Expect: the device recorded at once with the write lease; the guest's bytes read back by the library; the
+/// attachment gone once the end closes; the window offered (the capability's residency names DAX-mapped guest pages);
+/// and the stranger refused `NotFound` naming the volume.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use slates_bridge_fuse::reply::EntryOut;
+
+  let (daemon, mut instance) = grouped("vhost-user");
+  let volume = provision(&mut instance, &VolumeSpec::empty("vhosted", ROOM));
+  let device = instance
+    .serve_vhost_user(volume, Intent::Write, ("slates", None), None)
+    .unwrap();
+  assert!(device.attachment.capability.supported);
+  assert!(
+    device.attachment.lease_epoch.is_some(),
+    "the write lease is taken"
+  );
+  assert_eq!(
+    instance.status(volume).unwrap().attachments,
+    1,
+    "the device is recorded before its front end speaks"
+  );
+  let front = vhost_front_end::FrontEnd::over(device.end);
+  let ram = vhost_front_end::guest_ram(true);
+  let mut driver = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&driver);
+  let created = through_vhost(
+    &front,
+    &mut driver,
+    &guest::message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &guest::create_body(GUEST_FILE),
+    ),
+  );
+  assert_eq!(guest::reply_error(&created), 0, "CREATE");
+  let node = guest::u64_at(&created, OUT_HEADER_LEN);
+  let handle = guest::u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  let written = through_vhost(
+    &front,
+    &mut driver,
+    &guest::message(
+      Opcode::Write.to_wire(),
+      2,
+      node,
+      &guest::write_body(handle, FROM_THE_GUEST),
+    ),
+  );
+  assert_eq!(guest::reply_error(&written), 0, "WRITE");
+  let released = through_vhost(
+    &front,
+    &mut driver,
+    &guest::message(
+      Opcode::Release.to_wire(),
+      3,
+      node,
+      &guest::release_body(handle),
+    ),
+  );
+  assert_eq!(guest::reply_error(&released), 0, "RELEASE");
+  assert_eq!(
+    read_file(&mut instance, volume, &format!("/{GUEST_FILE}")),
+    FROM_THE_GUEST,
+    "the library reads what the guest wrote"
+  );
+  drop(driver);
+  drop(front);
+  wait_for_attachments(&mut instance, volume, 0);
+  let windowed = instance
+    .serve_vhost_user(
+      volume,
+      Intent::Write,
+      ("slates", None),
+      Some(slates_mem::DAX_RANGE_BYTES),
+    )
+    .unwrap();
+  assert!(
+    matches!(
+      windowed.attachment.capability.residency,
+      slates_ipc::protocol::Residency::DaemonRamAndGuestPageCache { dax_mapped: true }
+    ),
+    "the window is offered: {:?}",
+    windowed.attachment.capability.residency
+  );
+  drop(windowed);
+  wait_for_attachments(&mut instance, volume, 0);
+  assert_eq!(
+    instance
+      .serve_vhost_user(NOWHERE, Intent::Write, ("slates", None), None)
+      .err(),
+    Some(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  daemon.stop();
+}
+
+/// AC-5.12 (A-278; §4.6, G-vhost): vhost-user is Linux's (its eventfds and the KVM VMMs that speak it), and elsewhere the
+/// library's route answers so, typed. Do: on another platform, ask the library to serve a volume over vhost-user.
+/// Expect it refused `Unsupported::Attachment` naming the inherited-descriptor transport and `BindingNotBuilt`, before
+/// any effect: the volume holds no attachment after.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_vhost_user_device_is_refused_typed_where_the_form_is_not_built() {
+  let (daemon, mut instance) = grouped("vhost-elsewhere");
+  let volume = provision(&mut instance, &VolumeSpec::empty("vhost-elsewhere", ROOM));
+  assert_eq!(
+    instance
+      .serve_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .err(),
+    Some(Error::Unsupported(Unsupported::Attachment {
+      transport: AttachTransport::VirtioFsInheritedDescriptor,
+      reason: slates_api::UnsupportedReason::BindingNotBuilt,
+    }))
+  );
+  assert_eq!(
+    instance.status(volume).unwrap().attachments,
+    0,
+    "nothing attached"
+  );
+  daemon.stop();
 }
 
 /// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop, on every platform:

@@ -143,7 +143,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
 /// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
 /// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux; macOS too
-/// since A-339, the type unchanged), none elsewhere and from the simulator (A-316; the same day). 13: signed merges
+/// since A-339, and Windows since A-427, the type unchanged), none from the simulator (A-316; the same day). 13: signed merges
 /// (A-321): `merge` sends its signature and answers how the daemon judged it, `merge_statement` (a
 /// [`MergeStatement`]), `approve_merge` carries the signature again (`MergeApproval::signature`), `merge_record` (a
 /// [`MergeRecord`], `Missing::Version`), `set_signers` and `signers` ([`TrustedSigner`]); a volume's policy may require
@@ -269,6 +269,15 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
     })
   })
 }
+
+/// The user guide, `docs/library.md`, as rustdoc collects doctests: each of its Rust examples compiles against this
+/// crate (`cargo test -p slates-api --doc`), so the guide cannot drift from the API it shows (a doc-truth test,
+/// CLAUDE.md §4; the library audit's gap d, 2026-11-18). Nothing else ever sees it: `cfg(doctest)` holds only while
+/// rustdoc collects doctests, so no build compiles it, no rendered page shows it, and a vendored copy without `docs/`
+/// builds as before.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/library.md")]
+pub struct Guide;
 
 #[cfg(test)]
 mod contract_history {
