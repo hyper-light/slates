@@ -429,16 +429,42 @@ jobs:
           # local install needs, and the publish lane builds the manylinux wheels in the containers.
           - { os: ubuntu-latest, maturin_compatibility: "--compatibility linux" }
           - { os: macos-latest, maturin_compatibility: "" }
+          # Windows, both arches: the Node suites and the packaged smoke test only. The Python steps below assume a
+          # Unix venv (`venv/bin`), so the Python leg there is owed (GAPS, "The Node SDK suites on Windows"). Until
+          # 2026-11-18 the Node suites had never run on Windows, and there every teardown's process-group kill was
+          # refused and swallowed, so a suite waited on its live anchor for good (over 70 minutes, diag run
+          # 44384411115); `crates/sdk-node/tests/anchor.mjs` now ends an anchor the platform's way and fails a test it
+          # cannot end.
+          - { os: windows-latest, node_only: true }
+          - { os: windows-11-arm, node_only: true }
     runs-on: ${{ matrix.os }}
     env:
       NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+      # AWS-LC's x86_64 Windows assembly is built from source (`windows-lint` says why); read on that target alone.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      # aws-lc-sys builds its C and its arm64 assembly with clang-cl on this target (`windows-arm64` says why).
+      - name: clang-cl for the C the daemon and the addon link (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-python@v5
+        if: ${{ !matrix.node_only }}
         with:
           python-version: "3.11"
       - uses: actions/setup-node@v4
@@ -447,6 +473,7 @@ jobs:
       - name: The daemon both SDK suites spawn
         run: cargo build -p slates-cli
       - name: Build the wheel and the sdist, check their metadata, install the wheel into a fresh venv
+        if: ${{ !matrix.node_only }}
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/venv"
@@ -462,32 +489,47 @@ jobs:
       # at 10 under the same load: five of five. The loop-responsiveness bound deliberately does not
       # scale with it, so this cannot mask the held-loop failure it is there to catch.
       - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        if: ${{ !matrix.node_only }}
         env:
           SLATES_TEST_RESTART_SLOWDOWN: "10"
         run: SLATES_DAEMON="$PWD/target/debug/slates" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
+      # Paths a native program reads: on Windows Git Bash's `pwd -W` and `cygpath -m` name the drive (`D:/a/...`), where
+      # `$PWD` is a POSIX path Node would misread; elsewhere `pwd` and the variable as it is. The daemon is
+      # `slates.exe` on Windows. A step's timeout bounds a suite that cannot end (the 70-minute wait above).
       - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        shell: bash
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
           (cd crates/sdk-node && npm run build)
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates"
+          if [ -e "$daemon.exe" ]; then daemon="$daemon.exe"; fi
           addon=$(ls crates/sdk-node/slates.*.node)
-          SLATES_NODE_ADDON="$PWD/$addon" SLATES_DAEMON="$PWD/target/debug/slates" \
+          SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
             node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
       - name: Pack the main and platform packages, install them into a fresh project, run the packaged smoke test
+        shell: bash
+        timeout-minutes: 30
         run: |
           set -euo pipefail
+          root=$(pwd -W 2>/dev/null || pwd)
+          temp=$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
+          daemon="$root/target/debug/slates"
+          if [ -e "$daemon.exe" ]; then daemon="$daemon.exe"; fi
           binary=$(basename "$(ls crates/sdk-node/slates.*.node)")
           platform=${binary#slates.}
           platform=${platform%.node}
           cp "crates/sdk-node/$binary" "crates/sdk-node/npm/$platform/"
-          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$RUNNER_TEMP")
-          (cd crates/sdk-node && npm pack --pack-destination "$RUNNER_TEMP")
-          mkdir "$RUNNER_TEMP/project"
-          cd "$RUNNER_TEMP/project"
+          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$temp")
+          (cd crates/sdk-node && npm pack --pack-destination "$temp")
+          mkdir "$temp/project"
+          cd "$temp/project"
           npm init -y >/dev/null
-          npm install "$RUNNER_TEMP"/hyper-light-slates-*.tgz
-          cp "$GITHUB_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
-          SLATES_DAEMON="$GITHUB_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
+          npm install "$temp"/hyper-light-slates-*.tgz
+          cp "$root/crates/sdk-node/tests/packaged.test.mjs" "$root/crates/sdk-node/tests/anchor.mjs" .
+          SLATES_DAEMON="$daemon" node --test packaged.test.mjs
 
   # The Windows cfg branches (the Win32 rendezvous, the IOCP driver, the Win32 machine facts, the
   # WinFsp bridge) lint on a NATIVE Windows runner — each platform builds and lints on its own OS, so
