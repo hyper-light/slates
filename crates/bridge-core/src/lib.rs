@@ -224,6 +224,147 @@ pub enum DaxOffer {
   },
 }
 
+/// How a guest's run sees the owners of the volume's files (§4.6, the Shards route; A-281): the identity on every
+/// transport but a Shards stream whose guest named its run's owner with Shards' owner word (`trusted.shards.owner`).
+/// There the owner the volume keeps for what its host made (the stream's root's owner when the word came) is shown to
+/// the guest as the run's owner, and the run's owner as that one, uid and gid each: a swap of two ids, so it is its own
+/// inverse. A chown the guest asks and the stat it reads back agree, two ids never collapse into one, and every other
+/// route (a host mount, NFS, the SDK, a landing) sees the owners the volume keeps.
+///
+/// Why a swap and not Shards' own rule (its server shows every file "the host made" as the run's): slates keeps a real
+/// owner on every file, the host's for a base file and the creator's for the rest, where Shards' server keeps the
+/// guest's owner in an attribute beside a host file the host user owns. A one-way rule (the host's id shown as the
+/// run's) would show the run's own files and the host's alike, and leave nothing for a chown to the host's id to store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnerView {
+  /// The two owners swapped, none for the identity.
+  swap: Option<OwnerSwap>,
+}
+
+/// The two owners an [`OwnerView`] swaps: the volume's and the run's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnerSwap {
+  /// The owner (uid, gid) the volume keeps for what its host made.
+  kept: (u32, u32),
+  /// The owner (uid, gid) the run named.
+  run: (u32, u32),
+}
+
+impl OwnerView {
+  /// The view every transport has until a guest names its run's owner: each id shown as the volume keeps it.
+  pub const IDENTITY: OwnerView = OwnerView { swap: None };
+
+  /// The view that shows the volume's owner `kept` (uid, gid) as the run's owner `run`, and `run` as `kept`.
+  pub const fn swapping(kept: (u32, u32), run: (u32, u32)) -> OwnerView {
+    OwnerView {
+      swap: Some(OwnerSwap { kept, run }),
+    }
+  }
+
+  /// The uid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_uid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.0, s.run.0))
+  }
+
+  /// The gid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_gid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.1, s.run.1))
+  }
+
+  /// The uid the volume keeps for an id the guest names (a caller, a creator, a chown): the inverse of
+  /// [`OwnerView::shown_uid`], which, a swap being its own inverse, is the same exchange.
+  pub fn kept_uid(&self, shown: u32) -> u32 {
+    self.shown_uid(shown)
+  }
+
+  /// The gid the volume keeps for a gid the guest names: the inverse of [`OwnerView::shown_gid`].
+  pub fn kept_gid(&self, shown: u32) -> u32 {
+    self.shown_gid(shown)
+  }
+
+  /// The two owners swapped, the volume's (uid, gid) then the run's, none for the identity: what a stream's tables keep
+  /// so that a restored stream shows its guest the owners the saved one did (A-303), as
+  /// [`OwnerView::swapping`] makes the view again.
+  pub fn swapped(&self) -> Option<((u32, u32), (u32, u32))> {
+    self.swap.map(|swap| (swap.kept, swap.run))
+  }
+}
+
+/// `id` with `a` and `b` exchanged: `b` for `a`, `a` for `b`, any other unchanged.
+fn swapped(id: u32, a: u32, b: u32) -> u32 {
+  if id == a {
+    b
+  } else if id == b {
+    a
+  } else {
+    id
+  }
+}
+
+/// Format: the attribute namespace every route reads and writes: Linux's user namespace (xattr(7)), and what RFC
+/// 8276's names are stored under.
+pub const USER_NAMESPACE: &[u8] = b"user.";
+
+/// Format: the attribute namespaces a guest's kernel keeps on its files and no host's mount reaches (xattr(7), A-290):
+/// its administrator's (`trusted.`, which its kernel lets only a process with `CAP_SYS_ADMIN` read or set) and its
+/// security modules' (`security.`: `security.capability` from `setcap`, an SELinux label, an IMA hash).
+pub const GUEST_NAMESPACES: [&[u8]; 2] = [b"trusted.", b"security."];
+
+/// Format: the two names under which a Linux kernel keeps a file's POSIX ACLs (acl(5), `include/uapi/linux/xattr.h`
+/// `XATTR_NAME_POSIX_ACL_ACCESS` and `_DEFAULT`): the access ACL, and a directory's default ACL its new entries
+/// inherit. A guest's `setfacl` sets them; they are the guest's own like [`GUEST_NAMESPACES`]' names (A-302), while
+/// every other `system.` name stays refused on every route.
+pub const POSIX_ACL_NAMES: [&[u8]; 2] = [POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT];
+/// Format: a file's access ACL (`XATTR_NAME_POSIX_ACL_ACCESS`), one of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+/// Format: a directory's default ACL (`XATTR_NAME_POSIX_ACL_DEFAULT`), which its new entries inherit; Linux refuses
+/// one on anything but a directory (`EACCES`). One of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
+
+/// Which extended-attribute namespaces a transport's caller reaches (§4.5 "Extended attributes", §4.6; A-290, A-302).
+///
+/// Every route reads and writes `user.` names. A guest kernel's route (a Shards stream, slates' own virtio-fs device)
+/// also reaches the guest's own namespaces, [`GUEST_NAMESPACES`], and its POSIX ACLs, [`POSIX_ACL_NAMES`]: what a
+/// microVM keeps there (`security.capability` on a binary it gave a capability, `trusted.overlay.*` on an overlayfs
+/// upper directory it made on its share, an ACL its `setfacl` set) is the guest's data, kept in the volume like any
+/// attribute. A host's mount (a FUSE or NFS mount, the AppleDouble view of a macOS NFSv3 mount) neither shows nor sets
+/// them: there the host's own kernel would act on them, a capability on a binary the host runs, an overlay's whiteout
+/// on a directory the host reads, an ACL naming the guest's users.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeNamespaces {
+  /// A host's mount: `user.` alone.
+  #[default]
+  Host,
+  /// A guest kernel's route: `user.`, the guest's own namespaces and its POSIX ACLs.
+  Guest,
+}
+
+impl AttributeNamespaces {
+  /// Whether a caller of this kind reaches attribute `name`: a name in a namespace it reads and writes, with
+  /// something after the namespace's prefix, or, on a guest's route, one of [`POSIX_ACL_NAMES`].
+  pub fn reaches(self, name: &[u8]) -> bool {
+    let named_in = |prefix: &[u8]| name.len() > prefix.len() && name.starts_with(prefix);
+    named_in(USER_NAMESPACE)
+      || (self == AttributeNamespaces::Guest
+        && (GUEST_NAMESPACES.iter().any(|prefix| named_in(prefix)) || is_posix_acl(name)))
+  }
+}
+
+/// Whether attribute `name` is a guest's own (A-290, A-302): in one of [`GUEST_NAMESPACES`] or one of
+/// [`POSIX_ACL_NAMES`], which no host's mount shows or sets, whatever that mount's own rule for names (the AppleDouble
+/// view's are any of macOS's).
+pub fn guest_only(name: &[u8]) -> bool {
+  GUEST_NAMESPACES
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    || is_posix_acl(name)
+}
+
+/// Whether attribute `name` is one of [`POSIX_ACL_NAMES`] (A-302).
+pub fn is_posix_acl(name: &[u8]) -> bool {
+  POSIX_ACL_NAMES.contains(&name)
+}
+
 /// The store's parts a backed DAX session works with, lent by a bridge that has a store ([`Bridge::dax_state`]).
 pub struct DaxState<'a> {
   /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
@@ -598,6 +739,18 @@ pub trait Bridge {
     DaxOffer::Withheld
   }
 
+  /// How this bridge's transport shows its guest the owners of the volume's files ([`OwnerView`]): the identity by
+  /// default, a swap only on a Shards stream whose guest named its run's owner (A-281).
+  fn owner_view(&mut self) -> OwnerView {
+    OwnerView::IDENTITY
+  }
+
+  /// Which extended-attribute namespaces this bridge's transport reaches ([`AttributeNamespaces`]): a host's mount's
+  /// by default, a guest's only on a guest kernel's route (A-290).
+  fn attribute_namespaces(&mut self) -> AttributeNamespaces {
+    AttributeNamespaces::Host
+  }
+
   /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
   /// transport drives over this bridge. `None` for a bridge with no store.
   fn dax_state(&mut self) -> Option<DaxState<'_>> {
@@ -675,5 +828,88 @@ pub trait Bridge {
     _visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
     true
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{AttributeNamespaces, OwnerView, guest_only};
+
+  /// A-281. Do: swap the host's owner (501:20) with a run's (1000:1001), and read every id through the view both ways.
+  /// Expect each of the two shown as the other, uid and gid apart, every other id (root's among them) as it is, the way
+  /// back the same exchange so a chown and a stat agree, and the identity changing nothing.
+  #[test]
+  fn an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id() {
+    let view = OwnerView::swapping((501, 20), (1000, 1001));
+    assert_eq!((view.shown_uid(501), view.shown_gid(20)), (1000, 1001));
+    assert_eq!((view.shown_uid(1000), view.shown_gid(1001)), (501, 20));
+    assert_eq!((view.shown_uid(0), view.shown_gid(0)), (0, 0));
+    assert_eq!(
+      (view.shown_uid(20), view.shown_gid(501)),
+      (20, 501),
+      "uid and gid swap apart"
+    );
+    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
+      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
+      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
+      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
+      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
+    }
+    let same = OwnerView::swapping((1000, 1000), (1000, 1000));
+    assert_eq!(
+      (same.shown_uid(1000), same.kept_gid(1000)),
+      (1000, 1000),
+      "a run of the host's own owner changes nothing"
+    );
+    // A-303: the pair a stream's tables keep makes the same view again, and the identity keeps none.
+    let (kept, run) = view.swapped().unwrap();
+    assert_eq!(OwnerView::swapping(kept, run), view);
+    assert_eq!(OwnerView::IDENTITY.swapped(), None);
+  }
+
+  /// A-290, A-302. Do: ask a host's mount and a guest's route about names in each namespace, the two ACL names, bare
+  /// prefixes, names that only begin like one, and macOS names. Expect `user.` names reached by both; `trusted.` and
+  /// `security.` names and the two ACL names by the guest's alone and marked a guest's own; a bare prefix reached by
+  /// neither; every other `system.` name and every macOS name by neither and no guest's own.
+  #[test]
+  fn a_guests_namespaces_are_reached_by_its_route_alone() {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for name in [&b"user.x"[..], b"user.trusted.y"] {
+      assert!(host.reaches(name) && guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+    for name in [
+      &b"trusted.overlay.opaque"[..],
+      b"security.capability",
+      b"security.selinux",
+    ] {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+    for name in [&b"user."[..], b"trusted.", b"security."] {
+      assert!(
+        !host.reaches(name) && !guest.reaches(name),
+        "a bare prefix: {name:?}"
+      );
+    }
+    for name in [&b"system.posix_acl_access"[..], b"system.posix_acl_default"] {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+    for name in [
+      &b"system.posix_acl_accessx"[..],
+      b"system.sockprotoname",
+      b"system.",
+      b"trustedx",
+      b"securityx",
+      b"com.apple.FinderInfo",
+      b"",
+    ] {
+      assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+    assert_eq!(AttributeNamespaces::default(), host);
   }
 }
