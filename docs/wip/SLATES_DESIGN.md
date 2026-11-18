@@ -50,10 +50,10 @@ Nothing in this document is a placeholder. Where a fact is unknown, the document
 and names the measurement or experiment that resolves it.
 
 Reading order for a first pass: Parts 0 to 3, then §4.1 to §4.12 in order, then §4.15 (the base
-plane and landing) and §4.16 (the merge engine), which are data-path subsystems, and only then
-§4.13 (security) and §4.14 (observability), which are cross-cutting. The section numbers are
-stable identifiers cited from code, tests and the ledger, so the two cross-cutting sections keep
-their numbers.
+plane and landing), §4.16 (the merge engine) and §4.17 (the version-control servers built on it),
+which are data-path subsystems, and only then §4.13 (security) and §4.14 (observability), which are
+cross-cutting. The section numbers are stable identifiers cited from code, tests and the ledger, so
+the two cross-cutting sections keep their numbers.
 
 ### 0.2 The rules this design obeys, and how each is enforced
 
@@ -929,6 +929,13 @@ plan schedules.
 - Lost: symmetric operational transformation (no correct TP2 algorithm exists for strings; under a serializer rebasing suffices); an inferred three-way merge (diff3's pathologies; silent interleaves); last-writer-wins; locks or per-file leases as the conflict authority; a shared live mount of green (a pod's view must never move without its consent); big-bang merges at the end of a task (the streaming gate makes divergence short and conflicts cheap).
 - Measure: per-op verdict cost; mapping cost per intervening delta and the checkpoint spacing; merge-path latency end to end on a laptop and across hosts; merges per second per green; base-lag distribution; conflict rate by source (SDK edits versus whole-file tool rewrites); `StaleEpoch` refusals on merge records; rebase-retry rate; holder recomputation cost.
 - Consequence: D-16 gains the merge verdict as the conflict authority between work volumes; §4.5's journal records ranges and per-inode versions; §4.8 gains version chains, canonical deltas and merge records as ledger register entries; §4.10 gains placed-before-committed for increments and holder recomputation; §4.12 gains `slates.merge` and an SDK `edit` verb that declares true insert and delete ranges; a new Phase 6 builds the engine on one node and Phase 8 extends it to the fleet; a new crate `merge`.
+
+### D-28 Version-control servers are greens and works: a branch is a green, a push is a work whose verdict is the push's answer, objects are content indexed by the tool's id, and every tunable is learned from the deployment's own traffic
+- The decision: slates serves stock git, Mercurial and Subversion clients over their own protocols (§4.17). A repository's branches are greens that share the repository's owner and register; a push is a work whose base is the value the client says it saw and whose declared operations are the whole-file changes the client declared, plus, for git and Mercurial, the branch's head as one attribute, so §4.16's verdict answers exactly what each tool answers; stacked changes and rebases are chains of works; review requests are works held for review, and the requests built on them are works over works; every object is content deduplicated by identity and indexed per repository by the tool's id; policy and hooks decide admission before the verdict; every tunable is learned online.
+- Evidence: git's push contract (each ref compared with the old value the client saw, all or none when the client asks, pushed objects held in quarantine until admitted) [B: gitprotocol-pack, gitprotocol-capabilities, git-receive-pack]; Mercurial's heads check on `unbundle` and bundle2's check parts [B: hg wireprotocol, bundle2]; Subversion's commit rule, a node-by-node merge that fails a file changed on both sides, and its out-of-date test against the path's last-changed revision [B: svn_fs.h]; the merge engine it reuses (D-27). (`research/vcs-servers.md` §1-§3)
+- Lost: (1) running each tool's own server (`git-http-backend`, `hg serve`, `svnserve`) over a slates mount: their repositories are files with locks and append-only packs, every push would write through the mount, the tool's server would decide every push so the verdict would decide nothing, and neither the content sharing, the consistent cut of refs nor a green's replication would apply; (2) one green per repository holding the tool's on-disk layout: branches would no longer serialize independently, and the tool's packs and lock files would meet the verdict as opaque files; (3) a byte-range merge of a stock client's push: git's and Mercurial's commit ids and Subversion's working copy would no longer name what the server holds (the client-fidelity rule, §4.17.1).
+- Measure: per tool and operation, the server's wall time, CPU time and memory against the reference servers on the Linux kernel tree (§4.17.1's method); the conflict rate by source (stock pushes, agents' works, review merges); hook time; index table size and hit rate.
+- Consequence: §4.17; §4.8 gains the repository record and a register shared by a repository's greens; §4.16 gains works over works, a base given as a tree, and greens made at another green's version without a walk; review, protected branches and hooks are policy and evidence on greens.
 
 ---
 
@@ -5148,7 +5155,8 @@ drops.
 > 10 runs were red on both Linux runners, 44 calls failed 2.152 to 8.929 s after sending, and no beat was withheld. Now
 > every wait a call makes keeps one rule: the driver's tick, the synchronous round trip, and the wait for a slot on a
 > full ring. Each reply deadline that passes asks the daemon's liveness. Gone, the client recovers or reconnects and
-> fails `DaemonGone` past the reconnect budget, as before. Alive, the deadline re-arms and the call waits; a stopped
+> fails `DaemonGone` past the reconnect budget, as before (until A-468, below: a reconnect waits while the instance's
+> rendezvous has a holder, and fails at once with none). Alive, the deadline re-arms and the call waits; a stopped
 > daemon's call waits until it resumes or is cancelled.
 >
 > The rule is safe because a daemon that will never answer is ended. An anchored (`FromEnv`) daemon is killed by its
@@ -5184,6 +5192,23 @@ drops.
 > eventfd's only reader then, and gives the pipe's level back as it ends. The synchronous round trip waits so; the
 > reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
 > on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS.
+
+> **Status (2026-11-18, A-468): a client whose daemon is gone reconnects while its instance's rendezvous has a holder,
+> and fails `DaemonGone` at once when it has none.** Until A-468 a reconnect was tried for the reconnect budget (`T + W`,
+> the recovery budget and the liveness window, two seconds), and a claim under a live anchor waited at most that budget
+> as its restart bound. So a restart slower than two seconds (a starved start, a long recovery) failed the anchor's
+> clients while the anchor was still restarting their daemon, and a client whose daemon nothing would restart waited
+> out the whole budget before it was told. Now a claim carries no clock: it waits while the rendezvous's holder lives
+> (`slates_ipc::begin_connect_as`), the anchor that holds the rendezvous across restarts (A-114) or the daemon that
+> holds its own. On Linux the holder is the listening socket, which the anchor keeps across a restart and whose queued
+> claims the kernel resets when its last holder closes it; on macOS the owner's bootstrap name, which the anchor holds
+> while it holds the rendezvous; on Windows the anchor's process, named in the bootstrap header by its process id and
+> creation time (the layout `SLB4`), else the daemon's (A-447) with its start stamp. A claim refused for now (no claim
+> slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks `slates_ipc::holder_lives`: with a
+> holder the client claims again, paced as an async connect polls (doubling, at most a tenth of the claim wait); with
+> none it fails `DaemonGone` at once. The synchronous reconnect and the async driver's recovery keep that one rule.
+> `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
+> its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
@@ -5721,9 +5746,10 @@ The root configuration records the root group's voters the same way (A-406: `Roo
 contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
 regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
 representative died stays a region, so only the voters show it. It fetches as well when a peer's location query is bound
-to a newer root version than the one it holds (A-489), and asks that peer beside the voters it knows
-(`fleet::root_learner_fetch`). A seat change moves the root's version and neither of the other two signals, so a learner
-that missed it at formation kept its older root and refused every location round a peer on the newer root asked.
+to a newer root version than the one it holds (A-489), or a peer's refusal of its own location query names one (A-504),
+and asks that peer beside the voters it knows (`fleet::root_learner_fetch`). A seat change moves the root's version and
+neither of the other two signals, so a learner that missed it at formation kept its older root: as a peer it refused
+every location round asked under the newer root, and as an asker every round it asked was refused.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6693,9 +6719,10 @@ version.
 > bound to a newer view than the peer holds now also tells the peer that it is behind and that the asker holds the newer
 > root, so the peer's root learner fetches from the asker at its next period. The asker looks again every poll interval,
 > and that look is answered. Counted `fleet.owner_location.root_behind`. Regression:
-> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. Owed: the converse. An asker
-> behind its peers' root learns nothing from their refusal, which is an empty reply, so its rounds are refused until its
-> own learner fetches for another reason (A-489's owed item).
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. The converse is done too (A-504): a
+> refusal names the root its peer holds, where it was an empty reply, so an asker behind it counts itself behind
+> (`fleet.owner_location.asker_behind`), its root learner fetches from that peer at its next period, and each look of a
+> lookup asks under the root the asker holds at that look. Regression: `a_behind_askers_round_is_answered_after_one_fetch`.
 
 > **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
 > and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at
@@ -6739,7 +6766,11 @@ ports, and the mapping between them is the operator's. It announces the advertis
 plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
 its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
-the TLS stack cannot use, is refused by name at boot. The two serve
+the TLS stack cannot use, is refused by name at boot. A node addressed by name, and any peer enrolled under a trusted
+root (it announces its address, which may be a name), is resolved at every dial through the host's nameservers, read
+once at boot: `/etc/resolv.conf` on Unix; on Windows, which has no such file, the DNS servers of the network adapters
+that are up and have a gateway, with `resolv.conf(5)`'s default timeout and attempts (A-490); a manifest that may dial
+a name on a host with no IPv4 nameserver is refused at boot by name. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -10923,6 +10954,302 @@ versions, the deriver's inputs), §4.6 (`EROFS` on green mounts; invalidation on
 holder recomputation; submission across hosts), §4.12 (`slates.merge`, `edit`), §4.15 (the
 landing verdict shares the class vocabulary; entry-level for the disk side because the disk
 declares nothing), Part 6 (the merge oracle and the purity lint).
+
+### 4.17 Version-control servers: git, Mercurial and Subversion over greens and works (D-28)
+
+> **Status (2026-11-18, A-497).** Designed; nothing is built. The section has four parts. §4.17.1, the shared mapping,
+> is written here, and the three servers build on it without redefining its terms: §4.17.2 git (g261), §4.17.3
+> Mercurial (g291) and §4.17.4 Subversion (g292), each landing as its own amendment. The reading notes, with every
+> source's revision and the lines quoted, are `research/vcs-servers.md`.
+
+**Role.** slates serves stock git, Mercurial and Subversion clients over each tool's own protocols, as a hosting server
+does: clone, fetch, push, branches, review, protected branches, hooks and access control. The repository lives in
+slates instead of in the tool's files on a disk, and the merge engine of §4.16 is the server's write path: a branch is
+a green, a push is a work submitted to it, and the verdict is the push's answer. What this is meant to buy (each claim
+is unproven until measured by the method below):
+
+- no disk on the path (R1): a repository is held in RAM and replicated as every green is (§4.10), and it reaches a disk
+  only through a landing under a grant (§4.15);
+- one copy of every byte: file contents, the tool's objects, every branch, every fork and every checkout share content
+  by identity (§4.11);
+- a checkout is a mount: any version of any branch is a volume that an agent or a build attaches on the provisioning
+  path (R9), with nothing copied out of the repository;
+- no inferred merge anywhere (§2 ban 11, D-27): a server-side merge, a rebase or a stacked change is the verdict's
+  accept, identical or conflict with byte-exact windows, never a three-way text merge;
+- a push's answer is durable when it is given: the merge record commits at f+1 holders before the client hears "ok"
+  (§4.16 "Commit").
+
+#### 4.17.1 The shared mapping onto greens and works
+
+**Terms.** Each row is one concept in each tool, the slates object it becomes, and where the server's own section
+decides the details.
+
+| Concept | slates | git (§4.17.2) | Mercurial (§4.17.3) | Subversion (§4.17.4) |
+|---|---|---|---|---|
+| Repository | a repository record (§4.8) and its greens | a repository | a repository | a repository |
+| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each named branch's head; a name with several heads is §4.17.3's to decide | the whole repository: one green whose version N is revision N; a branch is a directory in it |
+| Push | a work submitted to the green; the verdict is the push's answer | `receive-pack`'s update commands | `unbundle`, with its heads check | `commit`: the request and its editor drive |
+| What the client says it saw | the work's base | each command's old value | the `heads` argument, or the `check:heads`, `check:updated-heads` and `check:bookmarks` parts | the base revision of each path the drive touches |
+| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets (§4.17.3 decides) | §4.17.4 decides |
+| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | §4.17.3 decides | §4.17.4 decides |
+| Objects | content in the volume store, deduplicated by identity, indexed by the tool's id | blobs, trees, commits and tags | changesets, manifests and file revisions | node revisions, their contents and revision properties |
+| History of a branch | the green's chain of versions | the successive values of the ref (the server's reflog) | the successive values of the bookmark or head | the revision sequence |
+
+**The repository and its greens.**
+1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
+   SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
+   namespace, from each branch's name to its green.
+2. Every green of one repository carries the repository's partition in the high bits of its id, as an attachment id and
+   a landing id carry their owner's (`crates/server/src/shards.rs`, `landing.rs`). So a repository's greens share one
+   owner and one ledger register, and one register append commits several greens' versions together. git's atomic push
+   ("Either all refs are updated or none" [B: gitprotocol-capabilities `atomic`]) and a Mercurial push that adds
+   changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
+   Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
+   register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
+   records, is the change this needs (a piece below).
+3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
+   of it, so two clients creating one name race on one append and one of them is refused.
+4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
+   identity, so creating it costs no walk of the tree. (Today `CreateGreen { base }` walks its base; this is a piece
+   below.) The new green records where it started (the green and version, or the tool's commit), which is the base a
+   review request between the two branches later uses.
+5. Deleting a branch retires its green: the name leaves the namespace, and the chain is kept for the retention the
+   policy names, so a deleted branch can be restored as a server's reflog allows.
+6. A tag is a green whose policy refuses any version after its first; the policy may allow a tag to move (git lets a
+   forced push move one).
+
+**A version.** Version N of a green is one value of the branch, and holds three things:
+- its tree: the snapshot of the files at the branch's head, so attaching version N is a checkout of it;
+- its head: the tool's name for what the branch names (git's commit id, Mercurial's changeset node, and for
+  Subversion the revision number, which is N);
+- the tool's objects that the version brought, each held as content (below).
+
+The chain is the history of the branch's values, which a server keeps as its reflog. Version N+1's head descends from
+version N's unless the policy allows a rewrite (a non-fast-forward push in git, a forced push in Mercurial); a rewrite is
+one more version, and the chain itself is never rewritten.
+
+**Objects: one copy, indexed by the tool's id.**
+1. Every object's raw bytes, the bytes the tool hashes to name it, are content in the volume store, chunked and
+   deduplicated by BLAKE3 identity (§4.11). A file's bytes in a version's tree and the tool's object for that file
+   (git's blob, Mercurial's file revision, Subversion's file contents) are the same content, so a checkout costs
+   metadata and no bytes.
+2. Wire forms are derived and never the truth: a git pack (zlib and deltas), a Mercurial bundle or changegroup and
+   Subversion's svndiff windows are computed from the raw objects for a transfer and cached by the identity of what
+   they encode. A damaged cache entry is dropped, never repaired.
+3. A repository keeps an index from the tool's id to the object's kind, length and content identity. The index belongs
+   to the repository and lives on its owner, reached by the repository's id: it is not a global catalog (§2 ban 12).
+   It is kept as immutable sorted tables that are content themselves, so a fork shares its parent's tables by identity
+   and adds only rows for its own objects. Each server's section gives its layout.
+4. The objects a push brings are held by the work, not by the green, until the verdict commits. This is the quarantine
+   git's `receive-pack` keeps: objects "are placed into a temporary "quarantine" directory ... and migrated into the
+   main object store only after the `pre-receive` hook has completed. If the push fails before then, the temporary
+   directory is removed entirely" [B: git-receive-pack]. A refused push leaves nothing behind; the work releases what it
+   held.
+5. Every object is checked on arrival: the server hashes it as the tool does, and a push holding an object whose bytes
+   do not hash to its claimed id is refused, typed, before any of it is indexed.
+
+**A push is a work.**
+1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
+   the server must "validate each reference that is being updated that it hasn't changed while the request was being
+   processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
+   client observed, which the server uses "to detect race conditions" [B: hg wireprotocol `unbundle`], or bundle2's
+   `check:heads`, `check:updated-heads` and `check:bookmarks` parts [B: hg bundle2]. In Subversion it is the base
+   revision of each path the editor drives, and a working copy mixes revisions, so one commit names a base per path:
+   the server checks each path against its own base (the out-of-date test, item 5) and builds the work on the version
+   current at that check, so the verdict then catches whatever lands after it. A value that no version of the green
+   ever held (git's old value naming a commit inside an earlier push, say) is answered as the tool answers a ref that
+   moved, before any work is built.
+2. **Its declared operations** are what the client declared, read at the granularity the client declared it. git and
+   Mercurial push snapshots, so a push declares which content now stands at each path: for each path whose content
+   identity differs between the base version's tree and the pushed head's tree, the work holds one `Delete` of the base
+   length and one `Insert` of the new bytes (the whole-file replacement §4.16's deriver makes of a whole-file rewrite);
+   `Create`, `Unlink`, `Mkdir` and `Rmdir` for what appears or vanishes; `SetMode` for the executable bit; `Symlink`;
+   and a special node for an entry with no file form (git's submodule link; §4.17.2). Subversion's editor declares
+   each changed file, and the work holds the same whole-file operations for it. This reads identities the client
+   computed: no bytes are compared and no edit position is guessed, so D-27's never-diff clause holds. A push that moves
+   a branch across several commits is one work: its post-state is the new head's tree, and the commits in between are
+   objects of the version it makes.
+3. **The head operation (git and Mercurial).** Each such work also sets the green's head: one `SetXattr` of the
+   reserved attribute `slates.vcs.head` on the green's root, to the new head's id. Two works that both move the branch
+   meet on that one attribute, and §4.16's verdict then answers what the tools answer: the same new value is
+   `AcceptIdentical` (that push already happened), and a different one is a `MetaMeta` conflict (another push came
+   first). A Subversion work sets no head: Subversion lands a commit made against an older revision when its paths did
+   not move, so its versions advance without a compare-and-swap on the whole repository. A work the server itself turns
+   into the tool's objects (item 4) carries no head operation either, or two such works on one version would conflict on
+   it: the server makes the commit after the verdict, records it with the version (its time and author taken from the
+   merge record, never from a holder's clock), and every holder recomputes it from the record (§4.16 "Apply on
+   holders").
+4. **The client-fidelity rule.** A stock client must end where it thinks it is. After its push is accepted, every path
+   it changed holds exactly the bytes it sent, and the branch names exactly the head it computed: git and Mercurial
+   name each commit by a hash of its content, so any change the server made would be a different commit, and
+   Subversion's client records each file it committed as being at the new revision with its own bytes. So a stock
+   client's work is decided at whole-file granularity, which the operations of item 2 give; it is never merged into
+   byte ranges it did not send. Byte-range accepts, where two edits to one file both land, are for works the server
+   itself turns into the tool's objects: an agent's work through the SDK or a mount, a server-side merge of a review
+   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it.
+5. **The answers.** For each tool:
+   - git: the push's old value is the green's head, and whether each command is a fast-forward is the policy's check
+     (`receive.denyNonFastForwards` [B: git-receive-pack]), made after the admission hooks and before the verdict.
+     Accept and identical are `ok <ref>`; a conflict on the head is `ng <ref>` with the reason git gives for a ref that
+     moved ("someone pushed in the meantime" [B: gitprotocol-pack]). §4.17.2 names every answer's words.
+   - Mercurial: the heads the client saw are the green's heads; accept answers the push response's change in heads
+     [B: hg wireprotocol `unbundle`], and a conflict answers the abort its heads check calls for (§4.17.3).
+   - Subversion: a commit whose paths did not change since their base revisions is accepted and answered with
+     `commit-info` and the new revision [B: ra_svn `protocol`, `commit`]; a path changed since its base revision is a
+     conflict, answered as Subversion's out-of-date error (§4.17.4). Here the verdict is Subversion's own commit rule:
+     it merges a transaction into the newest revision node by node and fails a file "whenever source, target, and
+     ancestor are all distinct node revisions" [B: svn_fs.h `svn_fs_merge`], and it calls a path out of date when its
+     base revision "is less than the last-changed-revision of the path" [B: svn_fs.h `svn_fs_lock_many`], which is the
+     negation of §4.16's fast path (`last_changed[path] <= base`).
+6. **A base that is no version.** A review request or a merge may need a base that is a commit inside an earlier push,
+   so not the head of any version. Such a base is given as a tree, and what the green changed since it is read as the
+   whole-file differences between that tree and the head's, which is all that stock pushes ever declared. It costs
+   precision only where the green holds byte-range works, which it then reads as whole files (a conflict a finer base
+   would have avoided, never a wrong accept).
+
+**Chains of works: stacked changes and rebases.**
+- A stack, a series of changes reviewed and landed in order, is a chain of works: each work's base is the post-state of
+  the one before it. Landing the chain submits each in order; when the policy asks for all or none, the versions are
+  one register append.
+- A rebase is §4.16's `rebase`: the work's operations are mapped through what the green accepted since its base. A
+  whole-file operation on a path the green changed meanwhile is a conflict naming the path; otherwise the work moves to
+  the new base. For a stock client's commits a rebase makes new commits (new ids, the authorship kept; §4.17.2 and
+  §4.17.3 decide the tool's fields), which the client fetches.
+- Rebasing a chain rebases each work over the one before it, in order, and stops at the first conflict with its
+  windows.
+
+**Works over works: review requests and their trees.**
+- A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
+  unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
+  approvals; and the evidence the policy requires (status checks, signatures).
+- A request built on another request is a work over a work: its base is the lower work's post-state, not a version of
+  the green. When the lower one is accepted unchanged on the fast path, the upper one's base is that version, and it
+  submits as any work does. When the lower one was mapped because other works landed first, the upper one is mapped
+  through the green's deltas except the lower work's own, which its base already holds. §4.16 bases a work on a green
+  version only, so this is new in the engine (a piece below).
+- A comment's range moves with the code: §4.16's position mapping shifts it through every delta in between, so a comment
+  stays on its line across rebases. A range that an edit replaced is marked outdated; it is never moved by a guess.
+- Merging a request is submitting it. Accept makes the new version, and the server makes the tool's merge commit or
+  rebased commits by the policy's merge method; every client fetches them. A conflict answers byte-exact windows on the
+  request, and its author rebases. There is no three-way text merge (§2 ban 11).
+
+**Policy: protected branches, access and hooks.**
+- Policy is set per repository and per green, by name pattern: who may read, who may submit, whether a rewrite (a head
+  that does not descend from the current one) or a delete is allowed, the evidence required (status checks and
+  approvals, §4.16's `require_evidence`), whether merges must be signed (§4.16, A-321), the merge method for review
+  requests, and the hooks.
+- Each tool's authentication (HTTP authorization, SSH keys, Subversion's SASL) ends in a principal of §4.13, and a
+  capability per repository and green decides reads and submits. The tools' protocols carry no authorization of their
+  own ("The protocol itself contains no authentication mechanisms" [B: gitprotocol-pack]): the transport proves who
+  the client is, and slates decides what it may do.
+- Hooks run at three points: at admission, before the verdict, where a hook may refuse with words the client prints
+  (git's `pre-receive` and `update` [B: git-receive-pack], Mercurial's `pretxnchangegroup` [B: hg config `hooks`],
+  Subversion's `pre-commit` [B: svn_repos.h]); after the commit, where hooks only observe (`post-receive`,
+  `changegroup`, `post-commit`); and on review events. A hook is a program the repository's owner configured, run over
+  a read-only attachment of the work's post-state (on Linux inside the launcher's namespace, `slates exec`, §4.6),
+  under a deadline learned from that hook's own runs. A hook never runs on the merge task's shard and never holds the
+  green: admission ends before the work reaches the merge task, so a slow hook delays only its own push.
+- The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
+
+**Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
+branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
+computes for it (a pack, a bundle, a slice of the index) is cached by its identity and shared across clients. The change
+index (the paths each version changed, A-264) and `last_changed` answer path-limited history (`log` of a path, `blame`)
+at version granularity before any object is read.
+
+**Durability and residency.** A repository is as durable as every green: in RAM, with each merge record committed at
+f+1 of 2f+1 holders before the client is answered (§4.16), replicated by placement (§4.10), and kept across a daemon
+restart by the anchor segment (§4.4). On a laptop (f = 0) the anchor's RAM is the only copy, so a machine restart loses
+what was not landed. Importing an existing
+repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
+under a grant (§4.15, R10).
+
+**Every tunable is learned online.** The rule for every server in this section (Ada, 2026-11-18): a tunable is an
+estimate the server keeps learning from the deployment's own traffic. It is never a constant, and never a value measured
+once on one machine and frozen, at build or at boot. Each server's table names, for every tunable:
+- the estimator (a running quantile, a regression, the argmin of a cost model);
+- its inputs (what is measured, and where);
+- when it updates (every request, every version);
+- its bounds (what it may never exceed, each bound itself derived, such as a memory budget of §4.2 or a deadline the
+  client sent, with a typed refusal at the bound);
+- its first value, computed from the first request's own inputs (that request's size and the rate this machine was just
+  measured to do that work at), never a literal.
+
+A-363's failover estimate is the pattern: its estimators keep learning from the traffic they judge.
+
+**The interop proof.** A server is proven by stock clients only:
+- each tool's own test suite or conformance runs, pointed at slates (each server's section names which tests and how
+  they are pointed);
+- a differential run of each operation: the same stock client against the reference server and against slates, over
+  the same repository, with what the client ends up holding compared whole (its refs or heads, its objects, and the
+  tool's own consistency check run on it).
+
+**The order-of-magnitude method.** Main measures and records it in `BENCHMARKS.md` under the rule of the project's
+§5: release builds, the hardware, the dataset's commit, the date, the load discipline, and the best of N with all N
+shown.
+- Competitors: `git-http-backend` and Gitaly for git; `hg serve` for Mercurial; `svnserve` and `mod_dav_svn` for
+  Subversion.
+- Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial
+  and Subversion, each recorded with the command that made it.
+- Operations, each from a stock client: clone; fetch after one, ten and a hundred upstream commits; push of one commit
+  and of a hundred; a server-side merge; `log` and `blame` of one path.
+- Measures: wall time at the client, the server's CPU time and peak memory, and throughput with N concurrent clients.
+  The competitor and slates each serve warm (the competitor's files in the page cache), so the comparison is the
+  servers' and not the disks'.
+- The claim: "an order of magnitude faster" is made per operation, only where it was measured. An operation bound by
+  the wire or by the client's own work (a full clone's indexing on the client) is reported as such, with the server's
+  share measured separately.
+
+**Failure matrix (shared).** A client that disconnects before its push is answered: the work is never submitted, and
+what it held is released. The owner lost while a push is in flight: the submit retries by the increment's identity
+(§4.16); a client that heard nothing and pushes again is answered identical (the head operation) or with its conflict.
+A hook past its deadline: the admission refuses and names the hook; the work is not submitted. An object whose bytes do
+not hash to its id: refused, and nothing is indexed. A holder whose recomputation differs: as §4.16.
+
+**Refusals (shared).** §4.16's, plus: the client's old value names no version (`UnknownBase`, answered in the tool's
+words for a ref that moved); `PolicyRefused { rule }`; `HookRefused { hook, words }`; `ObjectIdMismatch { id }`;
+`NotPermitted`. Each server maps every refusal to its tool's words.
+
+**Worked example.** Repository `linux` (git) has branch `master` at version 812, whose head is commit C812. Alice and
+Bob have both fetched it. Alice pushes three commits, C812 to C815. The server holds the pushed objects in her work,
+checks each one's id, and reads the seven paths whose content identity differs between C812's tree and C815's: seven
+whole-file replacements, plus the head set to C815. The `pre-receive` hook passes; no path and not the head changed
+since 812, so the fast path accepts. Version 813 commits at f+1 holders, and Alice reads `ok refs/heads/master`. Bob now
+pushes C812 to C816. His base is 812, the head attribute changed at 813, and the verdict is a `MetaMeta` conflict: Bob
+reads git's answer for a ref that moved; nothing he sent is kept. He fetches, rebases on his machine, and pushes C815 to
+C817: version 814. An agent works on version 814 through the SDK and replaces bytes 1,200 to 1,480 of `init/main.c`,
+while another agent's SDK work, accepted as version 815 with the server's commit C818, changed bytes 40,100 to 40,250 of
+the same file: the first agent's byte-range work is accepted as version 816, and the server makes commit C819 for it
+(the agent as author, C818 as parent), which every client fetches. Had version 815 come from a stock push, its
+whole-file replacement of `init/main.c` would have made the agent's edit a conflict, and the agent would rebase. In
+Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against revision 40 while the repository is at 42,
+where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before 40, so the fast path makes revision 43. Dan
+then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his base, so his commit is out of date, and he
+updates and commits again.
+
+**Laptop degenerate.** One node: the repository's register is its partition's log in the anchor segment, f = 0, the
+holder set is the owner, and every arrow above is an in-process call. The code is the fleet's (R8).
+
+**Pieces that follow (shared, in order).** Each is one piece with its own tests.
+1. The repository record and its namespace; green ids carrying the repository's partition; a green made at another
+   green's version, or at one commit's tree, without walking it.
+2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
+   recomputation on holders.
+3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
+   forks sharing tables; every object checked against its id on arrival.
+4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
+   client-fidelity test (an accepted push's paths hold exactly the client's bytes).
+5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
+6. Review records: comments anchored and moved by position mapping; approvals as evidence.
+7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
+   commit, under learned deadlines.
+
+Each server's pieces follow these, in its own section.
+
+**Integration points.** §4.4 (roles and verbs), §4.8 (the repository record; the register its greens share), §4.10
+(placement and replication of greens), §4.11 (content identity and deduplication), §4.12 (an agent's SDK work becomes a
+commit), §4.13 (principals and capabilities), §4.15 (import from a host directory; export by landing), §4.16 (the
+engine: the verdict, rebase, position mapping, the register).
 
 ---
 
@@ -26337,7 +26664,10 @@ model below; each red before its fix):
   report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
   its holder still keeps is kept whole since A-335.) Since A-341 the kept retirement does tell, at a successor's
   confirmation: an unasked copy goes as a stale one where the object's settled cohorts are within tolerance
-  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance or when judged on a completion record.
+  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance. Since A-484 the takeover judged is the first
+  since the copy was written, its writer's (`Acceptor::written_by`, `RegionalConfiguration::copy_stale`), never the
+  last in the line, and it is judged on its completion record too, which keeps the neighbourhoods it recovered through
+  and the hosts that stayed members through it; a settled line's unasked copy is judged the same way.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -32577,9 +32907,8 @@ owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-a
   A-406 declined. Binding the reply to a homes-only version would leave the learner on a stale root for everything else
   the root records. The query already carries the version, so it is the signal `root_diverges` called owed ("a
   version-carrying signal").
-- **Owed.** The converse direction. An asker that is a root learner behind its peers is refused by them with an empty
-  reply, which tells it nothing, so its rounds fail until its own learner fetches for another reason. A refusal that
-  names the peer's root version, or a reply under the peer's own view, would let it fetch: a reply format change.
+- **Owed, then done by A-504.** The converse direction: an asker that is a root learner behind its peers was refused by
+  them with an empty reply, which told it nothing, so its rounds failed until its own learner fetched for another reason.
 - **Tests.** `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`
   (`crates/server/src/owner_location.rs`, on a shard: the older and the newer views refused and its own served, three
   newer views counted; no fetch from a shown peer before the queries, a fetch from the one that showed the newest after
@@ -32621,6 +32950,183 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   old life, a withdrawn offer is not counted retired.
 - **Owed.** A cross-process test of a client killed before its claim (the reaper retiring it lets its offer go and its
   stream's attachment end), as `crates/client/tests/reap.rs` kills a client; main's to run.
+
+### A-468 — A client whose daemon is gone reconnects while its instance's rendezvous has a holder, and fails `DaemonGone` at once with none: a claim carries no restart bound (2026-11-18, UI goal 86 via g251b; R3's class C, C-b's second part; §4.7 "Rendezvous", "Failure matrix"; A-114, A-443, A-447, A-456)
+
+- **What was there.** A client whose daemon was found gone reconnected under its id for the reconnect budget
+  (`Deadlines::reconnect_ns`, `T + W`: the recovery budget and the liveness window, two seconds), the synchronous
+  reconnect and the async driver's recovery alike, and failed `DaemonGone` past it. Each claim it made under a live
+  anchor took that budget as its restart bound (A-443 kept a bound only there, since an anchor's life says nothing of
+  its daemon's), and a Windows claim under a live anchor waited at least the claim wait. So a restart slower than two
+  seconds failed the anchor's clients while the anchor was still restarting their daemon: the chaos record in
+  `docs/wip/BENCHMARKS.md` (100 clients, the daemon killed 3.5 s into the run) had the anchor restart three
+  successors before the fourth recovered, and by then every client had passed its budget, 0 reconnects. And a client
+  whose daemon nothing would restart waited out the whole budget before it was told.
+- **The rule.** A claim waits while its rendezvous's holder lives, by no clock (`begin_connect_as(instance, wanted)`,
+  `connect_as`; the restart-bound argument is gone): the anchor that holds the rendezvous across its daemon's restarts,
+  or the daemon that holds its own. Linux: the listening socket, which the anchor keeps across a restart, a claim
+  queued in its backlog until the next daemon accepts it, and whose queued claims the kernel resets when its last
+  holder closes it. macOS: the owner's bootstrap name, which the anchor holds while it holds the rendezvous and
+  launchd takes back at its holder's death, looked up on A-443's doubling. Windows: the anchor writes its creation time
+  beside its process id into the bootstrap header (offset 40; the layout's magic moves to `SLB4`, so each of `SLB3` and
+  `SLB4` refuses the other), and a claim under a live anchor waits on the claim's Event beside the anchor's process
+  handle, judged by both (a reused pid is never taken for the anchor); with none it waits on the daemon's as A-447 did.
+- **The reconnect.** A claim refused for now (no claim slot free, the restarted daemon not yet published, a daemon gone
+  mid-answer) asks `slates_ipc::holder_lives(instance)`: Linux, whether a connect to the listening socket is taken or
+  queued (`EAGAIN`, a full backlog, counts as held; `ECONNREFUSED` or `ENOENT` as none); macOS, whether the owner's
+  name is held; Windows, whether the anchor the header names lives, or else the daemon it names lives with its start
+  stamp published (no object by the name reads none, a header not yet written reads held, since its maker lives while
+  it writes it, and another layout's is refused as a claim refuses it). With a holder the client claims again, paced
+  as an async connect polls (`next_pause_ns`, doubling, at most a tenth of `CLAIM_WAIT_NS`); with none it fails
+  `DaemonGone` at once, its `after_ns` the time since the reconnect began. `Client::try_reconnect` (the driver's step)
+  and `Client::reconnect` (the synchronous one) share the rule (`refused_reconnect`, `adopt_reconnected`); the
+  driver's `Lost` no longer keeps when it began.
+- **What stays.** `Deadlines::reconnect_ns` keeps its derivation and now bounds only the waits on a fleet owner's
+  takeover: the window in which a request refused for now is held for its resend under its id, the pause between
+  such resends (a tenth of it) and `call_through_transient`; their own bound, the failover delay the daemon reports, is
+  owed (GAPS, class C). The server's reclaim of a taken-back map no holder claims (`held_copy::reconnect_budget_ns`)
+  mirrors the old budget, owed beside them. `CLAIM_WAIT_NS` keeps its users less the two A-468 removes (a Windows
+  claim's wait under a live anchor, and the further one for a claim the daemon took to answer).
+- **Tests (each written red first).** `rendezvous::platform::tests`, on every platform:
+  `a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget` (a daemon end stops before
+  answering; after 2.5 s, a quarter again the old budget, another opens over the held rendezvous; the claim is due all
+  the while and then connected to the region the second made for it) and
+  `a_claim_under_an_anchor_ends_at_the_anchors_going` (refused within the claim wait of the anchor's going; on Linux
+  with `holder_lives` read before and after); on macOS and Windows also
+  `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`, and the header's golden vector and hostile
+  images, now both marks (`the_process_marks_are_little_endian_at_their_offsets`,
+  `no_mark_is_read_where_none_was_written_and_a_hostile_one_is_read_as_written`; `SLB4`). The client's
+  `crates/client/tests/waits.rs` gone case is now `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`: a
+  killed daemon that held its own rendezvous ends both calls `DaemonGone` before the old budget, where it asserted they
+  took at least it.
+
+### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
+- **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's
+  repository, branches, pushes, stacked changes, review requests, objects and history become slates' repository record,
+  greens, works, chains of works, works over works, content and green chains. It defines the head operation that makes
+  §4.16's verdict answer each tool's push exactly; the client-fidelity rule (a stock push is decided at whole-file
+  granularity, and byte-range accepts are for works the server turns into the tool's objects itself); policy, hooks and
+  access; durability; the rule that every tunable is learned online; the interop proof; the order-of-magnitude method
+  main measures by; and the seven shared pieces, in order.
+- **Why this mapping.** Each tool's own push contract is a verdict §4.16 already computes. git compares each ref with
+  the old value the client saw and updates all or none when asked; Mercurial checks the heads the client saw; Subversion
+  merges a commit node by node and fails a file changed on both sides. The quotes, with their revisions and lines, are
+  in `research/vcs-servers.md` §2.
+- **The split.** Ada asked for one agent per tool (main, 2026-11-18). §4.17.2, git, is A-497's second part (g261);
+  §4.17.3, Mercurial (g291), and §4.17.4, Subversion (g292), are theirs, each building on §4.17.1 without redefining its
+  terms.
+- **Nothing is built.** No code changed; the GAPS entry tracks the pieces.
+
+Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
+top), `research/vcs-servers.md` (new).
+
+### A-490 — A Windows fleet node reads its nameservers from its network adapters, since Windows has no `/etc/resolv.conf`: a kiln runner on Windows can join a fleet that trusts kiln's CA (2026-11-18, UI goal 85 bug 5 via g071, found by g267 in kiln K3; §4.8 "Deployment"; contract 39)
+- **The bug.** A fleet node reads the host's nameservers at boot when a node is named or an enrollment root is trusted
+  (a peer enrolled under a root announces its addresses, which may be names). The one reader read `/etc/resolv.conf`,
+  so a Windows node whose manifest trusted a root was refused at its start and at kiln's `check_fleet`, every address a
+  literal or not; every kiln runner's manifest names kiln's CA as its root.
+- **The rule.** `read_resolver` is a seam with two halves of one signature. Unix reads `/etc/resolv.conf` as before.
+  Windows reads the DNS servers its network adapters list (`GetAdaptersAddresses`) and keeps, by Go's rule there
+  (`net/dnsconfig_windows.go`), those of the adapters that are up and have a gateway, in order, each once. Windows states
+  no timeout or attempt count an application can read, so `resolv.conf(5)`'s defaults (5 s, 2 attempts) stand, as Go
+  takes them; with one nameserver they give up 10 s after the first query, as the Windows DNS client does (Microsoft's
+  KB 2834226). No count caps the servers: the Windows client asks every server it holds (KB 2834226).
+- **Bounded and checked.** The call is asked for its size, then into a buffer of that size; an adapter added between the
+  two refuses the start by name rather than retrying. The walk reads a link or an address only once it lies wholly
+  inside the buffer, aligned, and walks no more steps than entries fit in the buffer.
+- **Test.** `a_windows_hosts_adapters_give_its_resolver` (`crates/api/src/role/fleet.rs`, on every host).
+- **Evidence (the Mac Studio, kiln, 2026-11-18, debug).** Red once, on a copy where no adapter counts (Windows with no
+  source, as before): the test failed at its first assertion. Green: `cargo test --locked -p slates-api --lib
+  role::fleet` 11 of 11. `cargo xwin check -p slates-api` (lib and all targets) and `cargo xwin clippy -p slates-api --lib
+  --no-deps -- -D warnings` for `x86_64-pc-windows-msvc`: clean, so the Windows half compiles and lints. Clippy found
+  nothing in A-490's lines on macOS (slates-server clean; slates-api's two findings are `crates/api/tests/api.rs` 1324
+  and 1630, another change's), and Windows clippy with dependencies stops first on `crates/server/src/shards.rs:1371`,
+  also another change's. `cargo xtask unsafe`: slates-api 9 of 9; structural ok; the literal check's 45 findings are
+  none of A-490's files. The live start on Windows and the Linux check are filed for main.
+
+Applied in the same change to: §4.8 "Deployment", GAPS (the kiln runners' entry), `docs/bugs/` (a record), `docs/cli.md`,
+`docs/deploy.md`, `crates/api/src/role/fleet.rs`, `crates/api/src/role/fleet/windows_dns.rs` (new),
+`crates/api/Cargo.toml`, `unsafe-budget.toml`, and the doc comments of `crates/server/src/dns.rs` and
+`crates/server/src/deploy.rs`.
+
+### A-484 — A copy no takeover asked for is judged by its writer's takeover, on its retirement or its completion record (2026-11-18, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; A-341's owed piece and a hole in its rule; A-309, A-335)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), the bug record of
+2026-11-18 on an unasked copy judged by the last takeover in its line, `crates/db/src/register.rs`
+(`CompletedTakeover::recovery`, `held` and `recovery_cohorts`; `RegionalConfiguration::within_tolerance`,
+`confirmed_for` and `copy_stale`; `Acceptor::written_by`), `crates/cluster/src/raft_wire.rs` (regional layout 5),
+`crates/server/src/takeover.rs` (`unasked_copy_stale`, used at a successor's confirmation and on a settled line) and
+`crates/db/tests/lineage_model.rs` (the holder rule, `reclaimed_unasked_record`).
+- **What was there.** A-341 let a holder the takeover never asked let its copy go where the kept retirement showed the
+  object recovered within tolerance, judged by the retired host the copy's routing last moved from. Two gaps. A
+  completion record kept no neighbourhood, so a copy first judged once the takeover completed (every object of the
+  last successor to confirm, and any lagging holder's) was kept for good (`fleet.takeover.kept_unasked`). And the
+  takeover judged was the last in the copy's line, not the first since the copy was written: where the writer's
+  takeover was past tolerance, its successor confirmed without ever learning the object (nobody its round asked held
+  it), and when that successor retired in turn its own takeover was within tolerance for an object it never held, so
+  the copy, possibly the object's last, went. Counting every member of a cohort also let a cohort host that retired
+  before the departed and was admitted again under its id make a cohort look within tolerance that was past it when
+  the round ran.
+- **The rule.** A copy no round asked for is stale only where the first takeover since it was written, its writer's,
+  recovered the object within tolerance and its share of the object is done (`copy_stale`: `confirmed_for` and
+  `within_tolerance` of the writer's takeover): within tolerance every committed record is on a recovery quorum's worth
+  of each settled cohort, so the round that took the object over heard one at least as new as the copy and adopted it
+  before its successor confirmed. The holder knows the writer from its acceptor (`written_by`: the owner of the last
+  record it accepted, kept while an install moves the authority to a successor); not persisted, so an acceptor rebuilt
+  from an image after an install moved its authority knows none, and its copy is kept. The judgment counts only the
+  retirement's survivors that are still members (none is admitted again while it is kept), or, once it completed, the
+  record's held hosts: the survivors still members at completion, members through every round. The record keeps the
+  settled neighbourhood of each recovery owner (`recovery`), so its cohorts are drawn as the retirement's were. An
+  object an explicit move took off its creator's line is not judged so (a restored holder cannot tell the move's owner
+  from the writer): its unasked copies are kept.
+- **The encoding.** Regional layout 5: each completion record carries, after its version and before its confirmed
+  hosts, its recovery neighbourhoods (a count, then each owner and its settled form) and its held hosts. A layout-4
+  configuration is refused by name (`LayoutVersion`).
+- **Tests.** `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover`
+  (`crates/server/src/daemon.rs`, red before: the second install let the copy go);
+  `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (its record phase now lets the second
+  register and a lagging holder's fourth copy go, the head kept for its content); in `crates/db/src/register.rs`
+  `a_completion_record_judges_an_object_as_its_kept_retirement_did`,
+  `a_cohort_host_admitted_again_counts_for_no_takeover_it_was_not_a_survivor_of` (red before),
+  `a_copy_is_judged_by_its_writers_takeover_never_a_later_one` and `an_acceptor_knows_its_copys_writer_while_it_can`;
+  `a_lying_completion_record_recovery_count_is_refused` and the layout golden (`crates/cluster/src/raft_wire.rs`); the
+  lineage model's oracle unchanged, its unasked releases judged by the writer's takeover, and
+  `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record` (the generated histories at the
+  default 400 seeds judge no copy on a record: `reclaimed_unasked` 10 and `kept_unasked` 214, as under A-341). Kiln on
+  the Mac Studio, 2026-11-18, debug: `slates-db` `register::` 84 of 84, `slates-cluster` `raft_wire::` 21 of 21,
+  `slates-server` `takeover::` and the holder tests 23 of 23. Red once each on a mutated copy: with A-341's rule (the
+  last takeover in the line) the server test's copy went at the second install (kept `(true, false)`); with every
+  member counted the returning host made the cohort read within tolerance (`(false, true)`).
+- **Still owed (GAPS).** The settle rule for a live owner (a holder an owner's neighbourhood settled away from), the
+  content release signal, and the Lineage.tla text for A-341 and this change.
+
+### A-504 — A location refusal names the root its peer holds, so an asker behind it fetches from that peer and asks again under the root it then holds (2026-11-18, g229, UI goal 85, bug 4's converse; §4.8 "Lookup" and learners, D-14; A-406, A-489)
+- **What was there.** A peer refused a location query with an empty reply, which named nothing, and every look of a
+  lookup asked under the root the lookup began with (`verbs::locate_within_horizon`). So an asker that was a root
+  learner behind its peers (A-489's case, the other way round) was refused by every peer on the newer root. Its own
+  learner fetched only when its regions or the voters it knew looked wrong (`fleet::root_diverges`). Even once it caught
+  up, its looks still asked under the old root and were refused again, for the lookup's whole budget.
+- **The rule.** A refusal names the root version its peer holds (`owner_location::Refused`, sent by
+  `owner_location::answer` for every refusal). An asker that reads one naming a newer root than it holds is behind:
+  counted `fleet.owner_location.asker_behind`, it records that version and that peer as A-489's peer side does
+  (`learn_from_refusal`, `ShardState::root_newer_seen`), and its root learner's next period fetches from that peer
+  (`fleet::root_learner_fetch`). Each look asks under the root the asker holds at that look (`Query::under_held_root`), so
+  the look after the fetch is answered.
+- **The encoding.** `Refused` is a new message of the location stream, a fixed 8 bytes (the version). It is never read
+  as a reply nor a reply as it: a reply is 42 bytes or more, and each decodes exactly. The located reply's bytes are
+  unchanged. An asker of an earlier build reads a refusal as malformed and folds it as no claim, as it folded the empty
+  reply. A peer of an earlier build still refuses with an empty reply, which is read as a refusal naming nothing. No
+  enum the `wire_order` guards cover changed (they cover `slates-ipc`'s protocol and `slates-db`'s records), so nothing
+  is published.
+- **Tests.** `a_behind_askers_round_is_answered_after_one_fetch` (`crates/server/src/owner_location.rs`, two daemons). The
+  peer's root is a version past the asker's. Its refusal names that root. The asker counts itself behind and its
+  learner fetches from the peer. After reaching the peer's root, the asker's next look under it is answered with the
+  peer's claim. Red with the refusal sent empty as before: the asker learned nothing. Also
+  `a_refusal_names_the_peers_root_and_no_reply_reads_as_one` (hostile input: every cut, a byte more, and each read as
+  the other).
+
+Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, A-489's owed item, GAPS (the
+location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 ### A-493 — A `UMNT` is confirmed at the pace this shard learned of its kernel's unmounts (2026-11-19, g232; UI goal 86, R3's class C, C-c part 2; §4.6 A-34, RFC 1813 §5.2.2, §5.2.3)
 

@@ -1,6 +1,7 @@
 //! The synchronous client's waits (§4.7, A-232, A-56's every call ends): a call waits while its daemon lives, and ends
-//! `DaemonGone` once its daemon is gone and no successor answers within the reconnect budget. Both waits are driven: the
-//! reply wait of a round trip, and the wait for a slot on a full command ring before the request can go. A daemon held
+//! `DaemonGone` at once when its daemon is gone and nothing holds its rendezvous to start a successor (A-468). Both
+//! waits are driven: the reply wait of a round trip, and the wait for a slot on a full command ring before the request
+//! can go. A daemon held
 //! off its CPU past several reply deadlines is the live case. A daemon killed in a child process (this test binary
 //! re-invoked, an environment variable selecting the role) is the gone case, a real process death the client learns of
 //! as it would in the field: the peer's close on Linux, the exit watch on macOS and Windows.
@@ -224,7 +225,7 @@ impl ChildDaemon {
       Command::new(std::env::current_exe().unwrap())
         .args([
           "--exact",
-          "a_call_to_a_killed_daemon_ends_daemon_gone_past_the_reconnect_budget",
+          "a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once",
           "--nocapture",
         ])
         .env(ROLE, "daemon")
@@ -261,14 +262,15 @@ impl Drop for ChildDaemon {
   }
 }
 
-/// Runs `call` and checks it ended `DaemonGone` past the reconnect budget: the reconnect's verdict, never a stall
-/// (non-vacuous: it took at least the budget, so the client tried to reconnect for it), and within twice the reply and
-/// reconnect budgets together.
-fn gone_past_the_budget(
+/// Runs `call` and checks it ended `DaemonGone` before the reconnect budget had passed. `DaemonGone` is the
+/// reconnect's verdict alone (the client answers it only when a reconnect found no holder of the rendezvous), so the
+/// client did try to reconnect; and before A-468 a reconnect waited the whole budget for a successor by the clock, so
+/// ending sooner is the proof that it waited for no clock (A-468).
+fn gone_at_once(
   call: impl FnOnce() -> Result<Vec<slates_client::VolumeSummary>, ClientError>,
   what: &str,
 ) {
-  let budgets = deadlines();
+  let budget = Duration::from_nanos(deadlines().reconnect_ns);
   let started = Instant::now();
   let ended = call();
   let took = started.elapsed();
@@ -276,21 +278,20 @@ fn gone_past_the_budget(
     matches!(ended, Err(ClientError::DaemonGone { .. })),
     "{what} to the killed daemon ended DaemonGone: {ended:?} after {took:?}"
   );
-  let budget = Duration::from_nanos(budgets.reconnect_ns);
-  let bound = Duration::from_nanos(budgets.reply_ns.saturating_add(budgets.reconnect_ns)) * 2;
   assert!(
-    took >= budget && took <= bound,
-    "{what} ended after {took:?}: at least the reconnect budget {budget:?}, within {bound:?}"
+    took < budget,
+    "{what} ended after {took:?}: before the reconnect budget {budget:?}, since nothing holds the rendezvous"
   );
 }
 
 /// A-232 (§4.7), a gone daemon. Do: run a one-shard daemon in a child process, connect two clients to it, `SIGKILL` the
 /// child (`TerminateProcess` on Windows), then list the volumes on the first client and, on the second, fill its
 /// command ring (proved full: refused `ChannelLost`, the daemon gone) and list them. Expect: both lists end
-/// `DaemonGone` once the reconnect budget has passed with no daemon answering, never `Stalled` (see
-/// [`gone_past_the_budget`]), as before A-232.
+/// `DaemonGone`, never `Stalled` (A-232), and before the reconnect budget has passed (A-468): the child daemon holds
+/// its own rendezvous and no anchor holds it, so nothing can start a successor, and the reconnect fails on the first
+/// refusal rather than waiting out a clock (see [`gone_at_once`]).
 #[test]
-fn a_call_to_a_killed_daemon_ends_daemon_gone_past_the_reconnect_budget() {
+fn a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once() {
   if std::env::var_os(ROLE).is_some() {
     serve_until_killed();
     return;
@@ -302,12 +303,12 @@ fn a_call_to_a_killed_daemon_ends_daemon_gone_past_the_reconnect_budget() {
   replying.list().expect("the child daemon answers");
   sending.list().expect("the child daemon answers");
   child.kill();
-  gone_past_the_budget(|| replying.list(), "a round trip");
+  gone_at_once(|| replying.list(), "a round trip");
   let refused = fill_the_ring(&mut sending);
   assert_eq!(
     refused,
     ClientError::ChannelLost,
     "the ring is full and the daemon gone"
   );
-  gone_past_the_budget(|| sending.list(), "a send on a full ring");
+  gone_at_once(|| sending.list(), "a send on a full ring");
 }

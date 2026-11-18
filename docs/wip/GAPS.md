@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **§4.17 version-control servers: the shared mapping is designed, nothing is built (2026-11-18, A-497, D-28; UI goal 91;
+> owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches, pushes, stacked changes,
+> review requests, objects and history onto greens and works; §4.17.2 (git), §4.17.3 (Mercurial) and §4.17.4
+> (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces of §4.17.1 (the repository record
+> and green ids carrying its partition; one register entry for several greens; the object store and its index; works
+> from a client's push, with the head operation and the client-fidelity test; works over works and bases given as trees;
+> review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
+> method.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -906,6 +915,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Fixed (2026-11-18, A-490): a Windows runner can read its nameservers.** Its manifest trusts kiln's CA as a root,
+>   so its start reads the host's nameservers (a peer enrolled under the root may announce a name), and the reader
+>   knew only `/etc/resolv.conf`, which Windows lacks: every Windows runner was refused at `check_fleet`. Windows now
+>   reads the DNS servers of its network adapters that are up and have a gateway (`role/fleet/windows_dns.rs`, Go's
+>   rule), judged by a cfg-free function unit-tested on every host (the bug record of 2026-11-18). Owed: a Windows
+>   node's live start on a manifest with a root (filed for main's Windows lanes).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
 >   target's runner mounting the moved volume under its own place once its new owner serves it. The live move across
@@ -2230,11 +2245,18 @@
 >   `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (`crates/server/src/daemon.rs`);
 >   kiln r41 (Mac Studio), each red: the model with the tolerance unjudged, the server with every or no unasked copy
 >   covered.
->   **Still owed:** a copy first judged on a completion record (the last successor to confirm completes the takeover
->   in the version that records it) or past tolerance is kept, `fleet.takeover.kept_unasked`: the completion record
->   keeps no neighbourhood to judge by. Owed: the completion record keeps the retired host's settled neighbourhood (and
->   its carried retirements'), so a holder judges its object's cohorts there too; and the settle-based rule above for a
->   live owner.
+>   **Fixed (A-484, g250, 2026-11-18): a copy first judged on a completion record, and a hole in A-341's rule.** The
+>   record keeps the settled neighbourhoods its takeover recovered through and the hosts that stayed members through it
+>   (regional layout 5), so a copy first judged once the takeover completed is judged as on the retirement. And the
+>   takeover judged is the first since the copy was written, its writer's (`Acceptor::written_by`,
+>   `RegionalConfiguration::copy_stale`), not the last in its line: A-341 let a copy go at a later takeover within
+>   tolerance though the writer's had been past tolerance and its successor confirmed without learning the object,
+>   possibly the object's last copy (found by reading; bug record of 2026-11-18). Only survivors still members count,
+>   so a cohort host admitted again under its id no longer makes a cohort look within tolerance. Tests:
+>   `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover` (red before) and the A-341 test
+>   (`crates/server/src/daemon.rs`), four register tests, the lineage model. Kept still, counted: a copy whose writer
+>   this process cannot know (its acceptor rebuilt from an image after an install moved it) and an unasked copy of a
+>   moved object. **Still owed:** the settle-based rule above for a live owner.
 > - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
 >   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
 >   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
@@ -2657,7 +2679,8 @@
 >   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
 >   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
 >   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
-> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients).
+>   Closed by A-468 (2026-11-18): a reconnect waits while the instance's anchor lives, however long the restart takes;
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
 >   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
@@ -3876,15 +3899,30 @@
 >   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
->   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
->   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
->   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
+>   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,
+>   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
+>   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
+>   C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
->   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
+>   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
+>   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would
+>   restart was reported gone two seconds late. Now a claim carries no restart bound and waits while its rendezvous's
+>   holder lives (the anchor across restarts, or the daemon holding its own; on Windows the anchor's process id and
+>   creation time in the bootstrap header, layout `SLB4`), and a refused claim asks `slates_ipc::holder_lives`: a holder,
+>   and the client claims again; none, and it fails `DaemonGone` at once
+>   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
+>   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
+>   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
+>   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `Client::call_through_transient`), owed to the failover delay the daemon reports; and the server's reclaim of a
+>   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") still mirrors the old
+>   reconnect budget, a fixed two seconds R3 forbids, owed. macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
@@ -4170,7 +4208,8 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stayed open here until
+>   A-468 (2026-11-18), when a reconnect came to wait while the instance's anchor lives, however long the start takes;
 >   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
@@ -4530,9 +4569,11 @@
 > that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
 > learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
 > `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
-> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
-> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
-> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+> fleet test's runs are filed for main. **The converse, closed the same day (A-504):** an asker behind its peers' root was
+> refused with an empty reply that told it nothing. A refusal now names the root its peer holds, so the asker counts
+> itself behind (`fleet.owner_location.asker_behind`), its root learner fetches from that peer, and each look asks under
+> the root the asker holds then. Regression: `a_behind_askers_round_is_answered_after_one_fetch`, red with the refusal
+> sent empty as before. Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from

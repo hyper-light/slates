@@ -1920,18 +1920,7 @@ async fn serve_peer_records(
                 .learned_members
                 .get(&peer_anchor)
                 .map_or(seed, |member| member.host);
-              match crate::owner_location::serve(state, peer_host, &request) {
-                Ok((reply, declined)) => {
-                  if let Some(declined) = declined {
-                    state.count(declined, 1);
-                  }
-                  reply
-                }
-                Err(error) => {
-                  state.count(error.counter(), 1);
-                  Vec::new()
-                }
-              }
+              crate::owner_location::answer(state, peer_host, &request)
             })
             .unwrap_or_default()
           }
