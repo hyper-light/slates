@@ -93,12 +93,18 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
->   records none today, so a green taken over reads its merged versions unsigned;
-> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
->   no trusted signers (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since the
->   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
->   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - **built and landed 2026-11-18 (A-321's third part; g090's branch `agents/g090-signed-work-takeover`, landed by the
+>   replication goal, g230):** signed work survives a takeover. A version's merge record carries its verdict
+>   (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it as it accepts the
+>   record (`merge_service::recompute`) and as a replica is advanced or rebuilt from the ledger (`merge_origin`), and the
+>   successor adopts the replica (A-333), so a green taken over reads its signed versions as they were judged; the catalog
+>   register carries the write policy, its version and the trusted signers (`CatalogValue::write`, `write_version`,
+>   `signers`), carried by `AdoptedGreen` and used by `record_adopted_green` and `materialize_taken_over`, so a successor
+>   enforces and reports them. Tests on three nodes at `f = 1` (`crates/server/tests/fleet.rs`):
+>   `a_greens_policy_signers_and_verdicts_survive_its_owner` and `a_volumes_policy_and_signers_survive_its_owner`, each
+>   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+>   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
+>   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
@@ -107,7 +113,10 @@
 >   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
 >   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
 >   written where the design says;
-> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
+>   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
+>   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
+>   Mac Studio carries only `ssh-sk-helper`'s hardware middleware (checked 2026-11-18);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
 >   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).
@@ -354,6 +363,15 @@
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
 >   a reader).
 
+> **Every delta behind a whole state in flight was refused for credit, and each refusal shipped the volume whole again:
+> fixed (2026-11-18, A-371, §4.10 "Live shipping", AC-8.9; g230).** The live credit counted the whole entry the owner had
+> just appended, and the owner sets the credit from that entry's size, so deltas behind it were refused `NoCredit` until
+> it was durable and every refusal owed a whole state: the measurer's 32 writers on a 128 MiB volume saw two extra
+> whole records of about 135.5 MB a run. The credit now holds the deltas alone; a whole state rides one past it. Test:
+> `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+> - **Owed (the measurer's):** the 32-writer, 128 MiB run again (diag-measurer-7's harness): expect `fleet.live.whole`
+>   to stay 1 and fewer one-second steps.
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
@@ -581,9 +599,14 @@
 >   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
 >   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
 >   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
->   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
->   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
->   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
+>   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
+>   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
+>   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
+>   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
+>   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
+>   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
 >   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
 >   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
@@ -690,7 +713,15 @@
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> keep the stated difference and offer the change upstream. **2026-11-18, A-360 (goal g258):** the driver change is
+> written, two commits on WinFsp v2.1 that apply to v2.2 (`docs/wip/winfsp-patches`, never sent to WinFsp), and the
+> drive declares `HardLinks` and serves a forwarded link (its focused tests on both Windows runners). Proven end to end
+> on a test-signing Windows Server 2025 VM under KVM (adacachy) with the patched driver: the live `CreateHardLinkW`
+> test passes (one file index, two links, the other name reads a write 0.9 ms after the writer's close) and `git clone
+> --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
+> create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
+> (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
+> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
@@ -2447,6 +2478,22 @@
 >     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
 >     failure, with a client given up or starved, and with nothing timed.
 >
+>     **The harness's instants are sound, and it says what it may have added (2026-11-18, g083).** The measurer's
+>     1,000-client runs on main `7d760c4ea` (BENCHMARKS, "The 1,000-client bound on main") had three oracle failures,
+>     each at a point whose harness was starved of its CPU, and one recorded a submit's round trip of 5 µs where the
+>     run's submits took 374 to 399 µs. The cause was the harness's: it stamped a send after `Client::begin` had handed
+>     the request to its ring, and a reply before `take_ready` read the ring, so a worker the host preempted in either
+>     gap recorded a send after the verdict that reflected it, or a reply before it came, and the oracle's bounds
+>     (`support/load_oracle.rs`) were unsound. Now a send is read before its handing over and again after it, and a
+>     reply after its ring was read, on the host's monotonic clock (the daemon's spans' clock). Each attempt also has a
+>     `floor` row: its reply was not there when the connection's previous drain began, so the daemon and the ring took
+>     at least that long, whatever the harness's sweep did; `max_drain_gap_ns` is now the longest window a reply's
+>     arrival could not be placed in (it counted a connection's idle time before). Tests, failing first: a worker kept
+>     off its CPU right after handing a request over, while the daemon's one shard answers, still stamps its send before
+>     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
+>     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
+>     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
@@ -2544,6 +2591,31 @@
 >   holder rebuilds such a green and refuses it again only at the version that mismatched;
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
+>
+> **Fixed 2026-11-18 (g232, A-376): every version re-published the whole content hold.** The content hold's image was
+> one piece (A-270), every chunk, manifest and stage a holder keeps, recomputed at every publication and re-put whenever
+> it changed, which at `f > 0` is every version of a green: after A-372 about a tenth of a holder's time at 1,000
+> versions (`sample`, Mac Studio, debug), and deltas big enough that the journal checkpointed about as often as it
+> logged. Now the hold is a piece per chunk, per held manifest and per stage, it notes each piece it changes, and a delta
+> carries those (image version 30). Test: `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold`
+> (`daemon.rs`): on main's code a put's delta grew 158 bytes a put, now one size. With A-367, A-372 and this, the
+> late-submit test's late median at 300 versions is 2.28 to 2.37 ms against early 2.31 to 2.49, and at 1,000 versions
+> 3.76 against 6.00 (kiln r3543, Mac Studio, debug): no growth with a green's history left at `f = 1` on the commit path.
+>
+> **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
+> retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
+> object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
+> every version decoded every version's record before it: on the Mac Studio, a debug build, `sample` of the late-submit
+> test at 1,000 versions found a fifth of each holder's time in that rule (1,364 to 1,413 samples of about 6,570), the
+> late median at 18.2 ms against the early 2.16. A ledger never rewrites an accepted position, so its inputs placed below
+> its newest accepted version were judged when their records came; now the rule judges those placed at or past it
+> (`ContentHold::retain_placed_from`, over the hold's manifests indexed by placed sequence, charged with them), and the
+> newest placement is one read. Test: `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change`
+> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held (red with the rule
+> judging a ledger whole). Kiln r3491, the Mac Studio, debug: the late-submit test's late median at 300 versions 2.92 to
+> 3.28 ms against early 1.87 to 1.96 (it was 4.4 to 6.4 against 2.0 to 2.4), and at 1,000 versions 8.49 against 2.28
+> (18.2 against 2.16). What remains is the content hold's image, one piece re-encoded and re-put at each publication,
+> about a tenth of a holder's time at 1,000 versions, which also brings the checkpoints a delta's size triggers.
 >
 > **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
 > one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
@@ -2865,7 +2937,20 @@
 > is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
-> class C claim wait below.
+> class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
+> sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
+> coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
+> the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
+> (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
+> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
+> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
+> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
+> sum is kept only as the A/B baseline, a build of its own, never a mode.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -2971,6 +3056,20 @@
 > - ~~**Owed:** the five-arm A/B with every worker count fixed at build time and no probe~~ **done 2026-11-07**
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
+
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
+> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
+> which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
+> directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
+> supervisor. A recorded verb now meets the bound before it runs (`live_ship::refuse_over_bound` in
+> `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`).
+> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
+>   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
+>   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
+>   such a reply from the task's start, refused `Overloaded` before the task runs.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
@@ -3514,7 +3613,11 @@
 >   could not run and no draft was made). A-223 had imported three kernel32 functions that Nano Server's kernel32
 >   lacks (`EnableThreadProfiling`, `ReadThreadProfilingData`, `DisableThreadProfiling`). `slates-machine` now finds
 >   them at run time, and where they are missing the switch count is unknown, as when the OS refuses the profiling.
->   Only the release lane runs the Nano Server check, so no push to main showed it. Record:
+>   Only the release lane ran the Nano Server check, so no push to main showed it. Since the same day CI's Windows lane
+>   starts its debug binary there on every push (the Visual C++ runtime's DLLs beside it), through the action
+>   release.yml uses too (`.github/actions/nano-server-start`), which also starts Docker's engine when a runner left
+>   it stopped (1 of 11 `windows-2025` runners sampled; it failed the tag `v0.1.0`'s first Windows x86_64 build). It
+>   refused main before the fix with 0xC0000139 and adds 21 s to the lane (run 44354728411). Record:
 >   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
@@ -3801,11 +3904,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 >       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
 >       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
->       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
->       client's shard,
->       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
->       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
->       term).
+>       g250). The creator rule's two siblings on the client's shard are fixed (g229, 2026-11-18): a mount of a
+>       yielded volume is refused by its kind on the volume's shard (`remote_attach::lost_attach`; it had attached the
+>       copy), and a record-form attach of one is remembered with its client before it is sent, so the client's reap ends
+>       it at the successor (`remote_attach::remember_volume_at`; it had stayed there for good). Red first:
+>       `an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind` and
+>       `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`
+>       (`docs/bugs/2026-11-18-a-node-admitted-again-took-the-volumes-it-yielded-for-its-own-on-the-clients-shard.md`).
+>       **Owed:** releasing a yielded copy's memory (GAP-A9-7).
 >     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
 >       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
 >       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
@@ -5239,7 +5345,58 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
-### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
+### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20; re-diagnosed 2026-11-05: Ubuntu's AppArmor restriction; CLOSED 2026-11-18 by A-370: slates' profile, used when asked)
+
+> **Closed 2026-11-18 by A-370 (goal g078, kiln 7d8d1280): `slates exec` runs unprivileged on a restricted host, with
+> slates' AppArmor profile loaded and the option on.** Ada's decision the same day: "Ship the profile but feature flag
+> it so whether via SDK (Node/Python), API, or CLI it is user enabled." Design §4.6 "The launcher on a restricted
+> host".
+> - **The profile:** `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) { userns, }`, named by the
+>   executable's real path. It is rendered by the binary for its own path (`slates apparmor profile`) and by the SDKs
+>   and slates-api for any path. `slates apparmor check` says whether the host restricts user namespaces and prints the
+>   root commands that load the profile. slates never loads it (R10) and never writes `/etc/apparmor.d` (R1).
+> - **The flag:** `slates exec --apparmor-profile`, slates-api's `ExecSpec::apparmor` (`AppArmor::Profile`), the Python
+>   SDK's `exec_command(..., apparmor_profile=True)`, the Node SDK's `execCommand(..., { apparmorProfile: true })`; off
+>   unless set.
+>   - Off: a launcher running under its loaded profile leaves it first (`changeprofile unconfined`), so the host's
+>     restriction refuses it as with no profile loaded, and the refusal names the switch; with no profile loaded, the
+>     refusal is word for word the one of 2026-11-05.
+>   - On: the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so it holds
+>     no user-namespace grant.
+> - **Measured** (diagnostics run 44344947954, the launcher's sequence by a probe, 2026-11-18): on `ubuntu-24.04`
+>   (AppArmor 4.0.1, Linux 7.0.0-1017-azure) and `ubuntu-latest`, now Ubuntu 26.04.1 (AppArmor 5.0.2, Linux
+>   7.0.0-1016-aws, `apparmor_restrict_unprivileged_unconfined=1`):
+>   - the profile loaded, the maps, the private tree and the bind succeed, and the command reads the volume;
+>   - the step-out restores the refusal;
+>   - with `exec unconfined` the command runs `unconfined`, and its own `unshare -Ur` is refused (inherited, it
+>     succeeded);
+>   - a copy of the binary at another path is not covered.
+> - **Through the real binary** (diagnostics run 44350784102, 2026-11-18, on `ubuntu-24.04` x86_64 and arm64 and Ubuntu
+>   26.04.1 x86_64, each restricting unprivileged user namespaces):
+>   - the focused unit tests passed (`slates-client` 5, `slates-api` 4, the CLI's grammar 6);
+>   - with no profile loaded, `the_launcher_uses_slates_apparmor_profile_only_when_asked`,
+>     `apparmor_prints_the_profile_and_checks_the_host` and `the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`
+>     passed, 3 of 3; without the option the refusal is word for word the one of 2026-11-05;
+>   - the same test demanding the loaded regime with none loaded failed (the red check);
+>   - with the binary's profile loaded by `apparmor_parser -r`, the three passed again. By hand, with
+>     `--apparmor-profile` the command read the volume as the runner's uid 1001, ran `unconfined`, and its own
+>     `unshare -Ur` was refused; without it the launcher was refused naming the switch (exit 4);
+>   - the SDKs' plumbing tests passed against the built wheel (3 of 3) and addon (1 of 1).
+>
+>   CI's `gates` job runs both regimes on every push since (`The slates exec AppArmor profile, opted into (Linux)`).
+> - **Red-checked** (diagnostics run 44353311142, `ubuntu-24.04`), each guard removed in turn:
+>   - the switch dropped from the launcher's arguments failed the shared grammar's test and the CLI's round trip;
+>   - with the step-out removed, the launcher ran without the option under the loaded profile (exit 0, where 4 is
+>     owed);
+>   - with the exec-time drop removed, the command ran labelled `/home/runner/work/slates/slates/target/debug/slates
+>     (unconfined)` and held the grant (`grant-held`).
+> - **macOS** (diagnostics run 44352021341, `macos-latest`): the focused tests pass there too (5, 4, 6 and the CLI's
+>   `apparmor_prints_the_profile_and_checks_the_host`); `slates apparmor check` answers `readiness: unsupported` (exit 1)
+>   and `exec` the refusal it always gave off Linux (exit 4).
+> - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
+>   serves it (`role::main`'s `exec`), and the profile can name that executable.
+>
+> The entry as it stood on 2026-11-05:
 
 > **Re-diagnosed 2026-11-05 (bug-sweep): the refusal is fixed; the rest is a host setting after all, which slates
 > cannot lift unprivileged.** The entry below drew its conclusion from a probe that execs a shell, and an exec'd process
@@ -7065,8 +7222,9 @@ namespace. An unsatisfiable path is refused with the exact missing directory, ne
 budgeted `unsafe` (`unshare_unsafe`, sound in the single-threaded pre-exec launcher). The `--`
 splits the flags from the command; the parsing is unit-tested on every host, and the launcher
 runs against a real daemon mount in the CI Linux lane. Owed: the daemon publishing its root
-mount so `SLATES_ROOT` need not be set by hand, and the AppArmor-profile detection with the exact
-remedy message (a generic hint is given now).
+mount so `SLATES_ROOT` need not be set by hand. (The AppArmor detection with the exact remedy message landed
+2026-11-05; slates' AppArmor profile, used when the caller asks, with A-370 on 2026-11-18, when the launcher moved to
+`crates/api/src/exec.rs`: GAPS `8a-launcher-ci`.)
 
 The xtask unsafe counter was made word-boundary aware in the same change: it counted the
 substring `unsafe` inside identifiers like `unshare_unsafe`; it now counts the `unsafe` keyword
@@ -11636,6 +11794,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 

@@ -1664,3 +1664,61 @@ impl Client {
     Ok(UnitBegin { word, fast })
   }
 }
+
+/// Format: the executable [`exec_command`] runs unless its caller names another: the `slates` binary, found on the
+/// `PATH` as a shell finds it. slates' AppArmor profile attaches to the binary's real path (A-370).
+const SLATES_PROGRAM: &str = "slates";
+
+/// What [`exec_command`] takes beside the request: `{ apparmorProfile, program }` in JS.
+#[napi(object)]
+pub struct ExecOptions {
+  /// The launcher's AppArmor option (A-370), off unless `true`: on a host whose AppArmor restricts unprivileged user
+  /// namespaces (Ubuntu 24.04 and later), the launcher makes its namespace under slates' AppArmor profile for `program`,
+  /// which an administrator loads as root ([`apparmor_profile`]); off, it never uses that profile.
+  pub apparmor_profile: Option<bool>,
+  /// The executable that serves the launcher: `slates` (found on the `PATH`) unless named.
+  pub program: Option<String>,
+}
+
+/// The command that runs slates' chosen-path launcher (`slates exec`, §4.6 "The launcher"; A-370): `volume` shown at
+/// the existing directory `at` for `command`, in a namespace of its own (Linux). It returns the argument list for
+/// `child_process.spawn(argv[0], argv.slice(1))`, so the program spawns and awaits it as it would any command; the
+/// launcher finds the volume under `SLATES_ROOT` in the environment it is given. The grammar is every surface's
+/// (`slates_client::exec::ExecSpec`), so the `slates` command reads back exactly this request. `execCommand` in JS.
+#[napi]
+pub fn exec_command(
+  volume: String,
+  at: String,
+  command: Vec<String>,
+  options: Option<ExecOptions>,
+) -> Result<Vec<String>> {
+  if command.is_empty() {
+    return Err(Error::from_reason("exec needs a command"));
+  }
+  let (apparmor_profile, program) = match options {
+    Some(options) => (options.apparmor_profile.unwrap_or(false), options.program),
+    None => (false, None),
+  };
+  let spec = slates_client::exec::ExecSpec {
+    volume,
+    at,
+    command,
+    apparmor: if apparmor_profile {
+      slates_client::exec::AppArmor::Profile
+    } else {
+      slates_client::exec::AppArmor::Off
+    },
+  };
+  let mut argv = vec![program.unwrap_or_else(|| SLATES_PROGRAM.to_owned())];
+  argv.extend(spec.arguments());
+  Ok(argv)
+}
+
+/// slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+/// text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. It grants that
+/// executable `userns,` and nothing else. Throws for a path the profile cannot name exactly. `apparmorProfile` in JS.
+#[napi]
+pub fn apparmor_profile(executable: String) -> Result<String> {
+  slates_client::exec::profile(&executable)
+    .map_err(|refusal| Error::from_reason(refusal.to_string()))
+}

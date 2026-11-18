@@ -94,6 +94,9 @@ mod work_home;
 // stream's (Linux, macOS; A-316, A-339).
 #[cfg(unix)]
 mod write_log;
+// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365).
+#[cfg(unix)]
+mod dax_ranges;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]
 mod winfsp;
