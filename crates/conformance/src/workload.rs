@@ -1499,7 +1499,9 @@ mod tests {
     };
     let uname = String::from_utf8_lossy(&uname.stdout).into_owned();
     if !(uname.starts_with("MINGW") || uname.starts_with("MSYS")) {
-      eprintln!("SKIP: the `sh` on the PATH is not Git for Windows' (`uname -s` answered {uname:?})");
+      eprintln!(
+        "SKIP: the `sh` on the PATH is not Git for Windows' (`uname -s` answered {uname:?})"
+      );
       return;
     }
     for tool in ["hg", "python"] {
@@ -1509,7 +1511,10 @@ mod tests {
       }
     }
     let hg = sh("hg version -q").unwrap();
-    assert!(hg.status.success(), "`hg version` under the environment: {hg:?}");
+    assert!(
+      hg.status.success(),
+      "`hg version` under the environment: {hg:?}"
+    );
     let python = sh("python -c 'import sys; print(sys.argv[1])' '^/trunk'").unwrap();
     assert!(python.status.success(), "{python:?}");
     assert_eq!(

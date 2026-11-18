@@ -1113,14 +1113,14 @@ mod tests {
       .stdin(Stdio::null())
       .status();
     if !elevate.is_ok_and(|status| status.success()) {
-      eprintln!("SKIP: handing a directory to root needs passwordless sudo (`sudo -n true` refused)");
+      eprintln!(
+        "SKIP: handing a directory to root needs passwordless sudo (`sudo -n true` refused)"
+      );
       return;
     }
-    let work = crate::conformance::build_output(&format!(
-      "conformance-root-start-{}",
-      std::process::id()
-    ))
-    .unwrap();
+    let work =
+      crate::conformance::build_output(&format!("conformance-root-start-{}", std::process::id()))
+        .unwrap();
     let made = work.join("made-by-root");
     let _removed = Removed(work.clone(), made.clone());
     hand_to_root(&work, true).unwrap();
