@@ -2051,7 +2051,7 @@ fn serve_merge_shipment(
   }
   let may_place = content_authorized(
     s.council.configuration(),
-    &s.holder_records,
+    s.holder_records.as_map(),
     local,
     peer_host,
     slates_cluster::content::ContentAccess::Place,
