@@ -13848,6 +13848,27 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
       matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
     })
     .collect();
+  let probe_attachment = reader.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  });
+  eprintln!("probe: attach after the successor's restart: {probe_attachment:?}");
+  if let ReplyBody::Attached { attachment, .. } = probe_attachment {
+    let started = std::time::Instant::now();
+    let after = reader.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/after-restart".to_owned(),
+      bytes: b"after".to_vec(),
+      mode: 0o644,
+    });
+    eprintln!("probe: a write after the successor's restart, {:?}: {after:?}", started.elapsed());
+    let counters = summed_counters(&daemons[index]);
+    let live: Vec<_> = counters.iter().filter(|(name, _)| name.starts_with("fleet.live")).collect();
+    eprintln!("probe: successor live counters {live:?}");
+  }
   drop(reader);
   for daemon in daemons {
     daemon.stop();
