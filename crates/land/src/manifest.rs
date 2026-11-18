@@ -653,25 +653,29 @@ fn capture_entries(
         )]
       })
     }
-    (
-      Held::Symlink { target: before, .. },
-      Held::Symlink { target, windows },
-    ) => Ok(if before == target {
-      Vec::new()
-    } else {
-      vec![entry(
-        Action::Symlink {
-          target: target.clone(),
-        },
-        None,
-        None,
-        *windows,
-      )]
-    }),
+    (Held::Symlink { target: before, .. }, Held::Symlink { target, windows }) => {
+      Ok(if before == target {
+        Vec::new()
+      } else {
+        vec![entry(
+          Action::Symlink {
+            target: target.clone(),
+          },
+          None,
+          None,
+          *windows,
+        )]
+      })
+    }
     _ => {
       let mut out = Vec::new();
       if let Some((action, witness)) = removal_of(store, base, &was)? {
-        out.push(entry(action, Some(witness), None, WindowsAttributes::default()));
+        out.push(entry(
+          action,
+          Some(witness),
+          None,
+          WindowsAttributes::default(),
+        ));
       }
       if let Some((action, overlay, windows)) = made_entry(store, source, &now)? {
         out.push(entry(action, None, overlay, windows));

@@ -81,12 +81,11 @@ use windows_sys::Win32::Foundation::{
   STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-  FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-  FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-  FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
-  FileDispositionInfoEx, FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE,
-  SetFileInformationByHandle,
+  DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO,
+  FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+  FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
+  FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
+  GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
 
 use crate::engine::LandingTarget;
@@ -719,10 +718,7 @@ fn give_bits(
   made: crate::windows_bits::Made,
 ) -> Result<(), HostError> {
   let current = attributes(object)?;
-  set_attributes(
-    object,
-    crate::windows_bits::set_word(current, volume, made),
-  )?;
+  set_attributes(object, crate::windows_bits::set_word(current, volume, made))?;
   if crate::windows_bits::held(attributes(object)?, volume, made) {
     Ok(())
   } else {

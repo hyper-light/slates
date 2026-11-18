@@ -714,8 +714,8 @@ const SYSTEM: u32 = 0x4;
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
-  use std::os::windows::fs::FileTypeExt;
   use slates_vfs::inode::{Kind, WindowsAttributes};
+  use std::os::windows::fs::FileTypeExt;
   let ram = build_output();
   let ws = Workspace::new(&ram, "windows-bits");
   seed_dir(&ws.path.join("out"));
@@ -737,7 +737,13 @@ fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
   let mut store = store();
   let mut vol = scratch(&mut store);
   mkdir(&mut vol, &mut host, &mut store, "/d");
-  write_file(&mut vol, &mut host, &mut store, "/d/f.rs", b"in a hidden directory");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
   let mut marks = vec![
     ("/d", READONLY | HIDDEN, Kind::Dir),
     ("/d/f.rs", SYSTEM | HIDDEN, Kind::File),
@@ -788,7 +794,10 @@ fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
       .unwrap()
       .file_type();
     assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
-    assert_eq!(std::fs::read_link(out.join("to_d")).unwrap(), Path::new("d"));
+    assert_eq!(
+      std::fs::read_link(out.join("to_d")).unwrap(),
+      Path::new("d")
+    );
     assert_eq!(
       names_in(&out.join("to_d")),
       ["f.rs"],

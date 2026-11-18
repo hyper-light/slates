@@ -1863,13 +1863,23 @@ fn a_landing_gives_each_object_the_bits_the_volume_keeps_and_a_directory_link_it
   let mut store = store();
   let mut vol = scratch(&mut store);
   mkdir(&mut vol, &mut host, &mut store, "/d");
-  write_file(&mut vol, &mut host, &mut store, "/d/f.rs", b"in a hidden directory");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
   write_file(&mut vol, &mut host, &mut store, "/plain.rs", b"plain");
   symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
   symlink(&mut vol, &mut host, &mut store, "/to_f", "d/f.rs");
   let hidden = u32::from(WindowsAttributes::HIDDEN);
   let marks = [
-    ("/d", u32::from(WindowsAttributes::READONLY) | hidden, Kind::Dir),
+    (
+      "/d",
+      u32::from(WindowsAttributes::READONLY) | hidden,
+      Kind::Dir,
+    ),
     ("/d/f.rs", u32::from(WindowsAttributes::SYSTEM), Kind::File),
     (
       "/to_d",

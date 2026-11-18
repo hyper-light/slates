@@ -151,8 +151,14 @@ mod tests {
         let wanted = WindowsAttributes::kept(u32::from(volume), made.kind());
         let on_disk = landed(volume, made, 0o644);
         let read_back = WindowsAttributes::kept(on_disk, made.kind());
-        assert_eq!(read_back, wanted, "{made:?} with the volume's {volume:#06x}");
-        assert!(held(on_disk, volume, made), "{made:?} with the volume's {volume:#06x}");
+        assert_eq!(
+          read_back, wanted,
+          "{made:?} with the volume's {volume:#06x}"
+        );
+        assert!(
+          held(on_disk, volume, made),
+          "{made:?} with the volume's {volume:#06x}"
+        );
       }
     }
   }
@@ -189,7 +195,11 @@ mod tests {
       }
     }
     let link_kind = WindowsAttributes::LINK_DIRECTORY;
-    assert!(held(landed(link_kind, Made::Link, 0o644), link_kind, Made::Link));
+    assert!(held(
+      landed(link_kind, Made::Link, 0o644),
+      link_kind,
+      Made::Link
+    ));
     assert!(
       !held(landed(0, Made::Link, 0o644), link_kind, Made::Link),
       "a directory link made as a file link"
@@ -223,14 +233,42 @@ mod tests {
   fn the_word_replaces_what_the_volume_keeps_and_keeps_what_it_does_not() {
     let stale = HIDDEN | SYSTEM | OFFLINE | NOT_CONTENT_INDEXED | ARCHIVE;
     assert_eq!(set_word(stale | TEMPORARY, 0, Made::File), TEMPORARY);
-    assert_eq!(set_word(stale, WindowsAttributes::HIDDEN, Made::File), HIDDEN);
-    assert_eq!(set_word(stale, 0, Made::File), NORMAL, "no bit: NORMAL alone");
-    assert_eq!(set_word(DIRECTORY | stale, WindowsAttributes::READONLY, Made::Dir), READONLY, "a directory's read-only is a bit");
-    assert_eq!(set_word(READONLY, 0, Made::File), READONLY, "a file's read-only is its mode's, kept");
-    assert_eq!(set_word(REPARSE_POINT | DIRECTORY, WindowsAttributes::LINK_DIRECTORY, Made::Link), NORMAL, "a link's kind is never a bit set");
-    assert!(directory_link(WindowsAttributes::LINK_DIRECTORY | WindowsAttributes::HIDDEN));
+    assert_eq!(
+      set_word(stale, WindowsAttributes::HIDDEN, Made::File),
+      HIDDEN
+    );
+    assert_eq!(
+      set_word(stale, 0, Made::File),
+      NORMAL,
+      "no bit: NORMAL alone"
+    );
+    assert_eq!(
+      set_word(DIRECTORY | stale, WindowsAttributes::READONLY, Made::Dir),
+      READONLY,
+      "a directory's read-only is a bit"
+    );
+    assert_eq!(
+      set_word(READONLY, 0, Made::File),
+      READONLY,
+      "a file's read-only is its mode's, kept"
+    );
+    assert_eq!(
+      set_word(
+        REPARSE_POINT | DIRECTORY,
+        WindowsAttributes::LINK_DIRECTORY,
+        Made::Link
+      ),
+      NORMAL,
+      "a link's kind is never a bit set"
+    );
+    assert!(directory_link(
+      WindowsAttributes::LINK_DIRECTORY | WindowsAttributes::HIDDEN
+    ));
     assert!(!directory_link(WindowsAttributes::HIDDEN));
-    assert_eq!(mode_word(ARCHIVE | HIDDEN, 0o444), ARCHIVE | HIDDEN | READONLY);
+    assert_eq!(
+      mode_word(ARCHIVE | HIDDEN, 0o444),
+      ARCHIVE | HIDDEN | READONLY
+    );
     assert_eq!(mode_word(READONLY, 0o644), NORMAL);
   }
 }

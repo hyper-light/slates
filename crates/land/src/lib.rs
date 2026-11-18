@@ -30,9 +30,6 @@
 // The regions a ReFS block clone shares a file in (A-445): the Windows writer's, and pure, so its tests run on every host.
 #[cfg(any(windows, test))]
 mod block_clone;
-// The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
-#[cfg(any(windows, test))]
-mod windows_bits;
 #[cfg(test)]
 mod captured_tests;
 pub mod engine;
@@ -40,6 +37,9 @@ pub mod grant;
 pub mod manifest;
 pub mod source;
 pub mod verdict;
+// The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
+#[cfg(any(windows, test))]
+mod windows_bits;
 
 #[cfg(unix)]
 pub mod os;

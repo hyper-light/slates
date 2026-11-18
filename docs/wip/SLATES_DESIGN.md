@@ -31001,3 +31001,61 @@ two `windows-sys` features; `tests/oracle.rs` and `tests/os.rs`, a test each; `t
   directory (`SLATES_TEST_REFS_DIR`; skipped loudly without one). Compiled for `x86_64-pc-windows-msvc`.
 - **Owed.** Linux's `FICLONE` and macOS's `clonefile`, behind the same verb (their writers refuse it now and say no
   reflink); duplicates across batches; and the measured cost and gain the step waits on (the filed run reads both).
+
+### A-451 — A Windows landing gives each file, directory and link it makes the volume's other attribute bits, read back, and a directory link lands as one (2026-11-18, g085; A-262's landing half, A-185's owed item)
+Applied in the same change to: §4.15 (A-185's status), A-262 (stage 3's landing half), A-438 (its directory link),
+GAPS (A-185's owed list), `crates/vfs` (`src/host/mod.rs`: `LandFs::set_windows`, the bits on `mkdir` and `symlink`;
+`src/host/sim.rs`: the bits kept as a Windows disk keeps them, `windows_attributes`; `src/captured.rs`: a captured
+entry's bits; `src/volume.rs`: `windows_attributes_in`), `crates/land` (`src/manifest.rs`: `LandingEntry::windows`,
+layouts 3 and 4; `src/source.rs`: `Source::windows`; `src/engine.rs`: the bits handed to the writer;
+`src/windows_bits.rs`, new: the word, the read-back, four unit tests; `src/os_windows.rs`: `give_bits`, the three verbs,
+the mode's word moved to `windows_bits`; `src/os.rs`: the verbs take the bits and apply none; `tests/common/mod.rs`:
+`set_windows_bits`; `tests/oracle.rs`, a test added and one renamed; `tests/os.rs`, a Windows test; `tests/os_escape.rs`
+and `tests/os_removal.rs`, the bits passed through).
+- **What was there.** A-262 keeps the bits in the volume: hidden, system, archive, offline and not indexed on any
+  object, a directory's read-only, and since A-275 a link's directory kind. The WinFsp drive applies them. A landing
+  carried none: A-185's writer set a file's `READONLY` from its mode and kept what the file held, and A-438 landed every
+  link as a file link, since the seam carried no bits. So an `attrib +h`, Git for Windows' hidden `.git` and a
+  directory link Windows made in the volume were each lost at the landing.
+- **The rule.** Each manifest entry carries the bits the volume keeps for what it writes (`LandingEntry::windows`; none
+  for a delete, a rename or a removal), closed into the canonical encoding (layout 3, and 4 judged by content), so a
+  grant binds the bits it lands, as it binds a mode. The writer gives them to what it makes: a file's temporary before
+  its placement (`LandFs::set_windows`, after its mode), a directory as it is made, a link before its move into place.
+  Each bit the volume keeps for the kind is the volume's, set or cleared. A file's read-only state stays its mode's
+  (A-262's one model). A settable bit the volume keeps nothing of (`TEMPORARY`) stays as the object holds it. A word
+  with no bit is written `NORMAL`, since a zero word changes nothing (`windows_bits::set_word`). A link's kind is no bit
+  `FILE_BASIC_INFO` sets, so a directory link is made a directory object (`FILE_DIRECTORY_FILE`), as
+  `SYMBOLIC_LINK_FLAG_DIRECTORY` makes one. Linux and macOS hold none of the bits, and their writer applies none.
+- **Never dropped.** Every bit the volume keeps is one a caller may set (`FILE_ATTRIBUTE_VALID_SET_FLAGS`, `0x31A7`), and
+  NTFS and ReFS hold each. A file system that holds fewer drops the rest and answers success: FAT keeps `READONLY`,
+  `HIDDEN`, `SYSTEM`, `ARCHIVE` and the directory bit, and "the rest are silently dropped on the floor"
+  (`FatSetBasicInfo`, Microsoft's FastFAT sample, `filesys/fastfat/fileinfo.c`, read 2026-11-18). So the writer reads
+  the word back after setting it, and refuses the entry `EOPNOTSUPP` where a bit did not take (`windows_bits::held`,
+  which checks a link's kind too). A refused directory or link is removed and a refused file's temporary given up, so
+  nothing of the entry is left. A bit is landed or refused, never dropped.
+- **What NTFS adds.** The rename that places a file sets `ARCHIVE` again (A-185's measurement on CI's windows-latest),
+  so a landed file holds `ARCHIVE` whatever the volume held: the truth that it changed, which a backup reads. The
+  engine already sets a move's `ARCHIVE` aside when it checks a moved file against its witness (A-185).
+- **Tests.** Unit, on every host, in `windows_bits`: all 128 combinations of the seven bits on a file, a directory and
+  a link land, read back as the volume keeps them for that kind, and are held; a file's read-only state follows its
+  mode; the word replaces what the volume keeps and keeps what it does not; and a dropped bit, an extra bit and a link
+  of the wrong kind are each found. `cargo test --locked -p slates-land --lib` passed 20 of 20 on the Mac Studio
+  (2026-11-18, load 3.3 to 5.4, debug), the engine's captured-clone landings over the simulated host among them, and
+  `cargo test --locked -p slates-vfs --lib -- captured host::sim` passed 3 of 3. Red-checked once, two ways: with
+  `set_word` ignoring the volume's bits, 4 of the 4 failed; with `held` answering yes to every word, the one test that
+  guards it failed and the 3 others passed. `cargo check` (macOS) and `cargo xwin check --target x86_64-pc-windows-msvc`
+  of both crates with all targets were clean, and `cargo fmt --check` too. Filed for main's runs: the oracle's
+  `a_landing_gives_each_object_the_bits_the_volume_keeps_and_a_directory_link_its_kind` (a directory, a file in it, a
+  directory link, a file link and a plain file, each holding its bits on the simulated disk) and
+  `a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes` (renamed from
+  `a_landing_ignores_windows_attribute_bits_without_error`; the same disk and count written, now with the bits on
+  the edited and created files); the crash oracle, since `set_windows` is a write step of the simulated host; and, on
+  Windows, `the_volumes_windows_bits_land_and_a_directory_link_lands_as_one` (`crates/land/tests/os.rs`, its link part
+  skipped loudly without the link privilege or Developer Mode).
+- **Owed.** A change of an untouched base file's bits alone lands nothing. A landing judges a base file by its bytes,
+  so the verdict passes the entry its copy-up makes as `Skip`, as it passes a change of the file's mode alone, which
+  §4.15 step 1 names among what a landing carries; a captured clone's entry compares content alone likewise. A
+  directory's bits, like a Unix directory's mode, are given after it is made, so a crash between the two steps leaves it
+  without them, and a resumed landing takes it as already there. The presented entry list (`PlannedEntry`, §4.15 step
+  2) shows each entry's mode and not its bits, which the grant now binds. The backslash read-back of a landed link
+  (`..\src\lib.rs` read by the Windows base) is the base plane's own map, not this one, and stays its own piece.
