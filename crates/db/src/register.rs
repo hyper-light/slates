@@ -3765,6 +3765,12 @@ pub struct RootConfiguration {
   /// (per-region, like a per-host takeover — no global catalog, D-12). A region present here is no longer in
   /// `regions`.
   pub promotions: std::collections::BTreeMap<RegionId, RegionId>,
+  /// The root group's voters as the configuration last recorded them (§4.8 learners, A-406): the voter set its last
+  /// committed seat change left, in id order, recorded by its leader once that change has committed
+  /// ([`seat`](RootConfiguration::seat)). A root learner takes no part in the root group's Raft, so it knows who votes
+  /// from the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until
+  /// the first seat is recorded. Bounded by the regions, one representative each.
+  pub voters: Vec<HostId>,
 }
 
 impl RootConfiguration {
@@ -3779,7 +3785,35 @@ impl RootConfiguration {
       regions,
       homes: std::collections::BTreeMap::new(),
       promotions: std::collections::BTreeMap::new(),
+      voters: Vec::new(),
     }
+  }
+
+  /// Whether recording `voters` as the root group's voters would change the configuration ([`seat`]): they differ, as
+  /// a set, from the voters it records.
+  ///
+  /// [`seat`]: RootConfiguration::seat
+  pub fn seats(&self, voters: &[HostId]) -> bool {
+    in_id_order(voters) != self.voters
+  }
+
+  /// Records `voters` as the root group's voters, in id order, once the group has committed the seat change that left
+  /// them, and advances the version, so every root learner learns of the change as of any other (A-406, the root's
+  /// sibling of A-380's [`RegionalConfiguration::seat`]). A set equal to the one recorded, or a version with no
+  /// successor, changes nothing. Returns whether the configuration changed.
+  pub fn seat(&mut self, voters: &[HostId]) -> bool {
+    let voters = in_id_order(voters);
+    if voters == self.voters {
+      return false;
+    }
+    // A version with no successor refuses the change before anything moves, identically on every replica that applies
+    // it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.voters = voters;
+    self.version = version;
+    true
   }
 
   /// Admits `region` to the root membership (a region joins the fleet). Returns whether it changed — an
@@ -7498,6 +7532,36 @@ mod tests {
     assert!(
       !promotion.promoted(Quorum { f: 1 }),
       "one promise is not a quorum at f=1 — the new owner must not serve yet"
+    );
+  }
+
+  /// A-406 (§4.8 learners): the root configuration records the root group's voters, in id order, and a recorded change
+  /// advances its version as any change does. Do: in a three-region root, seat two voters given out of order, seat the
+  /// same set again in another order, then seat another set. Expect the first and the last to change the configuration,
+  /// each advancing the version by one and recording the set in id order, and the repeat to change nothing.
+  #[test]
+  fn a_root_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change() {
+    let mut root = RootConfiguration::formed(vec![RegionId(0), RegionId(1), RegionId(2)]);
+    let before = root.version;
+    let voters = [HostId(7), HostId(3)];
+    assert!(root.seats(&voters) && root.seat(&voters));
+    assert_eq!(
+      (root.version, root.voters.clone()),
+      (before + 1, vec![HostId(3), HostId(7)]),
+      "the voters recorded in id order, one version on"
+    );
+    let again = [HostId(3), HostId(7)];
+    assert!(
+      !root.seats(&again) && !root.seat(&again),
+      "the same set is no change"
+    );
+    assert_eq!(root.version, before + 1, "nothing moved");
+    let other = [HostId(9), HostId(3), HostId(7)];
+    assert!(root.seat(&other));
+    assert_eq!(
+      (root.version, root.voters.clone()),
+      (before + 2, vec![HostId(3), HostId(7), HostId(9)]),
+      "a new set recorded, one version on"
     );
   }
 

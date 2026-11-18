@@ -7151,7 +7151,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .holds_for(peer, state.fleet.host())
   {
     DirectContact::Holder
-  } else if state.council.known_voter(peer) || state.root.is_voter(peer) {
+  } else if state.council.known_voter(peer) || state.root.known_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
@@ -8867,6 +8867,9 @@ fn reconcile_root_membership(s: &mut ShardState) {
   s.root.reconcile_regions(&alive, &s.region_mirrors);
   let representatives = alive_representatives(s);
   s.root.reconcile_voters(&representatives);
+  // Once no change is in flight, the voters in force go into the root configuration, so a root learner learns them by
+  // its version (A-406): a seat change alone moves none.
+  s.root.record_voters();
 }
 
 /// One period as the **root** leader — the cross-region parallel of [`lead_council_period`]: reconcile the
@@ -9116,11 +9119,21 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
 /// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
 /// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
 /// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+/// A root voter it knows that its membership no longer holds alive is the same signal for the voters (A-406): the
+/// group has replaced it or will, and the configuration records who votes once it has, while a region whose
+/// representative died stays in the regions and moves nothing the first comparison sees.
 fn root_diverges(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<RegionId> = alive_regions(state).into_iter().collect();
   let known: std::collections::BTreeSet<RegionId> =
     state.root.configuration().regions.iter().copied().collect();
   alive != known
+    || state.root.known_voters().iter().any(|voter| {
+      state
+        .fleet
+        .membership()
+        .state(*voter)
+        .is_none_or(|held| held.liveness != Liveness::Alive)
+    })
 }
 
 /// Drives this node's **root group** one period from the record-plane coordinator (§4.8, D-14 — the root
@@ -9174,9 +9187,9 @@ async fn drive_root_group(
   if !is_voter && !is_leader {
     // A root learner (a region member that is not its region's representative): it does not drive the Raft.
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
-    // reactively, only when its own alive view of the regions diverges from the root configuration it holds
-    // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
-    // learner's reactive fetch.
+    // reactively, only when its own alive view of the regions, or of the root voters it knows, diverges from the
+    // root configuration it holds ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel
+    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406).
     // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
     let now = futures::now_ns();
     let wanted = state::with_state(|s| {
@@ -9197,7 +9210,8 @@ async fn drive_root_group(
     .unwrap_or(false);
 
     if wanted {
-      let targets = root_learner_targets(&voters, local);
+      let known = state::with_state(|s| s.root.known_voters()).unwrap_or_else(|| voters.clone());
+      let targets = root_learner_targets(&known, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         let still = !s.root.initialized();
