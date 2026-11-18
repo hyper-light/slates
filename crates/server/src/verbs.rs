@@ -12954,6 +12954,16 @@ fn widest_unnamed_status() -> StatusReport {
         epoch: u64::MAX,
         from_live_log: true,
         head_sequence: u64::MAX,
+        past_tolerance: Some(slates_ipc::protocol::PastTolerance {
+          registers: Some(slates_ipc::protocol::Shortfall {
+            needed: u64::MAX,
+            remaining: u64::MAX,
+          }),
+          live_log: Some(slates_ipc::protocol::Shortfall {
+            needed: u64::MAX,
+            remaining: u64::MAX,
+          }),
+        }),
       }),
     },
     drifted_elided: u32::MAX,
