@@ -11246,6 +11246,148 @@ fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
   );
 }
 
+/// Format: a node's count of objects its takeover rounds adopted (`takeover::record_adoption`).
+const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
+/// Format: a node's count of takeover rounds started over (`takeover::begin_round`, A-353).
+const TAKEOVER_ROUND_RESTARTED: &str = "fleet.takeover.restarted";
+/// Shape: the registers a live volume's takeover adopts, its head and its catalog.
+const VOLUME_REGISTERS: u64 = 2;
+
+/// Waits over `observed` until `node`'s count of `kind` is past `floor`: whether it moved within the placement wait.
+fn counted_past(observed: &[&Daemon], node: &Daemon, kind: &str, floor: u64) -> bool {
+  poll_until(observed, PLACEMENT_DEADLINE, || {
+    refusal_count(node, kind).map(|count| count > floor)
+  })
+}
+
+/// What the restarted-round test saw through the successor: a write's reply, whether a snapshot it took placed, and
+/// whether each file written on the owner read back.
+struct AfterTheRestart {
+  written: Result<ReplyBody, IpcError>,
+  placed: bool,
+  read: Vec<bool>,
+}
+
+/// Through the node serving `instance`: one write (its reply waited for at most the placement wait), a snapshot of
+/// `volume` and its placement, and each of the owner's files read back.
+fn after_the_restart(daemons: &[Daemon], instance: &str, volume: VolumeId) -> AfterTheRestart {
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(instance);
+  let attachment = write_attachment(&mut client, volume);
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
+  let written = client.try_call(
+    &RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: "/after-the-restart".to_owned(),
+      bytes: b"written after the round started over".to_vec(),
+      mode: 0o644,
+    },
+    deadline_ns,
+  );
+  let placed = snapshot_taken(&mut client, volume)
+    .is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, volume, snapshot));
+  let read = (0..CONTINUITY_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut client, volume, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+    })
+    .collect();
+  AfterTheRestart {
+    written,
+    placed,
+    read,
+  }
+}
+
+/// A-353 (§4.8 "Promotion and takeover"; the lossy flow's post-takeover hang, caught live by g229 on 2026-11-18): a
+/// successor's takeover round started over under a newer configuration keeps the epoch it adopted at, so its own
+/// adoptions are never fenced above the epoch it writes them at. Each survivor's confirmation of its own share is a new
+/// configuration, so this is a round that adopted before the other survivor confirmed. Do: three nodes at `f = 1`; on
+/// a, a live-shipped volume written six files, each answered at durability; both survivors withhold their share's
+/// confirmation (`Daemon::inject_confirmation_withheld`); stop a; once the survivor the volume ranks first has adopted
+/// the volume's two registers, lift the other survivor's hold, so its confirmation is the newer configuration; once the
+/// successor's round has started over (`fleet.takeover.restarted`), lift its hold; through the successor, write a file
+/// and snapshot the volume. Expect the write answered at durability, the snapshot placed in the region, and every file
+/// read back. Before, the round started over one epoch above its own adoptions, its pages fenced the other survivor's
+/// copies of the adopted registers there, and every record the successor wrote at its takeover epoch was refused
+/// `StaleEpoch` for good: its snapshot never placed, and in the lossy flow the catalog naming its live holders never
+/// placed, so its shipper never shipped and its write waited without end.
+#[test]
+fn a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "restarted-round");
+  drop(client);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let (index, other) = if successor == hosts[1] {
+    (1, 2)
+  } else {
+    (2, 1)
+  };
+  for survivor in [index, other] {
+    daemons[survivor]
+      .inject_confirmation_withheld(true)
+      .unwrap();
+  }
+  let adopted_before = refusal_count(&daemons[index], TAKEOVER_ADOPTED).unwrap();
+  daemons.remove(0).stop();
+  let (index, other) = (index - 1, other - 1);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let adopted = counted_past(
+    &observed,
+    &daemons[index],
+    TAKEOVER_ADOPTED,
+    adopted_before + VOLUME_REGISTERS - 1,
+  );
+  let restarted_before = refusal_count(&daemons[index], TAKEOVER_ROUND_RESTARTED).unwrap();
+  daemons[other].inject_confirmation_withheld(false).unwrap();
+  let started_over = counted_past(
+    &observed,
+    &daemons[index],
+    TAKEOVER_ROUND_RESTARTED,
+    restarted_before,
+  );
+  daemons[index].inject_confirmation_withheld(false).unwrap();
+  drop(observed);
+  let instance = daemons[index].instance().to_owned();
+  let after = after_the_restart(&daemons, &instance, id);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "restarted round: adopted {adopted}, started over {started_over}; the write after it {:?}, its snapshot placed {}, \
+     read {:?}",
+    after.written, after.placed, after.read
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on the owner was answered at durability: {written:?}"
+  );
+  assert!(
+    adopted && started_over,
+    "the successor adopted the volume's registers ({adopted}) and its round started over after ({started_over})"
+  );
+  assert!(
+    matches!(after.written, Ok(ReplyBody::FsDone { .. })),
+    "the write through the successor was answered at durability: {:?}",
+    after.written
+  );
+  assert!(
+    after.placed,
+    "the successor's snapshot placed in the region"
+  );
+  assert!(
+    after.read.iter().all(|read| *read),
+    "every file reads back through the successor: {:?}",
+    after.read
+  );
+}
+
 /// Format: a node's count of live volumes it took over from their logs (`live_ship::archive_from_live`).
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 
