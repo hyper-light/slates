@@ -1830,11 +1830,25 @@ epoch copies only its table, never a value.
   guest's data, like any attribute. No host's mount shows or sets them (a FUSE or NFS mount, the AppleDouble view of a
   macOS NFSv3 mount), since there the host's own kernel would act on them. An acknowledged change of any attribute is
   published before its reply on every route, as a namespace change is (D-18).
-- **A guest's POSIX ACLs (A-302).** A guest kernel's route also keeps `system.posix_acl_access` and
+- **A guest's POSIX ACLs (A-302, A-314).** A guest kernel's route also keeps `system.posix_acl_access` and
   `system.posix_acl_default` as the guest's data, checked as Linux checks an ACL and their named users and groups
-  turned through the route's owner view (A-281), as a chown's ids are. They are stored, not enforced: the route does
-  not negotiate `FUSE_POSIX_ACL`, so the guest's kernel checks the mode bits it is shown, as it does over Shards' own
-  server. Every other `system.` name stays refused on every route.
+  turned through the route's owner view (A-281), as a chown's ids are. The route asks the guest's kernel to enforce
+  them (`FUSE_POSIX_ACL`), so what a guest's `setfacl` grants or denies holds for its accesses, as on a Linux bind
+  mount. The kernel judges each access by the access ACL it reads; the rest of Linux's rules (`fs/posix_acl.c`) are the
+  shared seam's, on every route:
+  - **The mode is the access ACL's owner, mask and other entries** (the owning group's where there is no mask).
+    Setting an access ACL sets those three classes of the mode, and keeps the ACL only when it says more than a mode
+    can (a named entry or a mask), removing it otherwise. A chmod through any route changes those three entries,
+    since a reader is shown them from the mode as it reads. Removing an access ACL leaves the mode as it is.
+  - **A directory's default ACL is what it gives what is made in it,** through any route. The creator's umask is not
+    applied under one: the new node's mode keeps only what the default's owner, mask and other entries grant, it takes
+    the default's entries as its access ACL when they say more than its mode, and a new directory takes the default
+    too. A symlink takes neither. Without a default ACL, a FUSE creator's umask is applied, and an NFS client applied
+    its own.
+  - **Not kept:** Linux clears set-group-ID when a caller outside the file's group sets its ACL. The FUSE wire carries
+    that judgement only under `FUSE_SETXATTR_EXT`, which slates does not negotiate (GAPS).
+
+  Every other `system.` name stays refused on every route.
 
 > **A-32 status (2026-09-26).** The volume core is implemented (`crates/vfs/src/xattr.rs`, the
 > table in `inode.rs`, recovery image version 5). It is proven by the model oracle, which now
@@ -4218,7 +4232,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   guest's kernel;
 - the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
   data and shown to no host's mount (A-290, A-302, §4.5 "Extended attributes"); an ACL's named owners are kept through
-  the stream's owner view; an acknowledged attribute change is published before its reply;
+  the stream's owner view; the guest's kernel is asked to enforce its ACLs, which the shared seam keeps in step with
+  the mode and gives at every create under a default ACL (A-314); an acknowledged attribute change is published before
+  its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
@@ -4316,8 +4332,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > **Status (2026-11-18, A-302, the guest's ACLs).** Built and proven by use. A stream keeps a guest's access and
 > default ACLs, checked as Linux checks one, their named owners kept through the stream's owner view and read back as
 > set over a second stream; a default ACL on a file is refused `EACCES`; a host's mount neither lists nor sets them
-> (`crates/bridge-fuse/src/posix_acl.rs` and `tests/shards_fs.rs`; `crates/server/tests/shards.rs`). They are not
-> enforced, as Shards' own server enforces none.
+> (the codec now `crates/bridge-core/src/posix_acl.rs`; `crates/bridge-fuse/tests/shards_fs.rs`;
+> `crates/server/tests/shards.rs`). They were not enforced, as Shards' own server enforces none; A-314 enforces them.
+
+> **Status (2026-11-18, A-314, the guest's ACLs enforced).** Built and proven by use, at the dispatch every guest route
+> shares. A guest's INIT is answered with `FUSE_POSIX_ACL`, a host's without. Judged as a guest's kernel judges an access
+> (Linux's `acl_permission_check` and `posix_acl_permission`, modelled in the test over what GETATTR and GETXATTR
+> answer), a `setfacl -m u:4242:rw,u:4343:-` on a 0600 file makes it 0660 and lets 4242 read and write, 4343 nothing, the
+> owning group read; a chmod 0640 through a host's mount is read back as the mask r--; a removal leaves the mode; a
+> minimal ACL becomes the mode alone. A default ACL gives a file, a directory and a FIFO made under it the mode and
+> ACLs Linux's `posix_acl_create` gives, the umask ignored, a symlink nothing, and a file a host's route makes there the
+> same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
+> a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
+> enforcing them too (Shards' side, after its v0.8.0 tag).
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -6138,6 +6165,15 @@ failure.
 > it is resent or released (`release_retryable`), within the reconnect budget, so a caller that never resends cannot
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
+
+> **Status (2026-11-17, an `Overloaded` verb is never its own completion).** `Overloaded` means the request was not
+> started, so its id stays unanswered and a resend under it runs the verb. Raised inside a verb (a held copy not yet
+> materialized in the takeover's settle window; a deferred verb whose task the full arena refused), it was recorded as
+> the completion, and every resend under the id met it for good. `run_recorded` now leaves it unrecorded, counted
+> `verb.overloaded_unrecorded`; a verb that refuses it part-way ends what it began itself, as the Shards attach ends its
+> attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
+> `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
+> effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
 
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
@@ -8510,6 +8546,31 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > submits at `f = 1`, release, adacachy at load about 10: p50 265 µs, p99 731 µs, p999 and max 1.13 ms. Still owed:
 > a smaller per-version cost (the median of 50 submits grows from 116 µs to 473 µs across 500 versions), and more than
 > one version to a holder per pass.
+
+> **Status (2026-11-17, A-286: version 0 of a green over a base places at `f > 0` a slice at a time).** A green over a
+> base names its origin as version 0's inputs. At `f > 0` they were made in one poll (the held snapshot walked again,
+> encoded and archived) at the green's creation and again on every pass of the record plane until version 0 placed,
+> shipped whole in one message, and restored, decoded and seeded on each holder in one poll. Over the whole kernel
+> (1.67 GB) each of those is seconds of one shard's poll, past A-232's watchdog, so one primary and two replicas could not
+> set the kernel up; no fleet test had a based green. Now:
+> - the owner makes the inputs once, a share at a time, in a task of the green's shard (`merge_origin::OriginInputsJob`:
+>   the held walk a unit at a time, the canonical bytes written a share at a time into an archive cut and hashed as they
+>   arrive, the origin's identity hashed from the same bytes and checked against the recorded one), keeps them until
+>   every candidate holds version 0, and enqueues version 0's record once they are made;
+> - a shipment carries the record, the offer and at most one slice's verification of the chunks its targets lack, and
+>   a target that cannot accept the record yet answers with what it holds: a content acknowledgement when it holds the
+>   inputs whole, else the offer's missing set (`Committed::answers` hands both back to the owner);
+> - each holder seeds its replica a share at a time (`merge_origin::ReplicaSeed`: the held chunks one at a time, the
+>   origin decoded and the engine seeded a share at a time, the identity compared), its first slice as the record
+>   arrives, so a small origin is still acknowledged in the exchange that carried it, and only while the hold still
+>   holds the inputs (a green forgotten meanwhile, by its tombstone or a takeover's reclaim, installs nothing).
+>
+> Inputs archives are chunked at the archive's largest chunk (1 MiB), so the kernel's origin is about 1,600 extents
+> rather than 100,000 to 400,000. Test: `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`
+> (`crates/server/tests/fleet.rs`). Owed: the measurement over the whole kernel; a restarted owner remakes version 0's
+> inputs before it re-ships the record (A-246), since the inputs' identity is not recorded; a takeover successor still
+> gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
+> its chain entry on each pass that ships it.
 
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
@@ -16438,6 +16499,8 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   `docs/bugs/2026-11-07-creating-a-green-held-its-shard-for-the-whole-walk.md`). Peak RSS over `fs/` and the whole kernel
   is in BENCHMARKS.
 - **Owed.**
+  - (2026-11-17, A-286) At `f > 0` version 0's inputs are made once a share at a time, shipped in bounded parts and
+    seeded on each holder a share at a time; they were walked, encoded and archived in one poll on every pass.
   - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
     fleet path).
   - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
@@ -16910,6 +16973,58 @@ Applied in the same change to:
 - **Measured.** The bug record (`docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`):
   the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
   fence, which is independent of this rule (A-257).
+
+### A-286 — Version 0 of a green over a base is made, shipped and seeded a slice at a time at `f > 0` (accepted and built 2026-11-17, g232)
+
+§4.16 "Commit" names a version's inputs in its merge record and places them at `f + 1` before the record commits, and
+"Apply on holders" recomputes the version from them. For a green over a base, version 0's inputs are its origin: every
+byte of the base snapshot in the origin's canonical encoding. At `f > 0` the owner made them in one poll (the held
+snapshot walked again, encoded and archived; A-217) at the green's creation and again on every pass of the record plane
+until version 0 placed. A-244's shipment carried them whole in one message, and each holder restored, decoded and seeded
+them in one poll. Over the whole Linux kernel (97,229 files, 1.67 GB) each of those is seconds of one shard's poll, past
+the watchdog's verdict on a shard that holds its CPU that long (A-232), so the load test's one primary and two replicas
+could not set the kernel up at all. No fleet test had a green over a base, so none of it had run.
+
+Replace it, keeping A-244's one path:
+- **Made once, a share at a time.** The owner makes version 0's inputs in a task of the green's shard: the held snapshot
+  walked a unit at a time, its canonical bytes written a share at a time into an archive that cuts and hashes chunks as
+  the bytes arrive, and the origin's identity hashed from the same bytes and checked against the one the green recorded.
+  A taken-over green's recorded origin bytes are cut the same way. Version 0's record is enqueued once they are made, and
+  nothing of the green ships before. The archive is kept until every candidate holds version 0.
+- **Shipped in bounded parts.** A shipment carries the record, the offer of its inputs and at most a shipment's bound of
+  the chunks its targets lack. The bound is what a holder verifies in one slice, half a step quantum at the measured
+  BLAKE3 rate, and at least one chunk always goes. A target that cannot accept the record yet answers with what it holds
+  of the inputs: a content acknowledgement bound to them when it holds them whole, else the content plane's missing set
+  for the offer, asked again after the shipment's chunks. The owner keeps each target's missing set, ships each group of
+  targets what it lacks, and nudges the record plane when an answer shows progress. An ordinary increment is far below
+  the bound and still crosses whole in one exchange.
+- **Seeded a share at a time.** A holder seeds its replica of version 0 from the held chunks, read one at a time, the
+  origin decoded and the engine seeded a share at a time, and the head identity compared with the record's. The seed's
+  first slice runs as the record arrives, so an origin that seeds within it is acknowledged in that exchange; a larger
+  one goes on in a task, and every record of the green is answered with the content acknowledgement until it is done.
+  A seed installs its replica only while the hold still holds the inputs: a tombstone or a takeover's reclaim forgets
+  everything held for the green and drops its replica, and a seed past reading the hold that installed after that
+  would keep a whole origin nothing removes.
+- **Inputs chunked at the archive's largest chunk.** That is 1 MiB, the most any reader admits (AUD-29-13), where the host
+  page made a kernel-sized origin 100,000 to 400,000 extents and a 6 to 23 MB manifest. At 1 MiB it is about 1,600
+  extents and 90 KB, small enough to offer in every shipment and to read in a slice. Neither page nor chunk size is a
+  wire constant: a holder keys held inputs by the manifest identity the owner computed.
+
+Rejected: placing a large version's inputs through the content plane's own put ahead of its record (A-244's removed
+path), which is a second path chosen by size. Also rejected: one whole-archive shipment with a longer deadline, which still
+holds each holder's shard for the whole verification and decode. Also rejected: offering the manifest only once per
+target, since the holder can then name what it lacks only by keeping the offer, while at 1 MiB chunks the offer costs
+little.
+
+Applied in the same change to: §4.16 (status); A-217 (owed); A-244's shipment (bounded); GAPS; `slates-cluster`
+(`Committed::answers`; `ContentHold::held_manifest`, `held_chunk`); `slates-server` (new `merge_origin`: `InputsBuilder`,
+`OriginInputsJob`, `ReplicaSeed`, `seed_version_zero`; `merge_service`: `inputs_archive` at the archive's largest chunk,
+`MergeShardState::origin_inputs` and `seeding`, `PendingMergeRecord::lacking`, `ship_version`, `ship_groups`,
+`cut_shipments`, `ShipInputs`, `shipment_bound`, `record_inputs_answers`, `inputs_held`, `insert_pending`,
+`corrupt_if_faulted`, `HeldWalk::into_walked`, the removal of `walk_held_origin`; `fleet::serve_merge_shipment`); the
+unit tests (among them `a_seed_whose_green_is_forgotten_meanwhile_installs_nothing`, red with the install's hold check
+removed) and `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`. No change to a record's format, the
+content messages or the shipment's framing.
 
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 
@@ -22101,7 +22216,8 @@ Applied in the same change to:
   in id order, the order Linux's own ACLs keep and `libacl` expects. A value the volume keeps that no longer parses is
   `EIO` to a reader: the volume's fault, never the caller's. Every route but a guest kernel's refuses both names, as it
   refuses A-290's.
-- **Stored, not enforced.** Neither slates nor Shards' own server negotiates `FUSE_POSIX_ACL`, so the guest's kernel
+- **Stored, not enforced (superseded the same day by A-314, at Shards' coordinator's ask: enforced).** Neither slates
+  nor Shards' own server negotiates `FUSE_POSIX_ACL`, so the guest's kernel
   hands an ACL through and checks the mode bits it is shown (`fs/fuse/acl.c`: a server without the flag "could get
   and set POSIX ACLs without them being used for permission checking by the vfs"). The same guest therefore sees the
   same behaviour whichever server serves its share. Enforcement was weighed and not taken now: the flag makes the
@@ -22503,3 +22619,74 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
   `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
   each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
   and a list edited without its run fails the record's doc-truth test.
+
+### A-314 — A guest route enforces its guest's POSIX ACLs: its kernel checks them, and the seam keeps the mode and the ACL in step and gives a directory's default ACL at every create (2026-11-18, built for goal g268, what Shards needs from slates)
+
+Applied in the same change to:
+- §4.5 "Extended attributes": the ACL bullet, now the rules. §4.6, the Shards form: the guest's attributes' bullet,
+  A-302's status (the codec's new path; "not enforced" is past) and the status of this date. A-302's entry, whose
+  "Stored, not enforced" paragraph is marked superseded. `docs/cli.md`: the guest routes' paragraph. GAPS: A-281's
+  entry and the owed list.
+- `crates/bridge-core`: `posix_acl.rs`, moved from `slates-bridge-fuse` so the seam can apply it, and grown by
+  `Acl::permission_bits` and `Acl::exceeds_a_mode` (`posix_acl_equiv_mode`), `Acl::showing`
+  (`__posix_acl_chmod_masq`) and `Acl::given` (`posix_acl_create_masq`), each with a unit test worked by hand from
+  Linux v7.2-rc4's `fs/posix_acl.c`. `OpContext::umask`, the caller's umask where the transport carries it unapplied.
+  `VolumeBridge`: `xattr_get` shows an access ACL's owner, mask and other entries from the mode (`access_acl_shown`);
+  `xattr_set` keeps the mode with an access ACL and an ACL that says no more than a mode as none (`set_acl`);
+  `create`, `mknod` and `mkdir` apply the creator's umask or the parent's default ACL (`creation`) and give the new
+  node its ACLs (`give_acls`), taking it back out if one is refused; `setattr`'s chmod and the ACL's share
+  `chmod_through_overlay`.
+- `crates/bridge-fuse`: `flags::POSIX_ACL`; `init::negotiate_offering` takes the transport's `AttributeNamespaces`
+  and asks a guest's kernel for `FUSE_POSIX_ACL` (`acl_wanted`); the dispatch hands the creating request's umask to
+  the seam (`creation_umask`) instead of applying it (`masked`, removed), and maps the codec's refusals to errnos
+  (`acl_refusal_errno`). The tests (`tests/shards_fs.rs`): `a_guests_kernel_is_asked_to_check_its_acls_and_a_hosts_is_not`,
+  `what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks` and
+  `a_directorys_default_acl_is_what_it_gives_what_is_made_in_it_through_every_route`, the last two judging each access
+  with Linux's `acl_permission_check` and `posix_acl_permission` over what GETATTR and GETXATTR answer.
+
+- **What was there.** A-302 kept a guest's ACLs as its data and enforced none, as Shards' own server enforces none.
+  Shards' coordinator answered (2026-11-18): enforcement, "A Linux bind mount enforces a guest's setfacl, and we accept
+  Docker's inputs, never its limits"; Shards queues `FUSE_POSIX_ACL` in its own server after its v0.8.0 tag, so both
+  servers enforce. Unenforced, a `setfacl -m u:4242:rw` on a 0600 file left the mode 0600, and Linux's
+  `acl_permission_check` never reads an ACL while the group bits are clear: 4242 was refused what the ACL granted.
+- **Who enforces.** The guest's own kernel: the route asks for `FUSE_POSIX_ACL`, which makes the kernel read a node's
+  access ACL with GETXATTR at a permission check and judge with it, with `default_permissions` on (`fs/fuse/inode.c`
+  `process_init_reply`, `fs/fuse/acl.c` `fuse_get_inode_acl`; a virtio-fs mount has `default_permissions` on already,
+  `fs/fuse/virtio_fs.c`). A host's mount is never asked: it reaches no ACL (A-302), so its kernel must not look for one.
+- **What the server keeps (Linux's `fs/posix_acl.c` rules, which `fs/fuse/acl.c` leaves to a FUSE server).** The mode is
+  the access ACL's owner, mask and other entries (the owning group's without a mask): a set changes those classes of
+  the mode and keeps the ACL only when it says more than a mode can, removing it otherwise (`posix_acl_update_mode`);
+  a reader is shown those entries from the mode as it reads, so a chmod through any route, which changes only the
+  mode, is the ACL's change too (`posix_acl_chmod`; the guest's kernel drops its cached ACLs after its own chmod
+  because the server "may have updated" them, `fs/fuse/dir.c`); a removal leaves the mode. A create in a directory with
+  a default ACL ignores the umask and keeps of the asked mode only what the default grants, the new node taking the
+  default's entries as its access ACL when they say more than its mode and a new directory the default too
+  (`posix_acl_create`); a symlink takes neither. This is the shared seam's, so a host's mount, NFS, WinFsp and the
+  typed channel keep it without knowing an ACL exists, as a host writing into a guest's directory on a Linux bind
+  mount does. For it the dispatch now hands the seam the umask the request carries (under `FUSE_DONT_MASK`, which
+  slates always asks for), where it used to apply it.
+- **What was weighed.** Judging in the server: rejected, since a FUSE request names its caller's uid and primary gid
+  and none of its other groups (`struct fuse_in_header`), so a named group's entry could not be judged; the guest's
+  kernel knows them. Rewriting the kept ACL at every chmod: rejected for showing it from the mode, since every route's
+  chmod would have to parse an attribute it cannot otherwise see, where showing costs one parse at a read. Inheriting
+  on a guest's creates alone: rejected, since a default ACL is the directory's, and Linux gives it whoever creates.
+- **Not kept.** Linux clears set-group-ID when a caller outside the file's group sets its ACL
+  (`posix_acl_update_mode`). The FUSE wire carries that judgement only as `FUSE_SETXATTR_ACL_KILL_SGID` under
+  `FUSE_SETXATTR_EXT`, which widens SETXATTR's request per connection; no request decoder here takes a negotiated
+  form yet, and a stream restored or resynced without INIT would have to carry it. So the bit stays, as on any FUSE
+  server without that flag (`fs/fuse/acl.c`: such servers "don't expect setgid bits to be stripped"). Owed in GAPS.
+- **Evidence.** Failing first: kiln run r783 (macOS arm64, runner f3f618f2, 2026-11-18) of the three tests on the
+  tree before the change: the INIT kept no `FUSE_POSIX_ACL`; the file made under the default ACL was 0644 (the umask
+  applied) where Linux makes 0660; the file `setfacl` granted was still 0600 where Linux makes 0660. The other six
+  tests of the file passed. After: r807 (`slates-bridge-core` and `slates-bridge-fuse`, every test) and r810 (the
+  seam's consumers: `slates-bridge-virtiofs`, `slates-bridge-nfs`, and `slates-server`'s `daemon`, `shards` and
+  `virtiofs` tests) pass. Each guard removed alone (r809): no `FUSE_POSIX_ACL` asked fails all three; an ACL set that
+  leaves the mode, an ACL read not shown from the mode, and a minimal ACL kept each fail the `setfacl` test; no default
+  ACL inherited, and the umask applied under one, each fail the default ACL's test; and the default's mask left uncut
+  at a create fails only the codec's unit test, since a reader is shown the mask from the mode's group class, so the
+  kept mask is never seen.
+- **Cost.** A guest's kernel now sends a GETXATTR of the access ACL when it judges a caller who is not a file's owner,
+  where the group bits are not all clear, once per attribute lifetime (a stream's attributes are revalidated at each
+  use, so at each such check); answered from the inode's attribute table. A create reads its parent's attribute table
+  once. Owed to the integrator: the round trips a guest's non-owner `stat`-and-open costs over a stream, before and
+  after.
