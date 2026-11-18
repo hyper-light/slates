@@ -1250,7 +1250,9 @@ mod asynchronous_form {
   const POLLS: usize = 4;
 
   /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
-  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it.
+  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A wait
+  /// with no timeout is bounded by the suite's wait and fails past it, so a call that would wait for good fails the
+  /// test instead of hanging it.
   struct Blocking;
 
   impl Reactor for Blocking {
@@ -1258,13 +1260,17 @@ mod asynchronous_form {
       // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
       // as the instance lives, and the call that waits here borrows the instance.
       let descriptor = unsafe { BorrowedFd::borrow_raw(completion) };
-      let timeout =
-        timeout_ns.and_then(|ns| rustix::event::Timespec::try_from(Duration::from_nanos(ns)).ok());
+      let bound = timeout_ns.map_or(START_WAIT, Duration::from_nanos);
+      let timeout = rustix::event::Timespec::try_from(bound).ok();
       let mut interest = [rustix::event::PollFd::new(
         &descriptor,
         rustix::event::PollFlags::IN,
       )];
       let woke = match rustix::event::poll(&mut interest, timeout.as_ref()) {
+        Ok(0) if timeout_ns.is_none() => Err(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "nothing landed within the suite's wait",
+        )),
         Ok(0) => Ok(Woke::TimedOut),
         Ok(_) => Ok(Woke::Readable),
         Err(errno) => Err(std::io::Error::from(errno)),
