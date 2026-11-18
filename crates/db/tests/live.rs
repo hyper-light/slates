@@ -2695,6 +2695,29 @@ fn hostile_replies_are_refused() {
   }
 }
 
+/// §4.2 (a candidate's admission of a live log, g229): a holder that cannot admit the volume's claim answers `NoRoom`
+/// with what it could admit, so the owner can refuse typed. Do: encode a `NoRoom` reply at zero, a middle value and
+/// `u64::MAX`, then decode it whole, cut short at every length and with a byte too many. Expect: the same refusal back,
+/// whole; `Malformed` for every cut and for the extra byte; never a panic.
+#[test]
+fn a_holders_no_room_crosses_the_wire_with_what_it_could_admit() {
+  for available in [0, 1 << 20, u64::MAX] {
+    let refusal = Err(LiveError::NoRoom { available });
+    let bytes = encode_reply(&refusal);
+    assert_eq!(decode_reply(&bytes), refusal, "{available} back whole");
+    for length in 0..bytes.len() {
+      assert_eq!(
+        decode_reply(&bytes[..length]),
+        Err(LiveError::Malformed),
+        "{available} cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(decode_reply(&longer), Err(LiveError::Malformed));
+  }
+}
+
 /// Hostile input on the header readers a holder uses before it decodes a message it will not serve: an entry's and an
 /// install's epoch are read back as encoded, every truncation short of the epoch reads none, and a fetch is not read as
 /// an install. Never a panic.

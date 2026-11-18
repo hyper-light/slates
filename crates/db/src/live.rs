@@ -94,6 +94,8 @@ const REPLY_HEAD: u8 = 1;
 const REPLY_EMPTY: u8 = 2;
 /// Format: see [`REPLY_HEAD`].
 const REPLY_STALE: u8 = 3;
+/// Format: see [`REPLY_HEAD`]: the holder has no room for the volume's admission ([`LiveError::NoRoom`]).
+const REPLY_NO_ROOM: u8 = 4;
 
 /// A refusal of the live log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +122,14 @@ pub enum LiveError {
   NoCredit {
     /// The durable position.
     durable: Option<u64>,
+  },
+  /// The holder cannot make the volume's admission against its own machine (§4.2 "a remote holder makes the same
+  /// admission against its own machine before acknowledging placement"): the claim a successor's restore takes, or the
+  /// held log's bytes past it. `available` is what the holder could admit now. The holder takes nothing; the owner
+  /// counts it as no acknowledgement.
+  NoRoom {
+    /// The bytes the holder could admit now.
+    available: u64,
   },
 }
 
@@ -544,6 +554,10 @@ pub fn encode_reply(reply: &Result<Option<Head>, LiveError>) -> Vec<u8> {
       out.push(REPLY_STALE);
       out.extend_from_slice(&current.0.to_le_bytes());
     }
+    Err(LiveError::NoRoom { available }) => {
+      out.push(REPLY_NO_ROOM);
+      out.extend_from_slice(&available.to_le_bytes());
+    }
     // A refusal that names nothing the owner can act on is an empty answer: it counts as no acknowledgement.
     Err(_) => {}
   }
@@ -560,6 +574,9 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Option<Head>, LiveError> {
     REPLY_EMPTY => Ok(None),
     REPLY_STALE => Err(LiveError::StaleEpoch {
       current: HostEpoch(reader.word()?),
+    }),
+    REPLY_NO_ROOM => Err(LiveError::NoRoom {
+      available: reader.word()?,
     }),
     _ => Err(LiveError::Malformed),
   };

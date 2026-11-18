@@ -1255,19 +1255,19 @@ shards, replay, delayed replies or cancellation. A remote holder makes the same 
 against its own machine before acknowledging placement. A promise on host A reserves nothing
 on host B. Configuration and holder records expose the actual reservation and generation.
 
-> **Status (2026-11-18, g229: a candidate's admission is owed).** A candidate makes no admission
-> before it holds a live log (§4.10). It keeps the log's entries on its heap (`live_ship::keep`, at
-> most twice the volume's quota, outside the shard budget) and reserves nothing. A successor reserves a
-> bounded claim only at its restore (`verbs::make_restored`), and the successor is the
-> configuration's rendezvous pick among the retirement's survivors
-> (`RegionalConfiguration::successor`), never chosen by room. So a successor whose shard cannot admit
-> the claim refuses its own restore `BudgetExceeded` each period, and after the failover SLO's
-> attempts gives the volume up (`NotRecovered { TakeoverIncomplete }`, final), while another survivor
-> holds every acknowledged write. CI's 7 GB macOS runner showed it, a 782 MiB claim being 76 % of a
-> shard there (GAPS, the chaos entry, 2026-11-18). Owed: every candidate of the volume's recovery
-> cohort reserves the claim when it takes the log's first entry; the successor's restore takes that
-> reservation over; a placement a candidate cannot admit is refused typed at `live-ship`; and the
-> held log is charged.
+> **Status (2026-11-18, A-401, g229: a live log's candidate makes the admission).** A candidate reserves the claim a
+> successor's restore takes when it takes a live log's first entry (`live_ship::admit_claim`): the bytes, the inode
+> allowance, the records and a strict volume's locked entitlement, on the shard the volume's id routes to
+> (`verbs::admit_candidate_claim`). A candidate that cannot admit them answers `NoRoom` and takes nothing. The held log is
+> charged against the claim, and past it on the control shard, as content held for another owner (`live_ship::Room`).
+> A successor's restore takes the claim over (`verbs::take_claim_or_admit`), so whatever this node has admitted since
+> cannot take the volume's room. Before, a candidate reserved nothing. The successor is the configuration's rendezvous
+> pick among the survivors (`RegionalConfiguration::successor`), never chosen by room, so one whose shard had filled
+> refused its restore `BudgetExceeded` each period and gave the volume up while another survivor held every
+> acknowledged write (CI's 7 GB macOS runner, where a 782 MiB claim was 76 % of a shard;
+> `docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`). Owed: `live-ship`
+> answers before any candidate has admitted, where the rule refuses the placement typed (next, under A-401); and a
+> placed seal's successor still admits at its restore alone.
 
 **Resource dimensions.** A byte quota cannot bound arbitrarily many empty files, names,
 xattrs, open handles or snapshots. Admission therefore publishes a resource vector: content
@@ -7412,6 +7412,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > earlier form of this change also shipped a whole entry once the changes since the last were as large as it, which kept
 > that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
 > kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound.
+>
+> **A candidate's copy is charged, against the claim it reserved (2026-11-18, A-401, §4.2).** A copy's entries were heap
+> outside every ledger. Now the candidate reserves the volume's claim as it takes the first entry
+> (`live_ship::admit_claim`, refused `NoRoom` when it cannot), and the copy is charged against that claim. Only its bytes
+> past the claim are charged on the control shard (`live_ship::Room`, `ShardBudget::charge_replicated`), refused
+> `NoRoom` when that shard has no room, with the copy left as it was. A dynamic volume's claim holds no bytes, so its
+> copy is charged there whole. A destroy's let-go credits the copy and releases its claim at the control shard's next
+> reconciliation (`live_ship::reconcile_claims`), which also admits a warm restart's copies' claims again.
 >
 > **The held image is incremental (2026-11-08, A-270; on main 2026-11-18 at image version 27, delta version 10).** What
 > a shard holds for other owners is now keyed pieces: the
@@ -28072,3 +28080,52 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
 `crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
+
+### A-401 — A live log's candidate reserves the claim a successor's restore takes as it takes the log's first entry, and the restore takes that claim over (2026-11-18, goal g229: chaos across real processes; the macOS kill-at-ack failure)
+Applied in the same change to:
+- §4.2: "Atomic admission", its status. §4.10: the candidate's copy, its status of this date.
+- GAPS: the chaos entry, and GAP-A9-1's owed list.
+- `crates/db`: `live.rs`, `LiveError::NoRoom` and its reply kind.
+- `crates/server`:
+  - `verbs.rs`: `CandidateClaim`, `restore_credits`, `admit_candidate_claim`, `reconcile_candidate_claims`,
+    `take_claim_or_admit` and `return_to_claim`; `make_restored`; `restore_taken_over`.
+  - `live_ship.rs`: `Room`, `admit_claim`, `reconcile_claims`; `keep`, now guard-then-apply.
+  - `fleet.rs`: the record plane's admission, and the reconciliation in `adopt_and_serve`.
+  - `state.rs`, `daemon.rs`.
+- The bug record `docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`.
+
+- **What was there.**
+  - A candidate took a live log into a copy on its heap and reserved nothing.
+  - A successor made the volume's admission only at its restore. The successor is the configuration's rendezvous pick,
+    chosen by no measure of room.
+  - On CI's 7 GB macOS runner, the kill-at-ack flow's successor already held a 782 MiB claim it had taken over on each
+    of its two 1 GiB shards. Its restore was refused `BudgetExceeded` once a period for the failover SLO's 100 periods,
+    and the volume was given up (`NotRecovered`, final) while the other survivor held the whole log.
+- **The rule (§4.2's own).** A holder makes the owner's admission against its own machine before it acknowledges
+  placement.
+  - **When.** Before a candidate takes a message that would put entries in a copy holding no claim (an entry, a batch, an
+    install), it reserves on the shard the volume's id routes to exactly what a successor's restore takes: a bounded
+    claim's bytes and inode allowance, the volume's records, and a strict volume's locked entitlement. A dynamic volume's
+    claim holds no bytes.
+  - **Refused.** When the shard cannot admit them, the candidate answers `NoRoom { available }` and takes nothing; the
+    owner counts no acknowledgement.
+  - **The charge.** The copy is charged against the claim. Its bytes past the claim are charged on the control shard as
+    content held for another owner, and refused `NoRoom` past that shard's unpromised room. The log and the volume made
+    from it coexist only for the takeover's own work.
+  - **The takeover.** A successor's restore takes the claim over. A failed making returns the credits to the claim, so
+    the next attempt finds the room.
+  - **Reconciliation.** A claim is released once no copy holding entries names it. The control shard reconciles a
+    partition's claims after a let-go or an unanswered admission, and after a warm restart, whose copies have their claims
+    admitted again.
+- **What it costs.** A bounded volume's room is now reserved on every candidate, not only its owner: the design's own
+  accounting of a promise. On the 7 GB runner a node holds about one 782 MiB claim a shard, owned or held as a candidate.
+  The live chaos flows each keep one such volume. The kill-at-ack flow keeps six, so it makes them dynamic.
+- **Evidence.**
+  - `a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in` (`crates/server/tests/fleet.rs`). Do: fill the
+    successor's shard with everything it admits after it holds the log, then stop the owner. On main (94fffd000, Mac
+    Studio, kiln r263) the volume was given up, never served. With the change it is served, its six files read back,
+    and the claim is taken over.
+  - The unit tests of the charge and of the refusal, and the reply's wire test.
+  - Unchanged: the live takeover tests and the held image's fold oracle.
+- **Owed, next under this number.** `live-ship` refuses typed when a candidate cannot admit, so no placement is
+  acknowledged before every candidate holds its claim.
