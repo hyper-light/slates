@@ -354,7 +354,7 @@ fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
       "create {sequence}: {reply:?}"
     );
   }
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list the admitted volumes");
   };
   assert_eq!(volumes.len(), SDK_CREATE_COUNT);
@@ -434,7 +434,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   );
   let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
   assert!(matches!(
-    first.call(&RequestBody::List),
+    first.call(&RequestBody::List { after: None }),
     ReplyBody::Listed { .. }
   ));
   assert_eq!(
@@ -587,7 +587,7 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -670,7 +670,7 @@ fn an_idle_daemon_parks_once_its_clients_windows_have_passed() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -771,7 +771,7 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
     "the failure count is the one the policy was stated under"
   );
   // Reads continue: the listing answers (empty — nothing was created), and the status counts the refusal.
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     strict.stop();
     panic!("a read is served while writes are refused");
   };
@@ -885,7 +885,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
 
 /// List shows both volumes; detach releases the lease.
 fn list_and_detach(client: &mut Client, id: slates_ipc::protocol::VolumeId, attachment: u64) {
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   let mut names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -925,7 +925,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -970,7 +970,7 @@ fn rifl_scenario() {
     panic!("retry");
   };
   assert_eq!(again, volume);
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   assert_eq!(volumes.len(), 1, "the retry did not execute again");
@@ -1076,8 +1076,8 @@ fn grant_scenario() {
     0,
     "a grant for one target wrote into another"
   );
-  // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
-  // the volume's owner shard, not necessarily the client's).
+  // The landing runs under its grant. A grant once used is consumed, and a consumed grant leaves the table (A-266):
+  // `grants`, across shards (the record lives on the volume's owner shard), lists none, and its history is the audit's.
   let landed = client.call(&RequestBody::Land {
     volume: id,
     snapshot: Some(snapshot),
@@ -1090,9 +1090,19 @@ fn grant_scenario() {
   };
   assert_landed_reply_carries_what_it_achieved(&outcome);
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
+  let ReplyBody::Audit { records, .. } = client.call(&RequestBody::Audit { since: 0 }) else {
+    panic!("the audit");
+  };
+  assert!(
+    records
+      .iter()
+      .any(|r| r.kind == "grant_issued" && r.grant == Some(grant))
+      && records.iter().any(|r| r.kind == "landing_finished"),
+    "the consumed grant's history is the audit's: {records:?}"
+  );
   daemon.stop();
 }
 
@@ -1371,8 +1381,8 @@ fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 
   );
   assert!(
     matches!(
-      client.call(&RequestBody::Grants),
-      ReplyBody::Grants { grants } if grants.is_empty()
+      client.call(&RequestBody::Grants { after: None }),
+      ReplyBody::Grants { grants, .. } if grants.is_empty()
     ),
     "a forged approval issued nothing"
   );
@@ -1428,12 +1438,12 @@ fn landing_refusal_scenario() {
   ));
   // The caller has no grants and the audit log is empty (the refused landing recorded nothing).
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.is_empty()
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
   assert!(matches!(
     client.call(&RequestBody::Audit { since: 0 }),
-    ReplyBody::Audit { records } if records.is_empty()
+    ReplyBody::Audit { records, .. } if records.is_empty()
   ));
   daemon.stop();
 }
@@ -1620,7 +1630,7 @@ fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
   let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
     panic!("create the owner-only volume");
   };
-  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = workload.call(&RequestBody::List { after: None }) else {
     panic!("the consumer lists its accessible volumes");
   };
   let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
@@ -1799,7 +1809,7 @@ fn once_revoked_every_verb_refuses_before_any_effect(
     }
   ));
   assert!(matches!(
-    workload.call(&RequestBody::List),
+    workload.call(&RequestBody::List { after: None }),
     ReplyBody::Refused {
       refusal: Refusal::ConsumerRevoked
     }
@@ -2149,7 +2159,7 @@ fn version_reservation_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.is_empty() {
@@ -2600,7 +2610,7 @@ fn snapshot_destroy_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.iter().all(|v| v.name != "clone") {
@@ -2925,15 +2935,19 @@ fn merge_submit_scenario() {
   assert_eq!(head, 1, "the green advanced to version 1");
 
   // The chain's read side: the file A committed changed after version 0, but not after version 1.
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 0 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 0,
+    from: None,
+  }) else {
     panic!("changed_since");
   };
   assert_eq!(paths, vec!["f".to_owned()], "f changed after version 0");
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 1 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 1,
+    from: None,
+  }) else {
     panic!("changed_since");
   };
   assert!(
@@ -3572,7 +3586,7 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
 fn wait_for_volume_count(client: &mut Client, count: usize) {
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.len() == count {
@@ -3794,6 +3808,7 @@ fn role_kind_mismatch_part(
   let changed_since_plain = RequestBody::ChangedSince {
     green: p,
     version: 0,
+    from: None,
   };
   assert_eq!(refusal_of(client, &changed_since_plain), Refusal::NotGreen);
   let work_over_plain = RequestBody::CreateWork {
@@ -4379,13 +4394,17 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
 }
 
 /// The merge-retention balance: what the green charged equals what the engine holds beyond its
-/// files (history plus the rejected cache), the running history total equals its recount, and the
-/// fold floor is where the oldest reachable version stands.
+/// files (history, the change index and the rejected cache), the running history and index totals equal their
+/// recounts, and the fold floor is where the oldest reachable version stands.
 fn assert_balanced(retention: &slates_server::merge_service::MergeRetention, floor: u64) {
   assert_eq!(
     retention.charged,
-    retention.history + retention.rejected,
+    retention.history + retention.changes + retention.rejected,
     "the charge is exactly the retained bytes: {retention:?}"
+  );
+  assert_eq!(
+    retention.changes, retention.changes_recounted,
+    "the change index's running total is its recount: {retention:?}"
   );
   assert_eq!(
     retention.history, retention.history_recounted,

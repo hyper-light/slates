@@ -125,6 +125,11 @@ fn ipc_aliases_share_metadata_and_are_invalidated_with_their_inode() {
   assert_eq!(green.submit(&inc), Outcome::Accepted { version: 1 });
   assert_eq!(green.mode("alias"), Some(0o600));
   assert_eq!(green.changed_between(0, 1), vec!["alias", "pipe"]);
+  assert_eq!(
+    green.changed_since(0),
+    vec!["alias", "pipe"],
+    "the change index counts the link with its special"
+  );
 }
 
 /// AC-6.2 / A-26: equal mode bits cannot make a stale IPC chmod apply to a replacement file.
@@ -346,16 +351,22 @@ fn short_edits_and_unlinks_reserve_the_values_they_supersede() {
 
 fn assert_reserved_history_covers_apply(green: &mut Green, inc: &Increment) {
   let reserved = green.history_reservation(inc);
+  let index_reserved = green.changes_reservation(inc);
   let before = green.retained_bytes().history;
+  let index_before = green.changes_bytes();
   assert!(matches!(green.submit(inc), Outcome::Accepted { .. }));
   let added = green.retained_bytes().history - before;
+  assert!(
+    green.changes_bytes() - index_before <= index_reserved,
+    "the change index grew by no more than was reserved for it"
+  );
   assert!(
     added > inc.post_state.len(),
     "the incoming payload does not bound retention"
   );
   assert_eq!(reserved, added);
   assert_eq!(
-    green.history_reservation(inc),
+    green.history_reservation(inc) + green.changes_reservation(inc),
     0,
     "an accepted retry retains nothing new"
   );

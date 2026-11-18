@@ -631,7 +631,7 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       ..
     } => Some(*volume),
     RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
-    RequestBody::Status { volume } => Some(*volume),
+    RequestBody::Status { volume } | RequestBody::Drifted { volume, .. } => Some(*volume),
     _ => None,
   }
 }
@@ -2251,11 +2251,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::Revoke { consumer, proof } = body {
     return revoke_on_channel(state, client.index(), request.request, consumer, proof);
   }
-  if let RequestBody::List = body {
-    return scatter_list(state, client.index(), request.request, principal);
+  if let RequestBody::List { after } = body {
+    return scatter_list(state, client.index(), request.request, principal, after);
   }
-  if let RequestBody::Grants = body {
-    return scatter_grants(state, client.index(), request.request, principal);
+  if let RequestBody::Grants { after } = body {
+    return scatter_grants(state, client.index(), request.request, principal, after);
   }
   if matches!(
     &body,
@@ -2325,6 +2325,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     }
     // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
     RequestBody::Telemetry { partition } => Some(*partition),
+    // The audit is one partition's, the control shard's (§4.15, A-265).
+    RequestBody::Audit { .. } => Some(crate::landing::AUDIT_PARTITION),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -2515,6 +2517,8 @@ fn run_recorded(
       refused(refusal)
     }
   };
+  // What the committed verb owed the audit goes to the control shard now, after its transaction (A-265).
+  crate::landing::send_owed_audit(state);
   let end_ns = state.clock.monotonic_ns();
   state.current_span = outer;
   let partition_label = u32::from(state.partition);
@@ -3036,6 +3040,7 @@ fn scatter_list(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<VolumeId>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3043,25 +3048,20 @@ fn scatter_list(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match list(state, &principal) {
-    ReplyBody::Listed { volumes } => volumes,
-    other => return Served::Reply(other),
-  };
+  let mine = list_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Listed { volumes: mine });
+    return Served::Reply(list_page(vec![mine]));
   }
   state
     .scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| list(s, &principal)) {
-          Some(ReplyBody::Listed { volumes }) => volumes,
-          _ => Vec::new(),
-        };
+        let part =
+          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather(request, part);
         })
@@ -3084,6 +3084,7 @@ fn scatter_grants(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<u64>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3091,25 +3092,20 @@ fn scatter_grants(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match crate::landing::grants_verb(state, &principal) {
-    ReplyBody::Grants { grants } => grants,
-    other => return Served::Reply(other),
-  };
+  let mine = crate::landing::grants_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Grants { grants: mine });
+    return Served::Reply(crate::landing::grants_page(vec![mine]));
   }
   state
     .grant_scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| crate::landing::grants_verb(s, &principal)) {
-          Some(ReplyBody::Grants { grants }) => grants,
-          _ => Vec::new(),
-        };
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
+          .unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather_grants(request, part);
         })
@@ -3124,12 +3120,11 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` read into the scatter and, on the last part, delivers the merged
-/// grants in id order.
-fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
+fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3141,9 +3136,8 @@ fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut grants), unsent)) = done {
-    grants.sort_by_key(|g| g.id);
-    let reply = unsent.unwrap_or(ReplyBody::Grants { grants });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::landing::grants_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -3304,7 +3298,7 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
 
 /// Counts one part of a scatter in `table` down; its client slot when that was the last part (the entry is gone).
 fn count_down<T>(
-  table: &mut std::collections::BTreeMap<u64, (u32, usize, Vec<T>)>,
+  table: &mut std::collections::BTreeMap<u64, (u32, usize, T)>,
   request: u64,
 ) -> Option<u32> {
   let entry = table.get_mut(&request)?;
@@ -3942,10 +3936,10 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
 }
 
 /// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: Vec<VolumeSummary>) {
+fn gather(request: u64, part: ListPart) {
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3957,9 +3951,8 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut volumes), unsent)) = done {
-    volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    let reply = unsent.unwrap_or(ReplyBody::Listed { volumes });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| list_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -4101,8 +4094,8 @@ pub(crate) fn dispatch(
   body: RequestBody,
 ) -> ReplyBody {
   let republish = mutates_shard_image(&body);
-  if republish && !state.consensus_ready {
-    return refused(Refusal::ConsensusNotInitialized);
+  if let Some(refusal) = refused_before_dispatch(state, &body, republish) {
+    return refused(refusal);
   }
   let touched = volume_of(&body).map(to_db_volume);
   // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): a read of an owned object's **latest state** —
@@ -4211,7 +4204,11 @@ fn dispatch_inner(
       base,
     } => create_green(state, principal, &name, require_evidence, base),
     RequestBody::Versions { green } => versions(state, principal, green),
-    RequestBody::ChangedSince { green, version } => changed_since(state, principal, green, version),
+    RequestBody::ChangedSince {
+      green,
+      version,
+      from,
+    } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::Edit {
       work,
@@ -4361,7 +4358,8 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
-    RequestBody::List => list(state, principal),
+    RequestBody::Drifted { volume, from } => drifted(state, principal, volume, from),
+    RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
@@ -4455,7 +4453,9 @@ fn dispatch_inner(
       (volume, attachment),
       crate::fs_verbs::FsOp::Mkdir { path: &path, mode },
     ),
-    RequestBody::Grants => crate::landing::grants_verb(state, principal),
+    RequestBody::Grants { after } => {
+      crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
@@ -6063,13 +6063,20 @@ fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> Reply
   }
 }
 
-/// The files a green changed strictly after `version` (§4.16): the read a lagging work uses to know
-/// what green moved under it before it rebases.
+/// One page of the paths a green changed strictly after `version` (§4.16, A-264): the read a lagging work uses to know
+/// what the green moved under it before it rebases. Read from the green's change index from `from`, in version order,
+/// answering each path at the last version it changed at; the page ends when the next path would not fit one reply chunk
+/// or when the page has spent its slice of the shard's step ([`CHANGED_SLICE_PERMILLE`]), and its cursor names the first
+/// entry it did not pass. So a page costs the entries it passes, never the green's tree, and never more than its slice:
+/// before 2026-11-09 a page walked every path of every dimension, about 1 ms a page on a kernel tree whatever the span,
+/// and ten times that on ten times the tree. A version past the head is refused `UnknownBase`; one below the fold floor
+/// is answered, as the index keeps each path's last change there.
 fn changed_since(
   state: &ShardState,
   principal: &Principal,
   green: VolumeId,
   version: u64,
+  from: Option<slates_ipc::protocol::ChangedCursor>,
 ) -> ReplyBody {
   let record = match crate::merge_service::require_green(state, principal, green, "changed_since") {
     Ok(record) => record,
@@ -6078,9 +6085,74 @@ fn changed_since(
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
-  ReplyBody::ChangedSince {
-    paths: engine.changed_since(version),
+  if version > engine.head() {
+    return refused(Refusal::UnknownBase { green, version });
   }
+  let slice = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(CHANGED_SLICE_PERMILLE)
+    / PERMILLE;
+  let started = slates_rt::futures::now_ns();
+  let room = changed_page_room();
+  let mut used = 0usize;
+  let mut paths = Vec::new();
+  let mut next = None;
+  let cursor = from.map(|at| (at.version, usize::try_from(at.passed).unwrap_or(usize::MAX)));
+  for (passed, change) in engine.changes_after(version, cursor).enumerate() {
+    // Where a page that stops before this entry continues: this version, this many of its entries passed (a version
+    // holds far fewer than 2^32 paths; the green's memory is bounded long before).
+    let here = slates_ipc::protocol::ChangedCursor {
+      version: change.version,
+      passed: u32::try_from(change.index).unwrap_or(u32::MAX),
+    };
+    if passed > 0
+      && passed % CHANGED_CLOCK_EVERY == 0
+      && slates_rt::futures::now_ns().saturating_sub(started) >= slice
+    {
+      next = Some(here);
+      break;
+    }
+    if !change.last {
+      continue;
+    }
+    let path = change.path.to_owned();
+    let bytes = encoded_len(&path);
+    if !paths.is_empty() && used.saturating_add(bytes) > room {
+      next = Some(here);
+      break;
+    }
+    used = used.saturating_add(bytes);
+    paths.push(path);
+  }
+  ReplyBody::ChangedSince { paths, next }
+}
+
+/// Shape: a `changed_since` page's slice of the shard's step budget, parts per thousand: half, as a destroy slice's, so
+/// one page never takes the whole step from the shard's other clients (§4.3).
+const CHANGED_SLICE_PERMILLE: u64 = 500;
+/// Shape: the change-index entries a page passes between two looks at the clock: a look costs about what passing a
+/// few entries does, so one each 64 keeps the looks a small share and a page's overrun of its slice within 64 entries.
+const CHANGED_CLOCK_EVERY: usize = 64;
+
+/// The bytes a `changed_since` page's paths may take: one reply chunk less the page's own framing, its cursor included.
+fn changed_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::ChangedSince {
+    paths: Vec::new(),
+    next: Some(slates_ipc::protocol::ChangedCursor {
+      version: u64::MAX,
+      passed: u32::MAX,
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The encoded bytes `value` adds to a reply.
+pub(crate) fn encoded_len<T: Wire>(value: &T) -> usize {
+  let mut encoded = Vec::new();
+  value.encode(&mut encoded);
+  encoded.len()
 }
 
 /// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
@@ -6834,7 +6906,13 @@ fn submit(
   let Some(engine) = state.greens.get(&green_id) else {
     return refused(Refusal::NotFound);
   };
-  let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
+  // The change index grows with the version too (A-264), charged with the history it indexes.
+  let secured = u64::try_from(
+    engine
+      .history_reservation(&inc)
+      .saturating_add(engine.changes_reservation(&inc)),
+  )
+  .unwrap_or(u64::MAX);
   // An accepted work is reset to its green at the new version, where it holds nothing of its own
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
@@ -8999,6 +9077,8 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
 /// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
 /// bounded by that volume's own extent. Returns how many volumes were released.
 pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
+  // The audit records the refused atom owed the control partition went with it (A-265).
+  state.landing.audit_owed.clear();
   let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -9325,29 +9405,9 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drifted, watcher) = match slot.host.as_mut() {
-    Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
-      Ok(s) => (
-        s.drift
-          .iter()
-          .map(|(p, k)| format!("{p} ({k:?})"))
-          .chain(
-            s.unverified
-              .iter()
-              .map(|(p, refusal)| format!("{p} (unverified: {refusal})")),
-          )
-          .collect(),
-        format!("{:?}", s.watcher),
-      ),
-      Err(e) => (
-        vec![format!("status refused: {e:?}")],
-        "unavailable".to_owned(),
-      ),
-    },
-    None => (Vec::new(), "scratch".to_owned()),
-  };
+  let (drift, watcher) = drift_entries(slot, &mut state.store);
   let attachments = state.db.partition().attachments_of(record.id).len();
-  ReplyBody::Status {
+  let reply = ReplyBody::Status {
     report: Box::new(StatusReport {
       id: volume,
       name: record.name.clone(),
@@ -9358,7 +9418,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       head: SnapshotId {
         value: record.head.value,
       },
-      drifted,
+      drifted: Vec::new(),
       watcher,
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
       placed: placed_state(state, &record),
@@ -9371,7 +9431,124 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts_elided,
       journal,
       takeover_kept,
+      drifted_elided: 0,
     }),
+  };
+  with_drift(reply, drift)
+}
+
+/// A status reply's drift, filled in last (A-267): the status stays one reply, so it carries the first drifted entries
+/// that fit beside its other fields and counts the rest, which `Drifted` reads.
+fn with_drift(reply: ReplyBody, drift: Vec<String>) -> ReplyBody {
+  {
+    let ReplyBody::Status { mut report } = reply else {
+      return reply;
+    };
+    let total = drift.len();
+    report.drifted_elided = u32::try_from(total).unwrap_or(u32::MAX);
+    let framed = slates_ipc::protocol::framed_len(&ReplyBody::Status {
+      report: report.clone(),
+    });
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+    let room = chunk.saturating_sub(framed);
+    let mut used = 0usize;
+    for entry in drift {
+      let bytes = encoded_len(&entry);
+      if used.saturating_add(bytes) > room {
+        break;
+      }
+      used = used.saturating_add(bytes);
+      report.drifted.push(entry);
+    }
+    report.drifted_elided =
+      u32::try_from(total.saturating_sub(report.drifted.len())).unwrap_or(u32::MAX);
+    ReplyBody::Status { report }
+  }
+}
+
+/// An overlay volume's drifted entries in path order, each its path and the kind of drift (a witnessed entry whose
+/// disk no longer matches, or one whose re-check the host refused), and the watcher's state; none for a scratch volume.
+fn drift_entries(
+  slot: &mut VolumeSlot,
+  store: &mut slates_vfs::volume::Store,
+) -> (Vec<String>, String) {
+  match slot.host.as_mut() {
+    Some(host) => match slot.volume.with_host(host).status(store) {
+      Ok(s) => {
+        let mut entries: Vec<(String, String)> = s
+          .drift
+          .iter()
+          .map(|(p, k)| (p.clone(), format!("{p} ({k:?})")))
+          .chain(
+            s.unverified
+              .iter()
+              .map(|(p, refusal)| (p.clone(), format!("{p} (unverified: {refusal})"))),
+          )
+          .collect();
+        entries.sort();
+        (
+          entries.into_iter().map(|(_, entry)| entry).collect(),
+          format!("{:?}", s.watcher),
+        )
+      }
+      Err(e) => (
+        vec![format!("status refused: {e:?}")],
+        "unavailable".to_owned(),
+      ),
+    },
+    None => (Vec::new(), "scratch".to_owned()),
+  }
+}
+
+/// `Drifted`: one page of the volume's drifted entries from position `from` (A-267), as many as one reply chunk holds.
+/// An entry too long for any page alone is passed over and counted.
+fn drifted(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  from: u64,
+) -> ReplyBody {
+  let (handle, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("drifted");
+  }
+  let Ok(slot) = state.volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let (drift, _) = drift_entries(slot, &mut state.store);
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let room = chunk.saturating_sub(slates_ipc::protocol::framed_len(&ReplyBody::Drifted {
+    entries: Vec::new(),
+    next: Some(u64::MAX),
+    oversized: u32::MAX,
+  }));
+  let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let mut used = 0usize;
+  let mut entries = Vec::new();
+  let mut oversized = 0u32;
+  let mut position = start;
+  for entry in drift.iter().skip(start) {
+    let bytes = encoded_len(entry);
+    if bytes > room {
+      oversized = oversized.saturating_add(1);
+      position = position.saturating_add(1);
+      continue;
+    }
+    if used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    entries.push(entry.clone());
+    position = position.saturating_add(1);
+  }
+  let next = (position < drift.len()).then(|| u64::try_from(position).unwrap_or(u64::MAX));
+  ReplyBody::Drifted {
+    entries,
+    next,
+    oversized,
   }
 }
 
@@ -10240,34 +10417,316 @@ fn restore_node(
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
-fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
-  let volumes = state
+/// What a verb is refused before it runs: a mutation before the consensus group exists, a landing whose target no
+/// grants page could hold (`landing::longest_grantable_target`), and a new volume whose name no listing page could hold
+/// ([`longest_listable_name`]).
+fn refused_before_dispatch(
+  state: &ShardState,
+  body: &RequestBody,
+  republish: bool,
+) -> Option<Refusal> {
+  if republish && !state.consensus_ready {
+    return Some(Refusal::ConsensusNotInitialized);
+  }
+  if let RequestBody::Land { target, .. } = body
+    && target.len() > crate::landing::longest_grantable_target()
+  {
+    return Some(Refusal::TargetUnavailable {
+      reason: format!(
+        "a target of {} bytes is longer than the {} a grant's listing holds",
+        target.len(),
+        crate::landing::longest_grantable_target()
+      ),
+    });
+  }
+  if new_volume_name(body).is_some_and(|name| name.len() > longest_listable_name()) {
+    return Some(Refusal::InvalidName);
+  }
+  match body {
+    RequestBody::Create {
+      base: Some(path), ..
+    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: PATH_TOO_LONG_ERRNO,
+    }),
+    _ => None,
+  }
+}
+
+/// Format: the longest path the platform resolves, in bytes: `PATH_MAX` less its terminating NUL on macOS (1,024,
+/// `<sys/syslimits.h>`) and on Linux and the other Unixes (4,096, `<linux/limits.h>`), and on Windows the long-path
+/// limit, 32,767 UTF-16 units of at most three UTF-8 bytes each.
+#[cfg(target_os = "macos")]
+const PLATFORM_PATH_BYTES: usize = 1_023;
+/// Format: see the macOS arm.
+#[cfg(all(unix, not(target_os = "macos")))]
+const PLATFORM_PATH_BYTES: usize = 4_095;
+/// Format: see the macOS arm.
+#[cfg(windows)]
+const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
+
+/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
+/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+#[cfg(unix)]
+const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
+/// Format: see the Unix arm.
+#[cfg(windows)]
+const PATH_TOO_LONG_ERRNO: i32 = 38;
+
+/// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
+/// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a
+/// byte count, a table's name), a short phrase beside one refusal's display. A reason built longer is cut here as it is
+/// recorded ([`recorded_reason`]), so the cause's bound does not rest on every display staying short.
+const RECOVERY_REASON_BYTES: usize = 256;
+
+/// Derived: the longest overlay base path a volume records, in bytes (§4.4 `create`, §4.8): the platform's path
+/// maximum, and no longer than one reply holds whole in the refusal every verb on the volume answers when recovery
+/// cannot reacquire the base (`NotRecovered { BaseUnavailable { path, reason } }` beside the longest reason), so
+/// `status` names the cause whole. A longer base is refused at `create`, `BaseUnavailable` with `ENAMETOOLONG`, before
+/// anything is made. A listing page shows the cause cut to fit beside the volume's name ([`listed`]); the record and
+/// the refusal keep it whole.
+pub fn longest_recordable_base() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let pathless = ReplyBody::Refused {
+    refusal: Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::BaseUnavailable {
+        path: String::new(),
+        reason: "r".repeat(RECOVERY_REASON_BYTES),
+      },
+    },
+  };
+  chunk
+    .saturating_sub(slates_ipc::protocol::framed_len(&pathless))
+    .min(PLATFORM_PATH_BYTES)
+}
+
+/// `reason` as a recovery cause records it: whole, as every reason the daemon builds is, or cut at a character boundary
+/// to [`RECOVERY_REASON_BYTES`].
+fn recorded_reason(mut reason: String) -> String {
+  let mut keep = reason.len().min(RECOVERY_REASON_BYTES);
+  while !reason.is_char_boundary(keep) {
+    keep = keep.saturating_sub(1);
+  }
+  reason.truncate(keep);
+  reason
+}
+
+/// The name of the volume a request would create, if it creates one.
+fn new_volume_name(body: &RequestBody) -> Option<&str> {
+  match body {
+    RequestBody::Create { name, .. }
+    | RequestBody::CreateGreen { name, .. }
+    | RequestBody::CreateWork { name, .. }
+    | RequestBody::Clone { name, .. }
+    | RequestBody::ImageBuild { name, .. }
+    | RequestBody::ImageMerge { name, .. } => Some(name),
+    _ => None,
+  }
+}
+
+/// Derived: the longest volume name, in bytes, whose summary one listing page holds alone (§4.4 `list`): the page's
+/// room less a summary's bytes with an empty name. Every volume a client can create is one it can list; a longer name
+/// is refused `InvalidName` before anything is made. A `create` request carried names up to 4,062 bytes in a reply
+/// chunk of 4,096 (2026-11-08), whose summary no page held.
+fn longest_listable_name() -> usize {
+  let unnamed = bare_causes()
+    .into_iter()
+    .map(|cause| VolumeSummary {
+      id: VolumeId::default(),
+      name: String::new(),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: false,
+      live_shipped: false,
+      not_recovered: Some(cause),
+    })
+    .map(|summary| encoded_len(&summary))
+    .max()
+    .unwrap_or(0);
+  list_page_room().saturating_sub(unnamed)
+}
+
+/// Format: every recovery cause with its text empty: the fixed part of the cause a listed volume may carry, which the
+/// longest listable name leaves room for. A cause appended to the wire is added here too: [`shorten_cause`]'s match is
+/// exhaustive, so it does not compile until the new cause's text is given its place.
+fn bare_causes() -> [slates_ipc::protocol::RecoveryCause; 9] {
+  use slates_ipc::protocol::RecoveryCause;
+  [
+    RecoveryCause::NoImage,
+    RecoveryCause::BlocksUnclaimed,
+    RecoveryCause::BaseMissing {
+      path: String::new(),
+    },
+    RecoveryCause::BaseOnOwnMount {
+      path: String::new(),
+    },
+    RecoveryCause::BaseUnavailable {
+      path: String::new(),
+      reason: String::new(),
+    },
+    RecoveryCause::OriginNotRecovered,
+    RecoveryCause::ImageRefused {
+      reason: String::new(),
+    },
+    RecoveryCause::ResourcesUnavailable {
+      reason: String::new(),
+    },
+    RecoveryCause::TakeoverIncomplete {
+      waited_on: String::new(),
+    },
+  ]
+}
+
+/// `summary` as a listing page carries it (§4.4 `list`): whole when it fits a page alone, else with its recovery
+/// cause's text (the overlay base's path, a refusal's reason) shortened until it does. Its name, at most
+/// [`longest_listable_name`], always fits beside a cause's fixed part, so only the cause's text is ever cut; the cause
+/// names an unrecovered volume's trouble, and a path or a reason of any length cannot refuse the listing it is in.
+fn listed(mut summary: VolumeSummary) -> VolumeSummary {
+  let over = encoded_len(&summary).saturating_sub(list_page_room());
+  if over > 0
+    && let Some(cause) = summary.not_recovered.as_mut()
+  {
+    shorten_cause(cause, over);
+  }
+  summary
+}
+
+/// Cuts at least `over` bytes from `cause`'s text, its reason before its path, each at a character boundary.
+fn shorten_cause(cause: &mut slates_ipc::protocol::RecoveryCause, mut over: usize) {
+  use slates_ipc::protocol::RecoveryCause;
+  let texts: Vec<&mut String> = match cause {
+    RecoveryCause::BaseMissing { path } | RecoveryCause::BaseOnOwnMount { path } => vec![path],
+    RecoveryCause::BaseUnavailable { path, reason } => vec![reason, path],
+    RecoveryCause::ImageRefused { reason } | RecoveryCause::ResourcesUnavailable { reason } => {
+      vec![reason]
+    }
+    RecoveryCause::TakeoverIncomplete { waited_on } => vec![waited_on],
+    RecoveryCause::NoImage | RecoveryCause::BlocksUnclaimed | RecoveryCause::OriginNotRecovered => {
+      Vec::new()
+    }
+  };
+  for text in texts {
+    if over == 0 {
+      break;
+    }
+    let mut keep = text.len().saturating_sub(over);
+    while !text.is_char_boundary(keep) {
+      keep = keep.saturating_sub(1);
+    }
+    over = over.saturating_sub(text.len().saturating_sub(keep));
+    text.truncate(keep);
+  }
+}
+
+/// One shard's part of a page gathered from every shard (§4.3; a listing, §4.4 `list`, or a principal's grants): the
+/// items it holds past the page's cursor in key order, as many as one page can hold, and whether it holds more past
+/// them. No page takes more than one page's worth from any shard, so a shard's part never needs more, and a gather
+/// holds at most a page a shard.
+#[derive(Debug)]
+pub(crate) struct PagePart<T> {
+  pub(crate) items: Vec<T>,
+  pub(crate) more: bool,
+}
+
+impl<T> Default for PagePart<T> {
+  fn default() -> Self {
+    PagePart {
+      items: Vec::new(),
+      more: false,
+    }
+  }
+}
+
+/// A shard's part of a listing page.
+pub(crate) type ListPart = PagePart<VolumeSummary>;
+
+/// The parts of a listing page gathered so far, one a shard.
+pub(crate) type ListParts = Vec<ListPart>;
+
+/// The page the shards' `parts` make, merged in `key` order: as many items as `room` holds, and whether any part, or
+/// the merge, left more.
+pub(crate) fn merged_page<T: Wire, K: Ord>(
+  parts: Vec<PagePart<T>>,
+  room: usize,
+  key: impl Fn(&T) -> K,
+) -> (Vec<T>, bool) {
+  let more_elsewhere = parts.iter().any(|part| part.more);
+  let mut items: Vec<T> = parts.into_iter().flat_map(|part| part.items).collect();
+  items.sort_by_key(|item| key(item));
+  let (items, more_here) = fitting(items.into_iter(), room);
+  (items, more_here || more_elsewhere)
+}
+
+/// The bytes a listing page's volumes may take: one reply chunk less the page's own framing, its cursor included.
+fn list_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Listed {
+    volumes: Vec::new(),
+    next: Some(VolumeId {
+      bytes: [u8::MAX; 16],
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The first of `items` (in the page's order) that fit `room`, and whether any are left: at least one, so a walk
+/// always progresses.
+pub(crate) fn fitting<T: Wire>(items: impl Iterator<Item = T>, room: usize) -> (Vec<T>, bool) {
+  let mut used = 0usize;
+  let mut page = Vec::new();
+  let mut items = items.peekable();
+  while let Some(item) = items.peek() {
+    let bytes = encoded_len(item);
+    if !page.is_empty() && used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    if let Some(item) = items.next() {
+      page.push(item);
+    }
+  }
+  (page, items.peek().is_some())
+}
+
+/// This shard's part of the listing page after `after` ([`ListPart`]).
+fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>) -> ListPart {
+  let mut volumes: Vec<VolumeSummary> = state
     .db
     .partition()
     .volumes()
     .into_iter()
     .filter(|v| rights_of(v, principal).read && v.state != VolumeState::Destroyed)
-    .map(|v| VolumeSummary {
-      id: to_wire_volume(v.id),
-      name: v.name.clone(),
-      referenced_bytes: state
+    .filter(|v| after.is_none_or(|after| to_wire_volume(v.id) > after))
+    .map(|v| {
+      let live = state
         .by_id
         .get(&v.id)
         .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.referenced_bytes, |s| {
-          s.volume.accounting().referenced_bytes
-        }),
-      unique_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
-      overlay: matches!(v.base, BaseRecord::Path { .. }),
-      live_shipped: v.policy.live_shipped,
-      not_recovered: state.unrecovered.get(&v.id).cloned(),
+        .map(|s| s.volume.accounting());
+      listed(VolumeSummary {
+        id: to_wire_volume(v.id),
+        name: v.name.clone(),
+        referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
+        unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
+        overlay: matches!(v.base, BaseRecord::Path { .. }),
+        live_shipped: v.policy.live_shipped,
+        not_recovered: state.unrecovered.get(&v.id).cloned(),
+      })
     })
     .collect();
-  ReplyBody::Listed { volumes }
+  volumes.sort_by_key(|summary| summary.id);
+  let (items, more) = fitting(volumes.into_iter(), list_page_room());
+  ListPart { items, more }
+}
+
+/// The listing page the shards' `parts` make: their volumes in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+fn list_page(parts: ListParts) -> ReplyBody {
+  let (volumes, more) = merged_page(parts, list_page_room(), |summary| summary.id);
+  let next = more
+    .then(|| volumes.last().map(|summary| summary.id))
+    .flatten();
+  ReplyBody::Listed { volumes, next }
 }
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32]) -> ReplyBody {
@@ -12738,7 +13197,7 @@ fn build_recovered_volume(
     }
   };
   let mut volume = rebuilt.map_err(|error| RecoveryCause::ImageRefused {
-    reason: error.to_string(),
+    reason: recorded_reason(error.to_string()),
   })?;
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
@@ -12751,7 +13210,9 @@ fn build_recovered_volume(
     let discarded = volume.discard_partial_releasing(&mut state.store, host);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(RecoveryCause::ImageRefused {
-      reason: format!("the image's quota exceeds the acknowledged size policy: {error}"),
+      reason: recorded_reason(format!(
+        "the image's quota exceeds the acknowledged size policy: {error}"
+      )),
     });
   }
   Ok((volume, opened.map(|(host, _)| host), image.prefix))
@@ -12759,7 +13220,9 @@ fn build_recovered_volume(
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
 fn resources(reason: String) -> RecoveryCause {
-  RecoveryCause::ResourcesUnavailable { reason }
+  RecoveryCause::ResourcesUnavailable {
+    reason: recorded_reason(reason),
+  }
 }
 
 /// Why the overlay's base at `path` could not be reacquired, by the host's refusal.
@@ -12770,7 +13233,7 @@ fn base_cause(path: &str, error: slates_vfs::host::HostError) -> RecoveryCause {
     slates_vfs::host::HostError::OwnMount(_) => RecoveryCause::BaseOnOwnMount { path },
     other => RecoveryCause::BaseUnavailable {
       path,
-      reason: other.to_string(),
+      reason: recorded_reason(other.to_string()),
     },
   }
 }
@@ -13192,6 +13655,74 @@ mod tests {
     home_redirect, join_batch, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// §4.8, §4.4 `status` (A-263 on B9). Do: frame the refusal a verb on an unrecovered overlay answers, its cause the
+  /// longest one a volume records: a base path of [`super::longest_recordable_base`] bytes and a reason of
+  /// [`super::RECOVERY_REASON_BYTES`]; and record a reason past that bound, multi-byte characters at the cut. Expect: the
+  /// refusal fits one reply chunk whole, the base is no longer than the platform's path maximum, and the long reason
+  /// is cut at a character boundary to the bound.
+  #[test]
+  fn the_longest_recorded_cause_fits_the_refusal_whole() {
+    use slates_ipc::protocol::RecoveryCause;
+    let longest = super::longest_recordable_base();
+    let refusal = ReplyBody::Refused {
+      refusal: Refusal::NotRecovered {
+        cause: RecoveryCause::BaseUnavailable {
+          path: "p".repeat(longest),
+          reason: "r".repeat(super::RECOVERY_REASON_BYTES),
+        },
+      },
+    };
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    let framed = slates_ipc::protocol::framed_len(&refusal);
+    eprintln!(
+      "the longest recorded base here: {longest} bytes; the refusal's own room: {} bytes",
+      chunk - (framed - longest)
+    );
+    assert!(framed <= chunk);
+    assert!(longest <= super::PLATFORM_PATH_BYTES);
+    let reason = super::recorded_reason("é".repeat(super::RECOVERY_REASON_BYTES));
+    assert!(reason.len() <= super::RECOVERY_REASON_BYTES && reason.chars().all(|c| c == 'é'));
+  }
+
+  /// §4.4 `list` (A-263 with B8's `not_recovered`). Do: list a summary with the longest listable name and an unrecovered
+  /// overlay's cause whose base path and reason run 10,000 bytes each, multi-byte characters among them; and one whose
+  /// cause is short. Expect: the first fits a page alone, its name whole and its cause the same variant shortened at
+  /// character boundaries; the second is listed unchanged. A cause's text comes from the host and the recorded base, so
+  /// without the cut one long path made the listing it was in "reply too large for the bulk area".
+  #[test]
+  fn a_listed_volume_fits_a_page_whatever_its_recovery_cause_says() {
+    use slates_ipc::protocol::{RecoveryCause, VolumeSummary};
+    let summary = |cause: RecoveryCause| VolumeSummary {
+      id: VolumeId::default(),
+      name: "n".repeat(super::longest_listable_name()),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: true,
+      live_shipped: false,
+      not_recovered: Some(cause),
+    };
+    let long = "é/".repeat(3_334);
+    let whole = summary(RecoveryCause::BaseUnavailable {
+      path: long.clone(),
+      reason: long,
+    });
+    assert!(
+      super::encoded_len(&whole) > super::list_page_room(),
+      "uncut, it fits no page"
+    );
+    let listed = super::listed(whole);
+    assert!(super::encoded_len(&listed) <= super::list_page_room());
+    assert_eq!(listed.name.len(), super::longest_listable_name());
+    assert!(matches!(
+      listed.not_recovered,
+      Some(RecoveryCause::BaseUnavailable { .. })
+    ));
+    let short = summary(RecoveryCause::BaseMissing {
+      path: String::new(),
+    });
+    assert_eq!(super::listed(short.clone()), short);
+  }
 
   /// A volume owned by `owner`, sharing it with each of `access`.
   fn volume_owned_by(

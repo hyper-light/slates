@@ -243,12 +243,19 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
-  /// The files a green changed strictly after `version` (§4.16): what a lagging work reconciles.
+  /// One page of the paths a green changed strictly after `version` (§4.16, A-264): what a lagging work reconciles.
+  /// Read from the green's change index in version order from `from` (`None` begins), each page ending where one reply
+  /// chunk is full (§4.3) or where the shard's slice of its turn is spent, whichever comes first, so a page costs what
+  /// it passes and never the green's tree. A page may hold no path and still carry a cursor; the client walks to the
+  /// end. A path changed after `version` when the walk began is answered once, and once more if it changes again
+  /// during the walk. A version past the head is refused `UnknownBase`.
   ChangedSince {
     /// The green.
     green: VolumeId,
     /// The base version to compare against.
     version: u64,
+    /// Where the previous page stopped, or `None` for the first page.
+    from: Option<ChangedCursor>,
   },
   /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
   CreateWork {
@@ -336,8 +343,13 @@ pub enum RequestBody {
     /// The volume.
     volume: VolumeId,
   },
-  /// List the caller's volumes.
-  List,
+  /// One page of the volumes the caller may read (§4.4 `list`), in volume-id order: `after` `None` begins, and each
+  /// page's `next` continues it. A page holds what one reply chunk holds (§4.3), so the client walks a listing of any
+  /// length; a volume that exists throughout the walk is listed exactly once. A read; never recorded.
+  List {
+    /// The last volume of the previous page, or `None` for the first page.
+    after: Option<VolumeId>,
+  },
   /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
     /// Every sequence up to and including this one, except `owed`.
@@ -464,9 +476,16 @@ pub enum RequestBody {
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
   },
-  /// The caller's grants (a read; creating a grant is off-ring).
-  Grants,
-  /// The audit log from a sequence (a read).
+  /// One page of the caller's grants (a read; creating a grant is off-ring), in grant-id order past `after`: `None`
+  /// begins, and each page's `next` continues it. A page holds what one reply chunk holds (§4.3), so a principal's
+  /// grants of any number are walked; a grant that exists throughout the walk is answered exactly once.
+  Grants {
+    /// The last grant of the previous page, or `None` for the first page.
+    after: Option<u64>,
+  },
+  /// One page of the audit (§4.15, A-265): the records from sequence `since` on, in sequence order, as many as one
+  /// reply chunk holds. One partition holds the audit, the control shard's, so the sequence numbers the daemon's
+  /// records and a walk continues from one past the last record a page held. A read.
   Audit {
     /// Every record at or after this sequence.
     since: u64,
@@ -867,6 +886,17 @@ pub enum RequestBody {
   Policy {
     /// What the policy is set on.
     subject: PolicySubject,
+  },
+  /// One page of an overlay volume's drifted entries (§4.4 `status`, A-267): every witnessed entry whose disk no longer
+  /// matches its witness, and every one whose re-check the host refused, in path order from position `from`. A
+  /// status carries the first that fit; this reads them all. A position, not a path, continues it, so a long path never
+  /// rides in a request; a drift that changes between pages may repeat or skip an entry, as a directory listing may.
+  /// A read; never recorded. Appended.
+  Drifted {
+    /// The overlay volume.
+    volume: VolumeId,
+    /// The position to read from: 0 to begin, else the previous page's `next`.
+    from: u64,
   },
 }
 
@@ -1511,6 +1541,7 @@ impl RequestBody {
       | RequestBody::Resize { volume, .. }
       | RequestBody::Destroy { volume }
       | RequestBody::Status { volume }
+      | RequestBody::Drifted { volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -1554,14 +1585,14 @@ impl RequestBody {
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
-      | RequestBody::List
+      | RequestBody::List { .. }
       | RequestBody::DaemonStatus
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
       | RequestBody::RecoveryPlan { .. }
       | RequestBody::Recover { .. }
       | RequestBody::PromoteRegion { .. }
-      | RequestBody::Grants
+      | RequestBody::Grants { .. }
       | RequestBody::Audit { .. }
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
@@ -2135,6 +2166,9 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
+  /// Drifted entries the report did not carry (A-267; appended): `drifted` holds the first that fit beside the
+  /// report's other fields, and `Drifted` reads every one.
+  pub drifted_elided: u32,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -2904,6 +2938,16 @@ pub struct GrantSummary {
   pub state: String,
 }
 
+/// Where a `changed_since` walk stands (§4.16, A-264): the green version it is in and how many of that version's
+/// changed paths it has passed. A committed version's paths never change, so the cursor stays valid as the green moves.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangedCursor {
+  /// The version.
+  pub version: u64,
+  /// The entries of `version` passed.
+  pub passed: u32,
+}
+
 /// An audit record on the wire (§4.15).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry {
@@ -3408,10 +3452,13 @@ pub enum ReplyBody {
     /// The head version.
     head: u64,
   },
-  /// The files changed since a version.
+  /// One page of the paths changed since a version (`ChangedSince`).
   ChangedSince {
-    /// The changed file paths.
+    /// The changed paths this page answers.
     paths: Vec<String>,
+    /// Where the next page continues, or `None` when the walk is done. A version and a count, never a path, so a page
+    /// holding one long path need not hold it twice.
+    next: Option<ChangedCursor>,
   },
   /// A work volume was created over a green.
   WorkCreated {
@@ -3475,10 +3522,12 @@ pub enum ReplyBody {
     /// The report. Boxed: a cold, wide report that would otherwise size every reply's move.
     report: Box<StatusReport>,
   },
-  /// The listing.
+  /// One page of the listing (`List`), in volume-id order.
   Listed {
-    /// The volumes.
+    /// The volumes of this page.
     volumes: Vec<VolumeSummary>,
+    /// The cursor that continues the listing (the last volume of this page), or `None` when this page ends it.
+    next: Option<VolumeId>,
   },
   /// Acknowledged.
   Acknowledged,
@@ -3533,15 +3582,19 @@ pub enum ReplyBody {
     /// The outcome.
     outcome: LandingOutcome,
   },
-  /// The caller's grants.
+  /// One page of the caller's grants (`Grants`), in grant-id order.
   Grants {
-    /// The grants.
+    /// The grants of this page.
     grants: Vec<GrantSummary>,
+    /// The cursor that continues the walk (the last grant of this page), or `None` when this page ends it.
+    next: Option<u64>,
   },
-  /// The audit log.
+  /// One page of the audit (`Audit`, A-265): records in sequence order, as many as one reply chunk holds (§4.3).
   Audit {
-    /// The records.
+    /// The records of this page.
     records: Vec<AuditEntry>,
+    /// Whether more follow: the next page is asked from one past the last record's sequence.
+    more: bool,
   },
   /// A grant was issued for a presented landing (the reply to a verified `Grant`).
   Granted {
@@ -3773,6 +3826,16 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+  },
+  /// One page of a volume's drifted entries (`Drifted`), each its path and the kind of drift. Appended.
+  Drifted {
+    /// The drifted entries of this page.
+    entries: Vec<String>,
+    /// The position the next page reads from, or `None` when this page ends the list.
+    next: Option<u64>,
+    /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over
+    /// and counted, never sent as a reply no chunk holds.
+    oversized: u32,
   },
 }
 

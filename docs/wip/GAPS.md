@@ -189,6 +189,54 @@
 > 0 with its bytes until its last close, also across a daemon restart, and its 64 KiB come back at the close or at its
 > client's lease lapse. Still owed: NFSv3 has no open, so its clients' silly renames stay (NFS-OPEN on the NFSv3 lists).
 
+> **A chained async call stalled after its first step: fixed (2026-11-09, found by CI's diag list-3).** The async
+> driver reported a call ready once until it was finished, so a chained call (a listing's next page, a large edit's next
+> put) was never reported again and both SDKs' async listings past one page failed `Stalled`. `Driver::continued`
+> re-arms the call; both SDKs call it (`docs/bugs/2026-11-09-a-chained-async-call-stalled-after-its-first-step.md`).
+
+> **A volume listing outgrew one reply: fixed (found by liveness, fixed 2026-11-08, A-263, §4.4 `list`, §4.3).** `slates volume
+> list` was refused "reply too large for the bulk area" from 100 volumes on a two-shard daemon, so an operator could not
+> list what a server holds. `List { after }` is now answered a page at a time, `Listed { volumes, next }`: volumes in id
+> order, a reply chunk's worth, each shard sending at most a page. The client walks the pages, sync and as an async
+> chain. A new volume's name is bounded so its summary fits one page (4,012 bytes; `InvalidName` past it), and an unrecovered
+> volume's cause is cut to fit beside it; recorded, the cause is bounded (a base at `create`: 1,023 bytes on macOS, 3,812
+> on Linux and Windows; a reason at 256) so `status` names it whole. **Under load:** at load about 160 on this Mac (2026-11-09) creates
+> past about 2,300 volumes on two shards were answered `Stalled` by the client's own reply deadline, and `volume_list.rs`
+> counted each and asked again. Since A-232 a call waits while its daemon lives and `Stalled` is gone, so the re-land
+> (2026-11-17, goal g247) creates plainly; how long a create takes past a few thousand volumes under that load is not
+> yet measured. 3,000 volumes list on two shards, and a walk under churn lists each survivor once
+> (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
+> - **`changed_since`, the same shape: fixed the same way (A-264, 2026-11-08, revised 2026-11-09).** Refused at 800
+>   changed files; now paged from a change index (the paths each version changed, recorded as it commits) in version
+>   order, each page ending at a full reply or its slice of the shard's step, so a page costs the changes it passes and
+>   never the tree. It reports every dimension (`changed_between(v, head)`), where it read the content index alone. One
+>   path always fits a page alone: a green's paths arrive in requests, whose framing is larger than a page's (the
+>   longest an edit carries, 4,044 bytes, is answered). Merging a mounted work is owed and must bound its paths to one
+>   page when it lands. `changed_between`, which `advance` invalidates by, reads the same index (one
+>   computation in product code); the history walk is the tests' model (`test-model`), checked against at every
+>   version, below the checkpoint, across folds and after a restore
+>   (`docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`).
+> - **`audit`: numbered, bounded, one partition (A-265, 2026-11-08).** Refused between 50 and 100 records; paging it
+>   found every record numbered 0, the audit unbounded in memory and snapshots, and each shard keeping its own, a client
+>   reading its own shard's alone. Now numbered in `apply`, a derived window kept (`table_bytes / size_of::<AuditRecord>()`,
+>   the oldest dropped and counted; the operator horizon waits for a measured landing rate), the unwritten audit ring
+>   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
+>   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
+>   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
+> - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
+>   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
+>   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
+>   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
+>   writes no audit record, so an expired grant's history is its `grant_issued` alone
+>   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
+> - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
+>   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
+>   page at a time, and `slates status --drift` walks it. **Owed:** an SDK binding for the paged read
+>   (`docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`).
+> - **Still open, the same one-reply shape**, by their code and not reproduced: the conflict and invalidation lists of
+>   `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
+>   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
+
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records
 > it still owed its holders (they lived in memory), so a version appended before the crash and not yet placed was never

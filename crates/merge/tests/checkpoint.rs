@@ -42,6 +42,34 @@ fn chain_of(origin_rows: &[Raw], chain: &[Raw]) -> (Green, Vec<(Increment, u64)>
   (green, accepted)
 }
 
+/// Where the change index of `green` answers otherwise than the model walking its histories
+/// (`changed_between_by_histories`): `changed_since(v)` and `changed_between(v, head)` at every version, and
+/// `changed_between(a, b)` over every span ending at or above the fold floor (a span ending below it is not read:
+/// `advance` refuses a version below the floor). The first difference, or nothing.
+fn changes_match_the_model(green: &Green) -> Result<(), String> {
+  let head = green.head();
+  let floor = green.folded_below();
+  for from in 0..=head {
+    let model = green.changed_between_by_histories(from, head);
+    if green.changed_since(from) != model {
+      return Err(format!(
+        "changed_since({from}): {:?}, the model {model:?}",
+        green.changed_since(from)
+      ));
+    }
+    for to in floor.max(from)..=head {
+      let model = green.changed_between_by_histories(from, to);
+      if green.changed_between(from, to) != model {
+        return Err(format!(
+          "changed_between({from}, {to}): {:?}, the model {model:?}",
+          green.changed_between(from, to)
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -79,6 +107,13 @@ proptest! {
     prop_assert_eq!(restored.head_identity(), restored.head_identity_from_scratch());
     for version in at..=head {
       prop_assert_eq!(restored.files_at(version), green.files_at(version), "files at {}", version);
+    }
+    // What changed between two versions, read from the change index (`changed_between`, what `advance` invalidates by,
+    // and `changed_since`), is what the model walking the histories finds (A-264): in the green and its restoration,
+    // since every version, below the checkpoint and the fold too, and over every span that ends at or above the floor.
+    for green in [&green, &restored] {
+      prop_assert!(changes_match_the_model(green).is_ok(), "{:?}", changes_match_the_model(green));
+      prop_assert_eq!(green.changes_recounted(), green.changes_bytes());
     }
     if let Some((increment, version)) = accepted.iter().find(|(_, version)| *version <= at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });

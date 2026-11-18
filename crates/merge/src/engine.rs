@@ -399,6 +399,7 @@ impl OriginLoad {
         .identity
         .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
       green.hardlinks.insert(path.clone(), target.clone());
+      relink(&mut green.links_to, &path, None, Some(&target));
       green.hardlink_changed.insert(path.clone(), 0);
       green.hardlink_history.insert(path, vec![(0, Some(target))]);
       return Some(moved);
@@ -496,6 +497,25 @@ pub struct Green {
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
   fast_path_hits: u64,
+  /// The change index (§4.16 `changed_since`, A-264): the paths each version changed in any dimension, each version's
+  /// sorted and each path once, recorded as the version commits at the cost of its own changes, so what changed since a
+  /// version is read in the changes since it and never the green's whole tree. A hard link is recorded at a version that
+  /// changed the special it names, the rule [`Green::changed_between`] applies. Each entry carries whether its version
+  /// is the last its path changed at (cleared on the earlier entry when a later version records the path again), and
+  /// its place in its version's list as recorded, so a walk's cursor holds when a fold drops entries. Below the fold
+  /// floor each path keeps only its last change before the floor, as the folded histories keep each key's value in
+  /// effect at the floor, and a restore from a checkpoint indexes the same.
+  changes: BTreeMap<u64, Vec<ChangeEntry>>,
+  /// The last version in `changes` each path changed at: a path changed at several versions of a span is answered once,
+  /// at the last of them. One entry a path ever changed, as the histories keep a key a path.
+  latest_change: BTreeMap<String, u64>,
+  /// Each path's last change below the fold floor, whose entry the change index keeps there ([`Green::fold_history_before`]).
+  below_floor_last: BTreeMap<String, u64>,
+  /// The hard links naming each target, the reverse of `hardlinks`: the links a special's change changes.
+  links_to: BTreeMap<String, BTreeSet<String>>,
+  /// The bytes `changes` and `latest_change` hold, a running total counted in [`Green::history_bytes`], so the index
+  /// folds under the same budget as the histories it indexes.
+  changes_bytes: usize,
   /// The deltas the verdict's position mapping consulted (`intervening`): the non-vacuity count that it reads only the
   /// deltas that changed a path, never every delta since a base. A cell, as the deltas it counts are borrowed.
   deltas_visited: std::cell::Cell<u64>,
@@ -528,6 +548,8 @@ pub struct RetainedBytes {
   pub content: usize,
   /// Earlier file content and IPC metadata retained for reconstruction.
   pub history: usize,
+  /// The change index's bytes: the paths each version above the fold floor changed (§4.16 `changed_since`).
+  pub changes: usize,
   /// The rejected-result cache's bytes.
   pub rejected: usize,
 }
@@ -587,20 +609,102 @@ fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64) -> Vec<(u64, T)> {
 /// before it, cloned. `None` when nothing was recorded by then or the last entry was a removal.
 fn history_at<T: Clone>(history: &[(u64, Option<T>)], version: u64) -> Option<T> {
   history
-    .iter()
-    .rev()
-    .find(|(recorded, _)| *recorded <= version)
+    .get(..history.partition_point(|(recorded, _)| *recorded <= version))
+    .and_then(<[_]>::last)
     .and_then(|(_, value)| value.clone())
 }
 
-/// Whether a per-version history has an entry at a version in `(from, to]`.
+/// Whether a per-version history has an entry at a version in `(from, to]` (the model's, `test-model`). Histories are in
+/// version order, so this is a seek to the first entry past `from`, never a scan of the path's whole history (a file
+/// many clients edit has an entry a version until the fold).
+#[cfg(feature = "test-model")]
 fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
   history
-    .iter()
-    .any(|(version, _)| *version > from && *version <= to)
+    .get(history.partition_point(|(version, _)| *version <= from))
+    .is_some_and(|(version, _)| *version <= to)
 }
 
-/// The paths of a per-path history that changed at a version in `(from, to]`.
+/// Moves hard link `alias` from naming `old` to naming `new` in the reverse map of the links naming each target.
+fn relink(
+  links_to: &mut BTreeMap<String, BTreeSet<String>>,
+  alias: &str,
+  old: Option<&str>,
+  new: Option<&str>,
+) {
+  if let Some(old) = old
+    && let Some(aliases) = links_to.get_mut(old)
+  {
+    aliases.remove(alias);
+    if aliases.is_empty() {
+      links_to.remove(old);
+    }
+  }
+  if let Some(new) = new {
+    links_to
+      .entry(new.to_owned())
+      .or_default()
+      .insert(alias.to_owned());
+  }
+}
+
+/// Format: what the change index holds for each path a restore indexes: its entry in its version, its last change
+/// (`latest_change`) and its last change below the floor (`below_floor_last`).
+const RESTORED_INDEX_ENTRIES: usize = 3;
+
+/// Notes in `last` that `path` changed at `version`, when that is after the origin and later than what it holds.
+fn note_last(last: &mut BTreeMap<String, u64>, path: &str, version: Option<u64>) {
+  if let Some(version) = version.filter(|version| *version > 0) {
+    let at = last.entry(path.to_owned()).or_insert(version);
+    *at = (*at).max(version);
+  }
+}
+
+/// `paths` (sorted) as a version's entries of the change index, each numbered by its place and each its path's last.
+/// A version holds far fewer than 2^32 paths: the green's memory is bounded long before.
+fn numbered(paths: BTreeSet<String>) -> Vec<ChangeEntry> {
+  paths
+    .into_iter()
+    .enumerate()
+    .map(|(index, path)| ChangeEntry {
+      index: u32::try_from(index).unwrap_or(u32::MAX),
+      path,
+      last: true,
+    })
+    .collect()
+}
+
+/// The bytes one path costs the change index, an entry of a version's list or of the last-change map: its own bytes and
+/// the version beside it.
+fn change_bytes(path: &str) -> usize {
+  path.len().saturating_add(size_of::<u64>())
+}
+
+/// A path a version changed, in the change index (`Green::changes`).
+#[derive(Clone, Debug)]
+struct ChangeEntry {
+  /// Its place in its version's sorted list as the version recorded it: kept when a fold drops the entries before it.
+  index: u32,
+  path: String,
+  /// Whether its version is the last its path changed at.
+  last: bool,
+}
+
+/// One entry of the change index ([`Green::changes_after`]): a path a version changed, where it stands in that version's
+/// sorted list (a walk's cursor), and whether that version is the last the path changed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangeAt<'a> {
+  /// The version that changed the path.
+  pub version: u64,
+  /// The path's place among the version's changed paths.
+  pub index: usize,
+  /// The path.
+  pub path: &'a str,
+  /// Whether `version` is the last version the path changed at: the entry a walk answers it at, once.
+  pub last: bool,
+}
+
+/// The paths of a per-path history that changed at a version in `(from, to]` (the model's, `test-model`).
+#[cfg(feature = "test-model")]
 fn paths_changed_in<T>(
   histories: &BTreeMap<String, Vec<(u64, T)>>,
   from: u64,
@@ -616,9 +720,8 @@ fn paths_changed_in<T>(
 /// before it says so (absent when nothing was recorded by then).
 fn present_at(history: &[(u64, bool)], version: u64) -> bool {
   history
-    .iter()
-    .rev()
-    .find(|(recorded, _)| *recorded <= version)
+    .get(..history.partition_point(|(recorded, _)| *recorded <= version))
+    .and_then(<[_]>::last)
     .is_some_and(|(_, present)| *present)
 }
 
@@ -835,6 +938,25 @@ impl Effect {
   }
 
   /// The one key of the green's state this effect sets or removes (A-202).
+  /// The path the effect changes: the key of the history it records an entry in (an xattr's, the path it is on).
+  fn path(&self) -> &str {
+    match self {
+      Effect::Special(path, _)
+      | Effect::RemoveSpecial(path)
+      | Effect::SetContent(path, ..)
+      | Effect::RemoveContent(path)
+      | Effect::MakeDir(path)
+      | Effect::RemoveDir(path)
+      | Effect::Mode(path, _)
+      | Effect::Symlink(path, _)
+      | Effect::RemoveSymlink(path)
+      | Effect::Hardlink(path, _)
+      | Effect::RemoveHardlink(path)
+      | Effect::SetXattr(path, ..)
+      | Effect::RemoveXattr(path, _) => path,
+    }
+  }
+
   fn identity_key(&self) -> IdentityKey {
     match self {
       Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
@@ -952,6 +1074,7 @@ impl Green {
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
     green.special_history_bytes = green.special_history_recounted();
+    green.index_restored_changes();
     green
   }
 
@@ -1014,12 +1137,21 @@ impl Green {
         &mut self.hardlink_history,
       )
     };
-    if let Some(old) = map.remove(&changed.key) {
-      self.identity.remove(&link_entry(tag, &changed.key, &old));
+    let old = map.remove(&changed.key);
+    if let Some(old) = &old {
+      self.identity.remove(&link_entry(tag, &changed.key, old));
     }
     if let Some(target) = &changed.value {
       self.identity.add(&link_entry(tag, &changed.key, target));
       map.insert(changed.key.clone(), target.clone());
+    }
+    if tag != IDENTITY_TAG_SYMLINK {
+      relink(
+        &mut self.links_to,
+        &changed.key,
+        old.as_deref(),
+        changed.value.as_deref(),
+      );
     }
     changed_map.insert(changed.key.clone(), changed.at);
     history.insert(
@@ -1210,10 +1342,27 @@ impl Green {
 
   /// The paths any dimension of which changed at a version in `(from, to]` (§4.16 "`advance` …
   /// invalidates exactly the paths the manifest diff between the two versions names"): what an
-  /// attachment moving from `from` to `to` must invalidate. Read off the per-dimension histories,
-  /// which hold every version a path changed at — not the last-changed index alone, which would
-  /// miss a path changed inside the span and again after it. Sorted, each path once.
+  /// attachment moving from `from` to `to` must invalidate, read from the change index in the span's own entries, so
+  /// it costs the changes in the span and never the green's tree (A-264). Every version a path changed at is an entry
+  /// at or above the fold floor, so a path changed inside the span and again after it is named; below the floor each
+  /// path keeps its last change before the floor, as the folded histories do. Sorted, each path once.
   pub fn changed_between(&self, from: u64, to: u64) -> Vec<String> {
+    if from >= to {
+      return Vec::new();
+    }
+    let changed: BTreeSet<&str> = self
+      .changes
+      .range(from.saturating_add(1)..=to)
+      .flat_map(|(_, entries)| entries.iter().map(|entry| entry.path.as_str()))
+      .collect();
+    changed.into_iter().map(str::to_owned).collect()
+  }
+
+  /// The model of [`Green::changed_between`], for tests only (the `test-model` feature): the paths any dimension of
+  /// which changed at a version in `(from, to]`, read off the per-dimension histories, a walk of every path. Product
+  /// code reads the change index; this second computation stays out of it, as the oracle the index is checked against.
+  #[cfg(feature = "test-model")]
+  pub fn changed_between_by_histories(&self, from: u64, to: u64) -> Vec<String> {
     let mut changed: BTreeSet<String> = BTreeSet::new();
     changed.extend(paths_changed_in(&self.content_history, from, to));
     changed.extend(paths_changed_in(&self.special_history, from, to));
@@ -1244,8 +1393,8 @@ impl Green {
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
   /// content length, and the directories, modes, symlinks, hard links and xattrs — so an increment
   /// based on the head can be composed against what the green actually holds. (An *older* version's
-  /// base, for a work that lagged behind an intervening submit, is reconstructed by [`Green::base_at`];
-  /// symlinks, hard links and xattrs at an older version are still owed there.)
+  /// base, for a work that lagged behind an intervening submit, is reconstructed by [`Green::base_at`], every
+  /// dimension from its own history.)
   pub fn current_base(&self) -> crate::increment::Base {
     crate::increment::Base {
       specials: self
@@ -1348,15 +1497,52 @@ impl Green {
       .map(Vec::as_slice)
   }
 
-  /// The files whose content changed strictly after `version` (§4.16 the last-changed index): what a
-  /// lagging work must reconcile, and what a rebase remaps against. Sorted by path.
+  /// The paths any dimension of which changed strictly after `version`, sorted, each once (§4.16 `changed_since`): the
+  /// same paths as [`Green::changed_between`]`(version, head)`, read from the change index in the changes since
+  /// `version`.
   pub fn changed_since(&self, version: u64) -> Vec<String> {
-    self
-      .last_changed
-      .iter()
-      .filter(|(_, changed)| **changed > version)
-      .map(|(path, _)| path.clone())
-      .collect()
+    let mut changed: Vec<String> = self
+      .changes_after(version, None)
+      .filter(|change| change.last)
+      .map(|change| change.path.to_owned())
+      .collect();
+    changed.sort();
+    changed
+  }
+
+  /// The change index from just past `version`, or from `cursor` (a version and how many of its paths a walk has
+  /// passed), in version order and each version's paths in path order (§4.16 `changed_since`, paged; A-264). Every
+  /// path changed after `version` is an entry with `last` set exactly once, at the last version it changed at: a walk
+  /// answers those, and they are [`Green::changed_between`]`(version, head)`. A version's paths never change once it
+  /// commits and an entry keeps its place when a fold drops others, so a cursor stays valid while the green moves on and
+  /// folds; a path changed again after the walk passed it is answered again, at its new version. Reading costs the
+  /// entries passed, never the green's tree.
+  pub fn changes_after(
+    &self,
+    version: u64,
+    cursor: Option<(u64, usize)>,
+  ) -> impl Iterator<Item = ChangeAt<'_>> + '_ {
+    let (start, skip) = match cursor {
+      Some((at, passed)) if at > version => (at, passed),
+      _ => (version.saturating_add(1), 0),
+    };
+    self.changes.range(start..).flat_map(move |(at, entries)| {
+      let from = if *at == start {
+        entries.partition_point(|entry| usize::try_from(entry.index).unwrap_or(usize::MAX) < skip)
+      } else {
+        0
+      };
+      entries
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .map(move |entry| ChangeAt {
+          version: *at,
+          index: usize::try_from(entry.index).unwrap_or(usize::MAX),
+          path: &entry.path,
+          last: entry.last,
+        })
+    })
   }
 
   /// The number of paths merged through the content fast path (the non-vacuity counter).
@@ -1371,10 +1557,11 @@ impl Green {
   }
 
   /// The green's state at an older `version` as a deriver [`Base`](crate::increment::Base), for a
-  /// work whose base lagged behind an intervening submit. Files come from the content history (exact,
-  /// renames and deletes included); directories and modes are replayed from the deltas up to the
-  /// version. Symlinks, hard links and xattrs at an older version are owed — reconstructed empty here,
-  /// which is exact for the file-and-directory workflows and conservative otherwise.
+  /// work whose base lagged behind an intervening submit, or a listing of the green at that version. Every
+  /// dimension comes from its own `(version, value)` history, the last entry at or before `version`: files from the
+  /// content history (renames and deletes included), directories from their presence history, modes, symlinks, hard
+  /// links, xattrs and special nodes from their value histories. (Until 2026-11-09 this said symlinks, hard links and
+  /// xattrs were reconstructed empty; they have been read from their histories since those were kept.)
   pub fn base_at(&self, version: u64) -> crate::increment::Base {
     if version >= self.head() {
       return self.current_base();
@@ -2584,6 +2771,7 @@ impl Green {
 
   /// Applies the accepted effects, committing version `version`.
   fn commit(&mut self, effects: Vec<Effect>, version: u64) {
+    let changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
     let mut set_content: Vec<(String, Vec<u8>, Vec<Op>)> = Vec::new();
@@ -2641,7 +2829,8 @@ impl Green {
             .push((version, None));
         }
         Effect::Hardlink(path, target) => {
-          self.hardlinks.insert(path.clone(), target.clone());
+          let old = self.hardlinks.insert(path.clone(), target.clone());
+          relink(&mut self.links_to, &path, old.as_deref(), Some(&target));
           self.hardlink_changed.insert(path.clone(), version);
           self
             .hardlink_history
@@ -2650,7 +2839,8 @@ impl Green {
             .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
-          self.hardlinks.remove(&path);
+          let old = self.hardlinks.remove(&path);
+          relink(&mut self.links_to, &path, old.as_deref(), None);
           self.hardlink_changed.insert(path.clone(), version);
           self
             .hardlink_history
@@ -2698,6 +2888,156 @@ impl Green {
       delta.insert(path, ops);
     }
     self.deltas.push(delta);
+    self.record_changes(version, changed);
+  }
+
+  /// Records what version `version` changed in the change index (`changes`): every path an effect changed, and every
+  /// hard link naming one of them that is or was a special, as [`Green::changed_between`] counts a link changed with
+  /// the special it names. The cost of the version's own changes and their links.
+  fn record_changes(&mut self, version: u64, mut changed: BTreeSet<String>) {
+    let links: Vec<String> = changed
+      .iter()
+      .filter(|path| self.special_history.contains_key(*path))
+      .filter_map(|path| self.links_to.get(path))
+      .flatten()
+      .cloned()
+      .collect();
+    changed.extend(links);
+    if changed.is_empty() {
+      return;
+    }
+    for path in &changed {
+      let bytes = change_bytes(path);
+      match self.latest_change.insert(path.clone(), version) {
+        None => self.changes_bytes = self.changes_bytes.saturating_add(bytes),
+        // The earlier version's entry is no longer the path's last: a seek in that version's sorted list.
+        Some(earlier) => {
+          if let Some(entries) = self.changes.get_mut(&earlier)
+            && let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(path))
+            && let Some(entry) = entries.get_mut(at)
+          {
+            entry.last = false;
+          }
+        }
+      }
+      self.changes_bytes = self.changes_bytes.saturating_add(bytes);
+    }
+    self.changes.insert(version, numbered(changed));
+  }
+
+  /// Each path's last change after the origin in any dimension, read off the histories' last entries.
+  fn last_changes_after_origin(&self) -> BTreeMap<String, u64> {
+    let mut last: BTreeMap<String, u64> = BTreeMap::new();
+    for (path, history) in &self.content_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for (path, history) in &self.special_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for (path, history) in &self.dir_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for (path, history) in &self.mode_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for (path, history) in &self.symlink_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for (path, history) in &self.hardlink_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    for ((path, _), history) in &self.xattr_history {
+      note_last(&mut last, path, history.last().map(|(v, _)| *v));
+    }
+    last
+  }
+
+  /// Rebuilds the change index from the histories, each path at its last change after the origin: a green restored
+  /// from a checkpoint ([`Green::restore`]) holds one entry a key, at the version its value in effect was set, and a hard
+  /// link naming a special is changed when the special last changed, if later. The cost of the restore's own keys.
+  fn index_restored_changes(&mut self) {
+    let mut last = self.last_changes_after_origin();
+    for (alias, target) in &self.hardlinks {
+      if self.special_history.contains_key(target)
+        && let Some(special) = last.get(target).copied()
+      {
+        note_last(&mut last, alias, Some(special));
+      }
+    }
+    let mut by_version: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for (path, version) in &last {
+      by_version.entry(*version).or_default().insert(path.clone());
+    }
+    // Every key restored is at or below the checkpoint, the restored green's floor: its last change is the one below it.
+    self.changes_bytes = last
+      .keys()
+      .map(|path| change_bytes(path).saturating_mul(RESTORED_INDEX_ENTRIES))
+      .sum();
+    self.below_floor_last = last.clone();
+    self.changes = by_version
+      .into_iter()
+      .map(|(version, paths)| (version, numbered(paths)))
+      .collect();
+    self.latest_change = last;
+  }
+
+  /// Folds the change index below `floor` (from `previous`, the floor before), as the histories fold, each key keeping
+  /// its value in effect at the floor: of a path's entries below the floor only its last stays, the others go, so a span
+  /// that starts below the floor and ends at or above it is answered as the folded histories answer it. A version
+  /// emptied goes too; an entry keeps its place in its version, so a walk's cursor holds. The cost of the entries the
+  /// floor passes.
+  fn fold_changes_before(&mut self, previous: u64, floor: u64) {
+    let passed: Vec<u64> = self
+      .changes
+      .range(previous..floor)
+      .map(|(version, _)| *version)
+      .collect();
+    for version in passed {
+      let paths: Vec<String> = self
+        .changes
+        .get(&version)
+        .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect())
+        .unwrap_or_default();
+      for path in paths {
+        match self.below_floor_last.insert(path.clone(), version) {
+          None => self.changes_bytes = self.changes_bytes.saturating_add(change_bytes(&path)),
+          Some(earlier) => self.drop_change_entry(earlier, &path),
+        }
+      }
+    }
+  }
+
+  /// Drops `path`'s entry at `version` from the change index, and the version when it is left empty.
+  fn drop_change_entry(&mut self, version: u64, path: &str) {
+    let Some(entries) = self.changes.get_mut(&version) else {
+      return;
+    };
+    if let Ok(at) = entries.binary_search_by(|entry| entry.path.as_str().cmp(path)) {
+      entries.remove(at);
+      self.changes_bytes = self.changes_bytes.saturating_sub(change_bytes(path));
+    }
+    if entries.is_empty() {
+      self.changes.remove(&version);
+    }
+  }
+
+  /// The bytes the change index holds (`changes`, `latest_change`), a running total: charged with the histories'
+  /// ([`Green::retention_charge`]) and folded under the same budget.
+  pub fn changes_bytes(&self) -> usize {
+    self.changes_bytes
+  }
+
+  /// The change index's bytes, recounted from it: the oracle [`Green::changes_bytes`] is checked against.
+  pub fn changes_recounted(&self) -> usize {
+    self
+      .changes
+      .values()
+      .flatten()
+      .map(|entry| &entry.path)
+      .chain(self.latest_change.keys())
+      .chain(self.below_floor_last.keys())
+      .map(|path| change_bytes(path))
+      .sum()
   }
 
   /// Submits an increment: idempotent by identity, decides every dimension of its ops document, and
@@ -2890,6 +3230,40 @@ impl Green {
     )
   }
 
+  /// What the change index grows by when `inc` commits (§4.2 all-cost admission): each path its ops name, recorded at
+  /// the new version and as its last change, and the hard links naming any of them that is a special. Secured before
+  /// the verdict with [`Green::history_reservation`]; the settle after it trues the charge up to what the index holds,
+  /// crediting a path already recorded and charging the paths a directory's move derives for its children.
+  /// Nothing for an increment already accepted.
+  pub fn changes_reservation(&self, inc: &Increment) -> usize {
+    if self.accepted.contains_key(&inc.id) {
+      return 0;
+    }
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for op in &inc.doc.ops {
+      paths.extend(inc.doc.paths.path(op.path));
+      if op.kind == OpKind::Rename {
+        paths.extend(
+          u16::try_from(op.src)
+            .ok()
+            .and_then(|index| inc.doc.paths.path(index)),
+        );
+      }
+    }
+    let links = paths
+      .iter()
+      .filter(|path| self.special_history.contains_key(**path))
+      .filter_map(|path| self.links_to.get(*path))
+      .flatten()
+      .map(String::as_str);
+    paths
+      .iter()
+      .copied()
+      .chain(links)
+      .map(|path| change_bytes(path).saturating_mul(2))
+      .sum()
+  }
+
   /// The most this increment can add to the retained history ([`Green::retention_charge`]), charged before the
   /// verdict (A-16): what the history would gain if every op were applied. Per path (W2: the history shares what a
   /// version kept, `crate::history`):
@@ -3005,7 +3379,10 @@ impl Green {
   /// rejected-result cache's, both running totals, so the settle after every submit costs nothing that
   /// follows the green's size. [`Green::retained_bytes`] also sums the current files, a report's figure.
   pub fn retention_charge(&self) -> usize {
-    self.history_bytes().saturating_add(self.rejected_bytes)
+    self
+      .history_bytes()
+      .saturating_add(self.changes_bytes)
+      .saturating_add(self.rejected_bytes)
   }
 
   /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): the history and
@@ -3019,6 +3396,7 @@ impl Green {
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
       history: self.history_bytes(),
+      changes: self.changes_bytes,
       rejected: self.rejected_bytes,
     }
   }
@@ -3080,7 +3458,9 @@ impl Green {
   /// Returns the bytes released. A reachable floor at or below the current one is a no-op.
   pub fn fold_history_to_budget(&mut self, reachable_floor: u64, budget: usize) -> usize {
     let mut released = 0usize;
-    while self.history_bytes() > budget && self.folded_below < reachable_floor {
+    while self.history_bytes().saturating_add(self.changes_bytes) > budget
+      && self.folded_below < reachable_floor
+    {
       let next = self.folded_below.saturating_add(1);
       released = released.saturating_add(self.fold_history_before(next));
     }
@@ -3104,8 +3484,10 @@ impl Green {
     if self.identity_version < floor {
       self.fold_identity();
     }
+    let previous = self.folded_below;
     self.folded_below = floor;
-    let before = self.history_bytes();
+    let before = self.history_bytes().saturating_add(self.changes_bytes);
+    self.fold_changes_before(previous, floor);
     self.fold_content_before(floor);
     self.fold_specials_before(floor);
     for history in self.mode_history.values_mut() {
@@ -3123,7 +3505,7 @@ impl Green {
     for history in self.dir_history.values_mut() {
       fold_entries(history, floor);
     }
-    before.saturating_sub(self.history_bytes())
+    before.saturating_sub(self.history_bytes().saturating_add(self.changes_bytes))
   }
 
   /// Folds the content history below `floor`: the latest value is never folded, so the current values stand, and each

@@ -1654,6 +1654,13 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   volumes the drift list (every witnessed entry whose disk fingerprint no longer matches, with
   the kind of change: modified, deleted, replaced, type changed) and the watcher state (live,
   overflowed, unavailable).
+- list(after?) → Listed{volumes, next}: the volumes the caller may read, one page a reply, in volume-id order past
+  `after`; `next` continues the walk. A page holds what one reply chunk holds (§4.3), each shard sending at most a page,
+  so a listing of any length is answered and a volume that exists for the whole walk is listed exactly once. The
+  client walks the pages and returns them in name order. A new volume's name is bounded so its summary fits one page.
+
+  > **Status (2026-11-08, paged, A-263).** The whole listing was one reply, refused "reply too large for the bulk area" from
+  > 100 volumes on a two-shard daemon (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
 - read_base(volume, path) → bytes: the entry as the disk holds it right now, for an agent that
   wants to reconcile a drifted entry itself; a read, never a write.
 - rewitness(volume, paths?) → Rewitnessed: re-witness the named drifted entries (default: all) to the
@@ -1695,8 +1702,12 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   `rebase(work_volume, to?) → Rebased{version} | Conflict{windows}` (move the work volume's base to
   a newer green version by mapping its pending operations; unchanged on conflict);
   `advance(attachment, version)` (re-pin a green attachment; targeted invalidations);
-  `versions(green, from?, limit?)` and `changed_since(green, version, paths?)` (reads of the chain
-  and the per-path last-changed index); `edit(volume, path, at, delete_len, bytes)` (an SDK write
+  `versions(green, from?, limit?)` and `changed_since(green, version, from?)` (reads of the chain
+  and of the change index, the paths each version changed, recorded as it commits; `changed_since` names every path any
+  dimension of which changed after the version, as `advance` invalidates by, each at the last version it changed at, a
+  page a reply in version order from a cursor of a version and a count, each page ending at a full reply or at its slice
+  of the shard's step, so a page costs the changes it passes and never the tree, and a path changed when the walk began
+  is answered once; a version past the head is `UnknownBase`, 2026-11-09, A-264); `edit(volume, path, at, delete_len, bytes)` (an SDK write
   that declares a true insert or delete). A mount write to a green volume is `EROFS`; an SDK
   write is `ReadOnlyVolume`.
 
@@ -7048,7 +7059,8 @@ concurrent operation on it unless identical; the skills say so.
 **Landing from the SDKs.** `materialize(snapshot, target, filter=None, wait=True)` returns
 an awaitable landing request: awaited, it resolves to the landing report once a human has
 granted the request and the landing has run, or raises `GrantRequired` at once when `wait` is
-false; `status(volume)` carries the drift list; `read_base`, `rewitness` and `pin` are ordinary
+false; `status(volume)` carries the drift list's first entries and the count of the rest, and `drifted(volume)`
+reads the whole list a page at a time (A-267); `read_base`, `rewitness` and `pin` are ordinary
 async calls. No SDK method creates a grant.
 
 **Python SDK.** PyO3 extension (`abi3-py312` wheels plus `cp314t` for free-threaded builds);
@@ -7882,7 +7894,7 @@ with every finished entry listed.
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
 | Landing lease term | measured landing duration p99 × k, renewed by keepalive while entries are in flight | landing duration histogram |
 | Grant term | the session's lifetime for session grants; the measured plan-to-grant interval p99 × k for single-use grants | audit log intervals |
-| Audit retention | landing rate × operator audit horizon × record size | measured landing rate |
+| Audit retention | the partition's table bytes / the record's size (the memory ceiling, `PartitionCaps::audit_records`, A-265); an operator horizon × the measured landing rate may lower it once a rate is measured (none is yet) | table bytes; measured landing rate |
 | Watcher coalescing window | p50 inter-arrival of event bursts | watcher event timestamps |
 
 **Worked example.** An agent overlays `/home/u/proj` (300k files); edits twelve files, deletes
@@ -8413,8 +8425,8 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
 between the two versions names (O(changed) by structural sharing); no attachment's view changes
 without `advance`; `status(green)` reports the head, the attachment's version, and
-`changed_since(version, paths)` from the last-changed index so a work volume learns early which
-of its pending paths green has moved under (awareness, never load-bearing).
+`changed_since(version)` from the change index (the paths each version changed, A-264) so a work volume learns early
+which of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
 in-flight submissions retry by identity). Green owner loss in a fleet: Degraded for the
@@ -21348,3 +21360,117 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   against itself, refused because no stated line differed.
 - **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
   run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
+
+### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
+Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
+`Listed { volumes, next }`), `crates/server/src/verbs.rs` (`list_part`, `list_page`, `longest_listable_name`,
+`refused_before_dispatch`), `crates/server/src/state.rs`, `crates/client/src/client.rs` (`Client::list`, the async list
+as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, both SDKs' async suites, GAPS,
+`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`.
+- **Changes §4.4:** `list` returned every volume in one reply, which a reply chunk (4,096 bytes) held only to about 80
+  volumes; past that `slates volume list` was refused "reply too large for the bulk area". It is now a walk: a page
+  of volumes in id order past a cursor, sized to one reply chunk, each shard sending at most a page. `List` was
+  replaced, not joined by a second verb.
+- **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
+  refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
+  with room for a recovery cause's fixed part), so every volume a client can create is one it can list. An unrecovered
+  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
+  record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
+  room (1,023 bytes on macOS, 3,812 on Linux and Windows; `BaseUnavailable` with `ENAMETOOLONG` past it) and a reason,
+  the daemon's own text, at 256.
+- **Proven:** red first on main (3,000 volumes, refused); a walk under churn lists each of 2,991 survivors once in 37
+  pages; the longest admitted name lists; 2,000 volumes list through the CLI, plain and JSON.
+- **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a
+  status's `drifted`, the merge verbs' conflict and invalidation lists), recorded open in GAPS; a volume recovered
+  under a longer name is not refused.
+
+### A-264 — `changed_since` is answered a page at a time from a change index, and names every dimension (accepted 2026-11-08, revised 2026-11-09)
+Applied in the same change to: §4.16 (the merge verbs, the status read), `crates/merge/src/engine.rs` (the change
+index: `changes`, `latest_change`, `links_to`, `Green::changes_after`, `ChangeAt`, `Green::changes_reservation`; the
+seeks in `history_at`, `history_touches`, `present_at`), `crates/ipc/src/protocol.rs` (`ChangedSince { green, version,
+from }`, `ChangedSince { paths, next }`, `ChangedCursor`), `crates/server/src/verbs.rs` (`changed_since`,
+`CHANGED_SLICE_PERMILLE`, the submit's reservation), `crates/client/src/client.rs` (the walk, and the async form as a
+chain), GAPS, `docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`.
+- **Paged:** the whole answer was one reply, refused at 800 changed files. A page now holds what one reply chunk holds.
+- **Every dimension:** it read the content index alone, so a symlink, mode, xattr, special, directory or link moved under
+  a work went unreported. It answers `changed_between(v, head)`'s paths.
+- **From a change index, sliced (2026-11-09):** the first cut walked every dimension's path-keyed histories, so a page
+  cost the green's tree, not the span: about 1 ms a page on the kernel tree whatever the span, and ten times the tree
+  cost ten times that. Each version now records the paths it changed as it commits (O(changed)), and the answer is read
+  in version order from a cursor of a version and a count, each path once at the last version it changed at; a page
+  ends at a full reply or at half the shard's step, so it may hold no path and still carry a cursor. The index folds with
+  the histories, keeping each path's last change below the floor (so a version there, and a green restored from a
+  checkpoint, are answered as the histories answer them), and is charged with them. A version past the head is refused
+  `UnknownBase`.
+- **Seeks:** `history_touches`, `history_at` and `present_at` scanned a path's whole history; histories are in version
+  order, so each is one `partition_point`.
+- **One computation (2026-11-09):** `changed_between`, what `advance` invalidates by, walked every path's histories
+  beside the index `changed_since` read: two computations of what changed between versions, free to drift. It reads the
+  index's entries in the span; below the fold floor the index keeps each path's last change before the floor, as the
+  folded histories keep each key's value in effect there. The history walk is the tests' model
+  (`changed_between_by_histories`, the `test-model` feature, never in the shipped crate); the checkpoint proptest
+  compares `changed_between` and `changed_since` with it at every version and over every span ending at or above the
+  floor, in a green folded or not and its restoration. Red: four mutations of the index (the span's end excluded, a
+  superseded entry left last, a special's links not recorded, the fold keeping only last changes) each fail it.
+- **Cost, measured:** a page of 150 entries from the change index costs 0.25 to 1.7 µs at every span, on the kernel tree (97,229 paths) and on ten copies of it (972,290), where the path-keyed walk cost 17 to 33 µs a page at the dense spans and 0.6 to 1.4 ms at the sparse ones, and ten times the tree 90 to 236 µs and 10 to 22 ms (2,000 submits; release; this Mac at load 37 to 41; the two alternated ABBA; 2026-11-09). The index answers `changed_between(v, head)` at every version measured.
+- **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
+  an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.
+
+### A-265 — The audit is numbered, bounded, and held by the control shard alone (accepted 2026-11-08)
+Applied in the same change to: §4.15 (the audit retention row), `crates/db/src/partition.rs` (`append_audit`,
+`audit_next_seq`, `audit_dropped`, `PartitionCaps::audit_records`), `crates/anchor/src/layout.rs` (the audit region
+removed; layout version 8, since A-255 took 7 on main while this was out), `crates/server/src/config.rs`, `crates/server/src/landing.rs` (`audit_verb`,
+`write_audit`, `send_owed_audit`, `append_owed_audit`, `AUDIT_PARTITION`), `crates/server/src/verbs.rs` (the route, the
+send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }` answered `{ records, more }`),
+`crates/client/src/client.rs`, GAPS, `docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`.
+- **Numbered:** every record was numbered 0. The partition numbers each in `apply` from a snapshotted counter, so a
+  replay numbers them as the live partition did.
+- **Bounded:** the audit grew for the partition's life. A window of `table_bytes / size_of::<AuditRecord>()` is kept,
+  the oldest dropped past it and counted; the formula's horizon applies once a landing rate is measured.
+- **The ring removed:** the audit region was never written; the log and the snapshots in the anchor segment hold the
+  records, as §4.8 asks. Replaced, not kept beside.
+- **One partition:** each shard kept its own audit and a client read its own shard's alone. The control shard's
+  partition now holds every record (§4.15 "written through the control shard", §4.8's one `AuditLog`), so one sequence
+  numbers the daemon's audit and `--since N` keeps its meaning; `Audit` is served there, a page at a time.
+- **The crossing:** a record made on another shard is owed to the control partition by its atom and sent as one batch
+  once the atom commits: a presentation's and a granted landing's completion wait for it before replying, and a grant
+  (a sync verb) sends after its transaction, a refusal counted (`landing.audit_unappended`). On the control shard the
+  records stay in the atom. A crash between the owner's commit and the batch loses the batch; the owner's records and
+  the completion stand.
+- **Cost:** a granted landing of 1,000 files of 1 KiB from the shard that is not the control shard, its 1,000 `entry_written` records and its others crossing as one batch (`crates/server/tests/audit_land_cost.rs`, release, two shards, this Mac at load 40 to 100, before and after alternated ABBA three times, 2026-11-09): before, a landing's median 968 ms and fastest 430 ms; after, 827 ms and 424 ms (25 landings each, the first pair dropped as the warm-up). No cost shows within the noise: the crossing is one message and one transaction against a landing's own writes and fsyncs.
+- **Proven:** numbering and recovery, and the bounded window over a replay and a snapshot, in the database; a client on
+  either of two shards reads every shard's records at once after a landing's reply
+  (`a_client_on_any_shard_reads_every_shards_audit`); the audit paged by use.
+
+### A-266 — A principal's grants are paged, and the table holds live grants (accepted 2026-11-08)
+Applied in the same change to: §4.15 (grants), `crates/db/src/partition.rs` (`change_grant_state`,
+`grants_issued_through`), `crates/land/src/grant.rs` (`end`, `expired_at`, `restore_issued_through`, an absent id at or
+below the highest issued refused as spent), `crates/server/src/landing.rs` (`grants_part`, `grants_page`,
+`longest_grantable_target`, `end_grants_recorded_ended`, `end_expired_grants`), `crates/server/src/daemon.rs` (the reap
+tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/src/protocol.rs` (`Grants { after }`,
+`Grants { grants, next }`), `crates/client/src/client.rs`, GAPS,
+`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`.
+- **Paged:** the whole list was one reply, refused between 25 and 50 grants. A page holds what one reply chunk holds,
+  in grant-id order past a cursor, each shard sending at most a page.
+- **Live grants only:** every grant stayed in the table for the daemon's life. A grant leaves it at its terminal step,
+  in `apply`, and the runtime table once that commits; its history is the audit log. The highest id issued is kept and
+  snapshotted, so an id is never reused and a spent one is refused `GrantInvalid`.
+- **Ended at its term:** the reap tick ends grants past their term, counted.
+- **A target that a grant can be listed with:** a `land` request carries a target of about 4,046 bytes; a target past
+  `longest_grantable_target` (3,995 bytes, a grants page's room less a summary with an empty target) is refused
+  `TargetUnavailable` before presenting. Landing runs on macOS and Linux; macOS's `PATH_MAX` (1,023 bytes) is the
+  smaller there, so the bound binds on Linux.
+- **Open:** an expiry writes no audit record.
+
+### A-267 — A status's drift is carried as far as one reply holds, counted past it, and paged (accepted 2026-11-08)
+Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/protocol.rs` (`StatusReport::drifted_elided`,
+`Drifted { volume, from }`, `Drifted { entries, next, oversized }`), `crates/server/src/verbs.rs` (`with_drift`,
+`drift_entries`, `drifted`), `crates/client/src/client.rs` (`Client::drifted`), `crates/cli/src/verbs.rs`,
+`crates/mcp/src/lib.rs`, both SDKs, `crates/merge/src/engine.rs` (`base_at` and `current_base`'s docs, stale since every
+dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`.
+- **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
+- **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted.
+- **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
+  the count. An SDK binding for the paged read is owed.
+- **Still to come under A-267:** the conflict windows of `Submitted` and `Rebased`, kept with the work and paged from
+  it, and `GrantRequired`'s conflicts, `LandingConflict` and `Advanced`'s invalidations, each reproduced by use first.

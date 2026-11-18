@@ -2191,8 +2191,8 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
 /// Whether the daemon at `instance` lists `volume` among its own: a listing gathers its shards' catalogs only.
 fn lists_volume(instance: &str, volume: VolumeId) -> bool {
   matches!(
-    Client::connect(instance).call(&RequestBody::List),
-    ReplyBody::Listed { volumes } if volumes.iter().any(|summary| summary.id == volume)
+    Client::connect(instance).call(&RequestBody::List { after: None }),
+    ReplyBody::Listed { volumes, .. } if volumes.iter().any(|summary| summary.id == volume)
   )
 }
 
@@ -7133,7 +7133,7 @@ fn the_harness_reads_a_paged_status_whole_across_an_acknowledgement() {
   // One request short of an acknowledgement: the report's first page goes out without one, its second falls due.
   while client.sequence.saturating_sub(client.acknowledged) + 1 < every {
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -11442,7 +11442,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     OTHER_PARTITION,
     usize::from(TWO_SHARDS),
   )));
-  let listed = client.call(&RequestBody::List);
+  let listed = client.call(&RequestBody::List { after: None });
   let status = client.call(&RequestBody::DaemonStatus);
   daemon_a.stop();
   daemon_b.stop();
@@ -11467,7 +11467,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     "the other owner shard refuses with the shortfall it measured from the fanned configuration: {on_other:?}"
   );
   assert!(
-    matches!(&listed, ReplyBody::Listed { volumes } if volumes.is_empty()),
+    matches!(&listed, ReplyBody::Listed { volumes, .. } if volumes.is_empty()),
     "reads continue, and the refused creates created nothing: {listed:?}"
   );
   let ReplyBody::DaemonStatus { report } = status else {

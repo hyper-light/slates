@@ -18,6 +18,8 @@ export interface VolumeStatus {
   snapshots: number
   watcher: string
   drifted: string[]
+  /** Drifted paths the report did not carry; `slates status --drift` walks them (A-267). */
+  driftedElided: number
   nfsPort: number | null
   placed: boolean
   mirrorAgeNs: number | null
