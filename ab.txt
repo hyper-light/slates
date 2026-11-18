@@ -4027,3 +4027,5 @@ slates daemon: the control shard's beat task ran 531 ms after its last turn (a n
 slates daemon: the control shard's beat task ran 684 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 7 tasks live; its longest poll is 420 ms and its timer overrun 86 ms
 slates daemon: the control shard's beat task ran 513 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 1 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 7 tasks live; its longest poll is 420 ms and its timer overrun 68 ms
 ## run 10 of 10 done, 2026-11-18T11:15:56Z
+To https://github.com/hyper-light/slates
+   fe3a77e..270cdce  270cdcea53275ac34f203f719996cc536c575c21 -> diag-results/g258-44273781244-perkind-x86
