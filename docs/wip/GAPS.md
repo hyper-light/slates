@@ -2083,7 +2083,8 @@
 >     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
 >     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
 >     forwarding it could carry a cut-off node's traffic across.
->   - Eight flows run behind it (`Fleet::start_relayed`), the partitions each against a running process:
+>   - Nine flows run behind it (`Fleet::start_relayed`), the partitions each against a running process: the nemesis
+>     (below) and these eight:
 >     - writes streamed while every path holds 20 ms ± 5 ms and loses 1 %, then 5 %, then 1 % with 2 % duplicated, then
 >       a takeover over the lossy paths;
 >     - an owner cut off both ways, deafened (it speaks and hears nothing) or muted (it hears and nobody hears it), each
