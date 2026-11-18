@@ -38,10 +38,10 @@ pub mod exec;
 pub mod hold;
 
 pub use client::{
-  Advanced, ArchiveExported, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest,
-  DriftedPage, EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, MergeRecord, MergeStatement,
-  MoveState, Page, Rebased, Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding,
-  StreamEnd, Submitted, VhostUserDevice,
+  Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
+  Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, MergeRecord,
+  MergeStatement, MoveState, Page, Rebased, Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream,
+  SignedLanding, StreamEnd, Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -54,17 +54,17 @@ pub use hold::Hold;
 /// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
 pub use slates_ipc::protocol::{
-  ARCHIVE_FILE, AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability,
-  AuditEntry, CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport, ConflictClass,
-  Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport, DetectorPoolReport,
-  DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter, FleetReport,
-  GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence, HostPathReason,
-  IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache, LandingDegradation,
-  LandingDurability, LandingOutcome, LandingSummary, LearnerReport, NamePolicy, OciBinding,
-  PlacedState, PlannedAction, PlannedContent, PlannedEntry, PolicySubject, Principal, ReadAt,
-  ReadWritePolicy, RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights,
-  Scope, SessionReport, ShardReport, SharingSemantics, Signal, SignatureFault, Signer, SignerKey,
-  SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport,
+  ARCHIVE_FILE, AbsenceIs, ActionCount, ArchiveFault, AttachRequest, AttachTransport,
+  AttachmentCapability, AuditEntry, CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport,
+  ConflictClass, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
+  DetectorPoolReport, DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter,
+  FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
+  HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache,
+  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, LearnerReport, NamePolicy,
+  OciBinding, PlacedState, PlannedAction, PlannedContent, PlannedEntry, PolicySubject, Principal,
+  ReadAt, ReadWritePolicy, RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport,
+  Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal, SignatureFault, Signer,
+  SignerKey, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport,
   TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason,
   Verification, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode, WritePolicy,
 };

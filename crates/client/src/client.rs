@@ -129,6 +129,16 @@ pub struct ArchiveExported {
   pub manifest: [u8; 32],
 }
 
+/// A volume made from an archive (§4.11, A-453): the new volume, and the manifest identity of the archive it was made
+/// from, verified against its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveImported {
+  /// The new volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the exported snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
@@ -5093,6 +5103,31 @@ impl Client {
       }),
       _ => Err(ClientError::UnexpectedReply {
         verb: "archive_export",
+      }),
+    }
+  }
+
+  /// Makes a volume `name` of `size` from the archive the caller's volume `archive` holds in its root as
+  /// [`slates_ipc::protocol::ARCHIVE_FILE`] (§4.11, A-453), as an export leaves it or as a caller writes the bytes it
+  /// kept; `require_locked` as a create's. Waits for the import, which reads, verifies and restores the archive in
+  /// slices on `archive`'s owner. `read` on `archive` is required; bytes that make no volume are refused
+  /// `ArchiveRefused` by their kind, with nothing made.
+  pub fn archive_import(
+    &mut self,
+    archive: VolumeId,
+    name: &str,
+    size: SizeClass,
+    require_locked: bool,
+  ) -> Result<ArchiveImported, ClientError> {
+    match self.call(&RequestBody::ArchiveImport {
+      archive,
+      name: name.to_owned(),
+      size,
+      require_locked,
+    })? {
+      ReplyBody::ArchiveImported { id, manifest } => Ok(ArchiveImported { id, manifest }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_import",
       }),
     }
   }

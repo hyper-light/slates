@@ -346,17 +346,16 @@ pub struct ShardState {
   /// mounts and streams recovery keeps.
   pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
   /// Each range a Shards stream's held DAX backing has answered, in the region of the anchor's content object after the
-  /// delta log (A-365; `crate::dax_ranges`): what a successor ingests and never refills. `None` without a content object.
-  #[cfg(unix)]
+  /// delta log (A-365; Windows' sections, A-448; `crate::dax_ranges`): what a successor ingests and never refills. `None`
+  /// without a content object.
   pub(crate) dax_ranges: Option<crate::dax_ranges::RangeTable>,
-  /// The DAX objects the anchor handed back for this shard's partition (A-365; `crate::shards::dax_hold`), until
-  /// recovery takes each back or lets it go. Bounded by the anchor's held-copy bound.
-  #[cfg(unix)]
+  /// The DAX objects the anchor handed back for this shard's partition (A-365; Windows' sections, A-448;
+  /// `crate::shards::dax_hold`), until recovery takes each back or lets it go. Bounded by the anchor's bound for them
+  /// (`DaemonConfig::held_dax_bound`).
   pub(crate) inherited_dax: Vec<crate::shards::dax_hold::InheritedDax>,
   /// The DAX objects recovery kept again in the store, by the attachment of the stream they belong to, until the
   /// stream's adoption takes them (`crate::shards::adopt_one`); any left after every adoption is let go. Bounded as
   /// `inherited_dax` is, of which these were part.
-  #[cfg(unix)]
   pub(crate) adopted_dax: std::collections::BTreeMap<u64, Vec<crate::shards::dax_hold::AdoptedDax>>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
@@ -723,6 +722,9 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
+  /// The replicas of greens this shard owns or holds (A-457, A-273 step 5a; `crate::green_replicas`): as an owner, the
+  /// shards it fed and the engines it is retiring; as a replica's shard, the replicas it holds and what they charged.
+  pub(crate) green_replicas: crate::green_replicas::GreenReplicas,
   /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
   /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
   /// replaced, dropped or its client goes.

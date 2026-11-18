@@ -888,15 +888,19 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
     // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
-    // connections, served again on the listener's shard below.
-    let handed = crate::anchor_hold::adopt(config.held_device_bound());
+    // connections, served again on the listener's shard below. Windows parses at most every entry its anchor may hold,
+    // of every class: the attachments' and the DAX sections' (A-448).
+    let handed = crate::anchor_hold::adopt(
+      config
+        .held_device_bound()
+        .saturating_add(config.held_dax_bound()),
+    );
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
-    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
-    #[cfg(unix)]
+    // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
+    // owns its attachment; and the writable direct maps' copies (A-197), each to the shard that holds its map, which
+    // Linux alone sends the anchor.
     let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
-    #[cfg(unix)]
     let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
@@ -905,8 +909,23 @@ impl Daemon {
       // No other kind of copy is held here: one is let go at once, its record no shard's.
       let _released = crate::anchor_hold::release_copy(copy.copy);
     }
+    // No other kind of copy is held on Windows: a section whose record is no DAX record is an entry no shard adopts,
+    // which the control shard releases with the refused mounts (its release is an exchange only a shard can make).
     #[cfg(windows)]
-    let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    let mut held_mounts = handed.mounts;
+    #[cfg(windows)]
+    held_mounts.extend(
+      other_copies
+        .into_iter()
+        .map(|copy| crate::anchor_hold::HandedMount {
+          attachment: copy.copy,
+          handles: Vec::new(),
+          record: copy.record,
+          adoptable: false,
+        }),
+    );
+    #[cfg(windows)]
+    let mut inherited_winfsp = crate::winfsp::split_held(held_mounts, shards.len()).into_iter();
     // The Shards streams' resync ends (A-433), each to the shard that owns its attachment.
     #[cfg(windows)]
     let mut inherited_resync =
@@ -934,15 +953,16 @@ impl Daemon {
         dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
-      let windows_holds = (
-        inherited_winfsp.next().unwrap_or_default(),
-        if index == 0 {
+      let holds = ShardHolds {
+        winfsp: inherited_winfsp.next().unwrap_or_default(),
+        channel: if index == 0 {
           windows_channel.take()
         } else {
           None
         },
-        inherited_resync.next().unwrap_or_default(),
-      );
+        resync: inherited_resync.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
+      };
       // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
       // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
@@ -972,10 +992,7 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(unix)]
           holds,
-          #[cfg(windows)]
-          windows_holds,
         ));
         if let Err(e) = start.and_then(futures::detach) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -3767,8 +3784,10 @@ impl Daemon {
       .is_some()
   }
 
-  /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
-  /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
+  /// The least CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness window
+  /// held to this build (A-318, [`crate::watchdog::spin_window_ns`]); a shard whose host overruns that window is held to
+  /// its own window's, which is longer (A-455, [`crate::watchdog::watch_window_ns`]). `None` once the daemon has stopped
+  /// its watchdog.
   pub fn spin_window_ns(&self) -> Option<u64> {
     self
       .watchdog
@@ -3814,6 +3833,11 @@ impl Daemon {
     if let Some(watchdog) = self.watchdog.as_ref() {
       watchdog.stopping();
     }
+    // Every replica of a green leaves before its owner is given up (A-457, A-273 step 5a; `slates_mem::sealed`,
+    // "Lifetimes"), while the shards still run to carry the registrations home.
+    if self.runtime.is_some() {
+      self.give_back_replicas();
+    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
@@ -3828,6 +3852,47 @@ impl Daemon {
     // window, then left to the process's end, never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
       log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+    }
+  }
+}
+
+impl Daemon {
+  /// Closes every shard's green replicas and waits until no shard holds a registration of one, a replica, or a
+  /// registration owed home (A-457, A-273 step 5a; `crate::green_replicas::close`, `outstanding`), within an
+  /// observation's budget: an owner dropped with a replica registered keeps its blocks to the process's end
+  /// (`slates_mem::sealed::dropped_with_readers`). A shard that cannot be asked, and what is left at the budget, are
+  /// logged, never silent.
+  fn give_back_replicas(&self) {
+    for shard in &self.shards {
+      if let Err(error) = self.observe(Some(*shard), crate::green_replicas::close) {
+        slates_machine::log_line!(
+          "slates-server: stopping: shard {} gives back no replica: {error}",
+          shard.0
+        );
+      }
+    }
+    let started = slates_machine::clock::monotonic_ns();
+    loop {
+      let outstanding = self
+        .shards
+        .iter()
+        .filter_map(|shard| {
+          self
+            .observe(Some(*shard), crate::green_replicas::outstanding)
+            .ok()
+        })
+        .fold(0usize, usize::saturating_add);
+      if outstanding == 0 {
+        return;
+      }
+      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
+        slates_machine::log_line!(
+          "slates-server: stopping with {outstanding} green replica registrations not given back: their owners keep \
+           their blocks to the process's end"
+        );
+        return;
+      }
+      std::thread::yield_now();
     }
   }
 }
@@ -4051,9 +4116,9 @@ fn content_slice(
   }
 }
 
-/// The DAX range table in this shard's slice of the content object (A-365), with what the previous daemon recorded in
-/// it; none without a content object holding the shard's images (`images`, [`content_slice`]'s range).
-#[cfg(unix)]
+/// The DAX range table in this shard's slice of the content object (A-365; Windows' sections, A-448), with what the
+/// previous daemon recorded in it; none without a content object holding the shard's images (`images`,
+/// [`content_slice`]'s range).
 fn dax_range_table(
   config: &DaemonConfig,
   partition: u16,
@@ -4106,6 +4171,20 @@ struct ShardHolds {
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
+/// What the anchor handed back for one shard's partition (Windows): its WinFsp mounts (A-198), the hold channel (the
+/// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
+#[cfg(windows)]
+struct ShardHolds {
+  /// The held WinFsp mounts.
+  winfsp: Vec<crate::winfsp::InheritedMount>,
+  /// The hold channel's daemon end: the control shard installs it.
+  channel: Option<std::os::windows::io::OwnedHandle>,
+  /// The held Shards streams' resync ends (A-433).
+  resync: Vec<crate::anchor_hold::HandedResync>,
+  /// The held Shards streams' DAX sections (A-448).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -4115,12 +4194,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] windows_holds: (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-    Vec<crate::anchor_hold::HandedResync>,
-  ),
+  holds: ShardHolds,
 ) {
   // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
   // shard queues behind it (GAPS, boot, 2026-10-05).
@@ -4138,10 +4212,7 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(unix)]
     holds,
-    #[cfg(windows)]
-    windows_holds,
   )
   .await;
   let took_us = started.elapsed().as_micros();
@@ -4266,13 +4337,17 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] (inherited_winfsp, windows_channel, inherited_resync): (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-    Vec<crate::anchor_hold::HandedResync>,
-  ),
+  holds: ShardHolds,
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  #[cfg(windows)]
+  let ShardHolds {
+    winfsp: inherited_winfsp,
+    channel: windows_channel,
+    resync: inherited_resync,
+    dax: inherited_dax,
+  } = holds;
+  #[cfg(unix)]
+  let inherited_dax = holds.dax;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4391,8 +4466,7 @@ async fn init_shard(
   };
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  // The DAX range table (A-365), with what the previous daemon recorded in it.
-  #[cfg(unix)]
+  // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
@@ -4443,11 +4517,8 @@ async fn init_shard(
     replay: recovered_writes.records,
     pending_replies: std::collections::BTreeMap::new(),
     recovered_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     dax_ranges,
-    #[cfg(unix)]
-    inherited_dax: holds.dax,
-    #[cfg(unix)]
+    inherited_dax,
     adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
@@ -4631,6 +4702,7 @@ async fn init_shard(
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
+    green_replicas: crate::green_replicas::GreenReplicas::default(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
@@ -6541,7 +6613,7 @@ mod limits {
 #[cfg(test)]
 pub(crate) use tests::{
   audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_first, test_profile,
+  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6787,6 +6859,17 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  pub(crate) fn observe_at<T: Send + 'static>(
+    daemon: &super::Daemon,
+    partition: usize,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 

@@ -762,8 +762,20 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The file opened to read, never through a link (`O_NOFOLLOW`; a regular file alone): `fchmod` asks ownership, not
+  /// write access (A-458). A file its owner may not read is refused `EACCES`, typed, and the entry fails.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.host.open_file(dir, name)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     rustix::fs::fchmod(self.file(file)?, mode_bits(mode)).map_err(refusal)
+  }
+
+  /// Linux and macOS hold no Windows attribute bits (A-262: their landings carry them in the volume and apply none), so
+  /// the file is kept as it is (A-451).
+  fn set_windows(&mut self, file: HostFile, _windows: u16) -> Result<(), HostError> {
+    self.file(file).map(drop)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
@@ -834,7 +846,8 @@ impl LandFs for OsLand {
   /// never a symlink swapped in under the name) and given the recorded mode exactly with `fchmod`,
   /// as a file's temporary is by `set_mode`. Before 2026-10-01 the umask cleared bits the volume
   /// held (0775 landed 0755; docs/bugs/2026-10-01-landed-directory-mode-umask.md).
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  /// A directory with its mode; a Unix directory holds no Windows bits (A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, _windows: u16) -> Result<(), HostError> {
     let parent = self.dir(dir)?;
     rustix::fs::mkdirat(parent, name, mode_bits(mode)).map_err(refusal)?;
     let made = rustix::fs::openat(parent, name, dir_flags(), Mode::empty()).map_err(refusal)?;
@@ -845,13 +858,15 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::REMOVEDIR).map_err(refusal)
   }
 
-  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract).
+  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract); a Unix link
+  /// has no kind and holds no Windows bits (A-451).
   fn symlink(
     &mut self,
     dir: HostDir,
     name: &str,
     target: &str,
     _staged: &str,
+    _windows: u16,
   ) -> Result<(), HostError> {
     rustix::fs::symlinkat(target, self.dir(dir)?, name).map_err(refusal)
   }

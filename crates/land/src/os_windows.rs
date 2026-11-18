@@ -21,10 +21,16 @@
 //!   `FlushFileBuffers` on ⌈√n⌉ threads (the Unix derivation), off the shard (A-132). A directory's sync and the media
 //!   barrier are the directory's own `FlushFileBuffers`, through the directory opened again with `FILE_ADD_FILE` (an
 //!   empty name relative to its own handle): `ReOpenFile` with `GENERIC_WRITE` was refused `ERROR_ACCESS_DENIED`.
-//! - **Mode and times:** Windows keeps no POSIX mode. [`LandFs::set_mode`] records the one bit it can: a mode with no
-//!   write bit makes the file read-only (`FILE_ATTRIBUTE_READONLY`), as A-262 reads a file's read-only state as its
-//!   mode, and every other bit the file holds is kept. The modification time is set through `FILE_BASIC_INFO` in the
-//!   FILETIME domain.
+//! - **Mode, attributes and times:** Windows keeps no POSIX mode. [`LandFs::set_mode`] records the one bit it can: a
+//!   mode with no write bit makes the file read-only (`FILE_ATTRIBUTE_READONLY`), as A-262 reads a file's read-only
+//!   state as its mode, and every other bit the file holds is kept. Since A-451 every other bit the volume keeps
+//!   (hidden, system, archive, offline, not indexed, and a directory's read-only) is set on the file, directory or link
+//!   the landing makes ([`LandFs::set_windows`], the `mkdir` and `symlink` verbs; `crate::windows_bits`), so what a
+//!   person set through the drive is what the disk holds; NTFS sets `ARCHIVE` again on the rename that places a file.
+//!   The word is read back after it is set, and a bit the target's file system did not take (FAT holds no `OFFLINE`
+//!   and no `NOT_CONTENT_INDEXED`, and drops them without a word) refuses the entry `EOPNOTSUPP` (`give_bits`), so a
+//!   bit is landed or refused, never dropped. The modification time is set through `FILE_BASIC_INFO` in the FILETIME
+//!   domain.
 //! - **Reflinks (A-445):** where the target's volume shares clusters between files (ReFS, a Dev Drive:
 //!   `FILE_SUPPORTS_BLOCK_REFCOUNTING`), a file whose bytes its batch already staged is cloned from that temporary by
 //!   `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, in regions of whole clusters below 4 GiB laid out from the volume's own cluster
@@ -42,9 +48,9 @@
 //!   it disabled, and `CreateSymbolicLinkW` enables it around its own call, so the set runs on this thread under a copy
 //!   of the process's token with it enabled (`as_link_maker`), for that call alone. No privilege is asked for that the
 //!   process does not hold (R10): where NTFS refuses the set (a standard account outside Developer Mode) the entry fails
-//!   `EPERM`, typed, as every link did before A-438. A link is a file link: the seam carries no link's type, so a
-//!   directory link Windows made in the volume (A-275's `LINK_DIRECTORY`) lands as a file link until the volume's other
-//!   attribute bits reach a landing (GAPS, A-185's owed list).
+//!   `EPERM`, typed, as every link did before A-438. Since A-451 a directory link Windows made in the volume (A-275's
+//!   `LINK_DIRECTORY`) lands as a directory link: its object is made a directory, as `SYMBOLIC_LINK_FLAG_DIRECTORY`
+//!   makes one.
 //!
 //! Refusals the engine tells apart are reported in its errno numbers (it was written over POSIX): a name that exists
 //! as `EEXIST` (17), no room as `ENOSPC` (28), the missing exchange as `EOPNOTSUPP` (95).
@@ -75,12 +81,11 @@ use windows_sys::Win32::Foundation::{
   STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-  DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-  FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-  FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-  FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
-  FileDispositionInfoEx, FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE,
-  SetFileInformationByHandle,
+  DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO,
+  FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+  FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
+  FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
+  GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
 
 use crate::engine::LandingTarget;
@@ -101,6 +106,9 @@ const TEMP_ACCESS: u32 =
   FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written,
+/// nothing of its data (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`).
+const CHMOD_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
 const MADE_DIR_ACCESS: u32 =
   FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -111,12 +119,6 @@ const RENAME_POSIX: u32 = 0x2;
 /// FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE` (winbase.h): the name goes at once, whoever holds the file, and a
 /// read-only file goes too, as `unlink` removes one.
 const DISPOSE_POSIX: u32 = 0x1 | 0x2 | 0x10;
-/// Format: the POSIX write bits of a mode; a file with none of them is made read-only.
-const WRITE_BITS: u32 = 0o222;
-/// Format: `FILE_ATTRIBUTE_VALID_SET_FLAGS` (winnt.h): the attribute bits a caller may set through `FileBasicInfo`
-/// (`READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, `NORMAL`, `TEMPORARY`, `OFFLINE`, `NOT_CONTENT_INDEXED`); the others (a
-/// directory, a reparse point, compression, encryption, sparseness) are the file system's own and are never written.
-const SETTABLE_ATTRIBUTES: u32 = 0x0000_31A7;
 /// Format: the FILETIME epoch (1601) precedes the Unix epoch by this many 100 ns intervals.
 const FILETIME_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 /// Format: nanoseconds in a FILETIME interval.
@@ -694,6 +696,39 @@ fn enabled_link_token() -> Result<OwnedHandle, String> {
   Ok(copy)
 }
 
+/// Sets the attribute word `word` on the object `object` and leaves its times as they are (`FILE_BASIC_INFO` with
+/// every time zero).
+fn set_attributes(object: BorrowedHandle<'_>, word: u32) -> Result<(), HostError> {
+  set_basic(
+    object,
+    &FILE_BASIC_INFO {
+      CreationTime: 0,
+      LastAccessTime: 0,
+      LastWriteTime: 0,
+      ChangeTime: 0,
+      FileAttributes: word,
+    },
+  )
+}
+
+/// Gives the object `object`, made as `made`, the Windows bits the volume keeps for it (`volume`, A-451:
+/// `crate::windows_bits::set_word`), then reads its attributes back: a file system that holds fewer bits than NTFS
+/// drops the others without a word (FAT, `crate::windows_bits`), so a bit that did not take refuses the entry
+/// `EOPNOTSUPP` rather than land without it (`crate::windows_bits::held`).
+fn give_bits(
+  object: BorrowedHandle<'_>,
+  volume: u16,
+  made: crate::windows_bits::Made,
+) -> Result<(), HostError> {
+  let current = attributes(object)?;
+  set_attributes(object, crate::windows_bits::set_word(current, volume, made))?;
+  if crate::windows_bits::held(attributes(object)?, volume, made) {
+    Ok(())
+  } else {
+    Err(HostError::Unavailable(ERRNO_NOTSUP))
+  }
+}
+
 /// Writes `info` as the file's basic information: a zero member is left as it is.
 fn set_basic(file: BorrowedHandle<'_>, info: &FILE_BASIC_INFO) -> Result<(), HostError> {
   let size = u32::try_from(size_of::<FILE_BASIC_INFO>()).unwrap_or(0);
@@ -768,26 +803,6 @@ fn flush_dir(dir: BorrowedHandle<'_>) -> Result<(), HostError> {
 fn ticks_of_unix_ns(ns: i64) -> i64 {
   ns.div_euclid(HUNDRED_NS)
     .saturating_add(FILETIME_UNIX_EPOCH_TICKS)
-}
-
-/// The attribute word a file holding `current` is given for the mode `mode`. Windows keeps no POSIX mode, and the one
-/// bit a mode decides is `READONLY`: set where the mode has no write bit, cleared where it has one (A-262: a file's
-/// read-only state is its mode). Every other settable bit the file holds is kept, and `NORMAL` stands alone for a word
-/// with no bit, since a zero word in `FILE_BASIC_INFO` leaves the attributes as they are. Until 2026-11-18 the word was
-/// written whole (`NORMAL` or `READONLY`); the rename that places the temporary sets `ARCHIVE` again, so a landed file
-/// held it either way (measured on CI's windows-latest, run 44367207034), and only the rule changed.
-fn attributes_for_mode(current: u32, mode: u32) -> u32 {
-  let kept = current & SETTABLE_ATTRIBUTES & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_NORMAL);
-  let word = if mode & WRITE_BITS == 0 {
-    kept | FILE_ATTRIBUTE_READONLY
-  } else {
-    kept
-  };
-  if word == 0 {
-    FILE_ATTRIBUTE_NORMAL
-  } else {
-    word
-  }
 }
 
 /// Format: the bytes of the largest record `GetTokenInformation` fills here, `TOKEN_USER` and its SID (a `TOKEN_OWNER`
@@ -1233,21 +1248,41 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The file opened to have its attributes set and nothing else (A-458: `FILE_READ_ATTRIBUTES |
+  /// FILE_WRITE_ATTRIBUTES`), relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a
+  /// link: opened with `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = nt_create(
+      self.dir(dir)?,
+      name,
+      CHMOD_ACCESS,
+      nt::FILE_OPEN,
+      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      0,
+    )?;
+    if attributes(opened.as_handle())?
+      & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+      != 0
+    {
+      return Err(HostError::NotFile);
+    }
+    self.host.adopt_file(opened)
+  }
+
   /// The one bit a mode decides on Windows, `READONLY`, with every other bit the temporary holds kept
-  /// ([`attributes_for_mode`]).
+  /// (`crate::windows_bits::mode_word`).
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     let handle = self.file(file)?;
-    let wanted = attributes_for_mode(attributes(handle)?, mode);
-    set_basic(
-      handle,
-      &FILE_BASIC_INFO {
-        CreationTime: 0,
-        LastAccessTime: 0,
-        LastWriteTime: 0,
-        ChangeTime: 0,
-        FileAttributes: wanted,
-      },
-    )
+    let wanted = crate::windows_bits::mode_word(attributes(handle)?, mode);
+    set_attributes(handle, wanted)
+  }
+
+  /// The volume's Windows bits on the temporary (A-451, `give_bits`): every bit the volume keeps, set or cleared and
+  /// read back, the read-only state its mode gave it kept. The rename that places it sets `ARCHIVE` again (NTFS's own
+  /// rule for a renamed file, measured by A-185), so a landed file is `ARCHIVE` whatever the volume held: the truth that
+  /// it changed, which a backup reads.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
+    give_bits(self.file(file)?, windows, crate::windows_bits::Made::File)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
@@ -1314,17 +1349,30 @@ impl LandFs for OsLand {
     dispose(entry.as_handle())
   }
 
-  /// A directory made with `FILE_CREATE`; Windows keeps no POSIX mode, so `mode` decides nothing here.
-  fn mkdir(&mut self, dir: HostDir, name: &str, _mode: u32) -> Result<(), HostError> {
-    nt_create(
+  /// A directory made with `FILE_CREATE` and given the volume's Windows bits (A-451, `give_bits`: its read-only,
+  /// hidden, system, archive, offline and not-indexed bits); Windows keeps no POSIX mode, so `mode` decides nothing here.
+  /// Where its bits are refused, the empty directory is removed, so nothing of the entry is left. The bits are given
+  /// after the directory is made, as a Unix directory's mode is (`fchmod` after `mkdirat`), so a crash between the two
+  /// leaves it without them, and a resumed landing takes it as already there (GAPS, A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, _mode: u32, windows: u16) -> Result<(), HostError> {
+    let made = nt_create(
       self.dir(dir)?,
       name,
-      MADE_DIR_ACCESS,
+      MADE_DIR_ACCESS | FILE_WRITE_ATTRIBUTES | DELETE,
       nt::FILE_CREATE,
       nt::FILE_DIRECTORY_FILE,
       FILE_ATTRIBUTE_NORMAL,
-    )
-    .map(drop)
+    )?;
+    let given = give_bits(made.as_handle(), windows, crate::windows_bits::Made::Dir);
+    if let Err(refused) = given {
+      if let Err(left) = dispose(made.as_handle()) {
+        slates_machine::log_line!(
+          "slates-land: a directory whose attributes were refused stays at {name}: {left:?}"
+        );
+      }
+      return Err(refused);
+    }
+    Ok(())
   }
 
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
@@ -1336,35 +1384,45 @@ impl LandFs for OsLand {
   }
 
   /// The volume's link to `target` as a Windows symbolic link in A-275's form (the module's "Symbolic links"): made at
-  /// `staged`, its buffer set with the link privilege where the process holds it (`as_link_maker`), then moved to
-  /// `name` without replacing; whatever refuses a step, the staged object is removed, and a crash between them leaves
-  /// it at the landing's hidden name for its sweep.
+  /// `staged` (a directory object for a directory link, A-451), its buffer set with the link privilege where the process
+  /// holds it (`as_link_maker`), given the volume's bits (`give_bits`), then moved to `name` without replacing;
+  /// whatever refuses a step, the staged object is removed, and a crash between them leaves it at the landing's hidden
+  /// name for its sweep.
   fn symlink(
     &mut self,
     dir: HostDir,
     name: &str,
     target: &str,
     staged: &str,
+    windows: u16,
   ) -> Result<(), HostError> {
     let buffer = slates_vfs::host::windows_link::reparse_data(target)
       .map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
     entry_units(name)?;
     let parent = self.dir(dir)?;
+    // A directory link is a directory object (A-275's `LINK_DIRECTORY`, A-451), a file link a file.
+    let kind = if crate::windows_bits::directory_link(windows) {
+      nt::FILE_DIRECTORY_FILE
+    } else {
+      nt::FILE_NON_DIRECTORY_FILE
+    };
     let object = nt_create(
       parent,
       staged,
       LINK_ACCESS,
       nt::FILE_CREATE,
-      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      kind | nt::FILE_OPEN_REPARSE_POINT,
       FILE_ATTRIBUTE_NORMAL,
     )?;
-    let placed = as_link_maker(|| set_reparse(object.as_handle(), &buffer)).and_then(|()| {
-      if staged == name {
-        Ok(())
-      } else {
-        rename_handle(object.as_handle(), parent, name)
-      }
-    });
+    let placed = as_link_maker(|| set_reparse(object.as_handle(), &buffer))
+      .and_then(|()| give_bits(object.as_handle(), windows, crate::windows_bits::Made::Link))
+      .and_then(|()| {
+        if staged == name {
+          Ok(())
+        } else {
+          rename_handle(object.as_handle(), parent, name)
+        }
+      });
     if let Err(refused) = placed {
       // The step's own refusal is what the landing reports; a removal refused too leaves the object at the hidden name,
       // where this landing's sweep removes it (`engine::sweep_parent`).

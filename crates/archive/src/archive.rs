@@ -14,6 +14,11 @@
 //! This module is pure: it builds and reads byte buffers. slates never writes an archive to disk
 //! (R1); it lives in RAM, is handed to a caller, or is the replication/clone container.
 //!
+//! A reader decodes in one call ([`Archive::decode`]) or a bounded piece at a time ([`Decoding`], A-453): the
+//! whole-archive hash a slice a piece, then a chunk record a piece, the same checks in the same order, so a shard
+//! decoding an archive a caller handed it gives its thread back between pieces. The one call is the pieces run to their
+//! end, so one code path decodes either way.
+//!
 //! Scope: raw- and LZ4-encoded chunks, with the manifest a Merkle tree ([`crate::manifest`]).
 //! zstd, dictionaries, the cost model and export/restore are later Phase 7 work (owed); the format
 //! reserves their fields so an archive written then stays readable now.
@@ -30,7 +35,7 @@ use crate::wire::{Reader, Writer};
 /// length, flags, base page size, two chunk-size parameters, the manifest hash, the chunk count,
 /// the raw and stored byte totals, the creation time, the volume and snapshot ids, and the
 /// name-policy id and Unicode version.
-const HEADER_LEN: u64 = (size_of::<u32>()
+pub(crate) const HEADER_LEN: u64 = (size_of::<u32>()
   + size_of::<u16>()
   + size_of::<u16>()
   + size_of::<u32>()
@@ -50,7 +55,7 @@ const HEADER_LEN: u64 = (size_of::<u32>()
 
 /// Format: the trailer is the section index (four `u64` offsets), the whole-archive BLAKE3, and
 /// the tail magic.
-const TRAILER_LEN: u64 = (size_of::<u64>()
+pub(crate) const TRAILER_LEN: u64 = (size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>()
@@ -324,53 +329,13 @@ impl Archive {
 
   /// Parses and fully verifies an archive: the magic and major, the whole-archive hash (so a
   /// truncated or altered stream is refused), every chunk's identity, and the manifest's identity.
+  /// The [`Decoding`] run to its end in one call, so one code path decodes either way (A-453).
   pub fn decode(bytes: &[u8]) -> Result<Archive, ArchiveError> {
-    let header = Header::parse(bytes)?;
-    verify_archive_hash(bytes)?;
-    let sections = Sections::parse(bytes)?;
-
-    let mut reader = Reader::at(bytes, sections.chunks_offset)?;
-    let mut chunks = Vec::new();
-    let (mut raw_total, mut stored_total) = (0u64, 0u64);
-    for index in 0..header.chunk_count {
-      let chunk = read_chunk(&mut reader, index, header.chunk_max)?;
-      raw_total = raw_total.saturating_add(chunk.raw_len);
-      stored_total = stored_total.saturating_add(chunk.stored_len);
-      chunks.push(chunk);
-    }
-    if raw_total != header.raw_bytes || stored_total != header.stored_bytes {
-      return Err(ArchiveError::TotalsMismatch);
-    }
-
-    let mut manifest_reader = Reader::at(bytes, sections.manifest_offset)?;
-    let manifest_len = usize::try_from(manifest_reader.u64()?).unwrap_or(usize::MAX);
-    let manifest_bytes = manifest_reader.raw(manifest_len)?;
-    let (root_meta, tree_bytes) =
-      manifest::decode_root_meta(manifest_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
-    let manifest = Node::decode(tree_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
-    if manifest::manifest_identity(&root_meta, &manifest) != header.manifest_hash {
-      return Err(ArchiveError::ManifestHashMismatch);
-    }
-
-    // The seek table's magic is checked so a malformed one is refused.
-    let mut seek_reader = Reader::at(bytes, sections.seek_offset)?;
-    if seek_reader.u32()? != SEEK_TABLE_MAGIC {
-      return Err(ArchiveError::BadSeekTable);
-    }
-
-    Ok(Archive {
-      base_page_size: header.base_page_size,
-      chunk_min: header.chunk_min,
-      chunk_max: header.chunk_max,
-      created_unix: header.created_unix,
-      volume_id: header.volume_id,
-      snapshot_id: header.snapshot_id,
-      name_policy_id: header.name_policy_id,
-      unicode_version: header.unicode_version,
-      root_meta,
-      manifest,
-      chunks,
-    })
+    // Stepped with no bound, a fresh decoding runs to its archive or its refusal in this one call; `None` comes back
+    // only from a decoding that already gave its archive, which this one has not.
+    Decoding::new(bytes)?
+      .step(usize::MAX, || false)?
+      .ok_or(ArchiveError::Truncated)
   }
 
   /// The identity the header pins for the manifest: the root's own metadata and the tree's Merkle
@@ -409,6 +374,192 @@ impl Archive {
       }
     }
     Ok(None)
+  }
+}
+
+/// An archive parsed and verified a bounded piece at a time (A-453; CLAUDE.md "Bounded work everywhere"), as
+/// [`Archive::decode`] parses it in one call, with the same checks in the same order and the same refusals:
+/// - at once ([`Decoding::new`]), the header's fixed fields, so a foreign magic, an unknown major or required flag and
+///   a declared chunk maximum past the format's cap are refused before a byte past the header is read, then the
+///   stream's length against the header and trailer it must hold and the trailer's magic;
+/// - the whole-archive BLAKE3, at most `slice_bytes` of the stream a piece, compared with the trailer's once whole, so
+///   nothing past the header is decoded before the checksum holds (the hostile-input rule, §4.9);
+/// - each chunk record a piece: its declared sizes admitted before its payload is copied, its payload decoded and held
+///   to its identity, as a chunk is wherever it is read;
+/// - the totals the header declares against the chunks' own;
+/// - the manifest, decoded and held to the identity the header declares, and the seek table's magic, one piece.
+///
+/// A shard decoding an archive a caller handed it (`ArchiveImport`) gives its thread back between steps. Owed: the
+/// manifest's piece is the whole tree's decode and Merkle identity (GAPS A-453), as the takeover's restore once was.
+pub struct Decoding<'bytes> {
+  bytes: &'bytes [u8],
+  header: Header,
+  stage: DecodeStage<'bytes>,
+  /// The chunk records read so far, in the archive's order.
+  chunks: Vec<Chunk>,
+  /// The raw and stored bytes of the chunks read so far.
+  totals: (u64, u64),
+}
+
+/// Where a [`Decoding`] stands.
+enum DecodeStage<'bytes> {
+  /// The whole-archive BLAKE3 over the stream before its hash field, hashed up to `at`, which ends at `end`.
+  Hashing {
+    hasher: Box<blake3::Hasher>,
+    at: usize,
+    end: usize,
+  },
+  /// The chunk records read, `index` of them so far, the reader at the next.
+  Chunks {
+    sections: Sections,
+    reader: Reader<'bytes>,
+    index: u64,
+  },
+  /// The manifest and the seek table.
+  Manifest { sections: Sections },
+  /// The archive given.
+  Done,
+}
+
+impl<'bytes> Decoding<'bytes> {
+  /// A decoding of `bytes`, its header parsed and its length and trailer magic checked: refused at once, typed, for a
+  /// stream that is no archive this reader reads or is shorter than its frame.
+  pub fn new(bytes: &'bytes [u8]) -> Result<Decoding<'bytes>, ArchiveError> {
+    let header = Header::parse(bytes)?;
+    let end = hashed_end(bytes)?;
+    Ok(Decoding {
+      bytes,
+      header,
+      stage: DecodeStage::Hashing {
+        hasher: Box::new(blake3::Hasher::new()),
+        at: 0,
+        end,
+      },
+      chunks: Vec::new(),
+      totals: (0, 0),
+    })
+  }
+
+  /// The manifest identity the header declares: the archive's own once [`Decoding::step`] has returned it, since the
+  /// decode refuses a tree that does not hash to it.
+  pub fn manifest_identity(&self) -> [u8; 32] {
+    self.header.manifest_hash
+  }
+
+  /// Decodes until `spent` says the step's share is spent, a piece at least, no piece hashing more than `slice_bytes`
+  /// of the stream (a byte at least): `Some` with the archive once every piece is done, and `None` after (the archive
+  /// is given once). A stream that does not decode is refused typed, as [`Archive::decode`] refuses it.
+  pub fn step(
+    &mut self,
+    slice_bytes: usize,
+    mut spent: impl FnMut() -> bool,
+  ) -> Result<Option<Archive>, ArchiveError> {
+    loop {
+      if matches!(self.stage, DecodeStage::Done) {
+        return Ok(None);
+      }
+      if let Some(archive) = self.piece(slice_bytes)? {
+        return Ok(Some(archive));
+      }
+      if spent() {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// One piece of the decode; the archive once every piece is done.
+  fn piece(&mut self, slice_bytes: usize) -> Result<Option<Archive>, ArchiveError> {
+    match std::mem::replace(&mut self.stage, DecodeStage::Done) {
+      DecodeStage::Hashing {
+        mut hasher,
+        at,
+        end,
+      } => {
+        let stop = at.saturating_add(slice_bytes.max(1)).min(end);
+        hasher.update(self.bytes.get(at..stop).ok_or(ArchiveError::Truncated)?);
+        self.stage = if stop < end {
+          DecodeStage::Hashing {
+            hasher,
+            at: stop,
+            end,
+          }
+        } else {
+          let stored = self
+            .bytes
+            .get(end..end.saturating_add(size_of::<[u8; 32]>()))
+            .ok_or(ArchiveError::Truncated)?;
+          if hasher.finalize().as_bytes().as_slice() != stored {
+            return Err(ArchiveError::ArchiveHashMismatch);
+          }
+          let sections = Sections::parse(self.bytes)?;
+          DecodeStage::Chunks {
+            sections,
+            reader: Reader::at(self.bytes, sections.chunks_offset)?,
+            index: 0,
+          }
+        };
+        Ok(None)
+      }
+      DecodeStage::Chunks {
+        sections,
+        mut reader,
+        index,
+      } => {
+        if index >= self.header.chunk_count {
+          if self.totals != (self.header.raw_bytes, self.header.stored_bytes) {
+            return Err(ArchiveError::TotalsMismatch);
+          }
+          self.stage = DecodeStage::Manifest { sections };
+          return Ok(None);
+        }
+        let chunk = read_chunk(&mut reader, index, self.header.chunk_max)?;
+        self.totals = (
+          self.totals.0.saturating_add(chunk.raw_len),
+          self.totals.1.saturating_add(chunk.stored_len),
+        );
+        self.chunks.push(chunk);
+        self.stage = DecodeStage::Chunks {
+          sections,
+          reader,
+          index: index.saturating_add(1),
+        };
+        Ok(None)
+      }
+      DecodeStage::Manifest { sections } => self.manifest(sections).map(Some),
+      DecodeStage::Done => Ok(None),
+    }
+  }
+
+  /// The manifest decoded and held to the header's identity, the seek table's magic checked, and the archive.
+  fn manifest(&mut self, sections: Sections) -> Result<Archive, ArchiveError> {
+    let mut manifest_reader = Reader::at(self.bytes, sections.manifest_offset)?;
+    let manifest_len = usize::try_from(manifest_reader.u64()?).unwrap_or(usize::MAX);
+    let manifest_bytes = manifest_reader.raw(manifest_len)?;
+    let (root_meta, tree_bytes) =
+      manifest::decode_root_meta(manifest_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
+    let manifest = Node::decode(tree_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
+    if manifest::manifest_identity(&root_meta, &manifest) != self.header.manifest_hash {
+      return Err(ArchiveError::ManifestHashMismatch);
+    }
+    // The seek table's magic is checked so a malformed one is refused.
+    let mut seek_reader = Reader::at(self.bytes, sections.seek_offset)?;
+    if seek_reader.u32()? != SEEK_TABLE_MAGIC {
+      return Err(ArchiveError::BadSeekTable);
+    }
+    let header = &self.header;
+    Ok(Archive {
+      base_page_size: header.base_page_size,
+      chunk_min: header.chunk_min,
+      chunk_max: header.chunk_max,
+      created_unix: header.created_unix,
+      volume_id: header.volume_id,
+      snapshot_id: header.snapshot_id,
+      name_policy_id: header.name_policy_id,
+      unicode_version: header.unicode_version,
+      root_meta,
+      manifest,
+      chunks: std::mem::take(&mut self.chunks),
+    })
   }
 }
 
@@ -479,6 +630,7 @@ impl Header {
 }
 
 /// The trailer's section offsets.
+#[derive(Clone, Copy)]
 struct Sections {
   chunks_offset: u64,
   manifest_offset: u64,
@@ -504,8 +656,9 @@ impl Sections {
   }
 }
 
-/// Verifies the trailer magic and the whole-archive BLAKE3 (the bytes before the hash field).
-fn verify_archive_hash(bytes: &[u8]) -> Result<(), ArchiveError> {
+/// Where the whole-archive BLAKE3's coverage ends, the hash field's start, once the stream is checked long enough for a
+/// header and a trailer (else `Truncated`) and its trailer magic checked (else `BadTrailer`).
+fn hashed_end(bytes: &[u8]) -> Result<usize, ArchiveError> {
   let total = bytes.len() as u64;
   if total < HEADER_LEN + TRAILER_LEN {
     return Err(ArchiveError::Truncated);
@@ -520,9 +673,16 @@ fn verify_archive_hash(bytes: &[u8]) -> Result<(), ArchiveError> {
   // The hash covers everything up to the hash field (the section index included), which ends
   // `size_of::<[u8;32]>() + size_of::<u32>()` bytes before the end.
   let hash_field = size_of::<[u8; 32]>().saturating_add(size_of::<u32>());
-  let covered_end = usize::try_from(total)
-    .unwrap_or(usize::MAX)
-    .saturating_sub(hash_field);
+  Ok(
+    usize::try_from(total)
+      .unwrap_or(usize::MAX)
+      .saturating_sub(hash_field),
+  )
+}
+
+/// Verifies the trailer magic and the whole-archive BLAKE3 (the bytes before the hash field).
+fn verify_archive_hash(bytes: &[u8]) -> Result<(), ArchiveError> {
+  let covered_end = hashed_end(bytes)?;
   let covered = bytes.get(..covered_end).ok_or(ArchiveError::Truncated)?;
   let stored = bytes
     .get(covered_end..covered_end.saturating_add(size_of::<[u8; 32]>()))

@@ -3860,6 +3860,10 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
   let lease_expiring = u64::try_from(expiring).unwrap_or(u64::MAX);
   let shard_clients = u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX);
   let shard_deferred = u64::try_from(state.deferred.len()).unwrap_or(u64::MAX);
+  // The window the watchdog judges this shard by (A-455): its rule over the overrun this shard measured, which the
+  // watchdog reads from the shard's registry pulse, where the shard mirrors it at every wait it folds in.
+  let watch_window_ns =
+    crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
   // A signal's value is `Some` when measured (§4.14 A-9): the six shard signals are all computable on a
   // live shard, so each is `Some` — a real zero (no volumes, no expiring leases) is a measured zero, not
   // an absent one. The `None` case is reserved for a signal that genuinely cannot be measured in a state
@@ -3877,6 +3881,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       HealthSignal::NfsLocalP99Ns => nfs_quantile(state, NfsTimes::Local, P99_PPM),
       HealthSignal::NfsLocalOffCpuP99Ns => nfs_quantile(state, NfsTimes::LocalOffCpu, P99_PPM),
       HealthSignal::NfsForwardedP99Ns => nfs_quantile(state, NfsTimes::Forwarded, P99_PPM),
+      HealthSignal::WatchWindowNs => Some(watch_window_ns),
     }
   };
   // Each signal ages by the registry's stated basis (§4.14): a report-time value is age zero, a
@@ -4436,6 +4441,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::DurabilityPending { .. } => "durability_pending",
     Refusal::VerdictReplaced { .. } => "verdict_replaced",
     Refusal::MoveRefused { .. } => "move_refused",
+    Refusal::ArchiveRefused { .. } => "archive_refused",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4487,6 +4493,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
       | RequestBody::ArchiveExport { .. }
+      | RequestBody::ArchiveImport { .. }
   )
 }
 
@@ -4905,6 +4912,12 @@ fn dispatch_inner(
       snapshot,
       name,
     } => crate::image::archive_verb(state, principal, volume, snapshot, name),
+    RequestBody::ArchiveImport {
+      archive,
+      name,
+      size,
+      require_locked,
+    } => crate::image::import_verb(state, principal, archive, name, (size, require_locked)),
     RequestBody::Checkout {
       green,
       base,
@@ -9146,6 +9159,9 @@ fn judge_submission(
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
+  // The green's replicas on the node's other shards are made before its first change (A-457, A-273 step 5a), so the
+  // settle's fold and the verdict's version below are fed to them.
+  crate::green_replicas::ensure(state, green_id);
   if let Err(available) =
     crate::merge_service::settle_green_retention_leaving(state, green_id, room)
   {
@@ -9201,6 +9217,15 @@ fn judge_submission(
       ) {
         return refused(refusal);
       }
+      // The version goes to the green's replicas (A-457, A-273 step 5a) before anything else changes the green: a change
+      // left unfed would evict them all at the next.
+      crate::green_replicas::feed_version(
+        state,
+        green_id,
+        (version, &inc),
+        applied,
+        crate::signed_work::to_entry(&signed.verification),
+      );
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
       let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
@@ -11868,8 +11893,17 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
   }
+  // A green whose record went with the rollback is given up once every replica of it has left (A-457, A-273 step 5a).
+  let gone: Vec<DbVolumeId> = state
+    .greens
+    .keys()
+    .copied()
+    .filter(|id| state.db.partition().volume(*id).is_none())
+    .collect();
+  for id in gone {
+    crate::green_replicas::give_up(state, id);
+  }
   let partition = state.db.partition();
-  state.greens.retain(|id, _| partition.volume(*id).is_some());
   let mut released = 0u64;
   state.works.retain(|id, work| {
     let keep = partition.volume(*id).is_some();
@@ -12905,6 +12939,8 @@ pub(crate) fn adopt_taken_over_green(
     ..
   } = adopted;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, id);
   state.greens.insert(id, engine);
   // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
   // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
@@ -13283,12 +13319,26 @@ pub(crate) fn restore_admitted(
     SizeClass::Bounded { limit } => limit,
     SizeClass::Dynamic { max } => max,
   };
-  state.store.make_room(needed.min(volume_cap));
   // The room this node's candidate claim holds for the volume is the restore's own (§4.2, g229): what the shard could
   // admit beside it no longer counts it.
   let claimed = claimed_bytes(state, id);
-  let budget = volume_cap.min(state.store.budget.admittable().saturating_add(claimed));
-  let room = volume_cap.min(state.store.admittable().saturating_add(claimed));
+  restore_budget(state, volume_cap, claimed, needed)
+}
+
+/// The budget a restore needing `needed` bytes is admitted against, and the room a refusal names, for a volume that may
+/// hold `volume_cap` bytes and holds `own` bytes of the shard's room already (its claim's, or its admission's
+/// reservation): no more than the volume may hold and no more than this shard could admit beside what it holds. A shard
+/// that claims its arena lazily makes room for the restore first (A-98). One rule for a taken-over volume's restore
+/// ([`restore_admitted`]) and an archive's import (`image::ImportJob`, A-453).
+pub(crate) fn restore_budget(
+  state: &mut ShardState,
+  volume_cap: u64,
+  own: u64,
+  needed: u64,
+) -> (u64, u64) {
+  state.store.make_room(needed.min(volume_cap));
+  let budget = volume_cap.min(state.store.budget.admittable().saturating_add(own));
+  let room = volume_cap.min(state.store.admittable().saturating_add(own));
   (budget, room)
 }
 
@@ -14202,7 +14252,8 @@ fn new_volume_name(body: &RequestBody) -> Option<&str> {
     | RequestBody::Clone { name, .. }
     | RequestBody::ImageBuild { name, .. }
     | RequestBody::ImageMerge { name, .. }
-    | RequestBody::ArchiveExport { name, .. } => Some(name),
+    | RequestBody::ArchiveExport { name, .. }
+    | RequestBody::ArchiveImport { name, .. } => Some(name),
     _ => None,
   }
 }
@@ -15487,13 +15538,10 @@ pub(crate) async fn rebuild_recovered(
   slices.unit_done().await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
   // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
-  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365), in one ascending order of
-  // their backings' handles (A-389).
-  #[cfg(unix)]
-  {
-    rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
-    slices.unit_done().await;
-  }
+  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365; Windows' sections, A-448), in
+  // one ascending order of their backings' handles (A-389).
+  rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
+  slices.unit_done().await;
   // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
   // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
   rebuilt.writes_replayed = replay_writes(state, slices).await;
@@ -15913,6 +15961,8 @@ fn install_green(
       return Vec::new();
     }
   };
+  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, record.id);
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
   // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
@@ -16271,7 +16321,8 @@ fn fence_green(
   record: &VolumeRecord,
   fence: crate::merge_service::GreenFence,
 ) {
-  state.greens.remove(&record.id);
+  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, record.id);
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);

@@ -3,15 +3,18 @@
 //!
 //! The loop is the supervisor's `step` at the heartbeat cadence with two observations the
 //! supervisor itself does not make: a starting daemon that stops making progress before its
-//! first beat is killed (a start that is not a start), and a daemon whose heartbeat lapses past
+//! watchdog takes the beat over is killed (a start that is not a start), and a daemon whose heartbeat lapses past
 //! the liveness budget is killed (wedged, so a failure like a crash; the policy then decides).
 //! A start is judged in the daemon's own CPU time, read from the OS
-//! (`slates_machine::process_clock`), by the rule its watchdog judges each shard by once it runs
-//! (`slates_server::watchdog::ShardWatch`): no CPU progress for a liveness window is a start
-//! that is stuck, and a window of CPU with no first beat is one that spins; a start that keeps
-//! progressing, however slowly, is starved and waited for, and so is one whose process waits on memory while the host
-//! reports a memory stall (A-336: `slates_machine::memory_stall`, and the process's threads read as the watchdog reads a
-//! shard's, `slates_rt::process_run_reading`). Until 2026-11-07 a start that had not
+//! (`slates_machine::process_clock`), and its beats (A-312: the starting thread beats after each unit of its work), by
+//! the rule its watchdog judges each shard by once it runs (`slates_server::watchdog::ShardWatch`), each beat a step:
+//! a window with no beat, no CPU progress and never runnable is a start that is stuck, judged by its silence since its
+//! last beat, and a window of CPU on one thread with no beat is one that spins; a start that keeps beating or
+//! progressing, however slowly and however long in all, is waited for, starved when held off its CPUs, and so is one
+//! whose process waits on memory while the host reports a memory stall (A-336: `slates_machine::memory_stall`, and the
+//! process's threads read as the watchdog reads a shard's, `slates_rt::process_run_reading`). The window is this
+//! anchor's (A-461, [`anchor_window_ns`]): the liveness window raised to how late the anchor's own timed waits come
+//! back where that is longer, the watchdog's rule over the anchor's measure. Until 2026-11-07 a start that had not
 //! beaten within the fixed recovery budget, a wall second, was killed, and every restart started
 //! over: on this Mac at 144 spinners on 18 CPUs the anchor killed 153 starts of 153, each
 //! 1.07-1.22 s after its spawn, after it had used 16-18 ms of CPU.
@@ -22,7 +25,7 @@
 
 use std::time::Duration;
 
-use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Stopping, Supervisor};
+use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, StopBounds, Stopping, Supervisor};
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -210,9 +213,9 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   let profile: MachineProfile = measure(options.quick)?;
   // This build's cost, measured here, before any start is judged by it ([`start_spin_window_ns`]), and said once.
   slates_machine::log_line!(
-    "slates anchor: a start's busiest thread is judged spinning past {} ms of CPU without a beat (the liveness budget \
-     held to this build, A-318)",
-    start_spin_window_ns() / NS_PER_MS
+    "slates anchor: a start's busiest thread is judged spinning past {} ms of CPU without a beat at least (the liveness \
+     window held to this build, A-318; the window is longer where this anchor's own waits run later, A-461)",
+    start_spin_window_ns(LIVENESS_BUDGET_NS) / NS_PER_MS
   );
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
@@ -282,9 +285,14 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       config.held_copy_bound(),
     )
     .map_err(|e| failed("hold channel", e))?;
+  // Windows holds each class of entry to its own bound: the attachments' mounts and resync ends, and the Shards streams'
+  // DAX sections (A-448).
   #[cfg(windows)]
   supervisor
-    .hold_handles(config.held_device_bound())
+    .hold_handles(slates_anchor::handles::HoldBounds {
+      attachments: config.held_device_bound(),
+      sections: config.held_dax_bound(),
+    })
     .map_err(|error| failed("hold channel", error))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
   // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).
@@ -338,15 +346,27 @@ fn announce_issuer_surface(_supervisor: &Supervisor) {}
 
 /// Stops the daemon through the graceful protocol (`slates_anchor::layout::SUP_STOP`): asks it to stop, then
 /// steps the stop each heartbeat until it exits — on its own after handing off any consensus leadership it
-/// held, or killed when it does not acknowledge within the liveness budget, lets its heartbeat lapse, or
-/// outruns the deadline it declared ([`Supervisor::stop_step`]). Bounded by those three.
-fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result<(), Failure> {
+/// held, or killed when it lets its heartbeat lapse, or has beaten this anchor's window past the request without
+/// acknowledging it or past the deadline it declared ([`Supervisor::stop_step`]). Each bound is derived from what it
+/// waits for (A-461): the lapse is the bound this anchor holds a running daemon's beat to (its liveness window plus its
+/// own measured lateness, `lateness`), and the acknowledgement and the overrun are judged in the daemon's own beating
+/// against this anchor's window ([`anchor_window_ns`]), so a daemon held off its CPUs mid-drain is waited for while it
+/// beats. Bounded by those three.
+fn stop_gracefully(
+  supervisor: &mut Supervisor,
+  clock: &mut HostClock,
+  lateness: &Lateness,
+) -> Result<(), Failure> {
   supervisor
     .request_stop(clock.monotonic_ns())
     .map_err(|e| failed("stop", e))?;
+  let bounds = StopBounds {
+    lapse_ns: lateness.lapse_bound_ns(),
+    window_ns: anchor_window_ns(lateness),
+  };
   loop {
     match supervisor
-      .stop_step(clock.monotonic_ns(), LIVENESS_BUDGET_NS)
+      .stop_step(clock.monotonic_ns(), bounds)
       .map_err(|e| failed("stop", e))?
     {
       Stopping::Draining => std::thread::park_timeout(Duration::from_nanos(HEARTBEAT_NS)),
@@ -361,29 +381,48 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
   }
 }
 
-/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`): its progress and its busiest
-/// thread's CPU, judged by the watchdog's rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
-/// its one step, so it is alive while its CPU progresses and has run less than a window of it, and starved, not stuck,
-/// while its CPU stands still with one of its threads runnable (`slates_rt::process_run_reading`, A-228's rule), or with
-/// none runnable while the host reports a memory stall and its threads' waits are ones memory can show as (A-336: on
-/// Linux one held in the kernel, `D`; elsewhere any). With no clock reading (the process already gone) the wall window
-/// stands alone, as for a shard with no thread clock.
-fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
+/// Derived: the window this anchor judges a daemon's process by (A-461): the liveness window raised to the scheduling
+/// delay this anchor measures of its own waits, its lateness p99 over its last timed waits (`lateness`), and never past
+/// the watchdog's ceiling: the rule the daemon's watchdog judges its shards by (A-455,
+/// `slates_server::watchdog::watch_window_ns`), over this anchor's own measure, since a starting daemon's shards have
+/// measured nothing yet and a silent watchdog's are not to be read. A daemon's threads are scheduled by the host that
+/// delays this anchor's, so a host that holds this anchor's waits past the liveness window holds a start's that long
+/// too, and its process can show no progress sooner; a quiet host's waits come back within a tick, so its window is the
+/// liveness window. Before, every start was judged by the bare liveness window whatever the host.
+fn anchor_window_ns(lateness: &Lateness) -> u64 {
+  slates_server::watchdog::watch_window_ns(lateness.p99_ns())
+}
+
+/// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`) and its beats (A-312): its
+/// progress, its beat word `beat_ns` and its busiest thread's CPU, judged by the watchdog's rule over this anchor's
+/// window `window_ns` ([`anchor_window_ns`], A-461). A beat is its step, so it is alive at a beat and while its CPU
+/// progresses, judged spinning once its busiest thread has run the window of CPU held to the build without a beat, and
+/// starved, not stuck, while its CPU stands still with one of its threads runnable (`slates_rt::process_run_reading`,
+/// A-228's rule), or with none runnable while the host reports a memory stall and its threads' waits are ones memory
+/// can show as (A-336: on Linux one held in the kernel, `D`; elsewhere any). Wedged is its silence: a window since its
+/// last beat or CPU rise in which it was never runnable. With no clock reading (the process already gone) the wall
+/// window stands alone, as for a shard with no thread clock.
+fn judge_start(
+  supervisor: &Supervisor,
+  watch: &mut ShardWatch,
+  (now, beat_ns): (u64, u64),
+  window_ns: u64,
+) -> Verdict {
   judge_start_of(
     supervisor.child_pid(),
     watch,
-    now,
-    slates_machine::memory_stall::read(),
+    (now, beat_ns, slates_machine::memory_stall::read()),
+    window_ns,
   )
 }
 
-/// [`judge_start`] for the process `pid` names, with the host's memory stall at this look `memory`
-/// (`slates_machine::memory_stall::read`).
+/// [`judge_start`] for the process `pid` names, at the anchor's clock `now`, its beat word `beat_ns`, and the host's
+/// memory stall at this look `memory` (`slates_machine::memory_stall::read`), over the window `window_ns`.
 fn judge_start_of(
   pid: Option<u32>,
   watch: &mut ShardWatch,
-  now: u64,
-  memory: Option<slates_machine::memory_stall::StallReading>,
+  (now, beat_ns, memory): (u64, u64, Option<slates_machine::memory_stall::StallReading>),
+  window_ns: u64,
 ) -> Verdict {
   // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
@@ -397,21 +436,25 @@ fn judge_start_of(
   // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
   // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner). Before A-336 a process
   // waiting on memory, every thread off the CPU, was stuck the same way, a daemon paging whole killed at its lapse.
-  judge_start_by(watch, (now, memory, start_spin_window_ns()), clock, || {
-    pid.and_then(slates_rt::process_run_reading)
-  })
+  judge_start_by(
+    watch,
+    (now, memory, beat_ns),
+    (window_ns, start_spin_window_ns(window_ns)),
+    clock,
+    || pid.and_then(slates_rt::process_run_reading),
+  )
 }
 
-/// The CPU a start's busiest thread may run without a beat before the start is judged spinning: the liveness budget held
-/// to this build (`slates_server::watchdog::spin_window_ns`, A-318), measured once in this process
-/// (`slates_machine::build_cost::build_cost`). The anchor runs the executable it starts its daemon from (the roles'
-/// prefix, A-278), so its build is its daemon's. Before, the anchor judged a start at the bare budget whatever the
-/// build, while A-318 had held the daemon's own watchdog to it: under ThreadSanitizer a start's unit of work runs its
-/// slowdown's worth of CPU (17.9 to 35.3 times machine code on CI's runners), as a poll does, and a unit of a
-/// millisecond or two natively, a pair ring, a registration, is a few tens of milliseconds there, the beat after each
-/// unit (A-312) notwithstanding.
-fn start_spin_window_ns() -> u64 {
-  slates_server::watchdog::spin_window_ns(slates_machine::build_cost::build_cost())
+/// The CPU a start's busiest thread may run without a beat before the start is judged spinning: the window `window_ns`
+/// ([`anchor_window_ns`]) held to this build (`slates_server::watchdog::spin_window_ns`, A-318), the build measured once
+/// in this process (`slates_machine::build_cost::build_cost`). The anchor runs the executable it starts its daemon from
+/// (the roles' prefix, A-278), so its build is its daemon's. Before A-318 the anchor judged a start at the bare budget
+/// whatever the build, while A-318 had held the daemon's own watchdog to it: under ThreadSanitizer a start's unit of
+/// work runs its slowdown's worth of CPU (17.9 to 35.3 times machine code on CI's runners), as a poll does, and a unit
+/// of a millisecond or two natively, a pair ring, a registration, is a few tens of milliseconds there, the beat after
+/// each unit (A-312) notwithstanding.
+fn start_spin_window_ns(window_ns: u64) -> u64 {
+  slates_server::watchdog::spin_window_ns(slates_machine::build_cost::build_cost(), window_ns)
 }
 
 /// The start's rule over its readings, taken in this order (g243's rule for an observation, which the watchdog's look
@@ -422,11 +465,14 @@ fn start_spin_window_ns() -> u64 {
 /// window whose call returned just then ran and blocked again before the scheduler looked, and was judged stuck, the
 /// window still and never runnable; the anchor kills a start on that verdict. A runnable answer is starved, not stuck,
 /// whatever the clock, so it needs no second read.
-/// The busiest thread's CPU without a beat is judged against `spin_window_ns` ([`start_spin_window_ns`]); the wedged and
-/// starved judgments against the wall's budget, whatever the build.
+/// The daemon's beat word `beat_ns` is the start's step (A-312, a beat after each unit of its work, A-461): a start that
+/// beats is alive at that look and its CPU without a beat is counted from it, so a start is judged by its silence since
+/// its last beat, however long it has run in all. The silence is judged against `window_ns` and the busiest thread's CPU
+/// without a beat against `spin_window_ns` ([`start_spin_window_ns`]).
 fn judge_start_by(
   watch: &mut ShardWatch,
-  (now, memory, spin_window_ns): (u64, Option<slates_machine::memory_stall::StallReading>, u64),
+  (now, memory, beat_ns): (u64, Option<slates_machine::memory_stall::StallReading>, u64),
+  (window_ns, spin_window_ns): (u64, u64),
   mut clock: impl FnMut() -> Option<(u64, u64)>,
   scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
 ) -> Verdict {
@@ -439,14 +485,14 @@ fn judge_start_by(
     _ => first,
   };
   let look = Look {
-    steps: 0,
+    steps: beat_ns,
     parked: false,
     cpu,
     run,
     memory,
     now_ns: now,
   };
-  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS, spin_window_ns);
+  let (verdict, next) = watch.judge(look, window_ns, spin_window_ns);
   *watch = next;
   verdict
 }
@@ -502,12 +548,15 @@ fn on_lapse(
   let beat_age = now.saturating_sub(seen.heartbeat_ns);
   let looked_age = now.saturating_sub(seen.looked_ns.unwrap_or(0).max(seen.resumed_ns));
   let pid = supervisor.child_pid();
-  match judge_lapse(seen.looked_ns.is_some() && looked_age <= seen.bound, || {
+  // A silent watchdog's process is judged by the start's rule over this anchor's window (A-461), its beat its step.
+  let window = anchor_window_ns(lateness);
+  let watchdog_looking = seen.looked_ns.is_some() && looked_age <= seen.bound;
+  match judge_lapse(watchdog_looking, window, || {
     judge_start_of(
       pid,
       &mut quiet.watch,
-      now,
-      slates_machine::memory_stall::read(),
+      (now, seen.heartbeat_ns, slates_machine::memory_stall::read()),
+      window,
     )
   }) {
     Lapse::Withheld => {
@@ -565,34 +614,41 @@ enum Lapse {
 }
 
 /// What a lapsed beat means (A-232), pure so the table is tested on every host: `watchdog_looking` whether the watchdog
-/// marked a look within the lapse bound; `process` judges the daemon's process by the start's rule, asked only when the
-/// watchdog did not look. Before A-232 every lapse killed: at `cpu.weight` 1 beside default-weight spinners on CI the
-/// watchdog thread itself was held off past the window and the anchor's lateness p99, and the anchor killed a starved
-/// daemon in 3 of 20 runs (`diag-a232-starved-1`, beats 3.3 to 4.1 s old against bounds of 2.5 to 3.3 s).
-fn judge_lapse(watchdog_looking: bool, process: impl FnOnce() -> Verdict) -> Lapse {
+/// marked a look within the lapse bound; `process` judges the daemon's process by the start's rule over the window
+/// `window_ns` ([`anchor_window_ns`]), asked only when the watchdog did not look. Before A-232 every lapse killed: at
+/// `cpu.weight` 1 beside default-weight spinners on CI the watchdog thread itself was held off past the window and the
+/// anchor's lateness p99, and the anchor killed a starved daemon in 3 of 20 runs (`diag-a232-starved-1`, beats 3.3 to
+/// 4.1 s old against bounds of 2.5 to 3.3 s).
+fn judge_lapse(watchdog_looking: bool, window_ns: u64, process: impl FnOnce() -> Verdict) -> Lapse {
   if watchdog_looking {
     return Lapse::Withheld;
   }
-  match start_stuck(process()) {
+  match start_stuck(process(), window_ns) {
     Some(said) => Lapse::Stuck(said),
     None => Lapse::Starved,
   }
 }
 
-/// What a start's verdict says when it is to be killed: `None` while it is alive.
-fn start_stuck(verdict: Verdict) -> Option<String> {
+/// What a start's verdict says when it is to be killed, naming the window it was judged by: a wedge's, `window_ns`
+/// ([`anchor_window_ns`]), and a spin's, the window of CPU the verdict carries. `None` while it is alive.
+fn start_stuck(verdict: Verdict, window_ns: u64) -> Option<String> {
   match verdict {
     // A starved start, runnable with its CPU standing still, is not stuck (A-228).
     Verdict::Alive | Verdict::Starved { .. } => None,
+    // Its silence: no beat, no CPU progress and never runnable. The words before each number are the ones the CLI's
+    // tests read (`crates/cli/tests/cli.rs`, `STUCK_WORDS` and `frozen_kill_of`).
     Verdict::Wedged { for_ns } => Some(format!(
-      "made no progress for {} ms (the {} ms liveness window)",
+      "made no progress for {} ms (its {} ms window)",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
-    )),
-    Verdict::Spinning { cpu_ns, window_ns } => Some(format!(
-      "ran {} ms of CPU on one thread without beating (the {} ms liveness window)",
-      cpu_ns / NS_PER_MS,
       window_ns / NS_PER_MS
+    )),
+    Verdict::Spinning {
+      cpu_ns,
+      window_ns: spin_window_ns,
+    } => Some(format!(
+      "ran {} ms of CPU on one thread without beating (its {} ms window of CPU)",
+      cpu_ns / NS_PER_MS,
+      spin_window_ns / NS_PER_MS
     )),
   }
 }
@@ -620,7 +676,8 @@ fn observe(
   started: u64,
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
-  // The start under way, judged in the daemon's own CPU time until its first beat (the module doc).
+  // The start under way, judged in the daemon's own CPU time and its beats until its watchdog takes the beat over
+  // (the module doc, A-461).
   let mut start_watch = ShardWatch::default();
   let mut watch = Watch::default();
   let mut daemon_watch = DaemonWatch::default();
@@ -634,9 +691,10 @@ fn observe(
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
   // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
   slates_machine::log_line!(
-    "slates anchor: a starting daemon is killed once it makes no CPU progress for the {} ms liveness window, or one of \
-     its threads runs that much CPU without its first beat, in its own CPU time ({})",
-    LIVENESS_BUDGET_NS / NS_PER_MS,
+    "slates anchor: a starting daemon is judged until its watchdog takes the beat over, each of its beats a step: killed \
+     once it has neither beaten nor made CPU progress for its window, or one of its threads has run that window of CPU \
+     held to this build without a beat, in its own CPU time ({}); its window is the {} ms liveness window, raised to how \
+     late this anchor's own waits run where that is longer (A-461)",
     match supervisor
       .child_pid()
       .and_then(slates_machine::process_clock::process_cpu)
@@ -644,7 +702,8 @@ fn observe(
       Some(cpu) if cpu.busiest_thread_ns.is_some() => "read from the OS, each thread's",
       Some(_) => "read from the OS; its threads not, so nothing is judged spinning",
       None => "none read here: the wall window stands alone",
-    }
+    },
+    LIVENESS_BUDGET_NS / NS_PER_MS
   );
   let mut kill_sent = false;
   let mut quiet = Quiet::default();
@@ -654,11 +713,13 @@ fn observe(
   let until_served = crate::start::until_served_asked();
   loop {
     if signal::stop_requested() {
-      stop_gracefully(supervisor, clock)?;
+      stop_gracefully(supervisor, clock, &lateness)?;
       return Ok(());
     }
     let now = clock.monotonic_ns();
     let bound = lateness.lapse_bound_ns();
+    // The window a start, and a silent watchdog's process, is judged by at this look (A-461).
+    let window = anchor_window_ns(&lateness);
     match supervisor.step(now).map_err(|e| failed("step", e))? {
       slates_anchor::Step::Running => {
         let (heartbeat_ns, looked_ns, alive) = {
@@ -677,9 +738,9 @@ fn observe(
           )
         };
         quiet.reset_while(alive);
-        // A starting daemon is looked at every beat, since its start is judged by its CPU until its first beat, and so
-        // is one not yet judged recovered (A-311), so that verdict comes within a beat of being due; a recovered one only
-        // when its heartbeat could next be found lapsed (`lapse_wait`).
+        // A starting daemon is looked at every beat, since its start is judged by its CPU and its beats until its
+        // watchdog takes the beat over, and so is one not yet judged recovered (A-311), so that verdict comes within a
+        // beat of being due; a recovered one only when its heartbeat could next be found lapsed (`lapse_wait`).
         let recovered = supervisor
           .has_recovered()
           .map_err(|e| failed("supervision", e))?;
@@ -690,16 +751,25 @@ fn observe(
           Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, bound))
         };
         match starting_since {
-          Some(since) if heartbeat_ns >= since => {
+          // The start ends when its watchdog has looked (`SUP_LOOKED`, zeroed at each start): the daemon then judges its
+          // own shards, and its beat is the watchdog's verdict (A-232). Until then each beat is a step of the start's
+          // (A-312), so a start is judged by its silence since its last beat (A-461). Before, the start's judgment ended
+          // at its first beat, and a start wedged after it was found only once its beat had lapsed and its process had
+          // stood still a whole window more.
+          Some(_) if looked_ns.is_some() => {
             starting_since = None;
           }
-          Some(_) if !kill_sent => {
-            if let Some(said) = start_stuck(judge_start(supervisor, &mut start_watch, now)) {
+          Some(since) if !kill_sent => {
+            if let Some(said) = start_stuck(
+              judge_start(supervisor, &mut start_watch, (now, heartbeat_ns), window),
+              window,
+            ) {
               slates_machine::log_line!(
-                "slates anchor: the starting daemon (pid {}) {said}; killing it",
+                "slates anchor: the starting daemon (pid {}, spawned {} ms ago) {said}; killing it",
                 supervisor
                   .child_pid()
-                  .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
+                  .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+                now.saturating_sub(since) / NS_PER_MS
               );
               supervisor.kill().map_err(|e| failed("kill", e))?;
               kill_sent = true;
@@ -909,7 +979,8 @@ mod lapse_tests {
       for look in 1..=looks {
         let verdict = judge_start_by(
           watch,
-          (look * HEARTBEAT_NS, None, LIVENESS_BUDGET_NS),
+          (look * HEARTBEAT_NS, None, 0),
+          (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
           || Some((10, 10)),
           blocked,
         );
@@ -926,7 +997,8 @@ mod lapse_tests {
     let mut reads = [Some((10, 10)), Some((12, 12))].into_iter();
     let verdict = judge_start_by(
       &mut moved,
-      (ends, None, LIVENESS_BUDGET_NS),
+      (ends, None, 0),
+      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
       || reads.next().flatten(),
       blocked,
     );
@@ -939,7 +1011,8 @@ mod lapse_tests {
     watched(&mut still);
     let verdict = judge_start_by(
       &mut still,
-      (ends, None, LIVENESS_BUDGET_NS),
+      (ends, None, 0),
+      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
       || Some((10, 10)),
       blocked,
     );
@@ -974,7 +1047,8 @@ mod lapse_tests {
         .map(|look| {
           judge_start_by(
             &mut watch,
-            (look * HEARTBEAT_NS, None, LIVENESS_BUDGET_NS),
+            (look * HEARTBEAT_NS, None, 0),
+            (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
             || Some((10, 10)),
             reading(state),
           )
@@ -985,7 +1059,7 @@ mod lapse_tests {
     assert!(
       runnable
         .iter()
-        .all(|verdict| start_stuck(*verdict).is_none()),
+        .all(|verdict| start_stuck(*verdict, LIVENESS_BUDGET_NS).is_none()),
       "a start held off its CPUs, its clock still and its threads runnable, is never stuck: {runnable:?}"
     );
     assert!(
@@ -998,7 +1072,7 @@ mod lapse_tests {
     assert!(
       blocked
         .iter()
-        .any(|verdict| start_stuck(*verdict).is_some()),
+        .any(|verdict| start_stuck(*verdict, LIVENESS_BUDGET_NS).is_some()),
       "the same stillness with its threads blocked is stuck: {blocked:?}"
     );
   }
@@ -1025,7 +1099,8 @@ mod lapse_tests {
       let cpu = look * HEARTBEAT_NS;
       let verdict = judge_start_by(
         &mut watch,
-        (cpu, None, spin_window),
+        (cpu, None, 0),
+        (LIVENESS_BUDGET_NS, spin_window),
         || Some((cpu, cpu)),
         runnable,
       );
@@ -1052,6 +1127,111 @@ mod lapse_tests {
     );
   }
 
+  /// What the scheduler says of a thread off the CPU and not ready, asleep (Linux `S`).
+  fn asleep() -> Option<slates_rt::RunReading> {
+    Some(slates_rt::RunReading {
+      state: slates_rt::RunState::Blocked,
+      waited_ns: None,
+      uninterruptible: Some(false),
+    })
+  }
+
+  /// A-461, A-312, §4.14. Do: judge a start look by look, a look a beat, on a quiet anchor (its window the liveness
+  /// window): its process asleep and its clock still between its beats (a start whose units wait on the host, so its CPU
+  /// shows nothing between them), beating every three fifths of a window for five windows, and then never again.
+  /// Expect: never stuck while it beats, though it has run five times the old bound in all, since each beat is a step of
+  /// the start's; and wedged by its silence, a window after the look that saw its last beat, never later. Before, the
+  /// start's beats were no step: the rule saw a start whose clock stood still and never ran, and judged it wedged a window
+  /// after its first look.
+  #[test]
+  fn a_start_that_beats_is_waited_for_and_a_wedged_one_is_judged_by_its_silence() {
+    let window = anchor_window_ns(&Lateness::default());
+    let beat_every = 3 * window / 5;
+    let beating_until = 5 * window;
+    let mut watch = ShardWatch::default();
+    let mut beat_ns = 0;
+    let mut wedged = None;
+    for look in 1..=(beating_until + 3 * window) / HEARTBEAT_NS {
+      let now = look * HEARTBEAT_NS;
+      if now <= beating_until {
+        // Its latest beat by now: a step the look sees once it has come.
+        beat_ns = now / beat_every * beat_every;
+      }
+      let verdict = judge_start_by(
+        &mut watch,
+        (now, None, beat_ns),
+        (window, window),
+        || Some((10, 10)),
+        asleep,
+      );
+      if now <= beating_until {
+        assert_eq!(
+          start_stuck(verdict, window),
+          None,
+          "look {look}: it beats, so it is waited for: {verdict:?}"
+        );
+      }
+      if let Verdict::Wedged { for_ns } = verdict {
+        wedged = Some((now, for_ns));
+        break;
+      }
+    }
+    assert_eq!(
+      wedged,
+      Some((beat_ns + window, window)),
+      "wedged by its silence: a window after the look that saw its last beat, at {beat_ns} ns"
+    );
+  }
+
+  /// A-461, A-455, §4.14. Do: derive the anchor's window from its own waits' lateness, each wait come back on time, two
+  /// and a half liveness windows late, and an hour late (a host paused); and judge by each a start whose process sleeps,
+  /// its clock still and no beat, a look a beat. Expect: on time, the liveness window, the start wedged a window after
+  /// its first look, as before; two and a half windows late, a window of two and a half, the start waited for past the
+  /// old bound and wedged at its window; an hour late, the ceiling the daemon's watchdog holds its own windows to, so a
+  /// stale reading never blinds the anchor. Before, every start was judged by the bare liveness window whatever the host.
+  #[test]
+  fn a_start_is_judged_by_the_window_its_anchors_own_waits_measure() {
+    let lateness_of = |late_ns: u64| {
+      let mut lateness = Lateness::default();
+      for _ in 0..LATENESS_SAMPLES {
+        lateness.record(HEARTBEAT_NS, HEARTBEAT_NS.saturating_add(late_ns));
+      }
+      lateness
+    };
+    let wedged_after = |window: u64| {
+      let mut watch = ShardWatch::default();
+      (1..=(slates_server::watchdog::WINDOW_CEILING_NS / HEARTBEAT_NS + 2)).find_map(|look| {
+        match judge_start_by(
+          &mut watch,
+          (look * HEARTBEAT_NS, None, 0),
+          (window, window),
+          || Some((10, 10)),
+          asleep,
+        ) {
+          Verdict::Wedged { for_ns } => Some(for_ns),
+          _ => None,
+        }
+      })
+    };
+    let budget = LIVENESS_BUDGET_NS;
+    for (late_ns, expected) in [
+      (0, budget),
+      (5 * budget / 2, 5 * budget / 2),
+      (3_600 * budget, slates_server::watchdog::WINDOW_CEILING_NS),
+    ] {
+      let window = anchor_window_ns(&lateness_of(late_ns));
+      assert_eq!(
+        window, expected,
+        "waits come back {late_ns} ns late: the window"
+      );
+      assert_eq!(
+        wedged_after(window),
+        Some(expected),
+        "waits come back {late_ns} ns late: a silent start is wedged at its window"
+      );
+    }
+  }
+
   /// A-232, §4.14. Do: judge a lapsed beat with the watchdog still looking, and with it silent while the daemon's process
   /// is alive, starved, wedged (no CPU, never runnable: frozen) or spinning (a window of CPU on one thread). Expect: a
   /// looking watchdog's lapse is its verdict and kills without asking about the process; a silent one kills only a
@@ -1060,7 +1240,7 @@ mod lapse_tests {
   fn a_lapse_kills_a_withheld_beat_or_a_stuck_process_and_spares_a_starved_one() {
     let window = LIVENESS_BUDGET_NS;
     assert_eq!(
-      judge_lapse(true, || panic!(
+      judge_lapse(true, window, || panic!(
         "a looking watchdog's lapse asks nothing of the process"
       )),
       Lapse::Withheld
@@ -1076,7 +1256,11 @@ mod lapse_tests {
         of: Want::Memory,
       },
     ] {
-      assert_eq!(judge_lapse(false, || spared), Lapse::Starved, "{spared:?}");
+      assert_eq!(
+        judge_lapse(false, window, || spared),
+        Lapse::Starved,
+        "{spared:?}"
+      );
     }
     for stuck in [
       Verdict::Wedged { for_ns: window },
@@ -1086,7 +1270,7 @@ mod lapse_tests {
       },
     ] {
       assert!(
-        matches!(judge_lapse(false, || stuck), Lapse::Stuck(_)),
+        matches!(judge_lapse(false, window, || stuck), Lapse::Stuck(_)),
         "{stuck:?}"
       );
     }
@@ -1203,9 +1387,9 @@ mod lapse_tests {
       judged.largest_gap = judged.largest_gap.max(last_look.elapsed());
       last_look = std::time::Instant::now();
       let now = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-      let verdict = judge_start_of(Some(pid), watch, now, memory);
+      let verdict = judge_start_of(Some(pid), watch, (now, 0, memory), LIVENESS_BUDGET_NS);
       judged.verdicts.push(verdict);
-      if start_stuck(verdict).is_some() {
+      if start_stuck(verdict, LIVENESS_BUDGET_NS).is_some() {
         judged.stuck_at = Some(from.elapsed());
         break;
       }
@@ -1582,11 +1766,11 @@ mod tests {
       {
         wait(LOOK);
         let now = u64::try_from(watched.elapsed().as_nanos()).unwrap();
-        let verdict = judge_start_of(Some(pid), &mut watch, now, None);
+        let verdict = judge_start_of(Some(pid), &mut watch, (now, 0, None), LIVENESS_BUDGET_NS);
         if matches!(verdict, Verdict::Starved { .. }) {
           starved_looks += 1;
         }
-        if let Some(said) = start_stuck(verdict) {
+        if let Some(said) = start_stuck(verdict, LIVENESS_BUDGET_NS) {
           stuck.push(said);
         }
         let progress = slates_machine::process_clock::process_cpu(pid).map(|cpu| cpu.progress);

@@ -3011,6 +3011,35 @@ impl Volume {
     Ok(inode.attrs)
   }
 
+  /// Whether inode `no`'s bytes, as the head holds them, are the bytes its witness recorded (A-458): a base file the
+  /// volume copied up for its metadata alone, its body still the disk's, nothing of the volume's own pinned over it and its
+  /// length the witnessed length. Their identity is then the witness's, known without reading the disk, whatever the disk
+  /// holds now: a landing plans the file from it, where a read would refuse a disk that drifted since (`BaseDrift`).
+  pub fn holds_witnessed_bytes(&self, store: &Store, no: InodeNo) -> Result<bool, VfsError> {
+    Ok(witnessed_bytes(self.inode(store, no)?))
+  }
+
+  /// [`Volume::holds_witnessed_bytes`] as snapshot `id` holds inode `no`.
+  pub fn holds_witnessed_bytes_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<bool, VfsError> {
+    Ok(witnessed_bytes(self.inode_in(store, id, no)?))
+  }
+
+  /// The Windows attribute bits kept beside inode `no`'s mode as snapshot `id` holds them (A-262): what a landing of
+  /// the snapshot carries (A-451), as [`Volume::windows_attributes`] gives the head's.
+  pub fn windows_attributes_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode_in(store, id, no)?.windows)
+  }
+
   /// A device node's number as a snapshot holds it (A-294); `None` for every other kind.
   pub fn device_in(
     &self,
@@ -7498,6 +7527,15 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
 
 /// The sealed extents a body holds: its sealed list, the sealed list beneath an open extent, or a
 /// base body's pinned windows; none for inline, symlink, directory and empty bodies.
+/// Whether `inode` holds its witness's bytes and none of its own ([`Volume::holds_witnessed_bytes`]).
+fn witnessed_bytes(inode: &Inode) -> bool {
+  matches!(
+    &inode.body,
+    Body::Base(base)
+      if base.witness.is_some() && base.pinned.is_empty() && inode.attrs.size == base.base_len
+  )
+}
+
 pub(crate) fn body_extents(body: &Body) -> &[Extent] {
   match body {
     Body::Sealed(extents) => extents,
