@@ -937,6 +937,60 @@ mod lapse_tests {
     );
   }
 
+  /// A-228's start rule with its condition put in place (the "inject the product's own condition" rule): what
+  /// `a_start_held_off_its_cpus_is_starved_not_stuck` makes of a real process on a host it can starve, which a big idle
+  /// one cannot (jupiter, 32 cores, 2026-11-18: "did not starve", the premise failing, not the rule). Do: judge a start
+  /// look by look while its clock stands still for two windows and three beats and the scheduler answers its threads
+  /// runnable, and again with the scheduler answering them blocked. Expect: runnable, never stuck, and starved once its
+  /// clock has stood still a window; blocked, stuck a window after it last moved, which the runnable answer alone
+  /// excuses.
+  #[test]
+  fn a_start_whose_clock_stands_still_while_runnable_is_starved_not_stuck() {
+    let reading = |state| {
+      move || {
+        Some(slates_rt::RunReading {
+          state,
+          waited_ns: None,
+          uninterruptible: Some(false),
+        })
+      }
+    };
+    let looks = (2 * LIVENESS_BUDGET_NS + 3 * HEARTBEAT_NS) / HEARTBEAT_NS;
+    let judged = |state| {
+      let mut watch = ShardWatch::default();
+      (1..=looks)
+        .map(|look| {
+          judge_start_by(
+            &mut watch,
+            (look * HEARTBEAT_NS, None, LIVENESS_BUDGET_NS),
+            || Some((10, 10)),
+            reading(state),
+          )
+        })
+        .collect::<Vec<Verdict>>()
+    };
+    let runnable = judged(slates_rt::RunState::Runnable);
+    assert!(
+      runnable
+        .iter()
+        .all(|verdict| start_stuck(*verdict).is_none()),
+      "a start held off its CPUs, its clock still and its threads runnable, is never stuck: {runnable:?}"
+    );
+    assert!(
+      runnable
+        .iter()
+        .any(|verdict| matches!(verdict, Verdict::Starved { .. })),
+      "non-vacuity: its clock stood still past a window, so it was starved: {runnable:?}"
+    );
+    let blocked = judged(slates_rt::RunState::Blocked);
+    assert!(
+      blocked
+        .iter()
+        .any(|verdict| start_stuck(*verdict).is_some()),
+      "the same stillness with its threads blocked is stuck: {blocked:?}"
+    );
+  }
+
   /// A-318's sibling, §4.14. Do: judge a start whose busiest thread is on a whole CPU without a beat, look by look for
   /// four budgets, with a spin window three budgets long (a build measured three times as slow as machine code, as an
   /// unoptimized one is, 3.4 times on a Mac Studio; ThreadSanitizer's 17.9 to 35.3). Expect: alive while its thread's CPU
@@ -1539,13 +1593,19 @@ mod tests {
         watched.elapsed()
       );
       assert!(
-        longest_flat >= flat_enough,
-        "did not starve: the start's CPU clock stood still for {longest_flat:?} at most, under {flat_enough:?}"
-      );
-      assert!(
         stuck.is_empty(),
         "a start held off its CPU was judged stuck: {stuck:?} (its clock stood still {longest_flat:?})"
       );
+      // The host decides whether the start starves: a big idle one runs it elsewhere however the spinners outrank it
+      // (jupiter, 32 cores, 2026-11-18). The rule is held with its condition put in place on every host
+      // (`a_start_whose_clock_stands_still_while_runnable_is_starved_not_stuck`); this test reads the real scheduler,
+      // and says so where it could not starve the start rather than fail on the host.
+      if longest_flat < flat_enough {
+        println!(
+          "skipping the starved half: this host did not hold the start off its CPU (its clock stood still \
+           {longest_flat:?} at most, under {flat_enough:?}); judged never stuck"
+        );
+      }
     }
   }
 }

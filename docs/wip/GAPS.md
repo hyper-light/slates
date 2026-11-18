@@ -80,13 +80,14 @@
 >   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
 >   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
 >   one does, its signed-merge requirement dropped; the catalog register should carry both;
-> - **a sibling found here, open (§4.15's audit, not signed work's):** a presented-then-granted landing's presentation
->   record is durable twice: `present` appends its `LandingPlanned`, and `finish` mirrors every record the engine's
->   in-memory ring (`state.landing.audit`) holds for the landing's id, the presentation's own among them; a resumed
->   landing's second finish would mirror the first attempt's records again the same way. Measured on the Mac Studio
->   (2026-11-18, `a_signed_landing_is_judged_recorded_and_read_back` with its records printed): the landing's audit read
->   planned (no grant), grant issued, planned (no grant), planned (grant 1), validated, entry written, finished. The
->   verdicts agree, so signed work reads true; the trail should mirror each engine record once;
+> - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
+>   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
+>   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
+>   shard owns, its signed-work verdicts with them. kiln starts two shards. Measured on the Mac Studio (2026-11-18): a
+>   presented-then-granted landing on a two-shard daemon (`crates/server/tests/daemon.rs`'s fixture) read back no record
+>   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
+>   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
+>   written where the design says;
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
@@ -2638,6 +2639,11 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/api/src/role/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
+>   Since 2026-11-18 (g251) the rule is held with its condition put in place on every host
+>   (`a_start_whose_clock_stands_still_while_runnable_is_starved_not_stuck`: the clock still and the threads runnable,
+>   never stuck; blocked, stuck a window after; red with the scheduler's answer dropped), since a big idle host cannot
+>   starve a real start (jupiter, 32 cores: "did not starve", the premise failing, not the rule); the real-process test
+>   says so and skips its starved half there.
 >   Its spinning half reads each thread too since 2026-11-08 (liveness): the busiest thread's CPU, not the process's sum,
 >   which had killed every start of 23 shards on a 32-CPU Studio
 >   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
