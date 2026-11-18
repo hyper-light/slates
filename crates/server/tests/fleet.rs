@@ -6104,15 +6104,13 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
     DEAD_SESSION_WATCH,
     DEAD_SESSION_WATCH_PERIODS,
     || {
-      Ok(
-        daemons[1]
-          .observation(
-            Some(daemons[1].shards()[0]),
-            slates_server::daemon::OBSERVE_BUDGET_NS,
-            |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
-          )?
-          .wait()?,
-      )
+      daemons[1]
+        .observation(
+          Some(daemons[1].shards()[0]),
+          slates_server::daemon::OBSERVE_BUDGET_NS,
+          |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
+        )?
+        .wait()
     },
   );
   // The burst, every forward of it first queued after the probe's.

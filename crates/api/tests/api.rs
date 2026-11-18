@@ -989,6 +989,34 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   let snapshot = seam.snapshot(origin).unwrap();
   let clone = made(seam, &VolumeSpec::clone_of("seam-clone", origin, snapshot));
   assert_eq!(names_of(seam), ["seam-clone", "seam-origin"]);
+  expect_strangers_refused_typed(seam, snapshot);
+  expect_a_work_over_a_green_alone(seam, origin);
+  expect_a_served_streams_peer_reads_its_end_at_the_detach(seam, origin);
+  assert!(
+    matches!(
+      seam.destroy_snapshot(origin, snapshot),
+      Err(Error::Invalid(Invalid::Request(_)))
+    ),
+    "a snapshot a clone pins is not destroyed"
+  );
+  let unpinned = seam.snapshot(origin).unwrap();
+  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
+  seam.destroy(clone).unwrap();
+  let started = Instant::now();
+  while names_of(seam).contains(&"seam-clone".to_owned()) {
+    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
+    std::thread::yield_now();
+  }
+  assert_eq!(
+    seam.snapshot(clone),
+    Err(Error::NotFound(Missing::Volume(clone)))
+  );
+}
+
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy and serve a volume no one
+/// made; detach an attachment no one made; provision an overlay of a relative folder. Expect each refused typed:
+/// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
+fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
   assert_eq!(
     seam.snapshot(NOWHERE),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
@@ -1023,6 +1051,11 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
       fault: PathFault::NotAbsolute
     }))
   );
+}
+
+/// The works of `the_seam_conforms`. Do: make a green, a work over it, a work over `origin` (no green) and one over no
+/// volume. Expect the work at the green's first version, and the others refused `NotGreen` and `NotFound`.
+fn expect_a_work_over_a_green_alone<V: Volumes>(seam: &mut V, origin: VolumeId) {
   let green = made(
     seam,
     &VolumeSpec {
@@ -1045,6 +1078,14 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
     seam.provision(&VolumeSpec::work("seam-over-nothing", NOWHERE)),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
   );
+}
+
+/// The Shards stream of `the_seam_conforms`. Do: serve `origin` to a Shards VMM, then detach it. Expect a stream of the
+/// Shards transport whose peer reads its end once detached.
+fn expect_a_served_streams_peer_reads_its_end_at_the_detach<V: Volumes>(
+  seam: &mut V,
+  origin: VolumeId,
+) {
   let served = seam.serve_shards(origin, Intent::Write, None).unwrap();
   assert_eq!(
     served.attachment.capability.transport,
@@ -1055,25 +1096,6 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   assert!(
     reads_its_end(&peer),
     "a detached stream's peer reads its end"
-  );
-  assert!(
-    matches!(
-      seam.destroy_snapshot(origin, snapshot),
-      Err(Error::Invalid(Invalid::Request(_)))
-    ),
-    "a snapshot a clone pins is not destroyed"
-  );
-  let unpinned = seam.snapshot(origin).unwrap();
-  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
-  seam.destroy(clone).unwrap();
-  let started = Instant::now();
-  while names_of(seam).contains(&"seam-clone".to_owned()) {
-    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
-    std::thread::yield_now();
-  }
-  assert_eq!(
-    seam.snapshot(clone),
-    Err(Error::NotFound(Missing::Volume(clone)))
   );
 }
 

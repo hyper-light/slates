@@ -455,20 +455,7 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
     "the consumer's ask holds a bypass volume's landing: {presented:?}"
   );
   assert_eq!(on_disk(&target), None);
-  let green = agent.create_green("session-green", false).unwrap();
-  let (work, _) = agent.create_work(green, "session-work").unwrap();
-  agent.edit(work, "f", 0, 0, b"merged work").unwrap();
-  let merged = agent.submit(work);
-  assert!(
-    matches!(
-      merged,
-      Err(ClientError::Refused(Refusal::PolicyForbids {
-        act: WriteAct::Merge,
-        by: PolicySubject::Consumer { consumer: by },
-      })) if by == consumer
-    ),
-    "{merged:?}"
-  );
+  expect_the_consumers_forbid_refuses_its_merge(&mut agent, consumer);
   let forbidden = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Forbid,
@@ -495,4 +482,24 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   drop(agent);
   drop(launcher);
   daemon.stop();
+}
+
+/// The merge of `a_consumers_own_policy_holds_its_agent_to_the_stricter_mode`. Do: as `agent`, bound to `consumer`
+/// whose own policy forbids merges, make a green and a work, edit the work and submit it. Expect the submit refused
+/// `PolicyForbids`, naming the merge and the consumer.
+fn expect_the_consumers_forbid_refuses_its_merge(agent: &mut Client, consumer: u64) {
+  let green = agent.create_green("session-green", false).unwrap();
+  let (work, _) = agent.create_work(green, "session-work").unwrap();
+  agent.edit(work, "f", 0, 0, b"merged work").unwrap();
+  let merged = agent.submit(work);
+  assert!(
+    matches!(
+      merged,
+      Err(ClientError::Refused(Refusal::PolicyForbids {
+        act: WriteAct::Merge,
+        by: PolicySubject::Consumer { consumer: by },
+      })) if by == consumer
+    ),
+    "{merged:?}"
+  );
 }
