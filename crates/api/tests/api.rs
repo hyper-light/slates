@@ -46,8 +46,9 @@ mod signer;
 const PROBE_MS: u64 = 5;
 /// Shape: one shard per test daemon: the library's verbs are the subject, not placement.
 const TEST_SHARDS: u16 = 1;
-/// Shape: the shards of the daemon kiln starts (`crates/kiln/src/workspace/slates.rs`, `SHARDS`): two on every machine,
-/// so each shard's reserve is a sixth of the machine's memory (three memory classes) while kiln's volume asks a quarter.
+/// Shape: the shards of the daemon kiln starts (`crates/kiln/src/workspace/slates.rs`, `SHARDS`): two on every
+/// machine, so each shard's reserve is a sixth of the machine's memory (three memory classes) while kiln's volume asks
+/// a quarter.
 const KILN_SHARDS: u16 = 2;
 /// Shape: how long a test waits for its daemon's rendezvous to answer after the start.
 const START_WAIT: Duration = Duration::from_secs(20);
@@ -957,8 +958,8 @@ fn a_merge_follows_its_greens_write_mode() {
   daemon.stop();
 }
 
-/// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in whole
-/// GiB, at least one and at most 64.
+/// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in
+/// whole GiB, at least one and at most 64.
 #[cfg(unix)]
 fn kiln_volume_max() -> u64 {
   /// Format: kiln's `MAX_VOLUME_GIB`.
@@ -982,9 +983,10 @@ fn print_version_slabs(instance: &mut Instance, when: &str) {
   }
 }
 
-/// P1 (2026-11-18, kiln's review over a microVM's volume, which failed `agents.change` with "reading .gitignore: a bound
-/// is reached: Quota"; `docs/bugs/2026-11-18-a-base-read-after-a-snapshot-was-refused-for-space.md`). Do: what kiln
-/// does, on the daemon kiln starts ([`KILN_SHARDS`]) with kiln's own volume spec (a quarter of the machine's memory):
+/// P1 (2026-11-18, kiln's review over a microVM's volume, which failed `agents.change` with "reading .gitignore: a
+/// bound is reached: Quota"; A-342, `docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md`). Do:
+/// what kiln does, on the daemon kiln starts ([`KILN_SHARDS`]) with kiln's own volume spec (a quarter of the machine's
+/// memory):
 /// the agent's three edits and its lookup of the project's `.gitignore` (git reads it); then review: snapshot, present
 /// that snapshot's landing without writing and list its entries, read `.gitignore` at the head as kiln's ignore rules
 /// do, and a base file nothing looked up before the snapshot. Expect: each file's bytes as the disk holds them — a read
@@ -1037,10 +1039,10 @@ fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() 
   daemon.stop();
 }
 
-/// P1's sibling (2026-11-18, the same bound): do provision one more of kiln's workspaces (kiln's own volume spec, a
-/// quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln does for
-/// its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds none of its
-/// shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
+/// P1's sibling (2026-11-18, the same bound, A-342): do provision one more of kiln's workspaces (kiln's own volume
+/// spec, a quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln
+/// does for its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds
+/// none of its shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
 #[cfg(unix)]
 #[test]
 fn kilns_workspaces_are_provisioned_side_by_side() {
