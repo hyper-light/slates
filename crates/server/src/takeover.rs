@@ -1350,7 +1350,7 @@ pub(crate) fn ready_objects(
   if local_promises {
     answer_own_copies_by_name(state, departed, local, &regional);
   }
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -1472,7 +1472,7 @@ pub(crate) fn unpromised_past_the_bound(
   state: &ShardState,
   departed: HostId,
 ) -> Vec<(ObjectId, u32)> {
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   state
     .host_takeovers
     .get(&departed)

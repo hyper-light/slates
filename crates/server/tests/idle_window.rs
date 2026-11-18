@@ -2,12 +2,12 @@
 //! keeps polling after its last work before it parks. Priced on the shard's online wake estimate, it fed on its own
 //! spinning: beside more runnable threads than CPUs a woken shard waits to run, its estimate counts that wait, the
 //! window grows with it, the shard spins longer, and the next wake waits longer still (a paced client kept its shards
-//! spinning at hundreds of milliseconds of window; BENCHMARKS, the idle window's rule, 2026-11-09). On Linux and macOS
+//! spinning at hundreds of milliseconds of window; BENCHMARKS, the idle window's rule, 2026-11-09). On every platform
 //! the daemon's window is R9's provisioning floor, which no estimate moves.
 //!
-//! Not on Windows: there a shard parked beside two spinners a CPU waits 50-100 ms to run again, so the window keeps
-//! the estimate's multiple and grows with load by design until Windows' own window is measured (the supervisor's
-//! decision, 2026-11-11; GAPS, A-223).
+//! On Windows since A-361 too: there a shard parked beside two spinners a CPU waited 14-42 ms to run again, a wake
+//! without the boost Windows gives every other waiter, so the window had kept a hundred times the estimate, which grew
+//! with that wait to seconds; a daemon spun past its watchdog's window and was killed (g258's now-x86 lane, 2026-11-18).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -15,7 +15,6 @@
   clippy::panic,
   clippy::indexing_slicing
 )]
-#![cfg(not(windows))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -61,9 +60,14 @@ fn a_paced_clients_shards_keep_their_idle_window_while_load_raises_their_wake_es
   let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   // The run's context: the window the daemon derived, as its boot log prints it.
   for line in config.derivations.iter().filter(|line| {
-    ["provision_floor_ns", "loaded_wake_ratio", "idle_window_ns"]
-      .iter()
-      .any(|name| line.starts_with(name))
+    [
+      "provision_floor_ns",
+      "idle_estimate_multiple",
+      "idle_window_ns",
+      "idle_spin_ceiling_ns",
+    ]
+    .iter()
+    .any(|name| line.starts_with(name))
   }) {
     println!("slates daemon: {line}");
   }
