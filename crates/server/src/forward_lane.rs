@@ -1044,6 +1044,8 @@ mod tests {
     Begin(usize),
   }
 
+  /// One step of the lane's model, any of the four kinds alike.
+  #[allow(clippy::disallowed_types)] // proptest's `prop_oneof!` holds its arms in an `Arc` (D-8's test-harness exception).
   fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
       (1usize..4).prop_map(Step::Issue),
