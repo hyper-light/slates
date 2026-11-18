@@ -20,10 +20,12 @@
 >   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
 >   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
 > - a guest's proof over virtio-fs, beside g260's `nodev` guest mount;
-> - Windows: a device node (and a FIFO or socket) has no WinFsp form, and a directory holding one fails its whole
->   listing today (`read_all_entries` in `crates/bridge-winfsp/src/host.rs` takes each entry's attribute word with `?`),
->   a sibling defect since A-26 that kept device nodes make common (an unpacked `/dev`); WSL's form, a reparse point
->   tagged `IO_REPARSE_TAG_LX_CHR` or `_LX_BLK`, is the candidate.
+> - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
+>   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
+>   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a
+>   directory holding only such entries lists empty and its removal is refused `STATUS_DIRECTORY_NOT_EMPTY`; the live
+>   proof is owed to CI's Windows runner. Showing them in WSL's form, a reparse point tagged `IO_REPARSE_TAG_LX_CHR`,
+>   `_LX_BLK`, `_LX_FIFO` or `_AF_UNIX`, is the candidate, now that the drive answers reparse requests (A-275).
 
 > **A snapshot's attribute-only change was lost in recovery: fixed (2026-11-17, §4.8).** The image's cross-snapshot
 > dedup matched a version to an earlier snapshot's by its body alone, while the rebuild shares the earlier snapshot's

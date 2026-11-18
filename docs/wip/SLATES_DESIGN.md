@@ -2122,7 +2122,8 @@ device: every mount slates makes is `nosuid,nodev` (macOS `MNT_NODEV`; the Linux
 binding), so its kernel refuses the open `EACCES` (`may_open_dev`); an export's PersistentVolume is `nodev` too, and in a
 pod, whose bind drops it (A-94), the container runtime's device cgroup refuses the open; a guest's mount of a virtio-fs
 share is the guest's, so slates asks it for `nodev`, and a guest that declines opens only its own devices. WinFsp and
-FSKit have no device kind and refuse the node unsupported, as a FIFO.
+FSKit have no device kind and refuse the node unsupported, as a FIFO; the WinFsp drive's listing leaves out each FIFO,
+socket and device node rather than fail the directory (`listed`).
 
 **A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
 not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
@@ -22498,6 +22499,6 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
 - **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
   number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof beside g260's `nodev`
   guest mount; a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
-  `_LX_BLK`), and WinFsp's listing of a directory holding a FIFO, socket or device node, which fails whole today (GAPS);
+  `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
   each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
   and a list edited without its run fails the record's doc-truth test.
