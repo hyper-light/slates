@@ -118,7 +118,7 @@ struct JoinState {
 struct Fetched {
   group: [u8; 32],
   join: Option<JoinState>,
-  /// The answerer's configuration, which records the council's voters (A-372): how a learner, whose own Raft state never
+  /// The answerer's configuration, which records the council's voters (A-380): how a learner, whose own Raft state never
   /// moves after its join, learns who votes now.
   configuration: Vec<u8>,
 }
@@ -304,7 +304,7 @@ pub(crate) fn adopt_fetch(
       state.recovery.council = None;
     }
     if !state.council.is_voter(state.fleet.host()) {
-      // The voters travel inside the configuration (A-372), so a view adopted only forward moves them only forward.
+      // The voters travel inside the configuration (A-380), so a view adopted only forward moves them only forward.
       state.council.adopt(configuration);
     }
   }

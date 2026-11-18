@@ -147,7 +147,7 @@ pub enum ConfigCommand {
     /// Its owner, the reporter.
     owner: HostId,
   },
-  /// The leader records the voters the council's last committed seat change left (A-372;
+  /// The leader records the voters the council's last committed seat change left (A-380;
   /// [`RegionalConfiguration::seat`]), so a learner learns who votes by the configuration's version.
   Seat {
     /// The voters, in id order.
@@ -523,7 +523,7 @@ pub enum Reconfiguration {
     /// Its owner.
     owner: HostId,
   },
-  /// Record the voters the council's last committed seat change left ([`ConfigCommand::Seat`], A-372).
+  /// Record the voters the council's last committed seat change left ([`ConfigCommand::Seat`], A-380).
   Seat(Vec<HostId>),
 }
 
@@ -1315,7 +1315,7 @@ impl RegionalCouncil {
   }
 
   /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its configuration
-  /// records (A-372, [`RegionalConfiguration::voters`]), or its join state's before any is recorded. A learner's Raft
+  /// records (A-380, [`RegionalConfiguration::voters`]), or its join state's before any is recorded. A learner's Raft
   /// state never moves after its join, so reading it alone left a learner contacting a voter long gone and dropping the
   /// leader it needed.
   pub fn known_voters(&self) -> Vec<HostId> {
@@ -1413,7 +1413,7 @@ impl RegionalCouncil {
   }
 
   /// **DRIVE** (leader): records the voters in force in the configuration once they differ from the ones it records
-  /// (A-372, [`RegionalConfiguration::seat`]): only while no change is in flight — this leader caught up and its voters
+  /// (A-380, [`RegionalConfiguration::seat`]): only while no change is in flight — this leader caught up and its voters
   /// out of any joint configuration, so they are the ones the council's last committed seat change left. A learner
   /// takes no part in the council's Raft and learns a change by the configuration's version, and a seat change is a
   /// Raft configuration entry that moves no version, so without this record a learner knew only the voters of its join
@@ -2710,7 +2710,7 @@ mod tests {
     assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
   }
 
-  /// A-372 (§4.8 learners): the leader records the voters in force in the configuration once no change is in flight, and
+  /// A-380 (§4.8 learners): the leader records the voters in force in the configuration once no change is in flight, and
   /// a learner knows who votes by the configuration it adopts, through a seat change too. Do: five members at `f = 1`
   /// (three voters, two learners); elect the first; record the voters and commit; let the last member, a learner, adopt
   /// the leader's configuration; take a voter over and drive the voter change that refills its seat; record again and

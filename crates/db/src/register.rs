@@ -2727,7 +2727,7 @@ pub struct RegionalConfiguration {
   /// ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move past the
   /// bound its proposer derives is refused before it is proposed.
   pub moved: std::collections::BTreeMap<ObjectId, Moved>,
-  /// The council's voters as the configuration last recorded them (§4.8 learners, A-372): the voter set the council's
+  /// The council's voters as the configuration last recorded them (§4.8 learners, A-380): the voter set the council's
   /// last committed seat change left, in id order, recorded by its leader once that change has committed
   /// ([`seat`](RegionalConfiguration::seat)). A learner takes no part in the council's Raft, so it knows who votes from
   /// the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until the
@@ -2813,7 +2813,7 @@ impl RegionalConfiguration {
   }
 
   /// Records `voters` as the council's voters, in id order, once the council has committed the seat change that left
-  /// them, and advances the version, so every learner learns of the change as of any other (A-372). A set equal to the
+  /// them, and advances the version, so every learner learns of the change as of any other (A-380). A set equal to the
   /// one recorded, or a version with no successor, changes nothing. Returns whether the configuration changed.
   pub fn seat(&mut self, voters: &[HostId]) -> bool {
     let voters = in_id_order(voters);
@@ -5057,7 +5057,7 @@ mod tests {
     );
   }
 
-  /// A-372 (§4.8 learners): the configuration records the council's voters, in id order, and a recorded change advances
+  /// A-380 (§4.8 learners): the configuration records the council's voters, in id order, and a recorded change advances
   /// its version as any change does. Do: in a five-member region, seat three voters given out of order, seat the same
   /// set again in another order, then seat another set. Expect the first and the last to change the configuration, each
   /// advancing the version by one and recording the set in id order, and the repeat to change nothing (`seats` false).

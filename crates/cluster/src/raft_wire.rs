@@ -715,7 +715,7 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 3 since A-372, which appended the council's recorded voters
+/// Format: the regional configuration's layout version: 3 since A-380, which appended the council's recorded voters
 /// (`voters`, a host set) after the moved-object exceptions. Layout 2 (A-309) put the completion records (`completed`)
 /// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
 /// byte, then its settled form, after its unconfirmed hosts). Layout 1 was the first versioned layout. A decoder
@@ -1902,7 +1902,7 @@ mod tests {
     complete_every_retirement(&mut config);
     assert!(!config.completed.is_empty());
     expect_round_trip(&config, "round-trip is identity with completion records");
-    // The council's recorded voters (A-372) survive it too.
+    // The council's recorded voters (A-380) survive it too.
     assert!(config.seat(&[HostId(3), B]));
     expect_round_trip(&config, "round-trip is identity with recorded voters");
   }
@@ -1981,7 +1981,7 @@ mod tests {
     assert!(config.moved.is_empty());
     let bytes = encode_regional_configuration(&config);
     // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count
-    // and the recorded voters' count (none of either here, A-372).
+    // and the recorded voters' count (none of either here, A-380).
     let tail = confirmed * size_of::<u64>() + 2 * size_of::<u32>();
     let count_at = bytes.len() - tail - size_of::<u32>();
     let mut lying = bytes.clone();
@@ -2013,7 +2013,7 @@ mod tests {
     );
     assert!(config.move_object(ObjectId::new(A, 5), A, B));
     let bytes = encode_regional_configuration(&config);
-    // The exceptions come before the recorded voters' count alone (none here, A-372): a count, then one entry of an
+    // The exceptions come before the recorded voters' count alone (none here, A-380): a count, then one entry of an
     // object id and two words.
     let voters = size_of::<u32>();
     let entry = OBJECT_BYTES + 2 * size_of::<u64>();
@@ -2050,7 +2050,7 @@ mod tests {
     // The last retirement ends with its confirmed ids (a count, none here), its unconfirmed ids (a count, none here)
     // and its current neighbourhood's presence byte (none here, A-309): make the confirmed count claim every id there
     // is. The adoptions' count, the completion records' count, the moved objects' count and the recorded voters' count
-    // (none of each here, the last A-372's) follow the last retirement, in that order.
+    // (none of each here, the last A-380's) follow the last retirement, in that order.
     let tail = 6 * size_of::<u32>() + 1;
     let confirmed_count_at = bytes.len() - tail;
     let mut lying = bytes.clone();
