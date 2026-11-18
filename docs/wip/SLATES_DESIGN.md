@@ -1869,6 +1869,13 @@ failover delay (one term) stays under the operator's failover SLO; tombstone hor
 × 2; destroy slice = measured per-node free cost × the shard's per-iteration budget; the base and
 landing constants are in §4.15.
 
+> **Status (2026-11-18, A-363): the failover delay is a live output, not a setting.** Each node estimates
+> `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
+> detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
+> the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
+> (`FleetReport::failover`). The operator's SLO above is still the 10 s placeholder its consumers read until each moves
+> to the estimate or to a term of its own (A-363's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
 `unique_bytes` is 0; the agent writes one file: the path from the root to that file is copied
@@ -4376,9 +4383,17 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
-  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends or
-  its guest first maps a file with DAX (whose stores then live where only the device maps them).
-  A successor hands the device a fresh stream over it in a `Resync` naming the same token, and keeps its own copy of
+  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends.
+  A stream whose guest maps files with DAX keeps its resync (A-365): the anchor holds each file's DAX object before its
+  first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
+  whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
+  resync up, as a stream did at its first map before A-365, since the guest's stores live where only the device maps
+  them once the daemon is gone.
+  A successor takes the held DAX objects back while recovery rebuilds the shard, at the very handles their backings
+  had, dormant through the write log's replay (each already holds every write the dead daemon made to its ranges, in
+  order with its guest's stores), and its stream ingests their writable ranges before it serves anything, wakes them so
+  every change reaches them again, and answers the device's new asks with the same objects. It hands the device a fresh
+  stream over the channel in a `Resync` naming the same token, and keeps its own copy of
   the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
   closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
   device reads it, and a socket whose every copy rides a message is what macOS's collector flushes); the device takes
@@ -4520,6 +4535,16 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > the stream's write log, the kept barrier reply, recovery keeping the stream, the replay, the successor's copy of the
 > fresh end (the end arrived flushed in 3 of 3 runs), the channel's watch, and the macOS daemon keeping its held
 > devices. Owed: the anchor holding a stream's DAX objects; Windows; and the siblings GAPS names.
+
+> **Status (2026-11-18, A-365, a stream's DAX maps outlive its daemon).** Built and proven by use on macOS (a Mac
+> Studio, kiln runs r3427 to r3489) and Linux. With the test as the anchor and the device: a stream's guest maps a file
+> with DAX and stores through the map without syncing; the anchor is given the file's object as the descriptor goes
+> out and the stream keeps its resync; across the daemon's death the successor takes the object back, the guest's
+> unsynced store reads back through another stream, the device's new ask is answered with the very object it maps (a
+> store through the old map reads back through the new one), and another stream's write after the resync reaches the
+> guest's map (`crates/server/tests/shards_resync_dax.rs`). The range table's codec and bounds, the held object's
+> record and `DaxObject::adopt`'s refusals have unit tests. Each of eight guards removed alone fails the restart test,
+> among them the dormancy through the replay, whose absence lost the guest's store. Owed: Windows (Shards' handle path).
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -8204,6 +8229,17 @@ it builds against the contract and adds to it rather than around it.
 > when that part was recovered within tolerance; the takeover record keeps it with the volume, so it survives the
 > successor's restart. `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within
 > live_log ...`, and the JSON (CLI and MCP) carries it under `loss.taken_over.past_tolerance`.
+> **`CONTRACT` = 22 (A-354):** a reply held for durability past the failover SLO is a typed retry
+> (`RetryCause::DurabilityPending`, the wire's appended `Refusal::DurabilityPending`): until then a write whose log or
+> tombstone could not be held where its reply waits for it was never answered.
+> **`CONTRACT` = 23 (A-366):** a start a host waits on needs no wall-clock deadline of its own:
+> `StartSpec::until_served` asks the anchor to stop when its daemons crash-loop before any of them has served, and
+> `Instance::wait_for` with that anchor's child then ends `StartFault::NeverServed`.
+> **`CONTRACT` = 24 (A-363):** the daemon's status carries the failover delay as the node estimates it now,
+> `DaemonReport::fleet`'s `failover` (a `FailoverReport`, appended to `FleetReport` and `ShardReport`): the total and
+> its detection, confirmation and recovery terms, each with the measurements behind it (round trips, coordinator
+> periods, takeovers and volumes timed), so a consumer tells a measured term from a prior. `slates status` prints
+> `fleet_failover: ...` and MCP's daemon status carries it under `fleet.failover`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -26366,10 +26402,23 @@ Applied in the same change to:
   before the record half in its place (the highest record alone), and TLC must refute it.
 - **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
   the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
-  were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
-- **The build owed** (GAPS, the record half): the green successor's materialization adopts, by this rule, the positions
-  between its own highest record and the adopted version from the members of the green's recovery cohorts, and
-  re-commits each under its own epoch, before it gathers the chain.
+  were re-run on the same toolchain and give the same counts. The three-epoch configuration ran 34 minutes without a
+  violation (40,469,260 distinct states, depth 26) and was stopped short of completion (GAPS' model table).
+- **The build (the record half).** A green successor that does not know the records of versions below the one its
+  round adopted (`green_adopt::Engine::RecordsShort`, A-333) asks every member of the green's recovery cohorts, settled
+  and current, for its positions in that range under the round's epoch and generation (`LedgerPrepare` /
+  `LedgerPromise`, stream 28, appended to the record session's kinds). A holder admits the question as it admits a page
+  (`takeover::question_refused`), answers only for the ledger's successor and a copy in this round
+  (`slates_db::takeover::answer_ledger`), promises the object at the epoch first, lists each position it accepted with
+  its epoch, paged by the frame, and answers once its publish keeps the raised fence. The successor counts each
+  position as the round counts an object (`slates_db::takeover::ledger_positions`: a member promised a position when it
+  reported it or its answer covers it and lists nothing there, `CountingRule::NamedAnswer`, within and past tolerance
+  as A-309 counts), adopts, in order, the value accepted under the highest epoch, and commits each again under itself
+  at the round's epoch (`takeover::commit_adopted`, the newest record's own path). A fence above the epoch starts the
+  round over above it. Then the versions' inputs are fetched by identity (the input half) and the chain gathered.
+  Counted `fleet.takeover.ledger_positions_adopted`, `_refused`, `_no_round`, `_fenced`, `_waiting`.
+- **Open (GAPS).** A holder's register refuses a different value at a position it holds (`ConflictingPosition`)
+  where the model's acceptor overwrites a lower epoch's; a never-committed divergent value cannot yet be replaced.
 
 Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
 files.
@@ -26705,6 +26754,127 @@ test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::track
 - **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
   compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
   growth, in the content's bytes.
+
+Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
+the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
+serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
+the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
+(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
+`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
+`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
+`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
+
+### A-363 — The failover delay is a live output: detection, confirmation and recovery estimated from what each node measures, every coordinator period (2026-11-18, built for goal g255; Ada's rule of the same day: "no arbitrary constants", and a value computed once at boot is still a constant, so the estimators keep learning from the traffic they judge)
+
+- **What was there.** `F` was the operator's failover SLO, `config::FAILOVER_SLO_NS`, a 10 s placeholder, and A-359
+  planned it as the membership horizon, the council's ten periods and `T` summed at boot (2.9 s). Ada: "2.9 s is just an
+  arbitrary constant, not a learned or data derived method that adapts."
+- **The estimate** (`crates/cluster/src/failover.rs`, its module doc cites each method): `F = D + E + R`, refreshed by the
+  control shard each coordinator period (`fleet::refresh_failover`), nothing setting it.
+  - `D`, detection: SWIM's count of `2(2m − 1) + 1` periods from a crashed peer's last answer to its condemnation
+    pending (§4.3 of Das, Gupta & Motivala 2002; hyper-swim's `Detector::detection_bound` counts the same), each at the
+    running tail of the detector's period as the member plane times it, one period's probe to the next
+    (`MemberPlane::detection`). Each pair is NFD-E (Chen, Toueg & Aguilera 2002) with Lifeguard's local health (Dadgar
+    et al. 2018), which stretch the periods `D` counts. **Not the detector's own bound:** hyper-swim counts each period
+    at the longest the member ever ran (and its latest wake lateness ever), a sound bound that only ratchets: one slow
+    period at formation set it for good, and a quiet three-node loopback fleet read 7.0 and 14.0 s before any loss where
+    other runs read 0.9 s (2026-11-18, the Mac Studio). The running tail forgets such a period as later ones run at
+    their pace (`detection_forgets_a_period_that_ran_long_once`). **The false-suspicion probability is derived:** each pair's margin minimizes
+    `U = (E(D) + α + η + T_E)/MTBF + T_E·β/η` (hyper-timing `qos`) against the fleet's measured MTBF, and `β` is
+    bounded from the measured lateness by Cantelli with the record-indicator share (Rényi 1962); in φ-accrual's terms
+    (Hayashibara et al. 2004) the threshold is `φ = −log10 β`, with the distribution-free tail in place of the normal
+    fit. Each peer's `β` was already reported (`DetectorPeerReport::mistake_milli`); no new detector was needed.
+  - `E`, confirmation: the council leader's death watch, `ElectionTiming::base_periods` (Raft's rule scaled from each
+    voter path's `srtt + 4·rttvar`, RFC 6298), plus one period for the successor's install, each period at the measured
+    coordinator period's tail (a starved coordinator's periods stretch, and the watch counts periods), plus the
+    retirement's commit round, the slowest voter path's tail.
+  - `R`, recovery: the larger tail (RFC 6298's estimator, Jacobson 1988) of the takeovers this node timed (a round begun
+    to its share done, `takeover::HostTakeover::time_done`) and of the volumes it timed (adopted to served,
+    `state::PendingVolume::adopted_ns`); before the first, the ratified `T` (RAMCloud's second, GAPS §5), as RFC 6298
+    §2.1 starts at a stated second until a measurement exists.
+  - On a laptop there is no peer to detect and no council to confirm: `F` is the recovery alone (R8, the same
+    derivation at its degenerate inputs).
+- **Published.** `FailoverReport` (appended to `FleetReport` and `ShardReport`, `CONTRACT` 24), `slates status`
+  `fleet_failover: ...`, MCP's `fleet.failover`: the total, each term, and the measurements behind each.
+- **Owed, each in its own change, failing test first:** the failover-shaped waits read the estimate instead of the
+  placeholder (a forward's `FailoverBound`, the location round's cap, `live_ship`'s fetch total, `takeover_attempts`,
+  the telemetry horizon), fanned to every shard with the configuration; each lease takes its term from a φ-accrual
+  detector over its own holder's renewals (a landing's target lease, the NFSv4 and delegation leases, a CLI attachment's
+  term once the CLI process sends a keepalive); `W`'s floor from the runtime pulses' running wake delay; then
+  `FAILOVER_SLO_NS` and `with_failover_slo` go. The boot-time sum is kept only as the A/B baseline, a build of its own.
+- **Evidence.** The estimator's unit tests (`crates/cluster/src/failover.rs`: the prior alone with nothing measured; the
+  recovery leaving its prior at RFC 6298's first-sample tail and following the takeovers it times; the larger of the
+  takeover and volume tails; the confirmation at the heartbeat before any period, stretched with the measured period,
+  and scaled with a far voter path's election base; detection as SWIM's period count at the measured period, and
+  forgetting a period that ran long once; the total the sum; no sample from a clock that reads earlier). The
+  fleet test `a_successors_failover_estimate_learns_the_takeover_it_completed` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`; before the loss each survivor's detection and confirmation are measured and its recovery the prior;
+  after the owner's death the successor serves the volume and its estimate has timed the takeover and the volume). The
+  wire's status test carries the report through fragmented pages (`crates/ipc/tests/status.rs`). Measured by that test
+  on the Mac Studio (2026-11-18, load 14-22, debug build, three runs): the survivors estimated 4.60-5.19 s before the
+  loss (detection 2.04-2.63 s on 82-235 detector periods, confirmation 1.56-1.57 s on 7 coordinator periods, recovery the
+  1 s prior); the successor 3.86-5.42 s after it (detection 2.07-2.12 s, confirmation 1.17-1.18 s on 27-33 periods,
+  recovery 0.62-2.14 s from one takeover and one volume timed). Each of the seven detector periods counts at its own
+  tail, `srtt + 4·rttvar`, which a loaded host's jitter widens; the periods are counted as correlated (a starved host
+  stalls them together), not as independent. Red-checked: without the takeover's fold, the volume's fold or the
+  period's refresh the test fails (the successor's takeovers or volumes untimed, or the survivors' detection and
+  confirmation zero).
+
+Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (the `CONTRACT` 24 status line, with A-354's 22 and A-366's 23 beside it), GAPS (the
+`LIVENESS_BUDGET_NS` entry), `crates/cluster/src/{failover,lib,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,verbs}.rs`,
+`crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
+`crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.
+
+### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
+Applied in the same change to:
+- §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
+- `crates/mem`: `DaxObject::adopt` (a held object's descriptor checked as one `DaxObject::create` made: its size, and on
+  Linux its seals) and `MemError::NotADaxObject`; the test
+  `an_object_held_across_its_makers_end_is_adopted_and_nothing_else_is`.
+- `crates/vfs/src/shards_backing.rs`: `ShardsBackings::adopt_vmm` (a VMM's backing kept again at its exact handle,
+  dormant) and `wake`; `VmmRefusal`.
+- `crates/bridge-core/src/dax_backing.rs`: `Then::Resume`, `filled_charge`, `most_views` public, `pending_inode`,
+  `backing_of`, `adopt`.
+- `crates/server`: `config.rs` (`ShardContentLayout::dax_ranges`, `dax_range_slots`, `dax_range_table_bytes`; the
+  anchor's held-copy bound grown by the DAX backings a shard can hold); `dax_ranges.rs` (the range table and its unit
+  tests); `shards/dax_hold.rs` (the held object's record, the split of handed copies by kind, `keep`, `let_go`,
+  `adopt_inherited` in one ascending order with A-197's copies, `claim`, `let_go_every_unclaimed`, the counters
+  `shards.dax_hold_refused`, `shards.dax_adopted`, `shards.dax_adopt_refused`); `anchor_hold.rs` (held copies on every
+  Unix); `held_copy.rs` (`adopt_or_release`, `claim_deadline`); `daemon.rs` (the table opened beside the write log,
+  `ShardHolds::dax`); `verbs.rs` (the merged adoption before the replay); `shards.rs` (`ShardsStream::held_dax`,
+  `keep_resync_through_dax`, `Then::Resume`, a stream whose ingest is under way turns at once, the claim at adoption,
+  `shards.dax_adopted_unpublished`); `shards/dax.rs` (the answer keeps what a successor needs; a backing's end lets it
+  go). The test: `crates/server/tests/shards_resync_dax.rs`, a binary of its own.
+
+- **What was there.** A stream gave its resync up at its guest's first DAX map (A-316): the guest's stores through a map
+  live in an object only the device maps once its daemon is gone, and a successor knew nothing of it, so a DAX share
+  ended at a daemon's death.
+- **What a successor needs.** The object, which the anchor holds as it holds a writable copy (A-197): sent before the
+  first descriptor goes to the device, its id the backing's handle encoded with its partition, its record the
+  attachment and the inode under a tag of its own; released at the backing's end. And which ranges of it are the file's
+  and which the guest may have stored into: a range never filled reads zeros, which a comparison against the file would
+  take for the guest's stores, and macOS's shared-memory objects say nothing of which pages were touched. So each range
+  answered is recorded in the shard's DAX range table in anchor RAM, with whether it was asked writable, when the ask is
+  answered (never at the fill's start: a death mid-fill must not leave a half-filled range named filled). The table has
+  a slot for each range the shard's fill budget can count, since each filled range counts a range against it, so a slot
+  is always free; a table of another layout is cleared and started again, never misread.
+- **The successor.** Recovery takes each held object back at the very handle its backing had, in one ascending order
+  with A-197's copies (the registry's `insert_at` contract), for each stream it kept, and dormant: no write reaches it
+  until its stream takes it. The object already holds every write the dead daemon made to its ranges, in order with its
+  guest's stores, and the write log's replay runs between: kept awake, the replay wrote the logged write over the
+  guest's later store, and the store never reached the file (measured, the first run of the test). The stream's
+  adoption takes the objects into its session, wakes them, ingests their writable ranges before it serves anything
+  (its serve task turns at once while an ingest is under way), publishes, and answers the device's new asks with the
+  same objects, so the guest's maps stay right. An object no kept stream claims is let go, its ranges forgotten.
+- **Found beside it** (GAPS): A-197's writable copies are adopted awake before the replay, so a logged write a client's
+  store followed can be written over that store at a takeover, the same hazard; its tests do not write through another
+  path before the client's store.
+- **Evidence.** On a Mac Studio (kiln runs r3427 to r3489): the focused tests pass, the restart test among them, and the
+  existing stream DAX tests; each of eight guards removed alone fails the restart test (the dormancy, the hold, the
+  range's record, its writable mark, the adoption's ingest, the wake, the session's adoption, and the resync kept at a
+  DAX map). Linux: GitHub's ubuntu runner (run 44347232055).
 
 ### A-372 — A holder judges only the content a new record or put can change: a ledger's inputs placed below its newest accepted version were judged when their records came (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree)
 Applied in the same change to: §4.10 "a late copy is redundant and reclaimed" (its rule's cost), GAPS (the load test's

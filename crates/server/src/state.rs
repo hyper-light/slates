@@ -340,6 +340,19 @@ pub struct ShardState {
   /// mounts and streams recovery keeps.
   #[cfg(unix)]
   pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
+  /// Each range a Shards stream's held DAX backing has answered, in the region of the anchor's content object after the
+  /// delta log (A-365; `crate::dax_ranges`): what a successor ingests and never refills. `None` without a content object.
+  #[cfg(unix)]
+  pub(crate) dax_ranges: Option<crate::dax_ranges::RangeTable>,
+  /// The DAX objects the anchor handed back for this shard's partition (A-365; `crate::shards::dax_hold`), until
+  /// recovery takes each back or lets it go. Bounded by the anchor's held-copy bound.
+  #[cfg(unix)]
+  pub(crate) inherited_dax: Vec<crate::shards::dax_hold::InheritedDax>,
+  /// The DAX objects recovery kept again in the store, by the attachment of the stream they belong to, until the
+  /// stream's adoption takes them (`crate::shards::adopt_one`); any left after every adoption is let go. Bounded as
+  /// `inherited_dax` is, of which these were part.
+  #[cfg(unix)]
+  pub(crate) adopted_dax: std::collections::BTreeMap<u64, Vec<crate::shards::dax_hold::AdoptedDax>>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
   /// client that holds unstable writes from before a restart sees it change and re-sends them.
@@ -1040,6 +1053,11 @@ pub struct ShardState {
   pub council_timing: slates_cluster::timing::ElectionTiming,
   /// The root group's election timing, derived as the council's is over the root voters' paths.
   pub root_timing: slates_cluster::timing::ElectionTiming,
+  /// The failover delay as this node estimates it (§4.8 "Derived constants", A-363): the coordinator's measured period,
+  /// the takeovers and volumes it timed, and the detection and confirmation terms the last period derived from the
+  /// detector and the council's timing. Live on the control shard, which runs the coordinator; a laptop's, and every
+  /// other shard's, is the recovery prior alone.
+  pub failover: slates_cluster::failover::Failover,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
@@ -1552,11 +1570,14 @@ pub struct PendingVolume {
   /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
   /// `None` within tolerance and for a volume no round adopted.
   pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
+  /// When it was adopted, on the shard's clock (zero off a shard): its recovery is timed from here to its service, into
+  /// the failover estimate (A-363).
+  pub adopted_ns: u64,
 }
 
 impl PendingVolume {
   /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
-  /// `cohort_hosts`: no attempt made yet.
+  /// `cohort_hosts`: no attempt made yet, adopted now.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
@@ -1570,6 +1591,7 @@ impl PendingVolume {
       round_seen: None,
       cohort_hosts,
       registers_short: None,
+      adopted_ns: slates_rt::futures::now_ns(),
     }
   }
 

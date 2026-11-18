@@ -727,12 +727,19 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
-/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
+/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
+/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
+/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
+/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
+/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
+/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
+/// leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
     .saturating_add(death_window_periods(daemons))
-    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(election_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
 }
 
@@ -9580,6 +9587,97 @@ fn three_daemons_take_over_a_dead_owners_head() {
     catalog.name, "taken-over",
     "the taken-over catalog survived the promotion and re-commit"
   );
+}
+
+/// The failover delay as a successor estimates it (§4.8 "Derived constants", A-363): an output that learns from the
+/// takeover it completes, never a setting. Do: three nodes at `f = 1`; on a, a volume shared with the fleet, its head
+/// held by both others; read each survivor's failover estimate; then a dies, and the successor serves the volume. Expect
+/// each survivor's estimate before the loss to carry detection from its detector and confirmation from the coordinator
+/// periods it timed, the recovery at its prior (the ratified recovery budget, nothing timed) and the total their sum; and
+/// the successor's, once its share is done, to have timed the takeover and the volume, the total still the sum of its
+/// terms.
+#[test]
+fn a_successors_failover_estimate_learns_the_takeover_it_completed() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("failover-learned")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  drop(client);
+  let object = ObjectId(id.bytes);
+  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let before: Vec<Option<slates_ipc::protocol::FailoverReport>> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| failover_through(&mut Client::connect(daemon.instance())))
+    .collect();
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = usize::from(successor != hosts[1]);
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  // One client for the whole wait: a client a poll would cost its shard a seat each time.
+  let mut status = Client::connect(&successor_instance);
+  let mut after = None;
+  let timed = poll_until(&survivors, SERVE_DEADLINE, || {
+    after = failover_through(&mut status);
+    Ok(after.is_some_and(|report| report.takeovers_timed > 0 && report.volumes_timed > 0))
+  });
+  drop(status);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("failover estimates: before the loss {before:?}; the successor's after it {after:?}");
+  assert!(
+    survivors_hold,
+    "both survivors held the head before the loss"
+  );
+  for report in &before {
+    let report = report.expect("each survivor reported its failover estimate");
+    assert!(
+      report.detection_ns > 0 && report.confirmation_ns > 0 && report.confirmation_samples > 0,
+      "detection from the detector and confirmation from timed periods, measured: {report:?}"
+    );
+    assert_eq!(
+      (
+        report.takeovers_timed,
+        report.volumes_timed,
+        report.recovery_ns
+      ),
+      (0, 0, slates_db::replay::RECOVERY_BUDGET_NS),
+      "nothing recovered yet: the recovery is its prior"
+    );
+    assert_eq!(
+      report.total_ns,
+      report.detection_ns + report.confirmation_ns + report.recovery_ns,
+      "the failover delay is its terms' sum"
+    );
+  }
+  assert!(served, "the successor serves the volume");
+  assert!(
+    timed,
+    "the successor timed its takeover and the volume into its estimate: {after:?}"
+  );
+  let after = after.expect("the successor reported its failover estimate");
+  assert_eq!(
+    after.total_ns,
+    after.detection_ns + after.confirmation_ns + after.recovery_ns,
+    "the failover delay is its terms' sum: {after:?}"
+  );
+}
+
+/// The failover estimate the daemon `client` is connected to reports in its status (A-363), or `None` when it did not
+/// answer one.
+fn failover_through(client: &mut Client) -> Option<slates_ipc::protocol::FailoverReport> {
+  match client.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.fleet.failover),
+    _ => None,
+  }
 }
 
 /// Prints each survivor's refusal counters after a takeover that did not complete (`completed` false): which step
@@ -22115,6 +22213,132 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
       head: Ok(3),
       at_one: Ok(b"hello".to_vec()),
       at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// GAP-A9-7's record half (A-364; §4.8 "For each ledger position ... adopts the highest accepted proposal consistent
+/// with the committed prefix", §4.16): a successor two versions behind the quorum takes the green over. Do: three nodes
+/// at `f = 1`; on a, a green advanced to version 2 and recomputed by both holders; the survivor rendezvous ranks first
+/// for the green then withholding every merge record and refusing every content put, so versions 3 and 4 commit at a
+/// and the other holder alone; a dies. Expect the successor at version 2 and the other holder at 4 when a dies; the
+/// successor to adopt the records of versions 3 and 4, fetch their inputs, and place the green at version 4 without
+/// giving it up, with the owner's chain, serving version 1 and the head's bytes. Before, phase one reported each
+/// holder's highest record alone, so the successor knew version 4's record but not version 3's, and gave the green up
+/// `TakeoverIncomplete { waited_on: "chain" }` at its bound.
+#[test]
+fn a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "two-behind", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusals install");
+  commit_version(&mut client, work, (11, "!"), 3);
+  commit_version(&mut client, work, (12, "?"), 4);
+  let other_at_four = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(4))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let owner_chain = daemons[0].merge_chain_identities(green).unwrap();
+
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let given_up = |daemon: &Daemon| {
+    daemon.refusals_on_every_shard().map(|counted| {
+      counted
+        .get("merge.takeover_given_up")
+        .is_some_and(|count| *count > 0)
+    })
+  };
+  // The daemon's own verdict ends the wait: the green placed at version 4, or given up at its bound.
+  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemons[successor_index].merge_record_placed(green, 4)?
+        || given_up(&daemons[successor_index])?,
+    )
+  });
+  let placed = daemons[successor_index].merge_record_placed(green, 4);
+  let counted = daemons[successor_index].refusals_on_every_shard();
+  let successor_chain = daemons[successor_index].merge_chain_identities(green);
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let counted = counted.expect("the successor's counters are read");
+  let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_four, "the other holder recomputed version 4");
+  assert_eq!(
+    successor_at_death.map(|state| state.version),
+    Ok(Some(2)),
+    "the successor was two versions behind when the owner died"
+  );
+  assert_eq!(
+    placed,
+    Ok(true),
+    "the successor placed the taken-over green at version 4 (given up {}, positions adopted {}, waited on its chain {})",
+    count_of("merge.takeover_given_up"),
+    count_of("fleet.takeover.ledger_positions_adopted"),
+    count_of("merge.takeover_incomplete"),
+  );
+  assert_eq!(
+    count_of("merge.takeover_given_up"),
+    0,
+    "the green was never given up"
+  );
+  assert!(
+    count_of("fleet.takeover.ledger_positions_adopted") >= 1,
+    "the successor adopted the version between its own and the adopted one"
+  );
+  assert_eq!(
+    successor_chain,
+    Ok(owner_chain),
+    "the successor's chain carries the owner's increment identities, in order"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(4),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!?".to_vec()),
     },
     "the successor serves the head version, version 1 and the head's bytes"
   );

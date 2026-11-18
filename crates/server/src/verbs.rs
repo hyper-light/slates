@@ -3933,6 +3933,24 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       slates_ipc::protocol::LearnerReport::default()
     },
+    failover: failover_report(state),
+  }
+}
+
+/// This shard's failover estimate as the wire carries it (A-363): live on the control shard, which runs the
+/// coordinator that refreshes it; every other shard's, and a laptop's, is the recovery prior alone.
+fn failover_report(state: &ShardState) -> slates_ipc::protocol::FailoverReport {
+  let estimate = state.failover.estimate();
+  let recovery = state.failover.recovery();
+  slates_ipc::protocol::FailoverReport {
+    total_ns: estimate.total_ns(),
+    detection_ns: estimate.detection.map_or(0, |term| term.ns),
+    detection_samples: estimate.detection.map_or(0, |term| term.samples),
+    confirmation_ns: estimate.confirmation.map_or(0, |term| term.ns),
+    confirmation_samples: estimate.confirmation.map_or(0, |term| term.samples),
+    recovery_ns: estimate.recovery.ns,
+    takeovers_timed: recovery.takeovers().samples(),
+    volumes_timed: recovery.volumes().samples(),
   }
 }
 
@@ -4132,6 +4150,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
     learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
+    failover: control.map_or_else(|| failover_report(state), |shard| shard.failover),
   }
 }
 
@@ -12967,11 +12986,12 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
-  // by the volume's write boundary (A-197).
-  #[cfg(target_os = "linux")]
+  // The objects the anchor held are taken back first, so every write the replay applies is written into them by the
+  // volume's write boundary: the writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects
+  // (A-365), in one ascending order of their backings' handles.
+  #[cfg(unix)]
   {
-    rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
+    rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
     slices.unit_done().await;
   }
   // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;

@@ -581,9 +581,14 @@
 >   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
 >   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
 >   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
->   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
->   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
->   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
+>   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
+>   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
+>   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
+>   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
+>   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
+>   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
 >   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
 >   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
@@ -2880,7 +2885,20 @@
 > is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
-> class C claim wait below.
+> class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
+> sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
+> coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
+> the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
+> (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
+> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
+> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
+> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
+> sum is kept only as the A/B baseline, a build of its own, never a mode.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -7502,6 +7520,7 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/Reconfig.tla` | `Reconfig.cfg`, re-run (A-364) | no error, the same as 2026-09-04 (1 s) | 20,478 distinct | 19 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -11650,6 +11669,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 
@@ -17803,20 +17830,31 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the shard panicked ("assertion failed: matches!(crate::merge_service::merge_role(state, id), Some(MergeRole::Green {
   .. }))") and the test failed; with the refusal it answers `AlreadyExists` and the plain volume stays plain and served
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
-- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
-  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+- **Fixed, the record half (GAP-A9-7; A-364, g250, 2026-11-18):** a successor whose own records ended two or more
+  versions below the adopted one lacked the intermediate records themselves (phase one reports each holder's highest
+  record only), which no fetch by identity can fill, and gave the green up `chain` at the bound. Modelled first:
   `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
-  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
-  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
-  successor's green materialization, finding positions between its own highest record and the adopted version unknown
-  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
-  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
-  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
-  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
-  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
-  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
-  `takeover::materializing`), so its holders still authorize the question.
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety) while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Built on it: the successor's
+  green materialization, finding versions below the adopted one whose records it does not know
+  (`green_adopt::Engine::RecordsShort`, A-333), asks every member of the green's recovery cohorts for the positions in that
+  range under its round's epoch (`slates_db::register::LedgerPrepare` on stream 28; a holder answers through the checks
+  a by-name question runs, promising the object first: `slates_db::takeover::answer_ledger`), adopts at each position,
+  in order, the record accepted under the highest epoch once a recovery quorum of each cohort promised it
+  (`slates_db::takeover::ledger_positions`), commits each again under its own epoch (`takeover::commit_adopted`, shared
+  with the newest record's adoption), and then fetches the versions' inputs and gathers the chain. Holders already kept
+  a ledger's every position (`Acceptor::accepted`, never compacted for a merge chain), and the takeover's share stays
+  open while the green is pending (A-345's `takeover::materializing`), so its holders still authorize the question.
+  Test: `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`
+  (`crates/server/tests/fleet.rs`; red with the catch-up skipped: waited on its chain 100 periods, given up), with the
+  db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's round trip and hostile input, and
+  `an_acceptor_reports_a_ledgers_positions_in_a_range`.
+- **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
+  differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
+  overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two
+  takeovers, the first adopting without it) cannot then be re-committed on the holders that keep the stale one; with
+  the successor among them its own commit is refused and the range waits for its bound. Not reached at `f = 1` with one
+  takeover; owed: accept a higher epoch's different value at an uncommitted position, held to the model.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

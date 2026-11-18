@@ -260,6 +260,11 @@ pub struct MemberPlane {
   holders: Vec<HostId>,
   due: Vec<Renewal>,
   counts: PlaneCounts,
+  /// The detector's protocol period as it runs, timed from each period's probe to the next ([`MemberPlane::step`]): the
+  /// failover estimate's detection term counts its tail ([`MemberPlane::detection`], A-363).
+  periods: crate::failover::RunningDuration,
+  /// When the detector last sent a period's probe, on the owner's clock.
+  last_probe_ns: Option<u64>,
 }
 
 impl std::fmt::Debug for MemberPlane {
@@ -330,6 +335,8 @@ impl MemberPlane {
       holders: Vec::new(),
       due: Vec::new(),
       counts: PlaneCounts::default(),
+      periods: crate::failover::RunningDuration::new(),
+      last_probe_ns: None,
     };
     member.gossip_room = member.room_beside_ack();
     member.view_room = member.room_beside_sync();
@@ -470,6 +477,25 @@ impl MemberPlane {
     &self.detector
   }
 
+  /// The detection term of this node's failover estimate (A-363): [`crate::failover::detection`] over the members the
+  /// detector's view holds besides this one, its own `m`, and the detector's period as this plane timed it.
+  pub fn detection(&self) -> Option<crate::failover::Term> {
+    let others =
+      u64::try_from(self.detector.membership().len().saturating_sub(1)).unwrap_or(u64::MAX);
+    crate::failover::detection(others, &self.periods)
+  }
+
+  /// The detector sent a period's probe at `now_ns`: the time since the last is the length of the period it ends, a
+  /// sample of the detector's period (A-363). A clock that read earlier is no sample.
+  fn period_probed(&mut self, now_ns: u64) {
+    if let Some(last) = self.last_probe_ns
+      && let Some(length) = now_ns.checked_sub(last)
+    {
+      self.periods.on_sample(length);
+    }
+    self.last_probe_ns = Some(now_ns);
+  }
+
   /// The detector's belief about `peer`, if it holds one.
   pub fn belief(&self, peer: HostId) -> Option<MemberState> {
     self.detector.membership().state(hyper_swim::HostId(peer.0))
@@ -566,6 +592,9 @@ impl MemberPlane {
     self.nacks = nacks;
     let mut requests = std::mem::take(&mut self.requests);
     let ping = self.detector.poll(now_ns, &mut requests);
+    if ping.is_some() {
+      self.period_probed(now_ns);
+    }
     self.counts.relays_asked = self
       .counts
       .relays_asked
