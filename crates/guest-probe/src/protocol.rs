@@ -23,6 +23,11 @@ const PATCH_ARGUMENTS: usize = 3;
 const STORM_ARGUMENTS: usize = 4;
 /// Format: the words an `entry` reply carries after its verb: a kind, a size, a digest and a path.
 const ENTRY_WORDS: usize = 4;
+/// Format: the arguments `exec` takes: a mount, a path, a user and a group.
+const EXEC_ARGUMENTS: usize = 4;
+/// Format: the words an `identity` reply carries after its verb: the real and effective user ids, then the real and
+/// effective group ids.
+const IDENTITY_WORDS: usize = 4;
 /// Format: the byte runs of no bytes at all, so an empty file's `write` keeps its argument.
 const NO_BYTES: &str = "-";
 /// Format: the radix of an entry's digest on the console: hexadecimal, as `{:016x}` writes it.
@@ -90,6 +95,37 @@ impl EntryKind {
       "other" => EntryKind::Other,
       other => return Err(ProtocolError::UnknownVerb(other.to_owned())),
     })
+  }
+}
+
+/// Which of the guest's mounts of what the VMM shares a command names (A-94, A-294).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mount {
+  /// The guest's own mount, made at boot `nosuid,nodev`, as `docs/cli.md`'s guest mount line asks: a volume keeps
+  /// set-id bits and device nodes as any writer made them, so a mount of it honours no set-id bit and opens no device
+  /// node.
+  Hardened,
+  /// The control ([`Command::Bare`]): the same file system mounted again without either flag, so a test shows that a
+  /// set-id bit or a device node reached the guest at all, and what the hardened mount withholds.
+  Bare,
+}
+
+impl Mount {
+  /// The mount's word on the console.
+  fn word(self) -> &'static str {
+    match self {
+      Mount::Hardened => "hardened",
+      Mount::Bare => "bare",
+    }
+  }
+
+  /// The mount a word names.
+  fn of(word: &str) -> Result<Mount, ProtocolError> {
+    match word {
+      "hardened" => Ok(Mount::Hardened),
+      "bare" => Ok(Mount::Bare),
+      other => Err(ProtocolError::UnknownVerb(other.to_owned())),
+    }
   }
 }
 
@@ -198,6 +234,29 @@ pub enum Command {
     /// How many sweeps.
     sweeps: u64,
   },
+  /// Mount what the VMM shares a second time, without `nosuid,nodev`: the control mount ([`Mount::Bare`]).
+  Bare,
+  /// Run the file `path` of `mount` as user `uid` and group `gid`, with no supplementary group, and answer what it says
+  /// of itself: a copy of the probe's own binary says its ids ([`Reply::Identity`]). A run the kernel refuses is
+  /// answered with its errno ([`Reply::Failed`]).
+  Exec {
+    /// The mount the file is run from.
+    mount: Mount,
+    /// The file, relative to the mount. The path holds no whitespace.
+    path: String,
+    /// The user it is run as.
+    uid: u32,
+    /// The group it is run as.
+    gid: u32,
+  },
+  /// Open the node `path` of `mount` for reading, without blocking, as the guest's root, and close it: [`Reply::Done`],
+  /// or the open's errno ([`Reply::Failed`]).
+  Open {
+    /// The mount the node is opened through.
+    mount: Mount,
+    /// The node, relative to the mount. The path holds no whitespace.
+    path: String,
+  },
   /// Unmap, unmount, sync and power the VM off.
   Quit,
 }
@@ -242,6 +301,24 @@ pub enum Reply {
     digest: u64,
     /// Its path, relative to the mount.
     path: String,
+  },
+  /// What a run of the probe's binary that is not the guest's `/init` says of itself, the answer to a
+  /// [`Command::Exec`]: its real and effective user and group ids.
+  Identity {
+    /// The real user id: the user the run was started as.
+    uid: u32,
+    /// The effective user id: a set-user-id file's owner where the mount honours the bit, else the real one.
+    euid: u32,
+    /// The real group id.
+    gid: u32,
+    /// The effective group id: a set-group-id file's group where the mount honours the bit, else the real one.
+    egid: u32,
+  },
+  /// A call the command made failed with this errno: the answer a test judges (an open refused `EACCES`), not a
+  /// failure of the probe's.
+  Failed {
+    /// The errno, as Linux numbers it.
+    errno: i32,
   },
   /// The command was refused: what was refused, and why.
   Refused(String),
@@ -332,6 +409,14 @@ impl Command {
         rounds,
       } => format!("storm {at} {len} {byte} {rounds}"),
       Command::Sweep { len, sweeps } => format!("sweep {len} {sweeps}"),
+      Command::Bare => "bare".to_owned(),
+      Command::Exec {
+        mount,
+        path,
+        uid,
+        gid,
+      } => format!("exec {} {path} {uid} {gid}", mount.word()),
+      Command::Open { mount, path } => format!("open {} {path}", mount.word()),
       Command::Quit => "quit".to_owned(),
     }
   }
@@ -450,6 +535,23 @@ impl Command {
           sweeps: number(sweeps)?,
         })
       }
+      "bare" => exactly::<0>("bare", arguments).map(|[]| Command::Bare),
+      "exec" => {
+        let [mount, path, uid, gid] = exactly::<EXEC_ARGUMENTS>("exec", arguments)?;
+        Ok(Command::Exec {
+          mount: Mount::of(mount)?,
+          path: path.to_owned(),
+          uid: number(uid)?,
+          gid: number(gid)?,
+        })
+      }
+      "open" => {
+        let [mount, path] = exactly::<2>("open", arguments)?;
+        Ok(Command::Open {
+          mount: Mount::of(mount)?,
+          path: path.to_owned(),
+        })
+      }
       "quit" => exactly::<0>("quit", arguments).map(|[]| Command::Quit),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
     }
@@ -473,6 +575,13 @@ impl Reply {
         digest,
         path,
       } => format!("entry {} {size} {digest:016x} {path}", kind.word()),
+      Reply::Identity {
+        uid,
+        euid,
+        gid,
+        egid,
+      } => format!("identity {uid} {euid} {gid} {egid}"),
+      Reply::Failed { errno } => format!("failed {errno}"),
       Reply::Refused(why) => format!("refused {why}"),
       Reply::Fatal(why) => format!("fatal {why}"),
     };
@@ -499,6 +608,8 @@ impl Reply {
       "timedout" => number(rest).map(|seen| Reply::TimedOut { seen }),
       "stormed" => number(rest).map(|micros| Reply::Stormed { micros }),
       "entry" => entry_of(rest),
+      "identity" => identity_of(rest),
+      "failed" => number(rest).map(|errno| Reply::Failed { errno }),
       "refused" => Ok(Reply::Refused(rest.to_owned())),
       "fatal" => Ok(Reply::Fatal(rest.to_owned())),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
@@ -516,6 +627,18 @@ fn entry_of(rest: &str) -> Result<Reply, ProtocolError> {
     digest: u64::from_str_radix(digest, DIGEST_RADIX)
       .map_err(|_| ProtocolError::Number(digest.to_owned()))?,
     path: path.to_owned(),
+  })
+}
+
+/// An `identity` reply's words after its verb: the real and effective user ids, then the real and effective group ids.
+fn identity_of(rest: &str) -> Result<Reply, ProtocolError> {
+  let words: Vec<&str> = rest.split_whitespace().collect();
+  let [uid, euid, gid, egid] = exactly::<IDENTITY_WORDS>("identity", &words)?;
+  Ok(Reply::Identity {
+    uid: number(uid)?,
+    euid: number(euid)?,
+    gid: number(gid)?,
+    egid: number(egid)?,
   })
 }
 
@@ -729,11 +852,110 @@ mod tests {
       Reply::Waited { micros: 509 },
       Reply::TimedOut { seen: 104 },
       Reply::Stormed { micros: 412_345 },
+      Reply::Identity {
+        uid: 65_534,
+        euid: 1_000,
+        gid: 65_534,
+        egid: 0,
+      },
+      Reply::Failed { errno: 13 },
       Reply::Refused("no map yet".to_owned()),
       Reply::Fatal("mount virtiofs slates: ENODEV".to_owned()),
     ] {
       assert_eq!(Reply::parse(&reply.encode(), ROOMY), Some(Ok(reply)));
     }
+  }
+
+  /// Do: encode each of the mount-flag guest's commands — the control mount, a run as a user from each mount, an open
+  /// from each — and parse it back. Expect the same command.
+  #[test]
+  fn every_mount_flag_command_reads_back_as_written() {
+    for command in [
+      Command::Bare,
+      Command::Exec {
+        mount: Mount::Hardened,
+        path: "set-id".to_owned(),
+        uid: 65_534,
+        gid: 65_534,
+      },
+      Command::Exec {
+        mount: Mount::Bare,
+        path: "bin/set-id".to_owned(),
+        uid: u32::MAX,
+        gid: 0,
+      },
+      Command::Open {
+        mount: Mount::Hardened,
+        path: "whiteout".to_owned(),
+      },
+      Command::Open {
+        mount: Mount::Bare,
+        path: "dev/null".to_owned(),
+      },
+    ] {
+      assert_eq!(Command::parse(&command.encode()), Ok(command.clone()));
+      assert_eq!(Command::parse_within(&command.encode(), ROOMY), Ok(command));
+    }
+  }
+
+  /// Do: parse hostile lines of the mount-flag guest's commands and replies: an unknown mount, a run short of an
+  /// argument, ids past `u32` or negative, an open with no path, a control mount with an argument, an identity short of
+  /// an id or holding a word, and an errno that is no `i32`. Expect each refused with its own error, never a command or
+  /// a reply.
+  #[test]
+  fn hostile_exec_open_and_identity_lines_are_refused_by_name() {
+    assert_eq!(
+      Command::parse("exec sideways set-id 1 2"),
+      Err(ProtocolError::UnknownVerb("sideways".to_owned()))
+    );
+    assert_eq!(
+      Command::parse("exec bare set-id 65534"),
+      Err(ProtocolError::Arguments {
+        verb: "exec",
+        wanted: 4,
+        got: 3
+      })
+    );
+    assert_eq!(
+      Command::parse("exec bare set-id 4294967296 0"),
+      Err(ProtocolError::Number("4294967296".to_owned()))
+    );
+    assert_eq!(
+      Command::parse("exec hardened set-id 0 -1"),
+      Err(ProtocolError::Number("-1".to_owned()))
+    );
+    assert_eq!(
+      Command::parse("open bare"),
+      Err(ProtocolError::Arguments {
+        verb: "open",
+        wanted: 2,
+        got: 1
+      })
+    );
+    assert_eq!(
+      Command::parse("bare /bare"),
+      Err(ProtocolError::Arguments {
+        verb: "bare",
+        wanted: 0,
+        got: 1
+      })
+    );
+    assert_eq!(
+      Reply::parse("PROBE identity 1 2 3", ROOMY),
+      Some(Err(ProtocolError::Arguments {
+        verb: "identity",
+        wanted: 4,
+        got: 3
+      }))
+    );
+    assert_eq!(
+      Reply::parse("PROBE identity 1 2 3 root", ROOMY),
+      Some(Err(ProtocolError::Number("root".to_owned())))
+    );
+    assert_eq!(
+      Reply::parse("PROBE failed 2147483648", ROOMY),
+      Some(Err(ProtocolError::Number("2147483648".to_owned())))
+    );
   }
 
   /// Do: parse the kernel's own console lines, and a reply line with the carriage return a raw console may add.

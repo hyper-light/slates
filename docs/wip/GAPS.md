@@ -7,7 +7,8 @@
 > makes one: root, except a whiteout (a character device 0/0) for any caller who may write the directory. Nothing opens
 > one as a device: a landing refuses it before its first write, and each consumer's kernel is guarded (slates' own
 > mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
-> `nodev`). Proven by each crate's unit tests (A-294 names them). **Owed:**
+> `nosuid,nodev`, a real guest's test of both built 2026-11-18, A-94's amendment). Proven by each crate's unit tests
+> (A-294 names them). **Owed:**
 > - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
 >   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
 >   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
@@ -19,8 +20,13 @@
 > - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
 >   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
 >   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
-> - a guest's proof over virtio-fs (g260's): the guest mount line in `docs/cli.md` asks for `nosuid,nodev` since
->   2026-11-17, with A-294's reason;
+> - the first runs of a guest's proof over virtio-fs, built 2026-11-18 (A-94's amendment, kiln goal g260):
+>   `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node` in
+>   `crates/cli/tests/guest_vhost.rs`. The guest mounts the tag `nosuid,nodev`, as the guest mount line in `docs/cli.md`
+>   asks since 2026-11-17. The test expects a whiteout the host's user makes to be refused `EACCES` there and to reach
+>   the device layer (`ENXIO`) through a control mount without the flags, and a set-id copy of the probe to run as its
+>   caller there and as its owner through the control. Not yet run in a guest: CI's live-guest lane runs it in QEMU
+>   11.1, and the supervisor's run is crosvm on adacachy;
 > - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
 >   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
 >   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a
@@ -8374,7 +8380,14 @@ SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.
 Condition 4, 2026-10-05: a setuid binary planted on a shared volume ran as root through a PersistentVolume mount
 without `nosuid`. Every mount slates makes or documents is now `nosuid,nodev` (A-94;
 docs/bugs/2026-10-05-setuid-through-a-shared-volume.md). The KIND lane's check runs only where the kernel has TLS
-(GitHub's Linux runner), so its first run is owed there.
+(GitHub's Linux runner), so its first run is owed there. A guest's mount of a share too (A-94 amended 2026-11-18, kiln
+goal g260): slates cannot set a guest's flags, so `docs/cli.md`'s `slates vhost-user` guest mount line asks for
+`nosuid,nodev` with A-94's reason, and the tests' guest mounts its share that way. A real guest's test is built,
+`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`
+(`crates/cli/tests/guest_vhost.rs`): it expects a set-id file and a whiteout the host's user made to run as their
+caller and be refused `EACCES` through the guest's mount, and to act through a control mount without the flags.
+**Owed:** its first runs: crosvm on adacachy (the supervisor's), and CI's live-guest lane, which runs every
+`guest_vhost.rs` test in QEMU.
 
 FUSE create path, 2026-10-05 (A-96): the delta's whole reference list and the op log's full scan are gone (2,000
 creates 0.64 → 0.36–0.45 s). Owed:

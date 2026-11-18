@@ -2135,7 +2135,8 @@ NFS after a taken name (`EEXIST`) and an unwritable directory (`EACCES`), the or
 device: every mount slates makes is `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's own options; the OCI
 binding), so its kernel refuses the open `EACCES` (`may_open_dev`); an export's PersistentVolume is `nodev` too, and in a
 pod, whose bind drops it (A-94), the container runtime's device cgroup refuses the open; a guest's mount of a virtio-fs
-share is the guest's, so slates asks it for `nodev`, and a guest that declines opens only its own devices. WinFsp and
+share is the guest's, so slates asks it for `nosuid,nodev` (`docs/cli.md`'s guest mount line; a real guest's test of
+both, A-94's amendment of 2026-11-18), and a guest that declines opens only its own devices. WinFsp and
 FSKit have no device kind and refuse the node unsupported, as a FIFO; the WinFsp drive's listing leaves out each FIFO,
 socket and device node rather than fail the directory (`listed`).
 
@@ -12757,8 +12758,15 @@ group first).
 ### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
 Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
 `crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in
-`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS.
-Status: built 2026-10-05 (condition 4).
+`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS. For a guest's mount (amended 2026-11-18, below):
+`docs/cli.md` (the `slates vhost-user` guest mount line asks for `nosuid,nodev` and gives this entry's reason; written
+2026-11-17 with A-294), `crates/guest-probe` (the guest's own mount `nosuid,nodev`, `HARDENED`; the control mount
+`bare`; `exec` and `open` from either mount; the `identity` and `failed` replies; a run of the probe that is not the
+first process says its ids), `crates/cli/tests/guest_vhost.rs`
+(`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`),
+`crates/cli/tests/vm/mod.rs` (the initramfs's `/bare`), §4.6, A-294 (its owed guest proof), GAPS.
+Status: built 2026-10-05 (condition 4). A guest's mount: the line 2026-11-17, a real guest's test 2026-11-18 (kiln
+goal g260); the test's first runs are owed (crosvm on adacachy; CI's live-guest lane runs it in QEMU 11.1).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
@@ -12772,6 +12780,24 @@ Status: built 2026-10-05 (condition 4).
   flags close the escalation without changing ownership.
 - Rejected: stripping setuid and setgid bits in the daemon. It would break a root filesystem built inside a volume
   (`sudo` installed by `dpkg` must stay setuid there) and still leave the mount honouring bits that arrive another way.
+- **Amended 2026-11-18 (kiln goal g260): a guest's mount of a share is `nosuid,nodev` too, and a real guest is held to
+  it.** A guest's kernel mounts the share, and the device never sees a mount's flags, so slates cannot set them: it asks
+  for them. `docs/cli.md`'s guest mount line for `slates vhost-user` is `mount -t virtiofs slates /mnt -o
+  dax=always,nosuid,nodev`, with this entry's reason (2026-11-17, with A-294, which made `nodev` the guard by keeping
+  device nodes as metadata), and slates' own guest, the tests' probe, mounts what it is shared, a tag or a volume's
+  image, the same way.
+  - The test that holds a real guest to it, built 2026-11-18 and not yet run in a guest:
+    `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`
+    (`crates/cli/tests/guest_vhost.rs`, in crosvm and in QEMU 11.1). Through the session's `slates mount` the host's
+    user makes a set-user-id and set-group-id copy of the probe, and a whiteout: a character device 0/0, the one device
+    node an ordinary user may make. In the guest, the copy run as `nobody` from the guest's mount must say `nobody`'s
+    ids, and the whiteout's open must be refused `EACCES` (`may_open_dev`). The control is the same tag mounted again
+    without the flags: a mount's flags are its own, not its file system's. There the copy must take its owner's ids,
+    and the open must reach the device layer (`ENXIO`, no driver for 0/0). So the test shows that the bits and the node
+    reach the guest, and that the flags alone withhold them. On CI's QEMU lane the test runs as root, so there the
+    control's copy runs as uid 0: this entry's escalation itself.
+  - Owed: the test's first runs. The supervisor's is crosvm on adacachy; CI's live-guest lane runs every test of
+    `guest_vhost.rs` in QEMU 11.1 from the first push.
 
 ### A-95 — A v4 READDIR page is encoded at the directory's owner (2026-10-05)
 Applied in the same change to: `crates/bridge-nfs/src/v4/listing.rs` (new: `PageRequest`, `encode_page`,
@@ -22526,8 +22552,12 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
   FUSE, an ordinary user: `/dev/null`'s number refused `EACCES` on the `nodev` mount) and
   `a_device_node_is_made_with_its_number_and_never_opened` (Linux's NFSv4.1 and 4.2 clients, as root, `nodev`).
 - **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
-  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof (g260's; the guest mount
-  line asks for `nosuid,nodev` since 2026-11-17); a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
+  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); the first runs of a
+  guest's proof, built 2026-11-18 (A-94's amendment:
+  `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`, which expects a
+  whiteout made by the host's user to be refused `EACCES` on the guest's `nodev` mount and to reach the device layer,
+  `ENXIO`, through a control mount without the flag; the guest mount line asks for `nosuid,nodev` since 2026-11-17); a
+  Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
   `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
   each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
   and a list edited without its run fails the record's doc-truth test.
