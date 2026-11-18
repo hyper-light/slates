@@ -1,0 +1,32 @@
+# DIAG (not for main): g242's green-share takeover test 10 times under two spinners a CPU at nice 19, on Linux x86_64
+# and arm64 (the integrator's queue item 2).
+name: diag-integrator-green
+on:
+  push:
+    branches: ['diag-integrator-green-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  green-share-takeover:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The green-share takeover test under spinners
+        run: bash .github/diag-integrator-green.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: green-results-${{ matrix.os }}
+          path: target/green-*
