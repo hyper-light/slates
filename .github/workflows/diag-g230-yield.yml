@@ -1,0 +1,46 @@
+# DIAG (not for main): g230's A-382 record half: the superseded owner's warm restart ships no record (green, and red
+# with the record skip removed), and the two convergence tests once more, on Linux x86_64 and arm64.
+name: diag-g230-yield
+on:
+  push:
+    branches: ['diag-g230-yield-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: Green
+        run: |
+          set +e
+          for t in a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes; do
+            n=$((n+1))
+            timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-green-$n-$t.log" 2>&1; code=$?
+            echo "== green $n $t exit $code"
+            grep -E "^retaken from its adopter|^a superseded owner|panicked at|test result" -A 1 "out-green-$n-$t.log" | cut -c1-600
+          done
+      - name: Red B, a lost volume's records shipped
+        run: |
+          set +e
+          perl -0pi -e 's/    if crate::verbs::lost_to_a_successor\(state, slot.id\) \{\n      continue;\n    \}\n//' crates/server/src/fleet.rs
+          grep -c "lost_to_a_successor(state, slot.id)" crates/server/src/fleet.rs | sed 's/^/remaining (0 = mutation applied): /'
+          t=a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost
+          timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-redB-$t.log" 2>&1; echo "== red B $t exit $?"
+          grep -E "^a superseded owner|panicked at|test result" -A 1 "out-redB-$t.log" | cut -c1-600
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yield-logs-${{ matrix.os }}
+          path: out-*.log
