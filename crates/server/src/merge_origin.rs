@@ -2647,7 +2647,11 @@ mod tests {
         .unwrap_or_default();
       (positions, ledger_identities(state, object, 3))
     });
-    assert_eq!(positions, vec![0, 2, 3], "the checkpoint at version 2 let go of position 1");
+    assert_eq!(
+      positions,
+      vec![0, 2, 3],
+      "the checkpoint at version 2 let go of position 1"
+    );
     assert_eq!(
       named,
       vec![(1, [1; 32]), (2, [2; 32]), (3, [3; 32])],

@@ -32294,4 +32294,9 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
   the held checkpoint's record of what it accepted where it let go of it (`merge_origin::ledger_identities`): the two
   durable halves of the successor's prefix since A-404. The engine (rebuilt or advanced from that checkpoint), the
   rebuild at a restart and the durable state were right throughout; only the read missed the checkpoint.
-- **Checks.** CHECKS_RESULT
+- **Checks.** On the Mac Studio (debug, r436, 2026-11-18): `cargo test --locked -p slates-server --lib merge_origin` 17
+  of 17, the new `a_successors_chain_names_the_versions_its_checkpoint_stands_for` among A-404's; the one-crate clippy
+  of `slates-server` clean; `cargo xtask check` structural clean and its literal check clean in this change (it counts
+  50 literals in other crates' files); rustfmt's layout taken. Red with the checkpoint's names left out (the read as it
+  was): the new test fails, naming `[(2, …), (3, …)]` for `[(1, …), (2, …), (3, …)]`, the fleet test's failure's shape.
+- **Owed.** The fleet test twenty times on Linux and on macOS (filed for main).
