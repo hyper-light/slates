@@ -5596,6 +5596,12 @@ epoch records that epoch even if the bytes equal the holder's older value. Match
 not justify keeping the old ballot: a later quorum could otherwise prefer a conflicting
 proposal from between those epochs (BUG-12). A replicated prefix must be checked for extension,
 not only length, before any mutation. No historical committed value may ever be rewritten.
+A holder accepts at a position any proposal at or above its promise: a higher epoch's different
+value replaces the one held there, which therefore never committed (every higher epoch's phase
+one adopts a committed value), and a second value under the epoch the position already holds is
+refused, since one ballot proposes one value a position (A-373; the `Accept` of
+`docs/wip/models/FencedLedger.tla`). What a holder derived from a replaced value, a green's
+replica, is rebuilt below it.
 
 Epoch allocation derives from configuration authority, not a simulation's access to unreachable
 holders' internal state. Checked counters refuse exhaustion. Quorum counts exclude duplicate,
@@ -6881,6 +6887,24 @@ reconstruction budget are derived, never fixed (D-O6).
 > `verbs::materialize_taken_over`) still lays the whole archive out in that one turn, and the sealed manifest is opened
 > in one turn (its cost grows with the volume's entries, not its bytes) (GAPS).
 >
+> **Status (2026-11-18, A-374, g251: a live takeover's materialization in turns, joined while it runs).** A successor
+> rebuilt a live volume's log, laid it out, restored it, made the volume and published it inside one owner-shard turn,
+> and the nemesis's watchdog ended successors there ("shard 1 is spinning", the stuck task the materialize call's, both
+> Linux arches and macOS; on a Mac Studio 16,737 to 27,430 sealed payloads of 152 to 306 MB took 0.42 to 1.08 s to
+> rebuild, 0.14 to 0.18 s to restore, 0.10 to 0.14 s to populate and up to 0.48 s to publish). And the call's deadline
+> was a period (100 ms), so every period's attempt fetched and rebuilt the whole log again. Now the materialization is
+> a task of the owner shard (`fleet::make_live`, outliving the attempt that began it, which waits a period for it): the
+> log's payloads opened and applied a slice a turn under the seal turns' share of the quantum
+> (`live_ship::Rebuilding`, a payload at least, counted `fleet.live.rebuild_slices`), then the archive, the restore
+> (`verbs::restore_taken_over`) and the making with its publication each a turn of their own (the volume becomes visible
+> in the turn that publishes it, A-343). The task's record on the owner shard (`ShardState::making_taken_over`: running
+> with its turns, made, or refused) is what a later attempt reads before it fetches anything: it joins one running
+> (`fleet.materialize.waits.making`, its turns counted as progress against the give-up bound) and reads one ended; the
+> log is rebuilt once a takeover (`fleet.live.rebuilds_begun`). Held by
+> `a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`). Owed: the archive's
+> layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first publication's
+> live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
+>
 > The same change gives every sliced walk its turns on the shard that drives it (`xshard::Turns`). A walk is driven by a
 > task of the control shard, one `xshard::call_within` a slice; a call to another shard is a task there, a turn of its
 > own, but a call to the caller's own shard runs inline, so a walk that called again at once ran every slice in the one
@@ -7048,8 +7072,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > least `f + 1` answers is adopted (`slates_db::live::adopt`). Whole entries carry the volume's lineage key wrapped for
 > each neighbour (the `sealing` a head carries), so the successor opens the log whether or not the volume ever sealed;
 > it replays the whole image and the deltas after it (`VolumeImage::apply`) and serves the volume as an archive of
-> that image and the content runs (`live_ship::archive_from_live`, the export's layout), through the same
-> `materialize_taken_over` a seal's takeover uses. A log that cannot be rebuilt whole is refused, counted
+> that image and the content runs (`live_ship::Rebuilding`, the export's layout; in turns since A-374), through the
+> same restore and making a seal's takeover uses (`verbs::restore_taken_over`, `materialize_taken_over_restored`). A log that cannot be rebuilt whole is refused, counted
 > (`fleet.live.takeover_refused`), never silently replaced by an older seal. The successor keeps the volume
 > live-shipped (its catalog carries the flag) and ships under the head's epoch, above the dead owner's. Across three
 > real daemon processes (`a_live_volumes_acknowledged_writes_survive_its_owners_death`): five writes, each answered at
@@ -26632,11 +26656,20 @@ BENCHMARKS ("Windows' own window"), `crates/rt` (`iocp.rs`: `RaisedForWait`, `mo
   at the round's epoch (`takeover::commit_adopted`, the newest record's own path). A fence above the epoch starts the
   round over above it. Then the versions' inputs are fetched by identity (the input half) and the chain gathered.
   Counted `fleet.takeover.ledger_positions_adopted`, `_refused`, `_no_round`, `_fenced`, `_waiting`.
-- **Open (GAPS).** A holder's register refuses a different value at a position it holds (`ConflictingPosition`)
-  where the model's acceptor overwrites a lower epoch's; a never-committed divergent value cannot yet be replaced.
+- **Open (GAPS), closed by A-373.** A holder's register refused a different value at a position it holds
+  (`ConflictingPosition`) where the model's acceptor overwrites a lower epoch's; a never-committed divergent value could
+  not be replaced.
 
-Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
-files.
+Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
+the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
+serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
+the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
+(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
+`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
+`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
+`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
 
 ### A-357 — The thread-profiling calls are found in kernel32 at run time, so the Windows binary starts where kernel32 lacks them (2026-11-18, the release goals g236 and g237; a bug in A-223 found by the test tag `v0.1.0-test.3`)
 Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release lane's entry), `crates/machine`
@@ -26979,17 +27012,6 @@ test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::track
 - **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
   compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
   growth, in the content's bytes.
-
-Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
-the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
-serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
-the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
-(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
-`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
-
-Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
-`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
-`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
 
 ### A-363 — The failover delay is a live output: detection, confirmation and recovery estimated from what each node measures, every coordinator period (2026-11-18, built for goal g255; Ada's rule of the same day: "no arbitrary constants", and a value computed once at boot is still a constant, so the estimators keep learning from the traffic they judge)
 
@@ -27353,3 +27375,93 @@ ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `Content
 
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/server/src/{state,daemon,fleet,forward_lane,verbs,live_ship,takeover,green_adopt}.rs`, `crates/server/tests/fleet.rs`.
+
+### A-373 — A held ledger position yields to a higher epoch's different value, as the model's acceptor does, and a green's replica follows its register (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Apply on holders"; A-364, A-333, A-313, BUG-12)
+Applied in the same change to: §4.8 (the per-position acceptance paragraph), GAPS (the record half's open
+`ConflictingPosition` item, now fixed, and the replica's lag, owed), `crates/db/src/register.rs` (`Acceptor::check`;
+`RegisterError::ConflictingPosition` and `Acceptor::accept` documented), `crates/server/src/merge_origin.rs`
+(`rewind_replica`, `rewind_past_replaced`, the install's check, `merge.replica.rewound`, `merge.replica.superseded`),
+`crates/server/src/merge_service.rs` (`hold_replacing_record`, called by `accept_merge_record`),
+`crates/server/src/fleet.rs` (`hold_checked_record`, `fleet.record.replaced`; `serve_merge_shipment` holds a replacing
+record before its inputs) and `crates/server/src/takeover.rs` (`commit_adopted`).
+- **What was there.** `Acceptor::check` refused any value different from the one a holder held at a position
+  (`ConflictingPosition`), whatever its epoch. `docs/wip/models/FencedLedger.tla`'s `Accept` takes a proposal at or above
+  the holder's promise and replaces the entry held there, as Paxos's acceptor does.
+- **Decided by the model's proof obligations.** A refusal is always safe, since a refused phase-two message is a lost
+  one, so the question was what the refusal cost and what the model's safety needs. Agreement and Continuity hold in the
+  model because each epoch is one host's, each owner adopts at every position the value a majority reports under the
+  highest epoch before it proposes, and holders refuse proposals below their promise. A value that committed at a
+  position is then the one every higher epoch's owner adopts there, so a higher epoch's different value replaces only
+  one that never committed. Slates keeps each obligation: a record is accepted only from the object's authority owner
+  (`Unauthorized` otherwise), a successor writes a departed owner's objects only after its round adopted them, at or
+  above the round's epoch, and the superseded owner is fenced below that epoch. The refusal cost liveness. A holder that kept a
+  dying owner's uncommitted value refused the successor's different value there for good, and its replica, built on the
+  refused value, refused the green at the next version's recomputation; at `f = 1` that holder was the one failure the
+  green could take. A successor that kept such a value could never commit the value its round adopted
+  (`fleet.takeover.adopt_unplaced.local`), and the green waited for its bound. So the code took the model's rule. The
+  model is unchanged, and there is nothing to re-run.
+- **The rule.** A holder refuses a second value at a position under the epoch the position holds (one ballot proposes
+  one value a position, `ConflictingPosition` as before; the mirror's rule for committed records is unchanged) and
+  accepts a higher epoch's different value in place of the held one (`fleet.record.replaced`).
+- **The replica follows.** A green's replica on a holder or a successor is the engine its records are recomputed on
+  (A-313, A-333). One built over a replaced value no longer holds its ledger's chain, and a version cannot be undone, so
+  it is rebuilt from the ledger through the version before (`merge_origin::rewind_replica`, `merge.replica.rewound`).
+  - The register path (a successor's adoption committed again to every candidate, with no inputs) rewinds it as the
+    record is held (`fleet::hold_checked_record`), and so does the successor's own acceptance (`takeover::commit_adopted`);
+    the successor's engine then advances from the version before, naming the inputs it lacks (A-333).
+  - The record plane ships a successor's new value with its inputs. The door admits inputs only where a held record
+    names them or runs ahead of the held records, and the replaced value names others at that position, so the record
+    is held first (`merge_service::hold_replacing_record`, before the shipment's content frames), which rewinds the
+    replica; the value is then recomputed as the replica's next version and acknowledged only after that.
+  - A build that read a version its ledger replaced while it ran installs nothing (`merge.replica.superseded`).
+- **Tests.** `a_held_position_yields_to_a_higher_epochs_value_and_refuses_a_second_in_one_epoch`
+  (`crates/db/src/register.rs`); in `crates/server/src/merge_origin.rs`,
+  `a_holder_follows_a_higher_epochs_value_at_a_version_it_applied` (the record plane's shipments through
+  `fleet::serve_merge_shipment`), `a_replica_rewinds_below_a_value_its_ledger_replaced_and_advances_to_the_new_one` (the
+  register path, then the successor's engine) and `a_build_that_read_a_replaced_version_installs_nothing`. Kiln r3555 on
+  the Mac Studio, 2026-11-18, debug build, load 15 to 17: the `slates-db` register tests 76 of 76; `slates-server --lib`
+  merge_origin, green_adopt, takeover, merge_service and holder tests 45 of 45; the fleet's green takeover and shipment
+  tests 5 of 5. Red (r3573), each mutation in a scratch copy:
+  - the old rule: the db test and both holder tests fail, `y` refused and the position still `x`'s under epoch 1;
+  - no hold before the shipment's inputs: `y` unacknowledged, its inputs unheld once, the replica rewound to version 0;
+  - no rewind on the register path: `y` acknowledged with the replica still at `x`'s identity, and the successor's
+    engine never ready;
+  - no check at the install: the build installs `x`'s replica, and `merge.replica.superseded` never moves.
+- **Still owed (GAPS).** A holder that holds an adopted record past its replica (the register path carries no inputs)
+  answers the next version out of order until it fetches those inputs and advances; the green goes on at `f + 1` while
+  its other holders answer. The successor's own replacement is not driven end to end by a test: that wants two
+  takeovers with divergent uncommitted values; its rewind is the register path's, which the tests drive.
+
+### A-374 — A live takeover's materialization runs in turns of its owner shard, by a task of that shard, and a later attempt joins it (2026-11-18, goal g251: every open slates bug fixed; the nemesis's watchdog kills; §4.8 "Promotion and takeover", §4.10 live shipping; CLAUDE.md "Bounded work everywhere"; A-347's sibling)
+Applied in the same change to: §4.10's status (A-374), GAPS (A-347's "one-turn walks of a whole volume": the live
+rebuild closed), the bug record `docs/bugs/2026-11-18-a-live-takeover-made-its-volume-in-one-turn.md`,
+`crates/server/src/live_ship.rs` (`Rebuilding` in place of `archive_from_live`, `rebuild_refused`, `taken_over`),
+`crates/server/src/fleet.rs` (`make_live`,
+`make_live_in_turns`, `begin_live`, `making_of`, `Joined`, `VolumeWait::Making`), `crates/server/src/verbs.rs`
+(`made_already`, `restore_taken_over`, `materialize_taken_over_restored`), `crates/server/src/state.rs`
+(`ShardState::making_taken_over`, `Making`, `PendingVolume::record_turns`, `live_adopted`), `crates/server/src/daemon.rs`
+(`Daemon::inject_live_turn_pause`).
+- **Why.** The nemesis (`live_chaos`, seeds 17036665960917068132 and 2120743995065985386) ended successors with exit 4,
+  "shard 1 is spinning, 1000 ms of CPU without a step": the stuck shard was inside one poll of the takeover's
+  materialization of a live volume, which rebuilt the whole log, restored and made the volume and published it in one
+  owner-shard turn (0.73 to 2.84 s on a Mac Studio for 152 to 306 MB of sealed log). The call's deadline was a period,
+  so the turn outlasted it, the attempt counted unanswered, and the next period's attempt fetched and rebuilt the whole
+  log again (five more rebuilds of 0.68 to 0.99 s seen in one run), until one of those turns crossed the spin window.
+  The supervisor's order (2026-11-18): the materialization in turns, and a repeated attempt joining it, never rebuilding.
+- **The rule.** A live volume's materialization is a task of its owner shard, recorded there while it runs, with the
+  turns it has taken. Its turns: the log's payloads opened, decoded and applied in order, a payload at least, until the
+  seal turns' share of the quantum has passed; the rebuilt volume laid out as an archive; the archive restored; the
+  volume made and published, in one turn, so it is never served unpublished. The attempt that begins it waits a period
+  for it, as the coordinator's other calls do, and reads its end at once when it comes; the task outlives the wait. An
+  attempt asks the owner shard, in that shard's own time, before it fetches anything: one that finds the task running
+  joins it (its turns are progress, so a long volume is never given up on while it moves) and one that finds it ended
+  reads the end, forgotten there once read; only an attempt that finds neither fetches the log. A give-up forgets the
+  record, and a task whose record was forgotten leaves no end. Waited for in the owner shard's own time, the beginning
+  attempt held the control shard's coordinator, its council and its heads, for the whole materialization (1.2 s in the
+  test's paused turns).
+- **What it does not change.** A sealed or plain volume's materialization (A-347's open in turns, then one turn), the
+  give-up bound, the rebuild's refusals and the materialization's own (`fleet.live.takeover_refused.*`,
+  `fleet.materialize.refused.*`), A-343's publication before serving.
+- **Owed.** The archive's layout and the restore in quantum slices (each one turn, about 0.1 s at 300 MB); the first
+  publication's live whole entry sealed in turns (g230's item); a sealed volume's restore (A-347's owed restore).
+

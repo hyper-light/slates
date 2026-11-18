@@ -2361,7 +2361,7 @@ const SHIPMENT_LENGTH_BYTES: usize = size_of::<u32>();
 
 /// A merge shipment (the bytes a holder is sent on [`MERGE_RECORD_STREAM`]): the record, then the content requests
 /// that place its inputs (an offer and its chunks), each frame behind its length.
-fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
   let total = frames.iter().fold(SHIPMENT_LENGTH_BYTES, |sum, frame| {
     sum
       .saturating_add(SHIPMENT_LENGTH_BYTES)
@@ -3440,12 +3440,50 @@ fn record_standing(
   }
 }
 
+/// Whether `record` offers a different value at a position this holder's ledger holds one (A-373): a higher epoch's,
+/// once `fleet::check_held_record` admitted it.
+fn replaces_held_value(state: &ShardState, record: &Record) -> bool {
+  state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice())
+}
+
+/// Holds `record`, a green's merge record, in this holder's register before its inputs and its recomputation when it
+/// replaces a different value held at its position (A-373): admitted by `fleet::check_held_record`, it comes under a
+/// higher epoch than the held value, which therefore never committed. Until it is held the door refuses its inputs,
+/// since the held value names others at that position (`content_retention::admits`), and the replica built over the
+/// replaced value is rewound as it is held (`fleet::hold_checked_record`), so [`accept_merge_record`] then serves the
+/// record as the replica's next version. The acknowledgement this acceptance makes is not sent: the record is
+/// acknowledged once recomputed. Anything else (no value held there, the same one, a refused record, a green refused
+/// here or a test's withheld acknowledgement) is left to [`accept_merge_record`].
+pub(crate) fn hold_replacing_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) {
+  if !replaces_held_value(state, record)
+    || state.merge.refused.contains(&record.object)
+    || state.merge.fault.refuse_records
+    || MergeRecordValue::from_record_bytes(&record.value)
+      .is_none_or(|value| value.version != record.sequence)
+    || crate::fleet::check_held_record(state, local, peer_host, record).is_err()
+  {
+    return;
+  }
+  // The reply goes unsent: the version is answered by its recomputation, or not at all.
+  let _ = crate::fleet::accept_held_record(state, local, peer_host, record);
+}
+
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
 /// acknowledgement returned. A holder with the green's records and no replica (a warm restart) rebuilds the replica
-/// from them first (A-313). Every other case is an empty reply the owner counts as no
-/// acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
+/// from them first (A-313); a higher epoch's different value at a version this holder holds is held first, which
+/// rewinds the replica below it ([`hold_replacing_record`], A-373). Every other case is an empty reply the owner counts
+/// as no acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
 pub(crate) fn accept_merge_record(
   state: &mut ShardState,
   local: HostId,
@@ -3475,6 +3513,9 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
+  // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
+  // it replaces; the record is then served as the replica's next version (A-373).
+  hold_replacing_record(state, local, peer_host, record);
   match record_standing(state, object, value.version) {
     None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
