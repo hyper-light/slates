@@ -30946,6 +30946,8 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), 
 - **Test.** `a_held_reply_is_given_up_silent_only_past_the_holder_paths_gone_floor` (`crate::live_ship`): a reply held
   with its holders silent and its receiver idling is given up silent past a liveness window and a half and within the
   floor and the three looks that confirm it.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 3-6, debug build, `cargo test --locked -p slates-server --lib --
+  live_ship durable`): 20 of 20. Red-checked once: with the window back at one liveness window, the reply is given up
+  at 1.3 s, short of a window and a half. The live-ship flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/live_ship.rs`.
