@@ -25463,7 +25463,8 @@ Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside 
   `share_done`): the retirement stays kept until the successor holds what it adopted. Hosts the retirement names are
   admitted again only after that, and answer reports meanwhile.
 - **The cost.** A holder away past the failover SLO's worth of attempts has the volume given up (`NotRecovered`) where
-  A-309 served it from the other members; a decision for Ada (GAPS), recommended kept.
+  A-309 served it from the other members. Decided 2026-11-18 by principle (Ada's "decide, don't ask"): kept, since
+  NoLoss is a register invariant and a typed final refusal is recoverable where a silent loss is not (R4).
 - **The failing tests.** `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
   (`crates/server/src/live_ship.rs`): the flow's decision alone. It waits for the retired holder and then adopts its
   170, where A-309's rule adopted 167 at once; and with the holder seen restarted it adopts past tolerance as before.
