@@ -214,7 +214,10 @@ fn a_base_files_mode_changed_alone_lands_and_no_byte_is_rewritten() {
   assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
   let after = host.fingerprint("/run.sh").unwrap();
   assert_eq!(after.mode & PERMISSIONS, EXECUTABLE_MODE & PERMISSIONS);
-  assert_eq!(after.ino, before.ino, "the same file: its bytes never rewritten");
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
   assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
   assert_eq!(report.bytes_written, 0, "{report:?}");
 }
@@ -241,7 +244,11 @@ fn a_mode_the_disk_changed_while_the_volume_kept_it_is_passed_by_and_the_volumes
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
   let after = host.fingerprint("/run.sh").unwrap();
-  assert_eq!(after.windows, WindowsAttributes::HIDDEN, "the volume's bits");
+  assert_eq!(
+    after.windows,
+    WindowsAttributes::HIDDEN,
+    "the volume's bits"
+  );
   assert_eq!(
     after.mode & PERMISSIONS,
     PRIVATE_MODE & PERMISSIONS,

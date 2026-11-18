@@ -929,7 +929,11 @@ mod tests {
       ),
     ];
     for (action, disk, expected) in rows {
-      assert_eq!(verdict(action, None, disk, None), expected, "{action:?} {disk:?}");
+      assert_eq!(
+        verdict(action, None, disk, None),
+        expected,
+        "{action:?} {disk:?}"
+      );
       assert_eq!(
         content_verdict(action, None, disk, None),
         expected,

@@ -401,7 +401,10 @@ fn a_captured_clones_mode_change_alone_lands() {
   assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
   let after = host.fingerprint("/target/src/keep.rs").unwrap();
   assert_eq!(after.mode & PERMISSIONS, EXECUTABLE_MODE & PERMISSIONS);
-  assert_eq!(after.ino, before.ino, "the same file: its bytes never rewritten");
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
   assert_eq!(
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])

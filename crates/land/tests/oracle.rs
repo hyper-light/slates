@@ -1850,8 +1850,7 @@ fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
   );
   let hidden_system = Some(u16::try_from(HIDDEN_SYSTEM).unwrap());
   assert_eq!(
-    bits_with,
-    [hidden_system; 3],
+    bits_with, [hidden_system; 3],
     "every marked file lands with the bits the volume keeps"
   );
   assert_eq!(

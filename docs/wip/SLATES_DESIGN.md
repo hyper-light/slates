@@ -31380,3 +31380,59 @@ and `tests/os_removal.rs`, the bits passed through).
   without them, and a resumed landing takes it as already there. The presented entry list (`PlannedEntry`, §4.15 step
   2) shows each entry's mode and not its bits, which the grant now binds. The backslash read-back of a landed link
   (`..\src\lib.rs` read by the Windows base) is the base plane's own map, not this one, and stays its own piece.
+
+### A-458 — A file whose only change is its mode or its Windows bits lands, as a metadata entry judged field by field and set through its own handle (2026-11-18, g085; §4.15 step 1's mode changes and the data model's `Chmod`; A-262, A-291, A-451)
+Applied in the same change to: §4.15 step 4 (the metadata entry's rule), A-262 (stage 3's landing half), A-451 (its
+owed bits-only change), GAPS (A-185's owed list), `docs/bugs/2026-11-18-a-files-mode-or-windows-bits-changed-alone-never-landed.md`,
+`crates/land` (`src/manifest.rs`: `Action::Chmod`, `FileMeta`, tag 8, `file_entry` and `file_identity`, the captured
+clone's plan; `src/verdict.rs`: `meta_verdict`, `chmod_verdict`, a table test; `src/engine.rs`: `Landing::chmod`;
+`src/source.rs`: `holds_witnessed_bytes`; `src/os.rs` and `src/os_windows.rs`: `open_to_chmod`; `src/chmod_tests.rs`,
+new, four tests; `src/captured_tests.rs`, one; `tests/oracle.rs`, A-451's bits test; `tests/os_escape.rs` and
+`tests/os_removal.rs`, the verb passed through), `crates/vfs` (`src/host/mod.rs`: `LandFs::open_to_chmod`;
+`src/host/sim.rs`; `src/volume.rs`: `holds_witnessed_bytes` and `holds_witnessed_bytes_in`), `crates/ipc`
+(`PlannedAction::Chmod` and `ActionTally::chmod`, appended; `tests/wire_order.txt`), `crates/server`
+(`landing_entries.rs`, `landing.rs`, `tests/presentations.rs`) and `crates/api` (`ActionTally::chmod`, contract 41).
+- **What was there.** §4.15 step 1 builds the manifest from "symlinks and mode changes", and the data model names a
+  `Chmod` action; neither was built. A file whose bytes the agent kept and whose mode it changed (`chmod +x`) was planned
+  as a replacement, and the verdict judged a replacement by its bytes alone (`overlay.hash != witness.identity`), so
+  the entry was `Skip` and the landing reported `Done` with the old mode on the disk. A captured clone's plan compared
+  content alone and planned no entry. A-451's Windows bits met the same wall. Under it, the failing-first tests found a
+  second fault: the plan hashed a metadata-only copy-up by reading its bytes from the disk, and an outsider's change to
+  that file's metadata moved its fingerprint, so the read was refused `BaseDrift` (AC-1.11) and the whole landing failed
+  to plan.
+- **The rule.** A file whose bytes are its base's and whose `FileMeta` (its permission bits, `0o7777` of the mode,
+  and the Windows bits a volume keeps for a file) is not is a metadata entry, `Chmod { from, to }`, encoded with both
+  (tag 8), so a grant binds what it sets and what it judged against. Its fields are judged one by one by step 4's own
+  rule: the volume's value is set where the disk still holds the base's, accepted as identical where the disk already
+  holds the volume's, and a conflict (`ModifyModify`) where it holds a third; a field the volume left as the base had
+  stays as the disk holds it, as bytes the disk changed and the volume did not. Never a value made of two (D-27). A
+  missing file is `ModifyDelete`, anything but a file `TypeChanged`. Its bytes are the disk's, whatever they are now,
+  so the file is judged by its metadata alone whichever object holds the name, and an overlay's entry and a captured
+  clone's are judged alike. A metadata-only copy-up's identity is its witness's, taken without reading the disk
+  (`Volume::holds_witnessed_bytes`: a base body with a witness, nothing pinned, its length the witnessed length).
+- **The write.** The file is opened through its own handle, never through a link (`LandFs::open_to_chmod`: Unix a
+  read-only no-follow open, since `fchmod` asks ownership and not write access; Windows `FILE_READ_ATTRIBUTES |
+  FILE_WRITE_ATTRIBUTES` with `FILE_OPEN_REPARSE_POINT`, a reparse point refused), judged again by that handle's
+  `fstat` so a field an outsider changed since the validation is never overwritten (`TargetInUse`), and each field to
+  set is set through it (`set_mode` with the file's own type bits, `set_windows`, read back on Windows as A-451 does).
+  No byte is written and nothing is staged; it runs with the replacements' class.
+- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r346, load 3.0 to 4.6, debug), main's code with the
+  tests alone: 5 of the 25 lib tests failed — the overlay's `chmod +x` was `Skipped(Drift)`, the captured clone's plan
+  held no entry for its file, and the three where the disk changed too were refused at the plan, `BaseDrift`. With the
+  fix (the same day, load 3.7 to 5.0): `cargo test --locked -p slates-land --lib` 26 of 26 (the four engine tests in
+  `chmod_tests`, the captured clone's, and `a_files_metadata_is_judged_field_by_field`), `slates-vfs --lib -- captured
+  host::sim` 3 of 3, `slates-api --lib -- summary contract` 2 of 2 and `slates-ipc --test wire_order` 2 of 2.
+  Red-checked once: with a field judged against the disk alone and its base ignored (the lost update the rule exists to
+  refuse), 3 of the 26 failed — the field table, the test where the disk changed the mode the volume kept, and the
+  conflict. macOS `cargo check` and `cargo xwin check --target x86_64-pc-windows-msvc` of slates-land, -vfs, -ipc, -api
+  and -server with all targets were clean, and `cargo fmt` laid the lines out. Filed for main's runs: the land oracle
+  (A-451's bits test now expects the untouched file's bits to land as one entry more) and the crash oracle, since the
+  set's `set_mode` and `set_windows` are write steps of the simulated host; on Windows, the land `--test os` suite.
+- **Owed.** A metadata-only write is made durable by its directory's sync alone, as a made directory's mode is; from
+  memory of ext4's and XFS's fsync paths, to verify, a directory's `fsync` commits only to that directory's own last
+  change, so a file-level `fsync` (not `fdatasync`, which skips a mode) off the shard is owed. A mode Windows cannot hold
+  (an execute bit) makes an entry whose set changes nothing there; the next landing finds the file as the disk keeps it.
+  A check and a set are two calls on one handle, and an outsider's change to the same field between them is not seen.
+  Siblings found, not fixed: a `touch` alone and a base directory's mode change alone still land nothing; a captured
+  clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the manifest's
+  canonical encoding, which grants bind, has no golden vector.
