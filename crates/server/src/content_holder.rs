@@ -192,6 +192,8 @@ const KIND_CONTENT_CHUNK: u8 = 7;
 const KIND_CONTENT_MANIFEST: u8 = 8;
 /// Format: see [`KIND_MIRRORED`]; an object's stage of the content hold (A-376), keyed by its object, its bytes its image.
 const KIND_CONTENT_STAGE: u8 = 9;
+/// Format: the piece kind of a holder's durable checkpoint of a green's replica (A-404), keyed by the green.
+const KIND_REPLICA_CHECKPOINT: u8 = 10;
 
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
@@ -298,7 +300,22 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
   for (volume, owned) in crate::live_ship::owned_pieces(state) {
     pieces.push(owned_piece(volume, owned));
   }
+  // Every durable checkpoint of a replica this holder keeps (A-404).
+  for (object, held) in &state.merge.checkpoints {
+    pieces.push(checkpoint_piece(*object, held));
+  }
   pieces
+}
+
+/// A held checkpoint's piece (A-404), keyed by its green.
+fn checkpoint_piece(
+  object: ObjectId,
+  held: &crate::merge_service::HeldCheckpoint,
+) -> slates_vfs::recover::HeldPiece {
+  slates_vfs::recover::HeldPiece {
+    key: piece_key(KIND_REPLICA_CHECKPOINT, object.0, 0),
+    bytes: held.to_piece(),
+  }
 }
 
 /// One live log's kept piece (A-344): what this shard's owner side keeps of `volume`'s log across a restart.
@@ -550,6 +567,14 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
       }
     }
   }
+  // The replica checkpoints this holder changed since the last committed publication (A-404): each kept now put, each
+  // dropped removed.
+  for object in &state.merge.checkpoints_changed {
+    match state.merge.checkpoints.get(object) {
+      Some(held) => put.push(checkpoint_piece(*object, held)),
+      None => removed.push(piece_key(KIND_REPLICA_CHECKPOINT, object.0, 0)),
+    }
+  }
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -629,6 +654,7 @@ pub(crate) fn held_committed(
   state.held_content.clear_changes();
   state.holder_records.clear_changed();
   state.live.held.clear_changed();
+  state.merge.checkpoints_changed.clear();
 }
 
 /// Adopts what a committed publication carried of the held registers (A-367): each register's published positions as
@@ -727,6 +753,8 @@ pub(crate) struct RecoveredHeld {
   live: Vec<crate::live_ship::HeldLive>,
   /// The live logs this shard shipped as their owner, each kept piece by volume (A-344).
   owned: Vec<([u8; 16], crate::live_ship::OwnedLive)>,
+  /// The durable checkpoints of replicas this holder kept, by green (A-404).
+  checkpoints: Vec<(ObjectId, crate::merge_service::HeldCheckpoint)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -745,6 +773,8 @@ pub(crate) enum HeldRefused {
   PositionWithoutHead([u8; 16]),
   /// The content hold's pieces do not make its image (A-376).
   Content(slates_cluster::content::HoldImageError),
+  /// A replica checkpoint's piece did not decode (A-404).
+  Checkpoint([u8; 16]),
 }
 
 impl std::fmt::Display for HeldRefused {
@@ -770,6 +800,9 @@ impl std::fmt::Display for HeldRefused {
           "a held register position of {object:02x?} with no head piece"
         )
       }
+      HeldRefused::Checkpoint(object) => {
+        write!(f, "the replica checkpoint of {object:02x?} did not decode")
+      }
     }
   }
 }
@@ -791,6 +824,7 @@ pub(crate) fn split_held(
     mirrored: Vec::new(),
     live: Vec::new(),
     owned: Vec::new(),
+    checkpoints: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -831,6 +865,11 @@ pub(crate) fn split_held(
       KIND_LIVE_OWNED => held.owned.push((
         object,
         crate::live_ship::OwnedLive::from_bytes(&piece.bytes)?,
+      )),
+      KIND_REPLICA_CHECKPOINT => held.checkpoints.push((
+        ObjectId(object),
+        crate::merge_service::HeldCheckpoint::from_piece(&piece.bytes)
+          .ok_or(HeldRefused::Checkpoint(object))?,
       )),
       other => return Err(HeldRefused::UnknownKind(other)),
     }
@@ -888,6 +927,9 @@ pub(crate) fn restore_held_registers(
   let count = held.registers.len();
   crate::live_ship::restore_copies(state, std::mem::take(&mut held.live));
   crate::live_ship::restore_owned(state, std::mem::take(&mut held.owned));
+  // The replica checkpoints (A-404): the image carries each, so none is owed to the next publication.
+  state.merge.checkpoints = std::mem::take(&mut held.checkpoints).into_iter().collect();
+  state.merge.checkpoints_changed.clear();
   // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
   // register refuses, is counted: the image held it, and this holder no longer does.
   for bytes in &held.mirrored {
