@@ -6449,11 +6449,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
 >   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
 >   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
->   lossy paths through a takeover, cut a running owner off, and deafen one. Every flow that takes a live volume over,
+>   lossy paths through a takeover; cut a running owner off, deafen it or mute it, each taken over; cut off, deafen or
+>   mute each candidate in turn, where no write may be refused and no candidate may depose the owner (one voter's view
+>   retires no one, A-250); and hold one candidate's every datagram 200 ms ± 50 ms (T-8.3's slow candidate, AC-8.12),
+>   where no write may wait for it. Every flow that takes a live volume over,
 >   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
 >   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
 >   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
->   from outside the processes.
+>   from outside the processes. The flows that take nothing over (candidates partitioned, stalled or slowed, and the
+>   lossy phases) read through every node mid-fault and after it, held to ReadSafety too, with the owner answering every
+>   read: its lease needs one healthy candidate's confirmation of two.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -6568,7 +6573,14 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   holder that accepts it drops the volume's and its catalog's records. Waiting for every candidate is what
 >   keeps a later takeover from meeting a lone live head.
 > - **A takeover adopts the tombstone** and never materializes the volume. Before this a successor served a
->   destroyed volume again.
+>   destroyed volume again. The successor records the adopted tombstone on the shard the id routes to once a period,
+>   and since 2026-11-18 past the failover SLO's worth of attempts (`failover_slo_ns / HEARTBEAT_NS`, as for a
+>   taken-over volume or green) it gives that record up, counted `fleet.tombstone.given_up` with its last reason (no
+>   shard for the partition, refused, unanswered): the adoption already placed the tombstone under the successor at the
+>   quorum, so the volume is never served again, and what is lost is the retirement, which leaves the candidates
+>   holding the tombstone, the safe state. The successor keeps it marked, so the volume stays known destroyed there.
+>   Before, a tombstone whose partition had no shard was skipped every period, uncounted, and a refused one retried
+>   every period without end.
 > - **On a laptop** the tombstone retires with the destroy: there is no remote candidate to ship to.
 > - **Single-value registers** (head, catalog, tombstone) keep only their newest accepted position. A
 >   green's chain is a ledger and is kept whole.
