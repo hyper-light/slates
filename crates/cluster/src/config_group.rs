@@ -138,9 +138,6 @@ pub enum ConfigCommand {
     from: HostId,
     /// The member it moves to.
     to: HostId,
-    /// The cohort its head and catalog are placed at `f + 1` of, the reporter among them (A-291): where the new
-    /// owner's phase one finds them.
-    cohort: Vec<HostId>,
   },
   /// A moved object's owner reports it destroyed, and its exception is dropped
   /// ([`RegionalConfiguration::forget_moved`]).
@@ -155,14 +152,6 @@ pub enum ConfigCommand {
   Seat {
     /// The voters, in id order.
     voters: Vec<HostId>,
-  },
-  /// A moved object's new owner reports it adopted and placed under its own placement, so the member the move left
-  /// may let its copy go ([`RegionalConfiguration::adopt_move`], A-291).
-  MoveAdopted {
-    /// The object adopted.
-    object: ObjectId,
-    /// Its new owner, the reporter.
-    owner: HostId,
   },
 }
 
@@ -185,9 +174,6 @@ const COMMAND_MOVED_FORGOTTEN: u8 = 8;
 /// Format: the tag of the leader's record of the council's voters ([`ConfigCommand::Seat`]): a little-endian u64 count,
 /// then each voter's id.
 const COMMAND_SEAT: u8 = 9;
-/// Format: the tag of a moved object's new owner's report that it adopted it ([`ConfigCommand::MoveAdopted`]): 10, since
-/// A-380's record of the seated voters took 9 on main first.
-const COMMAND_MOVE_ADOPTED: u8 = 10;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -254,20 +240,11 @@ impl ConfigCommand {
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&successor.0.to_le_bytes());
       }
-      ConfigCommand::Move {
-        object,
-        from,
-        to,
-        cohort,
-      } => {
+      ConfigCommand::Move { object, from, to } => {
         out.push(COMMAND_MOVE);
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&to.0.to_le_bytes());
-        // The cohort last, every host a word to the end: its count is the bytes that remain.
-        for host in cohort {
-          out.extend_from_slice(&host.0.to_le_bytes());
-        }
       }
       ConfigCommand::MovedForgotten { object, owner } => {
         out.push(COMMAND_MOVED_FORGOTTEN);
@@ -284,11 +261,6 @@ impl ConfigCommand {
         for voter in voters {
           out.extend_from_slice(&voter.0.to_le_bytes());
         }
-      }
-      ConfigCommand::MoveAdopted { object, owner } => {
-        out.push(COMMAND_MOVE_ADOPTED);
-        out.extend_from_slice(&object.0);
-        out.extend_from_slice(&owner.0.to_le_bytes());
       }
     }
     out
@@ -329,7 +301,7 @@ impl ConfigCommand {
         })
       }
       COMMAND_MIRROR_ADOPT | COMMAND_MIRROR_ADOPTED => decode_mirror(tag, rest),
-      COMMAND_MOVE | COMMAND_MOVED_FORGOTTEN | COMMAND_MOVE_ADOPTED => decode_move(tag, rest),
+      COMMAND_MOVE | COMMAND_MOVED_FORGOTTEN => decode_move(tag, rest),
       COMMAND_SEAT => decode_seat(rest),
       _ => None,
     }
@@ -353,45 +325,23 @@ fn decode_seat(rest: &[u8]) -> Option<ConfigCommand> {
   Some(ConfigCommand::Seat { voters })
 }
 
-/// Decodes a move command (`COMMAND_MOVE`, `COMMAND_MOVED_FORGOTTEN`, `COMMAND_MOVE_ADOPTED`) after its tag, or `None`
-/// for malformed bytes or trailing ones. A move's cohort is every word that remains, at least one: a remainder that is
-/// not whole words is refused, and the bytes bound the count, so nothing is allocated past what arrived.
+/// Decodes a move command (`COMMAND_MOVE`, `COMMAND_MOVED_FORGOTTEN`) after its tag, or `None` for malformed bytes or
+/// trailing ones.
 fn decode_move(tag: u8, rest: &[u8]) -> Option<ConfigCommand> {
   let (object, rest) = take_object(rest)?;
   let (first, rest) = take_host(rest)?;
-  match tag {
-    COMMAND_MOVED_FORGOTTEN => rest.is_empty().then_some(ConfigCommand::MovedForgotten {
+  if tag == COMMAND_MOVED_FORGOTTEN {
+    return rest.is_empty().then_some(ConfigCommand::MovedForgotten {
       object,
       owner: first,
-    }),
-    COMMAND_MOVE_ADOPTED => rest.is_empty().then_some(ConfigCommand::MoveAdopted {
-      object,
-      owner: first,
-    }),
-    _ => {
-      let (to, mut rest) = take_host(rest)?;
-      if rest.is_empty() || !rest.len().is_multiple_of(core::mem::size_of::<u64>()) {
-        return None;
-      }
-      let mut cohort = Vec::with_capacity(
-        rest
-          .len()
-          .checked_div(core::mem::size_of::<u64>())
-          .unwrap_or(0),
-      );
-      while !rest.is_empty() {
-        let (host, tail) = take_host(rest)?;
-        cohort.push(host);
-        rest = tail;
-      }
-      Some(ConfigCommand::Move {
-        object,
-        from: first,
-        to,
-        cohort,
-      })
-    }
+    });
   }
+  let (to, rest) = take_host(rest)?;
+  rest.is_empty().then_some(ConfigCommand::Move {
+    object,
+    from: first,
+    to,
+  })
 }
 
 /// Reads a u64 host id at the front of `bytes`, returning it and the remainder, or `None` if truncated.
@@ -565,8 +515,6 @@ pub enum Reconfiguration {
     from: HostId,
     /// The member it moves to.
     to: HostId,
-    /// The cohort its records are placed in.
-    cohort: Vec<HostId>,
   },
   /// Drop a destroyed object's exception at its owner's report ([`ConfigCommand::MovedForgotten`]).
   MovedForgotten {
@@ -577,13 +525,6 @@ pub enum Reconfiguration {
   },
   /// Record the voters the council's last committed seat change left ([`ConfigCommand::Seat`], A-380).
   Seat(Vec<HostId>),
-  /// Record a moved object adopted at its new owner's report ([`ConfigCommand::MoveAdopted`]).
-  MoveAdopted {
-    /// The object.
-    object: ObjectId,
-    /// Its new owner.
-    owner: HostId,
-  },
 }
 
 /// The voter set the council moves to (§4.8, D-14 — "a small elected council per region"), in id order: up
@@ -1240,23 +1181,10 @@ impl RegionalCouncil {
         ConfigCommand::MirrorAdopted { object, successor },
         self.fold.state().owes_adopted(object, successor),
       ),
-      Reconfiguration::Move {
-        object,
-        from,
-        to,
-        cohort,
-      } => {
-        let would = self.fold.state().moves(object, from, to) && cohort.contains(&from);
-        (
-          ConfigCommand::Move {
-            object,
-            from,
-            to,
-            cohort,
-          },
-          would,
-        )
-      }
+      Reconfiguration::Move { object, from, to } => (
+        ConfigCommand::Move { object, from, to },
+        self.fold.state().moves(object, from, to),
+      ),
       Reconfiguration::MovedForgotten { object, owner } => (
         ConfigCommand::MovedForgotten { object, owner },
         self.fold.state().forgets_moved(object, owner),
@@ -1265,10 +1193,6 @@ impl RegionalCouncil {
         let would = self.fold.state().seats(&voters);
         (ConfigCommand::Seat { voters }, would)
       }
-      Reconfiguration::MoveAdopted { object, owner } => (
-        ConfigCommand::MoveAdopted { object, owner },
-        self.fold.state().adopts_move(object, owner),
-      ),
     };
     if !would_change {
       return false;
@@ -1305,23 +1229,43 @@ impl RegionalCouncil {
   /// A member may also move one of its own objects to another member, and report one it moved destroyed (§4.8
   /// "Authority scope": the moved-object exceptions). A move that would add an exception while the configuration
   /// already holds `moved_bound` of them is answered [`ReportOutcome::Full`] and not proposed (banned item 8: the
-  /// exceptions are bounded, the bound derived by the leader's daemon, `slates_server::fleet::moved_bound`); a move of
-  /// an object already moved adds none. A move back to an object's creator adds one like any other (A-291).
+  /// exceptions are bounded, the bound derived by the leader's daemon, `slates_server::fleet::moved_bound`); a move
+  /// back to an object's creator, or of an object already moved, adds none.
   pub fn report(
     &mut self,
     reporter: HostId,
     command: ConfigCommand,
     moved_bound: usize,
   ) -> ReportOutcome {
-    let Some(change) = reported_change(reporter, command) else {
-      return ReportOutcome::Refused;
+    let change = match command {
+      ConfigCommand::Settle { owner, generation } if owner == reporter => {
+        Reconfiguration::Settle { owner, generation }
+      }
+      ConfigCommand::Confirm {
+        departed,
+        successor,
+      } if successor == reporter => Reconfiguration::Confirm {
+        departed,
+        successor,
+      },
+      ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
+        Reconfiguration::MirrorAdopted { object, successor }
+      }
+      ConfigCommand::Move { object, from, to } if from == reporter => {
+        Reconfiguration::Move { object, from, to }
+      }
+      ConfigCommand::MovedForgotten { object, owner } if owner == reporter => {
+        Reconfiguration::MovedForgotten { object, owner }
+      }
+      _ => return ReportOutcome::Refused,
     };
     if !self.is_leader() || !self.caught_up() {
       return ReportOutcome::NotLeader;
     }
-    if let Reconfiguration::Move { object, .. } = &change {
+    if let Reconfiguration::Move { object, to, .. } = &change {
       let configuration = self.fold.state();
-      let adds = !configuration.moved.contains_key(&object.placement_key());
+      let adds =
+        !configuration.moved.contains_key(&object.placement_key()) && *to != object.creator();
       if adds && configuration.moved.len() >= moved_bound {
         return ReportOutcome::Full;
       }
@@ -1638,13 +1582,8 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     Some(ConfigCommand::MirrorAdopted { object, successor }) => {
       configuration.adopted(object, successor);
     }
-    Some(ConfigCommand::Move {
-      object,
-      from,
-      to,
-      cohort,
-    }) => {
-      configuration.move_object(object, from, to, &cohort);
+    Some(ConfigCommand::Move { object, from, to }) => {
+      configuration.move_object(object, from, to);
     }
     Some(ConfigCommand::MovedForgotten { object, owner }) => {
       configuration.forget_moved(object, owner);
@@ -1652,50 +1591,7 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     Some(ConfigCommand::Seat { voters }) => {
       configuration.seat(&voters);
     }
-    Some(ConfigCommand::MoveAdopted { object, owner }) => {
-      configuration.adopt_move(object, owner);
-    }
     None => {}
-  }
-}
-
-/// The change a member's report asks for, when the member may report it (§4.8): a settle or a confirm of its own share,
-/// a mirror adoption it made, a move of an object it owns, a moved object it destroyed, or a move it adopted (A-291).
-/// `None` for a report about another member's state, or for a membership change, which only the leader's own
-/// reconciliation proposes.
-fn reported_change(reporter: HostId, command: ConfigCommand) -> Option<Reconfiguration> {
-  match command {
-    ConfigCommand::Settle { owner, generation } if owner == reporter => {
-      Some(Reconfiguration::Settle { owner, generation })
-    }
-    ConfigCommand::Confirm {
-      departed,
-      successor,
-    } if successor == reporter => Some(Reconfiguration::Confirm {
-      departed,
-      successor,
-    }),
-    ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
-      Some(Reconfiguration::MirrorAdopted { object, successor })
-    }
-    ConfigCommand::Move {
-      object,
-      from,
-      to,
-      cohort,
-    } if from == reporter => Some(Reconfiguration::Move {
-      object,
-      from,
-      to,
-      cohort,
-    }),
-    ConfigCommand::MovedForgotten { object, owner } if owner == reporter => {
-      Some(Reconfiguration::MovedForgotten { object, owner })
-    }
-    ConfigCommand::MoveAdopted { object, owner } if owner == reporter => {
-      Some(Reconfiguration::MoveAdopted { object, owner })
-    }
-    _ => None,
   }
 }
 
@@ -1840,7 +1736,6 @@ mod tests {
         object: ObjectId::new(OWNER, 9),
         from: A,
         to: B,
-        cohort: vec![A, OWNER, HostId(7)],
       },
       ConfigCommand::MovedForgotten {
         object: ObjectId::new(OWNER, 9),
@@ -1848,10 +1743,6 @@ mod tests {
       },
       ConfigCommand::Seat {
         voters: vec![OWNER, A, B],
-      },
-      ConfigCommand::MoveAdopted {
-        object: ObjectId::new(OWNER, 9),
-        owner: B,
       },
     ];
     for command in commands {
@@ -1870,7 +1761,6 @@ mod tests {
           | ConfigCommand::MirrorAdopted { .. }
           | ConfigCommand::Move { .. }
           | ConfigCommand::MovedForgotten { .. }
-          | ConfigCommand::MoveAdopted { .. }
           | ConfigCommand::Seat { .. }
       ) {
         assert_eq!(
@@ -2004,16 +1894,13 @@ mod tests {
     );
   }
 
-  /// §4.8 "Authority scope", §4.10 "operators keep an explicit move" (T-8.14's council half; A-291). Do: on a three-voter
-  /// council, report a move of one of `A`'s objects to `B` from `B`, then from `A` with a cohort that leaves `A` out,
-  /// then from `A` with its cohort; replicate; report the move adopted from `A`, then from `B`, twice; report another
-  /// object's move from `A` with the bound at the one exception already held, then that first object's move back to `A`
-  /// (its creator) at the same bound, then report it destroyed, twice. Expect the report naming another host refused,
-  /// the cohort without its mover not proposed, `A`'s proposed once and committed on every voter as `B`'s ownership
-  /// with `A` and the cohort recorded; the adoption refused from `A`, proposed once from `B` and committed as the
-  /// exception letting `A` go, the second unchanged; the second move answered `Full` and not proposed, the move back
-  /// proposed since it replaces the object's exception (one naming the creator, which adopts it back), the destroyed
-  /// object's first report dropping it, and the second changing nothing once it is back on its creator's line.
+  /// §4.8 "Authority scope", §4.10 "operators keep an explicit move" (T-8.14's council half). Do: on a three-voter
+  /// council, report a move of one of `A`'s objects to `B` from `B`, then from `A`; replicate; report another object's
+  /// move from `A` with the bound at the one exception already held, then that first object's move back to `A`
+  /// (its creator) at the same bound, then report it destroyed. Expect the report naming another host refused, `A`'s
+  /// proposed once and committed on every voter as `B`'s ownership, the second move answered `Full` and not proposed,
+  /// the move back proposed since it drops an exception, and a destroyed object's report changing nothing once it is
+  /// back on its creator's line.
   #[test]
   fn a_move_report_is_proposed_by_its_owner_and_held_to_the_bound() {
     let mut groups = councils(&[OWNER, A, B]);
@@ -2022,36 +1909,10 @@ mod tests {
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     let object = ObjectId::new(A, 7);
-    let cohort = vec![OWNER, A, B];
-    expect_only_the_owners_move_proposed(&mut groups, object, &cohort);
-    expect_only_the_new_owner_to_adopt(&mut groups, object);
-    expect_the_bound_held_and_the_move_back_proposed(&mut groups, object, &cohort);
-    expect_a_destroy_report_to_drop_the_exception_once(&mut groups, object);
-  }
-
-  /// The councils of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`, by member.
-  type Councils = std::collections::BTreeMap<HostId, RegionalCouncil>;
-
-  /// Two rounds of the leader's replication, as each report needs to commit on every voter.
-  fn commit_on_every_voter(groups: &mut Councils) {
-    replicate_round(groups, OWNER, &[OWNER, A, B]);
-    replicate_round(groups, OWNER, &[OWNER, A, B]);
-  }
-
-  /// The first part of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object`'s move to
-  /// `B` from `B`, then from `A` with a cohort that leaves `A` out, then from `A` with `cohort`; commit. Expect the
-  /// report naming another host refused, the cohort without its mover not proposed, `A`'s proposed and committed on
-  /// every voter as `B`'s ownership with `A` and the cohort recorded.
-  fn expect_only_the_owners_move_proposed(
-    groups: &mut Councils,
-    object: ObjectId,
-    cohort: &[HostId],
-  ) {
     let move_it = ConfigCommand::Move {
       object,
       from: A,
       to: B,
-      cohort: cohort.to_vec(),
     };
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
@@ -2059,134 +1920,55 @@ mod tests {
       ReportOutcome::Refused,
       "only an object's owner reports its move"
     );
-    let without_its_mover = ConfigCommand::Move {
-      object,
-      from: A,
-      to: B,
-      cohort: vec![OWNER, B],
-    };
     assert_eq!(
-      leader.report(A, without_its_mover, MOVES_UNBOUNDED),
-      ReportOutcome::Unchanged,
-      "a cohort without its mover places nothing of the mover's"
-    );
-    assert_eq!(
-      leader.report(A, move_it, MOVES_UNBOUNDED),
+      leader.report(A, move_it.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Proposed
     );
-    commit_on_every_voter(groups);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     for voter in [OWNER, A, B] {
-      let configuration = groups[&voter].configuration();
       assert_eq!(
-        configuration.owner_of(object),
+        groups[&voter].configuration().owner_of(object),
         Some(B),
         "the committed move names B the owner on {voter:?}"
       );
-      assert_eq!(
-        configuration
-          .moved
-          .get(&object)
-          .map(|moved| (moved.from, moved.cohort.clone())),
-        Some((Some(A), cohort.to_vec())),
-        "the member it left and the cohort its records sit in, on {voter:?}"
-      );
     }
-  }
-
-  /// The adoption of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object`'s move adopted
-  /// from `A`, then from `B`, commit, then from `B` again. Expect `A`'s refused, `B`'s proposed and committed as the
-  /// exception letting `A` go, and the second unchanged.
-  fn expect_only_the_new_owner_to_adopt(groups: &mut Councils, object: ObjectId) {
-    let adopted = ConfigCommand::MoveAdopted { object, owner: B };
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(A, adopted.clone(), MOVES_UNBOUNDED),
-      ReportOutcome::Refused,
-      "only the new owner reports its adoption"
-    );
-    assert_eq!(
-      leader.report(B, adopted.clone(), MOVES_UNBOUNDED),
-      ReportOutcome::Proposed
-    );
-    commit_on_every_voter(groups);
-    assert_eq!(
-      groups[&OWNER]
-        .configuration()
-        .moved
-        .get(&object)
-        .map(|moved| (moved.owner, moved.from)),
-      Some((B, None)),
-      "adopted: the member it left may let its copy go"
-    );
-    let leader = groups.get_mut(&OWNER).unwrap();
-    assert_eq!(
-      leader.report(B, adopted, MOVES_UNBOUNDED),
-      ReportOutcome::Unchanged,
-      "a move is adopted once"
-    );
-  }
-
-  /// The bound of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: with one exception held, report
-  /// another object's move from `A` at a bound of one, then `object`'s move back to `A` (its creator) at the same
-  /// bound; commit. Expect the second move answered `Full` and not proposed, and the move back proposed since it
-  /// replaces the object's exception (one naming the creator, which adopts it back).
-  fn expect_the_bound_held_and_the_move_back_proposed(
-    groups: &mut Councils,
-    object: ObjectId,
-    cohort: &[HostId],
-  ) {
-    let leader = groups.get_mut(&OWNER).unwrap();
-    let another = ConfigCommand::Move {
-      object: ObjectId::new(A, 8),
-      from: A,
-      to: B,
-      cohort: cohort.to_vec(),
-    };
-    assert_eq!(
-      leader.report(A, another, 1),
+      leader.report(
+        A,
+        ConfigCommand::Move {
+          object: ObjectId::new(A, 8),
+          from: A,
+          to: B,
+        },
+        1
+      ),
       ReportOutcome::Full,
       "a second exception past a bound of one is not proposed"
     );
-    let back = ConfigCommand::Move {
-      object,
-      from: B,
-      to: A,
-      cohort: cohort.to_vec(),
-    };
     assert_eq!(
-      leader.report(B, back, 1),
+      leader.report(
+        B,
+        ConfigCommand::Move {
+          object,
+          from: B,
+          to: A,
+        },
+        1
+      ),
       ReportOutcome::Proposed,
-      "a move back to the creator replaces the object's exception, adding none"
+      "a move back to the creator adds no exception"
     );
-    commit_on_every_voter(groups);
-    assert_eq!(
-      groups[&OWNER]
-        .configuration()
-        .moved
-        .get(&object)
-        .map(|moved| (moved.owner, moved.from)),
-      Some((A, Some(B))),
-      "the creator adopts it back under an exception naming it and the member it left"
-    );
-  }
-
-  /// The end of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object` destroyed by its
-  /// owner `A`, commit, and report it again. Expect the first report to drop the exception and the second to change
-  /// nothing once the object is back on its creator's line.
-  fn expect_a_destroy_report_to_drop_the_exception_once(groups: &mut Councils, object: ObjectId) {
-    let forgotten = ConfigCommand::MovedForgotten { object, owner: A };
-    assert_eq!(
-      groups
-        .get_mut(&OWNER)
-        .unwrap()
-        .report(A, forgotten.clone(), 1),
-      ReportOutcome::Proposed,
-      "its owner reports it destroyed"
-    );
-    commit_on_every_voter(groups);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     assert!(groups[&OWNER].configuration().moved.is_empty());
     assert_eq!(
-      groups.get_mut(&OWNER).unwrap().report(A, forgotten, 1),
+      groups.get_mut(&OWNER).unwrap().report(
+        A,
+        ConfigCommand::MovedForgotten { object, owner: A },
+        1
+      ),
       ReportOutcome::Unchanged,
       "an object on its creator's line has no exception to forget"
     );
@@ -3401,22 +3183,14 @@ mod tests {
       Reconfiguration::MirrorAdopted { object, successor } => {
         oracle.adopted(*object, *successor);
       }
-      Reconfiguration::Move {
-        object,
-        from,
-        to,
-        cohort,
-      } => {
-        oracle.move_object(*object, *from, *to, cohort);
+      Reconfiguration::Move { object, from, to } => {
+        oracle.move_object(*object, *from, *to);
       }
       Reconfiguration::MovedForgotten { object, owner } => {
         oracle.forget_moved(*object, *owner);
       }
       Reconfiguration::Seat(voters) => {
         oracle.seat(voters);
-      }
-      Reconfiguration::MoveAdopted { object, owner } => {
-        oracle.adopt_move(*object, *owner);
       }
     }
   }

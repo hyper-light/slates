@@ -38,8 +38,7 @@ use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
 use crate::outcome::{
   LandOutcome, LandingApproval, LandingConflict, MergeApproval, MergeConflict, MergeConflicts,
-  MergeOutcome, MergeRecord, MoveProgress, RebaseOutcome, Work, merge_class_of, report_of,
-  summary_of,
+  MergeOutcome, MergeRecord, RebaseOutcome, Work, merge_class_of, report_of, summary_of,
 };
 use crate::policy::{PolicyRefusal, PolicySubject, WritePolicy};
 use crate::signed::{MergeStatement, TrustedSigner, Verification, WorkSignature};
@@ -259,21 +258,6 @@ impl Instance {
     self
       .client
       .snapshot(volume)
-      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
-  }
-
-  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291), its id: every
-  /// file's bytes and every link's target become the volume's own, so a clone of the snapshot
-  /// (`VolumeSpec::clone_of`) needs no base directory, survives its runner's loss and moves between fleet members
-  /// ([`Instance::move_volume`]). The host asserts nothing writes the folder while the capture runs (kiln: a commit's
-  /// tree checked out where nothing else writes); a file that changed while it was read is refused `Error::Retry`
-  /// (`RetryCause::ChangedWhileRead`) and a folder that moved under the capture [`crate::Invalid::LiveBase`], and the
-  /// capture may be asked again. It reads the whole folder, so it takes as long as that does; a volume that is not an
-  /// overlay is refused [`crate::Unsupported::Feature`].
-  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, Error> {
-    self
-      .client
-      .capture_base(volume)
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
@@ -909,29 +893,6 @@ impl Instance {
       .policy(subject.wire())
       .map(|(policy, _)| policy.map(WritePolicy::of_wire))
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
-  }
-
-  /// Asks `volume`'s owner to move it to the fleet member `to` (§4.10 "Ownership follows the writer", A-291), the
-  /// member named by its id ([`Instance::member`] on that member's own instance). One ask: the move goes on between
-  /// asks, so a consumer asks again until it is [`MoveProgress::Moved`], and the volume is then served by `to` once it
-  /// has adopted it (its verbs answer [`crate::RetryCause::Overloaded`] until then). The volume must be a plain one with
-  /// no attachment, clone or snapshot but its head, and `admin` on it is required. Each refusal is typed by what to do:
-  /// [`crate::Busy::Attached`] (detach first), [`crate::Busy::Moving`], [`crate::Unusable::Unmovable`],
-  /// [`crate::Invalid::MoveTarget`], [`crate::RetryCause::MoveUnplaced`]; a lone instance, which has no other member, is
-  /// refused [`crate::MoveTarget::NotMember`].
-  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveProgress, Error> {
-    match self.client.move_volume(volume, to) {
-      Ok(slates_client::MoveState::Moving { to }) => Ok(MoveProgress::Moving { to }),
-      Ok(slates_client::MoveState::Moved { to }) => Ok(MoveProgress::Moved { to }),
-      Err(e) => Err(self.fail(e, Some(Missing::Volume(volume)))),
-    }
-  }
-
-  /// This instance's fleet member id: what another instance's [`Instance::move_volume`] names it by, and what its
-  /// volume ids and its peers name it by (§4.8). It is the node's certificate anchor with its boot's nonce, so a
-  /// daemon restarted under the same anchor is a new member; ask it again after a restart.
-  pub fn member(&mut self) -> Result<u64, Error> {
-    Ok(self.daemon_status()?.fleet.host)
   }
 
   /// The daemon's status (§4.14 `slates.status`): its shards, health signals with their freshness, the fleet's view,

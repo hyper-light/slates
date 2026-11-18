@@ -191,24 +191,6 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
-- Moving a volume to another fleet member (A-291): `member()` is this instance's member id, and
-  `move_volume(volume, to)` asks the volume's owner to move it to the member `to` (another
-  instance's `member()`): one ask, answered `MoveProgress::Moving` until the switch and
-  `MoveProgress::Moved` from it, so ask again until `Moved`; detach first. The new member serves the
-  volume once it has adopted it (its verbs answer `Retry` until then), and the old one lets its copy
-  go once the new one has placed it. Refusals: `Busy(Attached)`, `Busy(Moving)`,
-  `Unusable(Unmovable(NotPlain | Lineage | Snapshots))`, `Invalid(MoveTarget(NotMember |
-  OutsideNeighbourhood))`, `Retry { cause: MoveUnplaced, .. }`. A lone instance has no other member.
-  An overlay does not move (its folder stays on its machine); a clone of a captured base does.
-- Capturing a folder once for many workspaces that move (A-291): `capture_base(overlay)` makes
-  every byte and link of the overlay's folder the volume's own and answers a snapshot holding the
-  whole tree; `VolumeSpec::clone_of(name, overlay, snapshot)` then gives each workspace an O(1)
-  clone that reads no folder at all, so it moves like an empty volume's and outlives the folder.
-  Capture only a folder nothing writes while it runs (a commit's tree checked out for it): a file
-  that changes while it is read is refused `Error::Retry { cause: ChangedWhileRead, .. }`, and a
-  capture the folder moved under `Error::Invalid(Invalid::LiveBase)`; a volume with no folder is
-  refused `Error::Unsupported`. A large file is read whole, so the capture costs its bytes in memory
-  once more while it runs.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
 - Lists a page at a time: the daemon answers every list a reply at a time, so a host that shows a

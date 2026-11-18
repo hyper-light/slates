@@ -28,8 +28,8 @@ use slates_ipc::protocol::{
   AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass, Conformance,
   DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established, GrantScope,
   GrantState, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation,
-  LandingStage, MoveRefusal, NamePolicy, OwnMountUse, PlannedAction, PolicySubject, Principal,
-  ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
+  LandingStage, NamePolicy, OwnMountUse, PlannedAction, PolicySubject, Principal, ReadAt,
+  ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
   SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal,
   UnsupportedReason, Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
 };
@@ -63,7 +63,6 @@ fn schemas() -> Vec<&'static str> {
     <KernelCache as Wire>::SCHEMA,
     <LandingDegradation as Wire>::SCHEMA,
     <LandingStage as Wire>::SCHEMA,
-    <MoveRefusal as Wire>::SCHEMA,
     <NamePolicy as Wire>::SCHEMA,
     <OwnMountUse as Wire>::SCHEMA,
     <PlannedAction as Wire>::SCHEMA,

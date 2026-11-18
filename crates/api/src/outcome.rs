@@ -4,7 +4,6 @@
 //! - A landing ([`LandOutcome`]) is written, needs an approval, met conflicts, or was refused by a policy.
 //! - A merge ([`MergeOutcome`]) is merged at a green version, needs an approval, met conflicts, or was refused.
 //! - A rebase ([`RebaseOutcome`]) moved the work onto the green's head, or met conflicts.
-//! - A move of a volume to another fleet member ([`MoveProgress`], A-291) is under way, or done.
 //!
 //! **Conflicts are verdicts, never inferences (D-27, D-26).** The merge engine's verdict is accept, identical or
 //! conflict, and a landing's per-entry verdict is apply, skip, accept-identical or conflict (§4.15 step 4). A conflict
@@ -430,24 +429,4 @@ mod tests {
       Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
     ));
   }
-}
-
-/// Where a volume's move to another fleet member stands after one ask ([`crate::Instance::move_volume`]; §4.10
-/// "Ownership follows the writer", A-291). A move goes on between asks; a consumer asks again until it is
-/// [`MoveProgress::Moved`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoveProgress {
-  /// Under way: the volume is frozen on its owner, which waits for its records to be placed or for the configuration to
-  /// name the new owner. Every other verb on it is refused for now ([`crate::RetryCause::Overloaded`]).
-  Moving {
-    /// The member it moves to.
-    to: u64,
-  },
-  /// Done: the configuration names the new owner, where the volume's verbs go now. The new owner answers them once it
-  /// serves the volume (until then [`crate::RetryCause::Overloaded`]), and the old owner lets its copy go once the new
-  /// owner has placed the volume under its own placement.
-  Moved {
-    /// The member it moved to.
-    to: u64,
-  },
 }

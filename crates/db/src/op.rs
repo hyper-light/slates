@@ -570,23 +570,6 @@ pub enum Op {
     /// The records, in crossing order.
     records: Vec<AuditRecord>,
   },
-  /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
-  /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
-  /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
-  /// close them. Appended (2026-11-18).
-  VolumeReleased {
-    /// The volume.
-    id: VolumeId,
-  },
-  /// A snapshot was captured as a complete immutable base (§4.15 `capture_base`, A-291): its tree holds every name,
-  /// byte and attribute, none read from the host directory, so a clone of it is made with no base directory. Kept while
-  /// the snapshot and its volume are. Appended (2026-11-18).
-  BaseCaptured {
-    /// The volume.
-    volume: VolumeId,
-    /// The snapshot.
-    snapshot: crate::catalog::SnapshotId,
-  },
 }
 
 impl Op {
@@ -672,8 +655,6 @@ impl Op {
       Op::AuditOwed { .. } => "audit_owed",
       Op::AuditDelivered { .. } => "audit_delivered",
       Op::AuditBatchAppended { .. } => "audit_batch_appended",
-      Op::VolumeReleased { .. } => "volume_released",
-      Op::BaseCaptured { .. } => "base_captured",
     }
   }
 }

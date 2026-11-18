@@ -51,12 +51,6 @@ pub enum DbError {
     /// Which table.
     table: &'static str,
   },
-  /// A volume released to the member it moved to (A-291) still has attachment records: it leaves only whole, so none
-  /// is left naming a volume this node no longer holds. Never entered in the log.
-  Attached {
-    /// How many attachment records it has.
-    attachments: u32,
-  },
   /// An NFSv4 instance advance named an instance at or below the current one (§4.6 A-37): ids minted
   /// under it could repeat ids an earlier life minted.
   NfsInstanceRegressed {
@@ -113,9 +107,6 @@ impl fmt::Display for DbError {
       Self::LogFull { needed, free } => write!(f, "log full: {needed} bytes needed, {free} free"),
       Self::Corrupt { seq, reason } => write!(f, "record {seq} corrupt: {reason}"),
       Self::Capacity { table } => write!(f, "{table} at capacity"),
-      Self::Attached { attachments } => {
-        write!(f, "the volume still has {attachments} attachment records")
-      }
       Self::NfsInstanceRegressed { current } => {
         write!(f, "NFSv4 instance must advance past {current}")
       }
