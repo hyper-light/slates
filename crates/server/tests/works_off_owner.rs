@@ -69,6 +69,9 @@ fn submitted(client: &mut Client, work: VolumeId) -> String {
   match client.submit(work) {
     Ok(Submitted::Accepted(version)) => format!("accepted {version}"),
     Ok(Submitted::Conflict(windows)) => format!("conflict {windows:?}"),
+    Ok(Submitted::ApprovalRequired { identity, paths }) => {
+      format!("approval of {identity:?} over {paths} paths required")
+    }
     Err(error) => format!("refused {error:?}"),
   }
 }
