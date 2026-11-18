@@ -1,5 +1,26 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
+> `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
+> failed on every CI run of the ubuntu-latest gates job since main moved to Ubuntu 26.04 (from run 43146258837 on
+> 2026-11-12 to 44210937388 on 2026-11-18; diag-slabs-58 200 of 200 alone), and was ledgered as a rare race. It is
+> not a race: 26.04's `/usr/bin/mkdir` is uutils coreutils 0.10.0, which is told `EIO` by `mkdir(2)` and exits 0
+> because the refused directory exists in the volume (strace in diag-slabs-61, run 43146145846). The owner refused the
+> right request (`MkDir`) and the kernel answered `EIO`. The test now makes the directory by `mkdir(2)` and holds the
+> answer to `EIO`. Swept: no other test judges a coreutils program's refusal through a mount (the rest redirect in the
+> shell, `cat` a missing path, or run util-linux's `fallocate`). **Consequence, open:** the job runs `cargo test
+> --workspace`, which stops at the first failing binary, so no suite after `slates-bridge-fuse`'s `owner_turn` ran on
+> that lane from 2026-11-12 until this fix; the first run with it is the stack that lands it. Record:
+> `docs/bugs/2026-11-18-owner-turns-mkdir-asked-the-program-not-the-kernel.md`.
+
+> **KIND on Ubuntu 26.04 ran out of inotify instances: fixed in the lane (2026-11-09).** The KIND lane failed at
+> formation on `ubuntu-latest` once it became 26.04 (`peers_probed=0`), and passed on 24.04. The image keeps the
+> kernel's `fs.inotify.max_user_instances = 128` (24.04's set 1280), which kind's six privileged nodes share as the
+> host's root; kube-proxy crash-looped on 4 of 5 workers, so pods there never reached the cluster's DNS. Raised to
+> kind's documented 512 (and 524288 watches), 6 of 6 kube-proxies ran with 0 restarts (diag-release-14). The job
+> raises them before the lane; the image stays 26.04. Record:
+> `docs/bugs/2026-11-09-kind-on-ubuntu-26-04-ran-out-of-inotify-instances.md`.
+
 > **Device nodes are kept as metadata (2026-11-17, §4.5, §4.6, §4.15, §4.16; A-294, Ada's option (c) for A-26 of
 > 2026-11-18; replaces A-268's `EPERM`).** A block or character device node is now an inode whose body is its number,
 > kept through the volume, its recovery image (28) and delta (11), archives (manifest minor 4), merges and ext4 images,
@@ -267,7 +288,11 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
+> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
+> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
+> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
+> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
@@ -15583,11 +15608,27 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
         and the failing run's daemon reported its shard starved 1.6 s (`a heartbeat came 1626 ms after the last`).
         Arm B's one stall of the stale-handle test's attackers (0 attempts in its 2 s window, 1 of 14 runs; arm A 0 of
         13) has the same look, in a test where arm B does nothing but look its tracker up.
+        **Not reproduced on 1c49c33f (fs-server, 2026-11-11), closed by 4ae3f84b:** since 2026-11-06 a forwarded call
+        waits for its owner in the owner's own time (`xshard::task_in_shard_time`, A-65's rule), so a starved owner's
+        reply is heard and only a wedged one's is given up. 20 of 20 runs of
+        `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` passed beside 36 spinners in a 2-CPU unit
+        at load 17–201 on adacachy (at the recorded 1 in 5, twenty clean runs come by chance about 1% of the time).
       - Main's, found sweeping for the connection end's siblings: a READDIR of the host root asks every shard for its
         entries (`nfs.rs` `gather_all_entries`), though the capability it presents authorizes one volume, whose owner its
-        id names (D-14); a client holding a capability can make every shard answer as often as it likes.
+        id names (D-14); a client holding a capability can make every shard answer as often as it likes. **Fixed
+        2026-11-11 (fs-server):** the listing asks the one shard whose partition holds the capability's attachment (its
+        id's high bits), the only one that can list anything under it, and none without a capability. Red first:
+        `a_host_root_listing_asks_only_the_shard_its_capability_names` (`crates/server/tests/nfs_hostile.rs`), the host
+        root listed under a control-shard volume's capability while the other shard was wedged, answered `SYSTEM_ERR`
+        after 1.04 s; served after. Sibling, open: a dropped NFSv4 client's or destroyed session's purge
+        (`v4::compound::purge_owed`) is sent to every owner, so a client that churns sessions makes every shard answer;
+        the connection end's footprint (A-192) is the shape a fix would take.
       - Seen in both arms, not this change's: a WRITE at the last offsets of the range is answered
-        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_FBIG`.
+        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_FBIG`. **Fixed 2026-11-11 (fs-server):** NFSv3's statuses lacked
+        `NFS3ERR_FBIG` (27), so the volume's `FileTooLarge` fell to the catch-all; it now maps to `NFS3ERR_FBIG`, and to
+        `NFS4ERR_FBIG` on NFSv4. Red first: `a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives` now holds
+        the overflowing WRITE to 27 (it answered 10006). Siblings, open: `TooManyLinks` and `CrossVolumeMove` also fall to
+        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_MLINK` (31) and `NFS3ERR_XDEV` (18).
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
   it ended the connection, and the kubelet's `hard` mount retried it for good: through a kubelet-mounted export a file
