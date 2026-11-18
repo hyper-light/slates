@@ -122,6 +122,7 @@ Op 71 WorkSubmitSettled
 Op 72 WorkFloorDropped
 Op 73 VolumeSignersSet
 Op 74 VolumeRelinquished
+Op 75 GreenAdopted
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid

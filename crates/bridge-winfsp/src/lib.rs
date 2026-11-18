@@ -44,6 +44,9 @@ use slates_vfs::inode::Kind;
 mod ffi;
 #[cfg(windows)]
 pub mod host;
+// The account a drive is served for, as every object's owner and group: a SID's text from its token bytes and the
+// drive's one descriptor (A-350). Pure, so it is tested on every host.
+pub mod account;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 #[cfg(windows)]

@@ -51,7 +51,11 @@ use slates_vfs::inode::Kind;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::GetSecurityDescriptorLength;
+use windows_sys::Win32::Security::{
+  GetSecurityDescriptorLength, GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+  TokenPrimaryGroup, TokenUser,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::ffi::{
   self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
@@ -80,7 +84,8 @@ pub enum WinFspError {
     /// Its `NTSTATUS`.
     status: i32,
   },
-  /// The reference security descriptor could not be built (`ConvertStringSecurityDescriptor…`).
+  /// The drive's security descriptor could not be built: the daemon's token or its SIDs could not be read, or the
+  /// descriptor's SDDL was refused (`ConvertStringSecurityDescriptor…`; A-350).
   SecurityDescriptor,
   /// The mount thread could not be started, or ended without reporting.
   MountThread,
@@ -196,12 +201,6 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 /// Format: the maximum file-name component length the mount reports (`MaxComponentLength`) — 255, the
 /// NTFS/`MAX_PATH` component limit, matching the volume core's own 255-byte name cap (§4.5).
 const MAX_COMPONENT_LENGTH: u16 = 255;
-/// Format: an "allow Everyone full access" security descriptor in SDDL — owner and group the built-in
-/// Administrators, a protected DACL granting `FA` (full access) to `WD` (Everyone). WinFsp requires a
-/// valid descriptor for its access checks; the volume's own rights are the attachment's, enforced by the
-/// shard on every request, so one fixed descriptor serves every object, as WinFsp's `memfs` sample starts
-/// from a single SDDL string.
-const EVERYONE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;WD)";
 /// Format: the cleanup flags that say the handle changed the file or asked for its deletion (`winfsp.h`
 /// `FspCleanupDelete`, `SetAllocationSize`, `SetArchiveBit`, `SetLastWriteTime`, `SetChangeTime`): such a close
 /// publishes before its reply, as a FUSE close's `flush` does. A close that only read (`SetLastAccessTime` alone, or
@@ -1406,12 +1405,14 @@ fn read_all_entries(
 // --------------------------------------------------------------------- the WinFsp callback handler
 
 /// The handler stored in the file system's `UserContext`: the channel to the mount's task, the waker of that task, and
-/// the one reference security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte
-/// vector), so the owned receiver reaches it soundly. That single caller needs no DLL operation guard.
+/// the one security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte vector), so
+/// the owned receiver reaches it soundly. That single caller needs no DLL operation guard.
 struct Handler {
   requests: SyncSender<Request>,
   wake: Waker,
-  /// A self-relative security descriptor as raw bytes (built once from [`EVERYONE_SDDL`]).
+  /// The drive's one descriptor as self-relative bytes, built once at the mount ([`drive_security_descriptor`]): the
+  /// account the drive is served for as owner, its primary group as group, and the access list that lets the shard
+  /// decide (A-350).
   security_descriptor: Vec<u8>,
 }
 
@@ -1453,9 +1454,9 @@ pub(crate) struct Confirming(Receiver<Reply>);
 /// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
 /// the worker's next request (audit step 7, cut (c)). The answer is taken by [`confirmed_open`] before the journal
 /// overwrites the open's settled response. A request answered without the shard can come next and would otherwise find
-/// it unapplied: the host registers no GetSecurity callback (`ffi.rs`, `get_security: None`), so WinFsp's own
-/// QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`),
-/// and QueryEa and QueryStreamInformation likewise (`fsop.c:1208`, `1478`).
+/// it unapplied: the host's GetSecurity answers QuerySecurity from the mount's one descriptor on the receiving thread
+/// ([`get_security`], A-350), and WinFsp's own QueryEa and QueryStreamInformation answer without calling the host at
+/// all (WinFsp v2.1 `src/dll/fsop.c:1208`, `1478`).
 pub(crate) fn post_confirm(
   requests: &SyncSender<Request>,
   wake: &Waker,
@@ -1659,6 +1660,24 @@ extern "C" fn get_security_by_name(
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
+}
+
+/// `GetSecurity` (WinFsp's `QuerySecurity`): the mount's one descriptor, as `get_security_by_name` reports it, copied on
+/// the receiving thread without the shard, since every object reports the same one (A-350). Without this callback
+/// WinFsp's DLL refused every query `STATUS_INVALID_DEVICE_REQUEST` (v2.1 `src/dll/fsop.c` 1444-1445), and Windows' I/O
+/// manager answered such a refusal with its world descriptor, owner Everyone (S-1-1-0), so git refused every repository
+/// on the drive as owned by someone else (CI run 44271637767). Answered here, the kernel driver also keeps the
+/// descriptor with the open file for `SecurityTimeout`, the mount's `FileInfoTimeout`.
+extern "C" fn get_security(
+  fs: *mut FileSystem,
+  _context: Pvoid,
+  security_descriptor: PSecurityDescriptor,
+  p_sd_size: *mut usize,
+) -> Ntstatus {
+  // SAFETY: our file system, for the life of the call.
+  let handler = unsafe { handler(fs) };
+  // SAFETY: `p_sd_size`/`security_descriptor` follow WinFsp's in/out size protocol.
+  unsafe { copy_security_descriptor(handler, security_descriptor, p_sd_size) }
 }
 
 /// WinFsp's in/out reparse buffer: the bytes it offers and the length to report back; `None` when it asks only
@@ -2368,6 +2387,7 @@ static INTERFACE: Interface = Interface {
   set_file_size: Some(set_file_size),
   can_delete: Some(can_delete),
   rename: Some(rename),
+  get_security: Some(get_security),
   read_directory: Some(read_directory),
   resolve_reparse_points: Some(resolve_reparse_points),
   get_reparse_point: Some(get_reparse_point),
@@ -2436,7 +2456,7 @@ impl Mounted {
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
     let purge_marker = crate::purge_token::Marker::fresh()?;
-    let security_descriptor = everyone_security_descriptor()?;
+    let security_descriptor = drive_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
       wake,
@@ -3014,9 +3034,65 @@ fn run_mount(
   report(Outcome::Stopped);
 }
 
-/// Builds the "allow Everyone" reference security descriptor as self-relative bytes, from [`EVERYONE_SDDL`].
-fn everyone_security_descriptor() -> Result<Vec<u8>, WinFspError> {
-  let sddl = wide_nul(EVERYONE_SDDL);
+/// The drive's one security descriptor, as self-relative bytes: the account this daemon runs as, which every client of
+/// a Windows daemon is (its rendezvous admits that user's SID alone), as owner, the account's primary group as group,
+/// and the access list that lets the shard decide (`crate::account`, A-350). NTFS gives a file the account makes the
+/// same owner and group, unelevated. Refused `SecurityDescriptor` when the token or its SIDs cannot be read.
+fn drive_security_descriptor() -> Result<Vec<u8>, WinFspError> {
+  let mut token = std::ptr::null_mut();
+  // SAFETY: this process's pseudo-handle, which needs no closing, and an out-pointer to a local; the token is owned
+  // below.
+  if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+    || token.is_null()
+  {
+    return Err(WinFspError::SecurityDescriptor);
+  }
+  // SAFETY: the token handle just opened, owned here alone and closed on drop.
+  let token = unsafe { OwnedHandle::from_raw_handle(token) };
+  let sid = |class| {
+    token_information(&token, class)
+      .and_then(|buffer| crate::account::token_sid_text(&buffer))
+      .ok_or(WinFspError::SecurityDescriptor)
+  };
+  let sddl = crate::account::drive_sddl(&sid(TokenUser)?, &sid(TokenPrimaryGroup)?);
+  security_descriptor_of(&sddl)
+}
+
+/// The `class` information of `token`, in a buffer aligned for the token structures (each SID they point at lies in
+/// the same buffer, after them); `None` when the token refuses either query.
+fn token_information(token: &OwnedHandle, class: TOKEN_INFORMATION_CLASS) -> Option<Vec<u64>> {
+  let mut needed = 0u32;
+  // SAFETY: a size query with no buffer: it fails by design and writes the size it needs to a local.
+  unsafe {
+    GetTokenInformation(
+      token.as_raw_handle(),
+      class,
+      std::ptr::null_mut(),
+      0,
+      &mut needed,
+    )
+  };
+  let words = usize::try_from(needed).ok()?.div_ceil(size_of::<u64>());
+  if words == 0 {
+    return None;
+  }
+  let mut buffer = vec![0u64; words];
+  // SAFETY: `buffer` holds at least `needed` bytes, aligned for every token structure; the call writes no more.
+  let read = unsafe {
+    GetTokenInformation(
+      token.as_raw_handle(),
+      class,
+      buffer.as_mut_ptr().cast(),
+      needed,
+      &mut needed,
+    )
+  };
+  (read != 0).then_some(buffer)
+}
+
+/// A descriptor's self-relative bytes from its SDDL.
+fn security_descriptor_of(sddl: &str) -> Result<Vec<u8>, WinFspError> {
+  let sddl = wide_nul(sddl);
   let mut sd: PSecurityDescriptor = std::ptr::null_mut();
   let mut size: u32 = 0;
   // SAFETY: `sddl` is a NUL-terminated SDDL string; the call allocates a self-relative SD into `sd`
