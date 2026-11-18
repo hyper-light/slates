@@ -11,11 +11,15 @@
 >   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields).
 > - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
 >   seeds from kiln's runner directory); kiln's relocation of an
->   agent with its volume (detach, move, attach on the target); an overlay's move (its base stays on its source host,
->   §4.10 "Overlay volumes in a fleet": refused `NotPlain` until a captured base (§4.15 `capture_base`, the design's
->   preferred delta-plus-base form) or a remote base service exists; kiln's workspaces are overlays); the automatic
->   migration by the origin of the last N writes (AC-8.16's other half); a move carrying snapshots other than the
->   head; a multi-runner test with injected faults.
+>   agent with its volume (detach, move, attach on the target); `capture_base` (§4.15) and the move of a clone of a
+>   captured base, the form a kiln workspace takes (decided below; until then a clone is refused `Lineage`); the
+>   automatic migration by the origin of the last N writes (AC-8.16's other half); a move carrying snapshots other
+>   than the head; a multi-runner test with injected faults.
+> - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
+>   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
+>   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is
+>   a quiesced source) and gives each agent an O(1) clone, which moves like a plain volume and survives its runner's
+>   loss, the design's preferred delta-plus-base form. Kiln's W3 changes shape (g263, g264 told).
 > - **Decided (Ada, 2026-11-18):** the persistent disks Hex gives microVMs stay on their own machine (Hex's D281,
 >   "volumes stay per machine", stands); only slates workspaces replicate across kiln runners, so the moves and copies
 >   this entry owes are of slates volumes alone.

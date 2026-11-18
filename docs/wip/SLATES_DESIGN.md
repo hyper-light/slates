@@ -21595,5 +21595,17 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   `a_move_completes_when_its_old_owner_dies_at_the_switch` and
   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
   (`crates/api/tests/api.rs`).
-- **Owed.** The automatic migration by the origin of the last N writes (AC-8.16's other half); an overlay's move; a
-  move that carries snapshots other than the head; the multi-runner test with injected faults (GAPS).
+- **Decided (the supervisor, 2026-11-18, the design's own preferred form, so no ruling of Ada's was needed): how a kiln
+  agent's workspace moves.** Kiln made each agent an unpinned overlay of its runner's repository folder (kiln's
+  `docs/agentic.md` W3), and an overlay's base stays on its source host (§4.10 "Overlay volumes in a fleet"), so an
+  overlay keeps its typed refusal (`MoveRefusal::NotPlain`). The workspace instead becomes a clone of a captured base:
+  kiln captures the repository's base once into a complete immutable snapshot (§4.15 `capture_base`; a git commit's
+  tree, checked out where nothing else writes, is a quiesced source), and each agent gets an O(1) clone of it, which
+  moves like a plain volume and survives its runner's loss ("the preferred delta-plus-base design", §4.10). Rejected:
+  a remote base service (the source runner must stay up; asynchronous base reads in the volume core) and re-binding a
+  moved overlay to the target's own copy of the folder (an equal path on another host is not evidence of an equal
+  source).
+- **Owed.** `capture_base` and the move of a clone of a captured base (its lineage is refused `MoveRefusal::Lineage`
+  until then); kiln's switch from per-agent overlays to clones of a captured base; the automatic migration by the
+  origin of the last N writes (AC-8.16's other half); a move that carries snapshots other than the head; the
+  multi-runner test with injected faults (GAPS).
