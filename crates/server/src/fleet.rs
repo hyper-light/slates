@@ -6630,9 +6630,10 @@ const PAIR_ACCEPTED: u8 = 1;
 /// id and the asker's recipient public key ([`lineage_request`]), answered with the key wrapped to that recipient, or
 /// empty when refused (counted where it was refused).
 /// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable. After the work routes' (25,
-/// `work_route::STREAM`) and the volume moves' (26, g267's `MOVE_STREAM`, in flight): a kind another stream takes is
-/// served as that stream, so its request reaches no lineage handler at all (the first run of the window test, every
-/// ask unanswered while the work-route arm took kind 25).
+/// `work_route::STREAM`) and the live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as
+/// that stream, so its request reaches no lineage handler at all (the first run of the window test, every ask
+/// unanswered while the work-route arm took kind 25). Held distinct by `every_request_kind_the_record_session_
+/// dispatches_is_its_own`.
 const LINEAGE_STREAM: u64 = 27;
 
 /// Format: the refusal name counting council requests left unanswered because their sender is held dead
@@ -9590,7 +9591,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 25] = [
+    let kinds: [(&str, u64); 26] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -9624,6 +9625,7 @@ mod request_kind_tests {
       ("death", super::DEATH_STREAM),
       ("work route", crate::work_route::STREAM),
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
+      ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
     ];
     let mut shared = Vec::new();
