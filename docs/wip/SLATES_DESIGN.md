@@ -8104,7 +8104,9 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > its workspace volume by `Instance::move_volume` to the target's member id (its runner says the member its daemon
 > serves as at every start, `Instance::member`), following `MoveProgress` until `Moved` with no clock of its own (the
 > move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
-> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out).
+> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out). Its
+> workspaces on the fleet's runners are clones of the folder's captured base (A-463), plain volumes the move takes; one
+> capture serves the agents started over an unchanged folder, and a base goes with its last clone.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -32423,6 +32425,49 @@ names its file, `holds_unsynced_metadata`).
   --lib` 35 of 35, the writer ignored; `slates-vfs --lib -- host::sim captured` 3 of 3. Red-checked once: with the
   barrier given the batch's temporaries alone, the same 3 failed. `cargo fmt` laid the lines out. Filed for main: the
   crash oracle, whose metadata entries now take a barrier.
+
+### A-463 — A consumer's workspace is a clone of its folder's captured base where it must move (2026-11-18, g267, kiln goal 95101ef3 K5; §4.15 `capture_base`, §4.10 "Overlay volumes in a fleet", A-291, A-424, A-450)
+
+- **What was there.** A-291 decided that a kiln agent's workspace moves as a clone of a captured base and built the
+  capture and the clone's move; A-424 lands such a clone against its capture; A-450 drove the move from kiln. But kiln
+  still made every workspace an overlay of its folder, so every move of one was refused `NotPlain` (§4.10 "Overlay
+  volumes in a fleet": an overlay's base stays on its source host).
+- **The rule.** A consumer whose workspaces must move makes each one by capture-then-clone, never by a copy through a
+  disk: an overlay laid over the folder, `capture_base` on it (a `Retry` with `ChangedWhileRead` asked again after the
+  pause it carries, a bounded number of times), and `VolumeSpec::clone_of` that captured snapshot per agent: a plain
+  volume with no base plane, which `move_volume` takes. One capture serves every agent started over the folder while the
+  folder is as captured, which the consumer learns from the base overlay's drift (every entry the capture witnessed
+  re-checked, none drifted or unverified); a changed folder gets a new capture. The clone's drift is read from its base
+  (the clone reads no folder), and its landing is A-424's, judged by content against the capture. A base goes with its
+  last clone: once the clone's destroy has finished (`status` answers `NotFound` rather than `Unusable::Destroying`,
+  since the clone's pin on the captured snapshot is given back at the destroy's end), `destroy_snapshot` of the
+  capture, refused `Busy` while another clone pins it, and then `destroy` of the base. A clone that moved keeps no
+  lineage on its new owner and lands there as a scratch volume until stage 2 (A-424), so a consumer refuses its landing
+  until then. A capture reads the folder whole, ignored build output included, into memory, so a consumer whose
+  workspaces never move keeps overlays, which read only what an agent uses.
+- **Kiln's side** (kiln main, `workspace::slates::provision`, `capture`, `base_for`, `release_base`, `arrived`, `landing`): a
+  runner the server's `[slates_fleet]` lists makes captured clones, asked at each workspace's start; any other machine
+  keeps overlays. A workspace that came with its agent from another runner is marked moved and written back to no folder.
+- **Tests.** Kiln's `k5_a_fleet_workspace_is_a_captured_clone_whose_review_and_landing_are_the_agents_changes_since_its_capture`
+  (`crates/kiln/src/workspace/captured_tests.rs`, against a real instance run by a kiln executable, `KILN_TEST_KILN`,
+  no mount: the clone has no base plane and an overlay has one; two workspaces over the unchanged folder share one
+  capture and one after an outsider's edit has a new one reading it; the review is the agent's three changes alone; the
+  landing writes them under kiln's launcher authority and passes the outsider's edit; a base goes with its last clone),
+  and the unit tests `k5_a_workspace_from_another_machine_is_marked_moved_and_a_local_hand_over_is_not`,
+  `k5_a_moved_workspace_is_written_back_nowhere_until_slates_carries_its_capture`,
+  `k5_a_captured_clones_drift_is_read_from_its_base`, `k5_a_capture_is_shared_only_while_its_folder_is_as_captured` and
+  `k5_a_workspace_record_from_before_reads_and_writes_as_it_did`. On the Mac Studio (2026-11-18, kiln r407, load 9.5
+  to 16.8, debug), `cargo test --locked -p kiln --lib -- k5_ k4_ k3_ w1_kiln_speaks bindings_are_current
+  w3_an_archived` with `KILN_TEST_KILN` set passed 19 of 19 in 13.8 s, the real-instance test among them. Red-checked
+  once, six mutations at once (an overlay made where a capture was asked, a moved workspace's landing let through, the
+  drift read from the clone, a capture shared on its drifted entries alone, a workspace from another machine left
+  unmarked, a record from before written with a null base): 6 of 6 failed, each at its own assertion. No library change
+  was needed.
+- **Owed.** A capture of what the folder's version control tracks alone; admission reserving a capture's cost ahead
+  (§4.15's status); the advance and stage 2 (A-424's owed list); the live move of a captured clone between two Mac
+  runners and the bare-metal run on a captured clone's mount, filed for main.
+
+Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
 
 ### A-485 — Every held copy follows its object's move as the install's walk reaches it, whatever its route (2026-11-18, goal 85 bug 1, g079; §4.8 "Promotion and takeover", "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398)
 Applied in the same change to: §4.8 "Promotion and takeover" (A-398's status), GAPS (the move entry's target-dies

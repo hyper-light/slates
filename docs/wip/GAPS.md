@@ -908,10 +908,14 @@
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
->   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
->   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
->   move across two Mac runners is filed for main.
-> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
+>   target's runner mounting the moved volume under its own place once its new owner serves it. The live move across
+>   two Mac runners is filed for main.
+> - **Kiln's workspaces as captured clones (A-463, kiln K5, 2026-11-18):** on a runner the server's `[slates_fleet]`
+>   lists, each workspace is an O(1) clone of its folder's captured base (one capture shared while the folder is as
+>   captured, a base gone with its last clone), so it moves; its review and landing are A-424's; a workspace that moved
+>   is landed nowhere until stage 2. Machines outside the fleet keep overlays. Held by kiln's real-instance test
+>   (`captured_tests.rs`); the live move of a captured clone and the bare-metal run on its mount are filed for main.
+> - **Owed, in order:** the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
