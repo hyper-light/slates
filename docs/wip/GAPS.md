@@ -753,7 +753,10 @@
 > 63 cases of `chown/00.t` unlisted (`expected 0,0, got 0,20`): an object root makes takes the group of the directory
 > the run starts in under BSD's rule, and that directory was the harness's own user's (staff). pjdfstest assumes root's
 > directory, as the file system under test's is, so a root run now starts in a directory handed to root, owner and
-> group 0 (A-328's entry); (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> group 0 (A-328's entry): diagnostics run 44329324901 ran pjdfstest as root there with no unlisted failure (8,569 of
+> 8,686 passed, the 117 listed failed), and the macOS records are re-recorded, pjdfstest's from that run (the unprivileged
+> run of 2026-09-16 until then) and the workloads' from 44271637767 (all twelve identical); (2) ~~the Windows WinFsp
+> roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~

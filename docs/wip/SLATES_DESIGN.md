@@ -24632,7 +24632,10 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and its record's command says so. Linux's System V rule gave root's objects group 0 whatever the directory's group,
   so nothing changes there, and no listed case is about a group. Test:
   `what_root_makes_where_a_root_run_starts_is_in_group_0` (the same file), run by CI's macOS gates job, whose runner
-  has passwordless `sudo`; it skips loudly without it.
+  has passwordless `sudo`; it skips loudly without it. Green on macos-latest in diagnostics run 44329324901, and red
+  there with the group left out of the hand-over (`chown 0`): root's directory took group 20, its start's. In the same
+  run pjdfstest as root over the NFS loopback mount failed only its 117 listed cases (8,569 of 8,686 passed;
+  `chown/00.t` its 8 listed), and its record replaces the unprivileged run of 2026-09-16.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
