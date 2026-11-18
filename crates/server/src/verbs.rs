@@ -5514,7 +5514,9 @@ async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeI
   let bound = crate::state::with_state(|s| crate::told::bound_ns(s))
     .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
-    let ended = crate::xshard::task_within(
+    // Waited in the shard's own time (A-435): the bound is for the kernels the shard waits on, so a shard busy with
+    // its other work, or starved, is waited for rather than counted overdue; one idle past the bound is the kernels'.
+    let ended = crate::xshard::task_in_shard_time(
       origin,
       shard,
       move || crate::fuse::revoked_mounts_ended(mounts),

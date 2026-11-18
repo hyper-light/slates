@@ -3687,9 +3687,18 @@
 >   the claim reconciliation and re-admission (the record period's, before its materializations), and the live
 >   dispatch's wait (its lanes bounded by the live budget, its answer unread); and a work's verb held for its quorum
 >   commit or its route (A-434, goal g255: the owner lease's bound, about 0.9 s; now the failover delay, a held reply's
->   total, A-354/A-375, `work_home::park_bound_ns`). Owed in class A: ten of the 25 `xshard::call_within` and
->   `task_within` sites on the wall (`moves.rs` 2, `daemon.rs`, `verbs.rs`, `takeover.rs`, `shards_route.rs`,
->   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Class B (the
+>   total, A-354/A-375, `work_home::park_bound_ns`). Then an adopted move's seal, a takeover's give-up record and a
+>   revocation's wait for its fenced FUSE mounts (A-435, 2026-11-18, g251: the seal is not idempotent, so an answer
+>   dropped at a period's end took a second seal the next period and left the adopted snapshot behind; the give-up is
+>   one attempt, so a busy owner shard left its objects unrecorded for good;
+>   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
+>   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
+>   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
+>   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Owed in
+>   class A: five of the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`,
+>   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here:
+>   an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on the
+>   owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`) and the forward lane's stall (2026-11-18, A-315,
