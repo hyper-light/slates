@@ -5780,11 +5780,12 @@ enum DirectContact {
   /// This node is not a member of the council configuration it holds (A-331): a fresh member whose first fetch was
   /// answered before the council admitted it, or a member retired while it was away. It is no peer's neighbour and
   /// holds nothing under that configuration, and the voters it knows are its join donor's, which may be the member it
-  /// replaced alone. Judged by the member rule it kept no peer at all: every record link idled, its learner fetched
-  /// over no session, and it never learned the configuration that admits it (live_chaos's fresh-member flow, 2 of 48
-  /// runs at one CPU; diag-raft-chaos-ab-68b-2: council at version 8, in contact with none of its four live members,
-  /// `fleet.learner.no_session` 113 in 48 s). Every member it holds alive is contacted, as while forming, until it
-  /// holds a configuration that names it.
+  /// replaced alone. Judged by the member rule a fresh member kept no peer at all: every record link idled, its learner
+  /// fetched over no session, and it never learned the configuration that admits it (live_chaos's fresh-member flow, 2
+  /// of 48 runs at one CPU; diag-raft-chaos-ab-68b-2: council at version 8, in contact with none of its four live
+  /// members, `fleet.learner.no_session` 113 in 48 s); a retired member kept only the old neighbours of the placement it
+  /// last installed. Every member it holds alive is contacted, as while forming, until it holds a configuration that
+  /// names it.
   Unadmitted,
   /// Believed dead, but only as a manifest **seed** this node has not yet replaced by a learned id: the seed
   /// was never a live incarnation, so its death (folded where a neighbour learned the peer's real id, and

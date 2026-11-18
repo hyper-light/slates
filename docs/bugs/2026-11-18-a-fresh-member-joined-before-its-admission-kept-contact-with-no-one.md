@@ -57,9 +57,11 @@ naming only the member it replaced.
 
 ## Impact
 
-A fresh member, and a member retired while it was away, could stay out of the fleet for as long as it ran: no record
-session, so no fetch, no report and no part in placement, while the others had admitted it and placed content on it.
-The formation wait of every fleet test that replaces a node could time out on it.
+A fresh member whose join was answered before its admission, and that knew no live voter, stayed out of the fleet for
+as long as it ran: no record session, so no fetch, no report and no part in placement, while the others had admitted it
+and could place content on it. The formation wait of every fleet test that replaces a node could time out on it. A
+member retired while away was not stranded this way, since it keeps the neighbours of the placement it last installed and
+can fetch from them; A-331 widens its contact too, to every member it holds alive, until it is admitted again.
 
 ## Exact edits
 

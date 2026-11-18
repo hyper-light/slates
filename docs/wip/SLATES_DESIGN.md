@@ -5251,11 +5251,11 @@ A learner's reports to the council go to the same members, and the leader propos
 voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
-council admitted it, or a member retired while it was away. Judged by the member rule it kept no peer at all: it is no
-one's neighbour, holds nothing, and may know as a voter only the member it replaced, since a learner's join state names
-the voters of its own join. So it held no record session and its learner, which fetches over those, never learned the
-configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of main's first
-gated runs, 2026-11-18).
+council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
+all: it is no one's neighbour, holds nothing, and may know as a voter only the member it replaced, since a learner's join
+state names the voters of its own join. So it held no record session and its learner, which fetches over those, never
+learned the configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of
+main's first gated runs, 2026-11-18). A retired member kept only its old neighbours, by the placement it last installed.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
