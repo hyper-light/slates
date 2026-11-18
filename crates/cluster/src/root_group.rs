@@ -380,6 +380,30 @@ impl RootGroup {
 
   /// The voting set after the membership transition and its log have committed. During
   /// a joint change this is absent: observing application membership alone cannot prove admission.
+  /// DIAG: the root group's Raft state, one line.
+  pub fn debug_state(&self) -> String {
+    format!(
+      "role={:?} term={} voters={:?} joint={} commit={} last_log={} snapshot={} regions={:?} v{} learned={:?} tail={}",
+      self.raft.role(),
+      self.raft.term(),
+      self.raft.all_voters(),
+      self.raft.in_joint_configuration(),
+      self.raft.commit_index(),
+      self.raft.last_log_index(),
+      self.raft.snapshot_index(),
+      self.configuration().regions,
+      self.configuration().version,
+      self.learned.as_ref().map(|learned| learned.version),
+      self
+        .raft
+        .uncommitted_entries()
+        .iter()
+        .map(|entry| format!("t{} {:?}", entry.term, entry.config))
+        .collect::<Vec<_>>()
+        .join(" | ")
+    )
+  }
+
   pub fn committed_voters(&self) -> Option<Vec<HostId>> {
     (self.initialized() && self.caught_up() && !self.raft.in_joint_configuration())
       .then(|| self.raft.all_voters())

@@ -3291,7 +3291,7 @@ fn settle_initial_consensus(
       .map(|daemon| format!(
         "host={:?} ready={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
          record_links(host, out)={:?} record_dials={:?} pending_discovery={:?} demux={:?} council_state={:?} \
-         refusals={:?}",
+         root_state={:?} refusals={:?}",
         daemon.member_identity(),
         daemon.consensus_ready(),
         daemon.council_members(),
@@ -3306,6 +3306,7 @@ fn settle_initial_consensus(
         daemon.fleet_pending_discovery(),
         daemon.fleet_demux_counters(),
         daemon.council_debug(),
+        daemon.root_debug(),
         daemon.fleet_refusals(),
       ))
       .collect::<Vec<_>>()

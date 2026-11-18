@@ -4,7 +4,8 @@ name: DIAG g225 three-node formations looped at one CPU, Raft log diagnostics (n
 # not commit" (settle_initial_consensus; the integrator's diag-green-44269355181 arm64 run 7: the leader at voters [a],
 # last log 6, commit 6, while a follower holds a joint entry at index 7 the leader lacks, in the same term). Two
 # three-node fleet tests that settle the initial consensus, each alone in its process, pinned with its daemons to CPU 0
-# beside two busy loops there, looped. This tree logs every Raft truncation, restore, joint-change start, election win
+# beside two busy loops there, looped; and one two-region formation (g230's Windows report: the root group's voters
+# moved to the regions' representatives, which never reported a committed root voter set). This tree logs every Raft truncation, restore, joint-change start, election win
 # and leader step-down, and the council's debug state carries its uncommitted tail; a failure keeps every DIAG line and
 # the formation report.
 
@@ -40,7 +41,8 @@ jobs:
           echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), $(git rev-parse --short=9 HEAD), sample ${{ matrix.sample }}" > $R
           BIN=$(ls -t target/debug/deps/fleet-* | grep -v '\.d$' | head -1)
           TESTS="three_daemons_elect_one_stable_council_leader_over_the_transport
-          a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment"
+          a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment
+          a_root_learner_fetches_the_committed_region_membership_over_the_transport"
           deadline=$(( $(date +%s) + 150 * 60 ))
           round=0
           while [ $(date +%s) -lt $deadline ]; do

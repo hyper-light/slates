@@ -2012,6 +2012,11 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.root_timing)
   }
 
+  /// DIAG: the root group's Raft state, one line.
+  pub fn root_debug(&self) -> Result<String, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.root.debug_state())
+  }
+
   /// A diagnostic dump of this daemon's regional council Raft and applied state
   /// ([`slates_cluster::config_group::RegionalCouncil::debug_state`]) — the committed configuration-change
   /// log with terms, the voter set, the joint-change flag and the commit indexes — for diagnosing a stalled
