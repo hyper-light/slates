@@ -6375,6 +6375,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
 > up).
 >
+> **The period in slices (2026-11-17, g230).** The record period's live work on a shard (following each volume's
+> candidates, answering writers whose condition is met, owing or shipping a whole record or image, and re-sending what
+> each holder lacks) visited every live volume the shard owned in one turn, so its cost grew with the volumes and every
+> client of the shard waited behind it. It now runs a slice of about the shard's step quantum a turn
+> (`live_ship::period_slice`, the quantum a destroy's or an archive's slice is cut by), resuming after the last volume
+> visited; the first volume of a slice is always visited, so the period always ends. Held by
+> `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved` (`crates/server/tests/fleet.rs`: 24
+> live volumes, the quantum cut to one volume a slice, every log durable at its head after three periods). Owed
+> (measurement): the owner shard's longest step with thousands of live volumes, before and after.
+>
 > **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
 > a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
 > held to the wire bytes of the whole state an install would send (`slates_db::live::Bounds::of_whole`, set at each whole

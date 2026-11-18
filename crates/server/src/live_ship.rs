@@ -264,6 +264,9 @@ pub(crate) struct LiveState {
   /// shard: its log is not fetched again until phase one adopts another head. One entry a pending materialization, removed
   /// when it is served.
   pub(crate) refused_rebuilds: BTreeMap<ObjectId, (Head, &'static str)>,
+  /// Test support (`Daemon::inject_live_period_quantum`, never set in production): the quantum the period's slices are
+  /// cut by in place of the shard's step quantum ([`period_slice`]).
+  pub(crate) period_quantum_ns: Option<u64>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -2167,51 +2170,109 @@ fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
     .is_some_and(|live| live.owes_whole && live.shipper.admits_checkpoint())
 }
 
+/// Counter: one owner-shard turn of the record period's live work ([`period_slice`]).
+const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+/// Counter: a record period's live work on one shard ([`period`]), however many turns it took.
+const LIVE_PERIODS: &str = "fleet.live.periods";
+
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
 /// there still lacks, so a lost message or a holder that was away is caught up without waiting for the next write.
+/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]), so a
+/// shard owning many live volumes is never held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
+/// until 2026-11-17 one turn visited every one, a cost that grew with the volumes the shard owned while every client
+/// of the shard waited behind it.
 pub(crate) async fn period(origin: u16, shard: u16) {
   drain_stragglers();
-  let _ = crate::xshard::call_within(
-    origin,
-    shard,
-    |s| {
-      let volumes: Vec<[u8; 16]> = s.live.shipping.keys().copied().collect();
-      // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
-      // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
-      for volume in &volumes {
-        let id = slates_db::catalog::VolumeId { bytes: *volume };
-        follow_candidates(s, *volume);
-        // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
-        if let Some(live) = s.live.shipping.get_mut(volume) {
-          live.unreachable.clear();
+  let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut after = None;
+  let mut first = true;
+  loop {
+    let counted = std::mem::take(&mut first);
+    let next = crate::xshard::call_within(
+      origin,
+      shard,
+      move |s| {
+        if counted {
+          s.count(LIVE_PERIODS, 1);
         }
-        // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
-        // neighbourhood settles, a pair delivered): answered here at the latest.
-        resolve(s, *volume);
-        // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
-        // shard has delivered the pairs that would let it ([`covers_candidates`]).
-        if !covers_candidates(s, *volume)
-          && coverable_now(s, *volume)
-          && let Some(live) = s.live.shipping.get_mut(volume)
-        {
-          live.owes_whole = true;
-        }
-        if owes_whole_within_credit(s, *volume) {
-          published(s, id, None);
-        } else if owes_image(s, *volume) && published_whole(s, id) {
-          // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
-          refresh_image(s, id);
-        }
-      }
-      let mut sends = Vec::new();
-      for volume in volumes {
-        sends.extend(pending_sends(s, volume));
-      }
-      dispatch(s, sends);
-    },
-    crate::fleet::live_budget().max_deadline_ns(),
-  )
-  .await;
+        period_slice(s, after)
+      },
+      deadline,
+    )
+    .await;
+    match next {
+      Some(Some(last)) => after = Some(last),
+      _ => break,
+    }
+  }
+}
+
+/// One slice of [`period`]: the shard's live volumes after `after` in key order, each visited ([`period_volume`]) and
+/// what its holders lack sent, until the shard's step quantum is spent (`futures::step_budget_ns`, what a destroy's or
+/// an archive's slice is sized by); the last volume visited when any remain after it, `None` once none does. The first
+/// volume is always visited, so a slice always moves the period on.
+fn period_slice(s: &mut ShardState, after: Option<[u8; 16]>) -> Option<[u8; 16]> {
+  s.count(LIVE_PERIOD_SLICES, 1);
+  let quantum = s
+    .live
+    .period_quantum_ns
+    .or_else(slates_rt::futures::step_budget_ns)
+    .unwrap_or(s.config.runtime.step_budget_ns);
+  let began = slates_rt::futures::now_ns();
+  let mut cursor = after;
+  let mut sends = Vec::new();
+  let remaining = loop {
+    let next = match cursor {
+      Some(last) => s
+        .live
+        .shipping
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next()
+        .map(|(volume, _)| *volume),
+      None => s.live.shipping.keys().next().copied(),
+    };
+    let Some(volume) = next else {
+      break None;
+    };
+    period_volume(s, volume);
+    sends.extend(pending_sends(s, volume));
+    cursor = Some(volume);
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      break cursor;
+    }
+  };
+  dispatch(s, sends);
+  remaining
+}
+
+/// The period's visit to one live volume: follows its candidates, retries holders whose last lane went unanswered,
+/// answers writers whose wait a condition met, and owes or ships the whole record or image it is due.
+fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
+  let id = slates_db::catalog::VolumeId { bytes: volume };
+  follow_candidates(s, volume);
+  // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
+  if let Some(live) = s.live.shipping.get_mut(&volume) {
+    live.unreachable.clear();
+  }
+  // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
+  // neighbourhood settles, a pair delivered): answered here at the latest.
+  resolve(s, volume);
+  // A log whose last whole entry no successor among the candidates could open is checkpointed again once this shard has
+  // delivered the pairs that would let it ([`covers_candidates`]).
+  if !covers_candidates(s, volume)
+    && coverable_now(s, volume)
+    && let Some(live) = s.live.shipping.get_mut(&volume)
+  {
+    live.owes_whole = true;
+  }
+  // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its last
+  // writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
+  if owes_whole_within_credit(s, volume) {
+    published(s, id, None);
+  } else if owes_image(s, volume) && published_whole(s, id) {
+    // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
+    refresh_image(s, id);
+  }
 }
 
 /// This shard's live logs for `status` (A-200): each it ships, then each it holds as a candidate.

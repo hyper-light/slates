@@ -2654,6 +2654,19 @@ impl Daemon {
     })
   }
 
+  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), in
+  /// place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each slice after one volume, so
+  /// a test sees the slicing whatever the machine's wake cost. Delivered like [`Self::inject_live_state_withhold`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_live_period_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live.period_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
