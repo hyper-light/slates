@@ -8095,6 +8095,11 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
 > shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
 > gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
+> **2026-11-18:** it reads the shard's clock again after the scheduler answers. A thread leaves the run queue for a block
+> only by running first, so only a clock read after that answer shows a shard released between the two reads, which
+> ran, answered and parked before the scheduler looked; read only before it, such a shard was judged wedged and an
+> observation already answered was given up (once on CI's Windows runner, where a look at the scheduler is a 3 ms
+> snapshot; 1 of 32 runs of the failing tree, `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`).
 > **2026-11-08, the transitive wait:** a shard blocked joining another thread of the process (the FUSE notify thread,
 > the landing barrier thread, the WinFsp mount thread; `slates_rt::registry::spawn_waited`) is read as that thread while
 > it is runnable, so a shard waiting on a starved thread is starved, not stuck; one waiting on a blocked thread is still
