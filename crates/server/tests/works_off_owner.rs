@@ -453,6 +453,8 @@ fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
     ReplyBody::Submitted {
       version: Some(accepted),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "based at {base}"
   );
@@ -556,6 +558,8 @@ fn submit_with_the_answer_lost(
 const ACCEPTED_AT_TWO: ReplyBody = ReplyBody::Submitted {
   version: Some(2),
   conflicts: Vec::new(),
+  conflicts_elided: 0,
+  verdict: 0,
 };
 
 /// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost, so the green advanced
@@ -608,7 +612,10 @@ fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
   await_overloaded(&mut client, id);
   client.edit(other, "f", 32, 4, b"BBBB").unwrap();
   assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(3));
-  let ReplyBody::Submitted { version, conflicts } = client.retry(id, &request).unwrap() else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.retry(id, &request).unwrap()
+  else {
     panic!("the retry answers a submit");
   };
   assert_eq!(version, None);
@@ -778,6 +785,8 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
     ReplyBody::Submitted {
       version: Some(2),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }
   );
   assert!(

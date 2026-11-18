@@ -155,6 +155,49 @@ pub enum DriftKind {
   TypeChanged,
 }
 
+/// One range of a base entry as the disk holds it now ([`Overlay::read_base_range`]; §4.4 `read_base`,
+/// A-267): the bytes, the file's size, and a stamp of its fingerprint, so a reader joining ranges knows each is of one
+/// state of the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseRange {
+  /// The bytes from the range's offset: as many as asked, fewer at the file's end, none past it.
+  pub bytes: Vec<u8>,
+  /// The file's size when the range was read.
+  pub total: u64,
+  /// The file's fingerprint when the range was read, folded to a word (its device, inode number, size, times and
+  /// birth): a file changed or replaced between two ranges stamps them differently.
+  pub stamp: u64,
+}
+
+/// One entry of a page of an overlay's drift ([`Overlay::drift_page`]; §4.4 `status`, A-267): as `status` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriftPageEntry {
+  /// A witnessed entry whose disk no longer matches its witness, as recorded.
+  Drifted {
+    /// The entry, by path.
+    path: String,
+    /// What the disk did to it.
+    kind: DriftKind,
+  },
+  /// A witnessed entry whose re-check the host refused now: not known to match.
+  Unverified {
+    /// The entry, by path.
+    path: String,
+    /// The host's refusal.
+    refusal: VfsError,
+  },
+}
+
+/// A page of an overlay's drift ([`Overlay::drift_page`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriftPageRead {
+  /// The inodes found drifted or unverified, in inode order, each with its entries as `status` lists them: an entry
+  /// recorded drifted whose re-check the host refuses now is in both of `status`'s lists, so it is both here.
+  pub entries: Vec<(InodeNo, Vec<DriftPageEntry>)>,
+  /// The last inode the page visited, when inodes remain past it to visit; `None` once the walk is done.
+  pub next: Option<InodeNo>,
+}
+
 /// What `status` reports for an overlay volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseStatus {
@@ -781,6 +824,24 @@ fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
     .dirs
     .get(dir)
     .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
+}
+
+/// A fingerprint folded to a word ([`BaseRange::stamp`]): BLAKE3 over the fields a change or a replacement of the file
+/// moves (its device, inode number, size, modification, change and birth times), its first eight bytes.
+fn fingerprint_stamp(fp: &Fingerprint) -> u64 {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&fp.dev.to_le_bytes());
+  hasher.update(&fp.ino.to_le_bytes());
+  hasher.update(&fp.size.to_le_bytes());
+  hasher.update(&fp.mtime_ns.to_le_bytes());
+  hasher.update(&fp.ctime_ns.to_le_bytes());
+  hasher.update(&fp.birth_ns.to_le_bytes());
+  let digest = hasher.finalize();
+  let mut word = [0u8; 8];
+  for (to, from) in word.iter_mut().zip(digest.as_bytes()) {
+    *to = *from;
+  }
+  u64::from_le_bytes(word)
 }
 
 fn host_refusal(e: HostError) -> VfsError {
@@ -3237,6 +3298,104 @@ impl Overlay<'_> {
     Ok(())
   }
 
+  /// One page of `status`'s drift (§4.4, A-267): visits, in inode order past `after`, every inode `status` would list —
+  /// those witnessed, re-checked now as `status` re-checks them, and those with drift recorded — and answers the ones
+  /// found drifted or unverified, until `limit` are found or `spent` says the page's slice of the shard's step is used.
+  /// It always visits one inode before it asks, so a walk moves. Where inodes remain, the page names the last it
+  /// visited, which the next page starts after. A walk of the pages re-checks each witnessed entry once; reading the
+  /// whole status each page re-checked every entry once a page and held the shard for all of them each time.
+  /// The watcher's hints are `status`'s to take: a walk follows a status.
+  pub fn drift_page(
+    &mut self,
+    store: &mut Store,
+    after: Option<InodeNo>,
+    limit: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<DriftPageRead, VfsError> {
+    if self.vol.base.is_none() {
+      return Err(VfsError::NotOverlay);
+    }
+    let mut entries = Vec::new();
+    let mut cursor = after;
+    loop {
+      let Some(no) = self.next_drift_candidate(cursor) else {
+        return Ok(DriftPageRead {
+          entries,
+          next: None,
+        });
+      };
+      cursor = Some(no);
+      let mut found = Vec::new();
+      if self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|b| b.witness(no).is_some())
+      {
+        match self.check_drift(store, no) {
+          // Drift found is recorded by the check itself and listed below.
+          Ok(()) | Err(VfsError::BaseDrift) => {}
+          Err(refusal) => found.push(DriftPageEntry::Unverified {
+            path: self.path_or_inode(store, no),
+            refusal,
+          }),
+        }
+      }
+      if let Some(kind) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.drift.get(&no).copied())
+      {
+        found.push(DriftPageEntry::Drifted {
+          path: self.path_or_inode(store, no),
+          kind,
+        });
+      }
+      if !found.is_empty() {
+        entries.push((no, found));
+      }
+      if entries.len() >= limit || spent() {
+        let more = self.next_drift_candidate(cursor).is_some();
+        return Ok(DriftPageRead {
+          entries,
+          next: cursor.filter(|_| more),
+        });
+      }
+    }
+  }
+
+  /// The next inode past `after` that `status` would list: witnessed (to re-check), or with drift recorded.
+  fn next_drift_candidate(&self, after: Option<InodeNo>) -> Option<InodeNo> {
+    let plane = self.vol.base.as_ref()?;
+    let witnessed = plane
+      .witnesses
+      .iter_head_after(after.as_ref())
+      .next()
+      .map(|(no, _)| *no);
+    let from = match after {
+      Some(no) => std::ops::Bound::Excluded(no),
+      None => std::ops::Bound::Unbounded,
+    };
+    let drifted = plane
+      .drift
+      .range((from, std::ops::Bound::Unbounded))
+      .next()
+      .map(|(no, _)| *no);
+    match (witnessed, drifted) {
+      (Some(witnessed), Some(drifted)) => Some(witnessed.min(drifted)),
+      (witnessed, drifted) => witnessed.or(drifted),
+    }
+  }
+
+  /// An inode's path, or `inode N` where none names it, as `status` names it.
+  fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
+    self
+      .vol
+      .path_of_inode(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
+  }
+
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
   pub fn status(&mut self, store: &mut Store) -> Result<BaseStatus, VfsError> {
     self.process_hints(store)?;
@@ -3761,8 +3920,62 @@ impl Overlay<'_> {
 
   // ---------------------------------------------------------------- verbs
 
+  /// One range of `read_base` (§4.4, A-267): up to `max` bytes of the entry at `path` from `offset`, as the disk holds
+  /// it right now, with its size and its fingerprint's stamp ([`BaseRange`]); a read, never a write. The daemon answers
+  /// `read_base` a reply at a time from it, so neither a reply nor the daemon's memory holds more than a page of a base
+  /// file however large; reading the whole file in one call held all of it and answered past a reply's room with
+  /// "reply too large for the bulk area".
+  pub fn read_base_range(
+    &mut self,
+    path: &str,
+    offset: u64,
+    max: usize,
+  ) -> Result<BaseRange, VfsError> {
+    let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+      return Err(VfsError::IsDirectory);
+    };
+    let mut opened = Vec::new();
+    let mut dir = root;
+    let result = (|| {
+      for d in dirs {
+        dir = self.host.open_dir(dir, d).map_err(host_refusal)?;
+        opened.push(dir);
+      }
+      let file = self.host.open_file(dir, name).map_err(host_refusal)?;
+      let ranged = self.host.fstat(file).map_err(host_refusal).and_then(|fp| {
+        let left = fp.size.saturating_sub(offset);
+        let len = usize::try_from(left).unwrap_or(usize::MAX).min(max);
+        let mut bytes = vec![0u8; len];
+        let mut done = 0usize;
+        while let Some(unread) = bytes.get_mut(done..).filter(|unread| !unread.is_empty()) {
+          let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+          let n = self.host.read_at(file, at, unread).map_err(host_refusal)?;
+          if n == 0 {
+            break;
+          }
+          done = done.saturating_add(n);
+        }
+        bytes.truncate(done);
+        Ok(BaseRange {
+          bytes,
+          total: fp.size,
+          stamp: fingerprint_stamp(&fp),
+        })
+      });
+      self.host.close_file(file);
+      ranged
+    })();
+    for d in opened {
+      self.host.close_dir(d);
+    }
+    result
+  }
+
   /// `read_base`: the entry as the disk holds it right now, through the base's directories by
-  /// name; a read, never a write.
+  /// name; a read, never a write. The whole file in memory: the volume core's own callers and its tests; the daemon
+  /// answers `read_base` a range at a time ([`Self::read_base_range`]).
   pub fn read_base(&mut self, path: &str) -> Result<Vec<u8>, VfsError> {
     let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

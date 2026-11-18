@@ -1761,12 +1761,23 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   volumes the drift list (every witnessed entry whose disk fingerprint no longer matches, with
   the kind of change: modified, deleted, replaced, type changed) and the watcher state (live,
   overflowed, unavailable).
+- list(after?) → Listed{volumes, next}: the volumes the caller may read, one page a reply, in volume-id order past
+  `after`; `next` continues the walk. A page holds what one reply chunk holds (§4.3), each shard sending at most a page,
+  so a listing of any length is answered and a volume that exists for the whole walk is listed exactly once. The
+  client walks the pages and returns them in name order. A new volume's name is bounded so its summary fits one page.
+
+  > **Status (2026-11-08, paged, A-263).** The whole listing was one reply, refused "reply too large for the bulk area" from
+  > 100 volumes on a two-shard daemon (`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`).
 - read_base(volume, path) → bytes: the entry as the disk holds it right now, for an agent that
-  wants to reconcile a drifted entry itself; a read, never a write.
+  wants to reconcile a drifted entry itself; a read, never a write. Answered a reply at a time (`ReadBase { offset }`
+  → `BaseBytes { bytes, total, stamp }`, A-267), the stamp a fold of the file's fingerprint, so a client walks the
+  pages and refuses a file that changed between them (`ChangedWhileRead`); neither a reply nor the daemon holds more
+  than a page of a base file.
 - rewitness(volume, paths?) → Rewitnessed: re-witness the named drifted entries (default: all) to the
   disk as it is now, after the agent has rewritten its copies; the agent's content is untouched;
   the drift records for those entries clear. This is the explicit "a resolution is itself a
-  change" step; slates never merges.
+  change" step; slates never merges. The reply names the paths one reply holds and counts the rest, which were
+  re-witnessed too (A-267).
 - pin(volume, paths?) → Pinned: read the named subtrees (default: the whole base) into the store
   and witness them, so the view of those entries is stable regardless of later disk changes;
   cost proportional to what is pinned and reported in the reply; never implicit. Run a slice at a time on the
@@ -1801,9 +1812,14 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   (seal, compose, send the increment to the green's owner, park, resume with the verdict);
   `rebase(work_volume, to?) → Rebased{version} | Conflict{windows}` (move the work volume's base to
   a newer green version by mapping its pending operations; unchanged on conflict);
-  `advance(attachment, version)` (re-pin a green attachment; targeted invalidations);
-  `versions(green, from?, limit?)` and `changed_since(green, version, paths?)` (reads of the chain
-  and the per-path last-changed index); `edit(volume, path, at, delete_len, bytes)` (an SDK write
+  `advance(attachment, version)` (re-pin a green attachment; targeted invalidations: the paths one reply holds and a
+  count of the rest, past which a holder treats every path as invalidated, A-267);
+  `versions(green, from?, limit?)` and `changed_since(green, version, from?)` (reads of the chain
+  and of the change index, the paths each version changed, recorded as it commits; `changed_since` names every path any
+  dimension of which changed after the version, as `advance` invalidates by, each at the last version it changed at, a
+  page a reply in version order from a cursor of a version and a count, each page ending at a full reply or at its slice
+  of the shard's step, so a page costs the changes it passes and never the tree, and a path changed when the walk began
+  is answered once; a version past the head is `UnknownBase`, 2026-11-09, A-264); `edit(volume, path, at, delete_len, bytes)` (an SDK write
   that declares a true insert or delete). A mount write to a green volume is `EROFS`; an SDK
   write is `ReadOnlyVolume`.
 
@@ -3268,7 +3284,8 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > judged against NTFS with the drive's one stated difference: no hard links. Their first run (CI 44260193629,
 > 2026-11-18, both architectures) found Mercurial identical but for that difference, and the drive's one limitation
 > (A-327): Windows answers no final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, error 1005) for a file on
-> a drive that `DefineDosDeviceW` made rather than the Mount Manager, which only Administrators may ask, so git with
+> a drive that `DefineDosDeviceW` made rather than the Mount Manager (resolved by A-369: the drive is a Mount Manager
+> drive WinFsp's driver makes for the daemon, once the machine allows it), which only Administrators may ask, so git with
 > its own symbolic links on cannot change directory there. The lanes run git as Git for Windows ships it.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
@@ -8257,7 +8274,13 @@ it builds against the contract and adds to it rather than around it.
 > policy and hand out a statement to sign (A-285's owner, agreed through g262's inbox); typed fields
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
-> again; a paged listing; typed audit and grant states.
+> again (typed audit and grant states are built, piece 6). **Lists a page at a time (A-263 to A-267, goal g247,
+> `CONTRACT` = 26):** every
+> list the daemon answers a reply at a time is read through the contract a page at a time — `Page { items, next }`
+> from `Instance::{list_page, grants_page, audit_page, changed_since_page}`, an overlay's `DriftPage` from
+> `drift_page` — or whole (`list`, `grants`, `audit`, `changed_since`, `drift`); a status's `DriftReport` counts what
+> it could not carry (`elided`), and `drift` reads every entry. Proven by use (`crates/api/tests/api.rs`: 200 volumes,
+> 150 changed paths, 100 drifted files and 120 audit records, each walked a page at a time and read whole).
 
 > **Status (2026-11-18, A-299, piece 5: the write modes reach the contract).** Over A-285's policy
 > wire (203ad8fa): `Instance::set_write_policy(subject, &policy, &launcher)`, proven by the
@@ -8391,7 +8414,8 @@ concurrent operation on it unless identical; the skills say so.
 **Landing from the SDKs.** `materialize(snapshot, target, filter=None, wait=True)` returns
 an awaitable landing request: awaited, it resolves to the landing report once a human has
 granted the request and the landing has run, or raises `GrantRequired` at once when `wait` is
-false; `status(volume)` carries the drift list; `read_base`, `rewitness` and `pin` are ordinary
+false; `status(volume)` carries the drift list's first entries and the count of the rest, and `drifted(volume)`
+reads the whole list a page at a time (A-267); `read_base`, `rewitness` and `pin` are ordinary
 async calls. No SDK method creates a grant.
 
 **Python SDK.** PyO3 extension (`abi3-py312` wheels plus `cp314t` for free-threaded builds);
@@ -9344,7 +9368,7 @@ with every finished entry listed.
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
 | Landing lease term | measured landing duration p99 × k, renewed by keepalive while entries are in flight | landing duration histogram |
 | Grant term | the session's lifetime for session grants; the measured plan-to-grant interval p99 × k for single-use grants | audit log intervals |
-| Audit retention | landing rate × operator audit horizon × record size | measured landing rate |
+| Audit retention | the partition's table bytes / the record's size (the memory ceiling, `PartitionCaps::audit_records`, A-265); an operator horizon × the measured landing rate may lower it once a rate is measured (none is yet) | table bytes; measured landing rate |
 | Watcher coalescing window | p50 inter-arrival of event bursts | watcher event timestamps |
 
 **Worked example.** An agent overlays `/home/u/proj` (300k files); edits twelve files, deletes
@@ -9981,8 +10005,8 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
 between the two versions names (O(changed) by structural sharing); no attachment's view changes
 without `advance`; `status(green)` reports the head, the attachment's version, and
-`changed_since(version, paths)` from the last-changed index so a work volume learns early which
-of its pending paths green has moved under (awareness, never load-bearing).
+`changed_since(version)` from the change index (the paths each version changed, A-264) so a work volume learns early
+which of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
 in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
@@ -16676,7 +16700,10 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     Administrators group), and a security query is answered with it (before, WinFsp's DLL refused every query, and
     Windows reported its world descriptor: owner Everyone, no access list), so git trusts a repository on the drive. The
     reason stands for access lists and for an owner or group set after the create; three winfstest cases that ask for
-    exactly the drive's access list pass and are off the list.
+    exactly the drive's access list pass and are off the list. **Amended by A-368 (2026-11-18):** the one access list
+    grants the account, SYSTEM and the Administrators alone (and the mount's purge marker), as NTFS grants an account's
+    own folder; it granted Everyone, and another account reached the drive through its volume's kernel name. The three
+    cases fail again, listed under this reason.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
@@ -18371,7 +18398,8 @@ and failed-then-passing oracles distinguish those results from the initial sourc
      serves.
 
   A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
-  its volume and its drive at once. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
+  its volume and its drive at once. **Superseded by A-369 (2026-11-18):** two handles, the control handle and the
+  ledger; the drive is a Mount Manager drive the volume keeps, so no link is held. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
   anchor refused or did not answer.
 - **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
   `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
@@ -18379,6 +18407,9 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   releases its own link handle at teardown; the temporary link disappears when its final owner closes it. Only a
   partially failed construction removes its exact definition explicitly. Thus a dead or replaced daemon cannot
   remove the anchor-held drive. The DLL's `MountPoint` stays null, so deletion owns no drive definition.
+  **Superseded by A-369 (2026-11-18):** the daemon asks WinFsp's driver for a Mount Manager drive on the volume
+  (`FSP_FSCTL_MOUNTMGR`), which lives as long as the volume does, so a dead or replaced daemon still cannot remove the
+  anchor-held drive, and Windows resolves its files' final paths, which it does for no drive `DefineDosDeviceW` made.
 - **The next daemon serves the held volume.** It inherits the three handles and nothing else (A-183), with the held
   records naming each mount.
   - For each restored WinFsp attachment with a held volume, it calls `FspFileSystemCreate` with the mount's parameters.
@@ -25112,7 +25143,8 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   symbolic links on cannot change directory, and any program that asks a file's final path with `VOLUME_NAME_DOS` is
   refused alike. Mounting through the Mount Manager would need an Administrator, which R10 never requires; a WinFsp
   network file system would have a final path, a UNC one every tool would then print in place of the drive. Which, if
-  either, to offer is Ada's decision (GAPS).
+  either, to offer is Ada's decision (GAPS). **Resolved by A-369 (2026-11-18), without Ada:** the drive is a Mount
+  Manager drive WinFsp's driver makes for the unprivileged daemon, once the machine allows it.
 - **Why Subversion failed: the shell rewrote its argument.** Git for Windows' shell rewrites an argument that looks
   like a POSIX path before it starts a Windows program, and it took Subversion's repository-relative URL `^/trunk` for
   one. The shared environment now sets `MSYS_NO_PATHCONV=1`, Git for Windows' switch for handing every argument on as
@@ -26894,7 +26926,8 @@ the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_
   records the account as uid 0). So the drive's one descriptor names that account, the user of the daemon's token, as
   owner and the token's primary group as group, which is what NTFS gives a file the account makes unelevated; and the
   host answers `GetSecurity` with it, on the receiving thread and without the shard, since every object reports the
-  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before.
+  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before
+  (**superseded the same day by A-368:** the account, SYSTEM and the Administrators alone).
   Rejected: the Administrators group as owner, which git trusts only for an elevated administrator's process, so an
   unelevated user's repository stays refused; a descriptor kept per object in the volume, a format change for an owner
   that is the same account on every object; and each object's uid mapped to a SID by WinFsp's POSIX map
@@ -27469,6 +27502,288 @@ rebuild closed), the bug record `docs/bugs/2026-11-18-a-live-takeover-made-its-v
   `fleet.materialize.refused.*`), A-343's publication before serving.
 - **Owed.** The archive's layout and the restore in quantum slices (each one turn, about 0.1 s at 300 MB); the first
   publication's live whole entry sealed in turns (g230's item); a sealed volume's restore (A-347's owed restore).
+
+### A-368 — The WinFsp drive's access list grants its account, SYSTEM and the Administrators alone (2026-11-18, g261; amends A-209's SECURITY difference and A-350)
+Applied in the same change to: §4.6 (the stated SECURITY difference), A-350's entry, GAPS, `crates/bridge-winfsp/src/account.rs`
+(`drive_sddl` takes the purge marker), `purge_token.rs` (`Marker::sid_text`), `host.rs` (`drive_security_descriptor`),
+winfstest's reviewed list (three cases listed again) and its record, and `crates/cli/tests/winfsp_semantics.rs`.
+- **What was open.** The drive's one descriptor granted Everyone full access, a list that let WinFsp's open check pass
+  and the shard decide. But the shard decides by the attachment, which is the mounting account's, and the drive's volume
+  has a kernel name any process of any session can open (`\\?\GLOBALROOT\Device\Volume{…}`; WinFsp's device lets
+  Everyone read and traverse it). So another local account read and wrote the account's volume through that name, as the
+  account itself. A session drive letter hid the name only from casual use, and A-369 makes the drive the machine's.
+- **The decision.** The list is the one NTFS gives an account's own folder (`C:\Users\<name>`): full access for the
+  account, SYSTEM and the Administrators, and nothing for anyone else. One entry more, full access for the mount's purge
+  marker: the mount's purge client opens files with a copy of the account's token restricted to Everyone and that
+  marker (`crate::purge_token`), and Windows grants a restricted token only what its user and one of its restricting
+  SIDs are both granted; the marker is fresh for each mount and known to no other process.
+- **What winfstest sees.** The three cases A-350 took off the list ask for exactly `D:P(A;;FA;;;WD)` and fail again,
+  listed under the SECURITY reason: `t/base/10.t` cases 2 and 12, `t/streams/03.t` case 17 (379 to 382 entries): exactly those three were the unlisted failures with the change, on x86_64 and arm64
+  alike (diagnostics run 44347197823), and the record is re-recorded from diagnostics run 44349918413, with them listed:
+  733 cases, 351 passed, 382 failed, every one listed.
+- **Tests.** `another_account_cannot_open_a_file_on_the_drive` (`crates/cli/tests/winfsp_semantics.rs`): a file made
+  through the drive, read by this account through the volume's kernel name, and opened by another local account the test
+  makes (`NetUserAdd`, a network logon, impersonated for the one open), which is refused `ERROR_ACCESS_DENIED`; it
+  skips loudly where the process may not make an account. Red on main's code (diagnostics run 44351659976, x86_64, the
+  test alone added): the other account opened `\\?\GLOBALROOT\Device\Volume{…}\private.txt`, `Ok(())`. Green with the change on x86_64 and arm64
+  (diagnostics run 44349918413): `Err(5)`, `ERROR_ACCESS_DENIED`. And
+  `a_markers_sid_text_is_the_text_windows_writes_for_it` (`purge_token.rs`), the marker's text against
+  `ConvertSidToStringSidW`'s.
+
+### A-369 — The WinFsp drive is a Mount Manager drive WinFsp's driver makes, so every file on it has a final path (2026-11-18, g261; resolves A-327's limitation; amends A-198's held drive)
+Applied in the same change to: §4.6 (the Windows status; A-198's "what the anchor holds" and "the drive is the daemon's
+own"), A-327's entry, GAPS (A-300's entry, its decision for Ada closed), README (installing on Windows),
+`crates/bridge-winfsp/src/held.rs` (`Drive`, `Inherited`, `Offer`), `host.rs` (the mount, its offer and handle values,
+`WinFspError::MountManagerNotAllowed` and `DriveLetterTaken`), `crates/server/src/winfsp.rs` (the inherited split, the
+typed mount refusal) and `anchor_hold_windows.rs`, `crates/anchor/src/handles.rs` (`WINFSP_MOUNT_HANDLES`),
+`crates/ipc/src/protocol.rs` (`TargetRefusal::MountManagerNotAllowed`, `DriveLetterTaken`, appended and published),
+`crates/api/src/error.rs` (their words), CI's three WinFsp installs (the machine setting), `unsafe-budget.toml` (155 to
+153), and `crates/cli/tests/winfsp_semantics.rs`.
+- **What was open (A-327).** `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS` translates a volume's device name to a
+  drive through the Mount Manager, so it resolves a file only on a Mount Manager drive or a network drive (WinFsp issues
+  410 and 427; WinFsp never sees the translation). The mount's drive was a session drive `DefineDosDeviceW` made, so
+  every caller was answered `ERROR_UNRECOGNIZED_VOLUME` (1005): git with its own symbolic links on (`fatal: cannot chdir
+  to repo: No such device`), Python's `realpath`, Rust's `canonicalize`, AppLocker.
+- **Measured (diagnostics runs 44343541046 and 44344103821, windows-latest, WinFsp 2.1's memfs).** A session drive:
+  `realpath` WinError 1005, git with symbolic links on refused. A network volume with a UNC prefix: `realpath`
+  `\\memfs\share\…`, drive type remote, git working but printing `//memfs/share/repo` and its fsmonitor refused. A
+  Mount Manager drive: `realpath` `O:\probe-dir`, drive type fixed, git working with `O:/repo`, fsmonitor running. And as
+  a standard local account (Medium integrity, no Administrators): `\\.\P:` refused (exit 5) without the machine setting,
+  `\\.\Q:` made with it (`realpath` `Q:\probe-dir`, git's `init` and `status` 0, its top level `Q:/repo`).
+- **The decision.** The drive is a Mount Manager drive, made by WinFsp's driver on the daemon's request
+  (`FSP_FSCTL_MOUNTMGR` on the volume's control handle, `FspVolumeUseMountmgr` in WinFsp v2.1's `src/sys/volume.c`),
+  which needs no privilege of the daemon. The driver honours the request only where the machine allows it:
+  `MountUseMountmgrFromFSD` set to 1 under WinFsp's key, once, by an Administrator, as WinFsp itself is installed once;
+  elsewhere the mount is refused `MountManagerNotAllowed`, whose words name the one command. The network volume was
+  rejected: its paths are UNC paths every tool would print in place of the drive, git's fsmonitor refuses it, and
+  Windows' default symbolic-link evaluation turns off links met on a remote volume. A drive made by the Mount Manager is
+  the machine's, seen in every session, which A-368's access list makes safe; and a letter another volume has, or that a
+  definition local to the daemon's session hides, is refused `DriveLetterTaken`.
+- **The held drive.** The Mount Manager keeps the letter while the volume's device lives, and WinFsp's driver removes it
+  with that device (`FspMountdevFini`), when the last copy of the control handle closes, the daemon's and the anchor's.
+  So the drive outlives a daemon whose volume the anchor holds, as A-198's held link did, and a daemon that exits never
+  takes it from the anchor; a hold names two handles, the control handle and the ledger. The hold message keeps its room
+  for three (`MAX_HANDLES`), so its layout does not move between an anchor and a daemon of different builds.
+- **Tests.** `a_file_on_the_drive_has_its_drive_path_as_its_final_path` (a file's `canonicalize` is `\\?\X:\dir\file.txt`)
+  and `git_with_its_symbolic_links_on_works_on_the_drive` (`git init`, `status` and `rev-parse --show-toplevel` with
+  `MSYS=winsymlinks:nativestrict`, the top level `X:/repo`), both in `crates/cli/tests/winfsp_semantics.rs`.
+  Red on main's code (diagnostics run 44347197823, x86_64, the tests alone added): the final path `Err(Some(1005))`, and
+  `git init` `fatal: cannot chdir to E:\repo: No such device`, CI's own failure. Green with the change on x86_64 and
+  arm64 (the same run): `\\?\E:\dir\file.txt`, `git` exit 0 three times and the top level `E:/repo`; and the suites
+  the held drive touches pass beside them: the CLI's WinFsp mount tests (18, the twenty killed daemons, the held and
+  released drives, the refused hold among them), the bridge's live oracles, the anchor's hold tests, and Win32 semantics
+  (19).
+
+### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
+Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
+`Listed { volumes, next }`), `crates/server/src/verbs.rs` (`list_part`, `list_page`, `longest_listable_name`,
+`refused_before_dispatch`), `crates/server/src/state.rs`, `crates/client/src/client.rs` (`Client::list`, the async list
+as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, both SDKs' async suites, GAPS,
+`docs/bugs/2026-11-08-a-volume-listing-outgrew-one-reply.md`.
+- **Changes §4.4:** `list` returned every volume in one reply, which a reply chunk (4,096 bytes) held only to about 80
+  volumes; past that `slates volume list` was refused "reply too large for the bulk area". It is now a walk: a page
+  of volumes in id order past a cursor, sized to one reply chunk, each shard sending at most a page. `List` was
+  replaced, not joined by a second verb.
+- **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
+  refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
+  with room for a recovery cause's fixed part), so every volume a client can create is one it can list. Since
+  2026-11-18 it is also no longer than a status holds beside its other fields at their widest, 2,896 bytes (A-267, "A
+  name every reply holds"). An unrecovered
+  volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
+  record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
+  room (1,023 bytes on macOS, 3,812 on Linux and Windows; `BaseUnavailable` with `ENAMETOOLONG` past it) and a reason,
+  the daemon's own text, at 256.
+- **Proven:** red first on main (3,000 volumes, refused); a walk under churn lists each of 2,991 survivors once in 37
+  pages; the longest admitted name lists; 2,000 volumes list through the CLI, plain and JSON.
+- **A seek (2026-11-17, goal g247):** a shard's part of a page collected every volume of its partition, built each
+  one's summary, sorted them and took the first that fit, so a walk of the listing cost the table once a page. It now
+  reads the id index from the cursor a batch at a time (`Art::after`, a bounded ordered read that visits the nodes on
+  the path to the cursor and those of the keys it returns; `Partition::volumes_after`) and builds a summary only for a
+  volume the page takes. `Art::after` is held to an ordered map's range by an oracle (every bound the tree holds,
+  prefixes and keys past it, every limit), and the listing's own walk tests run through it.
+- **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a
+  status's `drifted`, the merge verbs' conflict and invalidation lists), recorded open in GAPS; a volume recovered
+  under a longer name is not refused.
+
+### A-264 — `changed_since` is answered a page at a time from a change index, and names every dimension (accepted 2026-11-08, revised 2026-11-09)
+Applied in the same change to: §4.16 (the merge verbs, the status read), `crates/merge/src/engine.rs` (the change
+index: `changes`, `latest_change`, `links_to`, `Green::changes_after`, `ChangeAt`, `Green::changes_reservation`; the
+seeks in `history_at`, `history_touches`, `present_at`), `crates/ipc/src/protocol.rs` (`ChangedSince { green, version,
+from }`, `ChangedSince { paths, next }`, `ChangedCursor`), `crates/server/src/verbs.rs` (`changed_since`,
+`CHANGED_SLICE_PERMILLE`, the submit's reservation), `crates/client/src/client.rs` (the walk, and the async form as a
+chain), GAPS, `docs/bugs/2026-11-08-a-greens-changed-since-outgrew-one-reply.md`.
+- **Paged:** the whole answer was one reply, refused at 800 changed files. A page now holds what one reply chunk holds.
+- **Every dimension:** it read the content index alone, so a symlink, mode, xattr, special, directory or link moved under
+  a work went unreported. It answers `changed_between(v, head)`'s paths.
+- **From a change index, sliced (2026-11-09):** the first cut walked every dimension's path-keyed histories, so a page
+  cost the green's tree, not the span: about 1 ms a page on the kernel tree whatever the span, and ten times the tree
+  cost ten times that. Each version now records the paths it changed as it commits (O(changed)), and the answer is read
+  in version order from a cursor of a version and a count, each path once at the last version it changed at; a page
+  ends at a full reply or at half the shard's step, so it may hold no path and still carry a cursor. The index folds with
+  the histories, keeping each path's last change below the floor (so a version there, and a green restored from a
+  checkpoint, are answered as the histories answer them), and is charged with them. A version past the head is refused
+  `UnknownBase`.
+- **Seeks:** `history_touches`, `history_at` and `present_at` scanned a path's whole history; histories are in version
+  order, so each is one `partition_point`.
+- **One computation (2026-11-09):** `changed_between`, what `advance` invalidates by, walked every path's histories
+  beside the index `changed_since` read: two computations of what changed between versions, free to drift. It reads the
+  index's entries in the span; below the fold floor the index keeps each path's last change before the floor, as the
+  folded histories keep each key's value in effect there. The history walk is the tests' model
+  (`changed_between_by_histories`, the `test-model` feature, never in the shipped crate); the checkpoint proptest
+  compares `changed_between` and `changed_since` with it at every version and over every span ending at or above the
+  floor, in a green folded or not and its restoration. Red: four mutations of the index (the span's end excluded, a
+  superseded entry left last, a special's links not recorded, the fold keeping only last changes) each fail it.
+- **Cost, measured:** a page of 150 entries from the change index costs 0.25 to 1.7 µs at every span, on the kernel tree (97,229 paths) and on ten copies of it (972,290), where the path-keyed walk cost 17 to 33 µs a page at the dense spans and 0.6 to 1.4 ms at the sparse ones, and ten times the tree 90 to 236 µs and 10 to 22 ms (2,000 submits; release; this Mac at load 37 to 41; the two alternated ABBA; 2026-11-09). The index answers `changed_between(v, head)` at every version measured.
+- **One path always fits a page:** a green's paths arrive in requests, whose framing is larger than a page's (the longest
+  an edit carries, 4,044 bytes, is answered); merging a mounted work is owed and must bound its paths when it lands.
+
+### A-265 — The audit is numbered, bounded, and held by the control shard alone (accepted 2026-11-08)
+Applied in the same change to: §4.15 (the audit retention row), `crates/db/src/partition.rs` (`append_audit`,
+`audit_next_seq`, `audit_dropped`, `PartitionCaps::audit_records`), `crates/anchor/src/layout.rs` (the audit region
+removed; layout version 9, since A-255 took 7 and A-288 took 8 on main while this was out), `crates/server/src/config.rs`, `crates/server/src/landing.rs` (`audit_verb`,
+`write_audit`, `send_owed_audit`, `append_owed_audit`, `AUDIT_PARTITION`), `crates/server/src/verbs.rs` (the route, the
+send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }` answered `{ records, more }`),
+`crates/client/src/client.rs`, GAPS, `docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`.
+- **Numbered:** every record was numbered 0. The partition numbers each in `apply` from a snapshotted counter, so a
+  replay numbers them as the live partition did.
+- **Bounded:** the audit grew for the partition's life. A window of `table_bytes / size_of::<AuditRecord>()` is kept,
+  the oldest dropped past it and counted; the formula's horizon applies once a landing rate is measured.
+- **The ring removed:** the audit region was never written; the log and the snapshots in the anchor segment hold the
+  records, as §4.8 asks. Replaced, not kept beside.
+- **One partition:** each shard kept its own audit and a client read its own shard's alone. The control shard's
+  partition now holds every record (§4.15 "written through the control shard", §4.8's one `AuditLog`), so one sequence
+  numbers the daemon's audit and `--since N` keeps its meaning; `Audit` is served there, a page at a time.
+- **The crossing:** a record made on another shard is owed to the control partition by its atom and sent as one batch
+  once the atom commits: a presentation's and a granted landing's completion wait for it before replying, and a grant
+  (a sync verb) sends after its transaction, a refusal counted (`landing.audit_unappended`). On the control shard the
+  records stay in the atom. A crash between the owner's commit and the batch loses the batch; the owner's records and
+  the completion stand.
+- **Cost:** a granted landing of 1,000 files of 1 KiB from the shard that is not the control shard, its 1,000 `entry_written` records and its others crossing as one batch (`crates/server/tests/audit_land_cost.rs`, release, two shards, this Mac at load 40 to 100, before and after alternated ABBA three times, 2026-11-09): before, a landing's median 968 ms and fastest 430 ms; after, 827 ms and 424 ms (25 landings each, the first pair dropped as the warm-up). No cost shows within the noise: the crossing is one message and one transaction against a landing's own writes and fsyncs.
+- **A seek (2026-11-17, goal g247):** a page of the audit filtered the whole window from its oldest record, so a walk
+  of the window cost its square; it seeks to `since` (`Partition::audit_from`, a binary search over the window, which
+  is in sequence order), so a page costs the records it carries. Checked against the filter from every sequence before,
+  inside and past a window that dropped its oldest, and after a recovery
+  (`a_read_from_any_sequence_is_the_window_past_it`).
+- **Proven:** numbering and recovery, and the bounded window over a replay and a snapshot, in the database; a client on
+  either of two shards reads every shard's records at once after a landing's reply
+  (`a_client_on_any_shard_reads_every_shards_audit`); the audit paged by use.
+
+### A-266 — A principal's grants are paged, and the table holds live grants (accepted 2026-11-08)
+Applied in the same change to: §4.15 (grants), `crates/db/src/partition.rs` (`change_grant_state`,
+`grants_issued_through`), `crates/land/src/grant.rs` (`end`, `expired_at`, `restore_issued_through`, an absent id at or
+below the highest issued refused as spent), `crates/server/src/landing.rs` (`grants_part`, `grants_page`,
+`longest_grantable_target`, `end_grants_recorded_ended`, `end_expired_grants`), `crates/server/src/daemon.rs` (the reap
+tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/src/protocol.rs` (`Grants { after }`,
+`Grants { grants, next }`), `crates/client/src/client.rs`, GAPS,
+`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`.
+- **Paged:** the whole list was one reply, refused between 25 and 50 grants. A page holds what one reply chunk holds,
+  in grant-id order past a cursor, each shard sending at most a page.
+- **Live grants only:** every grant stayed in the table for the daemon's life. A grant leaves it at its terminal step,
+  in `apply`, and the runtime table once that commits; its history is the audit log. The highest id issued is kept and
+  snapshotted, so an id is never reused and a spent one is refused `GrantInvalid`.
+- **Ended at its term:** the reap tick ends grants past their term, counted.
+- **A seek (2026-11-17, goal g247):** a page collected every grant of the principal and then skipped to the cursor,
+  so each page cost the table; it ranges from the cursor over the id-ordered table, lazily, and stops when the page
+  is full (`Partition::grants_of_after`), checked against the filter past every cursor for two principals' interleaved
+  grants (`a_principals_grants_past_any_cursor_are_read_in_id_order`).
+- **A target that a grant can be listed with:** a `land` request carries a target of about 4,046 bytes; a target past
+  `longest_grantable_target` (3,995 bytes, a grants page's room less a summary with an empty target) is refused
+  before presenting, typed `Target { TooLong { longest } }` since main typed every target refusal (A-299, 2026-11-18;
+  it was `TargetUnavailable` with both lengths in words). Landing runs on macOS and Linux; macOS's `PATH_MAX` (1,023
+  bytes) is the smaller there, so the bound binds on Linux. Since signed landings (A-321) a presentation's reply also
+  names the target, in the statement a signature signs: a presentation whose reply would not fit one reply beside its
+  summary and verdict is refused the same way before anything is recorded, naming the longest that one holds
+  (`presentation_overflow`).
+- **Open:** an expiry writes no audit record.
+
+### A-267 — A status's drift is carried as far as one reply holds, counted past it, and paged (accepted 2026-11-08)
+Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/protocol.rs` (`StatusReport::drifted_elided`,
+`Drifted { volume, after }`, `Drifted { drifted, unverified, next, oversized }`), `crates/server/src/verbs.rs` (`with_drift`,
+`drift_entries`, `drifted`), `crates/client/src/client.rs` (`Client::drifted`), `crates/cli/src/verbs.rs`,
+`crates/mcp/src/lib.rs`, both SDKs, `crates/merge/src/engine.rs` (`base_at` and `current_base`'s docs, stale since every
+dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`; and
+since 2026-11-17 to `crates/server/src/{verbs,landing,merge_service,state,snapshot_view,transports}.rs` (the carried
+lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base.rs` (`drift_page`,
+`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 26 to
+29), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
+`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`.
+- **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
+- **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted. Since the drift
+  travels typed (A-299's `StatusReport::base`, 2026-11-18), a page is typed the same way (`Drifted { drifted:
+  Vec<DriftEntry>, unverified, next, oversized }`), and a status fills its text list and its typed `base` in lockstep
+  from one read of the base, under one bound and one count (`with_drift`, `DriftItem`): the typed copy had no bound,
+  and would have refused the status again past 600 drifted entries. A base that cannot be read is refused typed by
+  the paged read (`refusal_of_vfs`), where it was a text line.
+- **A page re-checks what it passes (2026-11-17, goal g247):** each page of `Drifted` read the whole status — every
+  witnessed entry re-checked against the disk — and took its slice, so walking a drift of N entries over W witnessed
+  ones cost W host re-checks a page and held the shard for all of them each time (a branch switched beneath an overlaid
+  repository drifts tens of thousands). A page now visits, in inode order past a cursor, the inodes a status would
+  list (witnessed, or with drift recorded), re-checking the witnessed ones (`Overlay::drift_page`, a range over the
+  witness table and the drift record), until a reply's worth is found or its slice of the shard's step is spent
+  (`DRIFT_SLICE_PERMILLE`, half, as `changed_since`'s), visiting one before it asks so a walk moves; a walk re-checks
+  each witnessed entry once, and an entry drifted for the whole walk is answered once. An inode's entries go on one
+  page together. Held to `status` over the simulated host by an oracle (pages of 1, 3 and 64 inodes, the slice spent
+  after every visit, every second, or never; replaced, removed and refused entries)
+  (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`). `slates-api`'s `drift_page` reads past an inode and
+  `drift` answers its lists in path order (`CONTRACT` = 29).
+- **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
+  the count. Both SDKs read the whole drift with `drifted(volume)` (2026-11-17, goal g247): typed entries (`path`,
+  `kind`), the unverified paths and the oversized count.
+- **A list a verb's own reply carries (2026-11-17, goal g247):** reproduced by use first, each refused "reply too large
+  for the bulk area" at 400 entries (`crates/server/tests/reply_bounds.rs`): an advance and a rewitness after they had
+  taken effect, a presentation after it was recorded, and a granted landing's `LandingConflict`, in whose place the
+  daemon sent `BadRequest`. Each now carries the longest prefix one reply holds beside the rest of it and counts what
+  it left out (`crate::verbs::carried`, `reply_room`; no item forced in, so one long path is counted, never sent as a
+  reply no chunk holds): `Advanced::invalidated_elided` (a holder treats every path as invalidated, or reads a green's
+  with `ChangedSince`), `Rewitnessed::paths_elided` (the rewitness took them too), `GrantRequired::conflicts_elided`
+  (every entry and its conflict read a page at a time with `LandingEntries`, A-287) and
+  `LandingConflict::entries_elided` (presenting again lists them). Two siblings the same sweep found:
+  `LandingOutcome::degraded_elided`, since a host that refuses every directory's sync meets a degraded cell a directory
+  and a finished landing's reply outgrew a chunk after the landing ran (`landing::landed_reply`); and a status's mount
+  budget, which counted each mount's path and not its whole encoding (twelve bytes more). The mounts were never a
+  refusal: a partition holds a bounded number of attachments (`PartitionCaps::attachments`), and the 400-mount test met
+  that bound before any status (corrected 2026-11-18). The client, the CLI, MCP, both SDKs and `slates-api` carry the
+  counts (`CONTRACT` = 27:
+  `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
+  and counts no conflict).
+- **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
+  were refused at 400 (`crates/server/tests/verdict_pages.rs`), so a work in conflict learned nothing of what to
+  resolve. A work needs every window, not a count, so the work keeps its last conflicting verdict
+  (`WorkState::verdict`, `KeptVerdict`: every window under an id, the shard's monotonic clock past the work's last),
+  the reply carries the windows one reply holds with `conflicts_elided` and the `verdict` id, and `Conflicts { work,
+  verdict, from }` reads the rest a page at a time; the next submit or rebase replaces the verdict, a successful one
+  clears it, a restart forgets it, and a read of one no longer kept is refused `VerdictReplaced`. Its windows are the
+  work's own operations' conflicts, bounded by the journal the merge budget charges. Since A-247 the verdict is judged
+  on the green's owner, which holds no work on another shard, so its answer names every window and the work's shard
+  keeps them and carries what fits (`kept_conflict`, in the settle of the submit or the rebase); the owner's completion
+  record of that answer, from which a retry after a crash on the work's shard is answered, holds every window too. A
+  signed submit's verdict (`SubmittedSigned`, A-321) carries its windows the same way, with its own count and verdict
+  id (2026-11-18). The client walks them,
+  synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
+  `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
+  `Stale::Verdict` (`CONTRACT` = 28).
+- **A name every reply holds (2026-11-18, goal g247):** A-263 bounded a new volume's name by the listing alone (4,012
+  bytes). A status names the volume beside its transports, journal, loss window and mounts, so a volume under such a
+  name was listed and its status refused "reply too large for the bulk area" (reproduced by use,
+  `a_volume_under_the_longest_name_a_create_accepts_is_listed_and_statused`). A name is now bounded by the lesser of
+  the two (`longest_name`). The status's share is a chunk less `widest_unnamed_status`: every field at its widest, the
+  host facts cut at `HOST_FACT_BYTES` (255, macOS's `uname` field), and the transports of the widest situation on any
+  platform, each entry refused with a reason (`transports::widest_report`). That is 2,896 bytes on every host (2,931 before
+  A-332's takeover past tolerance joined the loss report). A
+  status's mounts take no more than the room the rest of its report leaves, then its drift what is left
+  (`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`).
+- **The byte lists (2026-11-17, goal g247):** `read_base` read the whole base file into the daemon's memory and
+  answered it in one reply, refused past about four kilobytes (`crates/server/tests/base_read_pages.rs`; its whole
+  read of 100 KiB, run on main 843f527ff on 2026-11-18, answered `Refused(BadRequest { reason: "reply too large for
+  the bulk area" })`), so an agent reconciling a drifted entry could read no real file. It is answered a page at a time from the volume core's
+  `Overlay::read_base_range` (the bytes from an offset, the file's size and a stamp of its fingerprint: device,
+  inode, size, modification, change and birth times, folded by BLAKE3), and the client walks the pages as `read` walks
+  `ReadRange`'s, refusing a mix of two states. The whole-file `Read` verb, a second read path beside the paged
+  `ReadRange` that read a whole file into memory and answered it in one reply, is retired. Nothing sends it: the
+  client's unused `read_begin`, `read_spin` and `read_poll` went with it, and tests read through `ReadRange`. It is
+  refused `Unsupported`, naming `ReadRange`, and kept with `ReplyBody::ReadBytes` in its published place, since
+  removing either moved every tag after it, which main's wire-order test (853943af0) refuses (D-15: a completion
+  record keeps its reply unframed). Retired, not kept beside: no second read path serves.
 
 ### A-380 — The council records its voters in the versioned regional configuration, so a learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; the open item A-337 recorded)
 

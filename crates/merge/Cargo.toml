@@ -14,11 +14,19 @@ blake3 = { workspace = true }
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The crate's own tests build it with its model of `changed_between` (`test-model`), the oracle the change index is
+# checked against; the shipped crate does not include it.
+slates-merge = { path = ".", features = ["test-model"] }
 
 # shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the sixteen-agent randomized schedule of
 # T-6.7 (`tests/shuttle_green.rs`); a dev-dependency, so nothing shipped links it.
 [target.'cfg(shuttle)'.dev-dependencies]
 shuttle = "0.9"
+
+[features]
+# `Green::changed_between_by_histories`: the history walk kept as the tests' model of `changed_between` (A-264), never
+# in product code, so the product has one computation of what changed between two versions.
+test-model = []
 
 [lints]
 workspace = true

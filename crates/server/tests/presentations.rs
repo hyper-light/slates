@@ -309,6 +309,7 @@ fn a_presentations_entry_list_names_each_entry_its_grant_would_write() {
     manifest,
     summary,
     conflicts,
+    ..
   }) = present(&mut client, volume, Some(snapshot), &target.path)
   else {
     panic!("the snapshot's landing was not presented");
