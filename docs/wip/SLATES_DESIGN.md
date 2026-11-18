@@ -8651,6 +8651,11 @@ it builds against the contract and adds to it rather than around it.
 > `Instance::member`, `MoveProgress`, and the move's refusals' details: `Busy::Attached`, `Busy::Moving`,
 > `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`), then an overlay's base captured whole so
 > its clones move (`Instance::capture_base`).
+> **`CONTRACT` = 35:** only a granted landing ends its audit trail when refused: one whose grant the daemon held as it
+> began. So every such `LandingFinished` names its manifest and verdict, and its landing record reaches the same
+> terminal state in the same atom (§4.15's status of the same day). A landing under a grant the daemon does not hold is
+> presented once planned; refused before its plan, it is a refused request with no trail. Under 30 it wrote an end that
+> named no manifest.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -9287,9 +9292,13 @@ would need a privilege slates never holds (R10).
 > a `LandingFinished` whose outcome is `Refused`, or `Aborted` once the attempt wrote an entry. It names the manifest
 > the attempt planned (its grant's when it planned none) and its signature's verdict against that manifest. A plan no
 > grant covers ends in a presentation instead, which records itself. Before, a refused landing's trail ended at its
-> grant. An end that names no manifest (refused before any plan, under a grant that names none) records no verdict, and
-> `Audit` reads none on it. Proven by four refusals in `crates/server/tests/presentations.rs`, three of them red before
-> (macOS arm64, Mac Studio, 2026-11-18). Record: `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
+> grant. Since a later change the same day the landing's record reaches the same terminal state in the same atom: its
+> presentation's record moves there, and a fresh id's record is made, so a restart's landing counter passes the id.
+> Only a granted landing, one whose grant the shard held as it began, leaves this trail; a landing under a grant it does
+> not hold is presented once planned, and refused before its plan it is a refused request (`CONTRACT` = 35). Proven by
+> four tests in `crates/server/tests/presentations.rs`, three of them red before the first change and each reading the
+> record's state since the second (macOS arm64, Mac Studio, 2026-11-18). Record:
+> `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
 
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
