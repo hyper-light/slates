@@ -912,6 +912,15 @@ impl Partition {
     self.audit.iter()
   }
 
+  /// The audit records from sequence `since` on, oldest first (A-265, A-267): a seek, never a scan of the window. The
+  /// window is in sequence order (each record is numbered as it is appended, and the oldest leave first), so a page of
+  /// the audit costs the records it carries and a binary search, not the window's length; filtering the window from its
+  /// start made a walk of it quadratic in the window.
+  pub fn audit_from(&self, since: u64) -> impl Iterator<Item = &AuditRecord> {
+    let start = self.audit.partition_point(|record| record.seq < since);
+    self.audit.range(start..)
+  }
+
   /// The audit records dropped oldest first past the bound since the partition began (A-265).
   pub fn audit_dropped(&self) -> u64 {
     self.audit_dropped

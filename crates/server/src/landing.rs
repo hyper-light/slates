@@ -3281,7 +3281,8 @@ pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
   let mut used = 0usize;
   let mut records = Vec::new();
   let mut more = false;
-  for record in state.db.partition().audit().filter(|r| r.seq >= since) {
+  // A seek to `since`, so a page costs what it carries, never the retained window (A-267).
+  for record in state.db.partition().audit_from(since) {
     let entry = AuditEntry {
       seq: record.seq,
       at_ns: record.at_ns,

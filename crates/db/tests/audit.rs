@@ -161,3 +161,46 @@ fn the_audit_keeps_its_bounded_window_newest_and_counts_what_it_dropped() {
   assert_eq!(seqs(&again), window, "and so does a snapshot");
   assert_eq!(again.partition().audit_dropped(), RECORDS - WINDOW as u64);
 }
+
+/// A-267 (§4.15, §4.14). Do: with the audit bounded at 16 records, append 40, so the oldest 24 are dropped; then read
+/// the window from every sequence before, inside and past it, and again after a recovery. Expect: each read is exactly
+/// the window's records at or past the sequence, oldest first, as filtering the whole window gives: a sequence before
+/// the window starts at its oldest, and one past the newest reads nothing. The read is a seek, so a page of the audit
+/// costs the records it carries, not the window.
+#[test]
+fn a_read_from_any_sequence_is_the_window_past_it() {
+  let bounded = PartitionCaps {
+    audit_records: WINDOW,
+    ..caps()
+  };
+  let mut seg = segment("slates-db-audit-from");
+  let (mut db, _) = recover(&mut seg, 0, bounded, NOW_NS).unwrap();
+  for landing in 0..RECORDS {
+    db.mutate(&mut seg, &planned(landing), NOW_NS).unwrap();
+  }
+  let check = |db: &slates_db::Db| {
+    for since in 0..RECORDS + 2 {
+      let sought: Vec<u64> = db
+        .partition()
+        .audit_from(since)
+        .map(|record| record.seq)
+        .collect();
+      let filtered: Vec<u64> = db
+        .partition()
+        .audit()
+        .filter(|record| record.seq >= since)
+        .map(|record| record.seq)
+        .collect();
+      assert_eq!(sought, filtered, "from {since}");
+    }
+  };
+  check(&db);
+  assert_eq!(
+    db.partition().audit_from(0).next().map(|record| record.seq),
+    Some(RECORDS - WINDOW as u64),
+    "a sequence before the window starts at its oldest"
+  );
+  drop(db);
+  let (recovered, _) = recover(&mut seg, 0, bounded, NOW_NS).unwrap();
+  check(&recovered);
+}

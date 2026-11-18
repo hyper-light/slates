@@ -22265,6 +22265,11 @@ send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }
   records stay in the atom. A crash between the owner's commit and the batch loses the batch; the owner's records and
   the completion stand.
 - **Cost:** a granted landing of 1,000 files of 1 KiB from the shard that is not the control shard, its 1,000 `entry_written` records and its others crossing as one batch (`crates/server/tests/audit_land_cost.rs`, release, two shards, this Mac at load 40 to 100, before and after alternated ABBA three times, 2026-11-09): before, a landing's median 968 ms and fastest 430 ms; after, 827 ms and 424 ms (25 landings each, the first pair dropped as the warm-up). No cost shows within the noise: the crossing is one message and one transaction against a landing's own writes and fsyncs.
+- **A seek (2026-11-17, goal g247):** a page of the audit filtered the whole window from its oldest record, so a walk
+  of the window cost its square; it seeks to `since` (`Partition::audit_from`, a binary search over the window, which
+  is in sequence order), so a page costs the records it carries. Checked against the filter from every sequence before,
+  inside and past a window that dropped its oldest, and after a recovery
+  (`a_read_from_any_sequence_is_the_window_past_it`).
 - **Proven:** numbering and recovery, and the bounded window over a replay and a snapshot, in the database; a client on
   either of two shards reads every shard's records at once after a landing's reply
   (`a_client_on_any_shard_reads_every_shards_audit`); the audit paged by use.
