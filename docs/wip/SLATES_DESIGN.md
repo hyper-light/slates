@@ -11934,7 +11934,9 @@ native since GitHub's `windows-11-arm` image (actions/runner-images#14592)]
 Recipes to copy verbatim:
 - One raw binary per platform attached to the GitHub release, no archive; `cargo-binstall`
   overrides name each asset explicitly and "unsupported targets fail instead of guessing".
-  [C: release.yml:1-16; crates/cli/Cargo.toml:78-103]
+  [C: release.yml:1-16; crates/cli/Cargo.toml:78-103] Built in slates since 2026-11-18 (A-413):
+  `crates/cli/Cargo.toml`'s `[package.metadata.binstall]`, one override per entry of `xtask/src/targets.rs`'s `ASSETS`,
+  held to it by `cargo xtask version`; the workspace names its `repository`, which `{ repo }` reads.
 - musl lanes build inside official `rust:alpine` containers, native per arch, with `apk add
   build-base`, `RUSTFLAGS="-C target-feature=+crt-static"`, the `LINKER=cc` environment override
   (env outranks `.cargo/config.toml`), and an `ldd` staticness gate that accepts both "not a
@@ -29300,3 +29302,20 @@ GAPS (the binary release lane's entry) and `docs/publish.md` ("The binary releas
   runner AC-9.5 asks for.
 - **Owed.** The proof is a release run (a tag or a dry run) whose two copies of a Windows target land on two images
   and match; filed for main. clang-cl, which compiles AWS-LC's C on arm64, still comes from the image.
+
+### A-413 — cargo-binstall installs a release binary: the CLI manifest names each shipped target's asset, and the version audit holds it to the shipped targets (2026-11-18, the release goals g236 and g237; B.2's recipe, A-210's "not yet")
+Applied in the same change to: `crates/cli/Cargo.toml` (`repository.workspace = true` and
+`[package.metadata.binstall]`), the root `Cargo.toml` (`[workspace.package] repository`), `xtask/src/version.rs`
+(`Binstall`, `read_binstall`, `audit_binstall`, five findings, and the tests
+`the_binstall_table_names_exactly_the_shipped_binaries` and `the_trees_binstall_table_names_the_release_binaries`),
+Appendix B.2, GAPS and `docs/publish.md`.
+- **What it does.** `cargo binstall --git https://github.com/hyper-light/slates slates-cli` reads the CLI manifest
+  and downloads the release binary for the machine's target: `pkg-fmt = "bin"` (a release attaches raw binaries) and
+  one override per shipped target naming `{ repo }/releases/download/v{ version }/<asset>`. A target slates does not
+  ship has no override, so the default archive names find nothing and cargo-binstall builds from source; quick-install,
+  a third party's builds, is off. vorpal's manifest is the model.
+- **Held to the shipped targets.** `cargo xtask version`, in `cargo xtask check` on every push and in every tag lane's
+  guard, refuses a shipped target with no override, an override for a target slates does not ship, an override
+  addressing another asset, an archive format, and a crate with no repository, each as its own finding.
+- **Owed.** An install against a published release (run request); publishing the crate to crates.io would let
+  `cargo binstall slates-cli` drop `--git`.

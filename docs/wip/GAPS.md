@@ -4191,7 +4191,9 @@
 >   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
 >   included, and the draft carries both digests of each. The numbers are in A-210.
 > - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
->   identity); `cargo-binstall` metadata.
+>   identity). `cargo-binstall` metadata is built (2026-11-18, A-413): `cargo binstall --git
+>   https://github.com/hyper-light/slates slates-cli` takes the release binary for a shipped target, and `cargo xtask
+>   version` holds its overrides to `ASSETS`; its first install against a published release is owed (run request).
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
