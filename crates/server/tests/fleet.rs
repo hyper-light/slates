@@ -3096,7 +3096,36 @@ fn start_mesh_unbootstrapped(
     shards,
     regions,
     mirrors,
+    |_| {},
   )
+}
+
+/// [`start_mesh_with_f`] at `shards` shards per daemon, each node's derived configuration changed by `tune` before
+/// its daemon starts: for a test that needs a derived bound small enough to reach (a shard's client seats).
+fn start_mesh_tuned(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  shards: u16,
+  tune: fn(&mut DaemonConfig),
+) -> Vec<Daemon> {
+  let none = std::collections::BTreeMap::new();
+  let daemons = start_mesh_bound_and_advertised(
+    nodes,
+    hosts.len(),
+    hosts,
+    certs,
+    (serve, serve),
+    1,
+    shards,
+    &none,
+    &std::collections::BTreeMap::new(),
+    tune,
+  );
+  bootstrap_mesh(&daemons, hosts, &none);
+  settle_initial_consensus(&daemons, hosts, &none, Quorum { f: 1 });
+  daemons
 }
 
 /// Each node's (probe, record) serve port pair, in node order.
@@ -3144,6 +3173,7 @@ fn start_mesh_bound_and_advertised(
     slates_db::register::RegionId,
     slates_db::register::RegionId,
   >,
+  tune: fn(&mut DaemonConfig),
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -3170,7 +3200,7 @@ fn start_mesh_bound_and_advertised(
         .collect();
       let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| hosts[j]).collect();
       let instance = format!("fleet3-{}-{pid}", host.0);
-      let config =
+      let mut config =
         DaemonConfig::derive(&profile, &instance, Some(shards)).with_fleet(FleetMembership {
           quorum: Quorum { f },
           peers: member_peers,
@@ -3181,10 +3211,11 @@ fn start_mesh_bound_and_advertised(
           durability: None,
           region_mirrors: mirrors.clone(),
         });
-      let config = match MESH_FAILOVER_SLO_NS.load(std::sync::atomic::Ordering::Acquire) {
+      let mut config = match MESH_FAILOVER_SLO_NS.load(std::sync::atomic::Ordering::Acquire) {
         0 => config,
         slo_ns => config.with_failover_slo(slo_ns),
       };
+      tune(&mut config);
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
@@ -12813,6 +12844,7 @@ fn mesh_with_mapped_candidates() -> (PortLease, [PortMapping; 2], Vec<Daemon>) {
     1,
     &regions,
     &std::collections::BTreeMap::new(),
+    |_| {},
   );
   bootstrap_mesh(&daemons, &seeds, &regions);
   settle_initial_consensus(&daemons, &seeds, &regions, Quorum { f: 1 });
@@ -23219,6 +23251,134 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
     head,
     ReplyBody::Versions { head: 1 },
     "nothing ran again: the green holds the one version"
+  );
+}
+
+/// The sum over `client`'s daemon's shards of the counter `kind` (`slates status`'s per-shard counts).
+fn shard_count(client: &mut Client, kind: &str) -> u64 {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("the daemon reported its status");
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|count| count.kind == kind)
+    .map(|count| count.count)
+    .sum()
+}
+
+/// Shape: a failover SLO no held reply of [`a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`]
+/// reaches: twice its longest wait ([`PLACEMENT_DEADLINE`]), so A-354 gives up none of the writes that fill the bound.
+const HELD_PAST_THE_TEST_NS: u64 = 2 * PLACEMENT_DEADLINE.as_secs() * 1_000_000_000;
+
+/// A-200 with the request window (§4.9): a verb refused `Overloaded` changed nothing, so its resend under the same id
+/// runs it once, as on a plain volume. Do: three nodes at `f = 1`, each shard seating one client, so the replies a
+/// shard may hold for durability are one ring of them; on a, a live-shipped volume with a file, then both candidates
+/// stopped, so nothing becomes durable; one client fills the owner shard's held replies with writes of the file; a
+/// second client makes a directory and, answered `Overloaded`, sends it again under its id. Expect both answers
+/// `Overloaded`, and never `AlreadyExists`: the shard was still at its bound. Before, the verb committed its effects and
+/// was refused after (`live_ship::defer`), so the resend made the directory a second time and was refused
+/// `AlreadyExists` for a directory its own first send made; an `O_APPEND` write appended twice (the supervisor's report
+/// of g232's finding, 2026-11-18).
+#[test]
+fn a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  // Two shards of one client seat each: the two clients sit on different shards, and the owner shard's bound on held
+  // replies (`live_ship::awaiting_bound`, seats times ring slots) is one client's ring.
+  // A-354 gives up a reply held past the failover SLO; held past this test's waits instead, so every held write stays
+  // held while the bound is filled and met.
+  let mut daemons = start_mesh_tuned(nodes, &hosts, &certs, &serve, 2, |config| {
+    config.clients_per_shard = 1;
+    config.failover_slo_ns = HELD_PAST_THE_TEST_NS;
+  });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut filler = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = filler.call(&scratch("over-bound")) else {
+    panic!("create");
+  };
+  share_with_fleet(&mut filler, id, &daemons);
+  let ReplyBody::Attached { attachment, .. } = filler.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
+  };
+  let shipped = filler.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let write = RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/file".to_owned(),
+    bytes: b"written".to_vec(),
+    mode: 0o644,
+  };
+  let first_write = filler.call(&write);
+  let mut maker = Client::connect(daemons[0].instance());
+  // Both candidates gone: nothing written from here becomes durable, so every write's reply is held.
+  for candidate in daemons.split_off(1) {
+    candidate.stop();
+  }
+  let held_before = shard_count(&mut maker, "fleet.live.awaited");
+  let ring = filler.end.region().cmd().slots();
+  filler.send_burst(&write, ring);
+  let ring_held = poll_until(&[&daemons[0]], PLACEMENT_DEADLINE, || {
+    Ok(shard_count(&mut maker, "fleet.live.awaited") >= held_before + u64::try_from(ring).unwrap())
+  });
+  let mkdir = RequestBody::FsMkdir {
+    volume: id,
+    attachment,
+    path: "/made".to_owned(),
+    mode: 0o755,
+  };
+  let made = maker.call(&mkdir);
+  let resent = maker.call_retry(&mkdir);
+  let over_bound = shard_count(&mut maker, "fleet.live.over_bound");
+  drop((filler, maker));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "live-ship {shipped:?}; first write {first_write:?}; {ring} writes held {ring_held}; mkdir {made:?}; resent \
+     {resent:?}; over_bound {over_bound}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    matches!(first_write, ReplyBody::FsDone { .. }),
+    "the write before the stop was durable and answered: {first_write:?}"
+  );
+  assert!(ring_held, "a ring of writes was held for durability");
+  assert!(over_bound >= 1, "the bound refused a verb (non-vacuous)");
+  let overloaded = |reply: &ReplyBody| {
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Overloaded { .. }
+      }
+    )
+  };
+  assert!(overloaded(&made), "the mkdir met the bound: {made:?}");
+  assert!(
+    overloaded(&resent),
+    "the resend met the bound again and ran nothing twice: {resent:?}"
   );
 }
 

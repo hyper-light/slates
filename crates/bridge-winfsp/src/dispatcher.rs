@@ -520,15 +520,20 @@ fn operation(
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
   CREATOR_MAY_LINK.set(creator_may_link(request)?);
-  // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
-  // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
-  // throughout the synchronous call.
-  let callback_status = unsafe {
-    callback(
-      file_system,
-      working.0.as_mut_ptr().cast(),
-      response.as_mut_ptr().cast(),
-    )
+  let callback_status = match request.link().map_err(WinFspError::Capture)? {
+    // A hard link a patched driver forwards (A-360): the DLL has no case for it, so the worker serves it itself.
+    // SAFETY: file_system is the live file system the owner keeps until this worker joins.
+    Some(link) => unsafe { crate::host::link(file_system, &link) },
+    // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
+    // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
+    // throughout the synchronous call.
+    None => unsafe {
+      callback(
+        file_system,
+        working.0.as_mut_ptr().cast(),
+        response.as_mut_ptr().cast(),
+      )
+    },
   };
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
