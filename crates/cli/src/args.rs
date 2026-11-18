@@ -124,28 +124,9 @@ impl std::fmt::Display for ParseError {
   }
 }
 
-/// Options of the anchor and the daemon.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProcessOptions {
-  /// The instance.
-  pub instance: String,
-  /// Measure the quick profile (tests; a full profile takes seconds).
-  pub quick: bool,
-  /// Shards, when the caller overrides the derivation (tests).
-  pub shards: Option<u16>,
-  /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
-  pub fleet: Option<FleetSelection>,
-}
-
-/// Which fleet node this process is: the operator's shared manifest and this node's name in it
-/// (`--fleet PATH --node NAME`; `slates_server::deploy` derives everything else from the two).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FleetSelection {
-  /// The path of the shared manifest.
-  pub manifest: String,
-  /// This node's name in it.
-  pub node: String,
-}
+// The anchor's and the daemon's options are the library's (`slates_api::role`, A-278): the roles run there, for this
+// command and for an embedding host's executable alike.
+pub(crate) use slates_api::role::{FleetSelection, ProcessOptions};
 
 /// Options of `profile`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -536,11 +517,6 @@ pub(crate) enum SharePrincipal {
     host: Option<u64>,
   },
 }
-
-/// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope
-/// names as the longest a human's single approval should stand without renewal (an agent that lands
-/// later than that re-presents its manifest for a fresh look). `--term SECONDS` overrides it.
-pub(crate) const GRANT_TERM_NS: u64 = 3_600 * 1_000_000_000;
 
 /// A client request: the instance and the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1819,7 +1795,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
             reason: e.to_string(),
           })?
           .saturating_mul(NANOS_PER_SECOND),
-        None => GRANT_TERM_NS,
+        None => slates_api::GRANT_TERM_NS,
       };
       Ok(client(
         &taken,
