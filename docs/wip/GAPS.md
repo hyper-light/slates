@@ -10061,6 +10061,25 @@ whose verifier disagrees written again — with a kill per round and a final kil
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
 
+### 2026-11-18: a WinFsp write answered before its publication may be lost across a daemon kill (A-358's sibling; open, unproven)
+
+A-358 found that an NFS write answered before any publication is lost when the daemon dies, if the client never sends
+it again (Apple's never does). WinFsp has the same shape:
+- a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
+  that wrote publish first (`crates/server/src/winfsp.rs`);
+- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- a WinFsp drive outlives a killed daemon (A-198).
+
+So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
+would answer success over the state without it, since Windows' cache manager already counts those pages clean.
+
+Owed:
+1. The test, on CI's Windows runners: `crates/cli/tests/nfs_held.rs`'s `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite`
+   shape on a WinFsp drive: write, kill, flush, close, read back.
+2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
+
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
+
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 
 The anchor now wakes on the daemon's exit (pidfd / `NOTE_EXIT`) and holds the client rendezvous. A restart: anchor +2

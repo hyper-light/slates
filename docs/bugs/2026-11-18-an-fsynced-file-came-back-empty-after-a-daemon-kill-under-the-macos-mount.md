@@ -103,9 +103,16 @@ On main (red, d1323898, 2026-11-18): all 6 COMMITs met a successor's verifier, a
 
 ## Siblings (reported, not changed here)
 
-- **WinFsp** answers a write before any publication, and only its flush takes a barrier (`Op::needs_barrier` in
-  `crates/bridge-winfsp/src/host.rs`). There is no write log off Linux. A WinFsp mount that outlived its daemon would
-  lose the same bytes behind a successful flush. Today the mount does not outlive the daemon, so the loss is not silent.
-- **Shards streams and virtio-fs** have the same shape on macOS: a write is answered before publication, and their
-  FSYNC is a barrier. The Linux path logs the write (A-63). A stream does not yet outlive its daemon ("attachments that
-  survive a daemon restart" is owed), so this is safe for now. It stops being safe when that lands.
+- **WinFsp, likely live.** A plain write is answered before any publication: only a namespace or size change, a flush,
+  and the close of a handle that wrote publish first (`crates/server/src/winfsp.rs`'s module doc; `Op::needs_barrier`
+  in `crates/bridge-winfsp/src/host.rs`). Windows has no write log (`write_log` is `#[cfg(unix)]`). A WinFsp drive
+  outlives a killed daemon (A-198: `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`, zero drives lost of
+  twenty).
+  - So a daemon killed between a paging write's reply and the next flush or close loses that write. Windows' cache
+    manager has already marked the pages clean, and the successor's flush then publishes a state without them and
+    answers success.
+  - Unproven. It needs this record's test shape on a WinFsp drive: a write, a kill, then a flush, a close and a read
+    back.
+  - The fix would be A-358's rule (every write published before its reply), or a write log on Windows.
+- **Shards streams on macOS, covered.** Since `1fa154230` (main, 2026-11-18) a stream outlives its daemon on macOS, and
+  its writes go to the write log there too (`write_log` is `#[cfg(unix)]`), so a successor replays them.
