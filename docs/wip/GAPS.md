@@ -1143,11 +1143,14 @@
 >     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
 >     and a model test, both red with the place ignored
 >     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
->   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
->     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
->     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
->     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
->     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
+>   - **Fixed (2026-11-18, A-315, goal g255): a forward still queued was given up at its stall budget while its lane
+>     moved.** Nothing of it was sent, and with its place kept its resend lost nothing, but each one cost its forwarder
+>     a give-up and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the
+>     most in the runs that starved. A queued forward's quiet now counts its lane's progress (a forward begun, a reply
+>     taken, bytes of a reply read), so it is given up only when the lane does not move for a stall budget, and the
+>     lane's progress holds it only until the failover bound from its first send (`forward_lane::Stall`,
+>     `fleet.forward.held_by_lane`). Unit-tested (`a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget`,
+>     red with the lane's progress ignored); owed: the burst's count of batches given up, run again on main.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
@@ -1619,7 +1622,15 @@
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
 >   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
->   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
+>   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
+>   quiet for its budget is given up only once its lane has found the session with nothing to read in a turn begun after
+>   the lane's shard has waited in its driver twice since the silence was seen, so an origin kept off its CPU reads its
+>   owner's replies before it calls the owner silent, and the failover bound from the forward's first send caps it
+>   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
+>   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane
+>   poll clock (`6da9670d`, CPU-credited turns of a 10 ms pace) did not land: it assumed an idle shard's timer fires on
+>   time, and Windows' 15.6 ms tick broke it (reverted from the B13 stack, `b458723c9`). C+D (A-232): the client's part
+>   is done, since a call waits while its
 >   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
 >   itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two

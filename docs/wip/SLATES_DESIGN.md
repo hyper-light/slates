@@ -5680,8 +5680,29 @@ version.
 > the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
 > `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
 > `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
-> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
-> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed then, built by A-315 (below): a forward
+> still queued was given up at its stall budget while its lane moved, so the backlog was cycled once a budget on the
+> control shard.
+
+> **Status (2026-11-18, A-315: a lane's silence is judged in its shard's own time).** A forwarder gave its batch up at
+> the first look past its stall budget. An origin whose control shard was kept off its CPU past a budget woke with its
+> owner's replies unread in its socket, and its waiting forwarders, woken by their timers ahead of the lane's driver,
+> gave those batches up to a live owner. Now a batch quiet for its budget is given up only once a turn of its lane,
+> begun after the lane's shard has waited in its driver twice since the silence was first seen (A-292's receiver rule),
+> has left the session's receive queue empty: a shard waits there only when nothing is ready to run, so by then
+> everything that reached it before is in the session's queue, and a turn that leaves the queue empty has consumed it.
+> The shard's waits alone are not enough, since another borrower (the link's discovery page) can hold the session while
+> the shard waits. A forward still queued, of
+> which nothing was sent, counts its lane's progress as its own (a forward begun, a reply taken, bytes of a reply
+> read), so a backlog that moves is no longer given up and resent once a budget (A-306's owed item). An open forward
+> still counts only its own reply's bytes (the 298 forwards of 2026-11-07). Both are bounded by the failover bound from
+> the forward's first send, which `resolve_and_forward` passes to every send: the lane's progress holds a queued
+> forward only until then, and past it a silence is given up without waiting for the receiver. The judge
+> (`forward_lane::Stall`) is pure and reads no CPU clock and keeps no poll pace, so it holds alike on every platform;
+> loadtest-scale's lane poll clock (`6da9670d`, reverted from the B13 stack) assumed an idle shard's timer fires on
+> time, which Windows' 15.6 ms tick breaks. Tests: the rule's unit and model tests, a queued forward behind a moving
+> lane, and `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (`crates/server/tests/fleet.rs`;
+> `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`).
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -22184,6 +22205,82 @@ Applied in the same change to:
   remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
+
+### A-315 — A forward lane's silence is judged once its shard has read what came, and a queued forward counts its lane's progress until its failover bound (2026-11-18, built for goal g255; A-306's owed item; supersedes loadtest-scale's lane poll clock, `6da9670d`, never on main)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-315), and A-306's status, whose owed item this builds.
+- `crates/server/src/forward_lane.rs`: `Stall` (pure, with `Heard`, `Verdict`, `GaveUp` and `Noted`), the lane's
+  `progress_ns` (a forward begun, a reply taken, bytes of a reply read) and `drained_idles` (`mark_drained`, a turn
+  that left the session's receive queue empty, `left_empty`), `look_in` and `answer_with` (the view and the reply's
+  bookkeeping apart from the shard and the session), `failover_bound_from`, `receiver_idles`; the counts
+  `fleet.forward.given_up_silent`, `fleet.forward.given_up_at_bound`, `fleet.forward.silence_awaited_receiver` and
+  `fleet.forward.held_by_lane`; the module doc. `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes
+  the bound; `forward_over_leader_session` passes one from its own send) and `crates/server/src/verbs.rs`
+  (`resolve_and_forward` passes its failover bound, from the first send, to every send through `forward_once`).
+  `crates/transport/src/endpoint.rs`: `Endpoint::datagrams_received`, the datagrams an established session took, by
+  which a lane's turn knows it left the session's receive queue empty (stream bytes would not tell: a datagram of
+  acknowledgements alone consumes none).
+- Tests: in `forward_lane.rs`, `a_silence_is_given_up_only_once_its_lane_has_drained_after_two_waits_of_its_shard`,
+  `progress_while_a_silence_awaits_its_receiver_starts_the_quiet_again`,
+  `a_queued_forward_counts_its_lanes_progress_until_its_failover_bound`,
+  `a_silence_past_its_bound_is_given_up_without_its_receiver`,
+  `a_batch_whose_own_forwards_progress_is_never_given_up_at_its_bound`,
+  `a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget` and the model test
+  `a_stall_judges_every_history_as_the_rule_reads_it`; in `crates/server/tests/fleet.rs`,
+  `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`.
+- GAPS: the load test's "dead record session" entry (A-306's open item, closed) and the R3 debt of
+  `LIVENESS_BUDGET_NS` (class B, the forward lane). The bug record:
+  `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`.
+- **What was there.** A forwarder looked at its batch whenever it woke, and gave it up once none of its forwards had
+  progressed for its stall budget on the wall clock: a liveness budget plus the path's measured round-trip tail. Two
+  things counted against a live owner. An origin whose control shard was kept off its CPU past a budget woke with the
+  owner's replies unread in its socket, and the waiting forwarders, woken by their timers, ran ahead of the lane's
+  driver, which reads one datagram a turn, and gave those batches up. And a forward still queued behind the session's
+  stream credit, of which nothing had been sent, was given up at its budget while its lane moved, and resent: behind a
+  256-client burst, 17,000 to 52,000 batches a run cycled through the control shard that way (A-306).
+- **The rule.** A batch is quiet from the latest of its start, its own forwards' progress and, while one of them is
+  still queued, its lane's progress, the last counted only up to the failover bound from the forward's first send. A
+  batch quiet for its stall budget before the bound is given up only once a driving turn of its lane, begun after the
+  lane's shard has waited in its driver twice since the silence was first seen, has left the session's receive queue
+  empty (`forward_lane::left_empty`: its drive took no datagram, or one more receive that does not wait took none,
+  counted by `Endpoint::datagrams_received`; `Lane::drained_idles`), looking again every poll interval (`HEARTBEAT_NS /
+  POLL_PER_PERIOD`); progress meanwhile ends the confirmation, and a later silence is confirmed afresh. Past the bound a
+  quiet batch is given up at once. A batch whose own forwards progress is never given up: a long read stalls only when
+  no byte of it comes for a budget, never at a deadline.
+- **Why.** A shard waits in its driver only when nothing is ready to run, and each wait collects everything readable, so
+  once it has waited twice after a moment, every datagram that reached it before that moment is in its session's queue
+  (A-292's reasoning, the same count), and a drive that then finds the queue empty has consumed it, its turn settling
+  the replies into the lane. The shard's waits alone are not enough: the link's discovery page can hold the session
+  while the shard waits, and the first form of this rule, which counted the waits alone, gave all 7 waiting batches up
+  so in 2 of the 18 CI runs it was run in, each with the lane's session found lent to the link once
+  (`fleet.lent_to.link` 1). Nor is a drive that waited and took nothing: a session busy with other forwards' replies is
+  never found so, and a forward its owner never answered stayed open there in 2 of 3 runs of its test on ubuntu-latest
+  (`a_silent_forward_gives_up_while_its_session_carries_others`, `diag-g255-lane-green-4`); an empty queue after the
+  turn's reads is the proof. The lane's state lives on its shard, so the verdict needs no further look, as A-292's
+  hand-off to a volume's shard does. A queued forward has sent nothing, so its lane moving is the only progress it can
+  make; an open one keeps to its own reply's bytes, since bytes of other forwards' replies kept forwards an owner never
+  answered open for good (the 298 forwards of 2026-11-07). The failover bound is the operator's bound on how long an
+  owner may go unserved, the bound the caller's resends already keep, so nothing here waits past it for a receiver that
+  never waits (always busy) or a lane that never begins a forward.
+- **Why not loadtest-scale's poll clock.** `6da9670d` counted the quiet on a clock each lane's driving turns credited:
+  a turn's wall time up to the larger of a 10 ms poll pace and the CPU its shard ran. It assumed an idle shard's timer
+  fires on time. Windows' completion-port wait keeps the system's 15.6 ms tick (`crates/rt/src/iocp.rs` asks no finer
+  timer), and Windows charges a thread's CPU time a tick at a time, so by the code an idle origin's clock ran at about
+  two thirds of the wall there. The test that wants a forward resent at its budget saw none resent, 5 of 5 on
+  `windows-latest` (`an_unanswered_forward_is_sent_again_within_the_takeover_bound`, run 44230887960), and it was
+  reverted from the B13 stack (`b458723c9`). The receiver's waits are counted the same way on every platform.
+- **Evidence.** `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (eight reads through b, a's
+  answers delayed half a budget, b's control shard held 1.5 budgets once the forwards were begun), on GitHub's
+  ubuntu-latest, macos-latest and windows-latest runners (2026-11-18): main's lane failed 9 of 9, each run giving up
+  and resending 7 of the 8 batches (run 44253485264); A-315 as landed passed 16 of 16 on ubuntu-latest and
+  windows-latest, none given up, 6 or 7 silences held for the receiver a run (run 44257173978), with the lane's other
+  promises kept (the silent forward given up while others flow, 12 of 12; a forward resent at its budget, 6 of 6; the
+  dead-session tests, 6 of 6 each). The bug record has the forms that did not land.
+- **Cost.** A look reads one word of the shard's registry pulse. A silence awaiting its receiver looks again every poll
+  interval, while it lasts: on a shard that waits in its driver, the first look or two. The lane's progress is one
+  stored instant per begin, reply and byte-bearing turn.
+- **Owed.** The supervisor's runs of the fleet suite under load and on Windows, and the load test's count of batches
+  given up behind a burst (A-306's 17,000 to 52,000 a run), which this should bring near none.
 
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.

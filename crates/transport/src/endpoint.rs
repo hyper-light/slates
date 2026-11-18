@@ -518,6 +518,11 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
+  /// Datagrams this established session took from its socket or its demultiplexer's queue, folded or discarded alike
+  /// ([`Endpoint::datagrams_received`]): a caller that drove the session and saw this unchanged knows its drive found
+  /// nothing to read (`slates_server`'s forward lane confirms a silence so). An injected deafness's datagrams are not
+  /// counted: such a session hears nothing, as one whose peer went away hears nothing.
+  datagrams_received: u64,
   /// Test support (never set in production): drops every datagram this end receives before the connection sees it, as
   /// a session whose peer went away without a word does (`slates_server`'s `Daemon::inject_session_deafness`).
   deaf: bool,
@@ -608,6 +613,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      datagrams_received: 0,
       deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -663,6 +669,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      datagrams_received: 0,
       deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -720,6 +727,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      datagrams_received: 0,
       deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
@@ -737,6 +745,12 @@ impl Endpoint {
   /// retransmit answered and dropped, a packet for another session, one that did not open.
   pub fn discarded(&self) -> u64 {
     self.discarded
+  }
+
+  /// Datagrams this established session has received, folded or discarded (see the field): a running total that only
+  /// rises, so a drive that leaves it unchanged read nothing.
+  pub fn datagrams_received(&self) -> u64 {
+    self.datagrams_received
   }
 
   /// The peer's end-entity certificate, once the handshake authenticated it — how a server that
@@ -1667,6 +1681,9 @@ impl Endpoint {
     }
     match self.recv_within(timeout_ns).await? {
       Some((datagram, from)) => {
+        if !self.deaf {
+          self.datagrams_received = self.datagrams_received.saturating_add(1);
+        }
         self.fold_or_discard(&datagram, from)?;
         Ok(true)
       }
