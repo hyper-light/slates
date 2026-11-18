@@ -4452,7 +4452,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
   the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
-  from the write log (A-63) as a mount's are; it removes any other's record, as before.
+  from the write log (A-63) as a mount's are. Where that log overflowed, the guest is told every file it had open may
+  have lost writes, as a taken-over mount's kernel is (`LostWrites`, A-393): a handle from before the death answers its
+  `flush` `EIO` until an `fsync` through it has, once. It removes any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -26474,7 +26476,8 @@ Applied in the same change to:
     runs the same rule.
   - **A death's lost writes are counted.** When the dead daemon's log overflowed, a resynced stream's guest is not told
     which writes it lost (a FUSE mount's is, `LostWrites`), so the successor counts
-    `shards.resync_writes_unreported` and GAPS keeps the gap.
+    `shards.resync_writes_unreported` and GAPS keeps the gap. (Amended 2026-11-18 by A-393: the guest is told, as a
+    taken-over mount's kernel is, counted `shards.resync_writes_lost`.)
   - **Evidence.** A Mac Studio, kiln run r2527: the focused tests pass (`shards_resync_restart`, `shards_resync`, the
     write log's and the replay's unit tests, the route's), and each of seven guards removed alone fails the restart
     test. Linux (adacachy, kernel 7.2.9, kiln run r3191; and GitHub's ubuntu runner, kernel 7.0.0-1016-aws, run
@@ -28524,6 +28527,32 @@ Applied in the same change to:
   volume's referenced bytes after the successor's recovery where the guest's `FORGET` left them, 39 bytes, the
   surviving file's. With the stream's `FORGET`s not logged, it fails on both: 65,575 bytes, the 64 KiB the nameless
   file kept referenced, and the 39.
+
+### A-393 — A resynced Shards stream whose dead daemon's write log overflowed tells its guest which writes it lost, as a taken-over FUSE mount does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's death bullet; A-339's entry, amended; GAPS: A-281's entry.
+- `crates/server`: `shards.rs` (`ShardsStream::lost`, set when a successor keeps the stream and handed to its bridge;
+  the counter `shards.resync_writes_lost` in place of `shards.resync_writes_unreported`), `state.rs` (`writes_lost`'s
+  notes), `daemon.rs` (`Daemon::inject_write_log_overflow`, test support); the test
+  `crates/server/tests/shards_resync_restart.rs`.
+
+- **What was there.** A daemon whose write log could not take an acknowledged write, and whose publication to empty it
+  was refused, marks the log overflowed (A-63); its successor then reports every file a taken-over FUSE mount had open
+  as having lost writes, as Linux reports a writeback error (`LostWrites`, A-61). A Shards stream kept across the death
+  (A-316, A-339) was served with no such report: the successor only counted the stream
+  (`shards.resync_writes_unreported`), so the guest's `fsync` of a file whose acknowledged write was gone succeeded.
+- **The rule.** A stream a successor keeps carries the death's losses: every file where the dead daemon's log
+  overflowed, none otherwise. Its bridge tells the guest as a mount's tells its kernel: a handle from before the death
+  that names a lost file answers its `flush` `EIO` until an `fsync` through it has, once; after that both succeed, and a
+  handle opened since is told nothing. Counted, `shards.resync_writes_lost`.
+- **The test.** `Daemon::inject_write_log_overflow` marks every shard's log overflowed, the very predicate a refused
+  publication of a full log leaves, so the test drives what the successor tells the guest, not the starving of a
+  publication; the overflow's own path is the write log's unit tests'.
+- **Evidence.** Linux (adacachy, kiln runs r266 and r269) and a Mac Studio (r267): the restart test passes, its guest
+  told: `EIO` for the flush and the first fsync through the handle from before the death, nothing for the second fsync,
+  the flush after it or a handle opened since. Each guard removed alone fails it, the flush answered 0 where `EIO`
+  belongs: the stream's bridge given no record of its losses (both platforms), and a resynced stream given none
+  (Linux).
 
 ### A-291 — A volume moves to another fleet member by place, switch, adopt and release (accepted and built 2026-11-18, kiln goal g267: the slates server federates across kiln runners, an agent moved between runners carries on with its volume)
 Applied in the same change to: §4.8 "Authority scope" (its status, amended), §4.10 "Ownership follows the writer" (its
