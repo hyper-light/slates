@@ -388,7 +388,9 @@ fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict
     run,
     now_ns: now,
   };
-  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
+  // A start's thread is held to the liveness budget itself, whatever the build: A-318 holds only the daemon's own
+  // watchdog to the build's measured slowdown and leaves the anchor's judgments at the budget.
+  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS);
   *watch = next;
   verdict
 }
@@ -526,10 +528,10 @@ fn start_stuck(verdict: Verdict) -> Option<String> {
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
-    Verdict::Spinning { cpu_ns } => Some(format!(
+    Verdict::Spinning { cpu_ns, window_ns } => Some(format!(
       "ran {} ms of CPU on one thread without beating (the {} ms liveness window)",
       cpu_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      window_ns / NS_PER_MS
     )),
   }
 }
@@ -831,7 +833,10 @@ mod lapse_tests {
     }
     for stuck in [
       Verdict::Wedged { for_ns: window },
-      Verdict::Spinning { cpu_ns: window },
+      Verdict::Spinning {
+        cpu_ns: window,
+        window_ns: window,
+      },
     ] {
       assert!(
         matches!(judge_lapse(false, || stuck), Lapse::Stuck(_)),

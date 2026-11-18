@@ -370,9 +370,15 @@
 >   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
 >   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
 >   without the guard: granted) and `fs_server.rs`'s server-node agent
->   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
->   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
->   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Built the same day, its
+>   siblings:** `Enroll` and `Revoke` verified the proof alone, so a consumer-bound channel holding a genuine proof
+>   could enroll a fresh consumer (binding a channel that escapes its own consumer policy) or revoke another agent's.
+>   Both now refuse `Forbidden` before the proof (`enroll_by_consumer`, `revoke_by_consumer`):
+>   `an_agent_cannot_enroll_or_revoke_a_consumer`, each guard red-checked alone (GitHub run 44274679371, Linux x86_64:
+>   without the enroll guard the agent's channel was handed consumer 11; without the revoke guard its revocation
+>   answered `Ok`; with both, `write_policy.rs` 11 of 11, `consumers.rs` 1 of 1, the server's unit tests 311 passed,
+>   clippy clean). The sweep of every launcher-proof check (the six callers of `landing::proven_by_launcher`, and
+>   consensus control) found no other: consensus control already refuses any principal but an OS account.
 
 > **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
 > (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
