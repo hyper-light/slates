@@ -1,0 +1,26 @@
+record dial pinning test (diag: the record dial's pinning test on both Linux runners, past main's known red -- diagnostics only, never on main: CI) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit 3861acae9247d2875adb60e3c30a6eed0a1cf3f3, parent 6ea672710adf0995cb9002176e907fd04f46e1c8
+== build: exit 0 in 86 s (build.log)
+run 1: pass in 2 s
+run 2: pass in 3 s
+run 3: pass in 2 s
+run 4: pass in 2 s
+run 5: pass in 2 s
+run 6: pass in 2 s
+run 7: pass in 2 s
+run 8: pass in 2 s
+run 9: pass in 2 s
+run 10: pass in 2 s
+run 11: pass in 3 s
+run 12: pass in 2 s
+run 13: pass in 2 s
+run 14: pass in 2 s
+run 15: pass in 2 s
+run 16: pass in 2 s
+run 17: pass in 2 s
+run 18: pass in 2 s
+run 19: pass in 2 s
+run 20: pass in 2 s
+== pinning test: 20 passed, 0 failed of 20
+== fleet binary: exit 0 in 729 s (fleet.log)
+   test result: ok. 119 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 728.42s
