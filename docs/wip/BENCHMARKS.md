@@ -13286,3 +13286,89 @@ held version 0's inputs (`merge.inputs_unheld` 709 each).
   inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. A second run (11:02 UTC) logged
   the same two lines with the same byte counts, so it is deterministic here. The seeding fix could not be exercised;
   the run is owed again once the volume recovers. Reported to goal 232.
+
+## A GiB volume's seal and a holder's return over thousands of live volumes, after the turns: both under the window, the seal 14 minutes long, one step at its end that grows with the volume (A-323, A-324; goal 230's landing; 2026-11-18)
+
+**What it is.** The two bounds goal 230's landing (`ca216dbf8`) owed at scale, measured on main by the measurer's
+uncommitted harness: two tests appended to `crates/server/tests/fleet.rs` in a scratch copy only (never on main), each
+a three-node `f = 1` fleet in one process (`formed_mesh`; a fleet test node has one shard, so the owner shard is its
+control shard), nothing injected, so the shard's own quantum slices the work.
+- *The seal (A-323).* On node a, a volume of 1,024 MiB (and of 256 MiB) of bytes no chunk repeats, written over a's NFS
+  port in 16 MiB files of 64 KiB `FILE_SYNC` writes, then sealed by a snapshot. Read: the wall time from the snapshot
+  to `AwaitPlaced` answering placed (polled every 20 ms), the wrap's turns (`fleet.seal.wrap_slices`), the record
+  periods the seal walk ran (`fleet.seal.walks`), each node's longest step (the shard pulse's `longest_step_ns`, a
+  maximum since the node started) before the snapshot and after placement, and in a fourth run each moment the owner's
+  longest step rose while the seal ran.
+- *The return (A-324).* On a, 1,000 (and 4,000) live-shipped volumes bounded at 64 KiB, made by 16 clients at once,
+  each written once at durability; b settled (it holds every log, the same positions at two reads in a row); then, as
+  `a_holders_return_is_walked_in_turns_and_it_takes_every_log` does, b's control shard held for two liveness budgets
+  while one client writes the volumes again in order, one at a time, until the hold's span has passed. Read: the time
+  from the hold's end until b holds every volume written again one entry past where it settled (each read one volume
+  at a time through `Daemon::fleet_live_held`, since a status report of thousands of live logs is past a test client's
+  status capacity), a's walk turns (`fleet.live.reached_slices`), and each node's longest step before the hold and
+  after the catch-up.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, 16 KiB pages, so a
+256 KiB chunk), 2026-11-18 12:30 to 14:08 UTC, load 5.1 to 19.1 from other work (no quieter host was free). Release
+`fleet` test binary of main `1eca77263` with the harness appended.
+
+**Command.** `SLATES_TEST_MEASURE=1 SLATES_MEASURE_DEADLINE_SECS=3600 SLATES_MEASURE_SEAL_MIB=<1024|256> fleet --exact
+measure_a_large_volume_seals_in_turns --nocapture`, and `SLATES_MEASURE_LIVE_VOLUMES=<1000|4000> fleet --exact
+measure_a_holders_return_over_thousands_of_live_volumes --nocapture`, each its own process, one at a time.
+
+**The seal.**
+
+| Volume | Run | Placed after the snapshot | Wrap turns | Record periods | a's longest step, before → after | b's, c's after |
+|---|---|---|---|---|---|---|
+| 1,024 MiB | 1 | 845.7 s | 4,096 | 8,310 | 2.2 → 230.5 ms | 20.7, 18.9 ms |
+| 1,024 MiB | 2 | 847.3 s | 4,096 | 8,314 | 1.8 → 272.2 ms | 18.1, 9.5 ms |
+| 1,024 MiB | 3 | 847.9 s | 4,096 | 8,318 | 2.2 → 233.2 ms | 10.5, 11.8 ms |
+| 1,024 MiB | 4 | 847.6 s | 4,096 | 8,321 | 2.1 → 243.4 ms | 13.7, 21.0 ms |
+| 256 MiB | 1 | 211.4 s | 1,024 | 2,079 | 3.6 → 42.7 ms | 2.2, 2.3 ms |
+| 256 MiB | 2 | 211.1 s | 1,024 | 2,078 | 0.6 → 23.6 ms | 7.9, 2.2 ms |
+| 256 MiB | 3 | 213.4 s | 1,024 | 2,089 | 0.6 → 27.6 ms | 4.4, 31.8 ms |
+
+The volume was written in 1.7 to 2.5 s (1,024 MiB) and 0.4 to 0.7 s (256 MiB), no write refused. Where the owner's
+longest step rose (runs 4 and 3): at 1,024 MiB it stayed at or under 5.6 ms through the archive walk and all 4,096
+wrap turns; then, at 838.17 to 838.72 s, with the wrap complete and the content not yet placed, it rose to 9.0, then
+152.9, then 243.4 ms; placed 8.9 s later. At 256 MiB it stayed at or under 9.8 ms until 210.06 s, then rose to 27.6 ms,
+3.4 s before placed.
+
+**The return.**
+
+| Live volumes | Run | Written again in the hold | b caught up after the hold ended | a's walk turns | a's longest step, before → after |
+|---|---|---|---|---|---|
+| 1,000 | 1 | 1,000 in 0.92 s | 0.279 s | 285 | 8.2 → 12.0 ms |
+| 1,000 | 2 | 1,000 in 1.07 s | 0.322 s | 338 | 11.2 → 11.2 ms (no rise) |
+| 1,000 | 3 | 1,000 in 1.01 s | 0.315 s | 270 | 7.3 → 11.0 ms |
+| 1,000 | 4 | 1,000 in 1.04 s | 0.250 s | 223 | 7.1 → 11.6 ms |
+| 1,000 | 5 | 1,000 in 0.93 s | 0.149 s | 173 | 10.2 → 11.4 ms |
+| 4,000 | 1 | 857 in 2.02 s | 0.237 s | 450 | 28.9 → 40.1 ms |
+| 4,000 | 2 | 979 in 2.00 s | 0.330 s | 458 | 46.8 → 46.8 ms (no rise) |
+| 4,000 | 3 | 1,071 in 2.00 s | 0.350 s | 391 | 29.8 → 37.8 ms |
+| 4,000 | 4 | 999 in 2.00 s | 0.308 s | 262 | 28.8 → 42.0 ms |
+| 4,000 | 5 | 960 in 2.00 s | 0.376 s | 405 | 51.8 → 51.8 ms (no rise) |
+
+The volumes were made in 13.9 to 14.1 s (1,000) and 62.9 to 66.0 s (4,000), none refused; b's hold was measured at
+2.000 to 2.139 s, so b's own longest step after is the hold itself. In every run a's `fleet.live.appended` rose by
+exactly the writes made, b's `fleet.live.held` by one more than that, and nothing stayed behind. Where a's longest step
+did not rise, no step of the return was longer than the step the setup had already taken (46.8 and 51.8 ms, made while
+4,000 volumes were created).
+
+**What it means.**
+- **Both bounds hold at this scale, on this Mac.** No owner step reached the 1 s watchdog window: 230 to 272 ms during
+  a GiB seal, at most 42 ms (or, where it did not rise, the setup's 52 ms) during a return over 4,000 live volumes on
+  one shard. The return's walk ran in 173 to 458 turns, and b held every log 0.15 to 0.38 s after its hold ended.
+- **The wrap is in turns, but the step after it is not.** The owner's longest step through the archive walk and the
+  4,096 wrap turns stayed at or under 5.6 ms; the steps of 153 and 243 ms came once the wrap was complete, before the
+  content placed. It grows with the volume: 23.6 to 42.7 ms at 256 MiB, 230 to 272 ms at 1,024 MiB, about a quarter of
+  a millisecond a MiB on this Mac, so a volume of about 4 GiB would reach the window here (an extrapolation, not
+  measured). Which step it is (the envelope's completion, or the first content round's put) the trace cannot say.
+  Reported to goal 230.
+- **A GiB seal takes fourteen minutes.** The seal walk advances each volume's seal one slice a record period
+  (`run_record_period`, 100 ms): 8,310 to 8,321 periods for 1,024 MiB, 2,078 to 2,089 for 256 MiB, linear in the
+  volume (101.7 ms a period). About half are the archive walk (about 259 KB a slice here) and half the wrap, which seals
+  one chunk a turn at this quantum: 4,096 turns for 4,096 chunks of 256 KiB. On a host with 4 KiB pages the chunk is
+  64 KiB, so the same wrap would be 16,384 periods, about 27 minutes on its own (computed here, not measured). Before
+  A-323 the wrap was one turn, and about a GiB ran past the window; now it places, slowly. Reported to
+  goal 230.
