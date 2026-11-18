@@ -3701,7 +3701,9 @@
 >   owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
->   asked path's measured tail, `owner_location::round_budget_for`) and the forward lane's stall (2026-11-18, A-315,
+>   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
+>   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
+>   the path's measured round-trip tail, `verbs::forward_stall_ns`) and the forward lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies

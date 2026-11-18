@@ -30620,3 +30620,22 @@ takeover status, after A-429's), GAPS (A-422's entry, its third sibling) and the
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{moves,takeover,verbs,
 daemon}.rs`.
+
+### A-439 — An operator's promotion forwarded to the root group's leader runs under the stall every forward over a leader session takes (2026-11-18, built for goal g255; R3's class B, item B-b; §4.8, D-14; A-228, A-315, A-352)
+- **What was there.** `promote-region` issued on a node that does not lead the root group is forwarded to the leader
+  it knows (`verbs::promote_region_here_or_forward`) over that leader's session, through the forward lane, with a
+  stall budget of one liveness window. A verb's forward to its owner over the same lane (`verbs::forward_once`) has run
+  under the window plus the measured round-trip tail of the path to its target since its WAN fix, so a leader across a
+  path slower than a window had the promotion's answer given up and the operator told `NotRootLeader`, while the same
+  path carried a verb's forward.
+- **The rule.** One derivation for every forward over a leader session (`verbs::forward_stall_ns`): one liveness
+  window, the lateness a live party may show before it is judged (A-228), plus the measured round-trip tail of the path
+  to the peer (`PathRtt`, RFC 6298 per path; none before the first sample). The promotion's forward reads it, as a
+  verb's does; the lane's silence judgment after a drained receiver (A-315) and its failover bound held to the path's
+  floor (A-352) still end a forward to a dead leader.
+- **Test.** `a_forward_over_a_slow_path_gets_its_round_trip_tail_on_top_of_a_window` (`crates/server/src/verbs.rs`):
+  with the path to a peer measured at two liveness windows a round trip, the stall is past that tail by a window; with
+  nothing measured, one window.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/verbs.rs`.
