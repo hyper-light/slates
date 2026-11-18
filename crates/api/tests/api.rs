@@ -1237,6 +1237,7 @@ mod shards {
 /// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop.
 #[cfg(unix)]
 mod asynchronous_form {
+  use std::cell::Cell;
   use std::os::fd::BorrowedFd;
   use std::pin::pin;
   use std::task::{Context, Poll, Waker};
@@ -1249,11 +1250,22 @@ mod asynchronous_form {
   /// guard against a call that loops without waiting.
   const POLLS: usize = 4;
 
+  /// Shape: how many times the rounds the cancellation case wants dropped it may run: a round whose call is answered on
+  /// its first poll (the daemon replied before the call reached its wait) drops nothing and runs again.
+  const ROUNDS_PER_DROP: usize = 4;
+
   /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
   /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A wait
   /// with no timeout is bounded by the suite's wait and fails past it, so a call that would wait for good fails the
-  /// test instead of hanging it.
-  struct Blocking;
+  /// test instead of hanging it. It counts how its waits ended, the evidence a test prints: a wait that timed out is
+  /// the driver's deadline, not a reply's signal.
+  #[derive(Default)]
+  struct Blocking {
+    /// Waits the completion signal ended.
+    readable: Cell<u64>,
+    /// Waits the timeout ended.
+    timed_out: Cell<u64>,
+  }
 
   impl Reactor for Blocking {
     fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
@@ -1275,6 +1287,12 @@ mod asynchronous_form {
         Ok(_) => Ok(Woke::Readable),
         Err(errno) => Err(std::io::Error::from(errno)),
       };
+      let counted = match woke {
+        Ok(Woke::Readable) => &self.readable,
+        Ok(Woke::TimedOut) => &self.timed_out,
+        Err(_) => return Box::pin(std::future::ready(woke)),
+      };
+      counted.set(counted.get().saturating_add(1));
       Box::pin(std::future::ready(woke))
     }
   }
@@ -1302,12 +1320,15 @@ mod asynchronous_form {
   }
 
   /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
-  /// provision a clone of the snapshot, ask the status of a volume no one made; then, more times than twice the calls
-  /// the client admits outstanding, drop a status call while its wait has not answered and ask again; destroy the
-  /// clone, and give the instance back to the synchronous form. Expect each answer as the synchronous verb answers it,
-  /// the stranger refused `NotFound` naming the volume, every call after a dropped one answered (a dropped call is
-  /// cancelled and its reply dropped when it comes; calls left in the driver would fill it and have one refused
-  /// `TooManyOutstanding`), and the synchronous form still serving afterwards.
+  /// provision a clone of the snapshot, ask the status of a volume no one made; then drop a status call while its wait
+  /// has not answered, and ask again, until more calls have been dropped than twice the calls the client admits
+  /// outstanding (a call the daemon answered before it reached its wait is answered on its first poll, drops nothing,
+  /// and the round runs again); destroy the clone, and give the instance back to the synchronous form. Expect each
+  /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, every call after a
+  /// dropped one answered (a dropped call is cancelled and its reply dropped when it comes; calls left in the driver
+  /// would fill it and have one refused `TooManyOutstanding`), every drop made within the rounds' bound, and the
+  /// synchronous form still serving afterwards. The reactor's wakes and the slowest answered round are printed: a
+  /// round's wait that timed out was ended by the driver's deadline, not by its reply's signal.
   #[test]
   fn an_async_instance_provisions_snapshots_reports_and_destroys() {
     let (daemon, mut instance) = grouped("async");
@@ -1316,52 +1337,87 @@ mod asynchronous_form {
       .outstanding_limit()
       .saturating_mul(2)
       .saturating_add(1);
+    let reactor = Blocking::default();
     let mut instance = AsyncInstance::new(instance).unwrap();
-    let volume = block_on(instance.provision(&Blocking, &VolumeSpec::empty("async", ROOM)))
+    let volume = block_on(instance.provision(&reactor, &VolumeSpec::empty("async", ROOM)))
       .unwrap()
       .volume();
-    let snapshot = block_on(instance.snapshot(&Blocking, volume)).unwrap();
-    let status = block_on(instance.status(&Blocking, volume)).unwrap();
+    let snapshot = block_on(instance.snapshot(&reactor, volume)).unwrap();
+    let status = block_on(instance.status(&reactor, volume)).unwrap();
     assert_eq!((status.name.as_str(), status.snapshots), ("async", 1));
     let copy = block_on(instance.provision(
-      &Blocking,
+      &reactor,
       &VolumeSpec::clone_of("async-copy", volume, snapshot),
     ))
     .unwrap()
     .volume();
     assert_eq!(
-      block_on(instance.status(&Blocking, NOWHERE)),
+      block_on(instance.status(&reactor, NOWHERE)),
       Err(Error::NotFound(Missing::Volume(NOWHERE)))
     );
-    eprintln!("dropping {abandoned} calls while they wait, each followed by a call answered");
-    for round in 0..abandoned {
-      {
-        let waiting = instance.status(&Never, volume);
-        let mut waiting = pin!(waiting);
-        let mut context = Context::from_waker(Waker::noop());
-        assert!(
-          waiting.as_mut().poll(&mut context).is_pending(),
-          "round {round}: the call waits on the host's loop"
-        );
-      }
-      let answered = block_on(instance.status(&Blocking, volume));
-      assert!(
-        answered.is_ok(),
-        "round {round}: a dropped call is cancelled, so the next is answered: {answered:?}"
-      );
-    }
+    let (dropped, slowest) = drop_and_ask_again(&mut instance, &reactor, volume, abandoned);
+    eprintln!(
+      "dropped {dropped} of {abandoned} calls; the slowest answered round took {slowest:?}; the reactor's waits ended \
+       {} by the signal, {} by the driver's deadline",
+      reactor.readable.get(),
+      reactor.timed_out.get()
+    );
     assert_eq!(
-      block_on(instance.status(&Blocking, copy)).map(|status| status.name),
+      dropped, abandoned,
+      "every drop made within the rounds' bound"
+    );
+    assert_eq!(
+      block_on(instance.status(&reactor, copy)).map(|status| status.name),
       Ok("async-copy".to_owned()),
       "a dropped call leaves the instance serving"
     );
-    block_on(instance.destroy(&Blocking, copy)).unwrap();
+    block_on(instance.destroy(&reactor, copy)).unwrap();
     let mut instance = instance.into_instance();
     assert_eq!(
       instance.status(volume).map(|status| status.snapshots),
       Ok(1)
     );
     daemon.stop();
+  }
+
+  /// The cancellation case of `an_async_instance_provisions_snapshots_reports_and_destroys`: rounds of a status call of
+  /// `volume` polled once on a loop that never answers and dropped, then one asked on `reactor`, until `wanted` calls
+  /// were dropped or [`ROUNDS_PER_DROP`] times that many rounds ran. A call the daemon answered on its first poll drops
+  /// nothing and must have been answered. Each asked call must be answered. The calls dropped, and the slowest round's
+  /// asked call.
+  fn drop_and_ask_again(
+    instance: &mut AsyncInstance,
+    reactor: &Blocking,
+    volume: VolumeId,
+    wanted: usize,
+  ) -> (usize, Duration) {
+    let mut dropped = 0;
+    let mut slowest = Duration::ZERO;
+    for round in 0..wanted.saturating_mul(ROUNDS_PER_DROP) {
+      if dropped == wanted {
+        break;
+      }
+      {
+        let waiting = instance.status(&Never, volume);
+        let mut waiting = pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        match waiting.as_mut().poll(&mut context) {
+          Poll::Pending => dropped += 1,
+          Poll::Ready(answered) => assert!(
+            answered.is_ok(),
+            "round {round}: a call answered on its first poll: {answered:?}"
+          ),
+        }
+      }
+      let asked = Instant::now();
+      let answered = block_on(instance.status(reactor, volume));
+      slowest = slowest.max(asked.elapsed());
+      assert!(
+        answered.is_ok(),
+        "round {round}: a dropped call is cancelled, so the next is answered: {answered:?}"
+      );
+    }
+    (dropped, slowest)
   }
 }
 
