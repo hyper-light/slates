@@ -56,11 +56,11 @@ pub use slates_ipc::protocol::{
   GroupReport, HostAnswer, HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent,
   JournalReport, KernelCache, LandingDegradation, LandingDurability, LandingOutcome,
   LandingSummary, LearnerReport, NamePolicy, OciBinding, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal,
-  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
+  PlannedContent, PlannedEntry, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
+  Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
   SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
   StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode, WritePolicy,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).
