@@ -3291,7 +3291,9 @@ pub enum Refusal {
     /// What stopped the publication.
     reason: String,
   },
-  /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4).
+  /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4). Superseded by
+  /// [`Refusal::Target`], which types the reason (A-299, 2026-11-18): no daemon of this build sends it; kept for the
+  /// wire's append-only rule.
   TargetUnavailable {
     /// What was wrong.
     reason: String,
@@ -3586,6 +3588,61 @@ pub enum Refusal {
     /// Why, typed.
     refusal: DatabaseRefusal,
   },
+  /// A target the verb needs cannot be used: a landing's directory, a mount point, or the mount the daemon made there
+  /// (§4.15 step 4, §4.6). Until 2026-11-18 its reason was words (`TargetUnavailable`). Appended.
+  Target {
+    /// Why, typed.
+    refusal: TargetRefusal,
+  },
+}
+
+/// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
+/// mount's refusal. The path is the caller's own, so none carries it. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRefusal {
+  /// The path is not absolute.
+  NotAbsolute,
+  /// A component escapes the landing's target directory.
+  Escapes,
+  /// The entry does not exist.
+  Missing,
+  /// Not a directory where one is needed.
+  NotDirectory,
+  /// Not a file where one is needed.
+  NotFile,
+  /// A handle the host no longer holds.
+  Stale,
+  /// Owned by another user than the one the verb runs for: the owner's uid, where the host named it.
+  OwnedByAnother {
+    /// The owner's uid.
+    owner: Option<u32>,
+  },
+  /// The host refused the path: its OS error number.
+  Host {
+    /// The OS error number.
+    errno: i32,
+  },
+  /// The kernel's mount table names no mount of this daemon's there.
+  NotMounted,
+  /// This daemon already records as many of its own mounts as it can: the bound.
+  RecordsFull {
+    /// The most mounts the daemon records.
+    capacity: u64,
+  },
+  /// This daemon has no tag to name its own mounts by, so it cannot record one (A-227).
+  NoOwnMountTag,
+  /// The OS's mount helper or kernel refused the mount: the OS error number, when one was given (the helper's own
+  /// words, and how it exited, are in the daemon's log).
+  MountRefused {
+    /// The OS error number.
+    errno: Option<i32>,
+  },
+  /// The mount point is not a drive letter (`S:`).
+  NotADriveLetter,
+  /// The anchor's hold on the drive did not answer within its bound (A-206): the mount, or its release, waits on it.
+  AnchorHold,
+  /// A detach of this drive already waits for the anchor's release.
+  DetachPending,
 }
 
 /// What the daemon's database refused, where the refusals before [`Refusal::Database`] name nothing closer (A-299):

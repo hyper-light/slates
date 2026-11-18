@@ -150,10 +150,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reached a consumer as an invalid request carrying words (A-299; the same day). 18: a snapshot's retention refused is
 /// typed apart from the quota (`VolumeRefusal::RetentionExceeded`, exhausted as `Exhausted::Volume`): until then the
 /// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
-/// day).
+/// day). 19: a target's refusal is typed (`HostFault::Target(TargetRefusal)`, the wire's appended `Refusal::Target`):
+/// until then a landing target's, a mount point's and a mount's refusals carried the daemon's words; the superseded
+/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 18;
+pub const CONTRACT: u32 = 19;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
@@ -162,8 +164,8 @@ pub use slates_ipc::protocol::{
   AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope, GreenBase,
   HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
   LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent,
-  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TargetRefusal, TelemetryReport,
+  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

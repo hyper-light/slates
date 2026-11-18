@@ -486,20 +486,25 @@
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
-> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
->   the integrator's two Windows failures; the sibling sweep, 2026-11-18: five arms that bypassed `refusal_of_vfs`
->   and answered a directory in words now go through it: a read map's (`direct_map.rs`, two arms, one variant
->   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
->   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
->   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. a snapshot's retention refused is typed apart from the quota (`VolumeRefusal::RetentionExceeded`, `CONTRACT` = 18,
->   where it was `NoSpace`, read as the quota); `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
->   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
->   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
->   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
->   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
->   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
+> - built: every refusal typed, never words (A-299's sweep, 2026-11-18):
+>   - `CONTRACT` = 15: the volume core's refusals (`Refusal::Volume`), no catch-all left in `refusal_of_vfs`;
+>   - `CONTRACT` = 16: an unmount's unasked volumes answered, and a host refusal rendered in words (the integrator's two
+>     Windows failures);
+>   - five arms that answered a directory in words now go through `refusal_of_vfs`: a read map's (`direct_map.rs`),
+>     a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`); tests in
+>     `crates/client/tests/client.rs`;
+>   - the 11 admission arms that sent a memory error in words, the two that answered a full registry, and a
+>     database's memory refusal now go through `refusal_of_mem`;
+>   - `CONTRACT` = 17: the database's last words (`Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
+>     `SealKeyMalformed`, `Wire`) are `Refusal::Database { DatabaseRefusal }`, `Unusable::Database`;
+>   - `CONTRACT` = 18: a snapshot's retention refused is `VolumeRefusal::RetentionExceeded`, apart from the quota's
+>     `NoSpace`;
+>   - `CONTRACT` = 19: a target's refusal is `Refusal::Target { TargetRefusal }`, where `TargetUnavailable` carried
+>     words (a landing target's, a mount point's, a mount's);
+> - owed: typed fields on the wire for a merge's versions (the work's base beside the head), and for the words the crate
+>   still reads from the daemon's closed tables (a landing's state, a summary's actions, the audit's kinds, a grant's
+>   state); an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read
+>   typed from its entries;
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
