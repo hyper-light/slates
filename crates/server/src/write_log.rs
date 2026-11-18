@@ -16,9 +16,10 @@
 //! does the log record that it overflowed: the next daemon then cannot replay every write, and reports every file a
 //! taken-over mount had open as having lost writes (`slates_bridge_core::LostWrites`), never a silent hole.
 //!
-//! The log holds the `FORGET`s since the last publication too: a `FORGET` gives back lookup references the kernel
-//! held, takes no reply, and is never resent, so one served after the last publication and lost with its daemon left
-//! the references counted for good (GAPS, A-154's sibling). A successor gives back each logged `FORGET` after the
+//! The log holds the `FORGET`s since the last publication too, a FUSE mount's and a Shards stream's whose resync end the
+//! anchor holds (A-390): a `FORGET` gives back lookup references the kernel held, takes no reply, and is never resent,
+//! so one served after the last publication and lost with its daemon left the references counted for good (GAPS, A-154's
+//! sibling). A successor gives back each logged `FORGET` after the
 //! writes logged before it. A `FORGET` the log cannot take forces a publication as a write does; a refused one is
 //! counted, never marked as an overflow, since no write was lost.
 //!
@@ -141,8 +142,7 @@ pub(crate) struct WriteLog {
   used: usize,
   stamp: u64,
   /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
-  /// Read by FUSE's flush rule alone ([`WriteLog::holds_every_write`]; Linux): a Shards stream's flush always publishes.
-  #[cfg(target_os = "linux")]
+  /// Read by the flush rule ([`WriteLog::holds_every_write`]) of a FUSE mount (Linux) and of a Shards stream (A-399).
   overflowed: bool,
   /// How far into the record area pages may be resident since they were last given back ([`WriteLog::purge`]): the
   /// furthest any record reached, or the whole area for a log opened over memory a predecessor may have written.
@@ -225,14 +225,10 @@ impl WriteLog {
       written: capacity,
       used: 0,
       stamp: image_generation,
-      #[cfg(target_os = "linux")]
       overflowed: false,
     };
     let recovered = log.read(object, image_generation);
-    #[cfg(target_os = "linux")]
-    {
-      log.overflowed = recovered.everything_lost;
-    }
+    log.overflowed = recovered.everything_lost;
     if recovered.records.is_empty() && !recovered.everything_lost {
       let _ = log.clear(object, image_generation);
     }
@@ -386,16 +382,12 @@ impl WriteLog {
   /// Records that an acknowledged write could not be logged, so the next daemon reports every file as having lost
   /// writes rather than replaying an incomplete log.
   pub(crate) fn overflow(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
-    #[cfg(target_os = "linux")]
-    {
-      self.overflowed = true;
-    }
+    self.overflowed = true;
     self.store(object, AT_OVERFLOW, &1u64.to_le_bytes())
   }
 
   /// Whether every write acknowledged since the last publication is in the log, so a successor replays them all: then
-  /// a FUSE `close`'s `flush` owes no publication of its own (A-63; Linux, where FUSE is).
-  #[cfg(target_os = "linux")]
+  /// a `close`'s `flush` owes no publication of its own, a FUSE mount's (A-63) or a Shards stream's (A-399).
   pub(crate) fn holds_every_write(&self) -> bool {
     !self.overflowed
   }
@@ -410,10 +402,7 @@ impl WriteLog {
     let logged = self.used;
     self.used = 0;
     self.stamp = stamp;
-    #[cfg(target_os = "linux")]
-    {
-      self.overflowed = false;
-    }
+    self.overflowed = false;
     // The header first (a crash mid-scrub then replays nothing), but the scrub runs whatever the header's writes
     // answered: the records are plaintext, and a refused header write that returned early left them in place while
     // this log already counted itself empty, so nothing would scrub them (2026-10-07). The first refusal is returned.
@@ -465,6 +454,45 @@ impl WriteLog {
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {
     let at = self.start.checked_add(offset).ok_or(Unwritten)?;
     object.write(at, bytes).map_err(|_| Unwritten)
+  }
+}
+
+/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write.
+const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
+
+/// Logs the lookups `forgotten` (each a file and a count) gave back through `attachment` on `volume` in the shard's
+/// write log (GAPS, A-154's sibling): a FUSE mount's `FORGET`s, and a Shards stream's whose resync end the anchor holds
+/// (A-390). A `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
+/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
+/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
+/// which would report every taken-over file as having lost writes.
+pub(crate) fn log_forgets(
+  s: &mut crate::state::ShardState,
+  (volume, attachment): (slates_db::catalog::VolumeId, u64),
+  forgotten: Vec<(u64, u64)>,
+) {
+  for (inode, count) in forgotten {
+    let forgotten = Forgotten {
+      volume: volume.bytes,
+      attachment,
+      inode,
+      count,
+    };
+    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+      (Some(log), Some(object)) => log.append_forget(object, forgotten),
+      _ => return,
+    };
+    let logged = match appended {
+      Ok(()) => true,
+      Err(Refused::Full) => {
+        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
+      }
+      Err(Refused::Unwritten) => false,
+    };
+    if !logged {
+      s.count(FORGET_UNLOGGED, 1);
+    }
   }
 }
 

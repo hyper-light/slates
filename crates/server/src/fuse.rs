@@ -978,7 +978,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
-  log_forgets(s, (mount.volume, attachment), mount.serve.take_forgotten());
+  crate::write_log::log_forgets(s, (mount.volume, attachment), mount.serve.take_forgotten());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let conflicts = mount.serve.take_writeback_conflicts();
@@ -1300,44 +1300,6 @@ fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
     s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
     if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
       let _ = log.overflow(object);
-    }
-  }
-}
-
-/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
-/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write.
-const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
-
-/// Logs the lookups this turn's `FORGET`s gave back through `attachment` in the shard's write log (GAPS, A-154's
-/// sibling): a `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
-/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
-/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
-/// which would report every taken-over file as having lost writes.
-fn log_forgets(
-  s: &mut ShardState,
-  (volume, attachment): (VolumeId, u64),
-  forgotten: Vec<(u64, u64)>,
-) {
-  for (inode, count) in forgotten {
-    let forgotten = crate::write_log::Forgotten {
-      volume: volume.bytes,
-      attachment,
-      inode,
-      count,
-    };
-    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-      (Some(log), Some(object)) => log.append_forget(object, forgotten),
-      _ => return,
-    };
-    let logged = match appended {
-      Ok(()) => true,
-      Err(crate::write_log::Refused::Full) => {
-        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
-      }
-      Err(crate::write_log::Refused::Unwritten) => false,
-    };
-    if !logged {
-      s.count(FORGET_UNLOGGED, 1);
     }
   }
 }

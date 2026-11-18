@@ -35,18 +35,21 @@ pub mod client;
 pub mod driver;
 pub mod error;
 pub mod exec;
+pub mod hold;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, DriftedPage,
-  EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, MergeRecord, MergeStatement, Page, Rebased,
-  Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd, Submitted,
-  VhostUserDevice,
+  EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, MergeRecord, MergeStatement, MoveState, Page,
+  Rebased, Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd,
+  Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
 #[cfg(any(unix, windows))]
 pub use client::{MappedRead, MappedWrite, page_bytes};
 pub use error::ClientError;
+/// A CLI attachment held alive by its holder (A-384).
+pub use hold::Hold;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
 /// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};

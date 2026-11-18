@@ -410,10 +410,55 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       destination: destination.clone(),
     };
     return emit_attach(&mut client, *volume, *snapshot, *intent, form, request.json)
+      .map(|_attachment| ())
       .map_err(|e| failure_of(e, &request.instance));
+  }
+  if let Verb::Hold {
+    volume,
+    snapshot,
+    intent,
+  } = &request.verb
+  {
+    return hold(
+      &mut client,
+      &request.instance,
+      (*volume, *snapshot, *intent),
+      request.json,
+    )
+    .map_err(|e| failure_of(e, &request.instance));
   }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
+}
+
+/// `slates attach VOLUME --hold` (A-384): attaches in the CLI's form and says so as `attach` does, then keeps the
+/// attachment alive from this process until it ends: a [`slates_client::Hold`] renews it at the cadence the daemon names,
+/// so other `slates` processes may name it however long they are idle. The process ending (an interrupt, a kill, any
+/// end) ends the renewals, and the attachment lapses at its holder's pace; a renewal the daemon refuses (the attachment
+/// detached elsewhere) ends the command with that refusal.
+fn hold(
+  client: &mut Client,
+  instance: &str,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  json: bool,
+) -> Result<(), ClientError> {
+  let attachment = emit_attach(
+    client,
+    volume,
+    snapshot,
+    intent,
+    AttachRequest::Termed,
+    json,
+  )?;
+  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
+  slates_machine::log_line!(
+    "slates attach --hold: holding attachment {attachment} (its term {} ms); it lapses once this process ends",
+    held.term_ns() / NANOS_PER_MILLISECOND
+  );
+  match held.wait_lost() {
+    Some(refused) => Err(refused),
+    None => Ok(()),
+  }
 }
 
 /// Serves the MCP tools (§4.12): the merge/volume/attach/base/land tools mapped onto the client SDK,
@@ -973,6 +1018,29 @@ fn emit_image_merge(
   Ok(())
 }
 
+/// `move ID --to HOST` (§4.10, A-291): one ask of the volume's owner to move it to the member. The move goes on between
+/// asks, so a caller asks again until it is done, as a client of the verb does. Prints `moving HOST` while it is under
+/// way and `moved HOST` once the configuration names the member, or `{ "moved": bool, "to": HOST }`.
+fn emit_moved(
+  client: &mut Client,
+  volume: VolumeId,
+  to: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (moved, to) = match client.move_volume(volume, to)? {
+    slates_client::MoveState::Moving { to } => (false, to),
+    slates_client::MoveState::Moved { to } => (true, to),
+  };
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "moved": moved, "to": to }));
+  } else if moved {
+    slates_machine::out_line!("moved {to}");
+  } else {
+    slates_machine::out_line!("moving {to}");
+  }
+  Ok(())
+}
+
 /// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
 /// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
 fn emit_placed(
@@ -1006,8 +1074,9 @@ fn emit_attach(
   intent: Intent,
   form: AttachRequest,
   json: bool,
-) -> Result<(), ClientError> {
+) -> Result<u64, ClientError> {
   let attached = client.attach_with(volume, snapshot, intent, form)?;
+  let attachment = attached.attachment;
   if json {
     slates_machine::out_line!("{}", slates_mcp::attachment_json(&attached));
   } else {
@@ -1022,7 +1091,7 @@ fn emit_attach(
     slates_machine::out_text!("{}", established_text(&attached.established));
     slates_machine::out_text!("{}", capability_text(&attached.capability));
   }
-  Ok(())
+  Ok(attachment)
 }
 
 /// What an attach established, as `key: value` lines; a container bind shows its verified source,
@@ -1168,6 +1237,17 @@ fn emit_pin(
     slates_machine::out_line!("{}", serde_json::json!({ "pinned": pinned }));
   } else {
     slates_machine::out_line!("pinned: {pinned}");
+  }
+  Ok(())
+}
+
+/// `base capture`: the snapshot holding the overlay's whole base (A-291), as text or a JSON `{ "snapshot" }`.
+fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
+  let snapshot = client.capture_base(volume)?;
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+  } else {
+    slates_machine::out_line!("snapshot: {}", snapshot.value);
   }
   Ok(())
 }
@@ -1357,8 +1437,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
-    // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } => {}
+    // `ClientError`), and `attach --hold` needs the instance for its own client, so [`run`] handles them before this
+    // dispatch; they never reach here.
+    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } | Verb::Hold { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
@@ -1414,7 +1495,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       snapshot,
       intent,
       form,
-    } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
+    } => {
+      emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?;
+    }
     Verb::Detach { attachment, volume } => {
       match volume {
         Some(volume) => client.detach_of(*volume, *attachment)?,
@@ -1442,6 +1525,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
     Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
+    Verb::CaptureBase { volume } => emit_captured(client, *volume, json)?,
     Verb::Land {
       volume,
       snapshot,
@@ -1473,6 +1557,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
         json,
       );
     }
+    Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }

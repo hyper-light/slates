@@ -525,7 +525,7 @@ fn dialer_restarted_onto_its_port(same: bool) -> Rebound {
         .unwrap();
       asked_tx.send(()).unwrap();
       received(gone_rx).await;
-      accepted.reply(stream, &request).unwrap();
+      accepted.reply(stream, request).unwrap();
       let settled = within(BOUND_NS, accepted.settle())
         .await
         .map(|result| format!("{result:?}"));
