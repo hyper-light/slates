@@ -7314,7 +7314,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart` and
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
->   until a write, its holders keep the old chain, which holds every write acknowledged before the restart.
+>   until a write, its holders keep the old chain, which holds every write acknowledged before the restart. Across real
+>   processes the owner's case is held by `a_live_owners_writes_after_its_warm_restart_survive_its_death`
+>   (`crates/cli/tests/live_fleet.rs`, goal g229): five writes, the owner's daemon killed and replaced by its anchor,
+>   five more through it, the owner killed whole; the restarted log ends past the head shipped before plus the writes
+>   since, and a survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log
+>   begun again at genesis the first write through it is never answered, its log at head 0 with nothing durable.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable

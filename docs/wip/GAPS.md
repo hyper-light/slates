@@ -139,8 +139,17 @@
 > `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart`,
 > `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`). Bug
 > record `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
-> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix, and an owner-restart flow across real
->   processes (`kill -9` under the anchor, writes before and after, then the owner's loss).
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix.
+> - **Written (g229, 2026-11-18): the owner-restart flow across real processes**,
+>   `a_live_owners_writes_after_its_warm_restart_survive_its_death` (`crates/cli/tests/live_fleet.rs`, gated on
+>   `SLATES_TEST_CLI=1`). Three anchored processes; five files written through the owner; its daemon `kill -9`ed and
+>   replaced by its anchor; five more through the restarted owner, each given the fleet wait to be answered; then the
+>   owner killed whole. The flow requires the daemon replaced, the restarted log's head past the head shipped before
+>   plus the writes made since (each write is its own entry, so a log begun again at genesis ends at their count), and a
+>   survivor serving all ten files. On a Mac Studio (release, 2026-11-18) it passed 4 of 4, heads 4 then 10 or 11, 3.9
+>   to 6.1 s a run. Red with a restarted owner's log begun again at genesis (`Start::Resumed` taken for `Start::New`): the
+>   first write through the restarted owner was never answered, the log at head 0 with nothing durable and owed (with
+>   no bound on that write, the run held 23 minutes until killed; the flow now fails it at the fleet wait).
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
