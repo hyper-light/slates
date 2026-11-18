@@ -51,7 +51,9 @@ the tree, flag it for removal.
 10. Consensus, a lock service, or a coordination call on a per-write path; the configuration group is touched only on membership, takeover, neighbourhood and home changes (D-14).
 11. An inferred merge (diff3, three-way text merge, OT, LLM resolution) anywhere; the verdict is accept, identical, or conflict (D-27, D-26).
 12. A global catalog or index for lookups; ids route to owners (D-14).
-13. Adding non-Rust tooling, a JDK, TLA+ tools, model checking, or any long-running job to the project's CI or to Ada's machine. The TLA+ models under `docs/wip/models/` are architecture artifacts re-run only by whoever changes §4.8, never by CI.
+13. *(Removed by Ada, 2026-11-18.)* TLA+ model checking (TLC, Apalache, with the JDK they need) and long-running CI
+    lanes (nightly chaos, model checks, soak runs) are allowed and expected. Re-run the models under `docs/wip/models/`
+    whenever a change touches what they model; CI may run them. Install such tools in user space, never with root.
 14. Subagents, background jobs, tool installs, or system-state changes during any task unless Ada asks for that specific thing.
 
 ## 3. Code shape (the vorpal habits, made mandatory)
@@ -298,15 +300,20 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 - Every claim carries a number, a date, and a command or a citation. "From memory" is flagged as such and listed for verification.
 - Plain English in every document and comment; no jargon that a careful engineer new to the project cannot act on.
 
-## 8. Every agent: implement, unit-test, merge (Ada, 2026-11-18, binding on every agent and subagent, forever)
+## 8. Every agent: implement, run focused unit and integration tests, merge (Ada, 2026-11-18, binding on every agent and subagent, forever)
 
-1. **Implement** the change, with its unit tests (a bug's failing test first) and the design, GAPS and docs lines it makes true, in one commit in the style above.
-2. **Test** with `cargo test -p <crate>` for each crate you touched, plus `cargo fmt`. Nothing else: no cross-platform builds, lint matrices, `xtask`, doc builds, integration or e2e suites, CI waits or benchmarks.
+1. **Implement** the change, with its tests (a bug's failing test first, red-checked) and the design, GAPS and docs lines it makes true, in one commit in the style above.
+2. **Test, focused:** run the unit tests and the integration tests that exercise the change, by name or filter
+   (`cargo test -p <crate> --lib <filter>`, `cargo test -p <crate> --test <file> <filter>`), on the host you work on,
+   plus `cargo fmt`. Not whole-crate or workspace suites, not clippy, not cross-platform builds, lint matrices,
+   `xtask`, doc builds, e2e suites, CI waits or benchmarks: main runs those and does the fixes.
 3. **Merge it yourself:**
    - `git fetch origin && git merge origin/main` into your branch;
-   - rerun those unit tests if the merge changed your crates;
+   - rerun those focused tests if the merge changed what they cover;
    - `git push origin HEAD:main`.
 
    If the push is refused because main moved, fetch, merge and push again. Never force-push or rewrite main.
 
-The supervisor and its integrator handle build, integration, e2e, cross-platform runs, CI and measurement on main after merges. They bisect any breakage to its commit and send it back to that commit's author, who fixes it the same way. This section overrides older instructions in this file about gates before landing and about who lands.
+Main (the supervisor) runs clippy, the full suites, build, cross-platform runs, e2e, CI and measurement on main after
+merges, does the fixes, and sends a breakage it cannot fix in place back to the commit's author, who fixes it the same
+way. This section overrides older instructions in this file about gates before landing and about who lands.

@@ -43,6 +43,11 @@ at a time: 12 tests pass, the 6 child roles ignored, in 51-52 s on windows-lates
 of three each (diagnostics run 44290078113). No lane had run it on Windows; g243's diagnostic runs alone had caught a
 starved-shard bug there.
 
+Since 2026-11-18 a nightly lane, `live-chaos-nightly`, runs every flow of `crates/cli/tests/live_chaos.rs` on
+ubuntu-latest and ubuntu-24.04-arm (release, each flow on its own, capped at four times the slowest passing flow, its
+log kept as an artifact). Ada lifted the ban on long CI lanes that day (CLAUDE.md §2 item 13). The day's on-demand
+runs it replaces: 24/35 flows passed before A-329, 31-34/35 after it, with two flows seen hanging once.
+
 ## What compiling the whole workspace for Windows found
 
 `cargo xwin clippy --target x86_64-pc-windows-msvc --workspace --all-targets --keep-going` (2026-11-06; no lane runs it:
