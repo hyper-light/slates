@@ -3752,8 +3752,11 @@
 >   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
 >   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
 >   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
->   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). Owed in C-a: the fleet tests' `CREDIT_WAIT` in daemon
->   time; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
+>   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
+>   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
+>   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

@@ -31067,3 +31067,20 @@ wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
   an owner keeping nothing.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{mach_claim,rendezvous}.rs`.
+
+### A-454 — The fleet tests' client waits in its daemon's own time: a connect is one claim, a full ring is waited out while its shard steps (2026-11-18, goal 85 via g251; R3's class C, C-a's second half; A-426, A-443, A-447)
+
+- **What was there.** The fleet suite's client (`crates/server/tests/fleet.rs`) retried a connect refused as unavailable,
+  and a send refused for a full request ring, for five seconds on the wall (`CREDIT_WAIT`). A daemon kept off its CPUs
+  could outlast it while alive, and the connect's retry dated from when a claim gave up at a second with its daemon
+  alive.
+- **The rule.** A connect is one claim: since A-443 and A-447 a claim waits while its daemon lives and ends at its
+  death, and every daemon of the suite opens its rendezvous before its start returns, so a refusal says no daemon holds
+  the instance's rendezvous and fails the test at once. A send that meets a full ring waits for room while the ring's
+  shard steps, since a shard drains its clients' rings at its steps (A-426's rule for room), and ends only once the
+  shard has taken no step for `FROZEN_CAP`, the suite's one wall bound for a daemon frozen or dead (`RoomWait`). No
+  product behaviour changes.
+- **Owed.** The same constant and the same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs`.
+- **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
