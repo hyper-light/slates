@@ -349,6 +349,53 @@ fn an_agent_cannot_approve_its_own_merge() {
   daemon.stop();
 }
 
+/// A-285: an agent never approves its own landing, as it never approves its own merge. Do: from a channel bound to an
+/// enrolled consumer, land the agent's own volume, whose policy asks, then grant that presented landing with a genuine
+/// proof (the launcher's secret leaked to the agent). Expect the approval request, the grant refused `Forbidden`, and
+/// nothing written: the landing's approval is the launcher's or the harness's, never the agent's own channel's.
+#[test]
+fn an_agent_cannot_approve_its_own_landing() {
+  let (daemon, instance) = daemon("approve-landing");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let mut launcher = connect(&instance);
+  let account = rustix::process::getuid().as_raw();
+  let (consumer, capability) = launcher
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut agent = connect(&instance);
+  agent.attest(consumer, &capability).unwrap();
+  let volume = volume_with(&mut agent, "self-approved", b"agent's work");
+  set(&mut launcher, &secret, volume, landing(WriteMode::Ask));
+  let Ok(Landing::GrantRequired {
+    landing: presented,
+    manifest,
+    ..
+  }) = agent.land(volume, None, &target.path, Filter::default(), None)
+  else {
+    panic!("an ask landing answers an approval request");
+  };
+  let proof = grant_proof(
+    &secret,
+    presented,
+    &manifest,
+    GrantScope::Once,
+    GRANT_TERM_NS,
+  );
+  let granted = agent.grant(presented, manifest, GrantScope::Once, GRANT_TERM_NS, proof);
+  assert!(
+    matches!(
+      granted,
+      Err(ClientError::Refused(Refusal::Forbidden { .. }))
+    ),
+    "a consumer-bound channel approves no landing, even with a genuine proof: {granted:?}"
+  );
+  assert_eq!(on_disk(&target), None);
+  drop(agent);
+  drop(launcher);
+  daemon.stop();
+}
+
 /// A-285: a present-only landing never writes, whatever the policy. Do: present a bypass volume's landing and a
 /// forbidden volume's. Expect each answered with its plan (an approval request), nothing on disk, and the bypass
 /// volume's ordinary `land` afterwards written at once.
