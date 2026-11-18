@@ -9093,10 +9093,16 @@ fn refresh_failover(state: &mut ShardState) {
     .and_then(slates_cluster::member_plane::MemberPlane::detection);
   let timing = state.council_timing;
   let estimate = state.failover.refresh(detection, &timing, HEARTBEAT_NS);
-  // What this shard's waits read, and the fan carries to the others when it moves.
+  // A/B BASELINE BUILD ONLY (never merged to main): the waits read A-359's boot sum, the membership horizon plus the
+  // council's death watch and install (eleven periods) plus the ratified recovery budget, in place of the live
+  // estimate; the estimate is still published in status for comparison.
+  let _live_ns = estimate.total_ns();
+  let boot_sum_ns = crate::lease::horizon_ns()
+    .saturating_add(HEARTBEAT_NS.saturating_mul(11))
+    .saturating_add(slates_db::replay::RECOVERY_BUDGET_NS);
   state.failover_ns = state
     .injected_failover_ns
-    .unwrap_or_else(|| failover_in_periods(estimate.total_ns()));
+    .unwrap_or_else(|| failover_in_periods(boot_sum_ns));
 }
 
 /// Derived: a failover delay of `ns` in whole coordinator periods, rounded up (A-363): the granularity every wait that
