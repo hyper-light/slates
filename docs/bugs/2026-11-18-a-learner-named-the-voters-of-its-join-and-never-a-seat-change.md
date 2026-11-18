@@ -35,8 +35,20 @@ the voter's side since), and an operator or a test reading `council_known_voters
 - `crates/server/src/consensus.rs`: the fetch reply carries no voters; `adopt_fetch` adopts the configuration alone.
 - `crates/server/src/fleet.rs`: the leader period calls `record_voters`.
 - Tests: `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`,
-  `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`, the configuration round trip
-  and the three end-relative encoding tests.
+  `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`, the configuration round trip,
+  the three end-relative encoding tests and the layout golden (`RCFG` version 3).
+
+## Evidence
+
+- Red-checks on the Mac Studio (kiln r3624, 2026-11-18, a copy of 7e76e684f): with the learner reading its Raft voters
+  as before (`known_voters` ignoring the record), the learner unit test fails at "the learner names the changed voters"
+  (it names `[1, 2, 3]`, the voters of its join); with the leader's record withheld (`record_voters` proposing
+  nothing), it fails at "the leader recorded the voters in force". Both pass with the change.
+- Focused runs, same machine: `slates-db` `register::tests` 76 of 76, `slates-cluster` `raft_wire` and `config_group`
+  48 of 48, the server's consensus, member-task and dialer tests 7 of 7, and ten fleet tests (the four learner tests,
+  the learner reports, the council's election and retirement, two takeovers) each passed.
+- Owed (the supervisor's diag lane): the learner tests' rate at one CPU beside two busy loops, as
+  diag-g225-forming-fleet-reaches-2 measured the 3 of 24 above.
 
 ## Siblings found, reported
 

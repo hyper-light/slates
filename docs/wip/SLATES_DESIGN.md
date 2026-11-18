@@ -27494,6 +27494,12 @@ rebuild closed), the bug record `docs/bugs/2026-11-18-a-live-takeover-made-its-v
   any change. The regional configuration's encoding gains the set (layout 3).
 - **What it does not change.** The council's voters themselves and how they change (Raft §6, one joint change at a time);
   the root group's learners, which still name the root voters of their join (GAPS, the open sibling).
+- **Tests.** `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+  (`crates/cluster/src/config_group.rs`) fails with the learner reading its Raft voters as before and with the leader's
+  record withheld (kiln r3624, the Mac Studio, 2026-11-18);
+  `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change` (`crates/db/src/register.rs`);
+  the configuration round trip and the layout golden in `crates/cluster/src/raft_wire.rs`. The fleet's learner tests
+  passed on the same machine; their rate at one CPU beside two busy loops is the diag lane's.
 
 Applied in the same change to: §4.8 (learners; A-337's paragraph), GAPS (the A-337 entry's open item),
 `crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/config_group.rs`,
