@@ -13,9 +13,13 @@
   clippy::panic
 )]
 
-use slates_bridge_core::{Attachments, OpContext, Rights, View};
+use slates_bridge_core::{Attachments, OpContext, OwnerView, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::shards_fs::{FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer, split_frame};
+use slates_bridge_fuse::reply::{Attr, EntryOut};
+use slates_bridge_fuse::request::SetAttrIn;
+use slates_bridge_fuse::shards_fs::{
+  FRAME_BYTES, Frame, LENGTH_BYTES, OWNER_WORD, OwnerWord, Split, answer, owner_word, split_frame,
+};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -79,9 +83,10 @@ fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
   m
 }
 
-/// The errno a FUSE reply carries (the out-header's `error`, a signed little-endian i32 at offset 4).
+/// The errno a FUSE reply carries, as Linux names it (the out-header's `error`, a signed little-endian i32 at offset 4,
+/// is its negation).
 fn errno(out: &[u8]) -> i32 {
-  i32::from_le_bytes(out[4..8].try_into().unwrap())
+  -i32::from_le_bytes(out[4..8].try_into().unwrap())
 }
 
 /// The file bytes a guest reads back; distinctive so the READ reply can only be the file's own content.
@@ -116,7 +121,7 @@ fn exchange(bridge: &mut VolumeBridge<'_>, cx: &OpContext, request: &[u8]) -> Ve
   let reply = answered.reply(&frame).to_vec();
   let word = u32::from_le_bytes(frame[..LENGTH_BYTES].try_into().unwrap());
   assert_eq!(usize::try_from(word).unwrap(), reply.len());
-  assert_eq!(answered.error, -errno(&reply));
+  assert_eq!(answered.error, errno(&reply));
   reply
 }
 
@@ -227,4 +232,706 @@ fn a_hostile_or_truncated_shards_fs_frame_is_refused_before_allocating() {
     split_frame(&[], FRAME_BYTES).unwrap(),
     Split::Partial(LENGTH_BYTES)
   );
+}
+
+/// Format: where `fuse_attr`'s uid and gid lie in it (after ino, size, blocks, the three times, their three nanosecond
+/// words, the mode and nlink: `include/uapi/linux/fuse.h`).
+const ATTR_UID_AT: usize = 68;
+const ATTR_GID_AT: usize = 72;
+/// Format: where `fuse_attr` lies in a `fuse_entry_out` (after nodeid, generation, the two valid times and their two
+/// nanosecond words) and in a `fuse_attr_out` (after its valid time, nanosecond word and padding).
+const ENTRY_ATTR_AT: usize = OUT_HEADER_LEN + EntryOut::LEN - Attr::LEN;
+const ATTR_OUT_ATTR_AT: usize = OUT_HEADER_LEN + 16;
+/// Format: a `fuse_dirent`'s fixed part (ino, off, namelen, type) after its `fuse_entry_out` in a READDIRPLUS reply, and
+/// the alignment its name is padded to (`FUSE_DIRENT_ALIGN`).
+const DIRENT_HEAD: usize = 24;
+const DIRENT_ALIGN: usize = 8;
+
+/// The owner the volume keeps for what its host made, and the run's owner a guest names: distinct, as on a Mac (the
+/// user 501 in group 20) under a run of user 1000.
+const HOST: (u32, u32) = (501, 20);
+const RUN: (u32, u32) = (1000, 1001);
+/// An owner neither the host nor the run is: the view leaves it as it is.
+const NEITHER: (u32, u32) = (4242, 4343);
+
+/// A FUSE request from the caller `uid`/`gid` (the in-header's `uid` and `gid` at 24 and 28).
+fn message_as(
+  opcode: u32,
+  unique: u64,
+  nodeid: u64,
+  (uid, gid): (u32, u32),
+  body: &[u8],
+) -> Vec<u8> {
+  let mut m = message(opcode, unique, nodeid, body);
+  m[24..28].copy_from_slice(&uid.to_le_bytes());
+  m[28..32].copy_from_slice(&gid.to_le_bytes());
+  m
+}
+
+/// The uid and gid of the `fuse_attr` at `at` in `reply`.
+fn owner_at(reply: &[u8], at: usize) -> (u32, u32) {
+  let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+  (word(at + ATTR_UID_AT), word(at + ATTR_GID_AT))
+}
+
+/// A SETXATTR of `name` set to `value` (`fuse_setxattr_in`: size, flags, then the name and its NUL, then the value).
+fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A-281 (Shards' owner word, as Shards' server takes it). Do: read the word as a stream does, from the guest's root on
+/// the share's root, with and without trailing NULs and either flag; from another caller; on another node; with values
+/// that are no `UID:GID`; with a value cut short of its size; and read requests that are not the word. Expect the run's
+/// owner named, `EPERM` from any caller but root, `EINVAL` on another node or for a malformed value, `EIO` for a body too
+/// short for its value, and nothing taken from any other request, which the dispatch answers.
+#[test]
+fn shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone() {
+  let set = Opcode::SetXattr as u32;
+  let word = |nodeid: u64, caller: (u32, u32), value: &[u8]| {
+    owner_word(&message_as(
+      set,
+      7,
+      nodeid,
+      caller,
+      &setxattr_body(OWNER_WORD, value),
+    ))
+  };
+  let named = Some(OwnerWord::Named {
+    unique: 7,
+    uid: 1000,
+    gid: 1001,
+  });
+  assert_eq!(word(1, (0, 0), b"1000:1001"), named);
+  assert_eq!(
+    word(1, (0, 0), b"1000:1001\0\0"),
+    named,
+    "trailing NULs are dropped"
+  );
+  let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
+  assert_eq!(
+    word(1, (1000, 1001), b"1000:1001"),
+    refused(1),
+    "only the guest's root names it: EPERM"
+  );
+  assert_eq!(
+    word(5, (0, 0), b"1000:1001"),
+    refused(22),
+    "only on the share's root: EINVAL"
+  );
+  for malformed in [
+    &b"1000"[..],
+    b"1000:",
+    b":1001",
+    b"a:b",
+    b"1000:1001:1",
+    b"-1:0",
+    b"4294967296:0",
+    b"",
+  ] {
+    assert_eq!(
+      word(1, (0, 0), malformed),
+      refused(22),
+      "{:?}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let mut short = setxattr_body(OWNER_WORD, b"1000:1001");
+  short[0..4].copy_from_slice(&64u32.to_le_bytes());
+  assert_eq!(
+    owner_word(&message_as(set, 7, 1, (0, 0), &short)),
+    refused(5),
+    "a value cut short of its size: EIO"
+  );
+  assert_eq!(
+    owner_word(&message_as(
+      set,
+      7,
+      1,
+      (0, 0),
+      &setxattr_body(b"user.shards.owner", b"1000:1001")
+    )),
+    None,
+    "another name is the dispatch's"
+  );
+  assert_eq!(
+    owner_word(&message_as(
+      Opcode::GetXattr as u32,
+      7,
+      1,
+      (0, 0),
+      &setxattr_body(OWNER_WORD, b"")
+    )),
+    None,
+    "another opcode is the dispatch's"
+  );
+  assert_eq!(owner_word(&[0u8; 8]), None, "no header: the dispatch's");
+}
+
+/// A volume whose root and three files are kept as the host's, the run's and neither's, behind no bridge yet.
+fn owned_volume(store: &mut Store) -> Volume {
+  let mut vol = Volume::create(
+    store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
+  )
+  .unwrap();
+  let root = vol.root_inode(store).unwrap();
+  vol.chown(store, root, HOST.0, HOST.1).unwrap();
+  for (name, owner) in [
+    ("host.txt", HOST),
+    ("run.txt", RUN),
+    ("neither.txt", NEITHER),
+  ] {
+    let file = vol.create_file_no(store, root, name, 0o644).unwrap();
+    vol.chown(store, file, owner.0, owner.1).unwrap();
+  }
+  vol
+}
+
+/// The owner a READDIRPLUS reply shows for `name`.
+fn listed_owner(reply: &[u8], name: &str) -> Option<(u32, u32)> {
+  let mut at = OUT_HEADER_LEN;
+  while at + EntryOut::LEN + DIRENT_HEAD <= reply.len() {
+    let dirent = at + EntryOut::LEN;
+    let len = usize::try_from(u32::from_le_bytes(
+      reply[dirent + 16..dirent + 20].try_into().unwrap(),
+    ))
+    .unwrap();
+    let listed = &reply[dirent + DIRENT_HEAD..dirent + DIRENT_HEAD + len];
+    if listed == name.as_bytes() {
+      return Some(owner_at(reply, at + EntryOut::LEN - Attr::LEN));
+    }
+    at = dirent + (DIRENT_HEAD + len).div_ceil(DIRENT_ALIGN) * DIRENT_ALIGN;
+  }
+  None
+}
+
+/// A-281 (a stream's owner view, through the dispatch every transport shares). Do: put a volume whose root and a file
+/// are kept as the host's (501:20), one file as the run's (1000:1001) and one as neither's behind a bridge that views
+/// owners as a stream does once its guest's root named the run's owner; LOOKUP each file, GETATTR the root, READDIRPLUS
+/// the root, CREATE a file as the run's user, and chown the neither's file to the run's ids. Expect the host's files
+/// shown as the run's, the run's as the host's and the neither's as they are; the created file and the chowned one kept
+/// as the host's in the volume, which every other route reads; and the same requests through a bridge with no view
+/// showing each owner as the volume keeps it.
+#[test]
+fn a_streams_owner_view_shows_the_hosts_files_as_the_runs_and_keeps_the_runs_ids_as_the_hosts() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let cx = test_cx();
+  let (made, chowned) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store)
+      .viewing_owners(OwnerView::swapping(HOST, RUN));
+    let mut ask = |unique: u64, opcode: Opcode, nodeid: u64, body: &[u8]| {
+      exchange(
+        &mut bridge,
+        &cx,
+        &message_as(opcode as u32, unique, nodeid, RUN, body),
+      )
+    };
+    for (unique, name, shown) in [
+      (1, "host.txt", RUN),
+      (2, "run.txt", HOST),
+      (3, "neither.txt", NEITHER),
+    ] {
+      let reply = ask(
+        unique,
+        Opcode::Lookup,
+        1,
+        &[name.as_bytes(), b"\0"].concat(),
+      );
+      assert_eq!(errno(&reply), 0, "LOOKUP {name}");
+      assert_eq!(
+        owner_at(&reply, ENTRY_ATTR_AT),
+        shown,
+        "{name} is shown as {shown:?}"
+      );
+    }
+    let root = ask(4, Opcode::GetAttr, 1, &[0u8; 16]);
+    assert_eq!(
+      owner_at(&root, ATTR_OUT_ATTR_AT),
+      RUN,
+      "the host's root is shown as the run's"
+    );
+    let opened = ask(5, Opcode::OpenDir, 1, &[0u8; 8]);
+    let mut read_in = vec![0u8; 40];
+    read_in[0..8].copy_from_slice(&body_u64(&opened).to_le_bytes());
+    read_in[16..20].copy_from_slice(&4096u32.to_le_bytes());
+    let listed = ask(6, Opcode::ReadDirPlus, 1, &read_in);
+    assert_eq!(
+      listed_owner(&listed, "host.txt"),
+      Some(RUN),
+      "a listing shows the host's file as the run's"
+    );
+    assert_eq!(
+      listed_owner(&listed, "run.txt"),
+      Some(HOST),
+      "and the run's as the host's"
+    );
+    // CREATE (`fuse_create_in`: flags, mode, umask, open flags; then the name) by the run's user.
+    let mut create = vec![0u8; 16];
+    create[4..8].copy_from_slice(&0o644u32.to_le_bytes());
+    create.extend_from_slice(b"made.txt\0");
+    let created = ask(7, Opcode::Create, 1, &create);
+    assert_eq!(errno(&created), 0, "CREATE");
+    assert_eq!(
+      owner_at(&created, ENTRY_ATTR_AT),
+      RUN,
+      "the run's file is shown as the run's"
+    );
+    // SETATTR (`fuse_setattr_in`, 88 bytes: the uid at 76, the gid at 80) of the neither's file to the run's ids.
+    let neither = body_u64(&ask(8, Opcode::Lookup, 1, b"neither.txt\0"));
+    let mut chown = vec![0u8; 88];
+    chown[0..4].copy_from_slice(&(SetAttrIn::FATTR_UID | SetAttrIn::FATTR_GID).to_le_bytes());
+    chown[76..80].copy_from_slice(&RUN.0.to_le_bytes());
+    chown[80..84].copy_from_slice(&RUN.1.to_le_bytes());
+    let changed = ask(9, Opcode::SetAttr, neither, &chown);
+    assert_eq!(errno(&changed), 0, "SETATTR");
+    assert_eq!(
+      owner_at(&changed, ATTR_OUT_ATTR_AT),
+      RUN,
+      "the chown reads back as the guest asked it"
+    );
+    (body_u64(&created), neither)
+  };
+  for (no, what) in [(made, "the created file"), (chowned, "the chowned file")] {
+    let kept = vol
+      .observe(&store, slates_vfs::ids::InodeNo(no))
+      .unwrap()
+      .attrs;
+    assert_eq!(
+      (kept.uid, kept.gid),
+      HOST,
+      "{what} is kept as the host's, as every other route reads it"
+    );
+  }
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  for (unique, name, kept) in [
+    (10, "host.txt", HOST),
+    (11, "run.txt", RUN),
+    (12, "made.txt", HOST),
+  ] {
+    let reply = exchange(
+      &mut bridge,
+      &cx,
+      &message(
+        Opcode::Lookup as u32,
+        unique,
+        1,
+        &[name.as_bytes(), b"\0"].concat(),
+      ),
+    );
+    assert_eq!(
+      owner_at(&reply, ENTRY_ATTR_AT),
+      kept,
+      "with no view {name} is shown as the volume keeps it"
+    );
+  }
+}
+
+/// A GETXATTR (`fuse_getxattr_in`: size, padding, then the name) or, with no name, a LISTXATTR, asking for `size` bytes.
+fn getxattr_body(size: u32, name: Option<&[u8]>) -> Vec<u8> {
+  let mut body = size.to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  if let Some(name) = name {
+    body.extend_from_slice(name);
+    body.push(0);
+  }
+  body
+}
+
+/// A REMOVEXATTR of `name` (the name and its NUL).
+fn removexattr_body(name: &[u8]) -> Vec<u8> {
+  let mut body = name.to_vec();
+  body.push(0);
+  body
+}
+
+/// The names a LISTXATTR reply lists, each without its NUL.
+fn listed_names(reply: &[u8]) -> Vec<Vec<u8>> {
+  reply[OUT_HEADER_LEN..]
+    .split(|byte| *byte == 0)
+    .filter(|name| !name.is_empty())
+    .map(<[u8]>::to_vec)
+    .collect()
+}
+
+/// Linux's `ENODATA` and `EOPNOTSUPP`.
+const ENODATA: i32 = 61;
+const EOPNOTSUPP: i32 = 95;
+
+/// A-290 (a guest's own attribute namespaces, through the dispatch every transport shares). Do: through a bridge that
+/// serves a guest, set `security.capability` on a file, `trusted.overlay.opaque` on a directory, `trusted.overlay.origin`
+/// on a symlink and a `user.` attribute on the file, then read and list each; then, through a host's bridge over the
+/// same volume, list, read, set, replace and remove names in the guest's namespaces; then remove the guest's own
+/// through its bridge. Expect the guest to read back every value and list every name; the host to list only `user.`,
+/// read the guest's names `ENODATA` and have every set or removal of one refused `EOPNOTSUPP`, the guest's values
+/// unchanged by it; and the guest's removal to take its attribute away.
+#[test]
+fn a_guests_own_attributes_are_kept_for_its_route_and_no_hosts_mount_reaches_them() {
+  let mut store = store();
+  let mut vol = Volume::create(
+    &mut store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
+  )
+  .unwrap();
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "bin", 0o755).unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "upper", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "link", "bin").unwrap();
+  let cx = test_cx();
+  let capability = [
+    1u8, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ];
+  let guests: [(u64, &[u8], &[u8]); 4] = [
+    (file.0, b"security.capability", &capability),
+    (dir.0, b"trusted.overlay.opaque", b"y"),
+    (link.0, b"trusted.overlay.origin", b"\x00\xfb\x21"),
+    (file.0, b"user.mime_type", b"application/x-executable"),
+  ];
+  {
+    let mut guest =
+      VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+    for (unique, (node, name, value)) in (1u64..).zip(guests) {
+      let set = exchange(
+        &mut guest,
+        &cx,
+        &message(
+          Opcode::SetXattr as u32,
+          unique,
+          node,
+          &setxattr_body(name, value),
+        ),
+      );
+      assert_eq!(errno(&set), 0, "the guest sets {name:?}");
+      let got = exchange(
+        &mut guest,
+        &cx,
+        &message(
+          Opcode::GetXattr as u32,
+          unique + 100,
+          node,
+          &getxattr_body(256, Some(name)),
+        ),
+      );
+      assert_eq!(
+        (errno(&got), &got[OUT_HEADER_LEN..]),
+        (0, value),
+        "the guest reads {name:?}"
+      );
+    }
+    let listed = exchange(
+      &mut guest,
+      &cx,
+      &message(
+        Opcode::ListXattr as u32,
+        200,
+        file.0,
+        &getxattr_body(4096, None),
+      ),
+    );
+    assert_eq!(
+      listed_names(&listed),
+      vec![b"security.capability".to_vec(), b"user.mime_type".to_vec()],
+      "the guest lists its own names beside user."
+    );
+  }
+  {
+    let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let listed = exchange(
+      &mut host,
+      &cx,
+      &message(
+        Opcode::ListXattr as u32,
+        300,
+        file.0,
+        &getxattr_body(4096, None),
+      ),
+    );
+    assert_eq!(
+      listed_names(&listed),
+      vec![b"user.mime_type".to_vec()],
+      "a host's mount lists user. alone"
+    );
+    for (unique, (node, name, _)) in (400u64..).zip(&guests[..3]) {
+      let got = exchange(
+        &mut host,
+        &cx,
+        &message(
+          Opcode::GetXattr as u32,
+          unique,
+          *node,
+          &getxattr_body(256, Some(name)),
+        ),
+      );
+      assert_eq!(errno(&got), ENODATA, "a host reads no {name:?}");
+      for flags in [0u32, 2] {
+        let mut body = setxattr_body(name, b"host");
+        body[4..8].copy_from_slice(&flags.to_le_bytes());
+        let set = exchange(
+          &mut host,
+          &cx,
+          &message(Opcode::SetXattr as u32, unique + 10, *node, &body),
+        );
+        assert_eq!(
+          errno(&set),
+          EOPNOTSUPP,
+          "a host sets no {name:?} (flags {flags})"
+        );
+      }
+      let removed = exchange(
+        &mut host,
+        &cx,
+        &message(
+          Opcode::RemoveXattr as u32,
+          unique + 20,
+          *node,
+          &removexattr_body(name),
+        ),
+      );
+      assert_eq!(errno(&removed), EOPNOTSUPP, "a host removes no {name:?}");
+    }
+  }
+  let mut guest =
+    VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+  for (unique, (node, name, value)) in (450u64..).zip(&guests[..3]) {
+    let got = exchange(
+      &mut guest,
+      &cx,
+      &message(
+        Opcode::GetXattr as u32,
+        unique,
+        *node,
+        &getxattr_body(256, Some(name)),
+      ),
+    );
+    assert_eq!(
+      (errno(&got), &got[OUT_HEADER_LEN..]),
+      (0, *value),
+      "{name:?} is the guest's as it set it"
+    );
+  }
+  let removed = exchange(
+    &mut guest,
+    &cx,
+    &message(
+      Opcode::RemoveXattr as u32,
+      500,
+      file.0,
+      &removexattr_body(b"security.capability"),
+    ),
+  );
+  assert_eq!(errno(&removed), 0, "the guest removes its own");
+  let gone = exchange(
+    &mut guest,
+    &cx,
+    &message(
+      Opcode::GetXattr as u32,
+      501,
+      file.0,
+      &getxattr_body(256, Some(b"security.capability")),
+    ),
+  );
+  assert_eq!(errno(&gone), ENODATA);
+}
+
+/// Linux's `EINVAL` and `EACCES`.
+const EINVAL: i32 = 22;
+const EACCES: i32 = 13;
+
+/// A POSIX ACL value (version 2, then each entry's tag, permission set and id), as a guest's kernel sends one.
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+  let mut value = 2u32.to_le_bytes().to_vec();
+  for &(tag, perm, id) in entries {
+    value.extend_from_slice(&tag.to_le_bytes());
+    value.extend_from_slice(&perm.to_le_bytes());
+    value.extend_from_slice(&id.to_le_bytes());
+  }
+  value
+}
+
+/// The bytes of attribute `name` the volume keeps on `no`, read past any bridge.
+fn kept_value(vol: &Volume, store: &Store, no: slates_vfs::ids::InodeNo, name: &[u8]) -> Vec<u8> {
+  let len = usize::try_from(vol.xattr_len(store, no, name).unwrap()).unwrap();
+  let mut value = vec![0u8; len];
+  assert_eq!(vol.xattr_read(store, no, name, 0, &mut value).unwrap(), len);
+  value
+}
+
+/// A-302 (a guest's POSIX ACLs, through the dispatch every transport shares). Do: through a bridge that serves a guest
+/// whose run named its owner (the host's 501:20 shown as the run's 1000:1001), set an access ACL on a file naming the
+/// run, a third user and the run's group, and a default ACL on the root; read both back and list the file; read what
+/// the volume keeps past any bridge; set a default ACL on the file, then malformed ACLs; then, through a host's bridge,
+/// list, read and set the ACL names. Expect the guest to read back exactly what it set; the volume to keep the run's
+/// ids as the host's, in id order; the default ACL on a file refused `EACCES`; a torn value `EINVAL` and another
+/// version `EOPNOTSUPP`, the kept ACL unchanged by them; and the host's bridge to list neither name, read each `ENODATA`
+/// and have a set refused `EOPNOTSUPP`.
+#[test]
+fn a_guests_acls_are_kept_through_its_owner_view_and_no_hosts_mount_reaches_them() {
+  const USER_OBJ: u16 = 0x01;
+  const USER: u16 = 0x02;
+  const GROUP_OBJ: u16 = 0x04;
+  const GROUP: u16 = 0x08;
+  const MASK: u16 = 0x10;
+  const OTHER: u16 = 0x20;
+  const NONE: u32 = u32::MAX;
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol
+    .create_file_no(&mut store, root, "shared.txt", 0o664)
+    .unwrap();
+  let cx = test_cx();
+  let access = acl(&[
+    (USER_OBJ, 6, NONE),
+    (USER, 6, RUN.0),
+    (USER, 4, NEITHER.0),
+    (GROUP_OBJ, 4, NONE),
+    (GROUP, 6, RUN.1),
+    (MASK, 6, NONE),
+    (OTHER, 4, NONE),
+  ]);
+  let default = acl(&[(USER_OBJ, 7, NONE), (GROUP_OBJ, 5, NONE), (OTHER, 5, NONE)]);
+  {
+    let mut guest = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store)
+      .viewing_owners(OwnerView::swapping(HOST, RUN))
+      .serving_a_guest();
+    let mut ask = |unique: u64, opcode: Opcode, nodeid: u64, body: &[u8]| {
+      exchange(
+        &mut guest,
+        &cx,
+        &message(opcode as u32, unique, nodeid, body),
+      )
+    };
+    let set = ask(
+      1,
+      Opcode::SetXattr,
+      file.0,
+      &setxattr_body(b"system.posix_acl_access", &access),
+    );
+    assert_eq!(errno(&set), 0, "the guest sets its file's ACL");
+    let set = ask(
+      2,
+      Opcode::SetXattr,
+      1,
+      &setxattr_body(b"system.posix_acl_default", &default),
+    );
+    assert_eq!(errno(&set), 0, "the guest sets its directory's default ACL");
+    for (unique, node, name, value) in [
+      (3, file.0, &b"system.posix_acl_access"[..], &access),
+      (4, 1, &b"system.posix_acl_default"[..], &default),
+    ] {
+      let got = ask(
+        unique,
+        Opcode::GetXattr,
+        node,
+        &getxattr_body(256, Some(name)),
+      );
+      assert_eq!(
+        (errno(&got), &got[OUT_HEADER_LEN..]),
+        (0, value.as_slice()),
+        "the guest reads its {name:?} as it set it"
+      );
+    }
+    let listed = ask(5, Opcode::ListXattr, file.0, &getxattr_body(4096, None));
+    assert_eq!(
+      listed_names(&listed),
+      vec![b"system.posix_acl_access".to_vec()]
+    );
+    let on_a_file = ask(
+      6,
+      Opcode::SetXattr,
+      file.0,
+      &setxattr_body(b"system.posix_acl_default", &default),
+    );
+    assert_eq!(
+      errno(&on_a_file),
+      EACCES,
+      "a default ACL is a directory's alone"
+    );
+    let mut torn = access.clone();
+    torn.pop();
+    let mut other_version = access.clone();
+    other_version[0] = 1;
+    for (unique, value, refused) in [(7, torn, EINVAL), (8, other_version, EOPNOTSUPP)] {
+      let set = ask(
+        unique,
+        Opcode::SetXattr,
+        file.0,
+        &setxattr_body(b"system.posix_acl_access", &value),
+      );
+      assert_eq!(errno(&set), refused);
+    }
+  }
+  assert_eq!(
+    kept_value(&vol, &store, file, b"system.posix_acl_access"),
+    acl(&[
+      (USER_OBJ, 6, NONE),
+      (USER, 6, HOST.0),
+      (USER, 4, NEITHER.0),
+      (GROUP_OBJ, 4, NONE),
+      (GROUP, 6, HOST.1),
+      (MASK, 6, NONE),
+      (OTHER, 4, NONE),
+    ]),
+    "the volume keeps the run's ids as the host's, in id order, and no refused set changed it"
+  );
+  let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let listed = exchange(
+    &mut host,
+    &cx,
+    &message(
+      Opcode::ListXattr as u32,
+      20,
+      file.0,
+      &getxattr_body(4096, None),
+    ),
+  );
+  assert_eq!(
+    listed_names(&listed),
+    Vec::<Vec<u8>>::new(),
+    "a host's mount lists no ACL"
+  );
+  for (unique, node, name) in [
+    (21, file.0, &b"system.posix_acl_access"[..]),
+    (22, 1, &b"system.posix_acl_default"[..]),
+  ] {
+    let got = exchange(
+      &mut host,
+      &cx,
+      &message(
+        Opcode::GetXattr as u32,
+        unique,
+        node,
+        &getxattr_body(256, Some(name)),
+      ),
+    );
+    assert_eq!(errno(&got), ENODATA, "{name:?}");
+    let set = exchange(
+      &mut host,
+      &cx,
+      &message(
+        Opcode::SetXattr as u32,
+        unique + 10,
+        node,
+        &setxattr_body(name, &default),
+      ),
+    );
+    assert_eq!(errno(&set), EOPNOTSUPP, "{name:?}");
+  }
 }
