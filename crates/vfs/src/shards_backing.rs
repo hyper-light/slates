@@ -57,8 +57,9 @@
 //!
 //! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. The registry also keeps
 //! its fill budget ([`ShardsBackings::set_budget`]), which the server sets from the shard's content reserve: a backing
-//! counts a range for each range it has filled, and at least one. A range is longer than a chunk, so the budget refuses
-//! long before the slab is full. Until the budget is set it is zero, and nothing is backed.
+//! counts a range for each range it has filled or a fill left uncleared ([`ShardsBacking::mark_uncleared`], A-419), and
+//! at least one. A range is longer than a chunk, so the budget refuses long before the slab is full. Until the budget is
+//! set it is zero, and nothing is backed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -247,14 +248,17 @@ pub struct PagePlacement {
   pub pmd_bytes: Option<u64>,
 }
 
-/// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and
-/// whether the disk has changed the file beneath it since.
+/// One file's backing for one holder: its object, the ranges filled from the volume, the ranges a fill began and did not
+/// finish, the ranges asked writable, and whether the disk has changed the file beneath it since.
 pub struct ShardsBacking {
   object: BackingObject,
   /// The prefix of the volume whose file it backs: the attachment's volume's own.
   volume: u16,
   inode: InodeNo,
   filled: BTreeSet<u64>,
+  /// Ranges a fill began and did not finish (A-419): no write reaches them, and the object may hold bytes there that
+  /// the file no longer has, so each is counted as a filled range is and cleared before a fill of it begins.
+  uncleared: BTreeSet<u64>,
   writable: BTreeSet<u64>,
   stale: bool,
 }
@@ -265,6 +269,7 @@ impl std::fmt::Debug for ShardsBacking {
       .field("volume", &self.volume)
       .field("inode", &self.inode)
       .field("filled", &self.filled.len())
+      .field("uncleared", &self.uncleared.len())
       .field("writable", &self.writable.len())
       .field("stale", &self.stale)
       .finish()
@@ -299,6 +304,7 @@ impl ShardsBacking {
       volume,
       inode,
       filled: BTreeSet::new(),
+      uncleared: BTreeSet::new(),
       writable: BTreeSet::new(),
       stale: false,
     }
@@ -338,9 +344,29 @@ impl ShardsBacking {
     self.filled.insert(range);
   }
 
-  /// Unmarks range `range`: a fill that did not complete.
+  /// Unmarks range `range`: a fill refused before it stored anything (its charge refused).
   pub fn unmark_filled(&mut self, range: u64) {
     self.filled.remove(&range);
+  }
+
+  /// Range `range`'s fill began and did not finish (A-419). It is no longer filled, so no write reaches it, but the
+  /// slices done may have stored bytes the file will not hold by the time the range is asked again, and a fill skips
+  /// holes and pages of zeros. So it stays counted against the fill budget, as a filled range is, until a fill of it
+  /// clears it first ([`ShardsBacking::cleared`]) or the backing goes.
+  pub fn mark_uncleared(&mut self, range: u64) {
+    self.filled.remove(&range);
+    self.uncleared.insert(range);
+  }
+
+  /// The ranges a fill began and did not finish, by index: each is cleared before a fill of it begins.
+  #[must_use]
+  pub fn uncleared(&self) -> &BTreeSet<u64> {
+    &self.uncleared
+  }
+
+  /// Range `range` was cleared: the object reads zero there again, as over a range never filled.
+  pub fn cleared(&mut self, range: u64) {
+    self.uncleared.remove(&range);
   }
 
   /// The ranges a mapping asked to write, by index: what an ingest compares.
@@ -411,7 +437,8 @@ pub struct ShardsBackings {
   refused: u64,
   /// Backings marked stale, monotone: the non-vacuity counter of the overlay's refill.
   marked_stale: u64,
-  /// The bytes the backings count against the budget: a range for each range each has filled, at least one each.
+  /// The bytes the backings count against the budget: a range for each range each has filled or left uncleared, at
+  /// least one each.
   charged: u64,
   /// The most they may count: the shard's content reserve, set by the server ([`ShardsBackings::set_budget`]).
   budget: u64,

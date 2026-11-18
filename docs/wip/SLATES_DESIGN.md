@@ -4422,7 +4422,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   once to `2^63 − 2 MiB` and never resized. Every range an ask touches is kept equal from then on, past the file's end
   too, since a guest maps by a size another path may have cut (A-167). It is filled from the volume a
   range at a time as asked, every change of the file through any path written into it before the change returns, and
-  the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
+  the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. A range whose fill is
+  refused or given up part-way is left uncleared: no change reaches it, it stays counted against the fill budget, and
+  its next fill clears it before storing anything, since a fill skips holes and pages of zeros (A-419). So there is no revoke
   and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
   range or more) while the shard's fill budget has room. On Windows (A-180) the object is a section under A-175's
   confining descriptor, reserved at the machine's memory and committed a range at a time. It is duplicated into the
@@ -29670,3 +29672,45 @@ records, `crates/server/src/merge_service.rs` (`record_standing`, `catch_up`, `M
   successor's version 4 committed with it and recomputed there, version 3's input fetched. Kiln r355, the Mac Studio,
   2026-11-18, debug build: green in 4.4 s; red without the catch-up, version 4 answered out of order 4,865 times in
   405 s. The merge unit tests (`merge_origin`, `merge_service`) 27 of 27.
+
+### A-419 — A DAX fill that fails part-way leaves its range uncleared and counted, cleared before its next fill begins (2026-11-18, goal 83 item B7, g079; §4.6 the backed route; A-163, A-193)
+Applied in the same change to: §4.6 (the Shards route's DAX line), GAPS (the 2026-10-25 G-vhost entry's open line and
+the backed L1 entry's twin), `crates/vfs/src/shards_backing.rs` (`ShardsBacking::mark_uncleared`, `uncleared`,
+`cleared`), `crates/bridge-core/src/dax_backing.rs` (a range's fill begins by clearing an uncleared one; a failure and
+`abandon_fill` leave it uncleared; `charge_of`; the fill's `range_charge` removed) with three unit tests, and the bug
+record `docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`.
+- **What was there.** A range is marked filled when its fill begins, so write-through reaches it. A fill refused
+  part-way (the volume refusing a slice's seek or read, the OS a store or a placement) or given up (the attachment's
+  bridge gone) unmarked the range and gave its charge back, while the pages its slices stored stayed in the object. No
+  change of the file reached the range from then on, and its next fill copies only the volume's data runs and pages
+  that are not zeros, since a range never filled reads zero. So where the file had since become a hole or zeros, the
+  guest's map showed the old bytes, and the backings held those pages uncounted. A-193's "placed after the fill"
+  reasoned from the old rule.
+- **The rule.** A fill that fails or is given up part-way leaves its range uncleared: no longer filled, so no write
+  reaches it, and still counted, since its slices may have stored bytes. The next fill of the range clears it before
+  it stores anything (`DaxObject::zero`: Linux gives the pages back; macOS and Windows store zeros over what holds
+  bytes, within the range's charge), then fills it as a range never filled. A clear the OS refuses refuses that fill,
+  and the range stays uncleared and counted. A backing's charge counts its filled and uncleared ranges together, so a
+  range moving between them changes no count, and letting the backing go gives both back.
+- **Why this and not another.**
+  - Clearing at the failure would need a second path for a clear refused there, and on macOS and Windows zeroing gives
+    no memory back, so the range would stay counted anyway.
+  - Clearing every range as its fill begins costs nothing on Linux, but on Windows a zeroing is stores over the whole
+    2 MiB (a section tells no holes), which would make every hole's pages resident. Only a range a fill left part-way
+    can hold bytes.
+  - Comparing every page with the volume, as a refill does, reads every page of the range, which on Windows faults
+    its committed pages in.
+- **What it costs.** Nothing on a fill that does not fail. A failed range stays counted until it is filled again or its
+  backing goes: at most a range for each fill that failed, within the budget.
+- **Tests** (`crates/bridge-core/src/dax_backing.rs`, the lib's unit tests; the refusal injected by a context of
+  another volume, which the bridge refuses as any read it cannot serve):
+  `a_fill_refused_part_way_leaves_nothing_a_later_fill_shows`, `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows`
+  and `a_part_way_fill_stays_counted_until_its_range_is_filled_again`. The Mac Studio (d1323898, macOS arm64), debug
+  build, 2026-11-18: red without the fix, 3 of 3 failing (kiln r97: the refused and abandoned fills' first slice still
+  read `A` after the file was zeroed; 2,097,152 bytes counted where two ranges held bytes); green with it, the module's
+  5 of 5.
+- **Siblings, reported, not changed here** (each from reading, each owed a failing test; GAPS):
+  - a successor's adopted DAX object (A-365) may hold a fill's bytes in a range its range table does not name, since
+    a range is recorded only once answered: the one the dead daemon was filling, or one that failed there;
+  - on Windows a range is committed (`prepare_range`) before its charge is asked, so a `Budget` refusal leaves a
+    committed range uncounted, and Windows gives no committed page of a section back.
