@@ -606,7 +606,6 @@ fn audit_optional_dependencies(
   }
 }
 
-/// `<root name>-<platform id>`: napi's platform package name.
 /// The CLI manifest's cargo-binstall table names exactly the shipped targets, each with the release's address of its
 /// binary, as raw binaries, under the crate's repository (Appendix B.2, A-413).
 fn audit_binstall(binstall: &Binstall, findings: &mut Vec<Finding>) {
@@ -646,6 +645,7 @@ fn audit_binstall(binstall: &Binstall, findings: &mut Vec<Finding>) {
   }
 }
 
+/// `<root name>-<platform id>`: napi's platform package name.
 fn platform_name(root_name: &str, platform: &Platform) -> String {
   format!("{root_name}-{}", platform.id)
 }
