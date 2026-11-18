@@ -93,11 +93,18 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - **built 2026-11-18 (A-321's third part):** signed work survives a takeover. A version's merge record carries its
->   verdict (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it and the successor adopts the replica (A-333), so a green
->   taken over reads its signed versions as they were judged; the catalog register carries the write policy, its
->   version and the trusted signers (`CatalogValue::write`, `write_version`, `signers`), so a successor enforces and
->   reports them (`crates/server/tests/fleet.rs`, two takeover tests on three nodes, each guard red alone);
+> - **built and landed 2026-11-18 (A-321's third part; g090's branch `agents/g090-signed-work-takeover`, landed by the
+>   replication goal, g230):** signed work survives a takeover. A version's merge record carries its verdict
+>   (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it as it accepts the
+>   record (`merge_service::recompute`) and as a replica is advanced or rebuilt from the ledger (`merge_origin`), and the
+>   successor adopts the replica (A-333), so a green taken over reads its signed versions as they were judged; the catalog
+>   register carries the write policy, its version and the trusted signers (`CatalogValue::write`, `write_version`,
+>   `signers`), carried by `AdoptedGreen` and used by `record_adopted_green` and `materialize_taken_over`, so a successor
+>   enforces and reports them. Tests on three nodes at `f = 1` (`crates/server/tests/fleet.rs`):
+>   `a_greens_policy_signers_and_verdicts_survive_its_owner` and `a_volumes_policy_and_signers_survive_its_owner`, each
+>   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+>   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
+>   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
@@ -356,6 +363,15 @@
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
 >   a reader).
 
+> **Every delta behind a whole state in flight was refused for credit, and each refusal shipped the volume whole again:
+> fixed (2026-11-18, A-371, §4.10 "Live shipping", AC-8.9; g230).** The live credit counted the whole entry the owner had
+> just appended, and the owner sets the credit from that entry's size, so deltas behind it were refused `NoCredit` until
+> it was durable and every refusal owed a whole state: the measurer's 32 writers on a 128 MiB volume saw two extra
+> whole records of about 135.5 MB a run. The credit now holds the deltas alone; a whole state rides one past it. Test:
+> `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+> - **Owed (the measurer's):** the 32-writer, 128 MiB run again (diag-measurer-7's harness): expect `fleet.live.whole`
+>   to stay 1 and fewer one-second steps.
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
@@ -583,9 +599,14 @@
 >   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
 >   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
 >   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
->   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
->   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
->   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
+>   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
+>   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
+>   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
+>   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
+>   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
+>   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
 >   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
 >   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
@@ -2547,6 +2568,21 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
+> retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
+> object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
+> every version decoded every version's record before it: on the Mac Studio, a debug build, `sample` of the late-submit
+> test at 1,000 versions found a fifth of each holder's time in that rule (1,364 to 1,413 samples of about 6,570), the
+> late median at 18.2 ms against the early 2.16. A ledger never rewrites an accepted position, so its inputs placed below
+> its newest accepted version were judged when their records came; now the rule judges those placed at or past it
+> (`ContentHold::retain_placed_from`, over the hold's manifests indexed by placed sequence, charged with them), and the
+> newest placement is one read. Test: `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change`
+> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held (red with the rule
+> judging a ledger whole). Kiln r3491, the Mac Studio, debug: the late-submit test's late median at 300 versions 2.92 to
+> 3.28 ms against early 1.87 to 1.96 (it was 4.4 to 6.4 against 2.0 to 2.4), and at 1,000 versions 8.49 against 2.28
+> (18.2 against 2.16). What remains is the content hold's image, one piece re-encoded and re-put at each publication,
+> about a tenth of a holder's time at 1,000 versions, which also brings the checkpoints a delta's size triggers.
+>
 > **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
 > one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
 > compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
@@ -3816,11 +3852,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 >       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
 >       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
->       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
->       client's shard,
->       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
->       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
->       term).
+>       g250). The creator rule's two siblings on the client's shard are fixed (g229, 2026-11-18): a mount of a
+>       yielded volume is refused by its kind on the volume's shard (`remote_attach::lost_attach`; it had attached the
+>       copy), and a record-form attach of one is remembered with its client before it is sent, so the client's reap ends
+>       it at the successor (`remote_attach::remember_volume_at`; it had stayed there for good). Red first:
+>       `an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind` and
+>       `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`
+>       (`docs/bugs/2026-11-18-a-node-admitted-again-took-the-volumes-it-yielded-for-its-own-on-the-clients-shard.md`).
+>       **Owed:** releasing a yielded copy's memory (GAP-A9-7).
 >     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
 >       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
 >       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read

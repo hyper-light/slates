@@ -364,3 +364,53 @@ fn a_guarded_object_holds_its_file_in_page_interiors_and_its_guards_stay_zero() 
     Err(MemError::OutOfRange { .. })
   ));
 }
+
+/// A-365. Do: store through a peer's map of an object, drop the object, keeping only a duplicate of its descriptor (as an
+/// anchor holds one across its maker's death), and adopt that descriptor; then store through the adopted object; then
+/// adopt a descriptor of something else: one end of a socket pair, and (Linux) a memfd of the right size never sealed.
+/// Expect the adopted object to read the peer's store and the peer to see the adopted object's, the same memory; and
+/// each other descriptor refused `NotADaxObject`, nothing adopted.
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn an_object_held_across_its_makers_end_is_adopted_and_nothing_else_is() {
+  let object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
+  let peer = PeerRange::map(&object, 2);
+  peer.store(7, b"before the end");
+  let held = rustix::io::fcntl_dupfd_cloexec(object.descriptor(), 0).unwrap();
+  drop(object);
+  let mut adopted = DaxObject::adopt(held, VIEWS, DaxLayout::Identity).unwrap();
+  let mut seen = [0u8; 14];
+  adopted.load(2 * DAX_RANGE_BYTES + 7, &mut seen).unwrap();
+  assert_eq!(
+    &seen, b"before the end",
+    "the adopted object holds the peer's store"
+  );
+  adopted
+    .store(2 * DAX_RANGE_BYTES + 100, b"after the adoption")
+    .unwrap();
+  assert_eq!(
+    peer.load(100, 18),
+    b"after the adoption",
+    "and is the very memory the peer maps"
+  );
+  let (socket, _other) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::empty(),
+    None,
+  )
+  .unwrap();
+  assert!(matches!(
+    DaxObject::adopt(socket, VIEWS, DaxLayout::Identity),
+    Err(MemError::NotADaxObject { .. })
+  ));
+  #[cfg(target_os = "linux")]
+  {
+    let unsealed = rustix::fs::memfd_create("not-dax", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    rustix::fs::ftruncate(&unsealed, DAX_OBJECT_BYTES).unwrap();
+    assert!(matches!(
+      DaxObject::adopt(unsealed, VIEWS, DaxLayout::Identity),
+      Err(MemError::NotADaxObject { object_bytes }) if object_bytes == DAX_OBJECT_BYTES
+    ));
+  }
+}
