@@ -409,7 +409,11 @@ fn timed_tail(seg: &mut AnchorSegment) -> Timed {
   let quartile = CHECK_RECOVERIES / 4;
   Timed {
     median_ns: replay_ns.get(CHECK_RECOVERIES / 2).copied().unwrap(),
-    spread_ns: replay_ns[CHECK_RECOVERIES - 1 - quartile] - replay_ns[quartile],
+    spread_ns: replay_ns
+      .get(CHECK_RECOVERIES - 1 - quartile)
+      .copied()
+      .unwrap()
+      .saturating_sub(replay_ns.get(quartile).copied().unwrap()),
     replayed,
   }
 }

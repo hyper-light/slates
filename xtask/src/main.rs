@@ -304,26 +304,82 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
 
 /// Strips string literals and comments from a code line so a word inside them cannot match.
 fn code_only(line: &str) -> String {
+  code_only_carrying(line, &mut StringState::Code)
+}
+
+/// Where a line of a file read in order starts and ends: in code, in a string literal, or in a raw string literal
+/// closed by a quote and that many `#`s. A string that spans lines (`"text \` continued below) leaves its later
+/// lines inside it, and those lines are string, not code (2026-11-18: three continuation lines of log and profile
+/// text were read as code and their amendment numbers and an Ubuntu release flagged as tuning literals).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringState {
+  Code,
+  Plain,
+  Raw(usize),
+}
+
+/// [`code_only`] for a line of a file read in order: `state` says whether the line starts inside a string an earlier
+/// line opened, and is left saying whether it ends inside one. A character literal of a quote (`'"'`, `b'"'`, `'\"'`)
+/// opens nothing, and a raw string closes only at a quote followed by its own count of `#`s.
+fn code_only_carrying(line: &str, state: &mut StringState) -> String {
   let mut out = String::with_capacity(line.len());
-  let mut chars = line.chars().peekable();
-  let mut in_string = false;
-  while let Some(c) = chars.next() {
-    if in_string {
-      if c == '\\' {
-        chars.next();
-      } else if c == '"' {
-        in_string = false;
-        out.push('"');
+  let chars: Vec<char> = line.chars().collect();
+  let mut at = 0;
+  while let Some(&c) = chars.get(at) {
+    at += 1;
+    match *state {
+      StringState::Plain => {
+        if c == '\\' {
+          at += 1;
+        } else if c == '"' {
+          *state = StringState::Code;
+          out.push('"');
+        }
       }
-      continue;
-    }
-    if c == '"' {
-      in_string = true;
-      out.push('"');
-    } else if c == '/' && chars.peek() == Some(&'/') {
-      break;
-    } else {
-      out.push(c);
+      StringState::Raw(hashes) => {
+        let closes = c == '"' && (0..hashes).all(|offset| chars.get(at + offset) == Some(&'#'));
+        if closes {
+          at += hashes;
+          *state = StringState::Code;
+          out.push('"');
+        }
+      }
+      StringState::Code => {
+        if c == '\'' && chars.get(at) == Some(&'"') && chars.get(at + 1) == Some(&'\'') {
+          at += 2;
+          out.push_str("''");
+        } else if c == '\''
+          && chars.get(at) == Some(&'\\')
+          && chars.get(at + 1) == Some(&'"')
+          && chars.get(at + 2) == Some(&'\'')
+        {
+          at += 3;
+          out.push_str("''");
+        } else if c == 'r'
+          && !chars
+            .get(at.wrapping_sub(2))
+            .is_some_and(|before| before.is_alphanumeric() || *before == '_')
+          && matches!(chars.get(at), Some('"' | '#'))
+        {
+          let hashes = chars.get(at..).map_or(0, |rest| {
+            rest.iter().take_while(|next| **next == '#').count()
+          });
+          if chars.get(at + hashes) == Some(&'"') {
+            at += hashes + 1;
+            *state = StringState::Raw(hashes);
+            out.push('"');
+          } else {
+            out.push(c);
+          }
+        } else if c == '"' {
+          *state = StringState::Plain;
+          out.push('"');
+        } else if c == '/' && chars.get(at) == Some(&'/') {
+          break;
+        } else {
+          out.push(c);
+        }
+      }
     }
   }
   out
@@ -1146,8 +1202,8 @@ mod structural {
 
 mod literals {
   use super::{
-    Failure, cargo_metadata, code_only, is_test_tree, lines_with_test_flag, rust_sources,
-    workspace_root,
+    Failure, StringState, cargo_metadata, code_only_carrying, is_test_tree, lines_with_test_flag,
+    rust_sources, workspace_root,
   };
   use std::path::Path;
 
@@ -1202,12 +1258,14 @@ mod literals {
     let lines = lines_with_test_flag(&source);
     let mut cover_until: usize = 0;
     let mut derived_depth: i64 = 0;
+    // Carried across every line, test lines too, so a string that spans lines is read as one.
+    let mut string_state = StringState::Code;
     for (line_no, line, in_test) in &lines {
       let trimmed = line.trim_start();
       if MARKERS.iter().any(|m| trimmed.contains(m)) {
         cover_until = line_no + MARKER_REACH;
       }
-      let code = code_only(line);
+      let code = code_only_carrying(line, &mut string_state);
       // A `derived!(` call covers every line until its parentheses close.
       let in_derived = derived_depth > 0 || code.contains("derived!(");
       if in_derived {
@@ -1307,5 +1365,53 @@ mod literals {
       || before.ends_with("align(")
       || after.starts_with(']')
       || before.ends_with("u8")
+  }
+}
+
+#[cfg(test)]
+mod string_state_tests {
+  use super::{StringState, code_only, code_only_carrying};
+
+  /// Every line of `text` read in order, as the literal check reads a file: each line's code alone.
+  fn code_of(text: &str) -> Vec<String> {
+    let mut state = StringState::Code;
+    text
+      .lines()
+      .map(|line| code_only_carrying(line, &mut state))
+      .collect()
+  }
+
+  /// Do: read a string that spans three lines, then code after it. Expect the middle line's digits and the
+  /// first line's tail inside the string gone, and the code after the string's close kept.
+  #[test]
+  fn a_string_spanning_lines_hides_its_continuation_lines() {
+    let lines = code_of("log!(\"held to this build \\\n   in 4 places, A-318)\", 64);\nlet x = 7;");
+    assert_eq!(lines, vec!["log!(\"", "\", 64);", "let x = 7;"]);
+  }
+
+  /// Do: read a character literal of a quote, then a number, on one line and the next. Expect the quote to open
+  /// nothing: both numbers stay code.
+  #[test]
+  fn a_quote_character_literal_opens_no_string() {
+    let lines = code_of("if c == '\"' { 42 }\nlet y = b'\"'; 43\nlet z = '\\\"'; 44");
+    assert!(lines[0].contains("42"), "{lines:?}");
+    assert!(lines[1].contains("43"), "{lines:?}");
+    assert!(lines[2].contains("44"), "{lines:?}");
+  }
+
+  /// Do: read a raw string holding a quote, closed on a later line, then code. Expect the inner quote not to close it
+  /// and the code after its `\"#` kept.
+  #[test]
+  fn a_raw_string_closes_only_at_its_own_hashes() {
+    let lines = code_of("let r = r#\"say \"5\" \nstill 6 inside\"#; let w = 9;");
+    assert!(!lines[0].contains('5'), "{lines:?}");
+    assert!(!lines[1].contains('6'), "{lines:?}");
+    assert!(lines[1].contains("let w = 9;"), "{lines:?}");
+  }
+
+  /// Do: strip one line on its own, as the structural check does. Expect a comment and a whole string gone.
+  #[test]
+  fn one_line_alone_strips_its_comment_and_string() {
+    assert_eq!(code_only("let s = \"7\"; // 8"), "let s = \"\"; ");
   }
 }

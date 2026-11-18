@@ -73,7 +73,7 @@ impl DaxRecord {
   pub(crate) fn decode(bytes: &[u8]) -> Option<DaxRecord> {
     let whole = <&[u8; RECORD_BYTES]>::try_from(bytes).ok()?;
     let (words, _) = whole.as_chunks::<{ size_of::<u64>() }>();
-    let [tag, attachment, inode] = <[[u8; 8]; 3]>::try_from(words)
+    let [tag, attachment, inode] = <[[u8; size_of::<u64>()]; 3]>::try_from(words)
       .ok()?
       .map(u64::from_le_bytes);
     (tag == TAG).then_some(DaxRecord { attachment, inode })

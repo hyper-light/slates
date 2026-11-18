@@ -4224,7 +4224,9 @@
 >   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
 >   included, and the draft carries both digests of each. The numbers are in A-210.
 > - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
->   identity); `cargo-binstall` metadata.
+>   identity). `cargo-binstall` metadata is built (2026-11-18, A-413): `cargo binstall --git
+>   https://github.com/hyper-light/slates slates-cli` takes the release binary for a shipped target, and `cargo xtask
+>   version` holds its overrides to `ASSETS`; its first install against a published release is owed (run request).
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
@@ -10892,7 +10894,14 @@ Open:
     ping and waits at FileVault's unlock screen. A panic is suspected and not yet read.
   - Its report (`/Library/Logs/DiagnosticReports/panic-full-*.panic`) is the next step: the GAPS entry below.
 
-### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; the kernel-client run with the fix open)
+### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; closed 2026-11-18 by the kernel-client run with the fix)
+
+> **Closed 2026-11-18 (main): the kernel-client run with A-358 kept every fsynced file.** GitHub's macos-latest (macOS
+> 26.7.2 25G332, Apple M1 virtual machine, 3 CPUs, xnu-12377.161.15), main c0d386107, run 44379621688:
+> `SLATES=<release slates> ROUNDS=8 KILLS=15 DURATION=30 bash docs/wip/bench/kill_fsync_macos.sh`. Over 8 rounds and
+> 120 SIGKILLs, 32,954 fsynced files were checked: every one intact, 0 empty, 0 corrupt, 0 missing, 0 resurrected, no
+> panic report. Before A-358 the same script lost one file per run on Studio-2 (table below). Run on a CI runner, as
+> Ada asked (a crash there disrupts nobody), since Studio-2 sat behind FileVault after its October panic.
 
 > **2026-11-18 (g079): reproduced through Apple's kernel client, traced, and fixed server-side (A-358).**
 > - **Machine.** Adas-Mac-Studio-2 (kiln b24c5c95): M4 Max, macOS 26.2 (25C56), xnu-12377.61.12, NFS kext

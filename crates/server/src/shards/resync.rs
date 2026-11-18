@@ -246,7 +246,7 @@ pub(super) fn session_bytes(token: &[u8; TOKEN_BYTES], kept: Kept) -> [u8; SESSI
 pub(super) fn from_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept)> {
   let whole = <&[u8; SESSION_BYTES]>::try_from(bytes).ok()?;
   let (token, rest) = whole.split_first_chunk::<TOKEN_BYTES>()?;
-  let (owners, form) = rest.split_first_chunk::<{ 4 * size_of::<u32>() }>()?;
+  let (owners, form) = rest.split_first_chunk::<{ size_of::<[u32; 4]>() }>()?;
   let (owners, _) = owners.as_chunks::<{ size_of::<u32>() }>();
   let [kept_uid, kept_gid, run_uid, run_gid] = <[[u8; 4]; 4]>::try_from(owners)
     .ok()?
@@ -256,7 +256,7 @@ pub(super) fn from_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept)> {
   } else {
     OwnerView::swapping((kept_uid, kept_gid), (run_uid, run_gid))
   };
-  let form = u64::from_le_bytes(<[u8; 8]>::try_from(form).ok()?);
+  let form = u64::from_le_bytes(<[u8; size_of::<u64>()]>::try_from(form).ok()?);
   if form & !FORM_SETXATTR_EXT != 0 {
     return None;
   }

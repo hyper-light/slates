@@ -407,6 +407,7 @@ fn an_object_held_across_its_makers_end_is_adopted_and_nothing_else_is() {
   #[cfg(target_os = "linux")]
   {
     let unsealed = rustix::fs::memfd_create("not-dax", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
     rustix::fs::ftruncate(&unsealed, DAX_OBJECT_BYTES).unwrap();
     assert!(matches!(
       DaxObject::adopt(unsealed, VIEWS, DaxLayout::Identity),
