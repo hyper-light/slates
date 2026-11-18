@@ -249,6 +249,11 @@ pub(crate) struct LiveVolume {
   /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
   /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
   heard: u64,
+  /// When this owner first asked a holder something on this volume's durability path since [`LiveVolume::heard`] last
+  /// moved: a lane opened to send it entries or an install ([`dispatch`]), or its head's or catalog's placement asked
+  /// (`fleet::ship_head`, through [`asked`]). `None` while nothing asked is unanswered. A held reply's silent window is
+  /// given up only once this is a window old (A-301): the owner's own delay in asking is not its holders' silence.
+  unanswered_since_ns: Option<u64>,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -483,8 +488,37 @@ pub(crate) const NS_PER_MS: u64 = 1_000_000;
 pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
   let volume = object.placement_key().0;
   if let Some(live) = state.live.shipping.get_mut(&volume) {
-    live.heard = live.heard.saturating_add(1);
+    note_heard(live);
   }
+}
+
+/// `live` heard something that moved its durability forward: counted ([`LiveVolume::heard`]), and every ask before it
+/// is answered ([`LiveVolume::unanswered_since_ns`]).
+fn note_heard(live: &mut LiveVolume) {
+  live.heard = live.heard.saturating_add(1);
+  live.unanswered_since_ns = None;
+}
+
+/// Whether this shard ships `object`'s volume live, so that an ask of its holders is noted for its held replies
+/// ([`asked`]).
+pub(crate) fn ships(state: &ShardState, object: ObjectId) -> bool {
+  state.live.shipping.contains_key(&object.placement_key().0)
+}
+
+/// This owner is asking `object`'s holders to place its volume's head or catalog (`fleet::ship_head`, a round about to
+/// be sent): noted on the volume's shipper as an ask the volume's held replies may hold its holders to (A-301); nothing
+/// for a volume this shard does not ship.
+pub(crate) fn asked(state: &mut ShardState, object: ObjectId) {
+  let volume = object.placement_key().0;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    note_asked(live, slates_rt::futures::now_ns());
+  }
+}
+
+/// `live`'s owner asked a holder something at `now_ns`: the oldest ask unanswered, unless an older one is
+/// ([`LiveVolume::unanswered_since_ns`]).
+fn note_asked(live: &mut LiveVolume, now_ns: u64) {
+  live.unanswered_since_ns.get_or_insert(now_ns);
 }
 
 /// Derived: how far apart the looks are that confirm a held reply's silent window
@@ -527,17 +561,20 @@ pub(crate) fn judge_durable_bound(
 }
 
 /// What a reply held for `volume`'s durability is judged against now: the acknowledgements the volume has heard
-/// ([`heard_of`]), and the waits the daemon's control shard has entered in its driver, each with nothing ready to run.
-/// The control shard holds the sessions every holder's acknowledgement arrives on (`send_from_control`), and hands each
-/// one to the volume's shard as a task there; so once it has waited twice after a moment, every acknowledgement that
-/// reached it before then has been read and handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`).
-/// Read off its registry pulse, with no shard round trip.
+/// ([`heard_of`]), the waits the daemon's control shard has entered in its driver, each with nothing ready to run, and
+/// the owner's oldest unanswered ask ([`LiveVolume::unanswered_since_ns`]). The control shard holds the sessions every
+/// holder's acknowledgement arrives on (`send_from_control`), and hands each one to the volume's shard as a task there;
+/// so once it has waited twice after a moment, every acknowledgement that reached it before then has been read and
+/// handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`). Read off its registry pulse, with no shard
+/// round trip.
 pub(crate) fn heard_now(state: &ShardState, volume: slates_db::catalog::VolumeId) -> Heard {
   let control = state.shards.first().copied().unwrap_or(state.shard);
+  let live = state.live.shipping.get(&volume.bytes);
   Heard {
     acknowledged: heard_of(state, volume),
     receiver_idles: slates_rt::registry::with_entry(control, |entry| entry.pulse.waits())
       .unwrap_or(0),
+    unanswered_since_ns: live.and_then(|live| live.unanswered_since_ns),
   }
 }
 
@@ -659,8 +696,8 @@ pub(crate) fn durability(
 
 /// What a reply waiting for `volume`'s log to be durable at `target` is still waiting on, as one line for a log: the
 /// owner's head and durable position, the last whole entry, each holder's acknowledged head, the lanes in flight and how
-/// long each has run, the holders found unreachable, and each condition [`answerable`] asks. Asked when a held reply
-/// gives up, so a refusal says which part of durability it lacked.
+/// long each has run, the holders found unreachable, each condition [`answerable`] asks, and how long the owner's oldest
+/// unanswered ask has waited. Asked when a held reply gives up, so a refusal says which part of durability it lacked.
 pub(crate) fn durability_report(
   state: &ShardState,
   volume: slates_db::catalog::VolumeId,
@@ -691,10 +728,14 @@ pub(crate) fn durability_report(
     .map(|(holder, began)| format!("{}:{}ms", holder.0, now.saturating_sub(*began) / NS_PER_MS))
     .collect();
   let unreachable: Vec<u64> = live.unreachable.iter().map(|holder| holder.0).collect();
+  // How long the owner's oldest unanswered ask has waited (A-301): none, when the owner had asked nothing unanswered.
+  let unanswered_ms = live
+    .unanswered_since_ns
+    .map(|asked| now.saturating_sub(asked) / NS_PER_MS);
   format!(
     "target {target}; head {:?}; durable {:?}; whole {:?}; owes whole {}; holders {holders:?}; lanes {lanes:?}; \
      unreachable {unreachable:?}; head placed {placed}; active set recorded {recorded} (at {:?}); covers candidates \
-     {covered}; fenced {:?}",
+     {covered}; fenced {:?}; oldest unanswered ask {unanswered_ms:?} ms",
     live.shipper.head().map(|head| head.position),
     live.shipper.durable(),
     live.whole_entry.map(|head| head.position),
@@ -1259,6 +1300,7 @@ pub(crate) fn published(
       whole_entry: None,
       image_anchors: None,
       heard: 0,
+      unanswered_since_ns: None,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -1999,6 +2041,8 @@ fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
         return false;
       }
       live.lanes.insert(send.holder, now);
+      // The holder is asked now: a held reply may hold it to an answer from a window hence (A-301).
+      note_asked(live, now);
       if !opened.contains(&(send.object, send.holder)) {
         opened.push((send.object, send.holder));
       }
@@ -2498,7 +2542,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
     if progressed {
-      live.heard = live.heard.saturating_add(1);
+      note_heard(live);
     }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
@@ -3333,19 +3377,7 @@ pub(crate) async fn fetch(
     .first()
     .and_then(|first| sealed_body(first))
     .and_then(|body| body.sealing);
-  // This node's own entry; else the key a fellow candidate handed over for this lineage, asked for now when none was
-  // (A-295), so a successor that holds no entry of its own is served at its first attempt, not a refusal later.
-  let own = sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
-  let lineage = match (own, sealing.as_ref()) {
-    (Some(own), _) => Some(own),
-    (None, Some(sealing)) => match handed.filter(|(id, _)| *id == sealing.lineage) {
-      Some(handed) => Some(handed),
-      None => handed_lineage(object, sealing, &answered).await,
-    },
-    (None, None) => None,
-  };
+  let lineage = lineage_for_rebuild(object, sealing.as_ref(), handed, &answered).await;
   let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
@@ -3354,6 +3386,28 @@ pub(crate) async fn fetch(
     naming,
     sealing,
   }))
+}
+
+/// The lineage key a rebuild opens the log sealed under `sealing` with: this node's own entry; else the key a fellow
+/// candidate handed over for that lineage (`handed`), or asked now of the hosts that answered phase one (`answered`), so a
+/// successor that holds no entry of its own is served at its first attempt, not a refusal later (A-295); none for a log
+/// shipped in the clear.
+async fn lineage_for_rebuild(
+  object: ObjectId,
+  sealing: Option<&crate::head::HeadSealing>,
+  handed: Option<([u8; 16], Vec<u8>)>,
+  answered: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = sealing?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  match handed.filter(|(id, _)| *id == sealing.lineage) {
+    Some(handed) => Some(handed),
+    None => handed_lineage(object, sealing, answered).await,
+  }
 }
 
 /// The lineage key of the log `sealing` belongs to, handed to this successor by a fellow candidate (A-295): asked of the
