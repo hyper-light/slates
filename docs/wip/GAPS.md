@@ -1,5 +1,19 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (g267, 2026-11-18): the wire's append-only rule (D-15) is kept by review alone, and a persisted reply is read
+> outside every schema check.** A variant's wire tag is its index in its enum (`crates/wire-derive/src/lib.rs`,
+> `expand_enum`). 04d7ea465 (A-285) inserted `RequestBody::SubmitHeld` and `EditSubmitHeld` before `SubmitApproved`, so
+> `SubmitApproved`'s tag moved from 69 to 71 (`CONTRACT` 6 had published it). Nothing was misread: a ring or fleet frame
+> carries its body's schema hash (`protocol::frame`), so a client and a daemon of different builds refuse each other
+> whole, and no request body is kept. A reply is: a completion record keeps `ReplyBody` unframed
+> (`CompletionRecord::result`, recorded by `Op::CompletionRecorded` and read back by `ReplyBody::from_bytes` in
+> `crates/server/src/verbs.rs`), and the log's own schema hash covers that field only as bytes. So the same insertion in
+> `ReplyBody`, or in any type it carries (`Refusal`, `MoveRefusal`, ...), would have a daemon restarted on a newer build
+> over the anchor's segment answer a retried request with another reply than the one it recorded, or `DuplicateRequest`.
+> Owed: a structural check that every enum the wire or a record carries only grows at its end (a golden of its variants
+> in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
+> record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
+
 > **Signed work: merges are signed work (2026-11-17, §4.16, §4.12 "The consumer contract"; A-321, goal g090, Ada's
 > rule of 2026-11-18 that a signature is provenance and never the permission gate).** A merge may carry an SSH
 > signature (`PROTOCOL.sshsig`, namespace `slates-work`, Ed25519 or FIDO Ed25519) over its statement — the work, its
