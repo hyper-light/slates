@@ -30966,7 +30966,8 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
   product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
   callers) are filed for main's run.
 - With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
-  EVIDENCE_PLACEHOLDER
+  Built and run on the Mac Studio (kiln, 2026-11-18, load 3-4, debug build, `cargo test --locked -p slates-server
+  --lib -- remote_attach session departed`): 8 of 8. No red-check: no product behaviour changed.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
 remote_attach}.rs`.
