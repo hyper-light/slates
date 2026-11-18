@@ -793,7 +793,7 @@ fn a_granted_landing_a_conflict_refuses_records_its_steps_and_its_refusal() {
   assert!(
     matches!(
       &landed,
-      Err(ClientError::Refused(Refusal::LandingConflict { entries })) if entries == &["/c.txt".to_owned()]
+      Err(ClientError::Refused(Refusal::LandingConflict { entries, .. })) if entries == &["/c.txt".to_owned()]
     ),
     "{landed:?}"
   );
