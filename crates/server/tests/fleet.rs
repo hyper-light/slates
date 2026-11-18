@@ -11394,6 +11394,104 @@ fn a_superseded_owners_clients_reach_its_successor() {
   );
 }
 
+/// Format: the prefix of a holder's counts of the live messages it refused, in total and by why (`live_ship`'s
+/// `count_refused`: a stale epoch, an owner the configuration does not name, ...).
+const LIVE_HOLD_REFUSED: &str = "fleet.live.hold_refused";
+
+/// A holder's counts of the live messages it refused, in total and by why ([`LIVE_HOLD_REFUSED`]), over its shards.
+fn hold_refusals(daemon: &Daemon) -> std::collections::BTreeMap<&'static str, u64> {
+  summed_counters(daemon)
+    .into_iter()
+    .filter(|(name, _)| name.starts_with(LIVE_HOLD_REFUSED))
+    .collect()
+}
+
+/// Shape: the old owner's record periods the A-349 test watches its holders over once it has learned its fence: long
+/// enough that an owner re-sending each period would be refused many times over (about one refusal a holder a period
+/// before the fix), short enough to keep the test to seconds.
+const FENCED_QUIET_PERIODS: u64 = 20;
+
+/// Shape: the refusals a holder may count in the watched window all the same: one lane already in flight when the window
+/// opens.
+const FENCED_QUIET_SLACK: u64 = 1;
+
+/// A-349 (§4.10 "Live shipping", §4.8 "Promotion and takeover"; the chaos nemesis, seed 6876545201569229162): a
+/// superseded owner ships nothing more of the volume it lost. Do: three nodes at `f = 1`; on a, a live-shipped volume
+/// written six files; cut a off on the probe plane alone until the survivor the volume ranks first has taken it over,
+/// and give it its probe plane back; write through a until a write is answered (the first finds a's log fenced: an
+/// entry its holders never take); then let a run [`FENCED_QUIET_PERIODS`] record periods. Expect a's log to show that
+/// entry past its durable position, and neither holder to refuse anything more of a's log in those periods (its whole
+/// `fleet.live.hold_refused` count, whatever the reason). Before, a's record period sent each holder that entry again
+/// every period and each refused it (a node the configuration does not name the volume's owner), and a's record
+/// sessions were out on that loan at the start of every period, where the nemesis's takeover round on a met them: it
+/// never sent the other survivor its page and gave up two objects within tolerance.
+#[test]
+fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "superseded-quiet");
+  drop(client);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let successor = &daemons[if successor == hosts[1] { 1 } else { 2 }];
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, successor);
+  let through_a = written_through(&daemons, 0, id, "/through-the-old-owner");
+  let mut client = Client::connect(daemons[0].instance());
+  let line = owned_live_line(&mut client, id);
+  drop(client);
+  let before = [hold_refusals(&daemons[1]), hold_refusals(&daemons[2])];
+  // Never met: the wait ends once a has run the window's periods.
+  let _ = poll_for_periods(
+    &[&daemons[0]],
+    PLACEMENT_DEADLINE,
+    FENCED_QUIET_PERIODS,
+    || Ok(false),
+  );
+  let after = [hold_refusals(&daemons[1]), hold_refusals(&daemons[2])];
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "superseded owner quiet: taken over {taken}; writes through a {through_a:?}; a's log (head, durable, owed) \
+     {line:?}; the holders' refusals {before:?} -> {after:?} over {FENCED_QUIET_PERIODS} periods"
+  );
+  let total = |refusals: &std::collections::BTreeMap<&'static str, u64>| {
+    refusals.get(LIVE_HOLD_REFUSED).copied().unwrap_or(0)
+  };
+  let before = before.each_ref().map(total);
+  let after = after.each_ref().map(total);
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    through_a
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "a write through a was answered at durability: {through_a:?}"
+  );
+  let (head, durable, _) = line.expect("a still shows the log it lost");
+  assert!(
+    head.is_some_and(|head| durable.is_none_or(|durable| head > durable)),
+    "a's log holds an entry its holders never took (head {head:?}, durable {durable:?}), so the window would show it \
+     sent again"
+  );
+  for (holder, (before, after)) in ["b", "c"].iter().zip(before.into_iter().zip(after)) {
+    assert!(
+      after.saturating_sub(before) <= FENCED_QUIET_SLACK,
+      "{holder} refused {} live messages of a's fenced log in {FENCED_QUIET_PERIODS} periods",
+      after.saturating_sub(before)
+    );
+  }
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.

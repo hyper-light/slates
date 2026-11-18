@@ -7278,6 +7278,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `crates/server/tests/fuse_mount.rs`, the supersession injected as each path brings it (`Daemon::inject_superseded`). An idle volume's mount learns of the takeover only once the
 >   owner knows it: with no write to meet a holder's fence, that waits for the re-admission's yield (A-334, owed); and
 >   the guest device, the Shards stream and the WinFsp mount still hold or serve such a volume (GAPS).
+> - **A superseded owner shipped on and starved its own takeover round (fixed 2026-11-18, A-349).** The nemesis (seed
+>   6876545201569229162, both Linux arches, 5 of 6 rounds) gave up two objects within tolerance. Its owner, isolated,
+>   superseded and admitted again, still sent each holder its fenced log's entries every record period, each refused
+>   `StaleEpoch`. The next departure's objects fell to it, and its round asked the other survivor for its page each period
+>   and found its record session out on that loan every time (`fleet.takeover.pages_unsent` 213 to 928, the diagnostic
+>   line `lent_to live_ship`), until A-304's bound gave them up: no survivor withheld a promise, the round never asked.
+>   `learn_superseded` said a superseded owner ships no more of the volume; the record period's visit did not ask. Now a
+>   fenced volume sends nothing and does no period work (`live_ship::pending_sends`, `period_volume`). Held by
+>   `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed (GAPS): the round's
+>   adoption there meets the node's own superseded copy, which a takeover must replace (A-334's re-adoption); a lane that
+>   ends on a refusal is sent again at once.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -25470,6 +25481,44 @@ go, naming its learned object, never a completed takeover's; the held copy kept,
 
 Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its residual), GAPS (A-272 (ii)'s entry)
 and `crates/server/src/takeover.rs`.
+
+### A-349 — A superseded owner ships nothing more of the volume it lost, so its record sessions are free for its own takeover rounds (2026-11-18, kiln goal g250; §4.10 live shipping, §4.8 "Promotion and takeover"; the chaos nemesis, seed 6876545201569229162; A-304, A-338)
+
+- **What was there.** An owner that learns its fence (a holder answered its log `StaleEpoch` at a later epoch) refuses
+  every write waiting on the volume and ships nothing more of it (`live_ship::learn_superseded`; `Next::Fenced`: "must
+  stop shipping and serving"). The paths that ship from a publication, a lane's end and a holder's return honoured
+  that; the record period did not. Its visit followed the volume's candidates and made whole records and images for it,
+  and `pending_sends` built each holder the entries or the install it lacked, every period, each refused `StaleEpoch`.
+  Each send borrows the holder's record session for its exchange (`borrow_session`, `fleet.lent_to.live_ship`), and the
+  coordinator starts the period's lanes just before it drives the takeover rounds (`run_record_period`, then
+  `adopt_and_serve`). A round's page question takes a session only if it is in its link at that instant
+  (`takeover::ask_pages`), so the old owner's rounds met it out on that loan every period. In the nemesis (diag-g250-
+  nemesis-2, CI run 44320668620, 5 of 6 rounds over both arches) the owner X1, isolated, superseded and admitted again,
+  was a survivor of the next departure (its successor X2, deafened); X2's objects fell to X1, the volume's home; X1's
+  round never sent the other survivor its page (`fleet.takeover.pages_unsent` 213 to 928) and A-304's bound gave both
+  up (NotRecovered) within tolerance. No survivor withheld a promise: the round never asked.
+- **The rule.** A fenced volume does nothing at the record period and sends nothing from any path
+  (`live_ship::pending_sends`, `period_volume`). Its writers were refused when the fence was learned, and later verbs go
+  to its successor (A-338).
+- **What it costs.** Nothing a superseded owner sent could land. Each period had sent each holder its stale entries or
+  a stale install (the whole volume: about 2,240 installs of 340 KB a run in the nemesis).
+- **Owed, found by this reading (GAPS).** The round on the old owner now adopts the objects that fall to it, and its
+  materialization meets the node's own superseded copy: `verbs::materialize_taken_over` keeps a volume the node already
+  holds, so the adopted state would never replace the stale copy, its fenced shipper or its kept fence (A-334's owed
+  re-adoption; g229 told). A lane that ends on any answer, a refusal included, sends the holder what it lacks again at
+  once (`lane_ended`): X2, retired before it knew, sent its log to the two members that refused it `not_a_member` about
+  86,000 times each in one run, its sessions out on that loop throughout. And a round's question still takes a session
+  only if it is in its link at that instant, so any borrower that takes it every period would starve it the same way.
+
+Held by `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`: the owner cut off
+on the probe plane until its volume is taken over, healed, one write through it to meet the fence, then 20 record
+periods watched): red with the fix reverted, each holder refusing the old owner's fenced entry again every period (19
+in the 20, and 102 before the window, `not_the_acting_owner` once the old owner was admitted again), and with it each
+holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
+
+Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
+`crates/server/tests/fleet.rs` and the bug record
+`docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
 
 ### A-347 — A takeover opens a sealed volume's envelope in turns of the successor's owner shard (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", §4.10 "Content replication"; CLAUDE.md "Bounded work everywhere"; A-323's sibling)
 Applied in the same change to:

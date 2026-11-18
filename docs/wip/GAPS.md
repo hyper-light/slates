@@ -79,6 +79,27 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A takeover round gave up two objects within tolerance: a superseded owner's shipper held its sessions every period
+> (2026-11-18, A-349, NoLoss; g250; the chaos nemesis, seed 6876545201569229162, CI diag 44311638654 on both Linux arches).**
+> Read with a status dump and three diagnostic lines (diag-g250-nemesis-2, CI run 44320668620, 5 of 6 rounds): the owner
+> X1, isolated, taken over and admitted again under host epoch 2, still shipped its fenced epoch-1 log every record
+> period (`fleet.live.install_built` 2,227 to 2,245, each refused `StaleEpoch`); the next fault retired its successor X2,
+> whose objects fell to X1; and X1's round never sent the other survivor its page, its record session out on that loan
+> at every period (`lent_to live_ship`, `fleet.takeover.pages_unsent` 213 to 928), until A-304's bound gave both objects
+> up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
+> (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
+>   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
+>   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
+>   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
+>   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
+>   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
+> - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
+>   takeover's fetch), so any borrower that takes it every period starves the round the same way.
+> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
 > gated by its lease alone: once it confirmed again, an NFS mount on the old owner answered reads from the copy the
@@ -1734,6 +1755,19 @@
 >   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
 >   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
 >   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+> - **A shard count past the runtime's registry was started and restarted for good (found 2026-11-18 by the
+>   integrator, fixed 2026-11-18, g251).** The test sized its start at three windows' worth of shards with no bound, and
+>   a 4-CPU runner's cheap shard starts asked 1,417 (ubuntu, run 44298844583) and 1,574 (macOS, run 44310013691): past
+>   the 1,024 one process registers (`slates_rt::registry::MAX_SHARDS`). The runtime refused the registration in the
+>   daemon ("too many shards: at most 1024 per process"), after the anchor had started it, so every start failed and the
+>   anchor, which gives no daemon up (A-119, A-311), backed it off for good. Now a `--shards` count past the registry is
+>   refused where it is given, before anything starts: as a bad `--shards` by the roles (`slates_api::role::shard_count`,
+>   which an anchor's own daemon and an embedding host's start read their arguments through) and by the `slates`
+>   command (`a_shard_count_past_the_runtimes_registry_is_refused_before_any_start`, `..._as_usage`, red before: both
+>   parsed 1,025). The test runs the most shards one process runs where three windows ask more, says how many windows
+>   they sum, and skips loudly where they do not pass one. The ring mesh stays quadratic, as A-312 chose (a beat per
+>   ring rather than fewer rings): at the registry's bound 1,047,552 rings, made and charged to no budget the daemon
+>   derives; a count that large is a test's override, never a derived one.
 
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
@@ -2505,11 +2539,16 @@
 >   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
 >   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
 >   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
->   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
->   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
->   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
->   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
->   this. The anchor's start judgment
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Its two siblings, reported then,
+>   closed 2026-11-18 (g251):** the watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment
+>   (`judge_start_of`) read in the same order, so a shard or a start blocked in a call for most of a window, whose call
+>   returned between the first read and the scheduler's answer, was judged stuck as it parked. Each now reads again after
+>   the answer (`watchdog::after_the_answer`; `anchor::judge_start_by`, when the answer is a block): a step, a park or a
+>   clock risen at the second read is movement. Red with the second read ignored, each at its own assertion
+>   (`a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved`: `Wedged` where `Alive` was due;
+>   `a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved`: likewise). Still open: no `ci.yml` lane
+>   runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw the first.
+>   The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
