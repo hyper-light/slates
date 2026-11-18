@@ -26293,7 +26293,10 @@ model below; each red before its fix):
   report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
   its holder still keeps is kept whole since A-335.) Since A-341 the kept retirement does tell, at a successor's
   confirmation: an unasked copy goes as a stale one where the object's settled cohorts are within tolerance
-  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance or when judged on a completion record.
+  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance. Since A-484 the takeover judged is the first
+  since the copy was written, its writer's (`Acceptor::written_by`, `RegionalConfiguration::copy_stale`), never the
+  last in the line, and it is judged on its completion record too, which keeps the neighbourhoods it recovered through
+  and the hosts that stayed members through it; a settled line's unasked copy is judged the same way.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -32301,3 +32304,53 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
   given back: the new test fails, nothing given back within an observation's budget.
 - **Owed.** The supervisor's A/B at 1,000 clients and more (running).
+
+### A-484 — A copy no takeover asked for is judged by its writer's takeover, on its retirement or its completion record (2026-11-18, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; A-341's owed piece and a hole in its rule; A-309, A-335)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), the bug record of
+2026-11-18 on an unasked copy judged by the last takeover in its line, `crates/db/src/register.rs`
+(`CompletedTakeover::recovery`, `held` and `recovery_cohorts`; `RegionalConfiguration::within_tolerance`,
+`confirmed_for` and `copy_stale`; `Acceptor::written_by`), `crates/cluster/src/raft_wire.rs` (regional layout 5),
+`crates/server/src/takeover.rs` (`unasked_copy_stale`, used at a successor's confirmation and on a settled line) and
+`crates/db/tests/lineage_model.rs` (the holder rule, `reclaimed_unasked_record`).
+- **What was there.** A-341 let a holder the takeover never asked let its copy go where the kept retirement showed the
+  object recovered within tolerance, judged by the retired host the copy's routing last moved from. Two gaps. A
+  completion record kept no neighbourhood, so a copy first judged once the takeover completed (every object of the
+  last successor to confirm, and any lagging holder's) was kept for good (`fleet.takeover.kept_unasked`). And the
+  takeover judged was the last in the copy's line, not the first since the copy was written: where the writer's
+  takeover was past tolerance, its successor confirmed without ever learning the object (nobody its round asked held
+  it), and when that successor retired in turn its own takeover was within tolerance for an object it never held, so
+  the copy, possibly the object's last, went. Counting every member of a cohort also let a cohort host that retired
+  before the departed and was admitted again under its id make a cohort look within tolerance that was past it when
+  the round ran.
+- **The rule.** A copy no round asked for is stale only where the first takeover since it was written, its writer's,
+  recovered the object within tolerance and its share of the object is done (`copy_stale`: `confirmed_for` and
+  `within_tolerance` of the writer's takeover): within tolerance every committed record is on a recovery quorum's worth
+  of each settled cohort, so the round that took the object over heard one at least as new as the copy and adopted it
+  before its successor confirmed. The holder knows the writer from its acceptor (`written_by`: the owner of the last
+  record it accepted, kept while an install moves the authority to a successor); not persisted, so an acceptor rebuilt
+  from an image after an install moved its authority knows none, and its copy is kept. The judgment counts only the
+  retirement's survivors that are still members (none is admitted again while it is kept), or, once it completed, the
+  record's held hosts: the survivors still members at completion, members through every round. The record keeps the
+  settled neighbourhood of each recovery owner (`recovery`), so its cohorts are drawn as the retirement's were. An
+  object an explicit move took off its creator's line is not judged so (a restored holder cannot tell the move's owner
+  from the writer): its unasked copies are kept.
+- **The encoding.** Regional layout 5: each completion record carries, after its version and before its confirmed
+  hosts, its recovery neighbourhoods (a count, then each owner and its settled form) and its held hosts. A layout-4
+  configuration is refused by name (`LayoutVersion`).
+- **Tests.** `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover`
+  (`crates/server/src/daemon.rs`, red before: the second install let the copy go);
+  `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (its record phase now lets the second
+  register and a lagging holder's fourth copy go, the head kept for its content); in `crates/db/src/register.rs`
+  `a_completion_record_judges_an_object_as_its_kept_retirement_did`,
+  `a_cohort_host_admitted_again_counts_for_no_takeover_it_was_not_a_survivor_of` (red before),
+  `a_copy_is_judged_by_its_writers_takeover_never_a_later_one` and `an_acceptor_knows_its_copys_writer_while_it_can`;
+  `a_lying_completion_record_recovery_count_is_refused` and the layout golden (`crates/cluster/src/raft_wire.rs`); the
+  lineage model's oracle unchanged, its unasked releases judged by the writer's takeover, and
+  `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record` (the generated histories at the
+  default 400 seeds judge no copy on a record: `reclaimed_unasked` 10 and `kept_unasked` 214, as under A-341). Kiln on
+  the Mac Studio, 2026-11-18, debug: `slates-db` `register::` 84 of 84, `slates-cluster` `raft_wire::` 21 of 21,
+  `slates-server` `takeover::` and the holder tests 23 of 23. Red once each on a mutated copy: with A-341's rule (the
+  last takeover in the line) the server test's copy went at the second install (kept `(true, false)`); with every
+  member counted the returning host made the cohort read within tolerance (`(false, true)`).
+- **Still owed (GAPS).** The settle rule for a live owner (a holder an owner's neighbourhood settled away from), the
+  content release signal, and the Lineage.tla text for A-341 and this change.
