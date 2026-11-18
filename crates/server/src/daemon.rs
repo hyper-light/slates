@@ -3529,6 +3529,19 @@ impl Daemon {
       .map(|watchdog| watchdog.turns().read())
   }
 
+  /// Test support: puts a memory-pressure level in place of the host's reading the watchdog takes at its looks (A-336,
+  /// [`crate::watchdog::MemoryStallSource`]): `Some(true)` the host reports a memory stall, `Some(false)` none, `None`
+  /// the host's own reading again. In production the watchdog reads the host (`slates_machine::memory_stall`); this
+  /// drives that very reading, as [`Daemon::inject_pressure_hold`] drives admission's, so a test proves the rule without
+  /// a host short of memory. `false` once the daemon has stopped its watchdog.
+  pub fn inject_memory_stall(&self, pressed: Option<bool>) -> bool {
+    self
+      .watchdog
+      .as_ref()
+      .map(|watchdog| watchdog.memory_stall().inject(pressed))
+      .is_some()
+  }
+
   /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
   /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
   pub fn spin_window_ns(&self) -> Option<u64> {

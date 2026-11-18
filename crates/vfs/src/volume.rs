@@ -2187,7 +2187,7 @@ impl Volume {
     // A preflight: the pool's claimable room counts (A-98); the charge that follows claims it.
     if retention > store.admittable() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // Replacing another entry keeps the replaced entry's spelling on a folding volume, as APFS does:
     // `d` renamed onto `a` where `A` exists leaves one entry, `A` (EQUIVALENCE §4). Under the exact
@@ -4132,9 +4132,15 @@ impl Volume {
       && self.retention_allowance != u64::MAX
       && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
     // The retention the copy-ups charge and the hold a dynamic volume's fresh inodes grow (A-342) both come from the
-    // shard's unpromised version capacity, so they are admitted together.
+    // shard's unpromised version capacity, so they are admitted together. A refusal names its bound: the retention
+    // when the copy-ups alone do not fit (§4.2 `RetentionBudgetExceeded`), else the growth, as a dynamic volume's
+    // refused bytes are named.
+    let admittable = store.versions.admittable();
+    if over_allowance || admittable < needs.retained {
+      return Err(VfsError::RetentionExceeded);
+    }
     let versions = needs.retained.saturating_add(self.hold_growth(needs.fresh));
-    if over_allowance || (versions > 0 && store.versions.admittable() < versions) {
+    if versions > 0 && admittable < versions {
       return Err(VfsError::NoSpace);
     }
     Ok(())
@@ -4435,7 +4441,7 @@ impl Volume {
     store.make_room(bytes);
     if store.budget.charge_retention(bytes).is_err() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_prepaid = self.retention_prepaid.saturating_add(bytes);
     Ok(())
@@ -4510,10 +4516,10 @@ impl Volume {
     store
       .budget
       .charge_retention(all)
-      .map_err(|_| VfsError::NoSpace)?;
+      .map_err(|_| VfsError::RetentionExceeded)?;
     if store.versions.charge_retention(versions).is_err() {
       store.budget.credit_retention(all);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_charged = bytes;
     self.versions_charged = versions;
@@ -4827,7 +4833,7 @@ impl Volume {
       && self.retains(born)
       && self.retained_versions() >= self.retention_allowance
     {
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // A retained version also draws a slot from the shard's version budget — from capacity not
     // promised to any volume's logical allowance or the copy-up headroom (§4.2: "a new retained
@@ -4847,7 +4853,7 @@ impl Volume {
       store
         .versions
         .charge_retention(1)
-        .map_err(|_| VfsError::NoSpace)?;
+        .map_err(|_| VfsError::RetentionExceeded)?;
       self.versions_charged = self.versions_charged.saturating_add(1);
     }
     let _ = kind;

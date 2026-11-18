@@ -145,19 +145,24 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
 /// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
 /// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
+/// day). 17: the daemon's database refusals typed (`DatabaseRefusal`, unusable as `Unusable::Database`): until then a
+/// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding
+/// reached a consumer as an invalid request carrying words (A-299; the same day). 18: a snapshot's retention refused is
+/// typed apart from the quota (`VolumeRefusal::RetentionExceeded`, exhausted as `Exhausted::Volume`): until then the
+/// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
 /// day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 16;
+pub const CONTRACT: u32 = 18;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase, HostAnswer,
-  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
-  MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
-  Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
+  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope, GreenBase,
+  HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
+  LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent,
+  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
