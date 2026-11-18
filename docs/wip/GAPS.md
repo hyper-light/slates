@@ -416,11 +416,17 @@
 > the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
 > `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
 > supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
-> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
-> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
-> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
-> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
-> well as by the walk (a design change to §4.8's install, with its model).
+> **Closed (the seal walk's other sibling, 2026-11-18, A-398):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raised every held record's fence and moved every held object of a retired owner
+> in one turn. It now installs the version in that turn and walks the copies a step quantum a turn
+> (`fleet::InstallWalk`; `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`). The worry written here,
+> that a record a stale owner sends to a copy not yet reached must still meet the new fence, was put to the model first
+> (`docs/wip/models/InstallInTurns.tla`, the model table): a copy not yet reached refuses a record of the new
+> generation by its own generation check, the node refuses one of any other generation at the door, and phase one's
+> page fences and re-authorizes each copy it lists itself; any one or two of those three may go and no stale record
+> commits, and only with all three gone does one. So no reconcile on access is needed for safety; the walk alone
+> decides when a copy follows. **Owed (measurement, the supervisor's):** the control shard's longest step at an install
+> with 10^4 and 10^5 held copies, before and after.
 
 > **A takeover round started over one epoch above its own adoptions, and the successor's writes were refused for good:
 > fixed for a newer configuration (2026-11-18, A-353, §4.8 "Promotion and takeover"; g230, caught live by g229).** Each
@@ -736,8 +742,10 @@
 >   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
->   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
->   writes a death still loses whether or not it is resynced. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
+>   its guest's maps. **Owed:** Windows on Shards' handle path. **Built since (A-402, 2026-11-18):** the write log on
+>   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
+>   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
+>   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
 >   A-197's writable copies were taken back awake before the write log's replay, so a logged write a client's store
 >   followed was written over that store, in the client's own map, at a takeover; they are kept dormant through the
 >   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
@@ -3430,8 +3438,8 @@
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
-> end with their client); owed: a laptop's failover delay counting its anchor's supervision window as its detection, and
-> the volume's write lease (D-16) taking its holder's term. Owed, each in its own
+> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
+> (two seconds there); owed: the volume's write lease (D-16) taking its holder's term. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
@@ -8211,6 +8219,11 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_eager.cfg` (A-398): 3 holders (symmetric), 3 versions (two takeovers), 1 record an owner, every copy moved at its node's install | no error (TypeOK, TotalOrder, Continuity, StaleNeverCommits, ReadSafety; 16 s) | 117,782 distinct | 32 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy.cfg` (A-398): the same, each copy reconciled at any later step (the walk in turns) | no error (34 s) | 192,633 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -10918,7 +10931,8 @@ A-358 found that an NFS write answered before any publication is lost when the d
 it again (Apple's never does). WinFsp has the same shape:
 - a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
   that wrote publish first (`crates/server/src/winfsp.rs`);
-- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- Windows had no write log (`write_log` was `#[cfg(unix)]`; it is on every platform since A-402, 2026-11-18, and a
+  Shards stream's writes are logged there; a WinFsp write is not logged yet);
 - a WinFsp drive outlives a killed daemon (A-198).
 
 So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
@@ -10929,7 +10943,8 @@ Owed:
    shape on a WinFsp drive: write, kill, flush, close, read back.
 2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
 
-Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
+since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 

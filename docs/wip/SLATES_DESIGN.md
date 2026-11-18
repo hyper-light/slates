@@ -4458,7 +4458,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
   the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
-  from the write log (A-63) as a mount's are. Where that log overflowed, the guest is told every file it had open may
+  from the write log (A-63) as a mount's are. On Windows, which hands no resync channel yet, a death ends the stream,
+  and the writes it acknowledged after its last publication are replayed into the volume all the same (A-402). Where that log overflowed, the guest is told every file it had open may
   have lost writes, as a taken-over mount's kernel is (`LostWrites`, A-393): a handle from before the death answers its
   `flush` `EIO` until an `fsync` through it has, once. It removes any other's record, as before.
 
@@ -5933,6 +5934,22 @@ stale owner is refused by holders that have installed the new fence and cannot o
 commit quorum. It drops its role on `StaleEpoch`. The historical `FencedRegister` model checks
 its modeled TotalOrder, Continuity, StaleNeverCommits and ReadSafety transitions; A-9 requires
 refinement and revalidation before those results can be applied to the corrected implementation.
+
+> **Status (2026-11-18, A-398: a holder takes an installed configuration a copy a turn).** "Every holder raises its
+> fence for that host to the new epoch" was done at the install, in the turn that installed the version, over every copy
+> the holder keeps: each fence raised to its owner's committed epoch, each object a kept retirement names moved to its
+> successor or let go as stale, each authority moved to the owner its route names. The install now takes the version in
+> that turn (the node's placement, so a record of another generation is refused at the door), and the copies follow by a
+> walk in key order, a step quantum of the control shard a turn (`fleet::InstallWalk`, `install_slice`, counted
+> `fleet.config.install_slices`, `installs_walked`), each turn a poll of its own; a newer install begins the walk again.
+> Model-checked first, `docs/wip/models/InstallInTurns.tla` (three holders, two takeovers, every interleaving of
+> installs, copy reconciles, promotions, writes and accepts): a copy reconciled any time after its node installed the
+> version keeps TotalOrder, Continuity, StaleNeverCommits and ReadSafety, and so it does with any one or two of its
+> three protections removed (its own generation check, the fence raises, phase one's demand that its authority name the
+> successor); with all three removed StaleNeverCommits fails at depth 12 (GAPS' model table). So a copy the walk has not
+> reached refuses, and nothing the walk delays can let a stale owner's record commit: a takeover round's page promises
+> and fences each copy it lists itself. Held by `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`
+> (`crates/server/tests/fleet.rs`).
 
 > **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
 > The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
@@ -29012,6 +29029,79 @@ Applied in the same change to:
   - Windows streams and the vhost-user device do neither, and are safe only while their guest dies with the daemon. The
     work that lets one outlive it must bring the write log or this rule. GAPS has the route table.
 - **Cost.** A publication per paging write, owed a measurement through a drive.
+
+### A-405 — A node no peer detects is detected by its anchor: the failover estimate's detection term is the supervision window there (2026-11-18, built for goal g255; A-363's laptop degenerate corrected, owed since A-384)
+
+- **What was there.** A-363 gave a node with no peer detector (a laptop, `f = 0`) no detection term, so its failover delay
+  was the recovery prior alone, one second, and A-384 made that a bare CLI attachment's idle term there.
+- **The rule.** A laptop has a detector: its anchor, whose daemon's watchdog ends a stuck daemon after the liveness
+  window and whose anchor starts it again (A-232), so a failure there is detected within that window. The estimator is
+  made supervised by it (`Failover::supervised(LIVENESS_BUDGET_NS)`, `crates/server/src/daemon.rs`), and where no peer's
+  detector has a term (a laptop; a fleet node before its detector's first period) the detection term is that window, with
+  no measurement behind it; a peer detector's term replaces it once measured (R8: the same derivation, degenerate input).
+- **What changes.** A laptop's failover delay is the window and the recovery prior, two seconds where it was one, and a
+  CLI attachment nothing renews lasts that long idle there (`docs/cli.md`); a fleet node's estimate is unchanged once its
+  detector runs. Held by the unit test `a_node_no_peer_detects_is_detected_by_its_supervision_window`
+  (`crates/cluster/src/failover.rs`).
+
+Applied in the same change to: `crates/cluster/src/failover.rs` (its laptop paragraph), `crates/server/src/daemon.rs`,
+`docs/cli.md`, GAPS (the `LIVENESS_BUDGET_NS` entry).
+
+### A-402 — The write log on every platform: a Windows Shards stream's acknowledged writes outlive its daemon's death (2026-11-18, goal g268; owed since A-316 in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's death bullet; GAPS: A-281's entry and the WinFsp write's entry (2026-11-18).
+- `crates/server`: `lib.rs` (`write_log` on every platform), `state.rs` (the log, its replay and its lost flag on
+  every platform), `daemon.rs` (`content_slice` opens the log everywhere; the DAX range table apart, Unix,
+  `dax_range_table`; the idle purge everywhere), `verbs.rs` (the replay and the publications' clear everywhere; the
+  replay's unit test `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone` everywhere), `shards.rs` (a
+  stream logs its writes everywhere, and its flush rule is everywhere's, A-399); the test
+  `crates/server/tests/stream_write_log.rs`, on every platform.
+
+- **What was there.** The write log (A-63) lived in each shard's slice of the anchor's content object on Unix alone:
+  a FUSE mount's writes (Linux) and, since A-316 and A-339, a Shards stream's (Linux, macOS). Windows has the same
+  content object and recovers the same images from it (a WinFsp drive outlives twenty killed daemons, A-198), but
+  kept no log, so a Windows stream's write acknowledged after the last publication was lost when its daemon died,
+  whether the stream ended or not.
+- **The rule.** One log on every platform, opened, appended, cleared at each publication that captures every volume,
+  given back when idle and replayed at recovery as on Unix. A Windows stream logs each write before its reply; its
+  `FORGET`s stay unlogged there, since no successor keeps a Windows stream yet (A-390 logs them for a stream the
+  anchor holds). A WinFsp write is not logged by this change; the log is now there for it (GAPS).
+- **Evidence.** On a Mac Studio (kiln run r368): the new test passes, as it did before on Unix, where streams were
+  logged already; and so do the write log's unit tests and the replay's. Windows, where the test is the red one, is
+  main's run (`run-requests.md`, 2026-11-18): it fails on main before this change, the file coming back empty.
+
+### A-398 — A holder takes an installed configuration a copy a turn: the install walks the held register copies in turns, model-checked first (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere"; A-324's sibling)
+Applied in the same change to: §4.8 "Promotion and takeover" (its status), GAPS (A-324's entry: the install's item
+closed; the model table: nine `InstallInTurns` runs), `docs/wip/models/InstallInTurns.tla` and its nine configurations
+(new), and the code below.
+- **What was there.** At every newly committed configuration the control shard's install moved every register copy it
+  held, in one turn: each fence raised to its owner's committed epoch, then each object a kept retirement names moved to
+  the successor its lineage ranks or let go as stale (`takeover::resolve_held_objects`), then each authority moved to
+  the owner its route names (`fleet::reconcile_held_authority`). One turn over every held copy, whatever their number.
+- **The question first.** GAPS held that the loop could not simply be cut: a record a stale owner sends to a copy not
+  yet reached must still meet the new fence. `docs/wip/models/InstallInTurns.tla` asks it: three holders, two
+  takeovers, owners that learn their own retirement and write on, and each copy reconciled at any later step than its
+  node's install. TotalOrder, Continuity, StaleNeverCommits and ReadSafety hold with the copies reconciled late; they
+  hold with any one or any two of the three protections removed (a copy's own generation check, the fence raises other
+  than an accepted record's, phase one's demand that the copy's authority name the successor); with all three removed
+  a stale owner's record commits at depth 12. A copy not yet reached refuses a record of the new generation, the node
+  refuses one of any other generation, and a takeover round's page fences and re-authorizes each copy it lists itself.
+- **The rule.** The install takes the version in its turn (the node's placement) and the copies follow by a walk in key
+  order (`fleet::InstallWalk`): a task of the control shard reaches them a step quantum a turn (`install_slice`), each
+  turn a poll of its own (`xshard::Turns`), each copy brought to the version as the install once did all of them
+  (`install_on_copy`: fence, then `takeover::resolve_held_object`, then `reconcile_held_copy`). A newer install begins
+  the walk again; a walk whose council has committed past it ends, and the next install begins its own; a task that
+  could not be spawned, or a turn not answered within a heartbeat, is begun again where the walk stands at the next
+  period. Counted `fleet.config.install_walks`, `install_slices`, `installs_walked`, `install_unwalked`.
+- **Tests.** `a_holders_copies_take_an_install_in_turns_and_every_copy_follows` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`; four volumes on a, held by b and c; b's and c's walks cut to one copy a turn; a cut off on the probe
+  plane until every head is placed on its successor): green 2 of 2 on macOS (Mac Studio, debug): b held 8 copies and
+  walked them in 27 turns over 3 walks, none sharing a poll, and every head was placed on its successor; red with each
+  walk in one turn (5 turns over 5 walks for the 8 copies). The fleet binary's `takeover`, `successor`, `retired`,
+  `readmitted` and `adopt` filters on the change: 60 passed and 2 failed, both a write after a warm restart refused
+  `DurabilityPending` at the live failover estimate (2.4 to 3.4 s), the failure A-344's owner-restart test shows on main
+  itself (g255's A-392); the successor's run to be told apart on main. The whole-map passes stay, as the daemon's
+  unit-test oracle of the per-copy steps.
 
 ### A-400 — A work lives on the shard that serves its creation, its client's own; its name is held where the name hashes to, by an alias (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Where a work lives")
 Applied in the same change to: §4.16 (A-247's rule, "Where a work lives"), GAPS (the load test's entry),

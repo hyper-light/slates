@@ -2058,8 +2058,8 @@ fn serve_request(
   kept_at_init(s, stream, &answered);
   release_forgotten(s, stream, total, &answered);
   // A write the guest is told succeeded outlives this daemon in the shard's write log, as a FUSE mount's does (A-63):
-  // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316).
-  #[cfg(unix)]
+  // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316;
+  // every platform, A-402).
   log_write(s, stream, total, &answered);
   #[cfg(unix)]
   log_forgets(s, stream, total, &answered);
@@ -2072,14 +2072,11 @@ fn serve_request(
   // A `close`'s `FLUSH` owes no publication of its own while the write log holds every write the shard acknowledged
   // (A-399, A-63's flush rule): a successor replays them all, kept stream or not, and a `FLUSH` the device resends after
   // a death is answered again, changing nothing. Published anyway when the log overflowed, as a mount's is.
-  #[cfg(unix)]
   let flush_logged = answered.opcode == Some(Opcode::Flush)
     && s
       .write_log
       .as_ref()
       .is_some_and(crate::write_log::WriteLog::holds_every_write);
-  #[cfg(windows)]
-  let flush_logged = false;
   if flush_logged {
     s.count(FLUSH_LOGGED, 1);
   }
@@ -2166,7 +2163,6 @@ fn keep_pending_reply(s: &mut ShardState, stream: &ShardsStream, answered: &Answ
 /// origin of a clone's inherited file): as `fuse`'s `log_write` does for a mount, a log with no room forces a publication
 /// that carries the write, and only a refused publication leaves it unlogged, marked as an overflow so the next daemon
 /// reports the loss rather than replaying around it.
-#[cfg(unix)]
 fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: &Answered) {
   if answered.opcode != Some(Opcode::Write) || answered.error != 0 {
     return;
@@ -2219,7 +2215,6 @@ fn log_forgets(s: &mut ShardState, stream: &ShardsStream, total: usize, answered
 }
 
 /// The node, offset and bytes of the `WRITE` request `request` is; `None` for any other.
-#[cfg(unix)]
 fn written(request: &[u8]) -> Option<(u64, u64, &[u8])> {
   let parsed = slates_bridge_fuse::request::Request::parse(request).ok()?;
   if parsed.opcode != Some(Opcode::Write) {
