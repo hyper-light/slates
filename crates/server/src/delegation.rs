@@ -150,7 +150,11 @@ async fn send_recalls(sessionid: SessionId) {
     let Some(recall) = next else {
       return;
     };
-    let _ = state::with_state_counted(|s| s.count(RECALL_SENT, 1));
+    let bound = state::with_state_counted(|s| {
+      s.count(RECALL_SENT, 1);
+      crate::callback::bound_ns(s, &sessionid)
+    })
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
     let answered = crate::callback::call_on_slot(
       sessionid,
       |next| {
@@ -161,7 +165,7 @@ async fn send_recalls(sessionid: SessionId) {
           &recall.fh.0,
         )
       },
-      crate::daemon::LIVENESS_BUDGET_NS,
+      bound,
     )
     .await;
     // A callback the transport lost (no reply, no carrier, a refused RPC) marks the back channel down, so the client is

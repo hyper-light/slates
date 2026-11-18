@@ -33,9 +33,11 @@ use common::{
   LARGE, Session, Setup, config, mkdir, read_through, rename, request, rm_r, scratch, store,
   unlink, write_file,
 };
-// The pieces only the Unix tests use (a symlink, a directory's recorded mode).
+// A link in the volume, which the Unix tests and the Windows link test land (A-438).
+use common::symlink;
+// The piece only the Unix tests use (a directory's recorded mode).
 #[cfg(unix)]
-use common::{mkdir_with_mode, symlink};
+use common::mkdir_with_mode;
 
 /// Format: the environment variable that turns this binary into the kill test's child.
 const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
@@ -136,7 +138,8 @@ fn edit_example(vol: &mut Volume, host: &mut OsLand, store: &mut Store) {
   unlink(vol, host, store, "/src/gone.rs");
   mkdir(vol, host, store, "/out");
   write_file(vol, host, store, "/out/inner", b"inner");
-  // Windows makes no symbolic link without a privilege slates never asks for (R10; `os_windows.rs`).
+  // Windows lands a link only where its account may make one (A-438): its own test,
+  // `a_symlink_in_a_landing_is_a_windows_symbolic_link`, which skips loudly where it may not.
   #[cfg(unix)]
   symlink(vol, host, store, "/link", "src/lib.rs");
   rename(vol, host, store, "/moved", "/moved2");
@@ -459,6 +462,156 @@ fn a_file_a_landing_placed_is_replaced_by_the_next_landing() {
   assert_eq!(read(&ws.path.join("out/f")).unwrap(), b"second landing");
 }
 
+/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): the probe link refused for want of the privilege and of Developer
+/// Mode.
+#[cfg(windows)]
+const PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// A-438 (a volume link in A-275's form, landed). Do: land a scratch volume holding `/src/lib.rs` and the relative link
+/// `/lib/link` to `../src/lib.rs` into an empty real directory, where this account may make symbolic links (skipped
+/// loudly where it may not: the probe `CreateSymbolicLinkW` refused `ERROR_PRIVILEGE_NOT_HELD`, no privilege and no
+/// Developer Mode). Expect the landing `Done` with every entry written; the link a Windows file symbolic link whose
+/// target reads `..\src\lib.rs` (the volume's `/` as `\`); the file's bytes read through it; and no hidden name left
+/// where the link was staged. Before A-438 the link's entry failed `EPERM` on every machine.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
+  use std::os::windows::fs::FileTypeExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "link");
+  seed_dir(&ws.path.join("out"));
+  let probe = ws.path.join("probe");
+  match std::os::windows::fs::symlink_file("out", &probe) {
+    Ok(()) => std::fs::remove_file(&probe).unwrap(),
+    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+      eprintln!(
+        "skipped: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
+      );
+      return;
+    }
+    Err(refused) => panic!("the probe link: {refused}"),
+  }
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/src");
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"lib");
+  mkdir(&mut vol, &mut host, &mut store, "/lib");
+  symlink(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/lib/link",
+    "../src/lib.rs",
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  let lib = ws.path.join("out").join("lib");
+  let kind = std::fs::symlink_metadata(lib.join("link"))
+    .unwrap()
+    .file_type();
+  assert!(kind.is_symlink_file(), "a file symbolic link: {kind:?}");
+  assert_eq!(
+    std::fs::read_link(lib.join("link")).unwrap(),
+    Path::new(r"..\src\lib.rs")
+  );
+  assert_eq!(
+    std::fs::read(lib.join("link")).unwrap(),
+    b"lib",
+    "read through the link"
+  );
+  assert_eq!(
+    names_in(&lib),
+    ["link"],
+    "nothing but the link: no staged name left"
+  );
+}
+
+/// Format: the environment variable naming a writable directory on a ReFS volume or a Dev Drive, where the reflink test
+/// lands (a runner makes one from a VHD it formats; without it the test skips, saying so).
+#[cfg(windows)]
+const REFS_DIR: &str = "SLATES_TEST_REFS_DIR";
+
+/// A-445 (a reflink in a Windows landing, ReFS block cloning). Do: land a scratch volume holding two files with the same
+/// bytes (three 64 KiB clusters and 17 bytes, so the last cluster is partial on either of ReFS's clusters) and one with
+/// other bytes, into a directory on a volume that shares clusters (`SLATES_TEST_REFS_DIR`; skipped loudly without one,
+/// or where the volume says it shares nothing). Expect the landing `Done`, every entry written, the second identical
+/// file cloned (`cloned` 1), both identical files whole at their exact length, and no hidden name left.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters() {
+  let Some(refs) = std::env::var_os(REFS_DIR) else {
+    eprintln!("skipped: {REFS_DIR} names no directory on a ReFS volume or a Dev Drive");
+    return;
+  };
+  let ws = Workspace::new(Path::new(&refs), "clone");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  if !host.capabilities(target.dir).unwrap().reflink {
+    eprintln!(
+      "skipped: the volume under {} shares no clusters between files",
+      ws.path.display()
+    );
+    return;
+  }
+  let same: Vec<u8> = (0..3 * 65_536 + 17u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/a.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/b.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/c.bin", b"other");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert_eq!(report.cloned, 1, "{report:?}");
+  let out = ws.path.join("out");
+  assert_eq!(read(&out.join("a.bin")).unwrap(), same);
+  assert_eq!(
+    read(&out.join("b.bin")).unwrap(),
+    same,
+    "the clone, whole at its exact length"
+  );
+  assert_eq!(read(&out.join("c.bin")).unwrap(), b"other");
+  assert_eq!(
+    names_in(&out),
+    ["a.bin", "b.bin", "c.bin"],
+    "no hidden name left"
+  );
+}
+
 /// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.
 #[cfg(windows)]
 const READONLY: u32 = 0x1;
@@ -540,6 +693,122 @@ fn a_landed_file_keeps_its_archive_bit_and_takes_read_only_from_its_mode() {
     ARCHIVE | READONLY,
     "the read-only file's attributes: {read_only:#x}"
   );
+}
+
+/// Format: `FILE_ATTRIBUTE_HIDDEN` (winnt.h).
+#[cfg(windows)]
+const HIDDEN: u32 = 0x2;
+/// Format: `FILE_ATTRIBUTE_SYSTEM` (winnt.h).
+#[cfg(windows)]
+const SYSTEM: u32 = 0x4;
+
+/// A-451 (the volume's Windows bits land, and a directory link as a directory link). Do: land into an empty real
+/// directory on NTFS a scratch volume holding a directory the drive made read-only and hidden, a file in it the drive
+/// made system and hidden, and the relative link `/to_d` to `d` that Windows made as a directory link (the link skipped
+/// loudly where this account may not make one: no privilege and no Developer Mode). Expect the landing `Done` with
+/// every entry written; the directory holding `READONLY | HIDDEN`; the file `SYSTEM | HIDDEN` and `ARCHIVE` (the rename
+/// that places it sets that bit) and not `READONLY` (its mode can write); the link a Windows directory symbolic link
+/// whose target reads `d`, the file listed through it; and no hidden name left. Before A-451 the bits stayed in the
+/// volume and a directory link landed as a file link.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
+  use slates_vfs::inode::{Kind, WindowsAttributes};
+  use std::os::windows::fs::FileTypeExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "windows-bits");
+  seed_dir(&ws.path.join("out"));
+  let probe = ws.path.join("probe");
+  let links = match std::os::windows::fs::symlink_dir("out", &probe) {
+    Ok(()) => {
+      std::fs::remove_dir(&probe).unwrap();
+      true
+    }
+    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+      eprintln!(
+        "skipped, the link part: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
+      );
+      false
+    }
+    Err(refused) => panic!("the probe link: {refused}"),
+  };
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/d");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
+  let mut marks = vec![
+    ("/d", READONLY | HIDDEN, Kind::Dir),
+    ("/d/f.rs", SYSTEM | HIDDEN, Kind::File),
+  ];
+  if links {
+    symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+    marks.push((
+      "/to_d",
+      u32::from(WindowsAttributes::LINK_DIRECTORY),
+      Kind::Symlink,
+    ));
+  }
+  for (path, bits, kind) in marks {
+    common::set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  let out = ws.path.join("out");
+  let directory = attributes_of(&out.join("d"));
+  assert_eq!(
+    directory & (READONLY | HIDDEN | SYSTEM),
+    READONLY | HIDDEN,
+    "the directory's attributes: {directory:#x}"
+  );
+  let file = attributes_of(&out.join("d").join("f.rs"));
+  assert_eq!(
+    file & (READONLY | HIDDEN | SYSTEM | ARCHIVE),
+    SYSTEM | HIDDEN | ARCHIVE,
+    "the file's attributes: {file:#x}"
+  );
+  if links {
+    let kind = std::fs::symlink_metadata(out.join("to_d"))
+      .unwrap()
+      .file_type();
+    assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
+    assert_eq!(
+      std::fs::read_link(out.join("to_d")).unwrap(),
+      Path::new("d")
+    );
+    assert_eq!(
+      names_in(&out.join("to_d")),
+      ["f.rs"],
+      "the directory listed through the link"
+    );
+  }
+  let mut landed = vec!["d"];
+  if links {
+    landed.push("to_d");
+  }
+  assert_eq!(names_in(&out), landed, "no hidden name left");
 }
 
 /// A-185. Do: on NTFS, seed a file and clear its `ARCHIVE` bit as a backup does; over the directory, write new bytes to

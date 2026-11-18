@@ -337,29 +337,25 @@ pub struct ShardState {
   /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393). Unix only: a FUSE
   /// mount is Linux's and a resynced stream Unix's, and nothing on Windows outlives its daemon to be told (a Windows
   /// stream's resync is owed, g234), so there the recovered log's verdict has no reader.
-  #[cfg(unix)]
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
   /// recorded before the barrier publishes, so the publication carries it with the effect, and removed once written. At
-  /// most one per attachment (each serves one request at a time).
-  #[cfg(unix)]
+  /// most one per attachment (each serves one request at a time). A Windows stream's too, since A-433.
   pub(crate) pending_replies: std::collections::BTreeMap<u64, slates_vfs::recover::HeldReply>,
   /// The barrier replies the previous daemon published and never delivered, by attachment (A-61), handed to the
   /// mounts and streams recovery keeps.
-  #[cfg(unix)]
   pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
   /// Each range a Shards stream's held DAX backing has answered, in the region of the anchor's content object after the
-  /// delta log (A-365; `crate::dax_ranges`): what a successor ingests and never refills. `None` without a content object.
-  #[cfg(unix)]
+  /// delta log (A-365; Windows' sections, A-448; `crate::dax_ranges`): what a successor ingests and never refills. `None`
+  /// without a content object.
   pub(crate) dax_ranges: Option<crate::dax_ranges::RangeTable>,
-  /// The DAX objects the anchor handed back for this shard's partition (A-365; `crate::shards::dax_hold`), until
-  /// recovery takes each back or lets it go. Bounded by the anchor's held-copy bound.
-  #[cfg(unix)]
+  /// The DAX objects the anchor handed back for this shard's partition (A-365; Windows' sections, A-448;
+  /// `crate::shards::dax_hold`), until recovery takes each back or lets it go. Bounded by the anchor's bound for them
+  /// (`DaemonConfig::held_dax_bound`).
   pub(crate) inherited_dax: Vec<crate::shards::dax_hold::InheritedDax>,
   /// The DAX objects recovery kept again in the store, by the attachment of the stream they belong to, until the
   /// stream's adoption takes them (`crate::shards::adopt_one`); any left after every adoption is let go. Bounded as
   /// `inherited_dax` is, of which these were part.
-  #[cfg(unix)]
   pub(crate) adopted_dax: std::collections::BTreeMap<u64, Vec<crate::shards::dax_hold::AdoptedDax>>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
@@ -581,6 +577,19 @@ pub struct ShardState {
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
   )>,
+  /// The Windows Shards streams recovery kept because the anchor held their resync ends (A-433), each with its record,
+  /// served again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by
+  /// that step; bounded as `inherited_resync` is, of which these were part.
+  #[cfg(windows)]
+  pub(crate) adopt_shards: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::anchor_hold::HandedResync,
+  )>,
+  /// The Shards streams' resync ends the anchor handed back for this shard's partition (Windows, A-433), until recovery
+  /// keeps each whose record it keeps (`adopt_shards`) or `shards::adopt_held` lets it go. Bounded by the anchor's
+  /// held-entry bound.
+  #[cfg(windows)]
+  pub(crate) inherited_resync: Vec<crate::anchor_hold::HandedResync>,
   /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
   /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,

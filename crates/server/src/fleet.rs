@@ -1010,16 +1010,21 @@ pub(crate) fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
-/// The budget a live-shipped entry's exchange runs under (A-200): a hard deadline of the daemon's liveness budget, past
-/// which a holder that has not answered is not a live one to wait for (its link is dropped and dialed afresh,
-/// `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply wakes the collector at once).
-/// Derived: `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS / POLL_PER_PERIOD`. Not the consensus round's budget: that is derived
-/// from the slowest path's tail, which a paused holder inflates, so one exchange to it held the holder's only session
-/// past a 40 s wait and the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a
-/// voter; each answers on its own.
+/// The budget a live-shipped exchange runs under where no holder's session is at hand (A-200, A-444): a hard deadline of
+/// the floor of the session plane's own judgment of a gone path, the persistent-congestion duration (RFC 9002 §7.6.1:
+/// three probe timeouts, each `smoothed_rtt + max(4·rttvar, kGranularity) + max_ack_delay`, §6.2.1) of a path with
+/// nothing measured, where each probe timeout is the initial one (§6.2.2): no holder's session is taken for gone sooner,
+/// so no live exchange gives a holder up sooner. Past it a holder that has not answered is not a live one to wait for (its
+/// link is dropped and dialed afresh, `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply
+/// wakes the collector at once). An exchange that holds its holder's session takes that session's own duration
+/// (`live_ship`'s `exchange_budget`). Until A-444 the deadline was one liveness window, under that floor, so the live lane
+/// dropped links its sessions still counted live. Not the consensus round's budget: that is derived from the slowest
+/// path's tail, which a paused holder inflates, so one exchange to it held the holder's only session past a 40 s wait and
+/// the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a voter; each answers on
+/// its own.
 pub(crate) fn live_budget() -> CommitBudget {
   CommitBudget::hard(
-    crate::daemon::LIVENESS_BUDGET_NS,
+    slates_transport::rtt::RttEstimator::new().persistent_congestion_duration_floored(0),
     (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
   )
 }
@@ -6050,6 +6055,8 @@ async fn begin_materializing(
       }
     });
   }
+  // A wall bound, by its reason (A-397, A-440): the period's, since the making runs on as a task of the owner shard and
+  // the next attempt joins it ([`making_of`], in that shard's own time).
   let ended = crate::xshard::task_within(
     origin,
     target,
@@ -11131,7 +11138,8 @@ const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 ///
 /// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one
 /// judgement of a dead session (`Endpoint::peer_silent_past`, fleet-transport.md §5), an ack-eliciting packet
-/// unanswered for a liveness budget or the session's persistent-congestion duration, whichever is longer. It covers a
+/// unanswered for the session's persistent-congestion duration (A-444: its floor is the session's own probe timeout,
+/// where a liveness window stood, which the duration, three initial probe timeouts at least, always passed). It covers a
 /// reset lost and a peer that is silent. Judged at the one place every borrower hands the session back, and every
 /// borrower's hold is bounded by a derived budget, so a silent session is judged within its window plus one hold: with
 /// a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward lane's
@@ -11151,10 +11159,12 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
           let dropped = crate::state::WallAndPeriods::now(s);
           s.dead_session_dropped_at.insert(host, dropped);
         }
+        // Silent past the session's own persistent-congestion duration (RFC 9002 §7.6.1), floored at its own probe
+        // timeout (§6.2.1): the session plane's estimator decides, never a fixed window (A-444).
         Some(link)
           if link.endpoint.is_none()
             && link.borrowed == returned
-            && endpoint.peer_silent_past(crate::daemon::LIVENESS_BUDGET_NS) =>
+            && endpoint.peer_silent_past(endpoint.pto()) =>
         {
           s.record_sessions.remove(&host);
           s.count(LINK_SESSION_JUDGED_DEAD, 1);
@@ -11164,7 +11174,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
             endpoint.peer_silence_ns().unwrap_or(0) / NS_PER_MS,
             endpoint
               .persistent_congestion_duration()
-              .max(crate::daemon::LIVENESS_BUDGET_NS)
+              .max(endpoint.pto())
               / NS_PER_MS
           );
           let dropped = crate::state::WallAndPeriods::now(s);

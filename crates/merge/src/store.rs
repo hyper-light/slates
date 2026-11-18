@@ -18,7 +18,11 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 
-use slates_mem::sealed::{Block, BlockReader, Changes, Joined, Left, Passed, SealedBlocks};
+use slates_mem::sealed::{
+  Block, BlockReader, Changes, Joined, Left, Passed, ReaderRefusal, SealedBlocks,
+};
+
+use crate::replica::ReplicaRefusal;
 
 /// Where a green's content bytes are (module docs).
 #[derive(Debug)]
@@ -103,11 +107,48 @@ impl Store {
     }
   }
 
-  /// A replica's registration with the owner's blocks now; none on a replica.
-  pub(crate) fn join(&mut self) -> Option<Joined> {
+  /// A replica's registration with the owner's blocks now, refused past `limit` replicas (A-273 step 4) and on a
+  /// replica, which has no blocks of its own.
+  pub(crate) fn join(&mut self, limit: usize) -> Result<Joined, ReplicaRefusal> {
     match self {
-      Store::Own(blocks, _) => Some(blocks.join()),
-      Store::Read(_) => None,
+      Store::Own(blocks, _) => blocks.join(limit).map_err(|full| ReplicaRefusal::Full {
+        readers: full.readers,
+        limit: full.limit,
+      }),
+      Store::Read(_) => Err(ReplicaRefusal::NotAnOwner),
+    }
+  }
+
+  /// The bytes the owner keeps for its replicas past which the slowest is evicted (A-273 step 4).
+  pub(crate) fn set_held_limit(&mut self, bytes: usize) {
+    if let Store::Own(blocks, _) = self {
+      blocks.set_held_limit(bytes);
+    }
+  }
+
+  /// At the start of a change on the owner: a change recorded and never sent to the replicas means they cannot be fed
+  /// in order, so every replica is evicted (A-273 step 4, `slates_mem::sealed`'s "Bounds").
+  pub(crate) fn evict_if_unfed(&mut self) {
+    if let Store::Own(blocks, _) = self
+      && blocks.has_pending()
+    {
+      blocks.evict_all();
+    }
+  }
+
+  /// Whether `changes` says the owner evicted this replica, read without taking it; never on the owner.
+  pub(crate) fn evicted_by(&self, changes: &Changes) -> bool {
+    match self {
+      Store::Read(reading) => reading.reader.evicted_by(changes),
+      Store::Own(..) => false,
+    }
+  }
+
+  /// Replicas the owner evicted: for what it kept for them, and for changes left unfed.
+  pub(crate) fn evictions(&self) -> (u64, u64) {
+    match self {
+      Store::Own(blocks, _) => blocks.evictions(),
+      Store::Read(_) => (0, 0),
     }
   }
 
@@ -143,18 +184,16 @@ impl Store {
   }
 
   /// Before a replica replays the message that carries `changes`: the blocks it sealed are admitted and queued for
-  /// adoption in the owner's order. False, unchanged, where the reader refuses them (another writer's, out of order)
-  /// or the store is the owner's own, which replays nothing.
-  pub(crate) fn begin(&mut self, changes: &Changes) -> bool {
+  /// adoption in the owner's order. Refused, unchanged, where the reader refuses them (evicted, another writer's, out
+  /// of order) or the store is the owner's own, which replays nothing (refused as another writer's).
+  pub(crate) fn begin(&mut self, changes: &Changes) -> Result<(), ReaderRefusal> {
     let Store::Read(reading) = self else {
-      return false;
+      return Err(ReaderRefusal::OtherWriter);
     };
-    if reading.reader.admit(changes).is_err() {
-      return false;
-    }
+    reading.reader.admit(changes)?;
     reading.adopting = changes.sealed().collect();
     reading.diverged = false;
-    true
+    Ok(())
   }
 
   /// After the replay: the message passed (its released blocks leave the live table), and what the owner frees by; none

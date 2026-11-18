@@ -1114,6 +1114,36 @@ pub enum RequestBody {
     /// The overlay.
     volume: VolumeId,
   },
+  /// Export a snapshot as an archive (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-441): a new volume `name` holding one
+  /// file, [`ARCHIVE_FILE`], the snapshot's content-addressed archive, which a caller reads a page at a time
+  /// (`ReadRange`) and keeps wherever it keeps bytes. The reply waits for the export, which walks the snapshot in
+  /// slices on the volume's owner shard, the snapshot pinned until its archive is written. `read` on the volume is
+  /// required. Appended.
+  ArchiveExport {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot exported.
+    snapshot: SnapshotId,
+    /// The archive volume's name.
+    name: String,
+  },
+  /// Make a volume from an archive (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-453): a new volume `name` of `size`
+  /// holding the tree of the archive the caller's volume `archive` holds as [`ARCHIVE_FILE`] in its root, as an export
+  /// leaves it (a caller writes the bytes it kept there). The archive file's length is admitted against `archive`'s
+  /// own size class and the shard's room before a byte is read; the file is read, decoded, verified and restored in
+  /// slices on `archive`'s owner shard, and the new volume made there with the archive's name policy. The reply waits
+  /// for the import. A stream that is no archive, or one not whole, is refused [`Refusal::ArchiveRefused`] by its
+  /// kind, with nothing made. `read` on `archive` is required. Appended.
+  ArchiveImport {
+    /// The volume whose root holds the archive file.
+    archive: VolumeId,
+    /// The new volume's name.
+    name: String,
+    /// The new volume's size class.
+    size: SizeClass,
+    /// Whether unlocked memory refuses, as a create's.
+    require_locked: bool,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1134,6 +1164,10 @@ pub enum EditBytes {
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
 pub const IMAGE_FILE: &str = "image.ext2";
+
+/// Format: the name of the archive file in an archive volume's root (`ArchiveExport`, A-441): the snapshot's archive in
+/// the format of `slates_archive` (§4.11), its own magic and version inside.
+pub const ARCHIVE_FILE: &str = "snapshot.slatesarchive";
 
 /// What an image merge did (§4.6, A-160), counted.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1253,12 +1287,17 @@ pub enum HealthSignal {
   NfsLocalOffCpuP99Ns,
   /// The 99th percentile of a call this shard read but forwarded to its volume's owner shard and back.
   NfsForwardedP99Ns,
+  /// The window the daemon's watchdog judges this shard by (A-455, §4.14 `daemon.alive`): the liveness window, raised to
+  /// the scheduler overrun the shard measured where that is longer, never past the observation budget. A shard with no
+  /// step for this long is stuck unless it waited for a CPU or for memory, and one that ran this long of CPU held to
+  /// the build without a step is spinning.
+  WatchWindowNs,
 }
 
 impl HealthSignal {
   /// The closed registry: every shard health signal, in the order the report emits them. A doc-truth
   /// test pins this set and its names so a rename or an addition is caught, not silently miscounted.
-  pub const ALL: [HealthSignal; 10] = [
+  pub const ALL: [HealthSignal; 11] = [
     HealthSignal::CatalogVolumes,
     HealthSignal::LogReplayNs,
     HealthSignal::LeaseExpiring,
@@ -1269,6 +1308,7 @@ impl HealthSignal {
     HealthSignal::NfsLocalP99Ns,
     HealthSignal::NfsLocalOffCpuP99Ns,
     HealthSignal::NfsForwardedP99Ns,
+    HealthSignal::WatchWindowNs,
   ];
 
   /// The dotted name this signal reports under (the stable wire vocabulary a consumer keys on).
@@ -1284,6 +1324,7 @@ impl HealthSignal {
       HealthSignal::NfsLocalP99Ns => "nfs.local_p99_ns",
       HealthSignal::NfsLocalOffCpuP99Ns => "nfs.local_off_cpu_p99_ns",
       HealthSignal::NfsForwardedP99Ns => "nfs.forwarded_p99_ns",
+      HealthSignal::WatchWindowNs => "shard.watch_window_ns",
     }
   }
 
@@ -1302,7 +1343,8 @@ impl HealthSignal {
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
       | HealthSignal::ShardClients
-      | HealthSignal::ShardDeferred => AbsenceIs::Degraded,
+      | HealthSignal::ShardDeferred
+      | HealthSignal::WatchWindowNs => AbsenceIs::Degraded,
     }
   }
 
@@ -1319,7 +1361,8 @@ impl HealthSignal {
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
       | HealthSignal::ShardClients
-      | HealthSignal::ShardDeferred => FreshnessBasis::AtReport,
+      | HealthSignal::ShardDeferred
+      | HealthSignal::WatchWindowNs => FreshnessBasis::AtReport,
     }
   }
 
@@ -1342,6 +1385,9 @@ impl HealthSignal {
       HealthSignal::NfsForwardedP99Ns => {
         "the shard's NFS service times for calls forwarded to an owner"
       }
+      HealthSignal::WatchWindowNs => {
+        "the shard's measured scheduler overrun, by the watchdog's window rule"
+      }
     }
   }
 
@@ -1359,7 +1405,8 @@ impl HealthSignal {
       | HealthSignal::NfsLocalP50Ns
       | HealthSignal::NfsLocalP99Ns
       | HealthSignal::NfsLocalOffCpuP99Ns
-      | HealthSignal::NfsForwardedP99Ns => Observer::OwnerShard,
+      | HealthSignal::NfsForwardedP99Ns
+      | HealthSignal::WatchWindowNs => Observer::OwnerShard,
     }
   }
 
@@ -1869,7 +1916,9 @@ impl RequestBody {
       | RequestBody::DetachOf { volume, .. }
       | RequestBody::RemoteReap { volume, .. }
       | RequestBody::Move { volume, .. }
-      | RequestBody::CaptureBase { volume } => Some(*volume),
+      | RequestBody::CaptureBase { volume }
+      | RequestBody::ArchiveExport { volume, .. } => Some(*volume),
+      RequestBody::ArchiveImport { archive, .. } => Some(*archive),
     }
   }
 
@@ -3896,6 +3945,31 @@ pub enum Refusal {
     /// Why.
     reason: MoveRefusal,
   },
+  /// The bytes an `ArchiveImport` read are not an archive this daemon can make a volume from (A-453), refused by kind
+  /// before the volume is published: nothing is made, its name stays free and its room goes back. Appended.
+  ArchiveRefused {
+    /// Why.
+    fault: ArchiveFault,
+  },
+}
+
+/// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
+/// archive reader's refusals (`slates_archive::ArchiveError`) a caller acts on alike. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFault {
+  /// The stream does not begin with an archive's magic: another format's file, or no file at all.
+  ForeignMagic,
+  /// An archive of a format this daemon does not read: a newer major, a required flag it does not know, or a name
+  /// policy it does not hold. A newer daemon reads it.
+  Unsupported,
+  /// The stream ends before its own frame does: cut off where it was kept or copied. Copy it again whole.
+  Truncated,
+  /// The bytes are not those the archive's checksum or identities name: altered where it was kept or copied.
+  Corrupt,
+  /// Whole and matching its checksum, the archive breaks the format's rules: a declared length past its cap, a chunk
+  /// out of canonical form, a total, extent, name or path that does not hold, or a tree that does not restore. A
+  /// faulty or hostile writer made it.
+  Malformed,
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -4722,6 +4796,23 @@ pub enum ReplyBody {
     /// The snapshot.
     snapshot: SnapshotId,
   },
+  /// A snapshot was exported as an archive (`ArchiveExport`, A-441). Appended.
+  ArchiveExported {
+    /// The archive volume, whose root holds [`ARCHIVE_FILE`].
+    id: VolumeId,
+    /// The archive file's length in bytes.
+    archive_bytes: u64,
+    /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17), the same for the same
+    /// tree wherever it is exported.
+    manifest: [u8; 32],
+  },
+  /// A volume was made from an archive (`ArchiveImport`, A-453). Appended.
+  ArchiveImported {
+    /// The new volume.
+    id: VolumeId,
+    /// The manifest identity of the archive it was made from, verified against the tree: the exported snapshot's.
+    manifest: [u8; 32],
+  },
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by
@@ -5118,6 +5209,7 @@ mod health_signal_registry {
       "nfs.local_p99_ns",
       "nfs.local_off_cpu_p99_ns",
       "nfs.forwarded_p99_ns",
+      "shard.watch_window_ns",
     ];
     let names: Vec<&str> = HealthSignal::ALL
       .iter()

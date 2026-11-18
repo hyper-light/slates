@@ -9,6 +9,9 @@
 //! lint wall refuses write-capable syscalls (R1).
 
 pub mod sim;
+/// A volume symlink as a Windows symbolic link (A-275): the reparse buffer the WinFsp drive shows and a Windows landing
+/// writes (A-438).
+pub mod windows_link;
 
 use crate::inode::Fingerprint;
 
@@ -153,7 +156,8 @@ pub trait HostFs {
 pub struct LandCapabilities {
   /// An atomic exchange of two names exists (`RENAME_EXCHANGE`, `RENAME_SWAP`).
   pub exchange: bool,
-  /// Reflinks exist (`FICLONE`, `clonefile`).
+  /// Reflinks exist (`FICLONE`, `clonefile`, ReFS block cloning: A-445): [`LandFs::clone_temp`] shares an
+  /// earlier temporary's bytes instead of copying them.
   pub reflink: bool,
   /// Unnamed temporaries exist (`O_TMPFILE`); otherwise a hidden sibling name is used.
   pub unnamed_temporaries: bool,
@@ -180,6 +184,20 @@ pub trait LandFs: HostFs {
   /// A new, empty, writable file under `dir`: unnamed where the filesystem allows, else at the
   /// hidden sibling `name`; it becomes visible only through [`LandFs::place`].
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// A new temporary at the hidden sibling `name` under `dir` (named, as `create_temp` names one where the filesystem
+  /// has no unnamed ones) holding the first `len` bytes of `from`, an earlier temporary of the same landing whose bytes
+  /// are all written, shared with it rather than copied (§4.15 step 6, A-445): ReFS block cloning on Windows (Linux
+  /// `FICLONE` and macOS `clonefile` are owed). Asked only where [`LandCapabilities::reflink`] says the filesystem has
+  /// it; refused `EOPNOTSUPP` (`ENOTSUP` on macOS) where this pair cannot be shared (another volume, the volume's
+  /// limit on a cluster's sharers, a file attribute the two do not share), with nothing left behind, so the engine
+  /// writes the bytes as it would have.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
   /// The file is final — its bytes, mode and mtime written (§4.15 step 8, A-130) — and joins its batch: its writeback
@@ -202,6 +220,10 @@ pub trait LandFs: HostFs {
   ) -> Result<(), HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
+  /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,
+  /// archive, offline, not indexed), where the filesystem holds them (A-451: Windows); its read-only state stays its
+  /// mode's ([`LandFs::set_mode`]). Linux and macOS hold none and keep the file as it is.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
   /// Gives the temporary the name `name` under `dir`, refused `EEXIST` when the name exists, so that it holds that
@@ -228,12 +250,26 @@ pub trait LandFs: HostFs {
   fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError>;
   /// Removes a file or symlink.
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a directory.
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError>;
+  /// Creates a directory, with the Windows attribute bits the volume keeps for it where the filesystem holds them
+  /// (A-451; a directory's read-only among them, which Windows gives no permission).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError>;
   /// Removes an empty directory.
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a symlink.
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError>;
+  /// Creates the symlink `name` under `dir` to `target`, refused `EEXIST` when the name exists, so that `name` is never
+  /// seen holding anything but the whole link. A writer that makes a link in one step (`symlinkat`) makes it at `name`
+  /// and ignores `staged`; one that needs two (Windows: the empty object, then its reparse buffer, A-438) makes it at
+  /// `staged`, a hidden name the landing owns, and moves it to `name` without replacing, so a crash between the steps
+  /// leaves only a hidden sibling the landing's sweep removes. `windows` is the bits the volume keeps for the link
+  /// (A-451): on Windows its directory kind (`FILE_ATTRIBUTE_DIRECTORY`, A-275) makes it a directory link, and the other
+  /// bits are its attributes; Linux and macOS links have no kind and hold no bits.
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    staged: &str,
+    windows: u16,
+  ) -> Result<(), HostError>;
   /// Makes the directory's entries durable (`fsync` on its descriptor).
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError>;
   /// One media barrier on the target after the entries' data syncs (§4.15 step 8: macOS

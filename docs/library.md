@@ -54,6 +54,12 @@ fn main() -> ExitCode {
   the anchor loops on them. For a host that has attached nothing yet, as kiln's own start of its
   machine's instance. Once a daemon has served, an anchor never gives its instance up (A-119), asked
   or not.
+- `StartSpec.fleet = Some(role::FleetSelection { manifest, node })` starts the instance as a node of the
+  fleet the manifest names (`--fleet PATH --node NAME`). A starter that writes the manifest itself checks
+  it first with `role::check_fleet(&selection)` (contract 39): the manifest and the files it names read
+  and the node's deployment planned exactly as its anchor and daemon do at their start, answering the
+  fleet's name, `f`, the node's peers and roots (`role::FleetCheck`), or the refusal that start would end
+  with (kiln writes each runner's manifest and checks it so; kiln goal 95101ef3).
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can

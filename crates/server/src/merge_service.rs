@@ -573,6 +573,10 @@ pub(crate) enum StoreVerb {
   Base,
   /// `image_build`, `image_merge`: a disk image of a snapshot, and its merge into a clone (A-160).
   Image,
+  /// `archive_export`: a snapshot's archive in a volume of its own (A-441).
+  Archive,
+  /// `archive_import`: the archive file read from a volume's root (A-453).
+  ArchiveRead,
 }
 
 /// The typed refusal a store-backed `verb` gets on a merge volume, or `None` for a plain volume
@@ -603,6 +607,14 @@ pub(crate) fn refuse_store_verb(
     },
     (_, StoreVerb::Image) => Refusal::Unsupported {
       feature: "a disk image of a merge volume".to_owned(),
+    },
+    (_, StoreVerb::Archive) => Refusal::Unsupported {
+      feature: "an archive of a merge volume: export a work's clone of its green instead"
+        .to_owned(),
+    },
+    (_, StoreVerb::ArchiveRead) => Refusal::Unsupported {
+      feature: "an archive read from a merge volume: write the archive into a plain volume's root"
+        .to_owned(),
     },
   };
   Some(refused(refusal))
