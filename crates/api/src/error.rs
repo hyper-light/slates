@@ -881,6 +881,11 @@ impl fmt::Display for Missing {
       }
       Self::Consumer { consumer } => write!(f, "consumer {consumer}"),
       Self::Shard { shard } => write!(f, "shard {shard}"),
+      Self::Version { green, version } => write!(
+        f,
+        "version {version} of green {} (folded into its checkpoint, or not yet committed)",
+        crate::volume_id_text(*green)
+      ),
     }
   }
 }
