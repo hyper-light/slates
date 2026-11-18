@@ -874,7 +874,7 @@ pub struct ShardState {
   /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
   /// On the control shard: the install of the committed configuration on this holder's register copies, while its walk
-  /// is owed ([`crate::fleet::InstallWalk`], A-389): the version it brings the copies to, where it stands, and whether
+  /// is owed ([`crate::fleet::InstallWalk`], A-398): the version it brings the copies to, where it stands, and whether
   /// a task walks it now. `None` once every copy has taken the installed version.
   pub(crate) install_walk: Option<crate::fleet::InstallWalk>,
   /// Test support (`Daemon::inject_install_walk_quantum`, never set in production): the quantum an install's walk over

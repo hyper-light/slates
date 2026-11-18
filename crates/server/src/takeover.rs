@@ -483,7 +483,7 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
 }
 
 /// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
-/// slice a turn (`fleet::install_on_copy`, A-389), and this whole pass is its oracle in the daemon's unit tests.
+/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests.
 pub(crate) fn resolve_held_object(
   state: &mut ShardState,
   local: HostId,

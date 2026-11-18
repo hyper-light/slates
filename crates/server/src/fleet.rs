@@ -1908,7 +1908,7 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// authorized owner — the object's new owner can then commit through this hold and its prepare authorizes.
 /// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
-/// authority only advances. An install walks the copies a slice a turn instead ([`install_on_copy`], A-389); this whole
+/// authority only advances. An install walks the copies a slice a turn instead ([`install_on_copy`], A-398); this whole
 /// pass is the walk's oracle in the daemon's unit tests.
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
@@ -9288,7 +9288,7 @@ fn sync_config_from_council(local: HostId) {
     // yielded to their successors (A-334, `crate::readmission`).
     let version = configuration.version;
     crate::readmission::install_placement(s, configuration, &members);
-    // The install reaches the held register copies by a walk a slice a turn (A-389, [`InstallWalk`]): each copy's
+    // The install reaches the held register copies by a walk a slice a turn (A-398, [`InstallWalk`]): each copy's
     // fence raised to its owner's committed epoch, its object moved to the successor a kept retirement's lineage ranks
     // or let go as stale, and its authority moved to the owner its route names ([`install_on_copy`]). Until the walk
     // reaches a copy, the copy refuses a record of this version (its own generation is older), and a takeover round's
@@ -9303,7 +9303,7 @@ fn sync_config_from_council(local: HostId) {
   });
 }
 
-/// The install of the committed configuration on this holder's register copies, a slice a turn (A-389; §4.8
+/// The install of the committed configuration on this holder's register copies, a slice a turn (A-398; §4.8
 /// "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere"). An install once moved every held copy in the
 /// turn that installed the version: each fence raised, each object a kept retirement names moved to its successor and
 /// each authority reconciled, one turn of the control shard over every copy this node holds. Now the version is
@@ -9325,7 +9325,7 @@ pub(crate) struct InstallWalk {
   walking: bool,
 }
 
-/// Counter: an install whose walk over the held register copies began ([`InstallWalk`], A-389).
+/// Counter: an install whose walk over the held register copies began ([`InstallWalk`], A-398).
 const INSTALL_WALKS: &str = "fleet.config.install_walks";
 /// Counter: one turn of an install's walk ([`install_slice`]).
 const INSTALL_SLICES: &str = "fleet.config.install_slices";
@@ -9856,7 +9856,7 @@ async fn follow_configuration(
   // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
   // recovery, driven below).
   sync_config_from_council(local);
-  // The install reaches the held register copies by a walk in turns (A-389): begun here once the version is installed,
+  // The install reaches the held register copies by a walk in turns (A-398): begun here once the version is installed,
   // and begun again where it stands if its task could not run.
   drive_install_walk(local);
   // Fan the committed placement and root configurations out to every other shard, every period, so a client

@@ -2936,7 +2936,7 @@ impl Daemon {
   }
 
   /// Test support: the quantum an install's walk over the held register copies is cut by on every shard
-  /// (`fleet::install_slice`, A-389), in place of the shard's own step quantum; `None` gives the shard its own back.
+  /// (`fleet::install_slice`, A-398), in place of the shard's own step quantum; `None` gives the shard its own back.
   /// Zero ends each turn after one copy, so a test sees the slicing whatever the machine's speed. `Ok` once installed
   /// on every shard, else the first typed refusal.
   pub fn inject_install_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {

@@ -12894,7 +12894,7 @@ fn every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter()
 /// catalog and its head), so a holder's walk spans more copies than one turn takes once each turn is cut to one copy.
 const INSTALL_WALK_VOLUMES: usize = 4;
 
-/// Format: a node's count of its install walks' turns (`fleet::install_slice`, A-389).
+/// Format: a node's count of its install walks' turns (`fleet::install_slice`, A-398).
 const INSTALL_SLICES: &str = "fleet.config.install_slices";
 /// Format: a node's count of install walks that reached every held copy.
 const INSTALLS_WALKED: &str = "fleet.config.installs_walked";
@@ -12910,7 +12910,7 @@ fn held_record_count(daemon: &Daemon) -> Option<u64> {
   Some(report.fleet.held_records)
 }
 
-/// A-389 (§4.8 "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere";
+/// A-398 (§4.8 "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere";
 /// `docs/wip/models/InstallInTurns.tla`): an installed configuration reaches a holder's register copies by a walk a
 /// slice a turn, and the copies still follow it. Do: three nodes at `f = 1`; on a, [`INSTALL_WALK_VOLUMES`] volumes
 /// shared with the fleet, each head held by b and c; cut b's and c's install walks to one copy a turn; cut a off on the
