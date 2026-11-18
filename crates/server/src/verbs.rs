@@ -5622,6 +5622,12 @@ fn share(
 /// Turns a volume's live shipping on or off (§4.10, A-200), as one recorded operation on its owner partition; `admin`
 /// on the volume is required, as for its access list. The flag rides the volume's catalog register, so a successor
 /// keeps shipping.
+///
+/// Turning it on, every candidate of the volume's placement makes the claim's admission first (§4.2: "a remote holder
+/// makes the same admission against its own machine before acknowledging placement"; A-401): the verb's reply is
+/// deferred to a task that asks them and records the flag only when none refused, else answers `BudgetExceeded` with
+/// the least room a candidate named (`live_ship::admit_then_ship`). Before, the flag was recorded at once, and a
+/// candidate without room for the claim could later succeed the owner and give the volume up.
 fn live_ship(
   state: &mut ShardState,
   principal: &Principal,
@@ -5635,6 +5641,44 @@ fn live_ship(
   if !rights_of(&record, principal).admin {
     return forbidden("live-ship");
   }
+  if !live_shipped || record.policy.live_shipped {
+    return set_live_shipping(state, volume, live_shipped);
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a live-ship outside a recorded request".to_owned(),
+    });
+  };
+  let object = ObjectId(volume.bytes);
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  let candidates: Vec<HostId> = configuration
+    .place(object)
+    .candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  let admit = slates_db::live::Admit {
+    object,
+    size: record.policy.size,
+    require_locked: record.policy.require_locked,
+  };
+  let shards = (
+    state.shard,
+    state.shards.first().copied().unwrap_or(state.shard),
+  );
+  crate::image::defer(
+    state,
+    crate::live_ship::admit_then_ship(shards, request, volume, admit, candidates),
+  )
+}
+
+/// Records volume `volume`'s live shipping flag (`Op::LiveShippingChanged`): the reply, or the database's refusal.
+pub(crate) fn set_live_shipping(
+  state: &mut ShardState,
+  volume: VolumeId,
+  live_shipped: bool,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   match state.db.mutate(
     &mut state.segment,

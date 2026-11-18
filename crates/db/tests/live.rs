@@ -2718,6 +2718,56 @@ fn a_holders_no_room_crosses_the_wire_with_what_it_could_admit() {
   }
 }
 
+/// §4.2 (A-401): an owner's ask that a candidate make a volume's admission names the volume's size class and its locked
+/// guarantee exactly. Do: encode a bounded, a dynamic and a locked ask, decode each whole, cut each short at every
+/// length, give each a byte too many, and give each an unknown size kind and locked flag. Expect: each back whole and
+/// read as an admission; `Malformed` for every cut, the extra byte and the unknown values; never a panic.
+#[test]
+fn an_owners_admission_ask_crosses_the_wire_whole_and_hostile_ones_are_refused() {
+  use slates_db::catalog::SizeClass;
+  use slates_db::live::{Admit, is_admit};
+  for admit in [
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      require_locked: false,
+    },
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Dynamic { max: u64::MAX },
+      require_locked: false,
+    },
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Bounded { limit: 0 },
+      require_locked: true,
+    },
+  ] {
+    let bytes = admit.encode();
+    assert!(is_admit(&bytes), "{admit:?} read as an admission");
+    assert_eq!(Admit::decode(&bytes), Ok(admit), "{admit:?} back whole");
+    for length in 0..bytes.len() {
+      assert_eq!(
+        Admit::decode(&bytes[..length]),
+        Err(LiveError::Malformed),
+        "{admit:?} cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(Admit::decode(&longer), Err(LiveError::Malformed));
+    let kind_at = 1 + OBJECT.0.len();
+    let mut unknown_kind = bytes.clone();
+    unknown_kind[kind_at] = 2;
+    assert_eq!(Admit::decode(&unknown_kind), Err(LiveError::Malformed));
+    let mut unknown_flag = bytes.clone();
+    if let Some(flag) = unknown_flag.last_mut() {
+      *flag = 2;
+    }
+    assert_eq!(Admit::decode(&unknown_flag), Err(LiveError::Malformed));
+  }
+}
+
 /// Hostile input on the header readers a holder uses before it decodes a message it will not serve: an entry's and an
 /// install's epoch are read back as encoded, every truncation short of the epoch reads none, and a fetch is not read as
 /// an install. Never a panic.

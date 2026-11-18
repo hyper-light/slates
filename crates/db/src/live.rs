@@ -88,6 +88,12 @@ const TAG_INSTALL: u8 = 1;
 const TAG_FETCH: u8 = 2;
 /// Format: a whole-state message's first byte: phase one's report (successor to holder; A-240).
 const TAG_REPORT: u8 = 3;
+/// Format: a whole-state message's first byte: a claim's admission (owner to candidate; §4.2, A-401).
+const TAG_ADMIT: u8 = 4;
+/// Format: an [`Admit`]'s size kind: a bounded claim.
+const SIZE_BOUNDED: u8 = 0;
+/// Format: an [`Admit`]'s size kind: a dynamic volume.
+const SIZE_DYNAMIC: u8 = 1;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
@@ -495,6 +501,74 @@ impl Report {
       Err(LiveError::Malformed)
     }
   }
+}
+
+/// An owner's ask, before it turns a volume's live shipping on, that a candidate make the admission a successor's restore
+/// would make (§4.2: "a remote holder makes the same admission against its own machine before acknowledging placement";
+/// A-401): the volume, its size class and whether it must live in locked RAM, as its catalog records them. Answered with
+/// the empty head when the candidate holds the claim ([`encode_reply`]'s `Ok(None)`), [`LiveError::NoRoom`] when it
+/// cannot make it, and nothing when it will not serve the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admit {
+  /// The volume.
+  pub object: ObjectId,
+  /// Its size class.
+  pub size: crate::catalog::SizeClass,
+  /// Whether its content must live in locked RAM.
+  pub require_locked: bool,
+}
+
+impl Admit {
+  /// The canonical bytes: its tag, the object, the size's kind and bytes, and the locked flag.
+  pub fn encode(&self) -> Vec<u8> {
+    let (kind, bytes) = match self.size {
+      crate::catalog::SizeClass::Bounded { limit } => (SIZE_BOUNDED, limit),
+      crate::catalog::SizeClass::Dynamic { max } => (SIZE_DYNAMIC, max),
+    };
+    let mut out = Vec::new();
+    out.push(TAG_ADMIT);
+    out.extend_from_slice(&self.object.0);
+    out.push(kind);
+    out.extend_from_slice(&bytes.to_le_bytes());
+    out.push(u8::from(self.require_locked));
+    out
+  }
+
+  /// Parses bytes that crossed the network: `Malformed` for another tag, an unknown size kind or locked flag, or any
+  /// length but the canonical one.
+  pub fn decode(bytes: &[u8]) -> Result<Admit, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_ADMIT {
+      return Err(LiveError::Malformed);
+    }
+    let object = reader.object()?;
+    let kind = reader.byte()?;
+    let bytes = reader.word()?;
+    let size = match kind {
+      SIZE_BOUNDED => crate::catalog::SizeClass::Bounded { limit: bytes },
+      SIZE_DYNAMIC => crate::catalog::SizeClass::Dynamic { max: bytes },
+      _ => return Err(LiveError::Malformed),
+    };
+    let require_locked = match reader.byte()? {
+      0 => false,
+      1 => true,
+      _ => return Err(LiveError::Malformed),
+    };
+    if reader.bytes.is_empty() {
+      Ok(Admit {
+        object,
+        size,
+        require_locked,
+      })
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// Whether a whole-state message is an [`Admit`].
+pub fn is_admit(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_ADMIT)
 }
 
 /// A holder's answer to a [`Report`]: the bytes it keeps of the log, then its reply (the head, or the fence refusing a
