@@ -205,28 +205,34 @@ fn mount_verb(
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so the library finds
 /// its attachment among the volumes' reported mounts and detaches it; a volume whose status was refused cannot report
-/// its mounts and is named on standard error, and the drive is still released when another volume reports it.
+/// its mounts and is named on standard error, whether or not the drive is released (another volume reports it). The
+/// names went missing from a released drive's unmount when the CLI moved onto the library (A-278) and came back on
+/// 2026-11-18 (the integrator's Windows lane, run 44257181904).
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut attached = Instance::from_client(instance, connect(instance)?);
   match attached.unmount(path) {
-    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }))
-      if !unreported.is_empty() =>
-    {
-      for volume in &unreported {
-        slates_machine::log_line!(
-          "slates: volume {} ({}) refused {}: its mounts are unknown",
-          volume.name,
-          slates_api::volume_id_text(volume.volume),
-          volume.refusal
-        );
-      }
+    Ok(unmounted) => {
+      name_the_unasked(&unmounted.unreported);
+      Ok(())
+    }
+    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported })) => {
+      name_the_unasked(&unreported);
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
         instance,
       ))
     }
-    other => other.map_err(|e| failure_of_api(e, instance)),
+    Err(refused) => Err(failure_of_api(refused, instance)),
+  }
+}
+
+/// Names on standard error each volume a Windows unmount could not ask, with its status's refusal: its mounts are
+/// unknown.
+#[cfg(windows)]
+fn name_the_unasked(unreported: &[slates_api::Unreported]) {
+  for volume in unreported {
+    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
   }
 }
 

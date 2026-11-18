@@ -402,7 +402,8 @@
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
 > - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
+>   the integrator's two Windows failures;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
