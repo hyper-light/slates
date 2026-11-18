@@ -3167,12 +3167,10 @@ pub(crate) fn serve_awaiting(
   id: RequestId,
   (object, version): ([u8; 16], u64),
 ) -> Option<ReplyBody> {
+  let green = DbVolumeId { bytes: object };
   let object = ObjectId(object);
   if placed_version(state, object).is_some_and(|placed| placed >= version) {
-    let reply = ReplyBody::Submitted {
-      version: Some(version),
-      conflicts: Vec::new(),
-    };
+    let reply = accepted_reply(state, green, version);
     state.db.begin();
     let recorded = crate::verbs::record_completion(state, origin, id, reply);
     return match state.db.commit(&mut state.segment) {
@@ -3227,6 +3225,64 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   true
 }
 
+/// How the submit that made `green`'s `version` was signed (A-321), as the green's accepted record keeps it on its
+/// owner: from the version's chain entry, and once a checkpoint folds that, from the checkpoint. `Unsigned` for a
+/// version whose submit carried no signature and for version 0, the origin; `None` for a version past the head, for a
+/// green this shard does not hold, and for a verdict this build cannot read.
+pub(crate) fn recorded_verification(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<slates_ipc::protocol::Verification> {
+  let engine = state.greens.get(&green)?;
+  if version > engine.head() {
+    return None;
+  }
+  crate::signed_work::of_entry(engine.signature(version))
+}
+
+/// The answer to a submit `green` accepted at `version` (§4.16; A-321): the version's own record answers, so a submit's
+/// first answer, its deferred one (AUD-11) and its resend's after a restart agree. `SubmittedSigned` with the
+/// signature's verdict when the version records one, else `Submitted`.
+pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64) -> ReplyBody {
+  match recorded_verification(state, green, version) {
+    Some(verification @ slates_ipc::protocol::Verification::Verified { .. })
+    | Some(verification @ slates_ipc::protocol::Verification::Invalid { .. }) => {
+      ReplyBody::SubmittedSigned {
+        version: Some(version),
+        conflicts: Vec::new(),
+        verification,
+      }
+    }
+    Some(slates_ipc::protocol::Verification::Unsigned) | None => ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    },
+  }
+}
+
+/// Serves `MergeRecord` (A-321): a committed version's record as a consumer reads it back — how its merge's signature
+/// was judged when it merged, its provenance — on the green's owner, to a principal with the read right. Version 0 is
+/// the origin, which no merge made, so it reads unsigned; a version not yet committed is `NotFound`.
+pub(crate) fn merge_record_verb(
+  state: &ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  version: u64,
+) -> ReplyBody {
+  let record = match require_green(state, principal, green, "merge_record") {
+    Ok(record) => record,
+    Err(refusal) => return crate::verbs::refused(refusal),
+  };
+  match recorded_verification(state, record.id, version) {
+    Some(verification) => ReplyBody::MergeRecord {
+      version,
+      verification,
+    },
+    None => crate::verbs::refused(Refusal::NotFound),
+  }
+}
+
 /// Answers every submit waiting on a version of `object` at or below `placed` (AUD-11): the
 /// acceptance is recorded as the request's completion on this owner partition — one durable step,
 /// so a retry after this meets the record — and the reply delivered to where the request came from
@@ -3244,10 +3300,7 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
     let Some(waiting) = state.merge.awaiting.remove(&(object, version)) else {
       continue;
     };
-    let reply = ReplyBody::Submitted {
-      version: Some(version),
-      conflicts: Vec::new(),
-    };
+    let reply = accepted_reply(state, DbVolumeId { bytes: object.0 }, version);
     for entry in waiting {
       state
         .merge
