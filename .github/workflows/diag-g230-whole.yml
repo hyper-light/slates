@@ -1,0 +1,35 @@
+# DIAG (not for main): g230's A-377 (a live whole entry sealed in turns) on Linux x86_64.
+name: diag-g230-whole
+on:
+  push:
+    branches: ['diag-g230-whole-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  whole:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run 2>&1 | grep -E "^(error|warning: unused)" -A 12 | head -80; exit ${PIPESTATUS[0]}
+      - name: Green
+        run: |
+          set +e
+          for t in a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume; do
+            timeout 900 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-$t.log" 2>&1; echo "== $t exit $?"
+            grep -E "^(whole entry in turns|burst)|panicked at|test result" -A 1 "out-$t.log" | cut -c1-400
+          done
+          timeout 2400 cargo test --locked -p slates-server --test fleet -- live --test-threads=1 > live.log 2>&1; echo "== live filter exit $?"
+          grep -E "^test result|FAILED|panicked at" live.log | head -20
+      - name: Red, the whole entry sealed in its publication's turn
+        run: |
+          set +e
+          perl -0pi -e 's/fn sealed_in_pieces\(state: &ShardState, body: &\[u8\]\) -> bool \{/fn sealed_in_pieces(state: &ShardState, body: &[u8]) -> bool {\n  if body.len() < usize::MAX { return false; }/' crates/server/src/live_ship.rs
+          grep -c "if body.len() < usize::MAX { return false; }" crates/server/src/live_ship.rs | sed 's/^/mutation applied: /'
+          timeout 900 cargo test --locked -p slates-server --test fleet -- --exact a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it --nocapture > red.log 2>&1; echo "== red exit $?"
+          grep -E "^whole entry in turns|panicked at|test result" -A 1 red.log | cut -c1-400
