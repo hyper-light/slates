@@ -38,4 +38,6 @@ and a recovery from a snapshot and the log keeps the same table and the highest 
 consumed grant is not listed, and its history is in the audit.
 
 **Open** (GAPS): an expiry writes no audit record (the audit's kinds have no expiry), so an expired grant's history is
-its `grant_issued` alone, which names no term.
+its `grant_issued` alone, which names no term. **Closed 2026-11-18** (goal g247): an expiry is recorded with a
+`grant_expired` record in one atom
+(`docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`).

@@ -13,7 +13,9 @@
 //! `--write` rewrites the document's generated block), `tally --outputs DIR [--privilege
 //! root|unprivileged]` (re-read a kept `pjdfstest-output` directory — a `--keep` scratch here, or
 //! the CI lane's uploaded artifact — and print the counts, the judgement, and the failures by
-//! shape and by file, so a run that happened elsewhere is reviewed by a command). Scratch lives
+//! shape and by file, so a run that happened elsewhere is reviewed by a command), `compare --plain
+//! DIR --live DIR [--suites S,S]` (a plain run and a live-shipped one, A-200, case by case and record
+//! by record; non-zero on any difference). Scratch lives
 //! in the build output (`--scratch`, else `<target>/conformance-scratch-<pid>`; A-50: never `/tmp`
 //! and never a RAM directory) and is removed at the end unless `--keep`.
 //!
@@ -90,6 +92,10 @@ pub(crate) struct Options {
   /// `compare`: the plain run's directory and the live-shipped run's, each holding the `records` and `scratch` its
   /// harness wrote (`--records DIR/records --scratch DIR/scratch --keep`).
   compared: Option<(PathBuf, PathBuf)>,
+  /// `compare --suites fsx,fsstress,pjdfstest`: the suites the two runs are held to, so a plain run that ran more (the
+  /// lane's `all`: the workloads, the tracer) is compared on the suites the live-shipped run ran; every suite when
+  /// absent.
+  compared_suites: Option<Vec<Suite>>,
   /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
   /// absent.
   privilege: Option<Privilege>,
@@ -192,6 +198,21 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
     compared: value_after(args, "--plain")
       .zip(value_after(args, "--live"))
       .map(|(plain, live)| (PathBuf::from(plain), PathBuf::from(live))),
+    compared_suites: value_after(args, "--suites")
+      .map(|list| {
+        list
+          .split(',')
+          .map(|slug| {
+            Suite::parse(slug).ok_or_else(|| {
+              Failure(format!(
+                "--suites: unknown suite `{slug}`; suites: {}",
+                Suite::ALL.map(Suite::slug).join(", ")
+              ))
+            })
+          })
+          .collect::<Result<Vec<Suite>, Failure>>()
+      })
+      .transpose()?,
     privilege,
     rounds: number(args, "--rounds", bench::DEFAULT_ROUNDS)?,
     bounds: Bounds {
@@ -226,19 +247,23 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
   }
 }
 
+/// One run's kept TAP outputs, by transport slug and suite ([`kept_cases`]).
+type KeptCases = std::collections::BTreeMap<(String, Suite), Vec<slates_conformance::tap::TapCase>>;
+
+/// One run's record outcomes, by record file name, each with the suite it is of ([`outcomes`]).
+type Outcomes = std::collections::BTreeMap<String, (Suite, serde_json::Value)>;
+
 /// The kept TAP outputs under a run's scratch, by transport and suite: pjdfstest's (`<a__b.t>.txt`) and winfstest's
 /// (`t_base_00.t.out`), each parsed as its judgement parses it.
-fn kept_cases(
-  scratch: &Path,
-) -> Result<std::collections::BTreeMap<String, Vec<slates_conformance::tap::TapCase>>, Failure> {
+fn kept_cases(scratch: &Path) -> Result<KeptCases, Failure> {
   let runner = suites::this_user();
   let mut kept = std::collections::BTreeMap::new();
   let Ok(transports) = std::fs::read_dir(scratch) else {
     return Ok(kept);
   };
   for transport in transports.filter_map(Result::ok) {
-    for (suite, extension) in [("pjdfstest-output", "txt"), ("winfstest-output", "out")] {
-      let dir = transport.path().join(suite);
+    for (suite, extension) in [(Suite::Pjdfstest, "txt"), (Suite::Winfstest, "out")] {
+      let dir = transport.path().join(format!("{}-output", suite.slug()));
       let Ok(files) = std::fs::read_dir(&dir) else {
         continue;
       };
@@ -261,7 +286,7 @@ fn kept_cases(
         cases.extend(slates_conformance::tap::parse_file(&relative, &output, &runner).cases);
       }
       kept.insert(
-        format!("{} {suite}", transport.file_name().to_string_lossy()),
+        (transport.file_name().to_string_lossy().into_owned(), suite),
         cases,
       );
     }
@@ -270,78 +295,127 @@ fn kept_cases(
 }
 
 /// The outcome of every record in a directory, by file name: what two runs' records must agree on.
-fn outcomes(
-  records: &Path,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Failure> {
+fn outcomes(records: &Path) -> Result<Outcomes, Failure> {
   let mut out = std::collections::BTreeMap::new();
   for record in load_records(records)? {
     let outcome = serde_json::to_value(&record.outcome).map_err(|e| Failure(e.to_string()))?;
-    out.insert(record.file_name(), outcome);
+    out.insert(record.file_name(), (record.suite, outcome));
   }
   Ok(out)
 }
 
-/// `compare --plain DIR --live DIR`: the plain run and the live-shipped one, compared (A-200): every kept pjdfstest and
-/// winfstest case by its verdict's kind, and every record's outcome (fsx's and fsstress's verdicts, the suites' counts).
-/// Exits non-zero on any difference, naming each.
+/// What [`comparison`] found: a line for each kept output and record it held the two runs to, as `compare` prints
+/// them, and every difference, named.
+#[derive(Debug, Default)]
+struct Comparison {
+  lines: Vec<String>,
+  differences: Vec<String>,
+}
+
+/// The plain run held to the live-shipped one (A-200) over the suites `named`, or every suite when `None`: each kept
+/// case by its verdict's kind, each record's outcome, and, for each named suite, that each run recorded it at all, so a
+/// filter never compares nothing. A plain run that ran more than the live-shipped one (the lane's `all`, with the
+/// workloads and the tracer, which a live-shipped session does not run) is held to it on the named suites alone.
+fn comparison(
+  (plain_cases, live_cases): (&KeptCases, &KeptCases),
+  (plain_records, live_records): (&Outcomes, &Outcomes),
+  named: Option<&[Suite]>,
+) -> Comparison {
+  let compared = |suite: Suite| named.is_none_or(|named| named.contains(&suite));
+  let mut found = Comparison::default();
+  let mut outputs: Vec<&(String, Suite)> = plain_cases
+    .keys()
+    .chain(live_cases.keys())
+    .filter(|(_, suite)| compared(*suite))
+    .collect();
+  outputs.sort_unstable();
+  outputs.dedup();
+  for key in outputs {
+    let (a, b) = (
+      plain_cases.get(key).map(Vec::as_slice).unwrap_or_default(),
+      live_cases.get(key).map(Vec::as_slice).unwrap_or_default(),
+    );
+    let differing = slates_conformance::differential::compare(a, b);
+    let output = format!("{} {}-output", key.0, key.1.slug());
+    found.lines.push(format!(
+      "{output}: {} cases plain, {} live, {} differing",
+      a.len(),
+      b.len(),
+      differing.len()
+    ));
+    found
+      .differences
+      .extend(differing.into_iter().map(|d| format!("{output} {d}")));
+  }
+  let mut names: Vec<&String> = plain_records
+    .iter()
+    .chain(live_records.iter())
+    .filter(|(_, (suite, _))| compared(*suite))
+    .map(|(name, _)| name)
+    .collect();
+  names.sort_unstable();
+  names.dedup();
+  for name in names {
+    let (a, b) = (
+      plain_records.get(name).map(|(_, outcome)| outcome),
+      live_records.get(name).map(|(_, outcome)| outcome),
+    );
+    let same = a == b;
+    found.lines.push(format!(
+      "record {name}: {}",
+      if same { "the same outcome" } else { "DIFFERS" }
+    ));
+    if !same {
+      found
+        .differences
+        .push(format!("record {name}: plain {a:?}, live {b:?}"));
+    }
+  }
+  for suite in named.unwrap_or_default() {
+    for (run, records) in [("plain", plain_records), ("live-shipped", live_records)] {
+      if !records.values().any(|(recorded, _)| recorded == suite) {
+        found
+          .differences
+          .push(format!("the {run} run holds no {} record", suite.slug()));
+      }
+    }
+  }
+  found
+}
+
+/// `compare --plain DIR --live DIR [--suites S,S]`: the plain run and the live-shipped one, compared (A-200): every kept
+/// pjdfstest and winfstest case by its verdict's kind, and every record's outcome (fsx's and fsstress's verdicts, the
+/// suites' counts), over the suites `--suites` names or every suite ([`comparison`]). Exits non-zero on any difference,
+/// naming each.
 fn compare(options: &Options) -> Result<(), Failure> {
   let (plain, live) = options
     .compared
     .as_ref()
     .ok_or_else(|| Failure("conformance compare: --plain DIR --live DIR are needed".to_owned()))?;
-  let mut differences = Vec::new();
-  let (plain_cases, live_cases) = (
-    kept_cases(&plain.join("scratch"))?,
-    kept_cases(&live.join("scratch"))?,
+  let found = comparison(
+    (
+      &kept_cases(&plain.join("scratch"))?,
+      &kept_cases(&live.join("scratch"))?,
+    ),
+    (
+      &outcomes(&plain.join("records"))?,
+      &outcomes(&live.join("records"))?,
+    ),
+    options.compared_suites.as_deref(),
   );
-  let mut suites: Vec<&String> = plain_cases.keys().chain(live_cases.keys()).collect();
-  suites.sort_unstable();
-  suites.dedup();
-  for suite in suites {
-    let (a, b) = (
-      plain_cases
-        .get(suite)
-        .map(Vec::as_slice)
-        .unwrap_or_default(),
-      live_cases.get(suite).map(Vec::as_slice).unwrap_or_default(),
-    );
-    let found = slates_conformance::differential::compare(a, b);
-    println!(
-      "compare: {suite}: {} cases plain, {} live, {} differing",
-      a.len(),
-      b.len(),
-      found.len()
-    );
-    differences.extend(found.into_iter().map(|d| format!("{suite} {d}")));
+  for line in &found.lines {
+    println!("compare: {line}");
   }
-  let (plain_records, live_records) = (
-    outcomes(&plain.join("records"))?,
-    outcomes(&live.join("records"))?,
-  );
-  let mut names: Vec<&String> = plain_records.keys().chain(live_records.keys()).collect();
-  names.sort_unstable();
-  names.dedup();
-  for name in names {
-    let (a, b) = (plain_records.get(name), live_records.get(name));
-    let same = a == b;
-    println!(
-      "compare: record {name}: {}",
-      if same { "the same outcome" } else { "DIFFERS" }
-    );
-    if !same {
-      differences.push(format!("record {name}: plain {a:?}, live {b:?}"));
-    }
-  }
-  if differences.is_empty() {
+  if found.differences.is_empty() {
     println!("compare: the live-shipped run conforms exactly as the plain one does");
     Ok(())
   } else {
-    for difference in &differences {
+    for difference in &found.differences {
       println!("compare: DIFFERENCE {difference}");
     }
     Err(Failure(format!(
       "{} differences between the plain and the live-shipped run",
-      differences.len()
+      found.differences.len()
     )))
   }
 }
@@ -1042,5 +1116,99 @@ mod plain_path_tests {
     );
     assert_eq!(plain_path(Path::new(r"C:\a")), r"C:\a");
     assert_eq!(plain_path(Path::new("/home/a")), "/home/a");
+  }
+}
+
+#[cfg(test)]
+mod compare_tests {
+  use super::{KeptCases, Outcomes, comparison};
+  use slates_conformance::Suite;
+  use slates_conformance::tap::{Runner, parse_file};
+
+  /// Format: the transport the cases and records are of.
+  const TRANSPORT: &str = "native-linux-fuse";
+
+  /// One kept pjdfstest file's cases, from its TAP output.
+  fn kept(tap: &str) -> KeptCases {
+    KeptCases::from([(
+      (TRANSPORT.to_owned(), Suite::Pjdfstest),
+      parse_file("tests/chmod/00.t", tap, &Runner::Root).cases,
+    )])
+  }
+
+  /// Records by file name, each with its suite and an outcome named by `outcome`.
+  fn records(entries: &[(Suite, &str)]) -> Outcomes {
+    entries
+      .iter()
+      .map(|(suite, outcome)| {
+        (
+          format!("{TRANSPORT}.{}.json", suite.slug()),
+          (*suite, serde_json::json!({ "ran": outcome })),
+        )
+      })
+      .collect()
+  }
+
+  /// A-200, AC-9.7/T-9.1 (the live-shipped pair in the conformance lane). Do: hold a plain run that also ran the
+  /// workloads and the tracer (the lane's `all`) to a live-shipped run of fsx and pjdfstest, whose cases and outcomes
+  /// agree, first over the suites the live run ran, then over every suite. Expect: no difference over the named suites,
+  /// whose records alone are compared; over every suite, the two records the live run never made are differences.
+  #[test]
+  fn a_plain_run_of_more_suites_is_held_to_the_live_run_on_the_named_suites_alone() {
+    let cases = kept("1..2\nok 1\nok 2\n");
+    let plain = records(&[
+      (Suite::Fsx, "passed"),
+      (Suite::Pjdfstest, "2 passed"),
+      (Suite::Workloads, "identical"),
+      (Suite::Hermeticity, "no writes"),
+    ]);
+    let live = records(&[(Suite::Fsx, "passed"), (Suite::Pjdfstest, "2 passed")]);
+    let named = comparison(
+      (&cases, &cases),
+      (&plain, &live),
+      Some(&[Suite::Fsx, Suite::Pjdfstest]),
+    );
+    assert!(named.differences.is_empty(), "{:?}", named.differences);
+    assert_eq!(
+      named.lines,
+      [
+        "native-linux-fuse pjdfstest-output: 2 cases plain, 2 live, 0 differing",
+        "record native-linux-fuse.fsx.json: the same outcome",
+        "record native-linux-fuse.pjdfstest.json: the same outcome",
+      ]
+    );
+    let every = comparison((&cases, &cases), (&plain, &live), None);
+    assert_eq!(every.differences.len(), 2, "{:?}", every.differences);
+    assert!(
+      every.differences.iter().any(|d| d.contains("hermeticity"))
+        && every.differences.iter().any(|d| d.contains("workloads")),
+      "{:?}",
+      every.differences
+    );
+  }
+
+  /// A-200, AC-9.7/T-9.1. Do: compare a live-shipped pjdfstest run whose second case failed against a plain run where
+  /// it passed, naming pjdfstest and also fsstress, which neither run recorded. Expect: the case is a difference
+  /// naming both verdicts, and the named suite neither run holds is a difference for each run, so a filter cannot
+  /// pass by comparing nothing.
+  #[test]
+  fn a_case_that_differs_and_a_named_suite_no_run_holds_are_each_a_difference() {
+    let plain = records(&[(Suite::Pjdfstest, "counts")]);
+    let found = comparison(
+      (
+        &kept("1..2\nok 1\nok 2\n"),
+        &kept("1..2\nok 1\nnot ok 2 - got EIO\n"),
+      ),
+      (&plain, &plain),
+      Some(&[Suite::Pjdfstest, Suite::Fsstress]),
+    );
+    assert_eq!(
+      found.differences,
+      [
+        "native-linux-fuse pjdfstest-output tests/chmod/00.t:2: plain pass, live fail",
+        "the plain run holds no fsstress record",
+        "the live-shipped run holds no fsstress record",
+      ]
+    );
   }
 }
