@@ -353,11 +353,32 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
-> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
-> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
-> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
-> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. **CI's first runs (2026-11-18) found three
+> gaps, each fixed failing-test-first (A-319):**
+> - The host gate was red in all three runs that reached it, by one cause: at `repo/db/rep-cache.db` (run 44247840584,
+>   ubuntu), then, once the integrator's 760fb7db printed that cache's rows, at its row for one text, item 3 against 4
+>   (runs 44252249999 and 44252854695). Subversion's client sends a commit's texts in the order of an APR hash table,
+>   seeded afresh in every process, and FSFS numbers a revision's items in the order they arrive, so the workload's one
+>   commit of two new files wrote `db/revs/0/2`, and the cache's rows, two ways: seven and five times in twelve runs
+>   (Subversion 1.14.5, kiln run r956, every other file alike). Each commit now sends one text: all twelve runs were
+>   identical in every revision file, the cache's rows and its bytes, and the gate passed 10 runs of 10 (kiln run
+>   r1031), where before the change it was red in 1 run of 6, at `db/revs/0/2` (r1024). The cache stays compared by
+>   its rows, printed where `sqlite3` is on the `PATH` (760fb7db), and `svnadmin verify` checks every row against its
+>   revision; the revisions stay byte-compared.
+> - `cargo` failed alike on both sides of the macOS leg (run 44247840584): every CI job sets `CARGO_TERM_COLOR=always`,
+>   whose escape sequence before `Fresh` made the script's count of fresh builds read 0. Before A-289 that was recorded
+>   `Identical`, so the reuse AC-3.2 names had never been checked in CI. The shared environment now sets cargo's colour
+>   off and its target directory to the crate's own, which kiln's runs move outside the tree
+>   (`the_workload_environment_keeps_a_parents_cargo_settings_out`, red at exit 127 before).
+> - The live guest was killed at its 1500 s bound (run 44247840584): its harness read QEMU's console only after the VM
+>   exited, and the console stopped at exactly 65,536 bytes, a Linux pipe's capacity, mid-line in the Mercurial mount
+>   run's output, once the version-control workloads made it that long. The console is now read while the VM runs
+>   (`a_child_writing_past_its_pipes_capacity_is_read_while_it_runs`, `crates/server/tests/virtiofs.rs`, killed at its
+>   60 s bound before). The same wait-then-read shape stands in five other test helpers whose children write a few
+>   lines (`run_within` in `crates/cli/tests/cli.rs` and `winfsp.rs`, `bounded` in `cli.rs` and
+>   `crates/bridge-fuse/tests/oci_container.rs`, the destroys in `live_chaos.rs`): none has met a pipe's capacity.
+>
+> Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
