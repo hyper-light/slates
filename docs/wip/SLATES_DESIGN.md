@@ -5646,6 +5646,16 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
+> forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
+> again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
+> detector condemns a member, so a false death is refuted within it), on the wall from its first look, and gives up
+> only once a look begun after the horizon has found no owner: a round waiting on silent peers no longer spends the
+> whole budget, and a refutation the shard read while a round waited is seen before it gives up (clients' runs, nice 19
+> beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
+> operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
+> ends, `budget_spent` and `slo_ended`.
+
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
@@ -22156,7 +22166,43 @@ Applied in the same change to:
 - **Evidence.** The suite over an in-process daemon and over the simulator, and the simulator's bound. Owed: Hex's own
   use of it, when Hex takes slates (its agent was idle until 2026-11-19).
 
-### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
+### A-317 — A forward's owner location is given the membership horizon, ended by a look begun after it, within the failover SLO (2026-11-18, built for goal g255; clients' class B, `3c072f490`, with the supervisor's derivation)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-317).
+- `crates/server/src/verbs.rs`: `locate_within_budget` (the give-up counted on the caller's side of the loop) and
+  `locate_within_horizon`, and the counts `fleet.owner_location.gave_up`, `.budget_spent` and `.slo_ended`.
+- Tests (`crates/server/tests/fleet.rs`): `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` and
+  `the_failover_slo_ends_a_forwards_location_budget` (new), and
+  `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, judged by the location's own counts
+  (clients' rewrite).
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the location budget).
+- **What was there.** A forward with no known owner gave its location one liveness budget of wall time, a fixed
+  second: the direct route, then a round, again every poll interval until the second ran out. A control shard kept off
+  its CPU ran out of it while the gossip that refutes a false death waited to be read, and its client was refused for
+  the machine's load (clients' runs at nice 19 beside two spinners a CPU, 1 or 2 calls in every false death); and with
+  silent peers the first round's own wait spent the whole second, so the location never looked again.
+- **The rule.** The location looks (the direct route, a round, and the direct route again) every poll interval. It
+  gives up once a look begun after the membership horizon, on the wall from its first look, has found no owner, or once
+  the operator's failover SLO has passed.
+- **Why.** An owner is unfindable while live for the time a false death takes to be gossiped and refuted, which the
+  detector's own horizon bounds (the supervisor's derivation of 2026-11-07: the location budget is the membership
+  horizon), not for a liveness budget. Ending only with a look begun after it means a round that outlasted the horizon
+  is followed by one more look, and the direct route asked after each round sees what the shard read while the round
+  waited on its peers.
+- **The forms that did not land.** Two longer budgets: clients' polls (a liveness budget's worth at the poll interval,
+  capped by the failover SLO), and the horizon followed by two waits of the control shard in its driver (A-292's
+  receiver rule). With either, the five-node takeover test
+  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` failed on GitHub's runners
+  where main's budget passed it 14 of 14 (`diag-g255-loc-red-1`, `-red-3`): the polls 2 of 6 (`-green-1`, run
+  44254608282), the waits 4 of 15 (`-green-3`, run 44257318582: ubuntu-latest and windows-latest 2 of 5 each), each
+  failure running its deadline out (the resend refused, the green never served again). The mechanism was not measured
+  apart; the likely one is a busy control shard, which rarely waits in its driver, holding the location to the SLO while
+  its rounds borrow the record sessions the takeover needs.
+- **Evidence.** EVIDENCE_LOC
+- **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
+  its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
+  when they wait on a silent peer.
+ its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
 Applied in the same change to:
 - §4.8 "Lookup": the status of 2026-11-18.
 - `crates/server/src/forward_lane.rs`: `Place`; each ticket's place, and the lane's queue ordered by place, then

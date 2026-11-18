@@ -17733,10 +17733,13 @@ const FALSE_DEATH_TRIALS: u32 = 5;
 /// §4.8 "Lookup" under the detector's stated accuracy (a live member condemned within its mistake allowance, the death
 /// gossiped and refuted): how long a node holding a live owner dead keeps its clients from that owner's volume. Do: on a
 /// three-node fleet, create a volume on A and reach it from B's client; then, [`FALSE_DEATH_TRIALS`] times, inject a
-/// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: no call
-/// refused, each trial served within one liveness budget (the forward's location allowance), the times printed for
-/// the A/B of the recovery path (`docs/wip/BENCHMARKS.md`). Before 2026-10-08 every false death refused at least one
-/// call `HomedElsewhere`; the forward now retries its owner's resolution within that allowance.
+/// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: every death
+/// landed, the forward's location never gave up before its budget ended (`fleet.owner_location.gave_up` at most its
+/// two ends, `slo_ended` and `budget_spent`: A-317), and a trial served; the times printed for the A/B of the recovery
+/// path (`docs/wip/BENCHMARKS.md`). Judged by the daemon's own counts, never a wall bound the load stretches (clients'
+/// rewrite of 2026-11-09: at nice 19 beside two spinners a CPU, the wall-bound form passed 0 of 10 on each of CI's
+/// arm64 and x86_64 Linux runners). Before 2026-10-08 every false death refused at least one call `HomedElsewhere`; the
+/// forward now retries its owner's resolution within its budget.
 #[test]
 fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget() {
   let _serial = serialize_fleet_tests();
@@ -17757,9 +17760,15 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
       ReplyBody::Status { .. }
     ))
   });
+  let before = location_ends(&daemons[1]);
   let outages: Vec<_> = (0..FALSE_DEATH_TRIALS)
     .map(|trial| time_false_death(&daemons, &mut forwarded, hosts[0], id, trial))
     .collect();
+  let after = location_ends(&daemons[1]);
+  let (gave_up, ended) = (
+    after.0.saturating_sub(before.0),
+    after.1.saturating_sub(before.1),
+  );
   let counters = daemons[1].fleet_refusals();
   for daemon in daemons {
     daemon.stop();
@@ -17769,17 +17778,130 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
     reached,
     "B's client reached A's volume before the false deaths"
   );
-  for (injected, served, took, refused) in &outages {
-    assert!(*injected, "the false death landed on B");
-    assert_eq!(
-      *refused, 0,
-      "no call was refused while the false death lasted: {outages:?}; B's counters {counters:?}"
-    );
-    assert!(
-      *served && *took < Duration::from_nanos(LIVENESS_BUDGET_NS),
-      "a forward recovered from a refuted false death within its location budget: {outages:?}; B's counters {counters:?}"
-    );
+  assert!(
+    outages.iter().all(|(injected, ..)| *injected),
+    "every false death landed on B: {outages:?}"
+  );
+  assert!(
+    gave_up <= ended,
+    "the forward's location never gave up before its budget ended: {gave_up} gave up, {ended} at the budget's end; \
+     {outages:?}; B's counters {counters:?}"
+  );
+  assert!(
+    outages.iter().any(|(_, served, ..)| *served),
+    "a forward recovered from a refuted false death: {outages:?}; B's counters {counters:?}"
+  );
+}
+
+/// `daemon`'s forward location give-ups (`fleet.owner_location.gave_up`), and those at the budget's own two ends
+/// (`slo_ended` plus `budget_spent`).
+fn location_ends(daemon: &Daemon) -> (u64, u64) {
+  daemon.fleet_refusals().map_or((0, 0), |counters| {
+    let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+    (
+      of("fleet.owner_location.gave_up"),
+      of("fleet.owner_location.slo_ended") + of("fleet.owner_location.budget_spent"),
+    )
+  })
+}
+
+/// A forward read through the one node left of a formed three-node fleet, of a volume whose owner that node holds dead
+/// with no peer left to answer a location round, `failover_slo_ns` applied to that node first when given: the reply, how
+/// many polls the location made past its first (`fleet.owner_location.retried`), and how its budget ended (the counts
+/// `budget_spent` and `slo_ended` moved by the read).
+fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64, (u64, u64)) {
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("no-owner-to-find")) else {
+    panic!("setup: the volume was not created on A");
+  };
+  share_with_fleet(&mut owner_client, id, &daemons);
+  drop(owner_client);
+  let survivor = daemons.remove(1);
+  for daemon in daemons {
+    daemon.stop();
   }
+  survivor
+    .observe_peer_dead(hosts[0], FALSE_DEATH_INCARNATION)
+    .expect("the owner is held dead on the survivor");
+  if let Some(slo) = failover_slo_ns {
+    survivor
+      .observation(
+        Some(survivor.shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        move |state: &mut slates_server::state::ShardState| state.config.failover_slo_ns = slo,
+      )
+      .unwrap()
+      .wait()
+      .expect("the ceiling is set on the survivor's control shard");
+  }
+  let counts = |daemon: &Daemon| {
+    daemon.fleet_refusals().map_or((0, 0, 0), |counters| {
+      let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+      (
+        of("fleet.owner_location.retried"),
+        of("fleet.owner_location.budget_spent"),
+        of("fleet.owner_location.slo_ended"),
+      )
+    })
+  };
+  let before = counts(&survivor);
+  let reply = Client::connect(survivor.instance()).call(&RequestBody::Status { volume: id });
+  let after = counts(&survivor);
+  survivor.stop();
+  (
+    reply,
+    after.0.saturating_sub(before.0),
+    (
+      after.1.saturating_sub(before.1),
+      after.2.saturating_sub(before.2),
+    ),
+  )
+}
+
+/// A-317, §4.8 "Lookup", the location budget: a forward whose owner cannot be found keeps looking for its budget and
+/// still ends. Do: read a volume through a node that holds its owner dead, with no peer left to answer a location
+/// round. Expect: the read refused, having looked again at least once, and its location ended at its own budget (a look
+/// begun past the membership horizon: `fleet.owner_location.budget_spent`), not at the failover SLO. Before A-317 the budget was one liveness budget of wall time, which the first round's wait for its
+/// silent peers spent, so the location never looked again. Counts, so the judgment holds whatever a loaded machine
+/// does to each look's time.
+#[test]
+fn a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls, (spent, slo_ended)) = read_with_no_owner_to_find(None);
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert!(
+    polls >= 1,
+    "the location looked again before it gave up ({polls} more looks): {reply:?}"
+  );
+  assert_eq!(
+    (spent, slo_ended),
+    (1, 0),
+    "the location ended at its own budget, not the failover SLO: {reply:?}"
+  );
+}
+
+/// A-317, the ceiling on the same budget: a location round can wait for peers that do not answer, so the operator's
+/// failover SLO ends the location on the wall whatever its other bound says. Do: the same read with the node's failover
+/// SLO at one nanosecond. Expect: refused at its first look at the ceiling, with no look past the first, counted as
+/// ended by the SLO.
+#[test]
+fn the_failover_slo_ends_a_forwards_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls, (spent, slo_ended)) = read_with_no_owner_to_find(Some(1));
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert_eq!(polls, 0, "the ceiling ended the budget at once: {reply:?}");
+  assert_eq!(
+    (spent, slo_ended),
+    (0, 1),
+    "ended by the failover SLO: {reply:?}"
+  );
 }
 
 /// One false-death trial: injects a false death of `owner` into `daemons[1]` and polls `client`'s forwarded status of
