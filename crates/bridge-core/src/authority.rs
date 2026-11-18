@@ -181,6 +181,13 @@ pub struct OpContext {
   /// is the uid-only authenticated identity that authority is checked against (§4.13), while the
   /// group is file ownership to stamp, carried beside it and never consulted for access.
   pub owner_gid: Option<u32>,
+  /// The creating process's file mode creation mask, where the transport carries it beside a mode it did not mask:
+  /// FUSE under `FUSE_DONT_MASK` (`fuse_create_in`, `fuse_mkdir_in`, `fuse_mknod_in`). The shared seam applies it at a
+  /// create unless the parent directory has a default ACL, which governs the new node's mode instead (Linux's
+  /// `posix_acl_create`; A-314). `None` where the mode a transport hands over is already the caller's whole ask: an
+  /// NFS client applied its own umask, WinFsp and the typed channel have none. Like the owner fields, metadata of the
+  /// request, never authority.
+  pub umask: Option<u32>,
 }
 
 /// The owner's attachment registry: it admits attachments under the current host epoch, validates
@@ -373,6 +380,8 @@ impl Attachments {
       // Set by the transport edge that has a credential group (the NFS export overlays the mounting
       // user's gid); the attachment registry itself carries no group.
       owner_gid: None,
+      // Set by the FUSE dispatch for a creating request, which carries its caller's umask (A-314).
+      umask: None,
     })
   }
 }

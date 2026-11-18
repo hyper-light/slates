@@ -509,7 +509,9 @@ fn entry_for(
           witnessed: None,
           overlay: None,
         })),
-        Child::Fifo(_) | Child::Socket(_) => Err(VfsError::SpecialFileOperation),
+        Child::Fifo(_) | Child::Socket(_) | Child::BlockDevice(_) | Child::CharDevice(_) => {
+          Err(VfsError::SpecialFileOperation)
+        }
         Child::File(no) => {
           let attrs = source.stat(vol, store, no)?;
           let mut bytes =

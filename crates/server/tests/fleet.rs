@@ -6104,15 +6104,13 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
     DEAD_SESSION_WATCH,
     DEAD_SESSION_WATCH_PERIODS,
     || {
-      Ok(
-        daemons[1]
-          .observation(
-            Some(daemons[1].shards()[0]),
-            slates_server::daemon::OBSERVE_BUDGET_NS,
-            |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
-          )?
-          .wait()?,
-      )
+      daemons[1]
+        .observation(
+          Some(daemons[1].shards()[0]),
+          slates_server::daemon::OBSERVE_BUDGET_NS,
+          |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
+        )?
+        .wait()
     },
   );
   // The burst, every forward of it first queued after the probe's.
@@ -11245,8 +11243,13 @@ fn a_repair_whose_acknowledgement_outlasts_its_round_is_counted() {
      {repairs_before:?} → {repairs_after:?}, late repairs {late_before:?} → {late_after:?}; the owner's put latency \
      (readings, p95 ns) {measured:?}; the owner's counts {healer:?}"
   );
+  let outlasted = outlasted_before
+    .as_ref()
+    .ok()
+    .zip(outlasted_after.as_ref().ok())
+    .is_some_and(|(before, after)| after > before);
   assert!(
-    matches!((&outlasted_before, &outlasted_after), (Ok(before), Ok(after)) if after > before),
+    outlasted,
     "the refill outlasted the round that sent it, so the case shown is the one that went uncounted: \
      {outlasted_before:?} → {outlasted_after:?}; the owner's put latency (readings, p95 ns) {measured:?}"
   );
@@ -16004,13 +16007,10 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
   }
   let counted = counted.expect("the successor's counters are read");
   let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
-  assert!(both_at_two, "both holders recomputed version 2");
-  assert!(unowned, "before the death neither holder owned the green");
-  assert!(other_at_three, "the other holder recomputed version 3");
-  assert_eq!(
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
     successor_at_death.map(|state| state.version),
-    Ok(Some(2)),
-    "the successor was one version behind when the owner died"
   );
   assert_eq!(
     placed,
@@ -16044,6 +16044,25 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
       at_head: Ok(b"hello world!".to_vec()),
     },
     "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// What `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` expects of the moment its
+/// owner died: both holders had recomputed version 2 while neither owned the green (`both_at_two`, `unowned`), the other
+/// holder had recomputed version 3 (`other_at_three`), and the successor was one version behind, at 2
+/// (`successor_at_death`).
+fn expect_the_successor_one_version_behind(
+  (both_at_two, unowned): (bool, bool),
+  other_at_three: bool,
+  successor_at_death: Result<Option<u64>, ObserveError>,
+) {
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_three, "the other holder recomputed version 3");
+  assert_eq!(
+    successor_at_death,
+    Ok(Some(2)),
+    "the successor was one version behind when the owner died"
   );
 }
 

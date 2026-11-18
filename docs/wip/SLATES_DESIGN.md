@@ -1830,11 +1830,25 @@ epoch copies only its table, never a value.
   guest's data, like any attribute. No host's mount shows or sets them (a FUSE or NFS mount, the AppleDouble view of a
   macOS NFSv3 mount), since there the host's own kernel would act on them. An acknowledged change of any attribute is
   published before its reply on every route, as a namespace change is (D-18).
-- **A guest's POSIX ACLs (A-302).** A guest kernel's route also keeps `system.posix_acl_access` and
+- **A guest's POSIX ACLs (A-302, A-314).** A guest kernel's route also keeps `system.posix_acl_access` and
   `system.posix_acl_default` as the guest's data, checked as Linux checks an ACL and their named users and groups
-  turned through the route's owner view (A-281), as a chown's ids are. They are stored, not enforced: the route does
-  not negotiate `FUSE_POSIX_ACL`, so the guest's kernel checks the mode bits it is shown, as it does over Shards' own
-  server. Every other `system.` name stays refused on every route.
+  turned through the route's owner view (A-281), as a chown's ids are. The route asks the guest's kernel to enforce
+  them (`FUSE_POSIX_ACL`), so what a guest's `setfacl` grants or denies holds for its accesses, as on a Linux bind
+  mount. The kernel judges each access by the access ACL it reads; the rest of Linux's rules (`fs/posix_acl.c`) are the
+  shared seam's, on every route:
+  - **The mode is the access ACL's owner, mask and other entries** (the owning group's where there is no mask).
+    Setting an access ACL sets those three classes of the mode, and keeps the ACL only when it says more than a mode
+    can (a named entry or a mask), removing it otherwise. A chmod through any route changes those three entries,
+    since a reader is shown them from the mode as it reads. Removing an access ACL leaves the mode as it is.
+  - **A directory's default ACL is what it gives what is made in it,** through any route. The creator's umask is not
+    applied under one: the new node's mode keeps only what the default's owner, mask and other entries grant, it takes
+    the default's entries as its access ACL when they say more than its mode, and a new directory takes the default
+    too. A symlink takes neither. Without a default ACL, a FUSE creator's umask is applied, and an NFS client applied
+    its own.
+  - **Not kept:** Linux clears set-group-ID when a caller outside the file's group sets its ACL. The FUSE wire carries
+    that judgement only under `FUSE_SETXATTR_EXT`, which slates does not negotiate (GAPS).
+
+  Every other `system.` name stays refused on every route.
 
 > **A-32 status (2026-09-26).** The volume core is implemented (`crates/vfs/src/xattr.rs`, the
 > table in `inode.rs`, recovery image version 5). It is proven by the model oracle, which now
@@ -1852,6 +1866,20 @@ or passed descriptors. A clone has its own endpoint identity. Communication is l
 the mounting kernel and its endpoint identity, never a distributed stream. The core's
 regular-file I/O refuses these kinds. Existing host special files remain excluded from
 the live base: importing a name must not connect the volume to a host endpoint.
+
+**Device nodes (A-294).** A block or character device node is an inode whose body is its number: a major and a minor,
+each the 32 bits NFS carries (`specdata3`, `specdata4`), kept exactly as made (`Body::Device(DeviceNumber)`, eight bytes
+inside a body already larger, so no inode should grow; owed: `tree_heap`'s measurement of `Inode`, 168 bytes before).
+It has no content, so the core's regular-file I/O refuses it as it
+refuses a FIFO; it links, renames, unlinks, snapshots, clones, recovers, replicates, archives and merges with its number,
+and a whiteout as overlayfs writes one is a character device numbered 0/0 like any other. Nothing in slates opens the
+device a node names: the base plane imports none from the host, a landing refuses one, and every consumer's kernel is
+guarded (§4.6).
+
+> **A-294 status (2026-11-17).** Built in the volume core (`Kind::BlockDevice`, `Kind::CharDevice`, `SpecialNode`,
+> `Volume::mknod_no`, `observe` and `device_in` report the number), the recovery image (version 28) and delta (11), the
+> archive (manifest minor 4), the merge deriver's ops document, and the ext4 image's build and merge (a number past the
+> image's 12-bit major and 20-bit minor is refused at the build, `DeviceNumberUnencodable`).
 
 > **A-26 implementation status (2026-09-20).** The shared namespace, VFS deltas, snapshots,
 > clones, recovery and archives carry IPC metadata. The merge service also preserves it
@@ -2093,10 +2121,23 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 **Special names (A-26).** A bridge may create and report FIFO/socket inodes only with
 their real type. The kernel owns transient communication; unsupported platforms refuse
-typed rather than returning a regular file. Block and character devices remain unsupported;
-neither the server nor a mounted client is granted device activation by a volume operation.
-Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
-must exercise local communication and isolation between clones as well as namespace calls.
+typed rather than returning a regular file. Neither the server nor a mounted client is granted device activation by a
+volume operation. Mounted acceptance must exercise local communication and isolation between clones as well as
+namespace calls.
+
+**Device nodes (A-294).** A bridge creates and reports a block or character device node with its number, in its own
+encoding: NFSv3's `rdev` (`specdata3`), NFSv4's `rawdev` (`specdata4`), FUSE's `rdev` in the Linux kernel's 32-bit form
+(`new_encode_dev`; a number past it reads as 0, as Linux's own NFS client reads one, `xdr_decode_specdata3`). A device
+node other than a whiteout (a character device 0/0) is made for a caller acting as root alone, a whiteout for any caller
+who may write the directory: Linux's rule (`vfs_mknod` asks `CAP_MKNOD` of every device but a whiteout; `nfsd` drops
+`CAP_MKNOD` from every uid but root's), applied once in the shared bridge (`access::needs_superuser`) and checked over
+NFS after a taken name (`EEXIST`) and an unwritable directory (`EACCES`), the order A-268 set. Nothing opens one as a
+device: every mount slates makes is `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's own options; the OCI
+binding), so its kernel refuses the open `EACCES` (`may_open_dev`); an export's PersistentVolume is `nodev` too, and in a
+pod, whose bind drops it (A-94), the container runtime's device cgroup refuses the open; a guest's mount of a virtio-fs
+share is the guest's, so slates asks it for `nodev`, and a guest that declines opens only its own devices. WinFsp and
+FSKit have no device kind and refuse the node unsupported, as a FIFO; the WinFsp drive's listing leaves out each FIFO,
+socket and device node rather than fail the directory (`listed`).
 
 **A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
 not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
@@ -2971,8 +3012,8 @@ therefore one implementation shared by both versions.
   defines: NFSv4.2's attributes (`xattr_support`) are not offered, nor returned, in an NFSv4.1 compound.
   `change_attr_type` is not offered until the counter is monotonic across a crash (TBD_FIXES: an
   unstable write's counter can precede the recovery image).
-- **Special names and times.** CREATE makes FIFOs and socket names through the v3 MKNOD, which keeps
-  A-26's rule (block and character devices refused). `supported_attrs` names `time_access_set` and
+- **Special names and times.** CREATE makes FIFOs, socket names and device nodes through the v3 MKNOD, which keeps
+  A-294's rule (a device node other than a whiteout for root alone), and GETATTR reports a device's `rawdev`. `supported_attrs` names `time_access_set` and
   `time_modify_set`, without which the Linux client drops `utimensat`'s explicit times; a GETATTR or
   READDIR asking for either is `NFS4ERR_INVAL` (§5.6). Times have NFSv4's full range: `nfstime4`'s
   signed 64-bit seconds reach the volume's `i64` nanoseconds both ways (the dialect carries them,
@@ -4191,7 +4232,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   guest's kernel;
 - the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
   data and shown to no host's mount (A-290, A-302, §4.5 "Extended attributes"); an ACL's named owners are kept through
-  the stream's owner view; an acknowledged attribute change is published before its reply;
+  the stream's owner view; the guest's kernel is asked to enforce its ACLs, which the shared seam keeps in step with
+  the mode and gives at every create under a default ACL (A-314); an acknowledged attribute change is published before
+  its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
@@ -4289,8 +4332,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > **Status (2026-11-18, A-302, the guest's ACLs).** Built and proven by use. A stream keeps a guest's access and
 > default ACLs, checked as Linux checks one, their named owners kept through the stream's owner view and read back as
 > set over a second stream; a default ACL on a file is refused `EACCES`; a host's mount neither lists nor sets them
-> (`crates/bridge-fuse/src/posix_acl.rs` and `tests/shards_fs.rs`; `crates/server/tests/shards.rs`). They are not
-> enforced, as Shards' own server enforces none.
+> (the codec now `crates/bridge-core/src/posix_acl.rs`; `crates/bridge-fuse/tests/shards_fs.rs`;
+> `crates/server/tests/shards.rs`). They were not enforced, as Shards' own server enforces none; A-314 enforces them.
+
+> **Status (2026-11-18, A-314, the guest's ACLs enforced).** Built and proven by use, at the dispatch every guest route
+> shares. A guest's INIT is answered with `FUSE_POSIX_ACL`, a host's without. Judged as a guest's kernel judges an access
+> (Linux's `acl_permission_check` and `posix_acl_permission`, modelled in the test over what GETATTR and GETXATTR
+> answer), a `setfacl -m u:4242:rw,u:4343:-` on a 0600 file makes it 0660 and lets 4242 read and write, 4343 nothing, the
+> owning group read; a chmod 0640 through a host's mount is read back as the mask r--; a removal leaves the mode; a
+> minimal ACL becomes the mode alone. A default ACL gives a file, a directory and a FIFO made under it the mode and
+> ACLs Linux's `posix_acl_create` gives, the umask ignored, a symlink nothing, and a file a host's route makes there the
+> same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
+> a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
+> enforcing them too (Shards' side, after its v0.8.0 tag).
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -4690,7 +4744,9 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 ### 4.8 Metadata database, registers and configuration (D-14, D-18)
 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
-hard links and snapshot versions. No live kernel endpoint state is part of the image.
+hard links and snapshot versions. No live kernel endpoint state is part of the image. A device node's image carries
+its number as its body (A-294, image version 28); an image giving one content or a size, or giving a FIFO or file a
+device body, is refused `RecoveryIncomplete`.
 
 > **Status (2026-10-01, AUD-29-30).** A leader admits a proposal or membership entry against its log budget
 > before its log changes, refusing it (`false`, counted `budget_refused`) instead of letting the next
@@ -7793,7 +7849,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
-No copy-up, hashing, archive or landing step opens a host special file as regular content.
+No copy-up, hashing, archive or landing step opens a host special file as regular content. A landing containing a
+device node refuses the same way (A-294): a grant authorizes content, never a device on the host, and making one there
+would need a privilege slates never holds (R10).
 
 > **Containment correction (2026-09-19).** Scratch directories created by inode operations
 > belong in the diverged set even without a base. Whole-target staging is removed: its hidden
@@ -8332,7 +8390,9 @@ granted-target exception).
 
 **Special names (A-26).** FIFO/socket changes are explicit namespace/metadata operations,
 with kinds included in canonical identities and conflicts. They have no content hunks.
-Applying or replicating an increment cannot import a live endpoint from the work volume.
+Applying or replicating an increment cannot import a live endpoint from the work volume. A device node is one more
+such kind with its number (A-294): the number is part of its canonical identity, so two works making one path with two
+numbers conflict, and the same node made twice converges.
 
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
@@ -8341,8 +8401,13 @@ Applying or replicating an increment cannot import a live endpoint from the work
 > deletion clears live metadata and preserves old versions. The wire declaration is implemented.
 > IPC rename, alias metadata declarations and primary unlink with aliases remain typed refusals
 > under the existing path-based work journal; an inode-aware journal and mounted green/work
-> volumes remain owed. Device creation/activation remain refused. Evidence:
+> volumes remain owed. Device activation remains refused. Evidence:
 > `docs/bugs/2026-09-20-merge-ipc-origins-refused.md`.
+>
+> **Status (2026-11-17, A-294).** A device node's kind and number ride the special-node encoding as kinds 2 and 3,
+> its major and minor after the FIFO and socket fields, so every FIFO and socket encoding and identity is unchanged and
+> no origin, checkpoint or chain format version moved; origins capture device nodes, declared work makes them
+> (`IpcNodeKind::BlockDevice`, `CharDevice`), and the post-state carries each node at its own length.
 >
 > Retention admission reserves the values a verdict can supersede, counting each affected path
 > once and both ends of a rename. Incoming bytes are not an upper bound on retained history:
@@ -10789,6 +10854,8 @@ activation remain refused, with device-metadata preservation a separate decision
   and server archive restoration; `merge`, IPC declarations and server merge capture/sealing,
   with the dated special-file and merge IPC bug records. No new privilege
   or tool is authorized.
+- Resolved (2026-11-18, Ada, option (c); A-294): device nodes are kept as metadata in volumes, images, archives,
+  merges and bridges, with their kind and number, and nothing opens one as a device; A-268's refusal is replaced.
 
 ### A-27 — Verify displaced content across the exchange's own ctime update (2026-09-20)
 
@@ -12729,8 +12796,9 @@ Status: built 2026-10-05 (condition 4).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
-  writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268).
+  writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon kept refusing
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268) until A-294
+  (2026-11-17) kept them as metadata, so `nodev` is now the guard, not moot.
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -17279,6 +17347,10 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   and winfstest judged against the 382-entry list.
 
 ### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+> **Superseded by A-294 (2026-11-17).** A device node is made; `NFS3ERR_PERM`/`NFS4ERR_PERM` now answers only a caller
+> who is not root asking for a device other than a whiteout, after the taken name and the unwritable directory this
+> amendment ordered.
+
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
 `docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
 (`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
@@ -21369,6 +21441,9 @@ The steps' own records follow.
   `FAILED_EXIT_CODE` (4, the CLI's code for a failed daemon), never a panic: a stuck shard's thread cannot be joined, so
   an orderly stop would wait on it for good. The end's line is written by a thread of its own, waited for at most one
   beat, since a shard can be wedged in a write to an undrained standard error while holding the lock every log line takes.
+  A writer that says the line is written is joined before the exit, so it is owned; one still blocked after the beat is
+  ended by the exit (2026-11-18: unjoined, a finished writer was a thread leak to ThreadSanitizer, whose exit report
+  held a lone daemon's end 26 s and made its exit code 66, `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`).
 - **Decided: only `FromEnv` is supervised; `Handoff` is not** (the plan's choice, recorded here as it asked). `Handoff`
   is an anchor in the daemon's own process: it may read the beat, but it cannot end a stuck daemon without ending
   itself, so nothing would end it, and its watchdog ends the process as a lone daemon's does. Supervision is a fact
@@ -22141,7 +22216,8 @@ Applied in the same change to:
   in id order, the order Linux's own ACLs keep and `libacl` expects. A value the volume keeps that no longer parses is
   `EIO` to a reader: the volume's fault, never the caller's. Every route but a guest kernel's refuses both names, as it
   refuses A-290's.
-- **Stored, not enforced.** Neither slates nor Shards' own server negotiates `FUSE_POSIX_ACL`, so the guest's kernel
+- **Stored, not enforced (superseded the same day by A-314, at Shards' coordinator's ask: enforced).** Neither slates
+  nor Shards' own server negotiates `FUSE_POSIX_ACL`, so the guest's kernel
   hands an ACL through and checks the mode bits it is shown (`fs/fuse/acl.c`: a server without the flag "could get
   and set POSIX ACLs without them being used for permission checking by the vfs"). The same guest therefore sees the
   same behaviour whichever server serves its share. Enforcement was weighed and not taken now: the flag makes the
@@ -22470,3 +22546,147 @@ Applied in the same change to:
   checked equal across a republish. A named holder that is a member but outside the object's current candidates is
   neither restored nor replaced (`fleet.heal.named_outside_candidates`; GAPS, open). The mirror's own healer stays open
   (GAPS, AC-8.15).
+
+### A-294 — Device nodes are kept as metadata, and each consumer's kernel is what keeps them from being opened (accepted 2026-11-18, Ada's option (c) for A-26's device decision; built 2026-11-17 for kiln goal g259)
+Applied in the same change to: A-26 (its device decision, resolved), A-268 (superseded), A-94 (`nodev` is the guard
+now), §4.5, §4.6 (with the NFSv4 attributes), §4.8, §4.15, §4.16 (status), GAPS, `docs/deploy.md`,
+`docs/wip/conformance.md` §3.4b and §6; `crates/vfs` (`Kind::BlockDevice` and `Kind::CharDevice`, `DeviceNumber`,
+`SpecialNode`, `Body::Device`, `Child::BlockDevice` and `Child::CharDevice`, `Volume::mknod_no`, `observe`,
+`device_in`; recovery image version 28 and delta version 11 (built as 26 and 9, landed after A-275 and A-270, so they
+take the next); the archive export; the deriver's ops document; the ext4
+image's build and merge, `ImageError::DeviceNumberUnencodable` replacing `NodeUnsupported`), `crates/archive` (manifest
+minor 4), `crates/merge` (`SpecialKind`'s device kinds), `crates/ipc` (`IpcNodeKind`'s device kinds),
+`crates/bridge-core` (`NodeAttr::device`, `Bridge::mknod` takes a `SpecialNode`, `access::needs_superuser`),
+`crates/bridge-fuse` (`rdev` in every attribute, `DT_BLK` and `DT_CHR`, MKNOD of a device, the mount's own
+`nosuid,nodev`), `crates/bridge-nfs` (MKNOD of a device, `rdev` in `fattr3`, `rawdev` over NFSv4), `crates/bridge-fskit`
+and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refused before a landing's first write), and
+`crates/server` (archive restoration, live shipping, the merge's origin capture, declared work, the image refusal).
+- **The decision.** A-26 authorized FIFO and socket names, kept device nodes refused and left keeping them to Ada; A-268
+  made the refusal `EPERM`. Three options were put to her: (a) keep refusing; (b) whiteouts alone (a character device
+  0/0); (c) every device node as metadata, guarded per consumer. On 2026-11-18 she chose (c): keep device nodes as
+  entries in volumes, images, archives, merges and bridges, with their kind and major and minor, and never let anything
+  open one as a real device; mounts are served `nodev`, guests are asked for `nodev`, and unpacking a container image or
+  a system archive that holds them works on every route.
+- **Why.** A refused device node breaks every unpacking that meets one: a root filesystem's `/dev/console` and
+  `/dev/null`, a system archive's device entries, overlayfs's whiteouts. The cascades were the bulk of every root
+  pjdfstest list: 1,798 of the Linux FUSE list's 1,800 entries, all 1,798 of the NFSv4, OCI and virtio-fs lists', and
+  1,788 of the macOS list's 1,905 cite A-26's device refusal.
+- **The rule.**
+  - A device node is an inode whose body is its number (§4.5): a major and a minor, each the 32 bits NFS carries, kept
+    as made. It has no content, so every regular-file operation refuses it (`SpecialFileOperation`). It links, renames,
+    unlinks, snapshots, clones, recovers, replicates by delta, archives (a file node with no extents, its mode's type
+    bits naming the kind, its number in the metadata), merges (kind and number in the canonical identity, so one path
+    made with two numbers by two works conflicts) and enters and leaves an ext4 image with its number. A number past
+    the image's 12-bit major and 20-bit minor is refused at the build, typed and named, never truncated.
+  - Who may make one is Linux's rule: a caller acting as root, except a whiteout, which any caller who may write the
+    directory makes (`vfs_mknod` in `fs/namei.c` skips `CAP_MKNOD` only for a whiteout; `nfsd_setuser` in
+    `fs/nfsd/auth.c` drops `CAP_MKNOD`, part of `CAP_NFSD_SET`, from every uid but root's). Over FUSE and virtio-fs the
+    kernel asks first; over NFS the server asks, after a taken name (`EEXIST`) and an unwritable directory (`EACCES`),
+    in A-268's order. The typed channel's declared work and the daemon's own restorations (an archive, an image merge)
+    make what they carry: metadata nothing opens.
+  - Nothing opens one as a device. Slates never does: the base plane lists a host's special files and serves none
+    (A-26), and a landing refuses a device node before its first write, since a grant authorizes content and making a
+    device node on the host needs a privilege slates never holds (R10). A consumer's kernel would, so each is guarded:
+    slates' own mounts are `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's options, which now state both
+    rather than rely on `fusermount3`'s default; the OCI binding), where the open is refused `EACCES` (`may_open_dev`);
+    an export's PersistentVolume is `nodev`, and in a pod, whose bind drops the flag (measured, A-94), the container
+    runtime's device cgroup refuses the open; a guest's mount of a share is the guest's, so slates asks for `nodev`
+    there (`docs/cli.md`'s guest mount line asks for `nosuid,nodev`), and a guest that declines opens only its own
+    devices, inside the VM.
+  - Each route reports the number in its own encoding: NFSv3's `rdev`, NFSv4's `rawdev`, and FUSE's `rdev` in the
+    Linux kernel's `new_encode_dev` form, where a number past it reads as 0, as Linux's NFS client reads one
+    (`xdr_decode_specdata3`). WinFsp and FSKit have no device kind and refuse the node unsupported, as a FIFO.
+- **What it does not change.** FIFO and socket names: every format and identity that holds one encodes it as before (the
+  merge's special-node encoding and the deriver's ops document add kinds 2 and 3, so no merge format version moved, and
+  the deriver's golden identity holds); the base plane's exclusion of a host's special files; A-268's order of checks;
+  the landing's refusal.
+- **Proven**, by `cargo test` of each crate: the volume (`crates/vfs/tests/special.rs`: every kind through links,
+  snapshots, clones, recovery, archives and derivation; images that smuggle content into a device or a device body
+  into a FIFO or file, refused; the Linux encoding's golden vectors; `edges.rs`'s content-operation matrix;
+  `image.rs`'s generated volumes and guest histories with device nodes, a guest's device node kept and an unencodable
+  number refused at the build); the merge (`crates/merge/tests/special.rs`: replay on owner and holder, a renumbered
+  node conflicting, golden vectors, every truncation refused, an origin's round trip, and the generated oracles over
+  device nodes); the server (the origin capture, the work log's round trip); the bridges (`crates/bridge-core`: root
+  alone, a whiteout for anyone, the number in every reply and listing; `crates/bridge-fuse`: `rdev` at its ABI offset
+  and MKNOD vectors of every kind; `crates/bridge-nfs`: made for root with `rdev`, `NFS3ERR_PERM` after `NFS3ERR_EXIST`
+  for uid 1000, a whiteout for uid 1000, NFSv4's `rawdev` read back); the landing oracle (refused before any write).
+  Through real kernels, on the lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened` (Linux
+  FUSE, an ordinary user: `/dev/null`'s number refused `EACCES` on the `nodev` mount) and
+  `a_device_node_is_made_with_its_number_and_never_opened` (Linux's NFSv4.1 and 4.2 clients, as root, `nodev`).
+- **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
+  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof (g260's; the guest mount
+  line asks for `nosuid,nodev` since 2026-11-17); a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
+  `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
+  each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
+  and a list edited without its run fails the record's doc-truth test.
+
+### A-314 — A guest route enforces its guest's POSIX ACLs: its kernel checks them, and the seam keeps the mode and the ACL in step and gives a directory's default ACL at every create (2026-11-18, built for goal g268, what Shards needs from slates)
+
+Applied in the same change to:
+- §4.5 "Extended attributes": the ACL bullet, now the rules. §4.6, the Shards form: the guest's attributes' bullet,
+  A-302's status (the codec's new path; "not enforced" is past) and the status of this date. A-302's entry, whose
+  "Stored, not enforced" paragraph is marked superseded. `docs/cli.md`: the guest routes' paragraph. GAPS: A-281's
+  entry and the owed list.
+- `crates/bridge-core`: `posix_acl.rs`, moved from `slates-bridge-fuse` so the seam can apply it, and grown by
+  `Acl::permission_bits` and `Acl::exceeds_a_mode` (`posix_acl_equiv_mode`), `Acl::showing`
+  (`__posix_acl_chmod_masq`) and `Acl::given` (`posix_acl_create_masq`), each with a unit test worked by hand from
+  Linux v7.2-rc4's `fs/posix_acl.c`. `OpContext::umask`, the caller's umask where the transport carries it unapplied.
+  `VolumeBridge`: `xattr_get` shows an access ACL's owner, mask and other entries from the mode (`access_acl_shown`);
+  `xattr_set` keeps the mode with an access ACL and an ACL that says no more than a mode as none (`set_acl`);
+  `create`, `mknod` and `mkdir` apply the creator's umask or the parent's default ACL (`creation`) and give the new
+  node its ACLs (`give_acls`), taking it back out if one is refused; `setattr`'s chmod and the ACL's share
+  `chmod_through_overlay`.
+- `crates/bridge-fuse`: `flags::POSIX_ACL`; `init::negotiate_offering` takes the transport's `AttributeNamespaces`
+  and asks a guest's kernel for `FUSE_POSIX_ACL` (`acl_wanted`); the dispatch hands the creating request's umask to
+  the seam (`creation_umask`) instead of applying it (`masked`, removed), and maps the codec's refusals to errnos
+  (`acl_refusal_errno`). The tests (`tests/shards_fs.rs`): `a_guests_kernel_is_asked_to_check_its_acls_and_a_hosts_is_not`,
+  `what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks` and
+  `a_directorys_default_acl_is_what_it_gives_what_is_made_in_it_through_every_route`, the last two judging each access
+  with Linux's `acl_permission_check` and `posix_acl_permission` over what GETATTR and GETXATTR answer.
+
+- **What was there.** A-302 kept a guest's ACLs as its data and enforced none, as Shards' own server enforces none.
+  Shards' coordinator answered (2026-11-18): enforcement, "A Linux bind mount enforces a guest's setfacl, and we accept
+  Docker's inputs, never its limits"; Shards queues `FUSE_POSIX_ACL` in its own server after its v0.8.0 tag, so both
+  servers enforce. Unenforced, a `setfacl -m u:4242:rw` on a 0600 file left the mode 0600, and Linux's
+  `acl_permission_check` never reads an ACL while the group bits are clear: 4242 was refused what the ACL granted.
+- **Who enforces.** The guest's own kernel: the route asks for `FUSE_POSIX_ACL`, which makes the kernel read a node's
+  access ACL with GETXATTR at a permission check and judge with it, with `default_permissions` on (`fs/fuse/inode.c`
+  `process_init_reply`, `fs/fuse/acl.c` `fuse_get_inode_acl`; a virtio-fs mount has `default_permissions` on already,
+  `fs/fuse/virtio_fs.c`). A host's mount is never asked: it reaches no ACL (A-302), so its kernel must not look for one.
+- **What the server keeps (Linux's `fs/posix_acl.c` rules, which `fs/fuse/acl.c` leaves to a FUSE server).** The mode is
+  the access ACL's owner, mask and other entries (the owning group's without a mask): a set changes those classes of
+  the mode and keeps the ACL only when it says more than a mode can, removing it otherwise (`posix_acl_update_mode`);
+  a reader is shown those entries from the mode as it reads, so a chmod through any route, which changes only the
+  mode, is the ACL's change too (`posix_acl_chmod`; the guest's kernel drops its cached ACLs after its own chmod
+  because the server "may have updated" them, `fs/fuse/dir.c`); a removal leaves the mode. A create in a directory with
+  a default ACL ignores the umask and keeps of the asked mode only what the default grants, the new node taking the
+  default's entries as its access ACL when they say more than its mode and a new directory the default too
+  (`posix_acl_create`); a symlink takes neither. This is the shared seam's, so a host's mount, NFS, WinFsp and the
+  typed channel keep it without knowing an ACL exists, as a host writing into a guest's directory on a Linux bind
+  mount does. For it the dispatch now hands the seam the umask the request carries (under `FUSE_DONT_MASK`, which
+  slates always asks for), where it used to apply it.
+- **What was weighed.** Judging in the server: rejected, since a FUSE request names its caller's uid and primary gid
+  and none of its other groups (`struct fuse_in_header`), so a named group's entry could not be judged; the guest's
+  kernel knows them. Rewriting the kept ACL at every chmod: rejected for showing it from the mode, since every route's
+  chmod would have to parse an attribute it cannot otherwise see, where showing costs one parse at a read. Inheriting
+  on a guest's creates alone: rejected, since a default ACL is the directory's, and Linux gives it whoever creates.
+- **Not kept.** Linux clears set-group-ID when a caller outside the file's group sets its ACL
+  (`posix_acl_update_mode`). The FUSE wire carries that judgement only as `FUSE_SETXATTR_ACL_KILL_SGID` under
+  `FUSE_SETXATTR_EXT`, which widens SETXATTR's request per connection; no request decoder here takes a negotiated
+  form yet, and a stream restored or resynced without INIT would have to carry it. So the bit stays, as on any FUSE
+  server without that flag (`fs/fuse/acl.c`: such servers "don't expect setgid bits to be stripped"). Owed in GAPS.
+- **Evidence.** Failing first: kiln run r783 (macOS arm64, runner f3f618f2, 2026-11-18) of the three tests on the
+  tree before the change: the INIT kept no `FUSE_POSIX_ACL`; the file made under the default ACL was 0644 (the umask
+  applied) where Linux makes 0660; the file `setfacl` granted was still 0600 where Linux makes 0660. The other six
+  tests of the file passed. After: r807 (`slates-bridge-core` and `slates-bridge-fuse`, every test) and r810 (the
+  seam's consumers: `slates-bridge-virtiofs`, `slates-bridge-nfs`, and `slates-server`'s `daemon`, `shards` and
+  `virtiofs` tests) pass. Each guard removed alone (r809): no `FUSE_POSIX_ACL` asked fails all three; an ACL set that
+  leaves the mode, an ACL read not shown from the mode, and a minimal ACL kept each fail the `setfacl` test; no default
+  ACL inherited, and the umask applied under one, each fail the default ACL's test; and the default's mask left uncut
+  at a create fails only the codec's unit test, since a reader is shown the mask from the mode's group class, so the
+  kept mask is never seen.
+- **Cost.** A guest's kernel now sends a GETXATTR of the access ACL when it judges a caller who is not a file's owner,
+  where the group bits are not all clear, once per attribute lifetime (a stream's attributes are revalidated at each
+  use, so at each such check); answered from the inode's attribute table. A create reads its parent's attribute table
+  once. Owed to the integrator: the round trips a guest's non-owner `stat`-and-open costs over a stream, before and
+  after.
