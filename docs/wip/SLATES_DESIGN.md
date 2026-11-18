@@ -419,7 +419,8 @@ inputs the daemon reads at boot or observes at runtime, never constants in the c
 > rate.** "1,000 clients under 1 ms" holds when every kind's p99 stays under 1 ms while one green takes 10³ or more
 > verdicts a second from 1,000 clients, the floor of the row "Increments per green volume per second" above, with no
 > oracle failure. Every kind is each request, attempt by attempt and end to end with its resends, and a whole edit and
-> merge with the client's own think pauses left out. The load test judges each level against it
+> merge with the client's own think pauses left out. A round to its accept, which holds as many edits and merges as
+> its conflicts make, is reported and not judged (A-416). The load test judges each level against it
 > (`crates/client/examples/load_bench.rs`, its `bound` row). A level with no think time is the rung's capacity in
 > verdicts a second and is never judged against the bound: its clients queue on the green's one serialized verdict,
 > so a request waits about the clients times the verdict's cost (Little's law), 21 ms at 1,000 clients on the owner's
@@ -29562,3 +29563,32 @@ Applied in the same change to:
   it) and writes into it, the daemon is killed by a fenced stop that publishes nothing, and a successor over the same
   segment reads the bytes back over NFS. Without the change the file comes back empty, as its create's publication left
   it. The vhost-user front end's run on Linux is main's (`run-requests.md`, 2026-11-18).
+
+### A-416 — The many-client bound judges every request and the cycle, and reports the round; the load test's hot set is a set (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-297's "The judgment")
+Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry),
+`crates/client/examples/load_bench.rs` (`Kind::judged`, `bound_row`, `hot_set`, `plan_round`, `level`'s `refused` row,
+the module's "The workload" and "The bound"), and the example's tests below.
+- **The round is reported, not judged.** A-297 judged "every kind", and the harness took that as every kind it timed,
+  the round among them. §1.4's status names the kinds as each request and a whole edit and merge, which the cycle is (a
+  round's first edit to its first verdict). A round is not one: it runs from its first edit to its accept, so it holds
+  as many edits and merges as its conflicts make, and its p99 grows with the conflict rate the hot set sets, not with
+  any request's time. On the Mac Studio at 1,000 clients and a think mean of 50 ms (1,102 verdicts a second, works on
+  their clients' shards, 2026-11-18) every request's p99 was 0.47 to 1.33 ms and the cycle's 104 ms (pauses left out),
+  while the round's was 191 ms. The bound now judges every request kind and the cycle; the round stays in the `latency`
+  row. This is g231's option (b), whose stated trigger, a measurement with the round alone over the bound, was met;
+  decided by the principle above, Ada's to veto.
+- **The hot set is a set.** The harness drew `--hot-files` indices with replacement, so a file drawn twice was twice as
+  hot as the rest of the set, and 800 draws over `kernel/`'s 700-odd eligible files made every file hot and some three
+  to five times hotter: 19 to 28 of 1,000 clients starved (ran out of resolutions) in every run, and the bound requires
+  none. The hot set is now `--hot-files` distinct files (a Fisher–Yates shuffle's first places, by the plan's own
+  draws), and at most half the files long enough to edit, so a pick from the whole tree misses it at least half the
+  time and the tree's picks stay mostly disjoint, as the workload states. A larger one is refused before the level
+  runs (`refused`, exit 1), never shrunk to fit; the 1,000-client rung's 800 hot files need a tree of 1,600 eligible
+  files or more (`fs/` of linux v7.4-rc1 holds 2,365 files). `--hot-files 0` is a level with no hot set; before, it
+  indexed an empty set.
+- **Tests** (`cargo test -p slates-client --example load_bench`): a round at 191 ms with every request and the cycle
+  under the bound meets it and names the cycle, and a cycle over it fails the level
+  (`a_round_is_reported_and_not_judged_and_a_cycle_is_judged`); a hot set names each file once and the same seed draws
+  it again (`a_hot_set_names_each_file_once`); a hot set past half the eligible files is refused and exactly half is
+  one (`a_hot_set_past_half_the_eligible_files_is_refused`); with no hot set every pick is from the whole tree and no
+  shared slot is written (`with_no_hot_set_every_pick_is_from_the_whole_tree`).
