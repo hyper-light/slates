@@ -1298,7 +1298,8 @@ fn a_read_map_of_a_directory_is_refused_typed() {
         refusal: VolumeRefusal::IsDirectory
       }
     ),
-    other => panic!("a typed refusal expected: {other:?}"),
+    Err(other) => panic!("a typed refusal expected: {other:?}"),
+    Ok(_) => panic!("a directory was mapped"),
   }
   assert_eq!(daemon.direct_map_copies().unwrap(), start, "no copy made");
   client.detach(writing).unwrap();
