@@ -1743,6 +1743,14 @@ async fn serve_peer_records(
           }
           PAIR_KEY_STREAM => state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
             .unwrap_or_default(),
+          LINEAGE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |member| member.host);
+            serve_lineage(s, peer_host, &request)
+          })
+          .unwrap_or_default(),
           DEATH_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -2204,6 +2212,9 @@ struct Head {
   shape: Placement,
   acked: Vec<HostId>,
   quorum: Quorum,
+  /// Whether its shard ships its volume live (`live_ship::ships`): then a held durable reply may hold the candidates to
+  /// an answer, and [`ship_head`] notes the ask on that shard before its round (A-301).
+  live: bool,
 }
 
 /// The volume heads this node owns that some candidate has **not yet acknowledged** (§4.8 "records are sent
@@ -2517,6 +2528,7 @@ fn owed_record(
     },
     acked,
     quorum: config.quorum,
+    live: crate::live_ship::ships(state, object),
   })
 }
 
@@ -5026,10 +5038,35 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   let adopted_head = live.as_ref().map(|fetched| fetched.head);
   let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
-  // holds the pair keys, and handed to the owner shard wrapped under this node's root.
-  let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
+  // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
+  // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
+  // reached it) is handed the key by a fellow candidate of the head, as a live log's successor is (A-295).
+  let own_lineage = head.sealing.as_ref().and_then(|sealing| {
     state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
   });
+  let envelope = live.is_none()
+    && archive
+      .as_ref()
+      .is_some_and(slates_cluster::envelope::is_envelope);
+  let successor_lineage = match (own_lineage, head.sealing.as_ref()) {
+    (Some(own), _) => Some(own),
+    (None, Some(sealing)) if envelope => {
+      let local = state::with_state(|s| s.fleet.configuration().owner);
+      let fellows: Vec<HostId> = placed
+        .placement
+        .candidates
+        .iter()
+        .copied()
+        .filter(|host| Some(*host) != local)
+        .collect();
+      let handed = ask_handed_lineage(object, sealing, &fellows).await;
+      if handed.is_some() {
+        count_refusal(ENVELOPE_KEY_HANDED);
+      }
+      handed
+    }
+    _ => None,
+  };
   let naming = head
     .sealing
     .as_ref()
@@ -5234,6 +5271,10 @@ const SEAL_ENVELOPE_REFUSED: &str = "fleet.seal.envelope_refused";
 /// not adopt, or a refused open; A-92 piece 3b): the volume is not materialized from it.
 /// Format: a counter name in the daemon's status report.
 const ENVELOPE_UNOPENED: &str = "fleet.seal.envelope_unopened";
+/// Counter: a taken-over volume whose envelope this successor had no entry of its own for, opened with the lineage key
+/// a fellow candidate handed it (A-295): once a key handed.
+/// Format: a counter name in the daemon's status report.
+const ENVELOPE_KEY_HANDED: &str = "fleet.seal.envelope_key_handed";
 /// Counter: a taken-over volume whose lineage key the successor could not record (A-92 piece 4c).
 /// Format: a counter name in the daemon's status report.
 const LINEAGE_UNADOPTED: &str = "fleet.seal.lineage_unadopted";
@@ -6589,6 +6630,15 @@ const RECIPIENT_STREAM: u64 = 18;
 const PAIR_KEY_STREAM: u64 = 19;
 /// Format: the reply byte of an accepted pair key.
 const PAIR_ACCEPTED: u8 = 1;
+/// The stream a volume's successor asks a fellow candidate for the volume's lineage key on (A-295): the object, the key's
+/// id and the asker's recipient public key ([`lineage_request`]), answered with the key wrapped to that recipient, or
+/// empty when refused (counted where it was refused).
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable. After the work routes' (25,
+/// `work_route::STREAM`) and the live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as
+/// that stream, so its request reaches no lineage handler at all (the first run of the window test, every ask
+/// unanswered while the work-route arm took kind 25). Held distinct by `every_request_kind_the_record_session_
+/// dispatches_is_its_own`.
+const LINEAGE_STREAM: u64 = 27;
 
 /// Format: the refusal name counting council requests left unanswered because their sender is held dead
 /// ([`serve_council`]).
@@ -8604,10 +8654,14 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
   // node back at its anchor with fresh RAM holds none of the keys it was delivered, and one marked delivered by anchor
   // alone was never delivered again, so the replacement could not open this node's heads as their successor (the same
   // key again is accepted by a node that kept it, so a redelivery to a warm restart changes nothing).
+  // Test support: the deliveries to one anchor made to fail (`Daemon::inject_pair_withhold_to`), as a delivery whose
+  // recipient answer never comes back fails each period, while the others go on and nothing delivered is forgotten.
+  let withheld_to = state::with_state(|s| s.injected_pair_withhold_to).flatten();
   let owed: Vec<(HostId, u64)> = anchors
     .iter()
     .copied()
     .filter(|(member, anchor)| delivered.get(anchor) != Some(member))
+    .filter(|(_, anchor)| Some(*anchor) != withheld_to)
     .collect();
   // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
   let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
@@ -8700,6 +8754,163 @@ async fn send_pair(member: HostId, request: &[u8], budget: CommitBudget) -> Opti
     return None;
   }
   Some(reply.bytes)
+}
+
+/// Counter: a volume's lineage key handed to the volume's successor (A-295), on the candidate that handed it.
+const LINEAGE_HANDED: &str = "fleet.seal.lineage_handed";
+/// Counter: a request for a volume's key whose bytes are not an object, a key id and a recipient key
+/// ([`lineage_request`]).
+const LINEAGE_MALFORMED: &str = "fleet.seal.lineage_refused.malformed";
+/// Counter: a request for a volume's key from a node that does not act for the volume here ([`acts_for`]).
+const LINEAGE_NOT_ACTING: &str = "fleet.seal.lineage_refused.not_acting";
+/// Counter: a request for a volume's key this node cannot open from its own copies: it holds no sealing of that key (no
+/// live log, no head naming it), or no entry or pair of its own for one.
+const LINEAGE_NOT_HELD: &str = "fleet.seal.lineage_refused.not_held";
+/// Counter: on a successor, a host asked for the volume's key that handed none (it refused, or did not answer).
+const LINEAGE_UNHANDED: &str = "fleet.seal.lineage_unhanded";
+/// Counter: on a successor, a key handed over that did not open the volume's naming record: refused, never kept.
+const LINEAGE_UNCHECKED: &str = "fleet.seal.lineage_unchecked";
+/// Counter: on a successor with no recipient key of its own (sealing unavailable here), no fellow candidate was asked.
+const LINEAGE_UNASKED: &str = "fleet.seal.lineage_unasked";
+/// Format: a lineage key's id (hyper-seal's `KeyId`), as a head's sealing names it.
+const LINEAGE_ID_BYTES: usize = 16;
+
+/// A request on [`LINEAGE_STREAM`]: `object`, the id of the lineage key asked for, and the asker's recipient public key
+/// as the recipient stream answers it (`seal_keys::node_recipient_public`), the key the answer is wrapped to.
+fn lineage_request_bytes(object: ObjectId, lineage: [u8; 16], public: &[u8]) -> Vec<u8> {
+  let mut request = Vec::with_capacity(
+    slates_db::register::OBJECT_BYTES
+      .saturating_add(LINEAGE_ID_BYTES)
+      .saturating_add(public.len()),
+  );
+  request.extend_from_slice(&object.0);
+  request.extend_from_slice(&lineage);
+  request.extend_from_slice(public);
+  request
+}
+
+/// A request on [`LINEAGE_STREAM`] read back: the object, the lineage key's id and the asker's recipient key, or `None`
+/// when the bytes are not those three (a recipient key that does not decode among them).
+fn lineage_request(
+  request: &[u8],
+) -> Option<(ObjectId, [u8; 16], hyper_seal::recipient::RecipientPublic)> {
+  let (object, rest) = request.split_at_checked(slates_db::register::OBJECT_BYTES)?;
+  let (lineage, public) = rest.split_at_checked(LINEAGE_ID_BYTES)?;
+  Some((
+    ObjectId(object.try_into().ok()?),
+    lineage.try_into().ok()?,
+    crate::seal_keys::decode_public(public)?,
+  ))
+}
+
+/// Whether `asker` acts for `object` in this node's view (A-295), `owner` being the owner this node's held record names
+/// (the object's creator while it holds none): `asker` is that owner and a member (a successor whose adoption has
+/// reached this holder), or the owner is retired and the configuration's line of retired owners takes the object to
+/// `asker` (`RegionalConfiguration::lineage`). Only such a node is handed the volume's key; as the owner's successor it is
+/// a candidate the owner would have delivered a pair to, so no node outside the volume's candidates learns the key.
+fn acts_for(
+  regional: &slates_db::register::RegionalConfiguration,
+  owner: HostId,
+  asker: HostId,
+  object: ObjectId,
+) -> bool {
+  if owner == asker {
+    return regional.members.contains(&asker);
+  }
+  !regional.members.contains(&owner)
+    && matches!(
+      regional.lineage(owner, object),
+      slates_db::register::Lineage::Successor { successor, .. } if successor == asker
+    )
+}
+
+/// This node's own copies of the sealing of `object` that wrap the lineage key `lineage`: its held live log's whole entry
+/// first, then each head it holds naming that key, newest first.
+fn held_sealings_of(
+  s: &ShardState,
+  object: ObjectId,
+  lineage: [u8; 16],
+) -> Vec<crate::head::HeadSealing> {
+  let mut sealings: Vec<crate::head::HeadSealing> = crate::live_ship::held_sealing(s, object)
+    .into_iter()
+    .collect();
+  if let Some(acceptor) = s.holder_records.get(&object) {
+    let mut heads: Vec<crate::head::HeadSealing> = acceptor
+      .values(object)
+      .filter_map(crate::head::HeadValue::from_record_bytes)
+      .filter_map(|head| head.sealing)
+      .collect();
+    heads.reverse();
+    sealings.extend(heads);
+  }
+  sealings.retain(|sealing| sealing.lineage == lineage);
+  sealings
+}
+
+/// A successor's request for a volume's lineage key (A-295), on this node's control shard, from the member `peer_host`
+/// the session's authenticated certificate resolves to: it must act for the volume here ([`acts_for`]); the key comes
+/// from this node's own copies of the volume's sealing ([`held_sealings_of`]), never from the request, opened under the
+/// pair the owner delivered to this node and wrapped to the recipient key the request carries. That key needs no other
+/// check: only the authenticated asker sent it, and a key it does not hold the other half of opens nothing for it.
+/// Carried rather than kept from a pair delivery, since this node delivers pairs only to its own neighbourhood, which
+/// in a fleet wider than one need not hold the asker. Empty when refused, counted by why.
+fn serve_lineage(s: &mut ShardState, peer_host: HostId, request: &[u8]) -> Vec<u8> {
+  let Some((object, lineage, public)) = lineage_request(request) else {
+    count_refusal_in(s, LINEAGE_MALFORMED);
+    return Vec::new();
+  };
+  let owner = s
+    .holder_records
+    .get(&object)
+    .map_or_else(|| object.creator(), slates_db::register::Acceptor::owner);
+  if !acts_for(s.council.configuration(), owner, peer_host, object) {
+    count_refusal_in(s, LINEAGE_NOT_ACTING);
+    return Vec::new();
+  }
+  let handed = held_sealings_of(s, object, lineage)
+    .iter()
+    .find_map(|sealing| crate::seal_keys::hand_lineage(s, sealing, &public));
+  match handed {
+    Some(delivery) => {
+      count_refusal_in(s, LINEAGE_HANDED);
+      delivery
+    }
+    None => {
+      count_refusal_in(s, LINEAGE_NOT_HELD);
+      Vec::new()
+    }
+  }
+}
+
+/// Asks `hosts` in turn for `object`'s lineage key as its successor (A-295), when this node cannot open its own entry in
+/// the volume's `sealing`: the first key handed that checks against the sealing (`seal_keys::accept_handed_lineage`) is
+/// returned, wrapped under this node's root. `None` when none handed one this attempt; a refusal is counted where it was
+/// made, and here a host that handed none or a key that did not check.
+pub(crate) async fn ask_handed_lineage(
+  object: ObjectId,
+  sealing: &crate::head::HeadSealing,
+  hosts: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let public =
+    state::with_state(|s| crate::seal_keys::node_recipient_public(s)).unwrap_or_default();
+  if public.is_empty() {
+    count_refusal(LINEAGE_UNASKED);
+    return None;
+  }
+  let request = lineage_request_bytes(object, sealing.lineage, &public);
+  for host in hosts.iter().copied() {
+    let Some(delivery) = request_peer(host, LINEAGE_STREAM, &request, live_budget()).await else {
+      count_refusal(LINEAGE_UNHANDED);
+      continue;
+    };
+    match state::with_state(|s| crate::seal_keys::accept_handed_lineage(s, sealing, &delivery)) {
+      Some(Ok(key)) => return Some(key),
+      _ => {
+        count_refusal(LINEAGE_UNCHECKED);
+      }
+    }
+  }
+  None
 }
 
 /// Counter: the owner shard did not answer this period's neighbour anchors (A-92 piece 4c); sent again next period,
@@ -8929,6 +9140,15 @@ async fn ship_head(
       SHIP_HEAD_NO_SESSION
     });
     return None; // No live session to a candidate that still needs the head; retry next period.
+  }
+  if head.live {
+    // The candidates are asked now, so a held durable reply on the live volume may hold them to an answer a window
+    // hence (A-301). Noted on the volume's shard before the round is sent: that shard runs what this one sends it in
+    // order, so the note is there before the round's own acknowledgements ([`record_acks_in`], sent after the round).
+    let object = head.object;
+    crate::xshard::run_on_counted(origin, head.shard, move |s| {
+      crate::live_ship::asked(s, object);
+    });
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(
@@ -9225,6 +9445,88 @@ pub(crate) async fn forward_batch_over_leader_session(
 }
 
 #[cfg(test)]
+mod lineage_tests {
+  use super::{HostId, ObjectId, acts_for, lineage_request, lineage_request_bytes};
+  use slates_db::register::{Quorum, RegionalConfiguration};
+
+  /// A-295, the successor's request for a volume's key read back. Do read a request made for an object, a key id and a
+  /// fresh recipient's public key, and requests of every other shape: none, one byte short, one byte long, a lone object
+  /// id, an object and key id with no recipient key, and the recipient key's mode byte changed. Expect the object, key
+  /// id and recipient key back from the first and nothing from the rest.
+  #[test]
+  fn a_lineage_request_of_any_other_shape_is_refused() {
+    let object = ObjectId::new(HostId(9), 3);
+    let public = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let encoded = crate::seal_keys::encode_public(&public);
+    let request = lineage_request_bytes(object, [7; 16], &encoded);
+    assert_eq!(
+      lineage_request(&request),
+      Some((object, [7; 16], public.clone()))
+    );
+    let short = request
+      .get(..request.len().saturating_sub(1))
+      .unwrap_or_default();
+    let mut long = request.clone();
+    long.push(0);
+    let unkeyed = lineage_request_bytes(object, [7; 16], &[]);
+    let mut remoded = request.clone();
+    let mode = request
+      .len()
+      .checked_sub(hyper_seal::recipient::ECDH_PUBLIC + 1)
+      .unwrap();
+    remoded[mode] ^= 0xff;
+    for refused in [
+      &[][..],
+      short,
+      &long[..],
+      &object.0[..],
+      &unkeyed[..],
+      &remoded[..],
+    ] {
+      assert_eq!(lineage_request(refused), None, "{} bytes", refused.len());
+    }
+  }
+
+  /// A-295, who is handed a volume's key. Do form three members, ask for the owner, the two others and an outsider
+  /// whether each acts for the owner's object (no held record), then retire the owner and ask again. Expect, while the
+  /// owner lives, only the owner; once it is retired, only the member the configuration makes its successor: never the
+  /// other survivor, an outsider or the retired owner.
+  #[test]
+  fn only_the_volumes_acting_owner_is_handed_its_key() {
+    let (owner, b, c, outsider) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let object = ObjectId::new(owner, 7);
+    let mut regional = RegionalConfiguration::formed(
+      vec![owner, b, c],
+      Quorum { f: 1 },
+      Default::default(),
+      3,
+      true,
+    );
+    let acting = |regional: &RegionalConfiguration| {
+      [owner, b, c, outsider]
+        .into_iter()
+        .filter(|asker| acts_for(regional, owner, *asker, object))
+        .collect::<Vec<HostId>>()
+    };
+    assert_eq!(
+      acting(&regional),
+      vec![owner],
+      "the owner lives: only the owner"
+    );
+    assert!(regional.retire(owner, 3), "the owner retired");
+    let successor = regional.successor(owner, object);
+    assert!(successor.is_some_and(|successor| successor == b || successor == c));
+    assert_eq!(
+      acting(&regional),
+      successor.into_iter().collect::<Vec<HostId>>(),
+      "once the owner is retired, only its successor"
+    );
+  }
+}
+
+#[cfg(test)]
 mod dial_tests {
   use super::{ESTABLISH_BUDGETS_BEFORE_REDIAL, HandshakeStall, keeps_its_socket};
 
@@ -9302,7 +9604,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 25] = [
+    let kinds: [(&str, u64); 26] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -9336,6 +9638,7 @@ mod request_kind_tests {
       ("death", super::DEATH_STREAM),
       ("work route", crate::work_route::STREAM),
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
+      ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
     ];
     let mut shared = Vec::new();
