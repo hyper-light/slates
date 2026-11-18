@@ -50,6 +50,11 @@ pub struct ClientSlot {
   /// revocation is fanned to every shard's slots when it commits — so the per-verb gate is one read,
   /// never a cross-shard call on a write path (banned item 10).
   pub revoked: bool,
+  /// The write policy of the consumer this channel attested as (A-285): read with the consumer's record at the
+  /// attestation, and replaced on every shard's bound slots when its launcher sets it, as a revocation is marked. The
+  /// channel's merges and landings are held to it before they are routed (`verbs::consumer_gate`). `None` for an
+  /// account's channel, and for a consumer with no policy set.
+  pub consumer_policy: Option<slates_db::catalog::WritePolicy>,
   /// The last successful remote route, released with this client. One slot, no global catalog.
   pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
   /// The read-ahead window of this client's latest forwarded read (`crate::verbs::ReadAhead`): the pages after the
@@ -272,8 +277,9 @@ pub struct ShardState {
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
-  /// The held replicas' image the committed journal holds, so a delta carries it only when it changed (A-68).
-  pub published_held: Vec<u8>,
+  /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
+  /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
+  pub(crate) published_held: crate::content_holder::PublishedHeld,
   /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
   /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
   /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost
@@ -532,6 +538,10 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The launcher secret its starter handed the anchor (A-285): a launcher-class proof verifies under it as under the
+  /// issuer secret, so a launcher keeps its authority across its own restarts and the daemon's. `None` while the anchor
+  /// publishes none.
+  pub launcher_secret: Option<[u8; slates_anchor::layout::LAUNCHER_SECRET_BYTES]>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
@@ -753,8 +763,9 @@ pub struct ShardState {
   /// to serve several owners at once is the owed refinement noted on [`slates_db::register::Authority`]),
   /// and lets a promotion for an object route to its hold by object id regardless of which peer socket
   /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
-  /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
-  pub holder_records: BTreeMap<ObjectId, Acceptor>,
+  /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs). Tracked
+  /// (`crate::tracked`), so a publication carries only the registers reached since the last (A-270).
+  pub(crate) holder_records: crate::tracked::Tracked<ObjectId, Acceptor>,
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
@@ -850,6 +861,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
+  /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
+  /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.
+  /// `None` in production (`Daemon::inject_content_ack_delay`).
+  pub injected_content_ack_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.

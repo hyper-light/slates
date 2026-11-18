@@ -4008,18 +4008,20 @@ impl Client {
     }
   }
 
-  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by `proof`, the keyed hash under the
-  /// instance's issuer secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound
+  /// Sets a write policy (A-285) from the `version` the setter read: the launcher's or the harness's act, proven by
+  /// `proof`, the keyed hash under the launcher's secret (`slates_server::landing::policy_proof`); refused
+  /// `PolicyChanged` once the policy has moved past `version`. Refused `Forbidden` on a consumer-bound
   /// channel (an agent never sets its own policy) and `GrantIssuerUnverified` without the proof.
   pub fn set_policy(
     &mut self,
     subject: PolicySubject,
-    policy: WritePolicy,
+    (policy, version): (WritePolicy, u64),
     proof: [u8; 32],
   ) -> Result<(), ClientError> {
     match self.call(&RequestBody::SetPolicy {
       subject,
       policy,
+      version,
       proof,
     })? {
       ReplyBody::PolicySet => Ok(()),
@@ -4027,10 +4029,14 @@ impl Client {
     }
   }
 
-  /// A write policy (A-285): `None` while none is set, which is ask.
-  pub fn policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, ClientError> {
+  /// A write policy (A-285) and its version, the one a [`Client::set_policy`] names: `None` while none is set, which
+  /// merges at once and lands under approval.
+  pub fn policy(
+    &mut self,
+    subject: PolicySubject,
+  ) -> Result<(Option<WritePolicy>, u64), ClientError> {
     match self.call(&RequestBody::Policy { subject })? {
-      ReplyBody::Policy { policy } => Ok(policy),
+      ReplyBody::Policy { policy, version } => Ok((policy, version)),
       _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
     }
   }

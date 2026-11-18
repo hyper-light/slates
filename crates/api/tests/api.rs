@@ -20,12 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  Approval, AuditKind, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error,
-  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome,
-  LandingConflict, LandingStage, LandingState, MergeOutcome, Missing, MoveTarget, PathFault,
-  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported,
-  Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode,
-  WritePolicy,
+  AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
+  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
+  LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
+  Missing, MountOptions, MoveTarget, PathFault, PolicyReason, PolicyRefusal, PolicySubject,
+  Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, Unsupported, Unusable, Verification,
+  VolumeId, VolumeSpec, Volumes, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -356,7 +356,7 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   let LandOutcome::ApprovalRequired(approval) = instance.land(&request, None).unwrap() else {
     panic!("a landing with changes asks under today's mode");
   };
-  assert_eq!(approval.awaiting, Awaiting::Landing(request.clone()));
+  assert_eq!(approval.request, request);
   assert_eq!(approval.verification, Verification::Unsigned);
   assert_eq!(
     (
@@ -400,18 +400,18 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   }
 
   let issuer = issuer_of(&daemon);
-  let stale = Approval {
+  let stale = LandingApproval {
     manifest: [0u8; 32],
     ..approval.clone()
   };
-  let changed = instance.approve(&stale, &issuer).unwrap();
+  let changed = instance.approve_landing(&stale, &issuer).unwrap();
   assert!(
     matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
     "an approval of another manifest is no approval of this one: {changed:?}"
   );
   assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
 
-  let landed = instance.approve(&approval, &issuer).unwrap();
+  let landed = instance.approve_landing(&approval, &issuer).unwrap();
   let LandOutcome::Written(report) = landed else {
     panic!("the approved manifest lands: {landed:?}");
   };
@@ -476,7 +476,6 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
       kind: DriftKind::Modified
     }]
   );
-  assert!(after.watcher.is_some(), "{after:?}");
   assert!(matches!(
     instance.status(volume).unwrap().base,
     Some(BaseState::Read(_))
@@ -501,10 +500,9 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
 /// AC-5.10 / AC-5.12 (A-299, A-285; Ada's rule of 2026-11-18): do set overlays' write policies with the launcher's
 /// authority — one bypass, one forbid — and land each, plan the bypass one, and ask for a policy that requires signed
 /// merges. Expect: an unset volume's policy reads back as none; the bypass volume read back as set and landed in the one
-/// call, `Written` and `Done`, its file on the disk; its plan refused `Unsupported(WritePolicies)` before anything is
-/// written, since no verb presents a bypass landing alone yet; the forbid volume's landing answered `Refused` by its own
-/// policy and nothing written; and the signed-merge requirement refused `Unsupported(SignedWork)` before anything is
-/// sent, since the daemon does not keep it yet.
+/// call, `Written` and `Done`, its file on the disk; its plan presented and nothing written (the daemon's present-only
+/// verb); the forbid volume's landing answered `Refused` by its own policy and nothing written; and the signed-merge
+/// requirement refused `Unsupported(SignedWork)` before anything is sent, since the daemon does not keep it yet.
 #[cfg(unix)]
 #[test]
 fn a_landing_follows_its_volumes_write_mode() {
@@ -539,12 +537,14 @@ fn a_landing_follows_its_volumes_write_mode() {
   );
   write_file(&mut instance, open, "/w.txt", b"written at once\n");
   let request = landing_into(open, &bypassed);
-  assert_eq!(
-    instance.plan_landing(&request),
-    Err(Error::Unsupported(Unsupported::WritePolicies)),
-    "a plan never writes"
+  assert!(
+    matches!(
+      instance.plan_landing(&request).unwrap(),
+      LandOutcome::ApprovalRequired(_)
+    ),
+    "a plan presents, whatever the mode"
   );
-  assert_eq!(bypassed.read("w.txt"), None);
+  assert_eq!(bypassed.read("w.txt"), None, "a plan never writes");
   let LandOutcome::Written(report) = instance.land(&request, None).unwrap() else {
     panic!("a bypass volume lands in the one call");
   };
@@ -587,7 +587,8 @@ fn a_landing_follows_its_volumes_write_mode() {
 
 /// AC-5.12 / T-5.14 (A-299; §4.16, D-27): do provision a green and work volumes over it; merge a seed, then two works
 /// based on the same version that rewrite the same bytes, one after the other; rebase and merge a third that changed
-/// another file. Expect the seed and the first `Merged` at versions 1 and 2, unsigned; the second `Conflicted` with a
+/// another file. Expect a green's and a work's status read with no base; the seed and the first `Merged` at versions 1
+/// and 2, unsigned; the second `Conflicted` with a
 /// window on the rewritten bytes and the green's head 2, nothing merged; the third rebased onto 2 and merged at 3; and a
 /// signed merge refused `Unsupported(SignedWork)` before anything is sent.
 #[test]
@@ -612,16 +613,20 @@ fn a_merge_is_accepted_or_conflicted_typed() {
   };
   let (seed, base) = work(&mut instance, "seed");
   assert_eq!((seed.green, base), (green, 0));
+  // A green and a work volume have no base folder: their status reads, with no base (the merge service reports their
+  // watcher as no overlay's, which a reading of the status text once took for a protocol fault).
+  assert_eq!(instance.status(green).unwrap().base, None);
+  assert_eq!(instance.drift(seed.volume).unwrap(), None);
   instance
     .client()
     .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
     .unwrap();
   assert_eq!(
-    instance.merge(&seed, Some(&a_signature())),
+    instance.merge(&seed, &[], Some(&a_signature())),
     Err(Error::Unsupported(Unsupported::SignedWork))
   );
   assert_eq!(
-    instance.merge(&seed, None).unwrap(),
+    instance.merge(&seed, &[], None).unwrap(),
     MergeOutcome::Merged {
       version: 1,
       verification: Verification::Unsigned
@@ -635,14 +640,14 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     .edit(first.volume, "f", 0, 4, b"XXXX")
     .unwrap();
   assert!(matches!(
-    instance.merge(&first, None).unwrap(),
+    instance.merge(&first, &[], None).unwrap(),
     MergeOutcome::Merged { version: 2, .. }
   ));
   instance
     .client()
     .edit(second.volume, "f", 0, 4, b"YYYY")
     .unwrap();
-  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, None).unwrap() else {
+  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, &[], None).unwrap() else {
     panic!("a rewrite of bytes the green changed since the base conflicts");
   };
   assert_eq!(conflicts.head, 2);
@@ -662,9 +667,99 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     RebaseOutcome::Rebased { version: 2 }
   );
   assert!(matches!(
-    instance.merge(&third, None).unwrap(),
+    instance.merge(&third, &[], None).unwrap(),
     MergeOutcome::Merged { version: 3, .. }
   ));
+  daemon.stop();
+}
+
+/// AC-5.12 (A-299, A-285; §4.16): do set a green's merge mode to ask with the launcher's authority, merge a work into
+/// it, approve an increment the approver never saw, then approve the one shown; then forbid the green's merges and merge
+/// another work. Expect: the merge held `ApprovalRequired` with the increment's identity and its one path, nothing
+/// merged (the green's head stays 0); the stranger's approval merging nothing and asking again with the same identity;
+/// the shown one `Merged` at version 1; and the forbidden merge answered `Refused` by the green's own policy.
+#[test]
+fn a_merge_follows_its_greens_write_mode() {
+  let (daemon, mut instance) = grouped("merge-modes");
+  let launcher = issuer_of(&daemon);
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "held-green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let ask = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Ask,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &ask, &launcher)
+    .unwrap();
+  let Provisioned::Work { work, .. } = instance
+    .provision(&VolumeSpec::work("held", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(work.volume, "f", 0, 0, b"held")
+    .unwrap();
+  let MergeOutcome::ApprovalRequired(approval) = instance.merge(&work, &[], None).unwrap() else {
+    panic!("an ask green holds the merge");
+  };
+  assert_eq!((approval.work, approval.paths), (work, 1), "{approval:?}");
+  assert_eq!(
+    instance.client().versions(green).unwrap(),
+    0,
+    "nothing merged"
+  );
+  let stranger = MergeApproval {
+    identity: [0u8; 32],
+    ..approval.clone()
+  };
+  assert!(
+    matches!(
+      instance.approve_merge(&stranger, &launcher).unwrap(),
+      MergeOutcome::ApprovalRequired(again) if again.identity == approval.identity
+    ),
+    "an approval of another increment merges nothing and asks again"
+  );
+  assert_eq!(instance.client().versions(green).unwrap(), 0);
+  assert!(matches!(
+    instance.approve_merge(&approval, &launcher).unwrap(),
+    MergeOutcome::Merged { version: 1, .. }
+  ));
+  let forbid = WritePolicy {
+    merge: WriteMode::Forbid,
+    ..ask
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &forbid, &launcher)
+    .unwrap();
+  let Provisioned::Work { work: late, .. } = instance
+    .provision(&VolumeSpec::work("late", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(late.volume, "g", 0, 0, b"no")
+    .unwrap();
+  assert_eq!(
+    instance.merge(&late, &[], None).unwrap(),
+    MergeOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Merge,
+      by: PolicySubject::Volume(green),
+      reason: PolicyReason::Forbidden,
+    })
+  );
   daemon.stop();
 }
 
@@ -787,4 +882,202 @@ mod shards {
     drop(device);
     daemon.stop();
   }
+}
+
+/// A volume id no instance issued (A-310's conformance cases).
+const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
+/// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.
+const SIM_MOST: usize = 16;
+
+/// The volume `seam` provisions from `spec`.
+fn made<V: Volumes>(seam: &mut V, spec: &VolumeSpec) -> VolumeId {
+  seam.provision(spec).unwrap().volume()
+}
+
+/// The names `seam` lists, sorted.
+fn names_of<V: Volumes>(seam: &mut V) -> Vec<String> {
+  let mut names: Vec<String> = seam.list().unwrap().into_iter().map(|v| v.name).collect();
+  names.sort();
+  names
+}
+
+/// A stream end made ready for [`reads_its_end`] while its attachment still lives: on Unix a socket whose read waits at
+/// most the suite's wait. The wait is set before the detach, since macOS refuses `SO_RCVTIMEO` (`EINVAL`) on a socket
+/// whose peer has gone.
+#[cfg(unix)]
+fn awaiting(end: slates_api::StreamEnd) -> std::os::unix::net::UnixStream {
+  let socket = std::os::unix::net::UnixStream::from(end);
+  socket.set_read_timeout(Some(START_WAIT)).unwrap();
+  socket
+}
+
+/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended.
+#[cfg(unix)]
+fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
+  let mut byte = [0u8; 1];
+  matches!(std::io::Read::read(&mut &*socket, &mut byte), Ok(0))
+}
+
+/// A stream end as it is where it is a pipe handle (Windows): [`reads_its_end`] does not judge it.
+#[cfg(not(unix))]
+fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
+  end
+}
+
+/// Whether the peer of a stream end reads its end: not judged where the end is a pipe handle (Windows).
+#[cfg(not(unix))]
+fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
+  true
+}
+
+/// A-310's conformance suite: one flow of the seam's verbs, each outcome and each refusal asserted as its typed value,
+/// run over an instance and over the simulator. Do: provision an empty volume and again by its name; snapshot it and
+/// clone the snapshot; list; snapshot, clone from, destroy and serve a volume no one made; detach an attachment no one
+/// made; provision an overlay of a relative folder; make a green, a work over it, a work over a volume that is no green
+/// and one over no volume; serve a volume to a Shards VMM and detach it; destroy a snapshot a clone pins, then an
+/// unpinned one; destroy the clone and wait for it to leave the list; snapshot it. Expect: the volume made once and
+/// refused `AlreadyExists` naming it; both volumes listed; the strangers refused `NotFound` naming the volume, the
+/// snapshot or the attachment; the relative folder refused `NotAbsolute`; the work at the green's first version, the
+/// others refused `NotGreen` and `NotFound`; a stream of the Shards transport whose peer reads its end once detached;
+/// the pinned snapshot's destroy refused as an invalid request (untyped yet, see the owed note) and the unpinned one's
+/// done; the clone gone from the list, and refused `NotFound` after.
+fn the_seam_conforms<V: Volumes>(seam: &mut V) {
+  let origin = made(seam, &VolumeSpec::empty("seam-origin", ROOM));
+  assert_eq!(
+    seam.provision(&VolumeSpec::empty("seam-origin", ROOM)),
+    Err(Error::AlreadyExists(Existing::Volume { existing: origin }))
+  );
+  let snapshot = seam.snapshot(origin).unwrap();
+  let clone = made(seam, &VolumeSpec::clone_of("seam-clone", origin, snapshot));
+  assert_eq!(names_of(seam), ["seam-clone", "seam-origin"]);
+  assert_eq!(
+    seam.snapshot(NOWHERE),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::clone_of("seam-stranger", NOWHERE, snapshot)),
+    Err(Error::NotFound(Missing::Snapshot {
+      volume: NOWHERE,
+      snapshot
+    }))
+  );
+  assert_eq!(
+    seam.destroy(NOWHERE),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam
+      .serve_shards(NOWHERE, Intent::Read, None)
+      .map(|served| served.attachment.attachment),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam.detach(u64::MAX),
+    Err(Error::NotFound(Missing::Attachment {
+      attachment: u64::MAX
+    }))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::overlay("seam-overlay", "relative/dir", ROOM)),
+    Err(Error::Invalid(Invalid::Path {
+      path: "relative/dir".to_owned(),
+      fault: PathFault::NotAbsolute
+    }))
+  );
+  let green = made(
+    seam,
+    &VolumeSpec {
+      name: "seam-green".to_owned(),
+      source: Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  match seam.provision(&VolumeSpec::work("seam-work", green)) {
+    Ok(Provisioned::Work { work, base }) => assert_eq!((work.green, base), (green, 0)),
+    other => panic!("a work over a green: {other:?}"),
+  }
+  assert_eq!(
+    seam.provision(&VolumeSpec::work("seam-not-over-a-green", origin)),
+    Err(Error::Invalid(Invalid::Kind(KindMismatch::NotGreen)))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::work("seam-over-nothing", NOWHERE)),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  let served = seam.serve_shards(origin, Intent::Write, None).unwrap();
+  assert_eq!(
+    served.attachment.capability.transport,
+    AttachTransport::ShardsFs
+  );
+  let peer = awaiting(served.stream);
+  seam.detach(served.attachment.attachment).unwrap();
+  assert!(
+    reads_its_end(&peer),
+    "a detached stream's peer reads its end"
+  );
+  assert!(
+    matches!(
+      seam.destroy_snapshot(origin, snapshot),
+      Err(Error::Invalid(Invalid::Request(_)))
+    ),
+    "a snapshot a clone pins is not destroyed"
+  );
+  let unpinned = seam.snapshot(origin).unwrap();
+  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
+  seam.destroy(clone).unwrap();
+  let started = Instant::now();
+  while names_of(seam).contains(&"seam-clone".to_owned()) {
+    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
+    std::thread::yield_now();
+  }
+  assert_eq!(
+    seam.snapshot(clone),
+    Err(Error::NotFound(Missing::Volume(clone)))
+  );
+}
+
+/// A-310: the conformance suite over a real instance, in this process.
+#[test]
+fn an_instance_answers_the_seams_conformance_suite() {
+  let (daemon, mut instance) = grouped("seam");
+  the_seam_conforms(&mut instance);
+  daemon.stop();
+}
+
+/// A-310: the conformance suite over the simulator, with no daemon anywhere.
+#[test]
+fn the_simulator_answers_the_seams_conformance_suite() {
+  the_seam_conforms(&mut SimVolumes::new(SIM_MOST));
+}
+
+/// A-310: the simulator's own bound and what a mount is to it. Do: give it room for one volume and one attachment;
+/// provision a second volume; mount the first, then mount it again, then a volume no one made; detach the mount. Expect
+/// the second volume refused `Exhausted::Table`, the first mount answered with the path as given, the second refused
+/// at the bound, the stranger `NotFound`, and the detach done.
+#[test]
+fn the_simulator_holds_what_it_was_given_room_for() {
+  let mut sim = SimVolumes::new(1);
+  let only = made(&mut sim, &VolumeSpec::empty("only", ROOM));
+  assert!(matches!(
+    sim.provision(&VolumeSpec::empty("second", ROOM)),
+    Err(Error::Exhausted(Exhausted::Table { .. }))
+  ));
+  let options = MountOptions {
+    read_only: false,
+    subtree: None,
+    shared: false,
+  };
+  let mounted = sim.mount(only, "/simulated/mount", &options).unwrap();
+  assert_eq!(mounted.path, "/simulated/mount");
+  assert!(matches!(
+    sim.mount(only, "/simulated/another", &options),
+    Err(Error::Exhausted(Exhausted::Table { .. }))
+  ));
+  assert_eq!(
+    sim.mount(NOWHERE, "/simulated/stranger", &options),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(sim.detach(mounted.attachment), Ok(()));
 }

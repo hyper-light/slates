@@ -67,11 +67,16 @@ fn landing(land: WriteMode) -> WritePolicy {
   }
 }
 
-/// Sets `volume`'s policy as the launcher does, under the daemon's issuer secret.
+/// Sets `volume`'s policy as the launcher does, under the daemon's issuer secret, from the version it reads.
 fn set(client: &mut Client, secret: &[u8; 32], volume: VolumeId, policy: WritePolicy) {
   let subject = PolicySubject::Volume { volume };
+  let (_, version) = client.policy(subject).unwrap();
   client
-    .set_policy(subject, policy, policy_proof(secret, &subject, &policy))
+    .set_policy(
+      subject,
+      (policy, version),
+      policy_proof(secret, &subject, &policy, version),
+    )
     .unwrap();
 }
 
@@ -93,7 +98,7 @@ fn a_bypass_volume_lands_at_once_with_no_approval() {
   set(&mut client, &secret, volume, landing(WriteMode::Bypass));
   assert_eq!(
     client.policy(PolicySubject::Volume { volume }).unwrap(),
-    Some(landing(WriteMode::Bypass))
+    (Some(landing(WriteMode::Bypass)), 1)
   );
   let landed = client.land(volume, None, &target.path, Filter::default(), None);
   assert!(
@@ -117,7 +122,7 @@ fn an_ask_volume_lands_only_after_an_approval_of_its_manifest() {
   let volume = volume_with(&mut client, "asked", b"needs approval");
   assert_eq!(
     client.policy(PolicySubject::Volume { volume }).unwrap(),
-    None
+    (None, 0)
   );
   set(&mut client, &secret, volume, landing(WriteMode::Ask));
   let Ok(Landing::GrantRequired {
@@ -202,12 +207,20 @@ fn an_agent_cannot_raise_its_own_policy() {
   agent.attest(consumer, &capability).unwrap();
   let subject = PolicySubject::Volume { volume };
   let bypass = landing(WriteMode::Bypass);
-  let raised = agent.set_policy(subject, bypass, policy_proof(&secret, &subject, &bypass));
+  let raised = agent.set_policy(
+    subject,
+    (bypass, 0),
+    policy_proof(&secret, &subject, &bypass, 0),
+  );
   assert!(
     matches!(raised, Err(ClientError::Refused(Refusal::Forbidden { .. }))),
     "a consumer-bound channel sets no policy, even with a genuine proof: {raised:?}"
   );
-  let forged = launcher.set_policy(subject, bypass, policy_proof(&[0; 32], &subject, &bypass));
+  let forged = launcher.set_policy(
+    subject,
+    (bypass, 0),
+    policy_proof(&[0; 32], &subject, &bypass, 0),
+  );
   assert!(
     matches!(
       forged,
@@ -215,7 +228,7 @@ fn an_agent_cannot_raise_its_own_policy() {
     ),
     "a forged proof: {forged:?}"
   );
-  assert_eq!(launcher.policy(subject).unwrap(), None);
+  assert_eq!(launcher.policy(subject).unwrap(), (None, 0));
   let presented = launcher.land(volume, None, &target.path, Filter::default(), None);
   assert!(
     matches!(presented, Ok(Landing::GrantRequired { .. })),
@@ -361,5 +374,119 @@ fn a_presentation_writes_nothing_whatever_the_policy() {
   assert!(matches!(landed, Ok(Landing::Landed(_))), "{landed:?}");
   assert_eq!(on_disk(&target).as_deref(), Some(&b"reviewed first"[..]));
   drop(client);
+  daemon.stop();
+}
+
+/// A-285: a launcher's proof sets a policy once. Do: set a volume's landing mode to bypass from version 0, then lower it
+/// to forbid from version 1, then replay the first setting (the captured bypass proof for version 0). Expect the replay
+/// refused `PolicyChanged { current: 2 }` and the policy still forbid: a captured proof cannot raise a lowered policy.
+#[test]
+fn a_replayed_policy_proof_cannot_raise_a_lowered_policy() {
+  let (daemon, instance) = daemon("replay");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let volume = volume_with(&mut client, "lowered", b"agent's work");
+  let subject = PolicySubject::Volume { volume };
+  let bypass = landing(WriteMode::Bypass);
+  let captured = policy_proof(&secret, &subject, &bypass, 0);
+  client.set_policy(subject, (bypass, 0), captured).unwrap();
+  set(&mut client, &secret, volume, landing(WriteMode::Forbid));
+  let replayed = client.set_policy(subject, (bypass, 0), captured);
+  assert!(
+    matches!(
+      replayed,
+      Err(ClientError::Refused(Refusal::PolicyChanged { current: 2 }))
+    ),
+    "{replayed:?}"
+  );
+  assert_eq!(
+    client.policy(subject).unwrap(),
+    (Some(landing(WriteMode::Forbid)), 2)
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// A-285, a session's own policy: the stricter of the consumer's and the volume's governs, and a policy set after the
+/// agent bound reaches its channel at once. Do: bind an agent's channel to an enrolled consumer, which makes its own
+/// volume; then, as the launcher, set that volume's landing mode to bypass and the consumer's landing mode to ask and
+/// its merge mode to forbid;
+/// the agent lands the volume and submits a work; then the launcher lowers the consumer's landing mode to forbid and the
+/// agent lands again. Expect the consumer's policy read back at version 1; the first landing answered with an approval
+/// request (ask over the volume's bypass) and nothing written; the submit refused `PolicyForbids` by the consumer; the
+/// second landing refused `PolicyForbids` by the consumer.
+#[test]
+fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
+  let (daemon, instance) = daemon("consumer");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let mut launcher = connect(&instance);
+  let account = rustix::process::getuid().as_raw();
+  let (consumer, capability) = launcher
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut agent = connect(&instance);
+  agent.attest(consumer, &capability).unwrap();
+  // The agent's own volume and work, as an agent works; the launcher sets the policies.
+  let volume = volume_with(&mut agent, "session-held", b"agent's work");
+  set(&mut launcher, &secret, volume, landing(WriteMode::Bypass));
+  let subject = PolicySubject::Consumer { consumer };
+  let asked = WritePolicy {
+    merge: WriteMode::Forbid,
+    land: WriteMode::Ask,
+  };
+  launcher
+    .set_policy(
+      subject,
+      (asked, 0),
+      policy_proof(&secret, &subject, &asked, 0),
+    )
+    .unwrap();
+  assert_eq!(launcher.policy(subject).unwrap(), (Some(asked), 1));
+  let presented = agent.land(volume, None, &target.path, Filter::default(), None);
+  assert!(
+    matches!(presented, Ok(Landing::GrantRequired { .. })),
+    "the consumer's ask holds a bypass volume's landing: {presented:?}"
+  );
+  assert_eq!(on_disk(&target), None);
+  let green = agent.create_green("session-green", false).unwrap();
+  let (work, _) = agent.create_work(green, "session-work").unwrap();
+  agent.edit(work, "f", 0, 0, b"merged work").unwrap();
+  let merged = agent.submit(work);
+  assert!(
+    matches!(
+      merged,
+      Err(ClientError::Refused(Refusal::PolicyForbids {
+        act: WriteAct::Merge,
+        by: PolicySubject::Consumer { consumer: by },
+      })) if by == consumer
+    ),
+    "{merged:?}"
+  );
+  let forbidden = WritePolicy {
+    merge: WriteMode::Forbid,
+    land: WriteMode::Forbid,
+  };
+  launcher
+    .set_policy(
+      subject,
+      (forbidden, 1),
+      policy_proof(&secret, &subject, &forbidden, 1),
+    )
+    .unwrap();
+  let refused = agent.land(volume, None, &target.path, Filter::default(), None);
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(Refusal::PolicyForbids {
+        act: WriteAct::Land,
+        by: PolicySubject::Consumer { .. },
+      }))
+    ),
+    "a lowered policy reaches the bound channel at once: {refused:?}"
+  );
+  assert_eq!(on_disk(&target), None);
+  drop(agent);
+  drop(launcher);
   daemon.stop();
 }

@@ -860,7 +860,9 @@ pub enum RequestBody {
     subject: PolicySubject,
     /// The policy.
     policy: WritePolicy,
-    /// The keyed hash under the issuer secret.
+    /// The policy version the setter read (`Policy`'s `version`): refused `PolicyChanged` once the policy has moved.
+    version: u64,
+    /// The keyed hash under the launcher's secret, over the subject, the policy and the version.
     proof: [u8; 32],
   },
   /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
@@ -881,6 +883,31 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+  },
+  /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
+  /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
+  /// channel sends in place of `Submit` when the consumer's merge mode asks; never needed from a client. Appended.
+  SubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
+  /// `SubmitHeld`'s is. Appended.
+  EditSubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
   },
   /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
   /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
@@ -1570,6 +1597,8 @@ impl RequestBody {
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
+      | RequestBody::EditSubmitHeld { work: volume, .. }
+      | RequestBody::SubmitHeld { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1631,6 +1660,8 @@ impl RequestBody {
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
+        | RequestBody::EditSubmitHeld { .. }
+        | RequestBody::SubmitHeld { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }
@@ -2180,6 +2211,59 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
+  /// An overlay's base as this status read it, typed (§4.15 "Drift"; A-299): the facts `drifted` and `watcher` carry as
+  /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
+  /// one, a green, a work volume). Appended.
+  pub base: Option<BaseReport>,
+}
+
+/// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum BaseReport {
+  /// The base was read.
+  Read {
+    /// Each entry the disk changed after the volume witnessed it: landing it would conflict.
+    drifted: Vec<DriftEntry>,
+    /// Each entry whose re-check the host refused now, by path: not known to match its witness.
+    unverified: Vec<String>,
+    /// The base's watcher.
+    watcher: WatcherState,
+  },
+  /// The base could not be read now: its drift is unknown.
+  Unreadable,
+}
+
+/// One drifted entry of an overlay (§4.15 "Drift").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DriftEntry {
+  /// The entry, from the volume's root.
+  pub path: String,
+  /// What the disk did to it.
+  pub kind: DriftKind,
+}
+
+/// What changed on the disk beneath a witnessed entry (§4.15 "Drift"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftKind {
+  /// The same file, with other bytes or attributes.
+  Modified,
+  /// The entry is gone.
+  Deleted,
+  /// Another file sits at the path.
+  Replaced,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+}
+
+/// An overlay's watcher (§4.15): hints that make drift reports prompt, never the truth. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherState {
+  /// Delivering hints.
+  Live,
+  /// It lost events; a full re-check is done or scheduled.
+  Overflowed,
+  /// None on this host or folder: fingerprints alone.
+  Unavailable,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3317,6 +3401,12 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
+  /// Read the policy again and set it from there. Appended.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
   /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
   /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
   /// Appended.
@@ -3850,6 +3940,8 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+    /// The policy's version: how many times it was set, which a `SetPolicy` names.
+    version: u64,
   },
   /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
   /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval
