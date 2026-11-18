@@ -2319,8 +2319,10 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     | RequestBody::Advance { attachment, .. }
     | RequestBody::BindMount { attachment, .. } => Some(owner_of_attachment(*attachment)),
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
-    // names — not the client's shard, where nothing is awaiting.
-    RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
+    // names — not the client's shard, where nothing is awaiting. So is a presentation's entry list.
+    RequestBody::Grant { landing, .. } | RequestBody::LandingEntries { landing, .. } => {
+      Some(owner_of_landing(*landing))
+    }
     // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
     RequestBody::Telemetry { partition } => Some(*partition),
     other => volume_of(other).map(owner_of),
@@ -4313,6 +4315,9 @@ fn dispatch_inner(
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
     RequestBody::DetachOf { volume, attachment } => {
       detach_of(state, principal, Some(volume), attachment)
+    }
+    RequestBody::LandingEntries { landing, from } => {
+      crate::landing_entries::landing_entries_verb(state, principal, landing, from)
     }
     // A peer's reap is served in `serve_forward`, under the peer's authenticated id; no client sends one.
     RequestBody::RemoteReap { .. } => refused(Refusal::BadRequest {
@@ -11600,7 +11605,7 @@ fn chain_phase(
 }
 
 /// A volume id's bytes in hexadecimal, as the CLI prints a volume id.
-fn hex_of(bytes: &[u8]) -> String {
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

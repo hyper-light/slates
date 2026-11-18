@@ -173,6 +173,13 @@ pub struct Awaiting {
   pub principal: Principal,
   /// The client that presented it: its retirement abandons the presentation (AUD-29-07).
   pub client: u32,
+  /// Its manifest's entries, in the manifest's order: the full entry list a person may ask for (§4.15 step 2;
+  /// `LandingEntries` pages them, `crate::landing_entries`). Moved from the plan, never copied, and held as long as the
+  /// presentation is, which A-46 bounds: consumed by its landing, replaced by its client's next, abandoned with its
+  /// client, at most one a client seat. Their size is the plan's, which the volume's diverged set bounds.
+  pub entries: Vec<slates_land::manifest::LandingEntry>,
+  /// The conflict classes the preliminary verdict pass found among them, by path (the conflicting entries alone).
+  pub conflicts: std::collections::BTreeMap<Box<str>, slates_land::verdict::ConflictClass>,
 }
 
 impl std::fmt::Debug for LandingState {
@@ -749,7 +756,7 @@ async fn run_presentation(mut job: PresentJob) {
       };
       match ended {
         Some(Ok(slates_land::engine::Planned::Presented(plan))) => {
-          present(s, presenter, &ids, &plan)
+          present(s, presenter, &ids, plan)
         }
         // A presentation carries no grant, so the engine never finds one: a defect, refused typed.
         Some(Ok(slates_land::engine::Planned::Granted(_))) => refused(Refusal::Unsupported {
@@ -773,7 +780,7 @@ fn not_landed(
   refusal: LandingRefusal,
 ) -> ReplyBody {
   match refusal {
-    LandingRefusal::GrantRequired(plan) => present(state, presenter, ids, &plan),
+    LandingRefusal::GrantRequired(plan) => present(state, presenter, ids, plan),
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
@@ -2200,15 +2207,17 @@ fn present(
   state: &mut ShardState,
   presenter: Presenter<'_>,
   ids: &LandingIds<'_>,
-  plan: &slates_land::engine::Presented,
+  plan: Box<slates_land::engine::Presented>,
 ) -> ReplyBody {
-  let manifest = &plan.manifest;
-  let binding = &plan.binding;
+  let slates_land::engine::Presented {
+    manifest,
+    preliminary,
+    binding,
+  } = *plan;
   // §4.15 step 2: the conflicts the engine's preliminary verdict pass found (step 4 run without writing), each with
   // its class, so the human deciding on the grant decides on evidence. Until 2026-10-08 the reply carried none, and a
   // plan over a disk an outsider had changed looked clean until the granted landing refused.
-  let conflicts: Vec<String> = plan
-    .preliminary
+  let conflicts: Vec<String> = preliminary
     .iter()
     .filter_map(|entry| match entry.verdict {
       Some(slates_land::verdict::Verdict::Conflict(class)) => {
@@ -2220,6 +2229,7 @@ fn present(
   let Presenter { client, principal } = presenter;
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
+  let summary = summary_of(&manifest);
   let landing_id = ids.landing_id;
   // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
   // longer grantable (AUD-29-07): re-planning costs no room.
@@ -2230,12 +2240,15 @@ fn present(
     landing_id,
     Awaiting {
       manifest: hash,
-      binding: binding.clone(),
+      binding,
       volume: ids.volume,
       snapshot: ids.snapshot,
       target: ids.target.to_owned(),
       principal: principal.clone(),
       client,
+      // The full entry list on demand (§4.15 step 2): the manifest's own entries, moved here.
+      entries: manifest.entries,
+      conflicts: crate::landing_entries::conflicts_of(&preliminary),
     },
   );
   let now = state.clock.monotonic_ns();
@@ -2273,7 +2286,7 @@ fn present(
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
-    summary: summary_of(manifest),
+    summary,
     conflicts,
   }
 }
