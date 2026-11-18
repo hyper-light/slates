@@ -104,6 +104,51 @@ pub enum GrantScope {
   Session,
 }
 
+/// A kind of write a policy governs (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAct {
+  /// A merge (a work's submit into its green).
+  Merge,
+  /// A landing to the host's disk.
+  Land,
+}
+
+/// How one kind of write is permitted: the mode the user gave the harness or agent (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+  /// Written at once, with no approval asked (Claude Code's `bypassPermissions`, Codex's full access).
+  Bypass,
+  /// Answered with an approval request the harness presents; written once an approval binds the manifest.
+  Ask,
+  /// Refused (a mode that forbids writing, such as plan).
+  Forbid,
+}
+
+/// A write policy: the mode for merges and the mode for landings (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+  /// How a merge is permitted.
+  pub merge: WriteMode,
+  /// How a landing is permitted.
+  pub land: WriteMode,
+}
+
+/// What a write policy is set on (A-285): an enrolled consumer (a session's agent) or a volume. The stricter of the
+/// caller's consumer and the volume governs.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicySubject {
+  /// An enrolled consumer.
+  Consumer {
+    /// The consumer id.
+    consumer: u64,
+  },
+  /// A volume.
+  Volume {
+    /// The volume.
+    volume: VolumeId,
+  },
+}
+
 /// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -806,6 +851,52 @@ pub enum RequestBody {
     /// Where the page starts.
     from: EntriesCursor,
   },
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by the keyed hash under the issuer
+  /// secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound channel whatever its
+  /// proof, so an agent can never set, and so never raise, its own policy; `GrantIssuerUnverified` without the proof.
+  /// A volume's policy is served on the volume's owner shard. Appended.
+  SetPolicy {
+    /// What the policy is set on.
+    subject: PolicySubject,
+    /// The policy.
+    policy: WritePolicy,
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
+  },
+  /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// What the policy is set on.
+    subject: PolicySubject,
+  },
+  /// Presents a landing and never lands it, whatever the volume's write policy (A-285): the answer is `GrantRequired`
+  /// with the plan, its entries kept for `LandingEntries`, exactly as an asked `Land` answers, and nothing is written.
+  /// A reviewer reads the changes a bypass volume would land at once, and a forbidden volume's too, since reading them
+  /// writes nothing. Served on the volume's owner shard, as `Land` is. Appended.
+  Present {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot, or the head.
+    snapshot: Option<SnapshotId>,
+    /// The target directory's path.
+    target: String,
+    /// The filter.
+    filter: Filter,
+  },
+  /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
+  /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
+  /// hash under the issuer secret (`slates_server::landing::merge_approval_proof`). The increment is built again and
+  /// merged only if it is still that one; one that changed since is refused `GrantMismatch`. Refused `Forbidden` on a
+  /// consumer-bound channel and `GrantIssuerUnverified` without the proof. Appended.
+  SubmitApproved {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+    /// The approved increment's identity.
+    identity: [u8; 32],
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1443,6 +1534,7 @@ impl RequestBody {
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
+      | RequestBody::SubmitApproved { work: volume, .. }
       | RequestBody::Rebase { work: volume }
       | RequestBody::Clone { volume, .. }
       | RequestBody::Attach { volume, .. }
@@ -1473,8 +1565,18 @@ impl RequestBody {
       | RequestBody::FsRename { volume, .. }
       | RequestBody::FsMkdir { volume, .. }
       | RequestBody::Land { volume, .. }
+      | RequestBody::Present { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
+      // A volume's policy lives in its record, on its owner shard.
+      RequestBody::SetPolicy {
+        subject: PolicySubject::Volume { volume },
+        ..
+      }
+      | RequestBody::Policy {
+        subject: PolicySubject::Volume { volume },
+      } => Some(*volume),
+      RequestBody::SetPolicy { .. } | RequestBody::Policy { .. } => None,
       // A checkout writes its green's base volume, on the owner shard of both (`green --base` runs there).
       RequestBody::Checkout { base, .. } => Some(base.volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
@@ -1519,6 +1621,7 @@ impl RequestBody {
         | RequestBody::EditSubmit { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
+        | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
@@ -1535,6 +1638,7 @@ impl RequestBody {
         | RequestBody::FsRename { .. }
         | RequestBody::FsMkdir { .. }
         | RequestBody::Checkout { .. }
+        | RequestBody::SetPolicy { .. }
     )
   }
 
@@ -3192,6 +3296,14 @@ pub enum Refusal {
     /// The requester, by its host's certificate anchor and its account.
     principal: Principal,
   },
+  /// The write policy forbids this act (A-285): the mode the user gave the agent forbids writing. `by` names the
+  /// subject whose policy decided. Appended.
+  PolicyForbids {
+    /// The act refused.
+    act: WriteAct,
+    /// The subject whose policy forbids it.
+    by: PolicySubject,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3686,6 +3798,24 @@ pub enum ReplyBody {
     total: u64,
     /// The manifest's hash, the one its `GrantRequired` named, so a reader joining pages knows each is of one manifest.
     manifest: [u8; 32],
+  },
+  /// A write policy was set (A-285). Appended.
+  PolicySet,
+  /// A write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// The policy.
+    policy: Option<WritePolicy>,
+  },
+  /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
+  /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval
+  /// (`SubmitApproved`) binds it; `paths` counts the paths it changes. Appended.
+  MergeApprovalRequired {
+    /// The work volume.
+    work: VolumeId,
+    /// The increment's identity.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
   },
 }
 
