@@ -2630,6 +2630,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median
+> of the last 50 of 300 submits to four times the first 50's plus 2 ms (R3), from windows minutes apart, so a load that
+> changed between them read as a cost of history. Its macOS failure on CI (run 44298844583, main 1e82ebda1) was not that
+> bound: the owner ran one poll of 3,417 ms after about 69 submits, its holders declared it dead, and the 70th submit
+> waited out the client's 120 s. That is the signature of the record plane's spin main fixed after that run (340d4f6fb,
+> g251: a nudge after every ship ran back-to-back passes in one poll), and 14 runs on the Mac Studio, quiet and under 48
+> spinners, never repeated it. Now, after 300 versions of one green, 50 pairs alternate a submit on it with one on a
+> fresh green, the order in each pair alternating, and the Wilcoxon signed-rank statistic W+ of the old-minus-fresh
+> differences must stay within n(n+1)/4 + z·√(n(n+1)(2n+1)/24), z = 4.7534 the normal quantile of a spurious failure in a
+> million runs (NIST/SEMATECH e-Handbook §1.3.6.7.1): 1,129.9 at 50 pairs. Kiln r3592, the Mac Studio, debug build: W+
+> 420 to 801 in 5 quiet runs and 331 to 772 in 3 under 48 spinners, both greens' medians 3.7 to 4.4 ms; with 20 µs a
+> version of the green's history injected into the submit path, W+ 1,225 and the test failed.
+>
 > **Fixed 2026-11-18 (g232, A-376): every version re-published the whole content hold.** The content hold's image was
 > one piece (A-270), every chunk, manifest and stage a holder keeps, recomputed at every publication and re-put whenever
 > it changed, which at `f > 0` is every version of a green: after A-372 about a tenth of a holder's time at 1,000
