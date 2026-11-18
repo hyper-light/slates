@@ -417,6 +417,9 @@ enum Step {
   GreenOriginate(usize),
   /// A green's checkpoint (W3) at a version, which folds the increments up to it.
   GreenCheckpoint(usize, u64),
+  /// A green recorded by its takeover successor's adoption of its holder ledger (A-333): the version it was adopted at,
+  /// and whether it has an origin.
+  GreenAdopt(u64, bool),
   NfsOpen(u8, u8, u32),
   NfsOpenClear(usize),
   NfsLock(usize, u64, u64, bool),
@@ -476,6 +479,7 @@ fn step() -> impl Strategy<Value = Step> {
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
     1 => (0..8usize, 0..6u64).prop_map(|(v, at)| Step::GreenCheckpoint(v, at)),
+    1 => (0..6u64, any::<bool>()).prop_map(|(at, origin)| Step::GreenAdopt(at, origin)),
     2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
     1 => (0..8usize).prop_map(Step::NfsOpenClear),
     2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
@@ -717,7 +721,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::Audit(..)
     | Step::GreenAdvance(..)
     | Step::GreenOriginate(..)
-    | Step::GreenCheckpoint(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenCheckpoint(..)
+    | Step::GreenAdopt(..)) => return op_for_service(step, ids, now_ns),
     step @ (Step::NfsOpen(..)
     | Step::NfsOpenClear(..)
     | Step::NfsLock(..)
@@ -842,6 +847,18 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       version: *at,
       checkpoint: at.to_be_bytes().to_vec(),
     },
+    // An adoption records a new green with its version 0 and every version up to the adopted one; the steps after it
+    // advance, checkpoint and destroy it as any green, and a later origin of it is refused, never recorded.
+    Step::GreenAdopt(at, origin) => {
+      let n = ids.next_volume;
+      ids.next_volume += 1;
+      Op::GreenAdopted {
+        record: volume(n, &format!("v{n}")),
+        version: *at,
+        identity: [u8::try_from(*at).unwrap_or(u8::MAX); 32],
+        origin: origin.then_some([7; 32]),
+      }
+    }
     _ => return None,
   })
 }
@@ -1037,7 +1054,7 @@ fn note_applied(op: &Op, ids: &mut Ids) {
     Op::NfsLockSet { record } => ids.nfs_locks.push(record.other),
     Op::NfsLockCleared { other } => ids.nfs_locks.retain(|o| o != other),
     Op::NfsInstanceAdvanced { instance } => ids.nfs_instance = *instance,
-    Op::VolumeCreated { record } => ids
+    Op::VolumeCreated { record } | Op::GreenAdopted { record, .. } => ids
       .live
       .push(u64::from_be_bytes(record.id.bytes[..8].try_into().unwrap())),
     Op::VolumeDestroyed { id } | Op::VolumeRelinquished { id } => {
@@ -1766,6 +1783,204 @@ fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
     live,
     "a snapshot carries the checkpoint"
   );
+}
+
+/// The adoption test's green, adopted at [`ADOPTED_AT`].
+const ADOPTED_GREEN: u64 = 2;
+/// Shape: the version the adoption test's green is adopted at by its takeover successor.
+const ADOPTED_AT: u64 = 3;
+
+/// The adoption test's green recorded by its adoption at `version` from a ledger whose version 0 names inputs `[7; 32]`.
+fn adopted_at(version: u64) -> Op {
+  Op::GreenAdopted {
+    record: volume(ADOPTED_GREEN, "adopted"),
+    version,
+    identity: [9; 32],
+    origin: Some([7; 32]),
+  }
+}
+
+/// Records the adoption test's green by its adoption at [`ADOPTED_AT`], then asks for a second adoption, a creation
+/// under its id and an origin: each refused `AlreadyExists`, none recorded.
+fn adopt_and_refuse_a_second_version_zero(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  db.mutate(seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  assert!(
+    db.partition().volume(green).is_some(),
+    "recorded by its adoption"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT);
+  assert!(db.partition().green_chain(green).is_empty());
+  let seq = db.next_seq();
+  for late in [
+    adopted_at(ADOPTED_AT + 1),
+    Op::VolumeCreated {
+      record: volume(ADOPTED_GREEN, "another"),
+    },
+    Op::GreenOriginated {
+      green,
+      origin: vec![1],
+    },
+  ] {
+    let refused = db.mutate(seg, &late, 0);
+    assert!(
+      matches!(refused, Err(DbError::AlreadyExists { .. })),
+      "{late:?}: {refused:?}"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused version 0 was recorded");
+}
+
+/// Advances the adopted green two increments, asks for checkpoints at its adoption, below it and past its head (each
+/// refused with the adoption as the floor held, none recorded), then checkpoints it at version 4: version 5 alone stays in
+/// the chain.
+fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  for n in 0..2u8 {
+    db.mutate(
+      seg,
+      &Op::GreenAdvanced {
+        green,
+        increment: vec![n; INCREMENT_BYTES],
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+  let seq = db.next_seq();
+  for version in [ADOPTED_AT, ADOPTED_AT - 1, ADOPTED_AT + 3] {
+    let refused = db.mutate(
+      seg,
+      &Op::GreenCheckpointed {
+        green,
+        version,
+        checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+      },
+      0,
+    );
+    assert_eq!(
+      refused.err(),
+      Some(DbError::CheckpointOutOfRange {
+        version,
+        held: ADOPTED_AT,
+        head: ADOPTED_AT + 2,
+      }),
+      "a checkpoint at {version} is refused"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused checkpoint was recorded");
+  db.mutate(
+    seg,
+    &Op::GreenCheckpointed {
+      green,
+      version: ADOPTED_AT + 1,
+      checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  assert_eq!(
+    db.partition().green_chain(green),
+    &[vec![1; INCREMENT_BYTES]],
+    "version 5 alone is past the checkpoint at 4"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+}
+
+/// §4.16 owner-loss recovery (A-333). Do: record a green by its adoption at version 3 (its successor's holder ledger
+/// holds versions 0 to 3), adopt it again, create a volume under its id and give it an origin; advance it two increments;
+/// checkpoint it at its adoption, below it and past its head, then at version 4; recover from the log and from a
+/// snapshot. Expect: the green recorded with a head of 3 and an empty chain; the second adoption, the creation and the
+/// origin refused `AlreadyExists`, never recorded; the two increments versions 4 and 5; the three checkpoints refused
+/// `CheckpointOutOfRange` with the adoption as the floor held, and the one at 4 leaving version 5 alone in the chain;
+/// both recoveries holding the adoption, the checkpoint and the chain.
+#[test]
+fn an_adopted_greens_chain_begins_after_its_adoption_and_recovery_holds_it() {
+  let green = vid(ADOPTED_GREEN);
+  let mut seg = segment("slates-db-adoption", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  adopt_and_refuse_a_second_version_zero(&mut seg, &mut db);
+  checkpoint_past_the_adoption(&mut seg, &mut db);
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().to_snapshot(0),
+    live,
+    "the log holds the adoption"
+  );
+  db.snapshot(&mut seg).unwrap();
+  drop(db);
+  let (recovered, stats) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert!(stats.snapshot.is_some());
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    live,
+    "a snapshot carries the adoption"
+  );
+  assert_eq!(
+    recovered.partition().green_adoption(green).copied(),
+    Some(slates_db::partition::GreenAdoption {
+      green,
+      version: ADOPTED_AT,
+      identity: [9; 32],
+      origin: Some([7; 32]),
+    })
+  );
+}
+
+/// AUD-29-43, A-238, A-333: a destroyed green's tombstone is written one past every sequence its register held, and a
+/// green's register holds a merge record at every version up to its head, whatever its chain still holds. Do: destroy a
+/// green checkpointed at 3 with a head of 5, and one adopted at 3 with a head of 4. Expect each tombstone's sequence past
+/// its head: 6 and 5. Before, it was one past the chain's length (3 and 2), below versions its holders had accepted.
+#[test]
+fn a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds() {
+  let mut seg = segment("slates-db-green-tombstone", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  let (checkpointed, adopted) = (vid(CHECKPOINT_GREEN), vid(ADOPTED_GREEN));
+  db.mutate(
+    &mut seg,
+    &Op::VolumeCreated {
+      record: volume(CHECKPOINT_GREEN, "checkpointed"),
+    },
+    0,
+  )
+  .unwrap();
+  for n in 0..5u8 {
+    db.mutate(&mut seg, &advance(n), 0).unwrap();
+    if n == 2 {
+      db.mutate(&mut seg, &checkpoint_at(3), 0).unwrap();
+    }
+  }
+  db.mutate(&mut seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  db.mutate(
+    &mut seg,
+    &Op::GreenAdvanced {
+      green: adopted,
+      increment: vec![1; INCREMENT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  for id in [checkpointed, adopted] {
+    for op in [
+      Op::VolumeStateChanged {
+        id,
+        state: VolumeState::Destroying,
+      },
+      Op::VolumeDestroyed { id },
+    ] {
+      db.mutate(&mut seg, &op, 0).unwrap();
+    }
+  }
+  let sequences = [checkpointed, adopted].map(|id| {
+    db.partition()
+      .tombstone(id)
+      .map(|tombstone| tombstone.sequence)
+  });
+  assert_eq!(sequences, [Some(6), Some(ADOPTED_AT + 2)]);
+  assert_eq!(db.partition().green_adoption(adopted), None);
 }
 
 /// §4.8 recovery, §2.6 boot step 2: recovery takes the newest snapshot slot that decodes. Do: take snapshots until both

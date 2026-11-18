@@ -3,14 +3,14 @@
   "suite": "workloads",
   "transport": "native-macos-nfs",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
+    "os": "macOS 26.7.2 (25G332)",
+    "kernel": "Darwin 25.6.0",
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-16",
+  "date": "2026-11-18",
   "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
-  "bound": "8 tools run, one script each",
+  "bound": "12 tools run, one script each",
   "outcome": {
     "kind": "ran",
     "counts": {
@@ -19,8 +19,25 @@
         {
           "name": "git",
           "status": {
-            "kind": "differs",
-            "detail": "exit code: host 0, mount 8; mount output tail: 100644 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\t._link\n100644 2227cddb7f6318ea735a1c4adb52f5cd36c5783c 0\ta.txt\n100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._mas…"
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "git-history",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "mercurial",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "subversion",
+          "status": {
+            "kind": "identical"
           }
         },
         {
@@ -38,8 +55,7 @@
         {
           "name": "python",
           "status": {
-            "kind": "differs",
-            "detail": "output line 2: host \"{\\\"names\\\": [\\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\", mount \"{\\\"names\\\": [\\\"._main.py\\\", \\\"._out.json\\\", \\\"._pkg\\\", \\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\""
+            "kind": "identical"
           }
         },
         {
@@ -51,8 +67,7 @@
         {
           "name": "rsync",
           "status": {
-            "kind": "differs",
-            "detail": "exit code: host 0, mount 1; mount output tail: 3\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt"
+            "kind": "identical"
           }
         },
         {
@@ -64,27 +79,21 @@
         {
           "name": "editor",
           "status": {
-            "kind": "differs",
-            "detail": "output line 2: host \"note.txt\", mount \"._note.txt\""
+            "kind": "identical"
           }
         },
         {
           "name": "watcher",
           "status": {
-            "kind": "skipped",
-            "tool": "fswatch"
+            "kind": "identical"
           }
         }
       ]
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 34089,
+  "duration_ms": 74423,
   "notes": [
-    "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s",
-    "git: exit code: host 0, mount 8; mount output tail: 100644 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\t._link\n100644 2227cddb7f6318ea735a1c4adb52f5cd36c5783c 0\ta.txt\n100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._mas…",
-    "python: output line 2: host \"{\\\"names\\\": [\\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\", mount \"{\\\"names\\\": [\\\"._main.py\\\", \\\"._out.json\\\", \\\"._pkg\\\", \\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\"",
-    "rsync: exit code: host 0, mount 1; mount output tail: 3\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt",
-    "editor: output line 2: host \"note.txt\", mount \"._note.txt\""
+    "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s"
   ]
 }

@@ -214,7 +214,10 @@ pub(crate) struct Interface {
   pub(crate) can_delete: Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr) -> Ntstatus>,
   pub(crate) rename:
     Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pwstr, Boolean) -> Ntstatus>,
-  pub(crate) get_security: OpaqueCallback,
+  /// `GetSecurity(FileSystem, FileContext, SecurityDescriptor, PSecurityDescriptorSize)`.
+  pub(crate) get_security: Option<
+    unsafe extern "C" fn(*mut FileSystem, Pvoid, PSecurityDescriptor, *mut usize) -> Ntstatus,
+  >,
   pub(crate) set_security: OpaqueCallback,
   pub(crate) read_directory: Option<
     unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pwstr, Pvoid, u32, *mut u32) -> Ntstatus,
