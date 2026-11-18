@@ -10067,7 +10067,8 @@ ship.
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
 5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
-   by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
+   by `release.yml` since 2026-11-04; its dry run stages the whole release since 2026-11-17, A-320), npm and PyPI
+   publishing, plugin package, docs (user docs short in `docs/`,
    this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
 
@@ -10411,7 +10412,10 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
 > verify. Since 2026-11-05 every target is built twice on separate runners, and the release is refused unless the two
-> copies are the same bytes (AC-9.5; A-210 records the measurements).
+> copies are the same bytes (AC-9.5; A-210 records the measurements). Since 2026-11-17 (A-320) every run, a tag's or
+> a dry run's, stages the whole release with read-only permissions: `SHA256SUMS`, the two copies compared, the
+> provenance, the notes and a publish plan, kept as the run's `release-staged` artifact. Only a tag's run signs and
+> makes the draft, from exactly those files. `workflow_dispatch` is the dry run (proof by use in A-320).
 
 | target | runner | asset name |
 |---|---|---|
@@ -10446,12 +10450,14 @@ Recipes to copy verbatim:
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
   records the digests of the bytes it ran (A-210).
-- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
-  test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target, carrying bytes no smoke
+  test ran, or whose two copies differ (AC-9.5), and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
   sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
   artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
   held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
-- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210). A run with no tag is a
+  dry run: it stages everything a tag's run stages, labelled a dry run, and holds no permission to sign or draft
+  (A-320; `docs/publish.md`, "The publish step").
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -23278,3 +23284,75 @@ entry), `crates/conformance/src/workload.rs` (the Subversion script and its excl
   The same wait-then-read shape stands in five other test helpers whose children write a few lines (GAPS lists them);
   none has met a pipe's capacity, and the cli VM harness (`crates/cli/tests/vm/mod.rs`) already reads its guest's lines
   as they come.
+
+### A-320 — The release lane's dry run stages the whole release: checksums, the two copies compared, provenance and a publish plan, with no permission to sign or publish (2026-11-17, built for goal g237, "complete the release pipeline")
+Applied in the same change to: Appendix B.2 (status and recipes), Phase 9 task 5's status, GAPS (the binary release
+lane's entry), `docs/publish.md` ("Cutting a release", "The binary release", and the new "The publish step"),
+`.github/workflows/release.yml` (the `stage` job; the `draft release` job takes its files), and `xtask/src/release.rs`
+and `tag.rs` (`--dry-run`, the plan, `release_tag`).
+- **Why.** A run with no tag (`workflow_dispatch`, or a diag branch's push) built and smoke-tested the fourteen copies
+  and stopped. The `release` job made `SHA256SUMS`, compared each target's two copies (AC-9.5) and wrote the
+  provenance, and it ran only on a tag. Only the test tags `v0.1.0-test.1` and `v0.1.0-test.2` (2026-11-05) ever ran
+  those checks; the last dry run (run 42701371173, `diag-release-9`, 2026-11-09) skipped them. A regression in them
+  would have shown first on the release tag itself.
+- **One staging for both kinds of run.** A `stage` job runs after the builds in every run, with the workflow's
+  read-only permissions. It runs the artifacts task (`--tag TAG`, or `--dry-run`) and `sha256sum --check --strict`
+  over the staged binaries, shows the plan as the job's summary, and keeps every staged file as the `release-staged`
+  artifact. On a tag, the `draft release` job, the only job holding write permissions, takes that artifact and checks
+  it against `SHA256SUMS` again. Then it signs and makes the draft. It no longer computes anything itself, so the
+  draft carries exactly the bytes that were staged and checked.
+- **Why the dry run stops where it does.** On a public repository the signature goes to Sigstore's public
+  transparency log as well as the repository's attestations. A release, even a draft, is a GitHub object under the
+  tag. Both are outward acts, and the publish reserves them for Ada. A dry run holds no permission that could do
+  either, so whatever its steps say, it cannot.
+- **A dry run cannot pass for a release.** Its title and notes say "not a release" (the notes then carry the
+  release's own text, so the dry run previews it). Its provenance has no tag and says `"dry_run": true`. Its plan
+  names the tag `v<version>` and what that tag would do, with the exact publish command. The task takes exactly one of
+  `--tag` and `--dry-run`. Tests: `a_dry_run_stages_a_releases_bytes_and_says_what_its_tag_would_do` (the dry run's
+  `SHA256SUMS` equals the release's for the same bytes), `the_artifacts_task_stages_for_a_tag_or_a_dry_run_never_both`
+  and `the_notes_name_every_shipped_asset_once`. The refusals of untested and unreproduced bytes now run on a dry run
+  too. `cargo test --locked -p xtask` passed on the Mac Studio (kiln run r1190, 2026-11-18): the release binary's 8
+  tests and xtask's 77.
+- **Proof by use (2026-11-18).** Dry run 44261010043 ran from 07:42 to 08:22 UTC, by `workflow_dispatch` on
+  `diag-g237-release-1`: commit 44c7cc17, which is main b41b11eb with this change's code. The guard, all fourteen
+  copies and `stage` passed, and `draft release` was skipped.
+  - Each copy passed every smoke step on its own runner. The steps, in ms: version, start to serving, steady
+    answers, bootstrap, provision, the MCP round trip, the second client's read, destroy, departure.
+
+    | asset | build | rebuild |
+    |---|---|---|
+    | `slates-macos-arm64` | 114, 3022, 2444, 167, 36, 180, 146, 26, 135 | 66, 1656, 1945, 47, 129, 45, 40, 109, 267 |
+    | `slates-linux-x64` | 20, 559, 385, 20, 20, 21, 20, 20, 23 | 20, 244, 386, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64` | 20, 283, 386, 20, 20, 22, 20, 20, 26 | 20, 289, 386, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-x64-musl` | 20, 370, 387, 20, 20, 22, 20, 20, 26 | 20, 567, 386, 20, 20, 21, 20, 20, 23 |
+    | `slates-linux-arm64-musl` | 20, 295, 388, 20, 20, 22, 20, 20, 26 | 20, 321, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1458, 426, 22, 42, 34, 22, 22, 23 | 25, 1097, 408, 22, 42, 36, 22, 22, 23 |
+    | `slates-windows-arm64.exe` | 36, 580, 418, 26, 27, 36, 27, 26, 28 | 35, 591, 416, 26, 26, 36, 26, 26, 29 |
+
+    `ldd` answered "statically linked" for the x86_64 musl binary and "not a dynamic executable" for the arm64 one.
+    `slates version` answered `slates 0.1.0` in a process-isolated Nano Server.
+  - `stage` took 63 s. It wrote the `SHA256SUMS` below, and `sha256sum --check --strict` answered OK for all seven.
+    Every rebuild's digest equals its build's. The two x86_64 Linux pairs matched across two runner image versions
+    (ubuntu26 20261111.82.6 and 20261111.196.1); each other pair ran on one image.
+
+    ```
+    fc53d4c9ed2cd59b0a78bf092df683a7d0f04f94febc1a4a331e38462fa8f0ad  slates-macos-arm64        14,625,600 B
+    5e3d51c6d4572b4175481aa0371b0815cf3cc80d795316bb096ae4222ba9815a  slates-linux-x64          20,450,024 B
+    46bba07ff638c7910ca6cc1bb623c29783eee36829f78645f9ae02b7cc4e5687  slates-linux-arm64        16,493,272 B
+    69395796e317958ec07e2db6f31294bb0f131cc176dbefb9c758a0fc3e4f05e8  slates-linux-x64-musl     20,392,400 B
+    05f4724df922383c978c83b833a400525b39ca653195eafa38c824167c4e7ad4  slates-linux-arm64-musl   16,654,408 B
+    e689e299f08a7ba9c4aa19bdead07751f5426c5d42273ab690fd67e5a58a5f93  slates-windows-x64.exe    14,851,072 B
+    e35ff7594d4cac6a394a98f3eccad54996e76babbcf6f225a1d34abd735a9ba4  slates-windows-arm64.exe  12,484,608 B
+    ```
+  - On adas-macbook-pro-2, `gh run download 44261010043 --name release-staged` gave `dist/` and `notes/`, the paths
+    the `draft release` job reads. `shasum -a 256 -c SHA256SUMS` answered OK seven times, and with one binary present
+    and `--ignore-missing` OK once (the README's command). The provenance said `"dry_run": true` and named no tag.
+    The macOS binary answered `slates 0.1.0`. Its signature is the linker's ad-hoc one with no team identifier, and
+    it carried no quarantine attribute.
+  - Nothing was published. `gh release list` still showed only the two test drafts, and no tag was made. GitHub holds
+    no attestation for a staged digest: `gh api repos/hyper-light/slates/attestations/sha256:<digest>` answered 404.
+- **Not yet, and Ada's.** The publish is goal g236: the tag `v0.1.0` and publishing its draft (`docs/publish.md`,
+  "The publish step"). The tag also starts the SDK lanes, which publish to PyPI and npm with no draft. Code signing and
+  notarization (B.7) need Ada's Apple and Windows identities. The `draft release` job's new shape runs only on a tag.
+  Before the release tag, a test tag `v0.1.0-test.3` would prove it; a refused job publishes nothing, so it fails
+  safe either way.
