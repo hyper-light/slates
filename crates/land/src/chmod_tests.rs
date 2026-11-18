@@ -315,3 +315,42 @@ fn a_mode_both_changed_differently_is_a_conflict_and_nothing_is_written() {
     PRIVATE_MODE & PERMISSIONS
   );
 }
+
+/// A-466's sibling for an overlay (T-1.14; §4.15 step 6). Do: rewrite `/run.sh` through the overlay and leave its mode,
+/// while an outsider makes the disk's file 0600; present and land. Expect `ModifyModify` at the file and nothing written:
+/// an overlay's replacement needs its witnessed file whole before its exchange, so the outsider's mode is never written
+/// over and the landing is refused instead, the disk keeping its bytes and the outsider's 0600.
+#[test]
+fn an_overlays_replacement_over_an_outsiders_mode_is_refused_and_the_mode_kept() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  {
+    let mut overlay = vol.with_host(&mut host);
+    overlay.truncate(&mut store, no, 0).unwrap();
+    overlay
+      .write(&mut store, no, 0, b"#!/bin/sh
+echo rewritten
+")
+      .unwrap();
+  }
+  host.advance_ns(1);
+  host.chmod("/run.sh", PRIVATE_MODE);
+  let (preliminary, landed) = land_granted(&mut host, &mut vol, &mut store);
+  assert_eq!(
+    preliminary,
+    vec![(
+      "/run.sh".into(),
+      Some(Verdict::Conflict(ConflictClass::ModifyModify))
+    )]
+  );
+  assert!(
+    landed.is_err() || landed.as_ref().is_ok_and(|report| report.written == 0),
+    "{landed:?}"
+  );
+  assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
+  assert_eq!(
+    host.fingerprint("/run.sh").unwrap().mode & PERMISSIONS,
+    PRIVATE_MODE & PERMISSIONS
+  );
+}
