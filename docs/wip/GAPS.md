@@ -267,7 +267,11 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
+> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
+> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
+> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
+> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver

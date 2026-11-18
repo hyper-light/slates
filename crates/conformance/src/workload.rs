@@ -214,7 +214,11 @@ hg -R ../shared status --all
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
-/// carriage return there, which the revision loop's count must not carry.
+/// carriage return there, which the revision loop's count must not carry. The repository's representation cache
+/// (`db/rep-cache.db`) is compared by what it holds, its rows, printed where `sqlite3` is on the `PATH`, never by its
+/// bytes: it is an SQLite file, whose page layout two runs of the same commits did not share (CI run 44247840584,
+/// ubuntu, 2026-11-18); the revisions it caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared, and
+/// `svnadmin verify` and the dump's checksum print the repository whole.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -275,6 +279,9 @@ svn cat -r 2 a.txt
 svn list -R '^/'
 cd ..
 svnadmin verify repo
+if command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, offset, size, expanded_size FROM rep_cache ORDER BY hash'
+fi
 svnlook tree repo
 # Format: revision 6, the merge, as the repository records it.
 svnlook changed -r 6 repo
@@ -613,6 +620,12 @@ pub const ROSTER: &[Workload] = &[
         "repo/db/uuid",
         "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
          the UUID itself is printed (`svn info --show-item repos-uuid`)",
+      ),
+      (
+        "repo/db/rep-cache.db",
+        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, so two runs of the \
+         same commits differ in its bytes; its rows are printed where sqlite3 is on the PATH, and the revisions it \
+         caches are compared byte for byte",
       ),
     ],
     runs_on_windows: true,
