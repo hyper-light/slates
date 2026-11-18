@@ -8,7 +8,7 @@ ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
 echo "runner $(uname -m), $(nproc) CPUs, commit $(git rev-parse --short HEAD), nofile $(ulimit -n)" > $R
 t=a_seeded_nemesis_of_single_faults_keeps_every_register_invariant
 seed=17036665960917068132
-for run in 1 2 3; do
+for run in 1 2; do
   began=$(date +%s)
   log=target/spin-$run.log
   SLATES_TEST_CLI=1 SLATES_CHAOS_SEED=$seed timeout 1200 cargo test --locked --release -q -p slates-cli --test live_chaos -- --exact $t --nocapture --test-threads=1 > $log 2>&1; code=$?
