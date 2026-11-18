@@ -1,6 +1,8 @@
 //! The Windows transport of the anchor's hold (A-198; the counterpart of `crate::held`'s Unix socketpair): a
 //! message-mode named-pipe pair (`slates_ipc::stream::message_pair`) over which a daemon asks the anchor to hold its
-//! WinFsp handles across its death, and the duplication that moves each handle into the anchor.
+//! WinFsp handles, and its Shards streams' resync ends (A-423), across its death, and the duplication that moves each
+//! handle into the anchor. A held entry's record can be replaced while it is held (`HandleMessage::Record`): a resync
+//! end's record is its stream's session, which moves while the stream lives.
 //!
 //! **Why a round trip, where Unix sends one way.** The Unix channel moves a descriptor with its message, by
 //! `SCM_RIGHTS`: once the daemon's `sendmsg` returns, the kernel holds the descriptor for the anchor's socket, so the
@@ -431,8 +433,8 @@ impl Held {
   }
 
   /// Applies one message from `daemon` (its process handle, which the anchor duplicates handles out of), and returns
-  /// the answer to send back, if any: a hold is answered [`HandleMessage::Held`] or [`HandleMessage::Refused`]; a
-  /// release drops the entry and answers only after every held handle has closed.
+  /// the answer to send back, if any: a hold is answered [`HandleMessage::Held`] or [`HandleMessage::Refused`], and so
+  /// is a record's replacement (A-423); a release drops the entry and answers only after every held handle has closed.
   pub fn apply(&mut self, daemon: HANDLE, message: HandleMessage) -> Option<HandleMessage> {
     match message {
       HandleMessage::Hold {
@@ -441,6 +443,7 @@ impl Held {
         values,
         record,
       } => Some(self.hold(daemon, id, what, &values, record)),
+      HandleMessage::Record { id, record } => Some(self.record(id, record)),
       HandleMessage::Release { id } => {
         self.entries.remove(&id);
         Some(HandleMessage::Released { id })
@@ -457,9 +460,10 @@ impl Held {
     }
   }
 
-  /// Duplicates each of `values` out of `daemon` and holds them as entry `id`, or refuses: the bound reached, the id
-  /// already held, or a handle that would not duplicate (a value that is not a handle of the daemon, or the daemon
-  /// gone). On refusal nothing of the entry is kept.
+  /// Duplicates each of `values` out of `daemon` and holds them as entry `id`, or refuses: a kind the anchor does not
+  /// hold or a count of handles that kind never names (`crate::handles::admits`), the bound reached, the id already
+  /// held, or a handle that would not duplicate (a value that is not a handle of the daemon, or the daemon gone). On
+  /// refusal nothing of the entry is kept.
   fn hold(
     &mut self,
     daemon: HANDLE,
@@ -468,11 +472,7 @@ impl Held {
     values: &[u64],
     record: Vec<u8>,
   ) -> HandleMessage {
-    if values.is_empty()
-      || values.len() > crate::handles::MAX_HANDLES
-      || record.len() > crate::handles::RECORD_CAP
-      || what != crate::handles::WHAT_WINFSP_MOUNT
-    {
+    if !crate::handles::admits(what, values.len()) || record.len() > crate::handles::RECORD_CAP {
       self.refused = self.refused.saturating_add(1);
       return HandleMessage::Refused {
         id,
@@ -523,6 +523,25 @@ impl Held {
         record,
       },
     );
+    HandleMessage::Held { id }
+  }
+
+  /// Replaces held entry `id`'s record with `record` (A-423: a Shards stream's session as it moves) and answers that the
+  /// anchor holds it, [`HandleMessage::Held`]; refused [`Reason::Malformed`] and counted, with nothing changed, for an
+  /// entry the anchor does not hold or a record past the cap. Its handles stay as they were held.
+  fn record(&mut self, id: u64, record: Vec<u8>) -> HandleMessage {
+    let Some(entry) = self
+      .entries
+      .get_mut(&id)
+      .filter(|_| record.len() <= crate::handles::RECORD_CAP)
+    else {
+      self.refused = self.refused.saturating_add(1);
+      return HandleMessage::Refused {
+        id,
+        reason: Reason::Malformed,
+      };
+    };
+    entry.record = record;
     HandleMessage::Held { id }
   }
 
@@ -751,6 +770,73 @@ mod tests {
     );
     assert_eq!(held.len(), 1);
     assert_eq!(held.refusals(), 2);
+  }
+
+  /// A-423. Do: hold one handle as a Shards stream's resync end with a session as its record; ask for one naming two
+  /// handles of that kind; replace the held entry's record; then replace the record of an entry not held, and one past
+  /// the cap. Expect: the one-handle hold held and the two-handle one refused `Malformed`; the replacement answered
+  /// `Held`, and the next process handed the new record under the resync kind with its one handle; the last two refused
+  /// `Malformed` and counted, with nothing changed.
+  #[test]
+  fn a_resync_end_is_held_alone_and_its_record_moves_with_its_session() {
+    use crate::handles::{RECORD_CAP, WHAT_SHARDS_RESYNC};
+    let (_anchor, daemon) = channel().unwrap();
+    let mut held = Held::new(4);
+    let (end, other) = (one_event(), one_event());
+    let value = handle_value(end.as_raw_handle());
+    let resync = |id, values: Vec<u64>| HandleMessage::Hold {
+      id,
+      what: WHAT_SHARDS_RESYNC,
+      values,
+      record: b"the attach's session".to_vec(),
+    };
+    assert_eq!(
+      held.apply(myself(), resync(1, vec![value])),
+      Some(HandleMessage::Held { id: 1 })
+    );
+    let two = vec![value, handle_value(other.as_raw_handle())];
+    assert_eq!(
+      held.apply(myself(), resync(2, two)),
+      Some(HandleMessage::Refused {
+        id: 2,
+        reason: Reason::Malformed
+      }),
+      "a resync end is one handle"
+    );
+    let named = b"the guest named its owner".to_vec();
+    assert_eq!(
+      held.apply(
+        myself(),
+        HandleMessage::Record {
+          id: 1,
+          record: named.clone()
+        }
+      ),
+      Some(HandleMessage::Held { id: 1 })
+    );
+    let handoff = held.handoff(&daemon).unwrap();
+    let (_, entries) = crate::handles::parse_env(handoff.env(), 4).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+      (entries[0].id, entries[0].what, entries[0].values.len()),
+      (1, WHAT_SHARDS_RESYNC, 1)
+    );
+    assert_eq!(entries[0].record, named);
+    for (id, record) in [(9, Vec::new()), (1, vec![0; RECORD_CAP + 1])] {
+      assert_eq!(
+        held.apply(myself(), HandleMessage::Record { id, record }),
+        Some(HandleMessage::Refused {
+          id,
+          reason: Reason::Malformed
+        })
+      );
+    }
+    assert_eq!((held.len(), held.refusals()), (1, 3));
+    let (_, kept) = crate::handles::parse_env(held.handoff(&daemon).unwrap().env(), 4).unwrap();
+    assert_eq!(
+      kept[0].record, named,
+      "a refused replacement changes nothing"
+    );
   }
 
   /// A-198. Do: ask to hold a value that is not a handle of the daemon. Expect: refused `Duplicate`, counted, nothing

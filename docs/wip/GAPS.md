@@ -775,9 +775,11 @@
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
 >   its guest's maps. **Owed:** Windows on Shards' handle path; its wire is built (A-418, 2026-11-18): a Windows
 >   `Resync` names the fresh end's handle in the stream's holder's process, where a successor duplicates it (A-175's
->   route), since no descriptor rides a message there; owed after it, the attach's half (the message-mode resync pipe,
->   the anchor holding its end with the session and the holder) and the successor's half (adopting the held end, the
->   duplicate into the holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
+>   route), since no descriptor rides a message there; and the Windows anchor's hold formats for it (A-423, the same
+>   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
+>   stream's session moves; owed after them, the attach's half (the message-mode resync pipe, the anchor holding its
+>   end with the session and the holder) and the successor's half (adopting the held end, the duplicate into the
+>   holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -3095,6 +3097,16 @@
 >     round, as many edits and merges as its conflicts make, stays in the `latency` row (191 ms at its p99 with every
 >     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
 >     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
+>
+>     **The harness's workers park instead of spinning (2026-11-18, g083, A-421).** Each worker spun for its whole
+>     level, a core each taken from the daemon it measured; on the loaded Mac Studio its sweeps took 25 to 127 ms and
+>     held 6.9 clients on average against 2.2 in flight. A worker now sweeps on for the daemon's published spin window
+>     after its last reply or send, then arms every connection with a request in flight and parks on their completions
+>     until a reply or its next deadline, waking early by the spin window and its parks' measured lateness. The
+>     `harness` row counts the parks. Unit tests: a worker parked with its request in flight is woken by the reply, and
+>     with nothing in flight meets its deadline. **Owed, measurement (the supervisor's):** the A/B of main's spinning
+>     harness against the parking one at the same daemon (`held`, `max_sweep_ns`, every kind's `latency` and `floor`
+>     p99).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,

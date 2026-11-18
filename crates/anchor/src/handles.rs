@@ -8,6 +8,13 @@
 //! committed record never names a hold the anchor was not given, the guarantee `SCM_RIGHTS` gives the Unix channel
 //! (`crate::held`).
 //!
+//! Two kinds of entry are held ([`admits`]): a WinFsp mount's handles (A-198), and a Shards stream's resync end (A-423,
+//! for A-418's Windows resync), whose record is the stream's session: its token, the owner view its guest named, its
+//! kernel's form and the process that holds the stream. A session moves while the stream lives (the guest names its
+//! owner, its `INIT` is answered, a restore runs, a holder is named), so a daemon replaces a held entry's record with
+//! [`HandleMessage::Record`], answered as a hold is, where the Unix channel sends a new session (`crate::held`'s
+//! `Session`); the record names no handle, so nothing is duplicated for it.
+//!
 //! Every message is [`MESSAGE_BYTES`] long, checksum-verified and checked by kind, counts and lengths before anything is kept: the channel
 //! crosses a process boundary, so its bytes are external input, and so is the environment a daemon parses. The
 //! transport is `crate::held_windows`; this module is pure and cfg-free, so it is tested on every host.
@@ -25,14 +32,34 @@ pub const WHAT_WINFSP_MOUNT: u8 = 1;
 /// third, the drive's temporary link, which a Mount Manager drive does not have).
 pub const WINFSP_MOUNT_HANDLES: usize = 2;
 
+/// Format: what a hold holds, its `what` byte: a Shards stream's resync end (A-423; A-316's channel on Windows, A-418):
+/// the daemon's end of the stream's message-mode resync pipe, its record the stream's session, which a successor reads
+/// to hand the device a fresh stream.
+pub const WHAT_SHARDS_RESYNC: u8 = 2;
+
+/// Format: the handles a Shards stream's resync hold names: the daemon's end of its resync pipe.
+pub const SHARDS_RESYNC_HANDLES: usize = 1;
+
 /// Format: the room one hold's message has for handles: three, A-198's WinFsp mount, kept since A-369 so the message's
 /// layout, which an anchor and a daemon built apart across an upgrade both read, does not move; a hold names one to
 /// this many.
 pub const MAX_HANDLES: usize = 3;
 
 /// Format: a WinFsp mount's largest handoff record: `FSP_FSCTL_VOLUME_NAME_SIZEMAX` (64 + 192 UTF-16 units), its
-/// two-unit drive name (`X:`), and one access-flags byte. The record is opaque to the anchor.
+/// two-unit drive name (`X:`), and one access-flags byte. The record is opaque to the anchor. It bounds every kind's
+/// record: a Shards stream's session is far shorter (A-418).
 pub const RECORD_CAP: usize = (64 + 192 + 2) * size_of::<u16>() + size_of::<u8>();
+
+/// Whether the anchor admits a hold of `what` naming `count` handles: a WinFsp mount one to [`MAX_HANDLES`] (its
+/// daemon names [`WINFSP_MOUNT_HANDLES`]; the room stays as A-198 left it, for a daemon built apart across an upgrade),
+/// a Shards stream's resync end exactly [`SHARDS_RESYNC_HANDLES`], and no other kind at all.
+pub fn admits(what: u8, count: usize) -> bool {
+  match what {
+    WHAT_WINFSP_MOUNT => (1..=MAX_HANDLES).contains(&count),
+    WHAT_SHARDS_RESYNC => count == SHARDS_RESYNC_HANDLES,
+    _ => false,
+  }
+}
 
 /// Format: the channel's magic, distinguishing these messages from another inherited protocol.
 const MAGIC: &[u8; 4] = b"SLHD";
@@ -49,6 +76,9 @@ const KIND_HELD: u8 = 3;
 const KIND_REFUSED: u8 = 4;
 /// Format: the anchor's acknowledgement after closing every handle of an entry (A-198).
 const KIND_RELEASED: u8 = 5;
+/// Format: a daemon's replacement of a held entry's record (A-423), laid out as a hold whose kind, count and handle
+/// slots are zero.
+const KIND_RECORD: u8 = 6;
 
 /// Format: where the entry's id starts (after the kind byte).
 const AT_ID: usize = AT_KIND + 1;
@@ -225,6 +255,14 @@ pub enum HandleMessage {
     /// The entry's id.
     id: u64,
   },
+  /// A daemon replaces held entry `id`'s record with `record` (A-423: a Shards stream's session as it moves), answered
+  /// [`HandleMessage::Held`] once the anchor keeps it, or [`HandleMessage::Refused`] for an entry it does not hold.
+  Record {
+    /// The entry's id.
+    id: u64,
+    /// The new record, at most [`RECORD_CAP`] bytes.
+    record: Vec<u8>,
+  },
   /// The anchor holds entry `id`.
   Held {
     /// The entry's id.
@@ -250,6 +288,7 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
   let mut bytes = [0u8; MESSAGE_BYTES];
   let (kind, id) = match message {
     HandleMessage::Hold { id, .. } => (KIND_HOLD, *id),
+    HandleMessage::Record { id, .. } => (KIND_RECORD, *id),
     HandleMessage::Release { id } => (KIND_RELEASE, *id),
     HandleMessage::Held { id } => (KIND_HELD, *id),
     HandleMessage::Released { id } => (KIND_RELEASED, *id),
@@ -281,6 +320,15 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
           .ok_or_else(|| malformed("handle offset"))?;
         put(&mut bytes, at, &value.to_le_bytes())?;
       }
+      put(&mut bytes, AT_RECORD_LEN, &record_len.to_le_bytes())?;
+      put(&mut bytes, AT_RECORD, record)?;
+    }
+    // A record's replacement names no kind, count or handle: those bytes stay zero.
+    HandleMessage::Record { record, .. } => {
+      if record.len() > RECORD_CAP {
+        return Err(malformed("a record past RECORD_CAP"));
+      }
+      let record_len = u16::try_from(record.len()).map_err(|_| malformed("record length"))?;
       put(&mut bytes, AT_RECORD_LEN, &record_len.to_le_bytes())?;
       put(&mut bytes, AT_RECORD, record)?;
     }
@@ -348,6 +396,7 @@ pub fn decode(bytes: &[u8]) -> Result<HandleMessage, HandleRefusal> {
   let id = u64_at(bytes, AT_ID)?;
   let (message, used) = match kind {
     KIND_HOLD => decode_hold(bytes, id)?,
+    KIND_RECORD => decode_record(bytes, id)?,
     KIND_RELEASE => (HandleMessage::Release { id }, AT_WHAT),
     KIND_RELEASED => (HandleMessage::Released { id }, AT_WHAT),
     KIND_HELD => (HandleMessage::Held { id }, AT_WHAT),
@@ -388,6 +437,38 @@ fn decode_hold(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRe
       return Err(malformed("a handle slot past the count"));
     }
   }
+  let (record, used) = decode_record_field(bytes)?;
+  Ok((
+    HandleMessage::Hold {
+      id,
+      what,
+      values,
+      record,
+    },
+    used,
+  ))
+}
+
+/// A record's replacement (A-423), and how many of the message's bytes it uses: its kind, count and handle slots must
+/// be zero, since it names no handle, and its record is read as a hold's.
+fn decode_record(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRefusal> {
+  let unnamed = AT_RECORD_LEN
+    .checked_sub(AT_WHAT)
+    .ok_or_else(|| malformed("record offsets"))?;
+  if field(bytes, AT_WHAT, unnamed)?
+    .iter()
+    .any(|byte| *byte != 0)
+  {
+    return Err(malformed(
+      "a record's replacement names a kind, a count or a handle",
+    ));
+  }
+  let (record, used) = decode_record_field(bytes)?;
+  Ok((HandleMessage::Record { id, record }, used))
+}
+
+/// The record a hold or a record's replacement carries, at most [`RECORD_CAP`] bytes, and the end of the bytes it uses.
+fn decode_record_field(bytes: &[u8]) -> Result<(Vec<u8>, usize), HandleRefusal> {
   let raw: [u8; 2] = field(bytes, AT_RECORD_LEN, RECORD_LEN_BYTES)?
     .try_into()
     .map_err(|_| malformed("record length"))?;
@@ -399,15 +480,7 @@ fn decode_hold(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRe
   let used = AT_RECORD
     .checked_add(record_len)
     .ok_or_else(|| malformed("record end"))?;
-  Ok((
-    HandleMessage::Hold {
-      id,
-      what,
-      values,
-      record,
-    },
-    used,
-  ))
+  Ok((record, used))
 }
 
 /// One held entry as the environment hands it to a spawned daemon: its id, what it is, the handle values the daemon
@@ -818,5 +891,128 @@ mod tests {
       parse_env(&duplicate, 2).is_err(),
       "entries cannot share a handle value"
     );
+  }
+
+  /// The session a Shards stream's resync hold carries in the tests: opaque to the anchor, the length of a Windows
+  /// stream's session (A-418: the token, the owner view, the form, the holder's id and start time).
+  fn session(fill: u8) -> Vec<u8> {
+    vec![fill; 52]
+  }
+
+  /// A-423: golden vector. Do: encode a record's replacement for a held entry. Expect: the magic, the record kind, the
+  /// id, zero where a hold names its kind, count and handles, then the record's length and bytes as a hold's, zero to
+  /// the checksum and the CRC32C; and the message back whole.
+  #[test]
+  fn a_record_encodes_to_its_golden_bytes_and_back() {
+    let message = HandleMessage::Record {
+      id: 0x0102_0304_0506_0708,
+      record: session(0x5a),
+    };
+    let mut expected = MAGIC.to_vec();
+    expected.push(6);
+    expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    expected.extend_from_slice(&[0, 0]);
+    expected.extend_from_slice(&[0; MAX_HANDLES * size_of::<u64>()]);
+    expected.extend_from_slice(&52u16.to_le_bytes());
+    expected.extend_from_slice(&session(0x5a));
+    expected.resize(AT_CHECKSUM, 0);
+    let checksum = slates_wire::crc32c::crc32c(&expected);
+    expected.extend_from_slice(&checksum.to_le_bytes());
+    let bytes = encode(&message).unwrap();
+    assert_eq!(bytes.to_vec(), expected);
+    assert_eq!(decode(&bytes).unwrap(), message);
+  }
+
+  /// A-423. Do: encode then decode a Shards stream's resync hold (one handle, a session as its record), a record's
+  /// replacement, and one with an empty record. Expect: each back whole, the kind's byte kept.
+  #[test]
+  fn a_resync_hold_and_a_record_round_trip() {
+    for message in [
+      HandleMessage::Hold {
+        id: 11,
+        what: WHAT_SHARDS_RESYNC,
+        values: vec![0x2c4],
+        record: session(1),
+      },
+      HandleMessage::Record {
+        id: 11,
+        record: session(2),
+      },
+      HandleMessage::Record {
+        id: u64::MAX,
+        record: Vec::new(),
+      },
+    ] {
+      let bytes = encode(&message).unwrap();
+      assert_eq!(decode(&bytes).unwrap(), message);
+    }
+  }
+
+  /// A-423: hostile input. Do: decode a record's replacement naming a kind, a count or a handle, one whose record runs
+  /// past the cap, and one with a bit changed anywhere; and encode one whose record is past the cap. Expect: every one
+  /// refused, none accepted, and the long record refused at encoding rather than cut.
+  #[test]
+  fn a_record_names_no_handle_and_stays_within_the_cap() {
+    let good = encode(&HandleMessage::Record {
+      id: 3,
+      record: session(7),
+    })
+    .unwrap();
+    let mut cases = Vec::new();
+    for at in [AT_WHAT, AT_COUNT, AT_HANDLES, AT_RECORD_LEN - 1] {
+      let mut named = good;
+      named[at] = 1;
+      cases.push(named);
+    }
+    let mut long = good;
+    long[AT_RECORD_LEN..AT_RECORD].copy_from_slice(&u16::MAX.to_le_bytes());
+    cases.push(long);
+    for mut case in cases {
+      // Re-signed, so each is refused by its shape and not by its checksum.
+      let checksum = slates_wire::crc32c::crc32c(&case[..AT_CHECKSUM]);
+      case[AT_CHECKSUM..].copy_from_slice(&checksum.to_le_bytes());
+      assert!(
+        matches!(decode(&case), Err(HandleRefusal::Malformed { .. })),
+        "accepted a record beginning {:?}",
+        case.get(..AT_RECORD)
+      );
+    }
+    for offset in 0..good.len() {
+      let mut changed = good;
+      changed[offset] ^= 1;
+      assert!(
+        decode(&changed).is_err(),
+        "accepted a change at byte {offset}"
+      );
+    }
+    assert!(matches!(
+      encode(&HandleMessage::Record {
+        id: 3,
+        record: vec![0; RECORD_CAP + 1],
+      }),
+      Err(HandleRefusal::Malformed { .. })
+    ));
+  }
+
+  /// A-423. Do: ask whether the anchor admits a hold of each kind naming each count of handles from none to one past
+  /// the message's room, and of kinds no daemon sends. Expect: a WinFsp mount one to the room (its daemon names two,
+  /// the room kept since A-369), a Shards stream's resync end exactly one, and nothing of any other kind.
+  #[test]
+  fn the_anchor_admits_each_kind_at_its_handle_counts_alone() {
+    for count in 0..=MAX_HANDLES + 1 {
+      assert_eq!(
+        admits(WHAT_WINFSP_MOUNT, count),
+        (1..=MAX_HANDLES).contains(&count),
+        "a WinFsp mount naming {count}"
+      );
+      assert_eq!(
+        admits(WHAT_SHARDS_RESYNC, count),
+        count == SHARDS_RESYNC_HANDLES,
+        "a resync end naming {count}"
+      );
+      for what in [0, 3, u8::MAX] {
+        assert!(!admits(what, count), "kind {what} naming {count}");
+      }
+    }
   }
 }
