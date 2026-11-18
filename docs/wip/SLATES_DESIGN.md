@@ -860,6 +860,10 @@ plan schedules.
   distinguishes workloads within it. A channel label supplied by a caller cannot establish
   human authority. A trusted confirmation surface binds its approval to the exact manifest;
   transport checks supplement that authority check (§4.13).
+- A-285 (Ada, 2026-11-18): the human's authority is a signature by a key only the human holds (an ssh-agent key that
+  asks for confirmation on every use, or a FIDO key that needs a touch), over the exact landing and a nonce the daemon
+  issued; the anchor's own terminal is the fallback where no key is registered. No secret a process of the user can
+  read is authority any more.
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -7062,6 +7066,12 @@ server, not inferred from command names.
 > engine's transition, so only a finished single-use landing consumes its grant. Before, a restart lost
 > every grant and a session grant was recorded spent at its first landing. Record:
 > `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
+
+> **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
+> signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
+> assertion over the same statement; the anchor's own terminal where no key is registered. The statement and the SSH
+> verifier are built (`crates/server/src/grant_signature.rs`); the wire, the nonce, key registration and the CLI are
+> owed, and the issuer secret still proves grants until they land. Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -21051,3 +21061,46 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
   `conformance run --suite workloads` does, as a user with no root, and holds the kernel's mount table to a FUSE
   mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
   runs over the mount are the supervisor's (CLAUDE.md §8).
+
+### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
+Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
+`crates/server/src/grant_signature.rs`.
+Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested). Owed, in order: the presentation's
+nonce, the signed `Grant` on the wire and the nonce spent once (replay); durable key registration (the first key only
+through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
+sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
+GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.
+- Why: before, the anchor held the grant-issuer secret. On Linux it sat in a descriptor only the anchor's children
+  inherit, so no `slates grant` could be issued and a Linux server's landing stopped at its presentation (GAPS, A-201);
+  on macOS and Windows the anchor printed `export` variables, and any process of the user that held them could grant,
+  agents included. fs-server's options (2026-11-05):
+  - A. The anchor asks on its own controlling terminal, naming the exact manifest. Small and on every OS, but R10 rests
+    on who owns that terminal: an agent that started the anchor in its own shell can answer.
+  - B. A same-user socket to the anchor checked by `SO_PEERCRED`. Any process of the user, agents included, can
+    grant; it breaks D-22. Rejected.
+  - C. A separate operator account owns issuance (the peer's uid is checked). Strong and unprivileged, but a setup per
+    machine and the human switching accounts for each grant.
+  - **D. A grant signed by a key only the human holds**: an ssh-agent key added with `ssh-add -c` (the agent asks the
+    human through askpass on every use) or a FIDO key (`sk-ssh-ed25519`, a touch per signature). An agent with a shell
+    cannot make the signature unseen.
+  - E. Standing grants in a file the human writes. It weakens R10 to a policy, and agents must not be able to write
+    the file.
+
+  Ada chose D, with A only where no key is registered, the same on macOS, Windows and Linux (2026-11-18).
+- The proof: an SSH signature (OpenSSH `PROTOCOL.sshsig`) under the namespace `slates-grant`, over a plain-text
+  statement, one field a line: the landing, the manifest hash, the target (prefixed by its byte length), the scope and
+  term, a nonce the daemon issues with the presentation, and an expiry in Unix seconds. It covers all that the old
+  keyed proof bound. The nonce makes a signature usable once and only after the presentation. Keys: `ssh-ed25519` and
+  `sk-ssh-ed25519@openssh.com`, whose signature must carry the authenticator's user-presence flag; hashes `sha512` or
+  `sha256`; Ed25519 and SHA-2 from AWS-LC (A-66). A second form is accepted over the same bytes: a WebAuthn assertion
+  whose challenge is the statement's SHA-256, made in kiln's person session (a passkey or a security-key touch).
+- Registration is itself a grant-class act. A standalone anchor accepts its first key only through A's terminal
+  prompt. A kiln-managed anchor has no terminal; it registers and confirms through kiln's person session, a WebAuthn
+  ceremony whose public key reaches the anchor over kiln's authenticated person path, which agents cannot use (kiln
+  already refuses an agent a manifest-bearing land). This last route is the supervisor's direction, put to Ada as a
+  recommendation (2026-11-18). Each later key must be signed by a registered key. No agent channel can add a key.
+- Proven (piece 1): a real `ssh-keygen -Y sign` signature (OpenSSH 10.0p2) verifies; every single-bit flip of it is
+  refused; an unregistered key, a changed manifest or any other changed field, another namespace, a statement past its
+  expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
+  panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
+  the exact encoding, since the first vector was signed before the target gained its length prefix.
