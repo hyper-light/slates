@@ -244,7 +244,10 @@
 > with the owner dead, so no survivor serves the volume until the replacement leaves. Nothing acknowledged is lost:
 > writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
 > it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
-> every key-wait counter 0).
+> every key-wait counter 0). While the replacement is not yet seated the owner's death is a second failure, past the
+> `f` the fleet has spent; but nothing orders the pair's acceptance before the seat, and a delivery that fails waits
+> for the next record period (`fleet.seal.pair_recipient_unknown`, `fleet.seal.pair_undelivered`), so how long the
+> window can outlast the seat, where the owner's death is a single failure, is not measured.
 > The sibling, read the same way: a sealed head's envelope opens only through the lineage key the head wraps for each
 > candidate's anchor under the same pair (A-92 piece 4c), so a replacement successor in that window leaves it unopened
 > (`fleet.seal.envelope_unopened`, `fleet::opened_archive`) and that volume unserved too. Owed for both: the
