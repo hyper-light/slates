@@ -187,7 +187,9 @@ const PARKS_PER_MILLE: u64 = 1000;
 
 /// Each shard's parks (driver waits) over a form, per thousand creates (each followed by its destroy), and
 /// each shard's measured wake cost after it: a shard that parks between a client's requests makes every
-/// request it serves or is forwarded pay that wake, which the percentiles show only as latency.
+/// request it serves or is forwarded pay that wake, which the percentiles show only as latency. Beside the wake, the
+/// idle turn a request meets as the shard has learned it: a shard keeps a closed loop's hold only while the turn is
+/// the shorter (A-387).
 fn print_parks(
   key: &str,
   before: &[slates_server::daemon::ShardPulse],
@@ -204,10 +206,11 @@ fn print_parks(
         .map_or(0, |old| old.waits);
       let parks = pulse.waits.saturating_sub(earlier);
       format!(
-        "shard {}: {} (wake {} ns)",
+        "shard {}: {} (wake {} ns, turn {} ns)",
         pulse.shard,
         parks * PARKS_PER_MILLE / creates,
-        pulse.wake_cost_ns
+        pulse.wake_cost_ns,
+        pulse.held_turn_ns
       )
     })
     .collect();
