@@ -218,6 +218,11 @@ pub trait LandFs: HostFs {
     files: &[HostFile],
     ran: Result<(), HostError>,
   ) -> Result<(), HostError>;
+  /// The existing file `name` under `dir`, opened so its mode and Windows bits can be set and nothing else (a landing's
+  /// metadata entry, A-458): never through a link, and refused `NotFile` for anything but a regular file. Unix opens it
+  /// to read, since `fchmod` asks for ownership, not write access; Windows asks `FILE_READ_ATTRIBUTES |
+  /// FILE_WRITE_ATTRIBUTES` and nothing of its data. Closed with [`HostFs::close_file`].
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,

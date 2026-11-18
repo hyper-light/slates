@@ -106,6 +106,9 @@ const TEMP_ACCESS: u32 =
   FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written,
+/// nothing of its data (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`).
+const CHMOD_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
 const MADE_DIR_ACCESS: u32 =
   FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -1243,6 +1246,27 @@ impl LandFs for OsLand {
     ran: Result<(), HostError>,
   ) -> Result<(), HostError> {
     ran
+  }
+
+  /// The file opened to have its attributes set and nothing else (A-458: `FILE_READ_ATTRIBUTES |
+  /// FILE_WRITE_ATTRIBUTES`), relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a
+  /// link: opened with `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = nt_create(
+      self.dir(dir)?,
+      name,
+      CHMOD_ACCESS,
+      nt::FILE_OPEN,
+      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      0,
+    )?;
+    if attributes(opened.as_handle())?
+      & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+      != 0
+    {
+      return Err(HostError::NotFile);
+    }
+    self.host.adopt_file(opened)
   }
 
   /// The one bit a mode decides on Windows, `READONLY`, with every other bit the temporary holds kept

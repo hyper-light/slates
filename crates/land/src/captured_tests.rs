@@ -38,6 +38,12 @@ const DIR_MODE: u32 = 0o040_755;
 const TERM_NS: u64 = 1_000_000_000_000;
 /// Shape: the large-file class boundary, one chunk window.
 const LARGE: u64 = 65_536;
+/// Shape: a file made executable (`chmod +x` of `FILE_MODE`).
+const EXECUTABLE_MODE: u32 = 0o100_755;
+/// Shape: an outsider's mode for a file, private to its owner.
+const PRIVATE_MODE: u32 = 0o100_600;
+/// Format: a mode's permission bits.
+const PERMISSIONS: u32 = 0o7777;
 
 fn store() -> Store {
   let mut arena = ChunkArena::new(PAGE);
@@ -364,4 +370,154 @@ fn a_target_already_holding_the_change_is_accepted_and_written_over_nothing() {
     Some(crate::engine::Outcome::Skipped(_))
   ));
   assert_eq!(host.bytes("/target/olddir/f.rs"), None);
+}
+
+/// A-458. Do: in a captured clone, `chmod` `/src/keep.rs`, a file whose bytes the agent never changed, from 0644 to
+/// 0755, and land the clone against its capture. Expect the change since the capture to hold the file, the landing
+/// `Done`, and the target's file at 0755 with its bytes and its inode kept (no byte rewritten). Before A-458 a captured
+/// clone's plan compared content alone, so it planned nothing for the file and its mode never landed.
+#[test]
+fn a_captured_clones_mode_change_alone_lands() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let keep = clone.resolve(&store, "/src/keep.rs").unwrap().inode;
+  clone.chmod(&mut store, keep, EXECUTABLE_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  let before = host.fingerprint("/target/src/keep.rs").unwrap();
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  assert!(
+    presented
+      .manifest
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src/keep.rs"),
+    "{:?}",
+    presented.manifest.entries
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  let after = host.fingerprint("/target/src/keep.rs").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, EXECUTABLE_MODE & PERMISSIONS);
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
+  assert_eq!(
+    host.bytes("/target/src/keep.rs").as_deref(),
+    Some(&b"kept"[..])
+  );
+}
+
+/// The mode the target's file holds, its permission bits alone.
+fn mode_on_disk(host: &SimHost, path: &str) -> u32 {
+  host.fingerprint(path).unwrap().mode & PERMISSIONS
+}
+
+/// A-466. Do: in a captured clone whose agent rewrote `/src/edit.rs` and left its mode, have an outsider make the
+/// target's file 0600, and land the clone against its capture. Expect the landing `Done` and the target's file holding
+/// the agent's bytes with the outsider's 0600: the bytes keep their content verdict, and a mode the agent left alone is
+/// the disk's. Before A-466 the replacement was staged with the clone's 0644, and the outsider's change was lost.
+#[test]
+fn a_captured_clones_replacement_keeps_an_outsiders_mode_it_left_alone() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let (mut host, target) = disk(&[]);
+  host.chmod("/target/src/edit.rs", PRIVATE_MODE);
+  let (_, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  assert_eq!(
+    host.bytes("/target/src/edit.rs").as_deref(),
+    Some(&b"the agent's body"[..])
+  );
+  assert_eq!(
+    mode_on_disk(&host, "/target/src/edit.rs"),
+    PRIVATE_MODE & PERMISSIONS,
+    "the outsider's mode, which the agent never changed"
+  );
+}
+
+/// A-466 (a mode both changed, differently; D-27: never inferred). Do: in a captured clone whose agent rewrote
+/// `/src/edit.rs`, `chmod` it 0755, while an outsider makes the target's file 0600; present and land. Expect
+/// `ModifyModify` at the file and nothing written there: the target's file keeps its captured bytes and the outsider's
+/// 0600. Before A-466 the bytes' verdict alone judged it, and the clone's 0755 replaced the outsider's 0600.
+#[test]
+fn a_captured_clones_replacement_whose_mode_both_changed_differently_is_a_conflict() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let edit = clone.resolve(&store, "/src/edit.rs").unwrap().inode;
+  clone.chmod(&mut store, edit, EXECUTABLE_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  host.chmod("/target/src/edit.rs", PRIVATE_MODE);
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  let verdict = presented
+    .preliminary
+    .iter()
+    .find(|r| r.path.as_ref() == "/src/edit.rs")
+    .and_then(|r| r.verdict);
+  assert_eq!(
+    verdict,
+    Some(Verdict::Conflict(ConflictClass::ModifyModify))
+  );
+  assert!(result.is_err() || result.as_ref().is_ok_and(|r| r.written == 0));
+  assert_eq!(
+    host.bytes("/target/src/edit.rs").as_deref(),
+    Some(&b"old body"[..])
+  );
+  assert_eq!(
+    mode_on_disk(&host, "/target/src/edit.rs"),
+    PRIVATE_MODE & PERMISSIONS
+  );
+}
+
+/// A-466 (the bytes already there, the mode not). Do: in a captured clone whose agent rewrote `/src/edit.rs`, `chmod` it
+/// 0755, while an outsider writes the agent's bytes into the target's file and leaves its 0644; land. Expect the landing
+/// `Done` and the target's file at 0755 with the agent's bytes under its own inode: the bytes accepted as identical and
+/// the mode set alone, no byte rewritten. Before A-466 the whole entry was accepted as identical, and the agent's mode
+/// never landed.
+#[test]
+fn a_captured_clones_replacement_already_on_the_disk_still_lands_its_mode() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let edit = clone.resolve(&store, "/src/edit.rs").unwrap().inode;
+  clone.chmod(&mut store, edit, EXECUTABLE_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  host.write_in_place("/target/src/edit.rs", b"the agent's body", 1);
+  let before = host.fingerprint("/target/src/edit.rs").unwrap();
+  let (_, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  assert_eq!(
+    mode_on_disk(&host, "/target/src/edit.rs"),
+    EXECUTABLE_MODE & PERMISSIONS
+  );
+  assert_eq!(
+    host.fingerprint("/target/src/edit.rs").unwrap().ino,
+    before.ino,
+    "the same file: its bytes never rewritten"
+  );
+  assert_eq!(
+    host.bytes("/target/src/edit.rs").as_deref(),
+    Some(&b"the agent's body"[..])
+  );
 }

@@ -32,6 +32,8 @@
 mod block_clone;
 #[cfg(test)]
 mod captured_tests;
+#[cfg(test)]
+mod chmod_tests;
 pub mod engine;
 pub mod grant;
 pub mod manifest;

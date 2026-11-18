@@ -546,8 +546,8 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
 /// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
 /// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
-/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
-/// start wait.
+/// window and at most one more, the window being the anchor's (the liveness budget, raised to how late the anchor's own
+/// waits ran where that is longer, A-461); and the new daemon answering within the suite's start wait.
 ///
 /// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
 /// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
@@ -610,10 +610,9 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert_eq!(
-    window,
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
-    "the anchor's window is the liveness budget"
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget, or longer where its own waits ran later (A-461): {window:?} ({line})"
   );
   assert!(
     age >= window && still >= window,
@@ -634,7 +633,7 @@ const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
 /// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
 /// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
-/// process made no progress for F ms (the W ms liveness window); killing it".
+/// process made no progress for F ms (its W ms window); killing it" (A-461: the window the anchor judged it by).
 const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
 
 /// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
@@ -769,12 +768,30 @@ fn a_stuck_start_is_killed_and_restarted() {
   drop(anchor);
   assert_ne!(answered, stuck);
   assert!(!stuck_alive, "the stuck start was killed");
-  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let still_for = kill_line
+  // The stillness and the window the line names (A-461: the anchor's window, the liveness budget or, where its own waits
+  // ran later, longer): "made no progress for F ms (its W ms window)".
+  let named: Vec<u64> = kill_line
     .split_once(STUCK_WORDS)
-    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|ms| ms.parse().ok())
-    .map(Duration::from_millis);
+    .map(|(_, rest)| {
+      rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .filter_map(|word| word.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default();
+  let (still_for, window) = match named[..] {
+    [still, window] => (
+      Some(Duration::from_millis(still)),
+      Duration::from_millis(window),
+    ),
+    _ => (None, Duration::ZERO),
+  };
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the start was judged by the anchor's window, never under the liveness budget: {kill_line:?}"
+  );
   assert!(
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"

@@ -1185,6 +1185,11 @@ impl LandFs for SimHost {
     Ok(())
   }
 
+  /// The file as [`HostFs::open_file`] opens it: the simulated disk keeps no access modes (A-458).
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    HostFs::open_file(self, dir, name)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     self.write_step()?;
     let now = self.now_ns;
