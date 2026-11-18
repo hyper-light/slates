@@ -2912,6 +2912,19 @@
 >   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
 >   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
 >   replaced by ask (the one land writes nothing).
+> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3; macOS legs
+>   done, Linux legs owed).** Two kiln runners, one manifest over the LAN (Wi-Fi: 90-150 ms average round trips, spikes
+>   to about 470 ms), no person in the run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`,
+>   `approve`) are the per-machine steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the
+>   client, `node` starts each node (the server under its launcher's secret, made on the server, mode 0600, read on
+>   standard input), the client pushes two increments over four files into two greens (accepted 1 and 2; the late push
+>   refused with `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1
+>   create, 3 replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one
+>   `slates land` writes 4 entries (92 bytes); the server's disk holds every merged byte. Server Adas-Mac-Studio, client
+>   Adas-Mac-Studio-2: passed in 83 s (kiln node runs r1052, r1054); the reverse: passed in 69 s (r1118, r1119). The
+>   kiln program that drives both machines is the supervisor's (`~/.cache/slates-scratch/fanout/fs-two-machines.js`).
+>   **Owed:** the Linux x86_64 legs (server on Linux, then client on Linux). adacachy2 was held for hours by kiln's own
+>   CI labs, during which kiln freezes every agent run there; adacachy did not answer.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
