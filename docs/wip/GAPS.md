@@ -74,12 +74,11 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
->   records none today, so a green taken over reads its merged versions unsigned;
-> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
->   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
->   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
->   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - **built 2026-11-18 (A-321's third part):** signed work survives a takeover. A version's merge record carries its
+>   verdict (`MergeRecordValue::signature`) to the holders it commits at and the successor's chain records it, so a green
+>   taken over reads its signed versions as they were judged; the catalog register carries the write policy, its
+>   version and the trusted signers (`CatalogValue::write`, `write_version`, `signers`), so a successor enforces and
+>   reports them (`crates/server/tests/fleet.rs`, two takeover tests on three nodes, each guard red alone);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
@@ -88,7 +87,10 @@
 >   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
 >   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
 >   written where the design says;
-> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
+>   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
+>   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
+>   Mac Studio carries only `ssh-sk-helper`'s hardware middleware (checked 2026-11-18);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
 >   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).

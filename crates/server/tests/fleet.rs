@@ -21128,7 +21128,8 @@ fn a_greens_policy_signers_and_verdicts_survive_its_owner() {
 
 /// A-285, A-321 (§4.8 "Promotion and takeover"): a plain volume's write policy and trusted signers survive its owner, by
 /// its catalog register. Do: three nodes at f = 1; on a, a scratch volume shared with the fleet, the launcher trusting
-/// one key on it and forbidding its landings; once both survivors hold its catalog register naming both, a dies.
+/// one key on it and forbidding its landings; once both survivors hold its head and its catalog register naming both,
+/// a dies.
 /// Expect on its successor, once the volume answers there: the policy and the signers read back as set, at version 2,
 /// and a landing refused `PolicyForbids` naming the volume. Before 2026-11-18 the successor made the volume's record with
 /// no policy and no signers: it read back unset and presented the landing as an unset volume's.
@@ -21147,11 +21148,13 @@ fn a_volumes_policy_and_signers_survive_its_owner() {
   trust_and_set(&mut launcher, (&secret, id), &key, landings_forbidden());
   let object = ObjectId(id.bytes);
   let held = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
-    Ok(
-      daemons[1..]
-        .iter()
-        .all(|daemon| holds_policy_and_signers(daemon, object)),
-    )
+    // A takeover adopts the volume's head and its catalog, so both survivors hold each before the owner dies.
+    Ok(daemons[1..].iter().all(|daemon| {
+      holds_policy_and_signers(daemon, object)
+        && daemon
+          .fleet_holder_head(object)
+          .is_ok_and(|head| head.is_some())
+    }))
   });
   drop(launcher);
   drop(client);
