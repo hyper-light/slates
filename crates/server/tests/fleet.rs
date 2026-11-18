@@ -9861,6 +9861,110 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
   );
 }
 
+/// CLAUDE.md §2 item 8 (no unbounded retry), §4.8 phase one: an object whose recovery cohort keeps a member that never
+/// promises it is given up by name once it has waited the failover SLO's worth of periods without progress, rather than
+/// waited for without end. Do: three nodes at f = 1; a volume on a, sealed and its head held by b and c; b and c each
+/// leave the other's takeover pages and questions unanswered (`Daemon::inject_takeover_silence`: a holder cut off from
+/// one successor alone, which the council never retires since every other member hears it); a stops. Expect: the
+/// volume's successor, which learns the object from its own copy, answers its status
+/// `NotRecovered { TakeoverIncomplete { waited_on: "promises" } }` within the serve deadline, having counted the wait
+/// past its bound and the give-up, while the other survivor counted its silences (non-vacuous). Before, the successor
+/// counted `fleet.takeover.unpromised` every period and answered a retryable `Overloaded` for as long as it ran.
+#[test]
+fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("unpromised")) else {
+    panic!("create on the owner")
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot on the owner")
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  assert!(
+    poll_snapshot_placed(&observed, &mut client, id, snapshot),
+    "the volume's head placed"
+  );
+  // Both survivors hold the head, so the successor learns the object from its own copy whichever it is.
+  assert!(
+    poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(
+        daemons[1].fleet_holder_head(object)?.is_some()
+          && daemons[2].fleet_holder_head(object)?.is_some(),
+      )
+    }),
+    "both survivors hold the volume's head"
+  );
+  drop(client);
+  let silenced = [
+    daemons[1].inject_takeover_silence(&[hosts[2]]),
+    daemons[2].inject_takeover_silence(&[hosts[1]]),
+  ];
+  assert!(
+    silenced.iter().all(Result::is_ok),
+    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
+  );
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).unwrap();
+  daemons.remove(0).stop();
+  let (at, other) = if successor == hosts[1] {
+    (0, 1)
+  } else {
+    (1, 0)
+  };
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[at].instance());
+  let mut last = None;
+  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
+    let named = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotRecovered {
+          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on },
+        },
+      } if waited_on == "promises"
+    );
+    last = Some(reply);
+    Ok(named)
+  });
+  drop(client);
+  let counted = daemons[at]
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  let silences = daemons[other]
+    .fleet_refusals()
+    .map(|counters| counters.get("fleet.takeover.silenced_by_fault").copied());
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(silences, Ok(Some(count)) if count > 0),
+    "the other survivor left the successor's takeover questions unanswered: {silences:?}"
+  );
+  assert!(
+    given_up,
+    "the successor gives the volume up naming the promises it waited for, within {SERVE_DEADLINE:?}; its last reply \
+     {last:?}; its counters {counted:?}"
+  );
+  let counted = counted.unwrap_or_default();
+  for name in [
+    "fleet.takeover.unpromised.past_bound",
+    "fleet.takeover.given_up",
+  ] {
+    assert!(
+      counted
+        .iter()
+        .any(|(counter, count)| *counter == name && *count > 0),
+      "the successor counted {name}: {counted:?}"
+    );
+  }
+}
+
 /// A-251 (d), the process test (§4.8 "Promotion and takeover"; NoLoss): a takeover adopts a committed head that a holder
 /// left out of its pages because its routing lost the copy, the warm-restart case of
 /// `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md` (A-250 restores routing on a warm restart, so
