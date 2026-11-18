@@ -312,11 +312,17 @@ pub(super) fn step(s: &mut ShardState, stream: &mut ShardsStream) {
   forward_counts(s, stream);
 }
 
-/// Answers the filled ask with its descriptor, riding the answer by `SCM_RIGHTS` (Unix).
+/// Answers the filled ask with its descriptor, riding the answer by `SCM_RIGHTS` (Unix). The guest's stores through
+/// the map then live in an object only the device maps once this daemon is gone, so the stream gives its resync up
+/// (A-316) until the anchor holds such objects too.
 #[cfg(unix)]
-fn answer(_s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor) {
+fn answer(s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor) {
   owe(stream, &descriptor_answer());
   stream.owed_descriptor = Some(handed);
+  #[cfg(target_os = "linux")]
+  super::give_up_resync_for_dax(s, stream);
+  #[cfg(not(target_os = "linux"))]
+  let _ = s;
 }
 
 /// Answers the filled ask with the value of the section's duplicate in the claimant's process (Windows), and remembers

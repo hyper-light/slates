@@ -27,7 +27,7 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
+use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, Verification, WritePolicy};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -54,6 +54,25 @@ pub enum Submitted {
     /// The paths the increment changes.
     paths: u64,
   },
+}
+
+/// What a signer signs to make a merge signed work (A-321): the merge's statement and the increment's identity it names
+/// ([`Client::merge_statement`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeStatement {
+  /// The increment's identity the statement names.
+  pub identity: [u8; 32],
+  /// The exact bytes to sign, under the namespace `slates-work`.
+  pub statement: Vec<u8>,
+}
+
+/// A green version's merge record as a consumer reads it back (A-321, [`Client::merge_record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeRecord {
+  /// The version.
+  pub version: u64,
+  /// How the signature of the merge that made it was judged.
+  pub verification: Verification,
 }
 
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"): the work moved onto the head
@@ -148,6 +167,10 @@ pub struct ShardsStream {
   /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
   /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
   pub stream: StreamEnd,
+  /// The device's end of the stream's resync channel (A-316; `slates_bridge_fuse::shards_resync`), close-on-exec, to
+  /// hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor daemon hands the
+  /// device a fresh stream after this one's daemon dies. None where the daemon hands none (macOS and Windows yet).
+  pub resync: Option<StreamEnd>,
 }
 
 /// What `attach_vhost_user` returns (§4.6; goal G-vhost): the attachment, and the socket end to hand the VMM as its
@@ -861,18 +884,39 @@ fn extract_read(body: ReplyBody) -> Result<Vec<u8>, ClientError> {
 /// Extracts a submit's outcome from its reply — accepted at a version, or a conflict with windows —
 /// or a typed mismatch. The same rule the sync [`Client::submit`] applies.
 fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
+  extract_judged(body).map(|(submitted, _)| submitted)
+}
+
+/// Extracts a submit's outcome and how its signature was judged (A-321): a signed submit's verdict and an approval
+/// request carry it; an unsigned verdict is `Unsigned`.
+fn extract_judged(body: ReplyBody) -> Result<(Submitted, Verification), ClientError> {
   match body {
-    ReplyBody::Submitted {
-      version: Some(v), ..
-    } => Ok(Submitted::Accepted(v)),
-    ReplyBody::Submitted {
-      version: None,
+    ReplyBody::Submitted { version, conflicts } => {
+      Ok((verdict_of(version, conflicts), Verification::Unsigned))
+    }
+    ReplyBody::SubmittedSigned {
+      version,
       conflicts,
-    } => Ok(Submitted::Conflict(conflicts)),
+      verification,
+    } => Ok((verdict_of(version, conflicts), verification)),
     ReplyBody::MergeApprovalRequired {
-      identity, paths, ..
-    } => Ok(Submitted::ApprovalRequired { identity, paths }),
+      identity,
+      paths,
+      verification,
+      ..
+    } => Ok((
+      Submitted::ApprovalRequired { identity, paths },
+      verification,
+    )),
     _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
+  }
+}
+
+/// A verdict's version and windows as a [`Submitted`].
+fn verdict_of(version: Option<u64>, conflicts: Vec<MergeWindow>) -> Submitted {
+  match version {
+    Some(version) => Submitted::Accepted(version),
+    None => Submitted::Conflict(conflicts),
   }
 }
 
@@ -1275,7 +1319,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_read" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1403,7 +1449,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedWrite::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_write" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_write" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1530,18 +1578,22 @@ impl Client {
         established,
         capability,
         token,
-      } => Ok(ShardsStream {
-        stream: self.delivered_stream(attachment)?,
-        attachment: Attachment {
-          attachment,
-          lease_epoch,
-          path,
-          version,
-          established,
-          capability,
-          token,
-        },
-      }),
+      } => {
+        let (stream, resync) = self.delivered_stream_and_resync(attachment)?;
+        Ok(ShardsStream {
+          stream,
+          resync,
+          attachment: Attachment {
+            attachment,
+            lease_epoch,
+            path,
+            version,
+            established,
+            capability,
+            token,
+          },
+        })
+      }
       ReplyBody::ShardsHanded {
         attachment,
         lease_epoch,
@@ -1549,6 +1601,7 @@ impl Client {
         handle,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1566,6 +1619,7 @@ impl Client {
         secret,
       } => Ok(ShardsStream {
         stream: self.claim_offer(attachment, &secret)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1638,21 +1692,54 @@ impl Client {
   /// (Linux: a Shards stream, A-161; a vhost-user device's socket, G-vhost).
   #[cfg(unix)]
   fn delivered_stream(&self, attachment: u64) -> Result<StreamEnd, ClientError> {
-    let delivered = self.recv_delivery(|delivery| {
+    self
+      .delivered_stream_and_resync(attachment)
+      .map(|(stream, _resync)| stream)
+  }
+
+  /// [`Self::delivered_stream`], and the stream's resync end when the stream's delivery says one follows it (A-316),
+  /// which the daemon sends next, before the reply.
+  #[cfg(unix)]
+  fn delivered_stream_and_resync(
+    &self,
+    attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
+    let unexpected = || ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    };
+    let ControlDelivery::Stream(delivered) = self.recv_delivery(|delivery| {
       matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
-    })?;
-    match delivered {
-      ControlDelivery::Stream(delivered) => Ok(delivered.stream),
-      ControlDelivery::Mapping(_) => Err(ClientError::UnexpectedReply {
-        verb: "attach_shards",
-      }),
+    })?
+    else {
+      return Err(unexpected());
+    };
+    if !delivered.resync_follows {
+      return Ok((delivered.stream, None));
     }
+    let ControlDelivery::Resync(resync) = self.recv_delivery(|delivery| {
+      matches!(delivery, ControlDelivery::Resync(resync) if resync.attachment == attachment)
+    })?
+    else {
+      return Err(unexpected());
+    };
+    Ok((delivered.stream, Some(resync.end)))
   }
 
   /// No control socket carries a handle here: a Windows daemon answers the Shards form `ShardsHanded`, naming the handle
   /// in the reply, so `Attached` is not one of its answers to it.
   #[cfg(not(unix))]
   fn delivered_stream(&self, _attachment: u64) -> Result<StreamEnd, ClientError> {
+    Err(ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    })
+  }
+
+  /// See [`Self::delivered_stream`]: no control socket carries a handle here.
+  #[cfg(not(unix))]
+  fn delivered_stream_and_resync(
+    &self,
+    _attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })
@@ -3437,21 +3524,62 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    match self.call(&RequestBody::Submit {
+    extract_submitted(self.call(&RequestBody::Submit {
       work,
       evidence: evidence.to_vec(),
+    })?)
+  }
+
+  /// Submits a work volume's declared operations, as signed work when `signature` is given (A-321): an SSH signature
+  /// blob (the armour's base64, decoded) over the merge's statement ([`Client::merge_statement`]), made under the
+  /// namespace `slates-work`. The daemon judges it under the work's and the green's trusted signers and records the
+  /// verdict with the version; the outcome is the submit's, as [`Client::submit_with_evidence`] answers it, with how the
+  /// signature was judged (an accepted version's as it was recorded; `Unsigned` with none). A signature permits nothing:
+  /// a volume whose policy requires signed merges refuses one that did not verify when it would merge
+  /// (`SignatureRequired`), and every other answer is what the write modes give.
+  pub fn submit_with_signature(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+    signature: Option<&[u8]>,
+  ) -> Result<(Submitted, Verification), ClientError> {
+    let evidence = evidence.to_vec();
+    extract_judged(self.call(&match signature {
+      Some(signature) => RequestBody::SubmitSigned {
+        work,
+        evidence,
+        signature: signature.to_vec(),
+      },
+      None => RequestBody::Submit { work, evidence },
+    })?)
+  }
+
+  /// The statement a signature over `work`'s merge signs now (A-321), and the increment's identity it names: the work
+  /// is submitted held (`SubmitHeld`), so its increment is built and nothing is merged, whatever the write modes, short
+  /// of their forbidding the merge (refused `PolicyForbids`). Sign the statement under the namespace `slates-work`
+  /// (`ssh-keygen -Y sign -n slates-work -f KEY FILE`) and submit with [`Client::submit_with_signature`] before the work
+  /// changes, or the signature no longer verifies.
+  pub fn merge_statement(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+  ) -> Result<MergeStatement, ClientError> {
+    match self.call(&RequestBody::SubmitHeld {
+      work,
+      evidence: evidence.to_vec(),
+      signature: None,
     })? {
-      ReplyBody::Submitted {
-        version: Some(v), ..
-      } => Ok(Submitted::Accepted(v)),
-      ReplyBody::Submitted {
-        version: None,
-        conflicts,
-      } => Ok(Submitted::Conflict(conflicts)),
       ReplyBody::MergeApprovalRequired {
-        identity, paths, ..
-      } => Ok(Submitted::ApprovalRequired { identity, paths }),
-      _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
+        identity,
+        statement,
+        ..
+      } => Ok(MergeStatement {
+        identity,
+        statement,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "merge_statement",
+      }),
     }
   }
 
@@ -3465,12 +3593,84 @@ impl Client {
     identity: [u8; 32],
     proof: [u8; 32],
   ) -> Result<Submitted, ClientError> {
-    extract_submitted(self.call(&RequestBody::SubmitApproved {
+    self
+      .submit_approved_signed(work, evidence, (identity, proof), None)
+      .map(|(submitted, _)| submitted)
+  }
+
+  /// [`Client::submit_approved`] of a signed merge (A-321): the approval carries the signature the held submit carried,
+  /// since the hold kept nothing, and the outcome comes with how it was judged.
+  pub fn submit_approved_signed(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+    (identity, proof): ([u8; 32], [u8; 32]),
+    signature: Option<&[u8]>,
+  ) -> Result<(Submitted, Verification), ClientError> {
+    extract_judged(self.call(&RequestBody::SubmitApproved {
       work,
       evidence: evidence.to_vec(),
       identity,
       proof,
+      signature: signature.map(<[u8]>::to_vec),
     })?)
+  }
+
+  /// Sets a volume's trusted signers (A-321) from the policy `version` the setter read: the whole set of public keys, in
+  /// SSH wire form, whose signatures over the volume's work verify. The launcher's act, proven by `proof`
+  /// (`slates_server::landing::signers_proof`); refused as [`Client::set_policy`] is, and `BadRequest` for a key slates
+  /// does not verify. Moves the volume's policy version.
+  pub fn set_signers(
+    &mut self,
+    volume: VolumeId,
+    (keys, version): (&[Vec<u8>], u64),
+    proof: [u8; 32],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetSigners {
+      volume,
+      keys: keys.to_vec(),
+      version,
+      proof,
+    })? {
+      ReplyBody::SignersSet => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "set_signers",
+      }),
+    }
+  }
+
+  /// A volume's trusted signers (A-321), in SSH wire form in the order set, and its policy version, the one a
+  /// [`Client::set_signers`] names.
+  pub fn signers(&mut self, volume: VolumeId) -> Result<(Vec<Vec<u8>>, u64), ClientError> {
+    match self.call(&RequestBody::Policy {
+      subject: PolicySubject::Volume { volume },
+    })? {
+      ReplyBody::Policy {
+        signers, version, ..
+      } => Ok((signers, version)),
+      _ => Err(ClientError::UnexpectedReply { verb: "signers" }),
+    }
+  }
+
+  /// A green version's merge record (A-321): how the signature of the merge that made it was judged. Refused `NotFound`
+  /// for a version not yet committed.
+  pub fn merge_record(
+    &mut self,
+    green: VolumeId,
+    version: u64,
+  ) -> Result<MergeRecord, ClientError> {
+    match self.call(&RequestBody::MergeRecord { green, version })? {
+      ReplyBody::MergeRecord {
+        version,
+        verification,
+      } => Ok(MergeRecord {
+        version,
+        verification,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "merge_record",
+      }),
+    }
   }
 
   /// Edits a work volume and submits it, in one request (§4.16, A-225): exactly [`Client::edit`] and then, when the
@@ -3503,21 +3703,10 @@ impl Client {
       let token = self.stage(work, bytes)?;
       request(slates_ipc::protocol::EditBytes::Staged { token })
     };
-    match self.call(&request)? {
-      ReplyBody::Submitted {
-        version: Some(v), ..
-      } => Ok(Submitted::Accepted(v)),
-      ReplyBody::Submitted {
-        version: None,
-        conflicts,
-      } => Ok(Submitted::Conflict(conflicts)),
-      ReplyBody::MergeApprovalRequired {
-        identity, paths, ..
-      } => Ok(Submitted::ApprovalRequired { identity, paths }),
-      _ => Err(ClientError::UnexpectedReply {
-        verb: "edit_and_submit",
-      }),
-    }
+    // An accept answers as its version recorded it (A-321): a version a signed submit made first answers signed.
+    extract_submitted(self.call(&request)?).map_err(|_| ClientError::UnexpectedReply {
+      verb: "edit_and_submit",
+    })
   }
 
   /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
@@ -4021,7 +4210,9 @@ impl Client {
     subject: PolicySubject,
   ) -> Result<(Option<WritePolicy>, u64), ClientError> {
     match self.call(&RequestBody::Policy { subject })? {
-      ReplyBody::Policy { policy, version } => Ok((policy, version)),
+      ReplyBody::Policy {
+        policy, version, ..
+      } => Ok((policy, version)),
       _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
     }
   }
