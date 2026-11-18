@@ -317,19 +317,16 @@ pub struct ShardState {
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,
   /// The writes acknowledged since the last complete publication, kept whole in the region before `content_range` in
-  /// the anchor's content object (A-63; `crate::write_log`); `None` without a content object. Unix: the log serves a
-  /// FUSE mount taken over across a restart (Linux) and a Shards stream's writes (Linux, macOS; A-316, A-339); an NFS
-  /// client resends what a restart lost itself, by its write verifier.
-  #[cfg(unix)]
+  /// the anchor's content object (A-63; `crate::write_log`); `None` without a content object. The log serves a FUSE
+  /// mount taken over across a restart (Linux) and a Shards stream's writes (every platform; A-316, A-339, A-402); an
+  /// NFS client resends what a restart lost itself, by its write verifier.
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
   /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
   /// (A-63).
-  #[cfg(unix)]
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
   /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393).
-  #[cfg(unix)]
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
   /// recorded before the barrier publishes, so the publication carries it with the effect, and removed once written. At

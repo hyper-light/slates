@@ -3980,22 +3980,10 @@ fn image_range(
   }
 }
 
-/// This shard's content range for its recovery images (§4.8). Windows keeps no write log: neither a WinFsp mount nor a
-/// Shards stream there logs its writes yet (GAPS).
-#[cfg(windows)]
-fn content_slice(
-  config: &DaemonConfig,
-  partition: u16,
-  content: Option<&slates_mem::SparseObject>,
-) -> (usize, usize) {
-  image_range(config, partition, content)
-}
-
 /// This shard's content range for its recovery images (§4.8), and the write log at the slice's front with what the
 /// previous daemon left in it to replay (A-63, `crate::write_log`: a FUSE mount's writes on Linux, a Shards stream's on
-/// Linux and macOS, A-316, A-339), opened against the generation of the committed image, before anything this daemon
-/// does can publish and clear it. No log and nothing to replay without a content object.
-#[cfg(unix)]
+/// every platform, A-316, A-339, A-402), opened against the generation of the committed image, before anything this
+/// daemon does can publish and clear it. No log and nothing to replay without a content object.
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -4004,17 +3992,12 @@ fn content_slice(
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
-  Option<crate::dax_ranges::RangeTable>,
 ) {
   let images = image_range(config, partition, content.as_deref());
   let Some(object) = content.filter(|_| images.1 > images.0) else {
-    return ((0, 0), None, crate::write_log::Recovered::default(), None);
+    return ((0, 0), None, crate::write_log::Recovered::default());
   };
   let layout = config.shard_content_layout();
-  // The DAX range table (A-365), with what the previous daemon recorded in it.
-  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
-  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
-  let dax_ranges = crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes);
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
@@ -4033,14 +4016,25 @@ fn content_slice(
     },
   );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
-    Some((log, recovered)) => (images, Some(log), recovered, dax_ranges),
-    None => (
-      images,
-      None,
-      crate::write_log::Recovered::default(),
-      dax_ranges,
-    ),
+    Some((log, recovered)) => (images, Some(log), recovered),
+    None => (images, None, crate::write_log::Recovered::default()),
   }
+}
+
+/// The DAX range table in this shard's slice of the content object (A-365), with what the previous daemon recorded in
+/// it; none without a content object holding the shard's images (`images`, [`content_slice`]'s range).
+#[cfg(unix)]
+fn dax_range_table(
+  config: &DaemonConfig,
+  partition: u16,
+  images: (usize, usize),
+  content: Option<&mut slates_mem::SparseObject>,
+) -> Option<crate::dax_ranges::RangeTable> {
+  let object = content.filter(|_| images.1 > images.0)?;
+  let layout = config.shard_content_layout();
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes)
 }
 
 /// This shard's chunk arena (A-98): the pool extents its partition holds from a previous daemon, added under their
@@ -4359,16 +4353,15 @@ async fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  #[cfg_attr(windows, allow(unused_mut))]
   let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
-  #[cfg(unix)]
-  let (content_range, write_log, recovered_writes, dax_ranges) =
+  let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  #[cfg(windows)]
-  let content_range = content_slice(config, partition, content.as_ref());
+  // The DAX range table (A-365), with what the previous daemon recorded in it.
+  #[cfg(unix)]
+  let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -4412,11 +4405,8 @@ async fn init_shard(
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
-    #[cfg(unix)]
     write_log,
-    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
-    #[cfg(unix)]
     replay: recovered_writes.records,
     #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
@@ -4940,7 +4930,6 @@ async fn seal_idle_content() {
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
-#[cfg(unix)]
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   let slice = give_back_slice(s);
   let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
@@ -4950,12 +4939,6 @@ fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   };
   learn_give_back_rate(s, purged.walked, started);
   (purged.bytes, purged.more)
-}
-
-/// No write log on Windows (see `content_slice`).
-#[cfg(windows)]
-fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
-  (0, false)
 }
 
 /// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time

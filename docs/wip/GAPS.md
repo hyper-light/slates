@@ -711,8 +711,10 @@
 >   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
->   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
->   writes a death still loses whether or not it is resynced. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
+>   its guest's maps. **Owed:** Windows on Shards' handle path. **Built since (A-402, 2026-11-18):** the write log on
+>   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
+>   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
+>   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
 >   A-197's writable copies were taken back awake before the write log's replay, so a logged write a client's store
 >   followed was written over that store, in the client's own map, at a takeover; they are kept dormant through the
 >   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
@@ -10812,7 +10814,8 @@ A-358 found that an NFS write answered before any publication is lost when the d
 it again (Apple's never does). WinFsp has the same shape:
 - a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
   that wrote publish first (`crates/server/src/winfsp.rs`);
-- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- Windows had no write log (`write_log` was `#[cfg(unix)]`; it is on every platform since A-402, 2026-11-18, and a
+  Shards stream's writes are logged there; a WinFsp write is not logged yet);
 - a WinFsp drive outlives a killed daemon (A-198).
 
 So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
@@ -10823,7 +10826,8 @@ Owed:
    shape on a WinFsp drive: write, kill, flush, close, read back.
 2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
 
-Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
+since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 

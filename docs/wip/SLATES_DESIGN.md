@@ -4455,7 +4455,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
   the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
-  from the write log (A-63) as a mount's are. Where that log overflowed, the guest is told every file it had open may
+  from the write log (A-63) as a mount's are. On Windows, which hands no resync channel yet, a death ends the stream,
+  and the writes it acknowledged after its last publication are replayed into the volume all the same (A-402). Where that log overflowed, the guest is told every file it had open may
   have lost writes, as a taken-over mount's kernel is (`LostWrites`, A-393): a handle from before the death answers its
   `flush` `EIO` until an `fsync` through it has, once. It removes any other's record, as before.
 
@@ -28837,3 +28838,26 @@ Applied in the same change to:
   save and a restore, and the write log's unit tests. The guard removed alone fails it (the counter 0). Measured on a
   Mac Studio (r286), three interleaved passes: a `FLUSH` after a logged page write took 17.5–20.0 µs p50 before and
   15.7–16.0 µs after, and every one of 1,000 published nothing (BENCHMARKS, this date).
+
+### A-402 — The write log on every platform: a Windows Shards stream's acknowledged writes outlive its daemon's death (2026-11-18, goal g268; owed since A-316 in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's death bullet; GAPS: A-281's entry and the WinFsp write's entry (2026-11-18).
+- `crates/server`: `lib.rs` (`write_log` on every platform), `state.rs` (the log, its replay and its lost flag on
+  every platform), `daemon.rs` (`content_slice` opens the log everywhere; the DAX range table apart, Unix,
+  `dax_range_table`; the idle purge everywhere), `verbs.rs` (the replay and the publications' clear everywhere; the
+  replay's unit test `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone` everywhere), `shards.rs` (a
+  stream logs its writes everywhere, and its flush rule is everywhere's, A-399); the test
+  `crates/server/tests/stream_write_log.rs`, on every platform.
+
+- **What was there.** The write log (A-63) lived in each shard's slice of the anchor's content object on Unix alone:
+  a FUSE mount's writes (Linux) and, since A-316 and A-339, a Shards stream's (Linux, macOS). Windows has the same
+  content object and recovers the same images from it (a WinFsp drive outlives twenty killed daemons, A-198), but
+  kept no log, so a Windows stream's write acknowledged after the last publication was lost when its daemon died,
+  whether the stream ended or not.
+- **The rule.** One log on every platform, opened, appended, cleared at each publication that captures every volume,
+  given back when idle and replayed at recovery as on Unix. A Windows stream logs each write before its reply; its
+  `FORGET`s stay unlogged there, since no successor keeps a Windows stream yet (A-390 logs them for a stream the
+  anchor holds). A WinFsp write is not logged by this change; the log is now there for it (GAPS).
+- **Evidence.** On a Mac Studio (kiln run r368): the new test passes, as it did before on Unix, where streams were
+  logged already; and so do the write log's unit tests and the replay's. Windows, where the test is the red one, is
+  main's run (`run-requests.md`, 2026-11-18): it fails on main before this change, the file coming back empty.
