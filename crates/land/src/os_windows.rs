@@ -106,9 +106,11 @@ const TEMP_ACCESS: u32 =
   FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written,
-/// nothing of its data (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`).
-const CHMOD_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written
+/// (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, which its batch's barrier needs to flush it
+/// (A-472: `FlushFileBuffers` "writes all the buffered information for a specified file", through a handle that "must
+/// have the GENERIC_WRITE access right"); none of its data is written.
+const CHMOD_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
 const MADE_DIR_ACCESS: u32 =
   FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -1248,9 +1250,10 @@ impl LandFs for OsLand {
     ran
   }
 
-  /// The file opened to have its attributes set and nothing else (A-458: `FILE_READ_ATTRIBUTES |
-  /// FILE_WRITE_ATTRIBUTES`), relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a
-  /// link: opened with `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again.
+  /// The file opened to have its attributes set (A-458) and its batch's barrier flush it (A-472: `CHMOD_ACCESS`),
+  /// relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a link: opened with
+  /// `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again. NTFS refuses a read-only file a
+  /// handle that may write, and the entry fails alone (GAPS, A-472).
   fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     let opened = nt_create(
       self.dir(dir)?,
