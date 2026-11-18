@@ -280,29 +280,29 @@ pub struct ShardState {
   /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,
-  /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
-  /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
-  /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost
-  /// itself, by its write verifier).
-  #[cfg(target_os = "linux")]
+  /// The writes acknowledged since the last complete publication, kept whole in the region before `content_range` in
+  /// the anchor's content object (A-63; `crate::write_log`); `None` without a content object. Unix: the log serves a
+  /// FUSE mount taken over across a restart (Linux) and a Shards stream's writes (Linux, macOS; A-316, A-339); an NFS
+  /// client resends what a restart lost itself, by its write verifier.
+  #[cfg(unix)]
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
   /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
   /// (A-63).
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
-  /// writes (A-61, A-63). Linux only, as FUSE is.
-  #[cfg(target_os = "linux")]
+  /// writes (A-61, A-63), and a resynced Shards stream is counted as one whose guest is not told (A-339; GAPS).
+  #[cfg(unix)]
   pub(crate) writes_lost: bool,
-  /// The barrier reply each FUSE mount is about to deliver (A-61): recorded before the barrier publishes, so the
-  /// publication carries it with the effect, and removed once written. At most one per mount (a mount serves one
-  /// request at a time).
-  #[cfg(target_os = "linux")]
+  /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
+  /// recorded before the barrier publishes, so the publication carries it with the effect, and removed once written. At
+  /// most one per attachment (each serves one request at a time).
+  #[cfg(unix)]
   pub(crate) pending_replies: std::collections::BTreeMap<u64, slates_vfs::recover::HeldReply>,
   /// The barrier replies the previous daemon published and never delivered, by attachment (A-61), handed to the
-  /// mounts recovery keeps.
-  #[cfg(target_os = "linux")]
+  /// mounts and streams recovery keeps.
+  #[cfg(unix)]
   pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
@@ -480,9 +480,10 @@ pub struct ShardState {
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
   pub(crate) stale_fuse_mounts: Vec<(u64, String)>,
-  /// The FUSE devices the anchor handed back for this shard's partition (A-61; `crate::fuse_hold`), until recovery
-  /// takes each for its kept mount or closes it. Bounded by the anchor's held-device bound.
-  #[cfg(target_os = "linux")]
+  /// The devices the anchor handed back for this shard's partition (A-61; `crate::fuse_hold`): FUSE devices (Linux) and
+  /// Shards streams' resync ends (A-316, A-339), until recovery takes each for its kept attachment or closes it. Bounded
+  /// by the anchor's held-device bound.
+  #[cfg(unix)]
   pub(crate) inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
   /// The writable copies the anchor handed back for this shard's partition (A-197; `crate::held_copy`), until recovery
   /// takes each back or lets it go. Bounded by the anchor's held-copy bound.
@@ -495,10 +496,10 @@ pub struct ShardState {
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
   )>,
-  /// The Shards streams recovery kept because the anchor held their resync ends (A-316), each with its record, served
-  /// again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by that
-  /// step; bounded as `inherited_fuse` is, of which these were part.
-  #[cfg(target_os = "linux")]
+  /// The Shards streams recovery kept because the anchor held their resync ends (A-316, A-339), each with its record,
+  /// served again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by
+  /// that step; bounded as `inherited_fuse` is, of which these were part.
+  #[cfg(unix)]
   pub(crate) adopt_shards: Vec<(
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
