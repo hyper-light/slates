@@ -1763,6 +1763,7 @@ mod tests {
       },
       completion: None,
       signature: None,
+      folded_below: 0,
     }
   }
 

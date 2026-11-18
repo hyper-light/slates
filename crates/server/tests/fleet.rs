@@ -21535,6 +21535,181 @@ fn expect_version_two_through_the_rebuilt_replica(
   );
 }
 
+/// Shape: the run of one byte [`a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder`] writes, in chunks
+/// of a version's inputs archive (cut at the archive format's largest chunk, `slates_archive::format::MAX_CHUNK_BYTES`).
+/// A run `R` chunks long covers at least `R − 1` whole chunks of the cut wherever the increment's encoding places it (all
+/// `R` when it begins at a cut), so three cover at least two: one chunk, named twice.
+const REPEATED_RUN_CHUNKS: u64 = 3;
+/// Shape: the byte the repeated run is made of; not zero, so nothing on the way can take the run for a hole.
+const REPEATED_RUN_BYTE: u8 = b'r';
+
+/// §4.16 "Apply on holders" (A-383; GAPS, the `held_inputs` sibling found 2026-11-18). A holder read a version's inputs
+/// from its hold by restoring their archive within the bytes of the archive's distinct chunks and one chunk more, on the
+/// rule that an inputs archive names each chunk once. The inputs are cut at fixed offsets, so inputs that repeat a
+/// chunk's bytes at the cut name one chunk at more than one extent and are longer than that cap: every holder refused
+/// them `merge.inputs_unheld` at every shipment, for good, and at `f = 1` such a version never placed and its submit was
+/// never answered. Do: on a settled three-node fleet at `f = 1`, make a green and a work over it, write one file of
+/// [`REPEATED_RUN_CHUNKS`] chunks of one byte into the work, a page a request, and submit it. Expect every page's edit
+/// declared, the submit answered `Submitted { version: Some(1) }` within the placement deadline, each holder's replica
+/// at version 1 and not refused, and the inputs each holder holds naming one chunk at more than one extent (the case
+/// meant).
+#[test]
+fn a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "repeats".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create the green: {created:?}");
+  };
+  // A volume's name is unique among the node's volumes, works and greens alike.
+  let created = client.call(&RequestBody::CreateWork {
+    green,
+    name: "repeats-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    panic!("create the work: {created:?}");
+  };
+  let run = usize::try_from(REPEATED_RUN_CHUNKS * slates_archive::format::MAX_CHUNK_BYTES).unwrap();
+  let edits = append_in_pages(&mut client, work, "repeated", &vec![REPEATED_RUN_BYTE; run]);
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
+  let submitted = client.try_call(
+    &RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    },
+    deadline_ns,
+  );
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let holders_at_one = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(
+      held
+        .iter()
+        .all(|state| state.version == Some(1) && !state.refused),
+    )
+  });
+  let holders: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| daemon.merge_holder_state(green))
+    .collect();
+  let repeats: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| held_inputs_name_a_chunk_twice(daemon, green))
+    .collect();
+  let counters = merge_and_content_counters(&daemons);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "inputs repeating a chunk: {} edits; submit {submitted:?}; holders at version 1 {holders_at_one} {holders:?}; held \
+     inputs name a chunk twice {repeats:?}; counters {counters:?}",
+    edits.len()
+  );
+  assert!(
+    edits
+      .iter()
+      .all(|edited| matches!(edited, ReplyBody::Edited)),
+    "every page of the run is declared: {edits:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      })
+    ),
+    "the submit is accepted as version 1 and placed at f = 1: {submitted:?}; {counters:?}"
+  );
+  assert!(
+    holders_at_one,
+    "each holder recomputed version 1 from inputs that repeat a chunk: {holders:?}; {counters:?}"
+  );
+  assert_eq!(
+    repeats,
+    vec![Some(true); 2],
+    "each holder holds inputs that name one chunk at more than one extent"
+  );
+}
+
+/// Declares `bytes` into `work` at `path` as edits appending a page each, every page what one request holds past an
+/// edit's own framing (as `slates_client` pages a staged edit's bytes): each edit's reply, in order.
+fn append_in_pages(
+  client: &mut Client,
+  work: VolumeId,
+  path: &str,
+  bytes: &[u8],
+) -> Vec<ReplyBody> {
+  let empty = RequestBody::Edit {
+    work,
+    path: path.to_owned(),
+    at: u64::MAX,
+    delete_len: 0,
+    bytes: Vec::new(),
+  };
+  let page = slates_ipc::protocol::chunk_capacity(client.end.region())
+    .saturating_sub(slates_ipc::protocol::framed_len(&empty))
+    .max(1);
+  let mut at = 0u64;
+  bytes
+    .chunks(page)
+    .map(|piece| {
+      let edited = client.call(&RequestBody::Edit {
+        work,
+        path: path.to_owned(),
+        at,
+        delete_len: 0,
+        bytes: piece.to_vec(),
+      });
+      at += u64::try_from(piece.len()).unwrap();
+      edited
+    })
+    .collect()
+}
+
+/// Whether the inputs of the newest version `daemon` holds of `green` as a holder name one chunk at more than one
+/// extent: `None` when it holds no record naming inputs, or not those inputs.
+fn held_inputs_name_a_chunk_twice(daemon: &Daemon, green: VolumeId) -> Option<bool> {
+  let object = ObjectId(green.bytes);
+  let record = daemon.fleet_held_record(object).ok()??;
+  let manifest =
+    slates_server::merge_service::MergeRecordValue::from_record_bytes(&record.value)?.inputs?;
+  let archive = daemon.fleet_held_archive(object, manifest).ok()??;
+  let archive = slates_archive::Archive::decode(&archive).ok()?;
+  let slates_archive::Node::Directory(entries) = archive.manifest else {
+    return None;
+  };
+  let mut named = std::collections::BTreeMap::<[u8; 32], u64>::new();
+  for entry in entries {
+    if let slates_archive::Node::File(extents) = entry.node {
+      for extent in extents.iter().filter(|extent| extent.chunk != [0; 32]) {
+        *named.entry(extent.chunk).or_default() += 1;
+      }
+    }
+  }
+  Some(named.values().any(|times| *times > 1))
+}
+
 /// Shape: each partition's merge budget in [`a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`]:
 /// a quarter of the base's bytes, so the green's origin is past it as the Linux kernel's 1.67 GB is past the merge
 /// budget a 64 GB machine of 16 shards derives (a quarter of a shard's metadata reserve, about 333 MB), while every chain
@@ -22124,6 +22299,152 @@ fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
     "a submit late in the green's history is answered as fast as an early one: W+ {positive} over {ranked} pairs \
      passes {bound:.1} (medians {old_median:?} against {fresh_median:?})"
   );
+}
+
+/// Shape: the green chain cap of [`a_holders_replica_keeps_no_more_history_than_its_owner`]'s nodes
+/// (`PartitionCaps::green_chain_bytes`, also the per-green history budget an owner folds its engine to): small, so the
+/// owner folds within the test's versions, as `crates/server/tests/green_checkpoint.rs` caps it.
+const FOLD_CHAIN_BYTES: usize = 256 << 10;
+
+/// §4.16 "delta retention before folding" and "Apply on holders" (A-385; A-238's owed "the holders' replicas and records
+/// grow per version"). An owner folds its green's histories to its per-green budget, never past a live reader's
+/// version; a holder's replica of the green, the engine it recomputes every version on and a takeover adopts, folded
+/// nothing, so it kept every value every version wrote, at the goal's 300,000 versions as at 3. Do: on a settled
+/// three-node fleet at `f = 1` whose chain cap is [`FOLD_CHAIN_BYTES`], make a green and one work, and submit versions
+/// from the work, each rewriting one file whole with what one request carries, until twice the cap is written; wait for
+/// both holders to hold the last version. Expect every version accepted in turn; the owner folded; each holder's replica
+/// folded where the newest record it holds says the owner had folded, counted, and holding no more history than the cap
+/// and one version's value (its bytes, and at most as many again for its piece list).
+#[test]
+fn a_holders_replica_keeps_no_more_history_than_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_tuned(nodes, &hosts, &certs, &serve, 1, |config| {
+    config.caps.green_chain_bytes = FOLD_CHAIN_BYTES;
+  });
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "folds".to_owned(),
+    require_evidence: false,
+    base: None,
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create the green: {created:?}");
+  };
+  let created = client.call(&RequestBody::CreateWork {
+    green,
+    name: "folds-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    panic!("create the work: {created:?}");
+  };
+  // Each version rewrites the file whole with what one request carries past an edit's framing.
+  let empty = RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: u64::MAX,
+    delete_len: u64::MAX,
+    bytes: Vec::new(),
+  };
+  let page = slates_ipc::protocol::chunk_capacity(client.end.region())
+    .saturating_sub(slates_ipc::protocol::framed_len(&empty))
+    .max(1);
+  let versions = u64::try_from(2 * FOLD_CHAIN_BYTES / page + 1).unwrap();
+  let mut answers = Vec::new();
+  for version in 1..=versions {
+    let delete_len = if version == 1 {
+      0
+    } else {
+      u64::try_from(page).unwrap()
+    };
+    let tag = format!("version-{version:06}-");
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len,
+      bytes: tag.bytes().cycle().take(page).collect(),
+    });
+    let submitted = client.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    });
+    answers.push((version, edited, submitted));
+  }
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let held = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(held.iter().all(|state| state.version == Some(versions)))
+  });
+  let owner = daemons[0].merge_history(green);
+  let holders: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| {
+      let floor = daemon
+        .fleet_held_record(ObjectId(green.bytes))
+        .ok()
+        .flatten()
+        .and_then(|record| {
+          slates_server::merge_service::MergeRecordValue::from_record_bytes(&record.value)
+        })
+        .map(|value| (value.version, value.folded_below));
+      (daemon.merge_history(green), floor)
+    })
+    .collect();
+  let counters = merge_and_content_counters(&daemons);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "replica folds: {versions} versions of {page} bytes; holders at the last {held}; owner (folded below, history) \
+     {owner:?}; holders (folded below, history) and their newest record (version, floor) {holders:?}"
+  );
+  for (version, edited, submitted) in &answers {
+    assert!(
+      matches!(edited, ReplyBody::Edited)
+        && matches!(submitted, ReplyBody::Submitted { version: Some(at), .. } if at == version),
+      "version {version} is edited and accepted: {edited:?} {submitted:?}"
+    );
+  }
+  assert!(held, "both holders hold the last version: {holders:?}");
+  assert!(
+    matches!(owner, Ok(Some((floor, _))) if floor > 0),
+    "the owner folded its green's history: {owner:?}"
+  );
+  let bound = FOLD_CHAIN_BYTES + 2 * page;
+  for (holder, (history, newest)) in holders.iter().enumerate() {
+    let Some((at, floor)) = *newest else {
+      panic!("holder {holder} holds a record of the green: {holders:?}");
+    };
+    assert_eq!(
+      at, versions,
+      "holder {holder}'s newest record is the last version"
+    );
+    assert!(
+      matches!(history, Ok(Some((folded, bytes))) if *folded == floor && floor > 0 && *bytes <= bound),
+      "holder {holder}'s replica folded where its owner had, below {floor}, holding no more than {bound} bytes of \
+       history: {history:?}"
+    );
+  }
+  for (holder, counted_on) in counters.iter().enumerate().skip(1) {
+    assert!(
+      counted(counted_on, "merge.replica.folded") > 0,
+      "holder {holder} counted the versions its replica folded: {counted_on:?}"
+    );
+  }
 }
 
 /// §4.16 "Commit" (AUD-11) across the owner's restart (the bug record of 2026-11-07, a version appended before its
@@ -26434,6 +26755,7 @@ fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRe
     // No request made the planted version (A-255's completion key is for a submit's resend).
     completion: None,
     signature: None,
+    folded_below: 0,
   }
 }
 
