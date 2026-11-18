@@ -1279,8 +1279,18 @@
 >   - The proof: `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`, red
 >     `DuplicateRequest`, green `Submitted { version: Some(1) }`
 >     (`docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
->   - Open: an `Overloaded` raised inside a verb is recorded as its completion, so a resend under its id meets it for
->     good.
+>   - **Fixed 2026-11-17 (g232): an `Overloaded` raised inside a verb was recorded as its completion**, so a resend
+>     under its id met it for good, though the protocol defines `Overloaded` as "not started". Raised inside a verb it
+>     is a held copy not yet materialized (`verbs::absent`, the takeover's settle window) or a deferred verb whose task
+>     the full arena refused (a work's checkout, a pin, a green over a base, a presentation, a granted landing). Now
+>     `run_recorded` leaves it unrecorded and counts it (`verb.overloaded_unrecorded`), and the resend runs the verb
+>     (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`, red with the reply recorded;
+>     `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Siblings found, open:
+>     - A verb on a live-shipped volume commits its effects with no completion, and `live_ship::defer` then refuses
+>       `Overloaded` past its held-reply bound, so the resend runs the verb a second time over its own effects.
+>     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
+>       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
+>       resend meets it for good.
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
@@ -1435,6 +1445,47 @@
 > the lowest head failed both that case and the property; counting a reply at the send's own instant as before it
 > failed the property. The harness prints the oracle's own time (`oracle_ns\t<n>\tsubmits\t…\theads\t…`). Owed: the
 > time measured at a 10,000-client rung before and after.
+>
+> **Version 0 over the kernel at `f = 1` (2026-11-17, g232, A-286): built, measurement owed.** The topology the goal
+> names (one primary and two replicas) could not set up a green over the whole kernel. At `f > 0` version 0's inputs,
+> the encoded origin, were made in one poll (walk, encode, archive) at the green's creation and again on every pass of
+> the record plane until version 0 placed, shipped whole in one message, and restored, decoded and seeded on each holder
+> in one poll. Over 1.67 GB each of those is seconds of one shard's poll, past A-232's watchdog. No fleet test had a
+> green over a base, so the path had never run. Now:
+> - the owner makes the inputs once, a share at a time (`crates/server/src/merge_origin.rs`, `OriginInputsJob`);
+> - shipments carry at most one slice's verification of what each target lacks, and the target answers with what it
+>   holds (`merge_service::ship_version`, `record_inputs_answers`; `Committed::answers` in `slates-cluster`);
+> - holders seed their replica a share at a time (`ReplicaSeed`), the first slice as the record arrives;
+> - inputs archives are chunked at 1 MiB, so the kernel's origin is about 1,600 extents, not 100,000 to 400,000.
+>
+> Test: `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time` (`crates/server/tests/fleet.rs`: three nodes at
+> `f = 1`, a 256-file base on node a; version 0 placed, both holders at version 0, a submit after it accepted as version
+> 1 on both, the counters `merge.origin_inputs.made`/`.slices`, `merge.inputs.partial`, `merge.replica.seeded` and
+> `.seed_slices`, and no node keeping a probe for half the placement). Unit: the streamed archive equals the whole one
+> in every cut; a shipment's bound; the owner's reading of answers; the seed against the whole seeding's identity, a
+> wrong identity and unheld inputs; a seed whose green is forgotten meanwhile (a tombstone, a takeover's reclaim)
+> installing nothing, red without the install's hold check; `Committed::answers`; `ContentHold::held_manifest`/
+> `held_chunk`.
+>
+> Measured by the fleet test (debug build, a loaded Mac at load 41, 2026-11-17): version 0 placed at `f + 1` in 951 ms
+> while 3,321 status probes were answered, the longest 22 ms. The owner made the inputs over 475 slices and shipped
+> them in 4 partial shipments; each holder seeded over 359 slices. Main without the change, same base and runner:
+> placed in 1.66 s, the longest probe 298 ms, from a 4 MiB origin. A poll's cost there grows with the origin, so
+> over 1.67 GB it is the seconds the watchdog ends. Owed:
+> - the measurement over the whole kernel on the launcher (`crates/cli/tests/load_scale.rs`): the owner's and the
+>   holders' longest polls while version 0 places, and the time to place it;
+> - a restarted owner remakes version 0's inputs before it re-ships the record (A-246);
+> - a takeover successor gathers version 0 from its hold in one call (`recover_green_inputs`);
+> - a large increment's archive is remade from its chain entry on each pass that ships it;
+> - version 0's archive is kept while any candidate lacks version 0, which is for good if a candidate never answers and
+>   membership does not remove it;
+> - a holder's seed gathers the size its held manifest declares, at most a chunk's bytes an extent, uncharged, as the
+>   one-call restore before it was: an owner's manifest naming one chunk many times makes a holder gather that many
+>   copies. The seed's transient bytes (gathered, decoded, seeded) want charging to the shard's budget;
+> - sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
+>   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
+>   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
+>   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness

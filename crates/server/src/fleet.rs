@@ -2018,7 +2018,11 @@ fn serve_content_request(
 /// Serves a merge shipment (§4.16 "Commit" in one exchange a version): its content frames — the offer of the record's
 /// inputs, then their chunks — through the content plane's own path, then the record. The record is accepted only if
 /// its inputs are held by then (`merge_service::accept_merge_record`), so a refused or partial placement answers no
-/// acknowledgement and the owner ships again; the content replies themselves are not the answer.
+/// acknowledgement and the owner ships again. A record not accepted is answered with what this holder holds of its
+/// inputs (A-286): a content acknowledgement bound to them when it holds them whole (`merge_service::inputs_held`), to
+/// a peer that may place them here; else the content plane's answer to the shipment's offer asked again after its
+/// chunks, the chunks it still lacks; else nothing. So inputs larger than one shipment cross in as many as they take,
+/// each carrying only what this holder lacks.
 fn serve_merge_shipment(
   s: &mut ShardState,
   local: HostId,
@@ -2045,7 +2049,25 @@ fn serve_merge_shipment(
     };
     let _ = serve_content_request(s, local, peer_host, stream, frame);
   }
-  crate::merge_service::accept_merge_record(s, local, peer_host, &record)
+  let accepted = crate::merge_service::accept_merge_record(s, local, peer_host, &record);
+  if !accepted.is_empty() {
+    return accepted;
+  }
+  let may_place = content_authorized(
+    s.council.configuration(),
+    s.holder_records.as_map(),
+    local,
+    peer_host,
+    slates_cluster::content::ContentAccess::Place,
+    record.object,
+  );
+  if may_place && let Some(held) = crate::merge_service::inputs_held(s, local, &record) {
+    return held;
+  }
+  match content.first() {
+    Some(offer) => serve_content_request(s, local, peer_host, CONTENT_OFFER_STREAM, offer),
+    None => Vec::new(),
+  }
 }
 
 /// Validates a record against both the transport principal and installed authority before any effect
