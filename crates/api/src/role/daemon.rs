@@ -1,6 +1,6 @@
-//! `slates daemon` (§2.6 steps 2, 3 and 5): attach the anchor's segment from the environment
-//! and take the profile it published, or, run alone, measure a profile and create a segment;
-//! derive the configuration; serve until a stop is requested or the anchor is gone.
+//! The daemon role, `slates daemon` or a host's own executable (§2.6 steps 2, 3 and 5, A-278): attach the anchor's
+//! segment from the environment and take the profile it published, or, run alone, measure a profile and create a
+//! segment; derive the configuration; serve until a stop is requested or the anchor is gone.
 
 use std::time::Duration;
 
@@ -9,9 +9,8 @@ use slates_machine::facts::Facts;
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-use crate::args::ProcessOptions;
-use crate::parent::ParentWatch;
-use crate::{Failure, signal};
+use super::parent::ParentWatch;
+use super::{Failure, ProcessOptions, signal};
 
 /// Shape: the probe budget of the quick profile (milliseconds): what the server's own tests
 /// measure with; the numbers are inputs to derivations, and a quick profile is marked so.
@@ -110,9 +109,33 @@ fn name_this_process() {
   }
 }
 
-/// Runs the daemon: [`start`], then [`serve`] until a reason to stop.
-pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
-  serve(start(options)?)
+/// The WinFsp mounts' purge client is this executable's own role in a child process (§4.6: no daemon thread opens a
+/// volume it serves), started with the executable's `prefix` before its role word, as the daemon itself was.
+#[cfg(windows)]
+fn install_purge_client(prefix: &[String]) -> Result<(), Failure> {
+  slates_bridge_winfsp::purge_client::install(slates_bridge_winfsp::purge_client::Program {
+    program: std::env::current_exe()
+      .map_err(|error| failed("the purge client's program", error))?
+      .into_os_string(),
+    args: prefix
+      .iter()
+      .map(std::ffi::OsString::from)
+      .chain([slates_bridge_winfsp::purge_client::ROLE_ARG.into()])
+      .collect(),
+  });
+  Ok(())
+}
+
+/// See the Windows arm: no WinFsp mount here, so no purge client.
+#[cfg(not(windows))]
+fn install_purge_client(_prefix: &[String]) -> Result<(), Failure> {
+  Ok(())
+}
+
+/// Runs the daemon: [`start`], then [`serve`] until a reason to stop. `prefix` is what this executable was started with
+/// before the role's arguments, which the daemon's own children (the WinFsp purge client) are started with too.
+pub(crate) fn run(prefix: &[String], options: &ProcessOptions) -> Result<(), Failure> {
+  serve(start(prefix, options)?)
 }
 
 /// A started daemon and its watch on the anchor, between [`start`] and [`serve`].
@@ -124,24 +147,17 @@ pub(crate) struct Started {
 }
 
 /// Starts the daemon over the anchor's segment from the environment (or its own, run alone) and marks it serving.
-pub(crate) fn start(options: &ProcessOptions) -> Result<Started, Failure> {
+/// `prefix` is the executable's own (see [`run`]).
+pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Started, Failure> {
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;
-  // The WinFsp mounts' purge client is this binary's own role in a child process (§4.6: no daemon thread opens a
-  // volume it serves).
-  #[cfg(windows)]
-  slates_bridge_winfsp::purge_client::install(slates_bridge_winfsp::purge_client::Program {
-    program: std::env::current_exe()
-      .map_err(|error| failed("the purge client's program", error))?
-      .into_os_string(),
-    args: vec![slates_bridge_winfsp::purge_client::ROLE_ARG.into()],
-  });
+  install_purge_client(prefix)?;
   // Before anything shows the process: its own name, not the kernel's `exe` from the anchor's restart (A-145).
   #[cfg(target_os = "linux")]
   name_this_process();
   // Before a volume holds a byte: no core dump may carry it (AUD-29-41).
-  crate::dumps::exclude_from_dumps()?;
+  super::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;
   let parent = ParentWatch::from_env();
   let (profile, source) = match published_profile()? {
@@ -161,13 +177,13 @@ pub(crate) fn start(options: &ProcessOptions) -> Result<Started, Failure> {
     ),
   };
   let mut config = DaemonConfig::derive(&profile, &options.instance, options.shards);
-  config.recovery_key = crate::recovery_key::load()?;
+  config.recovery_key = super::recovery_key::load()?;
   // A fleet node (§2.6 boot step 6): the shared manifest gives the membership the placement authority is
   // built over and the transport the membership loop drives; a laptop passes neither and runs the same
   // placement path, degenerate (R8).
   let transport = match &options.fleet {
     Some(selection) => {
-      let plan = crate::fleet::load(selection)?;
+      let plan = super::fleet::load(selection)?;
       slates_machine::log_line!(
         "slates daemon: fleet node `{}` of `{}`: member {} with {} peer(s) at f = {}",
         selection.node,

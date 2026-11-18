@@ -53,6 +53,211 @@ git fsck --strict --no-progress
 git count-objects -v | grep '^count:'
 "#;
 
+/// The git history workload: the operations an agent's repository lives by, over a bare upstream and two clones
+/// (the goal of 2026-11-18). A local clone links the upstream's loose objects rather than copying them (`git clone`'s
+/// `--local`, the default for a path), so the output counts the clone's objects with two names: a mount that cannot
+/// link, or reports the wrong link count, differs there. Then a branch, a merge, a rebase, a stash and its pop, a
+/// second worktree (made, committed in and removed, so no file names an absolute path), an annotated tag, a push and
+/// a pull, and the maintenance that rewrites every object file: `gc`, a full `repack`, the upstream's `gc` (a bare
+/// repository writes a reachability bitmap too), `verify-pack` and `fsck`. `pack.threads=1` makes the packs
+/// byte-identical between runs: with more threads the delta search hands work between threads by timing. The clone's
+/// origin is set back to the relative path, since `git clone` records a local source by its absolute path.
+/// `count-objects` prints its counts only, not its kilobytes (the `git` workload's reason).
+const GIT_HISTORY: &str = r#"
+git init -q --bare -b main upstream.git
+git init -q -b main seed
+cd seed
+printf 'one\n' > a.txt
+mkdir -p d
+printf 'two\n' > d/b.txt
+git add -A
+git commit -q -m base
+git remote add origin ../upstream.git
+git push -q origin main
+cd ..
+git clone -q upstream.git work
+cd work
+git remote set-url origin ../upstream.git
+echo "objects with two names after the clone: $(find .git/objects -type f -links 2 | wc -l | tr -d ' ') of $(find .git/objects -type f | wc -l | tr -d ' ')"
+git switch -q -c feature
+printf 'feature\n' > f.txt
+git add f.txt
+git commit -q -m feature
+git switch -q main
+printf 'main\n' >> a.txt
+git commit -q -am 'main change'
+git merge -q --no-ff -m 'merge feature' feature
+git switch -q -c topic HEAD~1
+printf 'topic\n' > t.txt
+git add t.txt
+git commit -q -m topic
+git rebase -q main
+git switch -q main
+git merge -q --ff-only topic
+printf 'wip\n' >> d/b.txt
+git stash -q
+git status --porcelain
+git stash pop -q
+git status --porcelain
+git checkout -q -- d/b.txt
+git worktree add -q -b hotfix ../wt main~1
+cd ../wt
+printf 'fix\n' > fix.txt
+git add fix.txt
+git commit -q -m fix
+cd ../work
+git worktree list --porcelain
+git merge -q --no-ff -m 'merge hotfix' hotfix
+git worktree remove ../wt
+git tag -a -m 'release one' v1
+git push -q origin main topic v1
+cd ../seed
+git pull -q --ff-only origin main
+git log --format='%H %T %P %s'
+cd ../work
+git -c pack.threads=1 -c gc.autoDetach=false gc -q --prune=now
+git -c pack.threads=1 repack -q -a -d -f
+git -C ../upstream.git -c pack.threads=1 -c gc.autoDetach=false gc -q --prune=now
+git count-objects -v | grep -E '^(count|in-pack|packs|prune-packable|garbage):'
+git verify-pack -v .git/objects/pack/pack-*.idx | grep -v '^chain length'
+git fsck --full --strict --no-progress
+git -C ../upstream.git fsck --full --strict --no-progress
+git log --graph --all --format='%H %T %P%d %s'
+git status --porcelain=v2 --branch
+"#;
+
+/// The Mercurial workload (the goal of 2026-11-18): a repository with a named branch, a merge, a tag and a bookmark;
+/// a local clone, whose store files are hard links to the source's (`hg clone` links a local store when it can); a
+/// commit in the clone, before which Mercurial copies each store file it appends to and still shares, judging that by
+/// the file's link count; a rebase (an extension shipped with Mercurial; it strips the old commit into a backup
+/// bundle); a push back; a share of the source's store (`hg share --relative`, so no file names an absolute path);
+/// then `verify` of all three. The output counts the store files with two names after the clone and after the
+/// clone's commit, so a mount that cannot link, or reports a stale or wrong link count, differs there; and one that
+/// let the clone append into a store file it still shared would fail the source's `verify`. Every commit carries one
+/// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
+/// since `hg clone` records a local source by its absolute path.
+const MERCURIAL: &str = r#"
+d='2026-09-14 00:00:00 +0000'
+hg init src
+cd src
+printf 'one\n' > a.txt
+mkdir -p d
+printf 'two\n' > d/b.txt
+hg add -q
+hg commit -q -d "$d" -m base
+hg branch -q feature
+printf 'feature\n' > f.txt
+hg add -q f.txt
+hg commit -q -d "$d" -m feature
+hg update -q default
+printf 'main\n' >> a.txt
+hg commit -q -d "$d" -m 'main change'
+hg merge -q feature
+hg commit -q -d "$d" -m 'merge feature'
+hg tag -d "$d" v1
+hg bookmark -r 'desc("main change")' stable
+hg status --all
+cd ..
+hg clone -q src clone
+echo "store files with two names after the clone: $(find clone/.hg/store -type f -links 2 | wc -l | tr -d ' ') of $(find clone/.hg/store -type f | wc -l | tr -d ' ')"
+cd clone
+printf '[paths]\ndefault = ../src\n' > .hg/hgrc
+hg update -q stable
+printf 'clone\n' > c.txt
+hg add -q c.txt
+hg commit -q -d "$d" -m 'clone change'
+echo "store files with two names after the clone's commit: $(find .hg/store -type f -links 2 | wc -l | tr -d ' ')"
+hg --config extensions.rebase= rebase -q -d 'children(v1)'
+hg log -G -T '{rev} {node} {branch} {bookmarks} {desc}\n'
+hg push -q -r . ../src
+cd ../src
+hg update -q tip
+hg --config extensions.share= share -q --relative . ../shared
+cd ../shared
+printf 'shared\n' > s.txt
+hg add -q s.txt
+hg commit -q -d "$d" -m 'shared change'
+cd ../src
+hg update -q tip
+hg diff --git -r 'desc("base")' -r tip
+hg log -G -T '{rev} {node} {branch} {p1node} {p2node} {tags} {bookmarks} {desc}\n'
+hg annotate a.txt
+hg verify -q
+hg -R ../clone verify -q
+hg -R ../shared verify -q
+hg -R ../clone status --all
+hg -R ../shared status --all
+"#;
+
+/// The Subversion workload (the goal of 2026-11-18): an FSFS repository made with a fixed UUID; a working copy of its
+/// trunk, whose state is SQLite (`.svn/wc.db`, journalled and locked as SQLite does over the file system under it);
+/// a commit, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on trunk,
+/// an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own merge,
+/// recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository verified
+/// and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
+/// setrevprop`, which runs no hook), as the git and Mercurial workloads fix theirs; the client's configuration is the
+/// workload's own (`--config-dir`), so nothing outside the tree is read or written. Every repository URL holds the
+/// workload's absolute path, which the comparison replaces by the root token.
+const SUBVERSION: &str = r#"
+top=$(pwd)
+svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+printf '2026-09-14T00:00:00.000000Z' > date
+svnadmin create repo
+svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
+url="file://$top/repo"
+svn mkdir -q -m layout "$url/trunk" "$url/branches" "$url/tags"
+svn checkout -q "$url/trunk" wc
+cd wc
+printf 'one\n' > a.txt
+mkdir d
+printf 'two\n' > d/b.txt
+svn add -q a.txt d
+svn commit -q -m base
+svn copy -q -m 'branch feature' '^/trunk' '^/branches/feature'
+svn switch -q '^/branches/feature'
+printf 'feature\n' > f.txt
+svn add -q f.txt
+svn commit -q -m feature
+svn switch -q '^/trunk'
+printf 'main\n' >> a.txt
+svn commit -q -m 'main change'
+svn update -q -r 2
+cat a.txt
+svn update -q
+svn merge -q '^/branches/feature'
+svn status
+svn commit -q -m 'merge feature'
+svn update -q
+svn copy -q -m 'tag v1' '^/trunk' '^/tags/v1'
+svn update -q
+svn cleanup
+svn status
+cd ..
+svn checkout -q "$url/branches/feature" other
+svn status other
+youngest=$(svnlook youngest repo)
+rev=0
+while [ "$rev" -le "$youngest" ]; do
+  svnadmin setrevprop repo -r "$rev" svn:date date
+  rev=$((rev + 1))
+done
+cd wc
+svn info --show-item revision
+svn info --show-item last-changed-revision
+svn info --show-item url
+svn info --show-item repos-uuid
+svn log -v -r 1:HEAD '^/'
+svn diff -c 5 '^/'
+svn propget svn:mergeinfo .
+svn cat -r 2 a.txt
+svn list -R '^/'
+cd ..
+svnadmin verify repo
+svnlook tree repo
+svnlook changed -r 6 repo
+svnadmin dump -q repo | cksum
+"#;
+
 /// The cargo workload: a dependency-free crate built twice; the second build must report the
 /// crate `Fresh` (AC-3.2 "incremental builds reuse artifacts") and the binary must run. The crate is its
 /// own workspace root (`[workspace]`), so it builds the same wherever its directory sits — a volume or a
@@ -208,6 +413,54 @@ wait $watcher || true
 if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
 "#;
 
+/// Format: the environment every leg runs a workload under, on both of its sides (the host and the mount, a container
+/// and the guest), so the two runs of a script differ only by the file system under them:
+/// - the one identity and date every git commit is made with, and none of the configuration a parent passes (kiln's
+///   agent sessions sign every commit through `GIT_CONFIG_COUNT`, and a signature carries its signing time);
+/// - Mercurial reading no configuration but a repository's own (`HGRCPATH` empty, per `hg help environment`), its
+///   plain output (`HGPLAIN`) and one committer; its commits' dates are the script's own `-d`;
+/// - one Python hash seed: Mercurial writes its store's file list (`fncache`) from a set, in the order the
+///   interpreter's string hashing gives, which is drawn afresh in every process unless fixed (measured 2026-11-17:
+///   two runs of the Mercurial workload wrote one list in two orders);
+/// - one time zone and locale, and npm with no update check, funding or audit messages and no log files (their path,
+///   in the cache, would be the one line that differs between runs).
+pub const ENVIRONMENT: &[(&str, &str)] = &[
+  ("GIT_AUTHOR_NAME", "slates"),
+  ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
+  ("GIT_COMMITTER_NAME", "slates"),
+  ("GIT_COMMITTER_EMAIL", "slates@example.invalid"),
+  ("GIT_AUTHOR_DATE", "2026-09-14T00:00:00Z"),
+  ("GIT_COMMITTER_DATE", "2026-09-14T00:00:00Z"),
+  ("GIT_CONFIG_GLOBAL", "/dev/null"),
+  ("GIT_CONFIG_NOSYSTEM", "1"),
+  ("GIT_CONFIG_COUNT", "0"),
+  ("HGRCPATH", ""),
+  ("HGPLAIN", "1"),
+  ("HGUSER", "slates <slates@example.invalid>"),
+  ("PYTHONHASHSEED", "0"),
+  ("TZ", "UTC"),
+  ("LC_ALL", "C"),
+  ("npm_config_update_notifier", "false"),
+  ("npm_config_fund", "false"),
+  ("npm_config_audit", "false"),
+  ("npm_config_logs_max", "0"),
+];
+
+/// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
+/// guest's).
+pub fn environment_exports() -> String {
+  ENVIRONMENT
+    .iter()
+    .map(|(key, value)| export_line(key, value))
+    .collect()
+}
+
+/// One POSIX shell `export` line with the value single-quoted, so the shell takes every byte as it is; a single quote
+/// in the value closes the quoting, is escaped, and reopens it (`'\''`).
+pub fn export_line(key: &str, value: &str) -> String {
+  format!("export {key}='{}'\n", value.replace('\'', "'\\''"))
+}
+
 /// Format: the environment variable the sqlite script reads its busy timeout from, in
 /// milliseconds; the harness sets it from its recorded bound.
 pub const ENV_SQLITE_BUSY_MS: &str = "SLATES_SQLITE_BUSY_MS";
@@ -239,6 +492,98 @@ pub const ROSTER: &[Workload] = &[
       ),
       (".git/COMMIT_EDITMSG", "a scratch file of the last commit"),
       (".git/ORIG_HEAD", "a scratch ref"),
+    ],
+  },
+  Workload {
+    name: "git-history",
+    tool: "git",
+    script: GIT_HISTORY,
+    excluded: &[
+      (
+        "seed/.git/index",
+        "the index caches stat data (mtime, inode, device) by design",
+      ),
+      (
+        "work/.git/index",
+        "the index caches stat data (mtime, inode, device) by design",
+      ),
+      (
+        "seed/.git/logs/",
+        "a clone's reflog names its source by absolute path, and gc expires entries by their age against the clock",
+      ),
+      (
+        "work/.git/logs/",
+        "a clone's reflog names its source by absolute path, and gc expires entries by their age against the clock",
+      ),
+    ],
+  },
+  Workload {
+    name: "mercurial",
+    tool: "hg",
+    script: MERCURIAL,
+    excluded: &[
+      (
+        "src/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "clone/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "shared/.hg/dirstate",
+        "the dirstate caches each file's size and modification time by design",
+      ),
+      (
+        "src/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "clone/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "shared/.hg/undo.backup.dirstate",
+        "the last transaction's copy of the dirstate (Mercurial 6.4 and later)",
+      ),
+      (
+        "src/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "clone/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "shared/.hg/undo.dirstate",
+        "the last transaction's copy of the dirstate (before Mercurial 6.4)",
+      ),
+      (
+        "clone/.hg/undo.desc",
+        "the last transaction's description names the repository a push answered by its absolute URL",
+      ),
+    ],
+  },
+  Workload {
+    name: "subversion",
+    tool: "svn",
+    script: SUBVERSION,
+    excluded: &[
+      (
+        "wc/.svn/wc.db",
+        "the working copy's database (and its journal) caches each file's size and modification time and each \
+         commit's server time by design; `svn status` and `svn info` print what it holds",
+      ),
+      (
+        "other/.svn/wc.db",
+        "the working copy's database (and its journal) caches each file's size and modification time and each \
+         commit's server time by design; `svn status` prints what it holds",
+      ),
+      (
+        "repo/db/uuid",
+        "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
+         the UUID itself is printed (`svn info --show-item repos-uuid`)",
+      ),
     ],
   },
   Workload {
@@ -486,7 +831,9 @@ fn describe(entry: &Entry) -> String {
   )
 }
 
-/// Compares a workload's host run with its mounted run.
+/// Compares a workload's host run with its mounted run. Exit codes come first: differing ones are a difference, and
+/// one nonzero code on both sides is a failed workload, never an identical one, since a script that stopped early on
+/// both sides (a refused option, a missing extension) proves nothing about the mount.
 pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
   if host.exit_code != mount.exit_code {
     return WorkloadStatus::Differs {
@@ -496,6 +843,12 @@ pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
         mount.exit_code,
         crate::exerciser::tail(&mount.output)
       )),
+    };
+  }
+  if host.exit_code != 0 {
+    return WorkloadStatus::Failed {
+      exit_code: host.exit_code,
+      detail: crate::exerciser::tail(&normalize_output(&host.output, &host.directory)),
     };
   }
   let host_output = normalize_output(&host.output, &host.directory);
@@ -551,11 +904,19 @@ mod tests {
     }
   }
 
+  /// The roster's workload named `name`.
+  fn named(name: &str) -> Workload {
+    *ROSTER
+      .iter()
+      .find(|workload| workload.name == name)
+      .unwrap_or_else(|| panic!("no workload named {name}"))
+  }
+
   /// Identical runs whose outputs differ only by their directory roots (including macOS's
   /// `/private` twin) compare identical; an excluded prefix hides a difference by design.
   #[test]
   fn identical_runs_compare_identical_under_the_exclusions() {
-    let workload = ROSTER[0];
+    let workload = named("git");
     let host = run(
       "/h/git",
       "app /h/git\nok\n",
@@ -580,7 +941,7 @@ mod tests {
   /// A differing exit code is named first, with the mounted output's tail.
   #[test]
   fn a_differing_exit_code_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mut mount = run("/m", "same\n", vec![file("a", "aa")]);
     mount.exit_code = 1;
@@ -588,10 +949,30 @@ mod tests {
     assert!(detail.starts_with("exit code: host 0, mount 1"), "{detail}");
   }
 
+  /// Part 6 "Real workloads" ("Exit codes 0"): do compare a host run and a mounted run that both exit 129 with the
+  /// same output and the same tree, as a script does when its tool refuses an option on both sides; expect the
+  /// workload judged failed, with the exit code and the host output's tail (its directory as the root token). Before
+  /// 2026-11-17 it was judged identical: `compare` asked only that the two exit codes be equal.
+  #[test]
+  fn a_workload_that_fails_alike_on_both_sides_is_failed_not_identical() {
+    let workload = named("git");
+    let mut host = run("/h", "fatal: /h/x: no such option\n", vec![file("a", "aa")]);
+    let mut mount = run("/m", "fatal: /m/x: no such option\n", vec![file("a", "aa")]);
+    host.exit_code = 129;
+    mount.exit_code = 129;
+    assert_eq!(
+      compare(&workload, &host, &mount),
+      WorkloadStatus::Failed {
+        exit_code: 129,
+        detail: "fatal: <dir>/x: no such option".to_owned(),
+      }
+    );
+  }
+
   /// A differing output line is named with its number.
   #[test]
   fn a_differing_output_line_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run("/m", "other\n", vec![file("a", "aa")]);
     let detail = difference(compare(&workload, &host, &mount));
@@ -602,7 +983,7 @@ mod tests {
   /// A transport-created sidecar changes the tree; an application can also own such a name.
   #[test]
   fn dot_underscore_names_are_compared_like_other_visible_files() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run(
       "/m",
@@ -626,7 +1007,7 @@ mod tests {
   /// A differing tree entry, or an extra one, is named with both sides.
   #[test]
   fn a_differing_tree_entry_is_named() {
-    let workload = ROSTER[4];
+    let workload = named("rg");
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run("/m", "same\n", vec![file("a", "bb")]);
     let detail = difference(compare(&workload, &host, &mount));
@@ -656,9 +1037,49 @@ mod tests {
     }
     let names: Vec<&str> = ROSTER.iter().map(|w| w.name).collect();
     for expected in [
-      "git", "cargo", "npm", "python", "rg", "rsync", "sqlite", "editor", "watcher",
+      "git",
+      "git-history",
+      "mercurial",
+      "subversion",
+      "cargo",
+      "npm",
+      "python",
+      "rg",
+      "rsync",
+      "sqlite",
+      "editor",
+      "watcher",
     ] {
       assert!(names.contains(&expected), "{expected}");
     }
+  }
+
+  /// The goal of 2026-11-18 (the guest's environment): do source [`environment_exports`] in a real POSIX shell and
+  /// print each variable back; expect every value exactly as [`ENVIRONMENT`] holds it, the empty `HGRCPATH` set but
+  /// empty, and `HGUSER`'s spaces and angle brackets intact. A value with a single quote, double quotes and a `$`
+  /// survives [`export_line`] too.
+  #[cfg(unix)]
+  #[test]
+  fn the_environment_exports_reach_a_shell_exactly() {
+    let mut script = environment_exports();
+    script.push_str(&export_line("QUOTED", "it's \"here\" $HOME"));
+    for (key, _) in ENVIRONMENT {
+      script.push_str(&format!("printf '%s=[%s]\\n' {key} \"${{{key}-unset}}\"\n"));
+    }
+    script.push_str("printf 'QUOTED=[%s]\\n' \"$QUOTED\"\n");
+    let output = std::process::Command::new("sh")
+      .args(["-c", &script])
+      .env_clear()
+      .output()
+      .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let mut expected: String = ENVIRONMENT
+      .iter()
+      .map(|(key, value)| format!("{key}=[{value}]\n"))
+      .collect();
+    expected.push_str("QUOTED=[it's \"here\" $HOME]\n");
+    assert_eq!(printed, expected);
+    assert!(printed.contains("HGRCPATH=[]\n"), "{printed}");
   }
 }

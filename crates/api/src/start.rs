@@ -1,0 +1,277 @@
+//! Starting an instance from a host's own executable (§2.6 "Boot order", §4.12 "Embedding", A-278): no `slates`
+//! binary is installed or run. The host names the executable that serves the roles — its own, whose `main` hands the
+//! arguments after its chosen prefix to [`crate::role::main`] — and the anchor runs as that executable, then starts its
+//! daemon from it with the same prefix (`crate::role`).
+//!
+//! **Two ways to start.** [`Instance::start`] spawns the anchor as a child of this process and returns once the
+//! instance answers, with the group of a laptop instance made ([`Instance::ensure_group`]). A host that launches the
+//! anchor its own way — under its service manager (`systemd-run --user`), so the instance outlives the host's process —
+//! takes [`StartSpec::anchor_command`], launches it, and waits with [`Instance::wait_for`].
+//!
+//! **Waiting for the first answer.** The anchor measures the machine and creates the segment before it holds the
+//! instance's rendezvous; until then a connect is refused at once, so the wait asks again at the anchor's own heartbeat
+//! cadence (`slates_server::daemon::HEARTBEAT_NS`, the cadence the anchor looks at its daemon). Once the rendezvous is
+//! held, a connect itself waits for the daemon (A-114) up to the client's reconnect deadline ([`crate::deadlines`]). A
+//! started anchor's exit ends the wait at once with its exit code ([`StartFault::AnchorExited`]); a wait without a
+//! child to watch ends at the host's deadline, as `Unavailable`.
+//!
+//! **The issuer is not handed over.** A started instance gives its starter no grant authority (§4.13, R10): under
+//! Ada's decision of 2026-11-18 a grant is proved by a key only the human holds, presented through
+//! [`Instance::grant`] whoever starts the instance.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::error::{Error, StartFault};
+use crate::instance::Instance;
+use crate::role::{FleetSelection, ProcessOptions, Role};
+
+/// What starts an instance: its name, the executable that serves the roles and the prefix before a role's arguments,
+/// and the anchor's options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartSpec {
+  /// The instance (its rendezvous name, §4.7).
+  pub instance: String,
+  /// The executable that serves the roles: the host's own (`std::env::current_exe()`), whose `main` calls
+  /// [`crate::role::main`] when its arguments begin with [`StartSpec::prefix`]; or a `slates` binary, with no prefix.
+  pub program: PathBuf,
+  /// The arguments before a role's own, which the host's `main` recognises (`["slates-role"]`, say). Every process of
+  /// the instance is started with them.
+  pub prefix: Vec<String>,
+  /// Shards, when the host overrides the derivation (tests); otherwise derived from the machine (§4.1).
+  pub shards: Option<u16>,
+  /// Measure the quick profile (tests): a full profile takes seconds.
+  pub quick: bool,
+  /// The fleet this node joins (§2.6 boot step 6); `None` for an instance run alone, whose group [`Instance::start`]
+  /// makes.
+  pub fleet: Option<FleetSelection>,
+}
+
+impl StartSpec {
+  /// An instance run alone from `program` with `prefix`: derived shards, the full profile, no fleet.
+  pub fn new(instance: &str, program: PathBuf, prefix: &[&str]) -> StartSpec {
+    StartSpec {
+      instance: instance.to_owned(),
+      program,
+      prefix: prefix.iter().map(|word| (*word).to_owned()).collect(),
+      shards: None,
+      quick: false,
+      fleet: None,
+    }
+  }
+
+  /// The anchor role this spec starts.
+  pub fn role(&self) -> Role {
+    Role::Anchor(ProcessOptions {
+      instance: self.instance.clone(),
+      quick: self.quick,
+      shards: self.shards,
+      fleet: self.fleet.clone(),
+    })
+  }
+
+  /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node
+  /// NAME]`, with standard input closed (no role reads it). Standard output and error are the host's to direct: the
+  /// roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so a signal
+  /// meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
+  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself.
+  pub fn anchor_command(&self) -> Command {
+    let mut command = Command::new(&self.program);
+    command
+      .args(self.prefix.iter().map(OsString::from))
+      .args(self.role().args())
+      .stdin(Stdio::null());
+    in_its_own_group(&mut command);
+    command
+  }
+}
+
+/// See [`StartSpec::anchor_command`]: a process group of the anchor's own (`setpgid(0, 0)` in the child).
+#[cfg(unix)]
+fn in_its_own_group(command: &mut Command) {
+  use std::os::unix::process::CommandExt;
+  /// Format: `setpgid`'s "the child's own process id" for a new group.
+  const OWN_GROUP: i32 = 0;
+  command.process_group(OWN_GROUP);
+}
+
+/// See the Unix arm: the Windows anchor stays in the host's console group, so its console control handler hears the
+/// host's interrupt; [`Anchor::stop`] ends it.
+#[cfg(not(unix))]
+fn in_its_own_group(_command: &mut Command) {}
+
+/// A started instance: the attached instance, and its anchor.
+#[derive(Debug)]
+pub struct Started {
+  /// The instance, attached, its group made when it runs alone.
+  pub instance: Instance,
+  /// The anchor, a child of this process.
+  pub anchor: Anchor,
+}
+
+/// An anchor this process started: a child process. Dropping it leaves the anchor running (an instance outlives the
+/// host's handle on it); [`Anchor::stop`] stops it.
+#[derive(Debug)]
+pub struct Anchor {
+  /// The anchor's process.
+  child: Child,
+}
+
+impl Anchor {
+  /// The anchor's process id: every process of the instance carries `--instance NAME` in its arguments, the anchor
+  /// first among them.
+  pub fn id(&self) -> u32 {
+    self.child.id()
+  }
+
+  /// The anchor's process, for a host that waits on it or keeps it otherwise.
+  pub fn into_child(self) -> Child {
+    self.child
+  }
+
+  /// Stops the instance and waits for its anchor to exit; the anchor's exit code (`None` when a signal ended it). On
+  /// Unix the anchor is asked to stop (`SIGTERM`): its daemon hands off what it leads and exits, killed if it does not
+  /// within the anchor's own bounds (§2.6), and then the anchor exits 0. On Windows the anchor is ended outright, and
+  /// its daemon with it (the anchor's job object). Either way the instance's volumes are gone: they lived in its memory
+  /// (R1).
+  pub fn stop(mut self) -> Result<Option<i32>, Error> {
+    ask_to_stop(&mut self.child)?;
+    self
+      .child
+      .wait()
+      .map(|status| status.code())
+      .map_err(|error| {
+        Error::Start(StartFault::Wait {
+          errno: error.raw_os_error(),
+        })
+      })
+  }
+}
+
+/// See [`Anchor::stop`]: `SIGTERM`, which the anchor's stop flag turns into its graceful stop.
+#[cfg(unix)]
+fn ask_to_stop(child: &mut Child) -> Result<(), Error> {
+  let refused = |errno: Option<i32>| Error::Start(StartFault::Stop { errno });
+  let pid = i32::try_from(child.id())
+    .ok()
+    .and_then(rustix::process::Pid::from_raw)
+    .ok_or(refused(None))?;
+  match rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
+    Ok(()) => Ok(()),
+    // Already exited, so already stopped: the wait reaps it.
+    Err(rustix::io::Errno::SRCH) => Ok(()),
+    Err(errno) => Err(refused(Some(errno.raw_os_error()))),
+  }
+}
+
+/// See [`Anchor::stop`]: the process ended outright.
+#[cfg(not(unix))]
+fn ask_to_stop(child: &mut Child) -> Result<(), Error> {
+  child.kill().map_err(|error| {
+    Error::Start(StartFault::Stop {
+      errno: error.raw_os_error(),
+    })
+  })
+}
+
+/// Derived: how long a wait for an instance's first answer pauses between connects refused at once: the anchor's
+/// heartbeat, the cadence at which the anchor itself looks at its daemon (§4.14), so the wait is at most a beat behind
+/// the instance.
+fn pause() -> Duration {
+  Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS)
+}
+
+impl Instance {
+  /// Starts the instance `spec` names (A-278): spawns its anchor ([`StartSpec::anchor_command`], standard output and
+  /// error inherited from this process) as a child, waits until the instance answers ([`Instance::wait_for`] while the
+  /// anchor lives), and makes the group of an instance run alone ([`Instance::ensure_group`]). Refused
+  /// [`StartFault::AlreadyRunning`] when the instance already answers (attach to it instead), [`StartFault::Spawn`]
+  /// when the program cannot run, and [`StartFault::AnchorExited`] when the anchor ends before the instance answered
+  /// (its log lines, on standard error, say why).
+  pub fn start(spec: &StartSpec) -> Result<Started, Error> {
+    match Instance::attach(&spec.instance) {
+      Ok(_running) => {
+        return Err(Error::Start(StartFault::AlreadyRunning {
+          instance: spec.instance.clone(),
+        }));
+      }
+      Err(error) if error.is_unavailable() => {}
+      Err(error) => return Err(error),
+    }
+    let mut child = spec.anchor_command().spawn().map_err(|error| {
+      Error::Start(StartFault::Spawn {
+        program: spec.program.to_string_lossy().into_owned(),
+        errno: error.raw_os_error(),
+      })
+    })?;
+    let mut instance = match Instance::wait_for(&spec.instance, Some(&mut child), None) {
+      Ok(instance) => instance,
+      Err(error) => return Err(stop_after(child, error)),
+    };
+    if spec.fleet.is_none()
+      && let Err(error) = instance.ensure_group()
+    {
+      return Err(stop_after(child, error));
+    }
+    Ok(Started {
+      instance,
+      anchor: Anchor { child },
+    })
+  }
+
+  /// Waits until the instance `name` answers, and attaches to it: a connect refused at once (no rendezvous yet: the
+  /// anchor is still measuring the machine) is asked again a heartbeat later; a held rendezvous is waited on by the
+  /// connect itself. With `anchor`, the anchor's exit ends the wait ([`StartFault::AnchorExited`]); with `until`, the
+  /// deadline does, refused `Unavailable` as the last connect was. With neither, it waits as long as no daemon answers,
+  /// so a host that launched the anchor through a service manager passes a deadline.
+  pub fn wait_for(
+    name: &str,
+    mut anchor: Option<&mut Child>,
+    until: Option<Instant>,
+  ) -> Result<Instance, Error> {
+    loop {
+      if let Some(child) = anchor.as_deref_mut() {
+        anchor_still_runs(child)?;
+      }
+      match Instance::attach(name) {
+        Ok(instance) => return Ok(instance),
+        Err(error) if error.is_unavailable() => {
+          if until.is_some_and(|until| Instant::now() >= until) {
+            return Err(error);
+          }
+        }
+        Err(error) => return Err(error),
+      }
+      std::thread::park_timeout(pause());
+    }
+  }
+}
+
+/// Refused [`StartFault::AnchorExited`] once `child` has exited.
+fn anchor_still_runs(child: &mut Child) -> Result<(), Error> {
+  match child.try_wait() {
+    Ok(None) => Ok(()),
+    Ok(Some(status)) => Err(Error::Start(StartFault::AnchorExited {
+      code: status.code(),
+    })),
+    Err(error) => Err(Error::Start(StartFault::Wait {
+      errno: error.raw_os_error(),
+    })),
+  }
+}
+
+/// `error`, after stopping the anchor a start spawned and could not finish with, so a refused start leaves no instance
+/// behind. A stop that fails too is said on standard error, beside the roles' own lines: the start's failure is still
+/// `error`, and the anchor's process id is in the line.
+fn stop_after(child: Child, error: Error) -> Error {
+  let anchor = Anchor { child };
+  let pid = anchor.id();
+  if let Err(stop) = anchor.stop() {
+    slates_machine::log_line!(
+      "slates: a start that failed ({error}) could not stop its anchor, pid {pid}: {stop}"
+    );
+  }
+  error
+}
