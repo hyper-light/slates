@@ -18158,7 +18158,7 @@ fn a_superseded_owners_nfs_mount_answers_stale() {
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let name = "superseded-nfs";
   let mut client = Client::connect(daemons[0].instance());
-  let id = live_volume_named(&mut client, &daemons, name);
+  live_volume_named(&mut client, &daemons, name);
   drop(client);
   let port = daemons[0].nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
@@ -26222,6 +26222,7 @@ fn a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_re
 
 /// Format: what the mapper of [`a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`] stores, as long
 /// as the file the filler writes, so the whole store lies within the file and a write-back would write all of it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAP_STORE: &[u8] = b"STORED!";
 
 /// A-200, the held replies' bound for an asynchronous outcome (GAPS, "A live-shipped verb refused at the held replies'
@@ -26349,7 +26350,9 @@ fn a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing() {
   );
 }
 
-/// A shard counter of the daemon `client` reaches, summed over its shards, asked through the client library.
+/// A shard counter of the daemon `client` reaches, summed over its shards, asked through the client library. Linux and
+/// macOS, as the one test that asks it is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
   let Ok(ReplyBody::DaemonStatus { report }) = client.call(&RequestBody::DaemonStatus) else {
     panic!("the daemon reported its status");
