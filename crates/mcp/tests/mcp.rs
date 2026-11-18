@@ -890,8 +890,9 @@ fn assert_land(server: &mut McpServer) {
   );
 }
 
-/// R10, the real run: `slates.land.materialize` over MCP only *plans* a landing — it never writes the host disk
-/// without a human grant, not even when the agent writes real content and sneaks a `grant` argument. The target
+/// R10, the real run: under the default policy (ask, A-285), `slates.land.materialize` over MCP only *plans* a landing — it
+/// never writes the host disk without the launcher's grant, not even when the agent writes real content and sneaks a
+/// `grant` argument. The target
 /// is a real, writable, empty host directory (under `CARGO_TARGET_TMPDIR`); after the call it is still empty, and
 /// the tool answered `grant_required`. This is the agent-surface half of R10: the grant is a human-only CLI act,
 /// and no MCP argument can forge one (`land_materialize` hardcodes no grant).
@@ -943,6 +944,77 @@ fn assert_materialize_never_writes_without_a_grant(server: &mut McpServer) {
   assert_eq!(
     wrote, 0,
     "no bytes reached the host disk without a grant — the target is still empty"
+  );
+  let _ = std::fs::remove_dir_all(&target);
+}
+
+/// A-285, the real run: under a bypass write policy, which the launcher sets and the agent cannot, the agent's own
+/// `slates.land.materialize` writes at once. Do: write a file into a volume over MCP, set the volume's landing mode to
+/// bypass through the launcher's issuer proof, and land it over MCP into a real empty directory. Expect
+/// `grant_required` false and the file on disk with the agent's bytes.
+// The test is the outsider reading the host directory, as above.
+#[allow(clippy::disallowed_methods)]
+fn assert_materialize_lands_under_a_bypass_policy(
+  server: &mut McpServer,
+  instance: &str,
+  secret: &[u8; 32],
+) {
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "bypass-landed", "bounded": 1u64 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let writer = call(
+    server,
+    "slates.attach.attach",
+    json!({ "volume": volume, "write": true }),
+  )["attachment"]
+    .as_u64()
+    .unwrap();
+  call(
+    server,
+    "slates.fs.write",
+    json!({ "volume": volume, "attachment": writer, "path": "landed.txt", "text": "the agent's work\n" }),
+  );
+  let mut launcher = connect(instance);
+  let id = launcher
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|summary| summary.name == "bypass-landed")
+    .unwrap()
+    .id;
+  let subject = slates_client::PolicySubject::Volume { volume: id };
+  let bypass = slates_client::WritePolicy {
+    merge: slates_client::WriteMode::Bypass,
+    land: slates_client::WriteMode::Bypass,
+  };
+  launcher
+    .set_policy(
+      subject,
+      (bypass, 0),
+      slates_server::landing::policy_proof(secret, &subject, &bypass, 0),
+    )
+    .unwrap();
+  let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    .join(format!("slates-bypass-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&target);
+  std::fs::create_dir(&target).unwrap();
+  let structured = call(
+    server,
+    "slates.land.materialize",
+    json!({ "volume": volume, "target": target.to_str().unwrap() }),
+  );
+  assert_eq!(
+    structured["grant_required"], false,
+    "a bypass landing is written at once: {structured}"
+  );
+  assert_eq!(
+    std::fs::read_to_string(target.join("landed.txt")).unwrap(),
+    "the agent's work\n"
   );
   let _ = std::fs::remove_dir_all(&target);
 }
@@ -1067,6 +1139,8 @@ fn the_mcp_surface_serves_the_tools() {
   assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_materialize_never_writes_without_a_grant(&mut server);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  assert_materialize_lands_under_a_bypass_policy(&mut server, &instance, &secret);
   assert_malformed(&mut server);
   assert_http_transport(&profile, &instance);
 

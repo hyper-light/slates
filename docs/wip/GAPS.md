@@ -27,8 +27,10 @@
 > **Owed, in order:**
 > - the launcher's own authority, outliving its restarts (agreed with A-285's owner, 2026-11-18): a launcher secret the
 >   starter provides at every start, published by the anchor (built: the segment's field and its reader,
->   `AnchorSegment::launcher_secret`), delivered on the anchor's standard input with `Issuer::from_launcher_secret`
->   (owed, next), and verified by the daemon beside the issuer secret (owed, A-285's owner);
+>   `AnchorSegment::launcher_secret`; its delivery on the anchor's standard input, `StartSpec::with_launcher`, and
+>   `Issuer::from_launcher_secret`, `CONTRACT` = 7), verified by the daemon beside the issuer secret (A-285's owner,
+>   0366b68a), and proven by use across a daemon restart (`tests/start.rs`) — built; owed only its run on Linux and
+>   Windows (the start tests run where the integrator's lanes run them);
 > - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
@@ -7048,6 +7050,15 @@ Open, owed in this workstream:
     skipped). Those tests are now serialized by a test-only gate: 0 of 80.
   - Closing the window for every spawner in a process needs every spawn to use `POSIX_SPAWN_CLOEXEC_DEFAULT`, or one
     owner of both pipe creation and spawning. Owed.
+  - **2026-11-18: the gate had two gaps, closed.** `mach_claim`'s stranger test spawns `sh` (GAP-A9-9) and `stream`'s two
+    `EPIPE` tests make a socket pair the same non-atomic way (A-161), and neither held the gate: g242's two failures
+    (the pipe's write `Ok(1)`, the stream's send `EAGAIN`) each came while the stranger's child ran. Every test in the
+    binary that spawns a process, and every one that asserts a descriptor's last close (an `EPIPE`, a zero read), the
+    Linux rendezvous's refused delivery among them, now holds it (`descriptor_test_gate`'s doc names them). A/B on a
+    15-core Mac at loads 47 to 53, each arm built apart and its binary run directly, interleaved: 8 of 100 runs failed
+    without the gate, 0 of 100 with it. Measured beside it: a spawn takes along only what was made inside the window,
+    for the child's whole life (a Python probe on this Mac, 444,617 socket pairs beside 138 `sleep 1` spawns: 4 held,
+    each 1.06 to 1.18 s, none short).
 
 Whole-workspace verification (2026-09-28): all 175 test binaries run directly, each under a timeout. Before
 the fixes below, 173 passed and 2 failed; both failed only outside `cargo test`, and both are fixed rather
