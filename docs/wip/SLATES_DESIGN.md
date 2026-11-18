@@ -5221,6 +5221,19 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > Test: `crates/server/tests/closed_loop.rs` (each owner decides by what it measured; the loop's parks follow the
 > decision).
 
+> **Status (2026-11-18, the Node SDK suites end on Windows).** The Node suites (`sdk.test.mjs`, `sdk_async.test.mjs`,
+> `packaged.test.mjs`) start a real anchor and end it in one shared teardown (`crates/sdk-node/tests/anchor.mjs`). On
+> Unix the anchor leads its own process group and one `SIGKILL` to the group ends it and every daemon it started. On
+> Windows a negative pid is refused (libuv opens the process by its id), and the anchor holds its daemon in a
+> kill-on-close job only it has a handle to (`crates/anchor/src/supervise.rs`), so ending the anchor's own process
+> ends the daemon with it. Until 2026-11-18 the suites had never run on Windows, and every teardown sent the group kill
+> there, swallowed its refusal and left the anchor running, whose process handle kept `node --test` waiting for over
+> 70 minutes on both Windows runners (diag run 44384411115). A teardown now fails its test if the anchor is still
+> running 20 s after its kill. CI's `sdk` job runs the Node suites and the packaged smoke test on `windows-latest`
+> and `windows-11-arm` (its Python steps need a Unix venv and are owed there). The test that freezes the daemon with
+> `SIGSTOP` and finds it with `pgrep` and `ps` skips loudly on Windows; its Windows freeze (`NtSuspendProcess`, as
+> slates' Rust suites freeze a process there) is owed (GAPS).
+
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
 (fast path); if the daemon were busy, the extension parks, the reply lands, the daemon writes the

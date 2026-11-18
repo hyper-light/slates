@@ -1046,6 +1046,29 @@
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
 
+> **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
+> Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
+> 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with
+> no log kept. The cause, read from the code: every teardown sent `process.kill(-anchor.pid, 'SIGKILL')`, which Windows
+> refuses (libuv opens the process by its id, and there are no groups), and swallowed the refusal; the anchor lived on,
+> and its process handle kept `node --test` waiting. **Built:** one teardown the three suites share
+> (`crates/sdk-node/tests/anchor.mjs`): the group kill on Unix, and on Windows the anchor's own process ended, whose
+> kill-on-close job ends its daemon (`crates/anchor/src/supervise.rs`); a teardown fails its test when the anchor still
+> runs 20 s after its kill. CI's `sdk` job gains `windows-latest` and `windows-11-arm` legs that run the Node suites
+> and the packaged smoke test, each Node step bounded at 30 minutes; the packaged test's helper is copied beside it in
+> `ci.yml`, `.kiln/ci.yaml` and `.kiln/nightly.yaml`. **Owed:**
+> - the first Windows run of the three suites (filed for main; red would be a suite failing, not hanging);
+> - the Python suites on Windows: the `sdk` job's Python steps assume a Unix venv (`venv/bin/pip`), and the suites
+>   themselves start the anchor with `start_new_session` and end it with `os.killpg(os.getpgid(..), SIGKILL)`
+>   (`test_sdk.py`, `test_sdk_async.py`), neither of which Windows has, and the async suite's freeze uses `pgrep` and
+>   `SIGSTOP` as the Node one does: the same teardown, the anchor's own process ended, is owed there;
+> - `every async call ends across restart, silence, reader loss and death` (`sdk_async.test.mjs`) skips loudly on
+>   Windows. It freezes the daemon with `SIGSTOP`/`SIGCONT`, finds the instance's daemons with `pgrep -f` and reads
+>   whether each has stopped with `ps -o state=`; none exists there. Its Windows twin freezes each process whole with
+>   `NtSuspendProcess`/`NtResumeProcess`, as `crates/cli/tests/start_judgment.rs` does, and finds them by command
+>   line; a Node test can make the call only through native code (a test helper the suite spawns, never the shipped
+>   addon).
+
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
 > goal of 2026-11-18).** The Windows lanes (`windows-lint`, `windows-arm64`) now run the roster's four version-control
 > workloads (`git`, `git-history`, `mercurial`, `subversion`) over the drive: each script run by Git for Windows' `sh`

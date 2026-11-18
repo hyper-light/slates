@@ -212,7 +212,7 @@ jobs:
           cd "$TMPDIR/project"
           npm init -y >/dev/null
           npm install "$TMPDIR"/hyper-light-slates-*.tgz
-          cp "$KILN_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
+          cp "$KILN_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" "$KILN_WORKSPACE/crates/sdk-node/tests/anchor.mjs" .
           SLATES_DAEMON="$KILN_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
 
   miri-and-loom:
