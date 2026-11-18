@@ -495,20 +495,25 @@
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
-> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
->   the integrator's two Windows failures; the sibling sweep, 2026-11-18: five arms that bypassed `refusal_of_vfs`
->   and answered a directory in words now go through it: a read map's (`direct_map.rs`, two arms, one variant
->   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
->   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
->   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. a snapshot's retention refused is typed apart from the quota (`VolumeRefusal::RetentionExceeded`, `CONTRACT` = 18,
->   where it was `NoSpace`, read as the quota); `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
->   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
->   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
->   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
->   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
->   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
+> - built: every refusal typed, never words (A-299's sweep, 2026-11-18):
+>   - `CONTRACT` = 15: the volume core's refusals (`Refusal::Volume`), no catch-all left in `refusal_of_vfs`;
+>   - `CONTRACT` = 16: an unmount's unasked volumes answered, and a host refusal rendered in words (the integrator's two
+>     Windows failures);
+>   - five arms that answered a directory in words now go through `refusal_of_vfs`: a read map's (`direct_map.rs`),
+>     a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`); tests in
+>     `crates/client/tests/client.rs`;
+>   - the 11 admission arms that sent a memory error in words, the two that answered a full registry, and a
+>     database's memory refusal now go through `refusal_of_mem`;
+>   - `CONTRACT` = 17: the database's last words (`Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
+>     `SealKeyMalformed`, `Wire`) are `Refusal::Database { DatabaseRefusal }`, `Unusable::Database`;
+>   - `CONTRACT` = 18: a snapshot's retention refused is `VolumeRefusal::RetentionExceeded`, apart from the quota's
+>     `NoSpace`;
+>   - `CONTRACT` = 19: a target's refusal is `Refusal::Target { TargetRefusal }`, where `TargetUnavailable` carried
+>     words (a landing target's, a mount point's, a mount's);
+> - owed: typed fields on the wire for a merge's versions (the work's base beside the head), and for the words the crate
+>   still reads from the daemon's closed tables (a landing's state, a summary's actions, the audit's kinds, a grant's
+>   state); an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read
+>   typed from its entries;
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
@@ -1354,6 +1359,19 @@
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
 >   there is neither learned nor let go.
+> - **Fixed (A-340, g250, 2026-11-18): the bound's drop is typed and counted.** Why it must drop is stated (the
+>   configuration is bounded by its members; keeping every outstanding retirement grows it with every restart while one
+>   share stays open, refusing admissions stalls the region while one round is stuck, refusing a takeover leaves a dead
+>   host unfenced). The rounds it ends give every object they learned and did not adopt up by name: `NotRecovered
+>   { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted `fleet.takeover.given_up.retirement_dropped`;
+>   before, the rounds were forgotten silently and such a volume answered a retryable `OwnerUnreachable` for good. Every
+>   holder counts the copies it keeps on an unresolved line (`fleet.takeover.kept_unresolved`) or a lost one
+>   (`fleet.takeover.kept_lost`). Tests: `a_round_the_retirement_bound_ended_names_what_it_had_learned`,
+>   `a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (`crates/server/src/takeover.rs`).
+> - **Open (A-340): a volume no round had learned when its retirement went** is served by no member and answers
+>   `OwnerUnreachable` once the lookup's bound passes; only its holders' `kept_unresolved` shows it. Owed: a holder
+>   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
+>   `NotRecovered` by name.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before

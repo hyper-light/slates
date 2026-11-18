@@ -5761,6 +5761,13 @@ refinement and revalidation before those results can be applied to the corrected
 > one failure (`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`). Owed: the
 > release of a copy kept so (GAPS).
 
+> **Status (2026-11-18, A-340: the retirement bound's drop is typed and counted).** The bound lets a takeover go before it
+> completes only with more of them outstanding than members (A-309); the rounds it ends now give every object they had
+> learned and not adopted up by name (`NotRecovered { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted
+> `fleet.takeover.given_up.retirement_dropped`), and every holder counts the copies it keeps on an unresolved line
+> (`fleet.takeover.kept_unresolved`) or a lost one (`fleet.takeover.kept_lost`). Why it must drop, and what the operator
+> sees, are A-340's.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -7962,6 +7969,13 @@ it builds against the contract and adds to it rather than around it.
 > `VolumeRefusal::RetentionExceeded`, and the contract classes it `Exhausted::Volume`. kiln's review had read the
 > shard's slab as its own quota (A-342's record). Proof: `a_snapshots_retention_refused_is_not_the_quota`
 > (`crates/api/tests/api.rs`, a daemon whose slab is capped small).
+> **`CONTRACT` = 19:** a target's refusal is typed. `Refusal::Target { refusal: TargetRefusal }` is appended, and the
+> daemon sends it where it sent `TargetUnavailable` with words: a landing target that is not absolute, escapes, is
+> missing, is another's or that the host refused; a mount point that is not a directory or is another user's; a
+> mount the kernel's table does not name or past the records the daemon keeps; a mount the OS refused (its errno
+> when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
+> the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
+> daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -24758,6 +24772,7 @@ and unrecovered: the configuration no longer knows whether the successor it rank
 re-ranked there could adopt a stale copy beside a live adopter it cannot see. The bound lets a retirement go only past
 one per member, a region with more takeovers outstanding than members. A neighbourhood the owner wrote to before the
 last one it moved to, while unsettled, is not recorded: past tolerance a copy there is neither learned nor let go.
+(Since A-340 the drop is typed and counted, and why the bound must drop it is stated there.)
 
 Two corrections to piece 1 made with piece 2: `stale_after_confirmation` builds the successor's placement only once
 the confirmation is found (every install resolves every held copy; built first, it laid out an owner's copysets for each
@@ -25409,6 +25424,52 @@ content go.
 Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its holder rule and its owed line), GAPS
 (A-272 (ii)'s entry and the content hazard), `crates/server/src/takeover.rs`, `crates/server/src/daemon.rs` (tests) and
 the bug record.
+
+### A-340 — The retirement bound's drop of a takeover that had not completed is typed and counted: the rounds it ends give what they learned up by name, and holders count what they keep (2026-11-18, kiln goal g250; A-309's residual)
+
+A-309 keeps at most one retirement per member (`RegionalConfiguration::retirement_bound`) and, past it, lets go first one
+nobody owes or carries (it can never complete) and then the oldest, with every retirement that carries it. A takeover let
+go before it completed leaves its lines unresolved: holders keep their copies (A-272) and no round recovers them. Until
+now nothing said so. The successors' rounds of it were forgotten without a word (`takeover::drive_takeovers` forgot a
+takeover it no longer owed), a volume its round had learned and not adopted answered a retryable `OwnerUnreachable` for
+good, and a holder kept the copy uncounted.
+
+**Why the bound must drop it.**
+- The configuration is replicated on every member and bounded by its members (banned item 8). A retirement stays kept
+  while a member owes its share or a kept retirement carries it, so more than `members` of them accumulate only when
+  hosts retire faster than survivors finish their rounds: a crash loop retires a fresh id at every restart, and a
+  survivor keeps its share open while an object waits for, or was given up on, a cohort member cut off from it alone
+  (A-304, which the council never retires).
+- Each alternative is worse. Keeping every outstanding retirement grows the configuration with every restart for as long
+  as one share stays open. Refusing admissions at the bound stops the region from growing back for as long as one round
+  is stuck, which A-304 shows can be indefinite. Refusing a takeover leaves a dead host unfenced. Ranking the dropped
+  takeover's objects again among the members that remain could adopt a stale copy beside a live adopter the
+  configuration no longer names (A-309's residual). So the bound still drops; A-340 changes no rule of the configuration.
+
+**What the operator sees.**
+- **On each successor whose round the drop ended:** every volume and green its round had learned and not adopted is given
+  up by name. Its shard records it unrecovered, so its status and every verb on it answer `NotRecovered { cause:
+  TakeoverIncomplete { waited_on: "retirement" } }` and `volume list` shows `not_recovered=TakeoverIncomplete`; this node
+  claims it to lookups, so a read from another node meets that answer. Counted `fleet.takeover.given_up` and
+  `fleet.takeover.given_up.retirement_dropped`, with one log line naming the retired host and the first object
+  (`takeover::rounds_the_bound_ended`, `takeover::give_up_dropped`; the recording is A-304's, shared as
+  `takeover::record_given_up`).
+- **On every holder** of a copy whose line runs through it: the copy is kept, as unresolved never reclaims, and counted
+  `fleet.takeover.kept_unresolved` at each install that judges it; a line through a retirement with no survivor counts
+  `fleet.takeover.kept_lost`.
+- **A volume no round had learned** when its retirement went (a round still paging, or no asked member holding it) is
+  served by no member: a verb on it answers `OwnerUnreachable` once the lookup's bound passes, and only its holders'
+  `kept_unresolved` shows it. Owed (GAPS): a holder answers the owner-location exchange for a copy on an unresolved line,
+  so that lookup too answers `NotRecovered` by name.
+
+Held by, in `crates/server/src/takeover.rs`: `a_round_the_retirement_bound_ended_names_what_it_had_learned` (seven members
+at `f = 1`; four takeovers outstanding with two members left; the bound ends exactly the round of the takeover it let
+go, naming its learned object, never a completed takeover's; the held copy kept, counted) and
+`a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (a volume recorded `TakeoverIncomplete
+{ waited_on: "retirement" }` and claimed; the volume and its catalog register counted).
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its residual), GAPS (A-272 (ii)'s entry)
+and `crates/server/src/takeover.rs`.
 
 ### A-347 — A takeover opens a sealed volume's envelope in turns of the successor's owner shard (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", §4.10 "Content replication"; CLAUDE.md "Bounded work everywhere"; A-323's sibling)
 Applied in the same change to:
