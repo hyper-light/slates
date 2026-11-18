@@ -16992,6 +16992,19 @@ fn a_holder_restarted_over_its_segment_recomputes_the_greens_next_version() {
     "holder restart: first {first:?}; both held version 1 {both_held}; b after its restart {restarted:?}, after the \
      second submit {restarted_after:?}; submit {submitted:?}; version 2 placed {placed}; counters {counters:?}"
   );
+  expect_version_one_held_before_the_restart(&first, both_held, &edited, &withheld, &counters);
+  expect_version_two_through_the_rebuilt_replica(&submitted, placed, &restarted_after, &counters);
+}
+
+/// The holder-restart test's steps before its second submit, judged: the first submit accepted as version 1 and
+/// recomputed by both holders before b restarts, the second work's edit declared, and holder c withholding merge records.
+fn expect_version_one_held_before_the_restart(
+  first: &[(u64, ReplyBody, ReplyBody, Duration)],
+  both_held: bool,
+  edited: &ReplyBody,
+  withheld: &Result<(), ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
   assert!(
     matches!(
       first.first(),
@@ -17019,6 +17032,17 @@ fn a_holder_restarted_over_its_segment_recomputes_the_greens_next_version() {
     withheld.is_ok(),
     "holder c withholds merge records: {withheld:?}"
   );
+}
+
+/// The holder-restart test's second submit, judged: accepted as version 2 and placed at the quorum through the
+/// restarted holder b, whose replica was rebuilt from what it holds and recomputed version 2, while holder c withheld
+/// the record, so b alone carried the quorum.
+fn expect_version_two_through_the_rebuilt_replica(
+  submitted: &Result<ReplyBody, IpcError>,
+  placed: bool,
+  restarted_after: &Result<slates_server::merge_service::HolderMergeState, ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
   assert!(
     matches!(
       submitted,
@@ -20869,7 +20893,7 @@ fn plant_taken_over_volume(daemon: &Daemon, planted: PlantedVolume) {
         );
         s.pending_materializations.insert(
           object,
-          slates_server::state::PendingVolume::adopted(head, None),
+          slates_server::state::PendingVolume::adopted(head, None, Vec::new()),
         );
       },
     )

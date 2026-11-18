@@ -5625,6 +5625,21 @@ refinement and revalidation before those results can be applied to the corrected
 > takeover questions unanswered, `Daemon::inject_takeover_silence`; the owner stops) and
 > `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`.
 
+> **Status (2026-11-18, A-309 piece 1; A-272 (ii)).** "A retirement is dropped once all have" now leaves a record: a
+> takeover whose every survivor confirmed its share, or left owing it and carried it into a takeover of its own that
+> completed, becomes a completion record (`RegionalConfiguration::completed`), and only such a record lets a line read
+> settled. A retirement records the neighbourhood a change in flight reached (`Retirement::current`), whose members are
+> survivors and asked too; an object no survivor of its cohorts can be ranked for is ranked among all the survivors; and
+> a holder lets a copy go only for a takeover that asked it (`RegionalConfiguration::settled_for`,
+> `takeover::stale_after_confirmation`). A retirement with no survivor, or one a survivor left that never completed,
+> stays kept until the retirement bound lets it go, with every kept retirement that carries it. Records are bounded by
+> the members, never letting go of one a kept retirement still needs. The lineage model is `docs/wip/models/Lineage.tla`
+> (text only) with `crates/db/tests/lineage_model.rs`. Piece 2: an object one of whose cohorts is past its tolerance
+> is adopted once every surviving member of its cohorts, settled and current, has promised it, with the newest record
+> any of them holds (`Readiness::ReadyPastTolerance`); nothing is declared lost, and a wait past tolerance is bounded by
+> A-304's like any other (a member that never promises gives the object up by name). Piece 3: a live log whose recorded
+> holders are past tolerance is taken from every surviving holder of it, recorded or in the retired owner's cohorts.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -5792,16 +5807,18 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > (`RegionalConfiguration::owner_of`). A member reports a move through the council's report stream
 > (`ConfigCommand::Move`, `MovedForgotten` once the object is destroyed); the leader proposes it only when the
 > configuration names the reporter as the owner, or names no owner because the object's line runs through a takeover
-> that is done (the configuration no longer keeps that successor, and a host that lost its authority never reports
-> again under its id), and never for a lost or unresolved line. A move that would add an exception past the bound the
+> that completed or one it keeps no record of (the configuration no longer keeps that successor, and a host that lost
+> its authority never reports again under its id), and never for a lost line or one a kept retirement gives another
+> member. An unresolved line is allowed since A-309: completion records are bounded, so the line of every volume whose
+> creator's takeover completed long ago reads unresolved once its record is let go. A move that would add an exception past the bound the
 > leader derives is answered `ReportOutcome::Full` and not proposed (`fleet::moved_bound`: the members times one
 > member's volume slots, at the leader's size). A move back to the creator drops the exception. An exception follows
 > its owner's takeover at the successor's confirmation, through a takeover carried into another's too, so no line
 > starts at a retirement the configuration dropped. The encoding carries the exceptions last (the encoding itself is
-> still unversioned; GAPS). Held by four tests in `crates/db/src/register.rs` (`a_move_names_the_objects_owner_and_only_its_owner_moves_it`,
+> still unversioned; GAPS). Held by five tests in `crates/db/src/register.rs` (`a_move_names_the_objects_owner_and_only_its_owner_moves_it`,
 > `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`,
 > `a_moved_objects_exception_follows_a_takeover_carried_into_another`,
-> `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`), the council's
+> `a_member_moves_an_object_whose_line_names_no_owner` and `no_member_moves_a_lost_object`, both A-309's), the council's
 > `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` and the encoding's round trip and lying-count tests.
 > Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
 > old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
@@ -16480,7 +16497,9 @@ exchange and applied up to its first gap; the burst flow's batch counters), §4.
   - Phase one counts `f + 1` reports only among the holders the adopted catalog records. Every member asked still
     reports, and the greatest head among all reports is adopted.
   - When too few recorded holders answer, phase one waits (`fleet.live.takeover_waits_quorum`). It never falls back to
-    the current placement.
+    the current placement. (A-309: past tolerance, when fewer than `f + 1` recorded holders are still members so the
+    count can never be met, every surviving recorded holder and every surviving member of the retired owner's cohorts
+    for the volume must report, and the greatest head is adopted; within tolerance this rule is unchanged.)
   - A catalog that records no holders belongs to a shipper that never shipped: there is no log, and the volume is
     served from its placed seal.
   - A successor keeps the recorded holders in its own record until its shipper records its own, so a catalog it ships
@@ -21787,17 +21806,23 @@ in it.
 - **Settled needs that evidence.** A line reads settled only when its retirement was pruned. A ranked successor that
   is neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
   retired with no neighbourhood to recover through read **unresolved** (`Lineage::Unresolved`,
-  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding).
+  `RegionalConfiguration::dropped_unconfirmed`, carried in the configuration's encoding; A-309 replaced it with
+  completion records, so settled rests on a record and every other absence reads unresolved).
 - **Unresolved never reclaims.** A holder keeps its copy, as for a lost object.
 - **Owed (A-272 ii):** kept adoption records, so settled rests on a record rather than on a pruned retirement, and a
-  round of the current members for unresolved objects, so `f + 1` counts the members that exist now.
+  round of the current members for unresolved objects, so `f + 1` counts the members that exist now. A-309 takes it:
+  the completion records and the lineage model (piece 1), the recovery by the members that exist now (piece 2), and the
+  live takeover past tolerance (piece 3) are built.
 
-Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled`,
+Held by `an_absent_ranked_successor_leaves_the_object_unresolved_not_settled` (A-309 renamed it
+`an_absent_ranked_successor_settles_the_object_only_on_its_completion_record`),
 `a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved` (`crates/db/src/register.rs`),
-`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`), and the store-destroyed
+`a_round_that_lost_an_object_does_not_confirm_its_share` (`crates/server/src/takeover.rs`; since A-309 nothing is
+lost, and it is `a_round_confirms_only_once_every_object_it_learned_is_adopted`), and the store-destroyed
 flow's check that no surviving holder reclaims while nobody serves the volume (`crates/cli/tests/live_chaos.rs`). The
 §4.8 model (`docs/wip/models/Reconfig.tla`) covers the neighbourhood change, not takeover lineage, and states nothing
-here; a lineage model is owed with (ii).
+here; a lineage model is owed with (ii) (A-309 wrote it: `docs/wip/models/Lineage.tla`, text only, with
+`crates/db/tests/lineage_model.rs`).
 
 **The encoding.** `dropped_unconfirmed` is the last field of `raft_wire::encode_regional_configuration`. An entry of
 the old encoding read by a new build runs out of bytes there (`RaftWireError::Truncated`), and a new entry read by an
@@ -23886,6 +23911,149 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and the decision's own two unit tests. By use over the export:
   `an_object_made_over_the_export_takes_its_group_by_this_hosts_rule` (`crates/bridge-nfs/tests/procedures.rs`), which
   holds macOS's CI run to BSD's rule and every other host to System V's. The FUSE creation test of AUD-29-81 stands.
+
+### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
+
+A-272 made a takeover's line settled only on evidence, but the evidence was still an absence: a retirement no longer
+kept read as one whose every survivor had confirmed, unless the bound's drop of it had been recorded
+(`dropped_unconfirmed`). And "every survivor confirmed" did not mean every object was adopted. Five histories let a
+holder let go of a copy nobody had adopted (the first two read from the code, the last three found by the lineage
+model below; each red before its fix):
+- **A takeover with no survivor.** A region formed on one node settles that node's neighbourhood as itself alone
+  (A-234). Taken over before it reported its grown neighbourhood placed, its retirement had no survivor, so no member
+  owed a confirmation and it was dropped at once. The members that held its joint writes read its objects settled.
+- **A takeover carried into one with no survivor.** A survivor that retires owing its share carries the earlier
+  takeover into its own. When the carrier had no survivor, its retirement was dropped at once, the earlier one then had
+  no member owing and was dropped too, and both lines read settled.
+- **An object no survivor of its cohorts was ranked for.** It read lost, no round learned it, every survivor
+  confirmed, and the dropped retirement read its line settled while a member of the current neighbourhood held its
+  copy.
+- **A carried retirement the bound dropped while its carrier was kept.** The carrier's objects were ranked anew
+  (their successors are ranked among the carried cohorts too); a survivor confirmed its share without an object it had
+  first been ranked for, and a holder that had routed the copy to it read the confirmation as an adoption.
+- **A holder the round never asked.** A neighbourhood the owner had left still held a copy no asked member held; the
+  successor confirmed without ever learning it, and the holder read the confirmation (or, lagging, the dropped
+  retirement) as an adoption.
+
+**Piece 1, the completion record (built).**
+- **A takeover that completes is kept as a record** (`RegionalConfiguration::completed`, `CompletedTakeover`: the
+  version it completed at and the survivors that confirmed). It replaces `dropped_unconfirmed`: settled rests on a
+  record, and its absence on nothing.
+- **A retirement completes only on evidence that every object was adopted** (`RegionalConfiguration::completes`): it
+  had survivors, and each confirmed its share or left owing it and carried it into a takeover of its own that
+  completed. A survivor that left owing its share retired while this retirement was kept, so its own retirement
+  carried this one, and that takeover's completion is the evidence.
+- **The retirement records the neighbourhood a change in flight reached** (`Retirement::current`), and its members
+  are survivors and asked in the round (`recovery_hosts`): a member that joined the owner's neighbourhood after it was
+  settled can hold a copy no settled host holds (the replacement holding the live log, in the store-destroyed
+  takeover).
+- **Every object ranks a survivor.** One no survivor of its cohorts can be ranked for is ranked among all the
+  retirement's survivors (`successor`), fixed at the retirement; so a takeover whose survivors all confirmed has
+  adopted every object they hold.
+- **A retirement that cannot complete stays kept.** One no member owes anything of and no kept retirement carries, but
+  that cannot complete (a survivor left and its own takeover never completed, or it had no survivor), stays in
+  `retired`, so its lines still name the successors that adopted (`Lineage::Successor`) and the objects nobody can
+  recover (`Lineage::Lost`). Past the retirement bound such ones go first, then the oldest, and every kept retirement
+  that carries the one dropped goes with it, so a kept takeover always ranks as it did at its retirement.
+- **A line ends settled only at a completion record** (`RegionalConfiguration::line_end`, `Lineage::Settled
+  { takeover }`). Anywhere else it is unresolved: a retirement the bound dropped, a record let go, a host never retired
+  here. Unresolved never reclaims.
+- **A holder lets a copy go only for a takeover that asked it.** On a settled line only a holder that confirmed that
+  takeover (`RegionalConfiguration::settled_for`): it was a member of its recovery neighbourhoods throughout and
+  answered every successor before any confirmed, so every copy it held was learned and adopted. On a successor's
+  confirmation (`takeover::stale_after_confirmation`, a holder outside the successor's placement) only a survivor of
+  that takeover, and the completion record's confirmations are read too, since the last confirmation drops the
+  retirement in the version that records it (before, such a holder kept its stale copy for good). A holder the round
+  never asked keeps its copy (`fleet.takeover.kept_unasked`): within tolerance it is stale, past it it may be the only
+  one, and nothing in the configuration tells which. Owed (GAPS): a holder an owner's neighbourhood settled away from
+  lets its copies go at that settle, on the owner's report, so these do not stay.
+- **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
+  the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
+  completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
+  never a loss. An id admitted again loses its old record (`admit`): it says nothing of the member it names now, and
+  kept it would let a later, uncompleted takeover of the id read as completed.
+- **A move on an unresolved line is allowed** (`RegionalConfiguration::moves`). Records are bounded, so the line of
+  every volume whose creator's takeover completed long ago reads unresolved once its record goes; refusing it, as
+  A-272 did, would leave such a volume unmovable for good. The configuration names no owner there and holds no claim
+  against the member that serves the object, which only its adopter does. A lost line and one a kept retirement gives
+  another member still refuse.
+- **The encoding.** `raft_wire::encode_regional_configuration` carries the records where `dropped_unconfirmed` was
+  (after the adoptions, before the moved objects: a count, then each host, version and confirmed hosts), and each
+  retirement's current neighbourhood after its unconfirmed hosts (a presence byte, then its settled form). The regional
+  layout version is 2 (`raft_wire::REGIONAL_LAYOUT`, g230's versioned layout, which landed first): a layout-1 build and
+  a layout-2 build refuse each other's configurations by name, where without the version a layout-1 entry with nothing
+  dropped and no retirement kept would have parsed as layout 2.
+- **The lineage model** (`docs/wip/models/Lineage.tla`, read as text only: CLAUDE.md §2 item 13 keeps TLA+ tooling off
+  Ada's machines and out of CI) and its executable counterpart `crates/db/tests/lineage_model.rs`, which drives the
+  real configuration through generated histories: a member lets a copy go only if its object was adopted after that
+  copy was written, and the retirements and records stay bounded. It found the last three histories above; 4,096
+  histories pass with the rules here, and over 400 fixed seeds every verdict is reached (settled and confirmed
+  reclaims, unresolved and unasked keeps, adoptions, completions, shares left unconfirmed past tolerance).
+
+**Piece 2, the members that exist now recover a cohort past its tolerance (built).** An object one of whose settled
+cohorts has fewer members than its recovery quorum, more of it failed than the region tolerates, was lost: never
+adopted, its share never confirmed, its copies kept and recovered by no one (A-272 kept them; nothing used them). Now it
+is adopted once every surviving member of its cohorts, settled and current (`RegionalConfiguration::current_cohorts`),
+has promised it, with the newest record any of them holds (`slates_db::takeover::Readiness::ReadyPastTolerance`,
+counted `fleet.takeover.recovered_past_tolerance`). No quorum can meet every committed record past tolerance; this is
+the most the members that exist now hold, and the round waits for every one of them, so a holder of a newer record is
+never passed over. A member of a current cohort is asked for such an object by name as a settled one is
+(`takeover::unanswered_by_name`). Within tolerance the counting is unchanged, and `Readiness::Lost`, with the round's
+lost set, is gone: an object stays learned until it is adopted, so a share still confirms only once every object it
+learned is adopted (`share_done`). The store-destroyed takeover's shape: the settled cohort {owner, A, old B} with A
+alone left, the owner's current neighbourhood {owner, A, B'}; A, its successor, adopts once A and B' have answered,
+with B''s newer record.
+
+**Piece 3, the live takeover past tolerance (built).** When fewer than `f + 1` of a live volume's recorded holders are
+still members (`slates_db::live::past_tolerance`), A-240's count can never be met, and the takeover waited for good: at
+`f = 1` an owner whose holders were recorded as {survivor, destroyed node} left the replacement that caught up on the
+log out of the count (g240's finding). Past tolerance phase one now asks, and waits for, every surviving recorded holder
+and every surviving member of the retired owner's cohorts for the volume, settled and current
+(`PendingVolume::cohort_hosts`, taken from the configuration at the volume's adoption, since the retirement may be let
+go before the log is fetched), and adopts the greatest head among all the reports
+(`slates_db::live::adopt_past_tolerance`, counted `fleet.live.taken_over_past_tolerance`; while one has not reported,
+`fleet.live.takeover_waits_past_tolerance`). Within tolerance A-240's rule is unchanged. With piece 2 this is the
+store-destroyed takeover end to end: A adopts the registers once B' answered, then the live log from whichever of A and
+B' holds the greater head.
+
+**Residual (recorded, not built).** A line through a retirement the bound let go before it completed stays unresolved
+and unrecovered: the configuration no longer knows whether the successor it ranked adopted the object, and a round
+re-ranked there could adopt a stale copy beside a live adopter it cannot see. The bound lets a retirement go only past
+one per member, a region with more takeovers outstanding than members. A neighbourhood the owner wrote to before the
+last one it moved to, while unsettled, is not recorded: past tolerance a copy there is neither learned nor let go.
+
+Two corrections to piece 1 made with piece 2: `stale_after_confirmation` builds the successor's placement only once
+the confirmation is found (every install resolves every held copy; built first, it laid out an owner's copysets for each
+copy at each install), and its test's region is seven members, so an object its successor places away from the holder
+always exists.
+
+Held by, in `crates/db/src/register.rs`:
+`a_bootstrap_taken_over_before_it_settled_is_ranked_among_the_members_its_joint_writes_reached` and
+`a_takeover_carried_into_one_whose_settled_neighbourhood_is_gone_is_ranked_among_its_current_one` (both read settled
+before), `an_object_whose_cohort_has_no_survivor_is_ranked_among_the_retirements_survivors` (read lost, then settled),
+`an_absent_ranked_successor_settles_the_object_only_on_its_completion_record`,
+`a_confirmed_takeover_settles_the_lineage_and_frees_the_id`,
+`completion_records_stay_bounded_and_keep_what_a_kept_retirement_needs`,
+`a_member_moves_an_object_whose_line_names_no_owner` and `no_member_moves_a_lost_object`; in
+`crates/db/tests/lineage_model.rs`: its three tests (since piece 2 it adopts past tolerance too, 276 times over its
+400 fixed seeds); in `crates/db/src/takeover.rs`:
+`a_short_cohort_waits_for_every_surviving_holder_and_a_whole_one_for_its_quorum`; in
+`crates/db/tests/takeover_model.rs`: `the_newest_surviving_record_is_adopted_past_tolerance` (proptest: waiting until the
+last surviving holder answers, then the newest record any of them holds; never past tolerance within it); in
+`crates/server/src/daemon.rs`: `a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now` (counted lost
+and never adopted before); in `crates/db/tests/live.rs`: `a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder`
+(A-240's rule adopting nothing whatever is reported);
+`a_holder_outside_the_successors_placement_lets_its_copy_go_when_the_takeover_completes` (kept its copy before) and
+`a_holder_the_takeover_never_asked_keeps_its_copy` (let it go on the kept retirement's confirmation before); in
+`crates/cluster/src/raft_wire.rs`: the configuration round trip and `a_lying_completion_record_count_is_refused`.
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status) and the moved-object exceptions' status, A-272
+(its owed line and test names), GAPS (A-272's entry and its open (ii), the encoding entry), `docs/wip/models/Lineage.tla`,
+`crates/db/src/register.rs`, `crates/db/src/takeover.rs`, `crates/db/src/live.rs`, `crates/db/tests/lineage_model.rs`,
+`crates/db/tests/takeover_model.rs`, `crates/db/tests/live.rs`, `crates/cluster/src/raft_wire.rs`,
+`crates/server/src/takeover.rs`, `crates/server/src/live_ship.rs`, `crates/server/src/fleet.rs`,
+`crates/server/src/state.rs`, `crates/server/src/mirror.rs` and `crates/server/src/daemon.rs` (tests); A-240 (its
+waiting rule).
 
 ### A-318 — The watchdog holds a poll's CPU to the build it runs in (2026-11-18, goal g251: every open slates bug fixed; the supervisor's order for the TSan lane)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/build_cost.rs`
