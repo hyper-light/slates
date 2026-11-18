@@ -853,6 +853,7 @@ plan schedules.
 - Lost: Brotli, xz, fixed "save 12.5%" rules (sector-rounding artefacts), SHA-256 (not fixed-cost across the matrix), CDC everywhere.
 - Amended (A-53, 2026-09-30): format minor 3 — every node's four times are signed and complete (access, modification, change, birth) and its extended attributes are carried as names with value extents over the archive's chunks, all covered by the manifest identity; a takeover successor restores them (AUD-29-56, `docs/bugs/2026-09-30-a-placed-archive-lost-attributes-and-times.md`).
 - Amended (A-20, 2026-09-15): the manifest's per-node metadata carries the owner (uid, gid), and the root directory's own metadata (mode, owner, times) rides ahead of the tree in the manifest section — format minor 2, both covered by the header's manifest identity — so replication, clone-from-archive and a takeover successor's rebuild (`materialize_taken_over`) reproduce ownership, not only modes and times; under the NFS edge's POSIX access control a tree rebuilt as `0:0` would have shut its owner out (`docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`).
+- Amended (A-391, 2026-11-18): a restore is made in bounded steps (`slates_archive::Planning`, `Planned::restoring`, `Restoring`): the tree planned a node or a directory's entry at a time, the chunks indexed and the need counted an extent at a time, then the buffers allocated, the references gathered, each extent filled from its chunk (decoded once, with the first extent that names it) and each piece laid into its file, one at a time, each step until its caller's `spent` says the share is spent. `restore` and `restore_needed` are the steps run to their ends, one code path. A takeover successor restores in turns of its shard's clock through it (g251; the plain takeover's restore of the 1.99 GB kernel base volume ran seconds in one poll, g232).
 - Erasure coding: the format carries a fragment record kind from the first release: a chunk may be held as k data and m parity fragments (Reed-Solomon), each fragment with its own BLAKE3, the chunk's identity unchanged, so replication, archive and clone-from-archive all understand fragments from the first release; the policy that codes cold sealed content instead of replicating it is measured in Phase 8 (D-O6): the class boundary comes from measured read rates, the (k, m) from the failure-domain tree, and the reconstruction cost from the profile [A: Rashmi et al., EC-Cache, NSDI 2016; A: Muralidhar et al., f4, OSDI 2014; A: Huang et al., LRC, ATC 2012].
 
 ### D-18 Durability: explicit client, process, host and region boundaries
@@ -16604,9 +16605,10 @@ the green's shard.
     which the work keeps until its base moves; a rebase answers those of its restated journal. A submit or rebase
     fetches what its journal names that the work lacks, composes by the owner's own function over `Base::for_names`, and
     sends the increment alone. The owner only judges.
-  - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
-    region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
-    and stalled every run.
+  - *Asks are batched per owner.* A shard keeps at most two batches of asks out to each owner at a time (A-388; one
+    until 2026-11-18), each at most a client region's credit, waiting for room on the owner's channel; one message an ask
+    flooded the channels at 3,000 clients and stalled every run, and one batch at a time made an ask wait for the batch
+    before it to come back before it left.
   - *A creation holds its id and its name* while the owner admits it (`Op::WorkCreationPending`, settled with the
     creation, dropped at a start). The id is the creating transaction's sequence, so a parked creation, which commits
     nothing, would share it with every other parked in the same step.
@@ -28305,3 +28307,58 @@ takeover's fetch), the bug record `docs/bugs/2026-11-18-a-takeover-fetch-copied-
 `crates/db/src/live.rs`, `crates/db/tests/live.rs`, `crates/transport/src/{stream,connection,endpoint,conn,flow}.rs`,
 `crates/transport/tests/{session,stateless_reset}.rs`, `crates/transport/examples/{congestion_bench,path_mtu_bench}.rs`,
 `crates/server/src/{live_ship,fleet,config}.rs`, `crates/server/tests/fleet.rs`.
+
+### A-388 — A shard keeps two batches of asks out to each owner, so an ask made while one is out leaves at once (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Asks are batched per owner")
+Applied in the same change to: §4.16 (A-247's rule, "Asks are batched per owner"), GAPS (the load test's entry),
+`crates/server/src/work_home.rs` (`Outbox::out`, `BATCHES_OUT`, `BATCHES_OUT_PEAK`, `start_ask`, `take_batch`, the module's
+"Asks are batched"), and the test below.
+- **What was measured.** A work's verb that needs its green's owner parks on the work's shard and its ask goes into the
+  shard's outbox for that owner; one batch was out at a time, so an ask made while a batch was out waited for that
+  batch's whole round trip (the owner's turn, the answer's way back, the shard's turn to send again) before it left. The
+  g083 trace on the Mac Studio (1,000 clients over 23 shards, a think mean of 50 ms, load 25 to 35, 2026-11-18) split an
+  ask's way to the owner at that wait: in the outbox p50 32 to 37 µs and p99 1.6 to 2.1 ms for submits and rebases,
+  against 71 to 84 µs and 2.4 to 2.7 ms from the batch's sending to the owner's start of the ask; in the slowest 1% of
+  edits, submits and rebases the outbox's mean was 3.5, 6.2 and 8.5 ms against the rest of the way's 3.6, 6.5 and 8.1.
+- **The rule.** A shard keeps at most two batches out to each owner: an ask made while fewer are out goes in a batch of
+  its own at once, and past two it waits for a batch's answer, as before. Two is double buffering, the least that
+  keeps the owner from waiting an asking shard's round trip for its next batch: one is served while the other waits at
+  the owner. A work's order is unchanged: a work has one ask out at a time (its queue's oldest verb), so two batches out
+  never carry two asks of one work. The owner's channel holds at most two messages from each asking shard, the bound
+  one batch gave it doubled.
+- **Test.** `a_shards_second_ask_leaves_while_its_first_batch_is_still_out` (`crates/server/tests/works_off_owner.rs`):
+  two works on one shard ask the green's held owner, one after the other, and the shard has two batches out at once;
+  red at one batch (its peak 1). The status counter `merge.work.batches_out_peak` is the most a shard has had out to
+  one owner at once.
+- **Measured** (BENCHMARKS, "Two batches of asks out to an owner", Mac Studio, 1,000 clients, 2026-11-18): every request
+  kind's p99 lower in five of six pairs back to back, by 40 to 50% in the pair at matched load 30 at a think mean of
+  50 ms (an accepted submit 1.55 to 0.80 ms); traced, the outbox's p999 fell eightfold to tenfold (a submit's 12.9 to
+  1.4 ms) and the whole submit's p999 by two thirds.
+
+### A-391 — An archive restore is made in bounded steps
+
+*2026-11-18, g251 (the coordinator's order: the takeover's archive, restore and population in turns).* D-17's restore
+(`crates/archive/src/restore.rs`) planned the whole tree, allocated every buffer, decoded every chunk and laid every
+file out in one call: a takeover successor's restore ran inside one turn of its owner shard (0.14 to 0.18 s for a
+300 MB live volume on a Mac Studio, A-374's trace; seconds for g232's 1.99 GB, 97,254-file kernel base volume).
+**Now** the restore is three types, each made a piece at a time until its caller's `spent` answers that the step's
+share is spent, a piece at least: `Planning` (the root's attributes, then a node or a directory's entry a piece, the
+archive's chunks indexed a chunk a piece from the last, the need counted an extent a piece), `Planned` (its `needed`,
+and `restoring(budget)`, which refuses `OverBudget` before anything is allocated, as before), and `Restoring` (a buffer
+allocated, an extent's reference gathered, an extent filled from its chunk, the chunk decoded and verified once with
+the first extent that names it, or a data piece laid into its file, contiguous pieces merged). No piece holds more than
+one chunk's bytes, except a merge onto a file's growing piece, which copies the piece it lays. `restore` and
+`restore_needed` are the steps run to their ends, so every caller restores through one code path. The walk is
+iterative per entry, so a flat directory of 97,254 entries is that many pieces, never one. Nothing changes in what a
+restore produces: the 13 existing restore tests and 3 transfer tests pass on the stepped code.
+
+Tests: `a_restore_in_steps_of_one_piece_is_the_restore_in_one_call` (`crates/archive/tests/restore.rs`: an archive with
+a sparse file of three data extents over two chunks around a hole, a compressed chunk named eight times, a nested tree,
+an empty file, attribute values on the root and on a file, a duplicated and an unnamed chunk; one piece a step equals
+one call, with more plan steps and restore steps than files; the need equals `restore_needed`; a budget one byte short
+refused before a step; a missing chunk refused in steps as in one call). Red: a chunk's later extents dropped after its
+first fill fails `a_chunk_named_many_times_is_decoded_once_and_its_expansion_is_admitted` (the step-for-step oracle
+alone cannot see it, since one call is the same steps).
+
+Applied in the same change to: D-17 (its amendment line), GAPS (A-347's one-turn walks: the restore's steps exist; the
+server still restores in one turn until the population and the plain takeover path follow),
+`crates/archive/src/{restore,lib}.rs`, `crates/archive/tests/restore.rs`.
