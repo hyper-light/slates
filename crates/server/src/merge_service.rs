@@ -112,9 +112,10 @@ pub struct MergeShardState {
   /// each time. Nothing of a green ships while its inputs are not made. Bounded by the greens this shard owns; dropped
   /// with the green and once every candidate holds version 0.
   pub(crate) origin_inputs: BTreeMap<ObjectId, crate::merge_origin::OriginInputs>,
-  /// On a holder: the greens whose version 0 a task of this shard is seeding into a replica a share at a time from the
-  /// inputs it holds (`crate::merge_origin::ReplicaSeed`, A-286). Every record of such a green is answered with no
-  /// acknowledgement until the replica is seeded; the owner ships it again. Bounded by the greens this holder backs.
+  /// On a holder: the greens whose replica a task of this shard is building a share at a time from what it holds
+  /// (`crate::merge_origin::ReplicaSeed`): version 0 seeded from its inputs (A-286), and on a holder that restarted,
+  /// every version it accepted recomputed from its held increments (A-313). Every record of such a green is answered with
+  /// no acknowledgement until the replica is built; the owner ships it again. Bounded by the greens this holder backs.
   pub(crate) seeding: BTreeSet<ObjectId>,
 }
 
@@ -3319,7 +3320,8 @@ const RECORD_WITHHELD: &str = "merge.record_withheld";
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
-/// acknowledgement returned. Every other case is an empty reply the owner counts as no
+/// acknowledgement returned. A holder with the green's records and no replica (a warm restart) rebuilds the replica
+/// from them first (A-313). Every other case is an empty reply the owner counts as no
 /// acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
 pub(crate) fn accept_merge_record(
   state: &mut ShardState,
@@ -3350,11 +3352,17 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
-  let next = state
-    .merge
-    .replicas
-    .get(&object)
-    .map(|replica| replica.head().saturating_add(1));
+  let next = match state.merge.replicas.get(&object) {
+    Some(replica) => Some(replica.head().saturating_add(1)),
+    // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
+    // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
+    // refused out of order here, for good.
+    None => match crate::merge_origin::rebuild_replica(state, object) {
+      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
+      crate::merge_origin::Rebuild::Later => return Vec::new(),
+      crate::merge_origin::Rebuild::Nothing => None,
+    },
+  };
   match (next, value.version) {
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     (Some(next), version) if version < next => {
