@@ -13165,6 +13165,160 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
   });
 }
 
+/// A formed two-node `f = 1` fleet of two shards a node, and node A's instance (A-247: a work can be on another shard).
+fn two_shard_fleet() -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  (ports, daemon_a, daemon_b, instance_a)
+}
+
+/// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
+fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "off-shard-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let name = (0u32..)
+    .map(|suffix| format!("off-shard-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// A-247, AUD-11. Do: in a two-node `f = 1` fleet whose holder withholds every merge record, submit from a client on the
+/// green's node a work on another shard of that node, and pipeline an edit behind it. Expect: the acceptance waits at
+/// the quorum on the owner, and neither verb is answered; once the holder takes the record the submit is answered the
+/// version and the edit after it, in order, and the work reads the edit over the accepted version.
+#[test]
+fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_shard_fleet();
+  let mut client = Client::connect(&instance_a);
+  let (green, work) = green_and_off_shard_work(&mut client);
+  let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at,
+    delete_len: 0,
+    bytes: bytes.to_vec(),
+  };
+  assert!(matches!(
+    client.call(&appended(0, b"hello")),
+    ReplyBody::Edited
+  ));
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+      refuse_work_catalogs: false,
+    })
+    .unwrap();
+  let mut pipelined = common::client::connect(&instance_a);
+  let submit = pipelined
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let both = [&daemon_a, &daemon_b];
+  assert!(
+    poll_until(&both, PLACEMENT_DEADLINE, || Ok(
+      daemon_a.merge_awaiting(green)? == 1
+    )),
+    "the acceptance waits at the owner"
+  );
+  let after = pipelined.begin(&appended(5, b"!")).unwrap();
+  assert!(
+    matches!(pipelined.poll_reply(after), Ok(None)),
+    "the edit behind the deferred submit is not answered"
+  );
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .unwrap();
+  let submitted = answer_within(&mut pipelined, submit.word());
+  let edited = answer_within(&mut pipelined, after.word());
+  let answered_late = daemon_a
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.answered_late")
+    .copied()
+    .unwrap_or(0);
+  let read = client.call(&RequestBody::Read {
+    volume: work,
+    path: "f".to_owned(),
+    at: ReadAt::Head,
+  });
+  drop(pipelined);
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    answered_late > 0,
+    "the quorum's commit resumed the parked submit, not a deadline and a retry"
+  );
+  assert_held_to_its_quorum(submitted, edited, &read);
+}
+
+/// What [`a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it`] must have seen.
+fn assert_held_to_its_quorum(
+  submitted: Option<Result<ReplyBody, String>>,
+  edited: Option<Result<ReplyBody, String>>,
+  read: &ReplyBody,
+) {
+  assert!(
+    matches!(
+      submitted,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the submit answers its version: {submitted:?}"
+  );
+  assert!(
+    matches!(edited, Some(Ok(ReplyBody::Edited))),
+    "and the edit after it: {edited:?}"
+  );
+  assert!(
+    matches!(read, ReplyBody::ReadBytes { bytes } if bytes == b"hello!"),
+    "the work reads the edit over the accepted version: {read:?}"
+  );
+}
+
 /// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
 struct ForwardedResend {
   faulted: bool,
@@ -15068,6 +15222,353 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
     carried >= SUBMITS,
     "every version's inputs reached a holder inside its merge record ({carried} of at least {SUBMITS}): {counters:?}"
   );
+}
+
+/// Shape: the files of the base a green's origin is walked from in [`a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`]:
+/// enough that its origin's inputs span many of a shard's slices and more than one shipment on any machine (the
+/// shipment bound is a slice of BLAKE3 work, a few MiB at most), few enough that a debug build's sliced walk ends within
+/// the test client's reply deadline on a loaded box (1,000 of them took about 30 s at load 51, `green_fairness.rs`).
+const ORIGIN_FILES: usize = 256;
+/// Shape: the directories the base's files are spread over, so the walk walks a tree.
+const ORIGIN_DIRS: usize = 16;
+/// Shape: each base file's bytes, about a source file's (the kernel's `fs/` averages about 16 KB a file).
+const ORIGIN_FILE_BYTES: usize = 16 * 1024;
+/// Shape: the base volume's bound over its files' bytes, room for the snapshot's copy-on-write.
+const ORIGIN_BOUND_FACTOR: u64 = 4;
+/// Shape: how long version 0 of the green may take to place at `f + 1` before the test gives up: past a debug build's
+/// sliced making, shipping and seeding of the base's origin on a loaded box.
+const ORIGIN_PLACE_WAIT: Duration = Duration::from_secs(240);
+
+/// A base file's path in [`a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`], in the base volume.
+fn origin_file_path(file: usize) -> String {
+  format!("/d{}/f{file}.c", file % ORIGIN_DIRS)
+}
+
+/// The same file's path in the green, relative to its root as the origin's walk names it.
+fn origin_green_path(file: usize) -> String {
+  format!("d{}/f{file}.c", file % ORIGIN_DIRS)
+}
+
+/// A `slates_client` connection to `instance`, which stages a request body larger than one ring slot and reads a file
+/// in pages: the base's writes and the green's reads are each larger than a slot.
+fn origin_client(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
+}
+
+/// A base file's bytes: its index, then filler to [`ORIGIN_FILE_BYTES`].
+fn origin_file_bytes(file: usize) -> Vec<u8> {
+  let mut bytes = format!("origin file {file}\n").into_bytes();
+  bytes.resize(ORIGIN_FILE_BYTES, b'o');
+  bytes
+}
+
+/// A volume on `client`'s node, `instance`, holding the base's [`ORIGIN_FILES`] files over [`ORIGIN_DIRS`] directories,
+/// written under a write attachment (through `slates_client`, which stages a body larger than one ring slot) and
+/// snapshotted: the green's base.
+fn origin_base(client: &mut Client, instance: &str) -> slates_ipc::protocol::GreenBase {
+  let ReplyBody::Created { id: volume } = client.call(&RequestBody::Create {
+    name: "origin-base".to_owned(),
+    size: SizeClass::Bounded {
+      limit: (ORIGIN_FILES * ORIGIN_FILE_BYTES) as u64 * ORIGIN_BOUND_FACTOR,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("create the base volume");
+  };
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach the base volume");
+  };
+  for dir in 0..ORIGIN_DIRS {
+    let made = client.call(&RequestBody::FsMkdir {
+      volume,
+      attachment,
+      path: format!("/d{dir}"),
+      mode: 0o755,
+    });
+    assert!(
+      matches!(made, ReplyBody::FsDone { .. }),
+      "mkdir {dir}: {made:?}"
+    );
+  }
+  let mut writer = origin_client(instance);
+  for file in 0..ORIGIN_FILES {
+    writer
+      .fs_write(
+        (volume, attachment),
+        &origin_file_path(file),
+        &origin_file_bytes(file),
+        0o644,
+      )
+      .unwrap();
+  }
+  let ReplyBody::Snapshotted { id: snapshot, .. } = client.call(&RequestBody::Snapshot { volume })
+  else {
+    panic!("snapshot the base volume");
+  };
+  slates_ipc::protocol::GreenBase { volume, snapshot }
+}
+
+/// A probe of one node while a green's version 0 places: which node, when it was sent, how long its answer took.
+type OriginProbe = (usize, Instant, Duration);
+
+/// Probes every node of `instances` in turn with a status read of a volume made on it, until `stop` is dropped: every
+/// probe taken.
+fn probe_nodes_until(
+  instances: &[String],
+  stop: &std::sync::mpsc::Receiver<()>,
+) -> Vec<OriginProbe> {
+  let mut probers: Vec<(Client, VolumeId)> = instances
+    .iter()
+    .enumerate()
+    .map(|(node, instance)| {
+      let mut client = Client::connect(instance);
+      let ReplyBody::Created { id } = client.call(&scratch(&format!("origin-probe-{node}"))) else {
+        panic!("create node {node}'s probed volume");
+      };
+      (client, id)
+    })
+    .collect();
+  let mut probes = Vec::new();
+  while matches!(stop.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+    for (node, (client, volume)) in probers.iter_mut().enumerate() {
+      let at = Instant::now();
+      let reply = client.call(&RequestBody::Status { volume: *volume });
+      assert!(
+        matches!(reply, ReplyBody::Status { .. }),
+        "node {node}'s status: {reply:?}"
+      );
+      probes.push((node, at, at.elapsed()));
+    }
+  }
+  probes
+}
+
+/// The count of `name` among one node's merge and content counters.
+fn counted(counters: &[(String, u64)], name: &str) -> u64 {
+  counters
+    .iter()
+    .filter(|(counter, _)| counter == name)
+    .map(|(_, count)| count)
+    .sum()
+}
+
+/// §4.16 "Commit" and "Apply on holders", A-217, §4.3 "Bounded work everywhere" (GAPS, "The many-client load test from
+/// 10,000 to 100,000 clients": one primary and two replicas editing the whole kernel). At `f > 0` a green over a base
+/// names its origin as version 0's inputs, and those were made in one poll — the held snapshot walked, encoded and
+/// archived, at the green's creation and again on every pass of the record plane until version 0 placed — shipped
+/// whole in one message, and recomputed on each holder in one poll: a kernel-sized origin (1.67 GB) holds a shard for
+/// seconds, past the watchdog's verdict (A-232), so the primary and its replicas could not even set up. Do: on a
+/// settled three-node fleet at `f = 1`, write [`ORIGIN_FILES`] files of [`ORIGIN_FILE_BYTES`] into a volume on node a,
+/// snapshot it, and create a green over the snapshot while a prober keeps asking every node for a volume's status.
+/// Expect: version 0 places at `f + 1`; both other nodes hold a replica at version 0, not refused; version 0 reads back
+/// the base's bytes; a submit after it is accepted as version 1, which each holder recomputes on its seeded replica; the owner made version 0's inputs once,
+/// over more than one slice, and shipped them to a holder in parts; each holder seeded its replica over more than one
+/// slice; and no node kept a probe waiting for half the placement or more.
+#[test]
+fn a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let base = origin_base(&mut client, daemons[0].instance());
+  let (stop, stopped) = std::sync::mpsc::channel::<()>();
+  let prober = std::thread::spawn(move || probe_nodes_until(&instances, &stopped));
+  let began = Instant::now();
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "origin-green".to_owned(),
+    require_evidence: false,
+    base: Some(base),
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    drop(stop);
+    let _ = prober.join();
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create the green over the base: {created:?}");
+  };
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  // Placed at the quorum on the owner, and held by every candidate: the second holder's seed may still be running when
+  // the first one's acknowledgement places the version.
+  let held_at = |version: u64| -> Result<bool, ObserveError> {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(
+      held
+        .iter()
+        .all(|state| state.version.is_some_and(|at| at >= version)),
+    )
+  };
+  let placed = poll_until(&refs, ORIGIN_PLACE_WAIT, || {
+    Ok(daemons[0].merge_record_placed(green, 0)? && held_at(0)?)
+  });
+  let placing = began.elapsed();
+  drop(stop);
+  let probes = prober.join().unwrap();
+  let holders: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| daemon.merge_holder_state(green))
+    .collect();
+  // Each sampled file at version 0, read in pages: whether its bytes are the base's, or why it could not be read.
+  let read_back: Vec<(usize, Result<bool, String>)> = {
+    let mut reader = origin_client(daemons[0].instance());
+    [0, ORIGIN_FILES / 2, ORIGIN_FILES - 1]
+      .into_iter()
+      .map(|file| {
+        let read = reader.read(
+          green,
+          &origin_green_path(file),
+          ReadAt::Version { version: 0 },
+        );
+        (
+          file,
+          read
+            .map(|bytes| bytes == origin_file_bytes(file))
+            .map_err(|error| format!("{error:?}")),
+        )
+      })
+      .collect()
+  };
+  let answers = if placed {
+    timed_submits(&mut client, green, 1)
+  } else {
+    Vec::new()
+  };
+  // The submit is answered once version 1 places at the quorum; the other holder follows.
+  let _caught_up = placed && poll_until(&refs, ORIGIN_PLACE_WAIT, || held_at(1));
+  let holders_after: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| daemon.merge_holder_state(green))
+    .collect();
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let longest: Vec<Duration> = (0..names.len())
+    .map(|node| {
+      probes
+        .iter()
+        .filter(|(probed, at, took)| {
+          *probed == node && *at >= began && *at + *took <= began + placing
+        })
+        .map(|(_, _, took)| *took)
+        .max()
+        .unwrap_or_default()
+    })
+    .collect();
+  let inside = probes
+    .iter()
+    .filter(|(_, at, took)| *at >= began && *at + *took <= began + placing)
+    .count();
+  eprintln!(
+    "green over {ORIGIN_FILES} files of {ORIGIN_FILE_BYTES} bytes: version 0 placed {placed} after {placing:?}; \
+     {inside} probes inside, the longest per node {longest:?}; holders {holders:?}, after a submit {holders_after:?}; \
+     counters {counters:?}"
+  );
+  assert!(
+    placed,
+    "version 0 placed at f + 1 within {ORIGIN_PLACE_WAIT:?}: {counters:?}"
+  );
+  for (holder, state) in holders.iter().enumerate() {
+    assert_eq!(
+      state.as_ref().ok().copied(),
+      Some(slates_server::merge_service::HolderMergeState {
+        version: Some(0),
+        refused: false,
+      }),
+      "holder {} holds the green's version 0",
+      holder + 1
+    );
+  }
+  assert!(
+    read_back.iter().all(|(_, read)| *read == Ok(true)),
+    "version 0 reads every sampled file's bytes: {read_back:?}"
+  );
+  assert!(
+    matches!(
+      answers.first(),
+      Some((
+        _,
+        _,
+        ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        },
+        _
+      ))
+    ),
+    "a submit after version 0 is accepted as version 1: {answers:?}"
+  );
+  for (holder, state) in holders_after.iter().enumerate() {
+    assert_eq!(
+      state.as_ref().ok().copied(),
+      Some(slates_server::merge_service::HolderMergeState {
+        version: Some(1),
+        refused: false,
+      }),
+      "holder {} recomputed version 1 on its seeded replica",
+      holder + 1
+    );
+  }
+  let owner = &counters[0];
+  assert_eq!(
+    counted(owner, "merge.origin_inputs.made"),
+    1,
+    "the owner made version 0's inputs once: {owner:?}"
+  );
+  assert!(
+    counted(owner, "merge.origin_inputs.slices") > 1,
+    "the owner made version 0's inputs over more than one slice: {owner:?}"
+  );
+  assert!(
+    counted(owner, "merge.inputs.partial") > 0,
+    "the owner shipped version 0's inputs in parts: {owner:?}"
+  );
+  for (holder, holder_counters) in counters.iter().enumerate().skip(1) {
+    assert_eq!(
+      counted(holder_counters, "merge.replica.seeded"),
+      1,
+      "holder {holder} seeded its replica of version 0 once: {holder_counters:?}"
+    );
+    assert!(
+      counted(holder_counters, "merge.replica.seed_slices") > 1,
+      "holder {holder} seeded its replica over more than one slice: {holder_counters:?}"
+    );
+  }
+  for (node, held) in longest.iter().enumerate() {
+    assert!(
+      *held * 2 < placing,
+      "node {node} kept no probe waiting for half the placement or more ({held:?} of {placing:?})"
+    );
+  }
 }
 
 /// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
@@ -20944,6 +21445,154 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
     })),
     "the submit was answered its version once its record committed"
+  );
+}
+
+/// A-298 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
+/// its submit's route, is committed, so the version's merge record, which carries the completion, never exists before
+/// its route. The owner's own gate cannot see such a work's catalog, since the owner's partition holds no record of it.
+/// Do: three nodes at `f = 1`, two shards each; on a, a green whose version 0 is placed; both holders withhold every
+/// work's catalog record; on a, a work whose name puts it on the other shard, one edit and a submit, its answer not
+/// read; watch over four liveness budgets of the fleet's periods; then lift the fault, and send the submit again under
+/// its id if its wait outlasted the lease bound (answered `Overloaded`, unrecorded). Expect: version 1's record never
+/// placed while the work's catalog is withheld, the work's shard counting the wait (`merge.work.awaited_route`,
+/// non-vacuous), and, once lifted, the submit answered version 1, its record placed, and the green at version 1.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "routed-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 0)
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_work_catalogs: true,
+    ..Default::default()
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  let name = (0u32..)
+    .map(|suffix| format!("routed-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut submitter = common::client::connect(daemons[0].instance());
+  let word = submitter.begin(&submit).map(|id| id.word());
+  let placed_while_withheld =
+    poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
+      daemons[0].merge_record_placed(green, 1)
+    });
+  let waits = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.awaited_route").copied().unwrap_or(0));
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  // A wait past the lease bound was answered `Overloaded`, unrecorded; the retry under its id meets the route again.
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| match answer_within(&mut submitter, *word) {
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") => {
+        resent_answer(&mut submitter, *word, &submit)
+      }
+      other => other,
+    });
+  let placed_after = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let head = client.call(&RequestBody::Versions { green });
+  drop(fleet);
+  drop(submitter);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    origin_placed,
+    "the green's version 0 was placed before the fault"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' faults were installed and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(
+    !placed_while_withheld,
+    "version 1's merge record was not placed while its work's catalog record was withheld"
+  );
+  assert!(
+    waits.as_ref().is_ok_and(|waits| *waits > 0),
+    "the work's shard held the submit for its route: {waits:?}"
+  );
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit was answered its version once its route and its record committed"
+  );
+  assert!(
+    placed_after,
+    "version 1's record was placed once the work's catalog could commit"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
   );
 }
 

@@ -269,7 +269,8 @@ pub(crate) struct HeldHead {
   identity: [u8; 32],
 }
 
-/// Holds again, after a warm restart, the copies a recovered image kept ([`held_copies`]), each with its fence.
+/// Holds again, after a warm restart, the copies a recovered image kept (`RecoveredHeld`'s live copies, in
+/// [`crate::content_holder::restore_held_registers`]), each with its fence.
 pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
   for copy in copies {
     let object = ObjectId(copy.object);
@@ -426,7 +427,7 @@ pub(crate) struct LiveState {
   /// the volume, holding those holders' sessions until they return ([`drain_stragglers`]). Bounded by the sessions: each
   /// holds at least one.
   stragglers: Vec<(u16, ObjectId, slates_cluster::Stragglers)>,
-  /// The head each taken-over live volume's rebuild was last refused at, and why ([`owes_refetch`]), on the control
+  /// The head each taken-over live volume's rebuild was last refused at, and why ([`next_fetch`]), on the control
   /// shard: its log is not fetched again until phase one adopts another head. One entry a pending materialization, removed
   /// when it is served.
   pub(crate) refused_rebuilds: BTreeMap<ObjectId, Refused>,
@@ -3374,7 +3375,7 @@ fn next_fetch(refused: Option<&Refused>, adopted: Head, now: u64, key_here: bool
 }
 
 /// Records on the control shard that `object`'s rebuild from the log at `head` was refused for `why`, so its log is not
-/// fetched again at that head ([`owes_refetch`]); forgets it once the volume is served (`why` is `None`).
+/// fetched again at that head ([`next_fetch`]); forgets it once the volume is served (`why` is `None`).
 pub(crate) fn note_rebuild(
   object: ObjectId,
   head: Head,
@@ -3468,11 +3469,11 @@ fn sealed_body(payload: &[u8]) -> Option<SealedBody> {
 }
 
 /// Whether a rebuild may open the log's payloads: a sealed log only under keys this node has recorded, adopted from the
-/// log's own whole entry or held before, never under a key made on the spot ([`seal_keys::recorded_lineage`]). Without
-/// them it is refused [`REFUSED_NO_KEY`] and waits for the key ([`next_fetch`]). Before, the rebuild made a key, failed
-/// to open the log under it and was refused `open`, final for the head: the successor waited for a head that could
-/// not move with its owner dead (`fleet.live.takeover_waits_new_head` 368 to 381 times a run, 2026-11-09), and the key
-/// it made stayed recorded in the way of the right one.
+/// log's own whole entry or held before, never under a key made on the spot ([`crate::seal_keys::recorded_lineage`]).
+/// Without them it is refused [`REFUSED_NO_KEY`] and waits for the key ([`next_fetch`]). Before, the rebuild made a key,
+/// failed to open the log under it and was refused `open`, final for the head: the successor waited for a head that
+/// could not move with its owner dead (`fleet.live.takeover_waits_new_head` 368 to 381 times a run, 2026-11-09), and the
+/// key it made stayed recorded in the way of the right one.
 fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static str> {
   if sealed && !keys_recorded {
     return Err(REFUSED_NO_KEY);
@@ -3747,10 +3748,12 @@ fn whole_file(
   vec![extent]
 }
 
-/// An inode's manifest metadata: its attributes with its kind's type bits, as the export writes them.
+/// An inode's manifest metadata: its attributes with its kind's type bits, and a device node's number (A-294), as the
+/// export writes them.
 fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
   use slates_vfs::export::{
-    MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, permissions_of_mode,
+    MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE, MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET,
+    MODE_SYMLINK, permissions_of_mode,
   };
   use slates_vfs::recover::KindImage;
   let type_bits = match inode.kind {
@@ -3759,6 +3762,12 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     KindImage::Symlink => MODE_SYMLINK,
     KindImage::Fifo => MODE_FIFO,
     KindImage::Socket => MODE_SOCKET,
+    KindImage::BlockDevice => MODE_BLOCK_DEVICE,
+    KindImage::CharDevice => MODE_CHAR_DEVICE,
+  };
+  let (device_major, device_minor) = match inode.body {
+    BodyImage::Device { major, minor } => (major, minor),
+    _ => (0, 0),
   };
   let attrs = &inode.attrs;
   slates_archive::NodeMeta {
@@ -3772,6 +3781,8 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     nlink: attrs.nlink,
     uid: attrs.uid,
     gid: attrs.gid,
+    device_major,
+    device_minor,
     xattrs: Vec::new(),
   }
 }
