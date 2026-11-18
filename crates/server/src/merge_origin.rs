@@ -2569,6 +2569,17 @@ mod tests {
     let manifests = [manifest(&one), manifest(&two), manifest(&three)];
     let (acked, positions, held, released, rebuilt) = crate::daemon::audit_on_shard(move |state| {
       let host = holder_of_a_dying_owners_version(state, object, &one);
+      // Version 1's inputs placed at their version's sequence, as the record plane places them (the helper holds them
+      // at the default placement); holding a manifest already held refreshes its placement.
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          object,
+          slates_cluster::content::Placed { sequence: 1 },
+          InputsBuilder::whole(&one.encode()).finish(0, 4096),
+        )
+        .unwrap();
       let serve = |state: &mut ShardState, record: &Record, increment: &Increment| {
         let reply = crate::fleet::serve_merge_shipment(
           state,
