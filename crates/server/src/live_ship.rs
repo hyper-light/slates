@@ -2700,27 +2700,43 @@ pub(crate) fn serve_entry(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  let epoch = slates_db::live::epoch_of(request);
+  serve_taken(state, (local, peer), (request, epoch), |request, bound| {
+    Entry::decode(request, bound).map(|entry| vec![entry])
+  })
+}
+
+/// The one way a candidate takes entries from `peer`, alone ([`serve_entry`]) or as a batch ([`serve_entries`]), so a
+/// batch is served exactly as its entries would be: authorized and bounded ([`admitted`]), decoded by `decode` within
+/// the bound, taken in order ([`take_entries`]), counted, and answered only once this shard's recovery image keeps what
+/// was taken ([`acknowledged`]). `epoch` is the request's, read from its header, for the refusal of an unauthorized one.
+/// Until 2026-11-17 a batch was served beside the single entry's path, and main's acknowledgement rule (A-270) reached
+/// the single entry alone when the two met at a merge.
+fn serve_taken(
+  state: &mut ShardState,
+  (local, peer): (HostId, HostId),
+  (request, epoch): (&[u8], Option<HostEpoch>),
+  decode: impl FnOnce(&[u8], usize) -> Result<Vec<Entry>, LiveError>,
+) -> Vec<u8> {
   let object = slates_db::live::object_of(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
     Err(why) => {
       count_refused(state, why);
-      return encode_reply(&Err(not_served(
-        state,
-        object,
-        slates_db::live::epoch_of(request),
-      )));
+      return encode_reply(&Err(not_served(state, object, epoch)));
     }
   };
-  let reply = Entry::decode(request, bound)
-    .and_then(|entry| take_entry(held_entry(state, peer, entry.object), &entry, bound));
+  let (reply, taken) = match decode(request, bound) {
+    Ok(entries) => take_entries(state, peer, &entries, bound),
+    Err(refusal) => (Err(refusal), 0),
+  };
   match &reply {
     Err(error) => {
       count_refused(state, refused_counter(error));
       encode_reply(&reply)
     }
     Ok(_) => {
-      state.count(LIVE_HELD, 1);
+      state.count(LIVE_HELD, taken);
       acknowledged(state, encode_reply(&reply))
     }
   }
@@ -2750,27 +2766,13 @@ pub(crate) fn serve_entries(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
-  let object = slates_db::live::object_of(request);
-  let bound = match admitted(state, local, peer, object) {
-    Ok(bound) => bound,
-    Err(why) => {
-      count_refused(state, why);
-      return encode_reply(&Err(not_served(
-        state,
-        object,
-        slates_db::live::epoch_of_batch(request),
-      )));
-    }
-  };
-  let (reply, taken) = match slates_db::live::decode_batch(request, bound) {
-    Ok(entries) => take_entries(state, peer, &entries, bound),
-    Err(refusal) => (Err(refusal), 0),
-  };
-  match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, taken),
-  }
-  encode_reply(&reply)
+  let epoch = slates_db::live::epoch_of_batch(request);
+  serve_taken(
+    state,
+    (local, peer),
+    (request, epoch),
+    slates_db::live::decode_batch,
+  )
 }
 
 /// A batch's entries taken in order ([`take_entry`]) until one is not: the head held after the last taken, or the first
