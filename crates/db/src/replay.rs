@@ -6,8 +6,8 @@
 //! and once the log since the last snapshot has taken the recovery budget's worth of measured
 //! replay work and is at least the last snapshot's size (A-243), publishes the partition into
 //! the alternate snapshot slot and trims the log behind it. [`recover`] is the other direction:
-//! the newest valid snapshot slot, then the records after its sequence, with the torn tail cut
-//! off and the replay timed (the recovered tail's starting work).
+//! the newest valid snapshot slot, then the records after its sequence, a record at a time
+//! (A-420), with the torn tail cut off and the replay timed (the recovered tail's starting work).
 
 use std::time::Instant;
 
@@ -39,9 +39,9 @@ pub struct SnapshotPolicy {
 pub struct Tail {
   /// Its bytes.
   pub bytes: u64,
-  /// The replay work its commits measured, nanoseconds: each record's append (encode, checksum, copy into the ring,
-  /// the mirror of a replay's read, checksum and decode) and its apply. After a recovery it starts at that recovery's
-  /// own time, the snapshot's decode included.
+  /// The replay work its commits measured, nanoseconds: each record's append (its encode, its decode as the replay
+  /// will decode it, its checksum and its copy into the ring, which cover a replay's read, checksum and decode; A-420)
+  /// and its apply. After a recovery it starts at that recovery's own time, the snapshot's decode included.
   pub replay_ns: u64,
 }
 
@@ -123,10 +123,12 @@ pub struct Db {
   snapshots_taken: u64,
   /// The running figures ([`DbStats`]).
   stats: DbStats,
-  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append
-  /// (encode, checksum, copy into the ring), the mirror of the replay's read, checksum and decode, and its apply; never
-  /// a wait outside them. Timing the apply alone made a replay look 16 to 21 times faster than it was (raft, A-243).
-  /// After a recovery it starts at the recovery's own time, so it errs early.
+  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append (its
+  /// encode, its decode as the replay will decode it, its checksum and its copy into the ring, which cover the replay's
+  /// read, checksum and decode) and its apply; never a wait outside them. Timing the apply alone made a replay look 16
+  /// to 21 times faster than it was (raft, A-243); timing the encode in the decode's place made a record whose decode
+  /// allocates what its encode copies replay in more than was measured (A-420). After a recovery it starts at the
+  /// recovery's own time, so it errs early.
   replay_work_ns_since_snapshot: u64,
   /// The recovery budget the tail's work is held to: [`RECOVERY_BUDGET_NS`] unless the operator set one
   /// ([`Db::set_recovery_budget`]; GAPS §5).
@@ -288,14 +290,11 @@ fn derive_partition(
     }
     None => (Partition::new(caps, now_ns), None, 0, 0),
   };
-  let replayed = log.replay(segment, from_seq)?;
-  let mut records = 0u64;
-  for (_, entry) in &replayed.ops {
-    for op in entry.ops() {
-      partition.apply(op)?;
-    }
-    records = records.saturating_add(1);
-  }
+  // A record at a time: decoded, applied and dropped before the next is read, the work each commit timed (A-420).
+  let replayed = log.replay(segment, from_seq, |entry| {
+    entry.ops().iter().try_for_each(|op| partition.apply(op))
+  })?;
+  let records = replayed.records;
   Ok(DerivedPartition {
     partition,
     snapshot,
@@ -303,6 +302,37 @@ fn derive_partition(
     from_seq,
     replayed,
     records,
+  })
+}
+
+/// Runs `step`, adding its wall time to `work_ns`.
+fn timed<T>(work_ns: &mut u64, step: impl FnOnce() -> T) -> T {
+  let started = Instant::now();
+  let done = step();
+  let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  *work_ns = work_ns.saturating_add(elapsed);
+  done
+}
+
+/// Appends `entry` as record `seq`, adding to `work_ns` what a replay of the record repeats (A-420): its decode, and
+/// the write's checksum and copy, which stand for the replay's own checksum and its copy out of the ring (an
+/// allocation, a zeroing and a copy, which the encode's allocation and its write of every byte bound). The encode
+/// itself is timed too, since it bounds the replay's read, so the measure covers the replay's work, erring early by the
+/// encode and a preempted commit's stall. It timed the encode in the decode's place, and a record whose decode
+/// allocates what its encode copies (a thousand one-byte keys) replayed in more than the commits measured, so the
+/// trigger let a tail run past its budget. A body that does not decode is refused before anything is written, as a
+/// replay would cut it.
+fn append_record(
+  log: &LogRing,
+  segment: &mut AnchorSegment,
+  seq: u64,
+  entry: &LogEntry,
+  work_ns: &mut u64,
+) -> Result<u64, DbError> {
+  timed(work_ns, || {
+    let encoded = LogRing::encode(entry);
+    encoded.decode_as_replayed(seq)?;
+    log.write(segment, seq, &encoded)
   })
 }
 
@@ -357,33 +387,32 @@ impl Db {
     }
   }
 
-  /// Adds the time since `started` to the tail's replay work (A-243). The time decides nothing inside an apply; the
-  /// commit consults it after the append ([`maintain`](Self::maintain)).
-  fn charge_replay_work(&mut self, started: Instant) {
-    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(elapsed);
+  /// Adds `work_ns` to the tail's replay work (A-243). The time decides nothing inside an apply; the commit consults it
+  /// after the append ([`maintain`](Self::maintain)).
+  fn charge_replay_work(&mut self, work_ns: u64) {
+    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(work_ns);
   }
 
   /// Applies `op` inside a transaction, timing it as replay work: its record is appended at the commit, so the apply
   /// and the append are timed apart.
   fn apply_timed(&mut self, op: &Op) -> Result<(), DbError> {
-    let started = Instant::now();
-    let applied = self.partition.apply(op);
-    self.charge_replay_work(started);
+    let mut work_ns = 0;
+    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    self.charge_replay_work(work_ns);
     applied
   }
 
-  /// Appends a transaction's record at its commit, timing it as replay work: the encode, checksum and copy a replay
-  /// mirrors with its read, checksum and decode (A-243). A refused append's time counts too, so the measure errs early.
+  /// Appends a transaction's record at its commit ([`append_record`]), charging the work a replay repeats for it. A
+  /// refused append's time counts too, so the measure errs early.
   fn append_timed(
     &mut self,
     segment: &mut AnchorSegment,
     seq: u64,
     entry: &LogEntry,
   ) -> Result<u64, DbError> {
-    let started = Instant::now();
-    let appended = self.log.append(segment, seq, entry);
-    self.charge_replay_work(started);
+    let mut work_ns = 0;
+    let appended = append_record(&self.log, segment, seq, entry, &mut work_ns);
+    self.charge_replay_work(work_ns);
     appended
   }
 
@@ -409,21 +438,20 @@ impl Db {
     let entry = LogEntry {
       ops: vec![op.clone()],
     };
-    // One clock pair over the append and the apply, adjacent here: the work a replay repeats for this record (A-243).
-    let mut started = Instant::now();
-    let bytes = match self.log.append(segment, seq, &entry) {
+    // The work a replay repeats for this record, timed step by step: the append's ([`append_record`]), then the apply.
+    let mut work_ns = 0;
+    let bytes = match append_record(&self.log, segment, seq, &entry, &mut work_ns) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
         // A full ring: the snapshot releases everything before it, then the append retries; the snapshot's own time is
-        // not replay work.
+        // not replay work, and the refused append's, timed before it, counts in the tail it starts, erring early.
         self.snapshot(segment)?;
-        started = Instant::now();
-        self.log.append(segment, seq, &entry)?
+        append_record(&self.log, segment, seq, &entry, &mut work_ns)?
       }
       Err(e) => return Err(e),
     };
-    let applied = self.partition.apply(op);
-    self.charge_replay_work(started);
+    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    self.charge_replay_work(work_ns);
     applied?;
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);

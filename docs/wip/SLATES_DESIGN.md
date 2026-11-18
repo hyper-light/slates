@@ -6656,6 +6656,12 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > the floor.
 > Recovery's bound changes with it (the paragraph below). The snapshot still runs whole on the committing shard's
 > turn; slicing it is owed. (`docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`.)
+> **A-420 (2026-11-18):** the commits timed each record's encode in place of the decode a replay does, and a replay
+> held every decoded record of its tail before applying the first, so a record that decodes dearer than it encodes
+> (a thousand one-byte keys, one allocation each) replayed in more than its commits measured and the tail ran past its
+> budget before the trigger fired. A commit now decodes its record as the replay will before writing it, and times
+> that decode with the encode, the write and the apply; recovery decodes, applies and drops one record at a time.
+> (`docs/bugs/2026-11-18-the-snapshot-trigger-timed-the-encode-in-place-of-the-replays-decode.md`.)
 
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
 indexes; the node rejoins with a new ephemeral id (a restart is a join); its owned objects are
@@ -6669,9 +6675,10 @@ need content fetch and a confirmed lease; measure that complete recovery boundar
 its last snapshot and replaying the log after it. A snapshot comes once that log has taken the budget's worth of
 replay work, as its commits measured it, and is at least the last snapshot's size (A-243). So a partition's recovery is
 at most decode(P) + max(budget, the replay of P bytes of log), where P is its snapshot's size: the budget while the
-partition is small enough, about twice its own snapshot's cost once it outgrows it. The commits' measure errs early,
-since it is slower per byte than the replay (17 against 24 to 27 bytes a microsecond on CI's x86_64, debug) and counts
-a preempted commit's stall.
+partition is small enough, about twice its own snapshot's cost once it outgrows it. The commits' measure covers the
+replay's work: each commit times its record's encode, its decode as the replay will decode it, its checksum and copy
+into the ring, and its apply, where a replay reads, checksums, decodes and applies a record at a time (A-420). It errs
+early by the encode, which bounds the replay's read, and by a preempted commit's stall.
 
 > **Status (2026-11-17, g230: the owner's `put_wal` is its `Local` records).** No structure of its own is needed: a
 > seal's snapshot record stays `Local` in the owner's partition, durable in its anchor with the rest of the log, until
@@ -29501,3 +29508,38 @@ code below.
   checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
   server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
   2026-11-18, debug).
+
+### A-420 — A commit times the decode a replay of its record does, and recovery replays a record at a time (2026-11-18, goal 83, g251; A-243's open line)
+
+Applied in the same change to:
+- §4.8: the A-243 status blockquote and the Recovery paragraph's account of the measure.
+- GAPS: the load-test entry's open line (the commits' measure against the replay's).
+- `crates/db/src/record.rs`: `LogRing::encode`, `Encoded::decode_as_replayed` and `LogRing::write` in place of
+  `append`; `LogRing::replay` hands each record to its caller's apply before reading the next (`Replayed::records` in
+  place of the collected `ops`).
+- `crates/db/src/replay.rs`: `append_record` and `timed`; `derive_partition` applies as it walks; the unit test.
+- `crates/ipc` (`DbSnapshotReport::tail_replay_ns`'s doc).
+- **What was there.** A-243's trigger fires once the tail's replay work, as its commits measured it, reaches the
+  recovery budget, so a recovery keeps to the budget only while that measure is at least the replay's own work. The
+  commits timed each record's encode, checksum, copy and apply; a replay reads, checksums, decodes and applies, and it
+  decoded the whole tail into one list before applying any of it. Where a record's decode costs more than its encode
+  the measure fell short: CI's macOS runner measured 0.4x to 1.25x of the replay (run 44260193629's mix test), and a
+  record of a thousand one-byte keys (its decode allocates each key, its encode copies five bytes a key) replays in
+  more than its commits measured on any machine.
+- **The rule.** The measure covers the replay's work, step for step. A commit encodes its record, decodes the body as
+  the replay will, writes it (the checksum and the copy) and applies it, and charges all four: the decode is the
+  replay's own, the write's checksum and copy are the replay's checksum and copy out of the ring, and the encode (an
+  allocation and a write of every byte) bounds the replay's read (an allocation, a zeroing and a copy). So the measure
+  errs early only by the encode and a preempted commit's stall. A body that does not decode is refused `Corrupt`
+  before anything is written: a replay would cut the record there, and every record after it with it. Recovery
+  decodes, applies and drops one record at a time, so it holds one decoded record, never a tail's worth, and repeats
+  per record what the commit timed.
+- **Rejected.** A per-class model of replay cost learned from recoveries: it learns nothing before a daemon's first
+  recovery, which is the one the bound must hold for, and a model by class and bytes misjudges records of one class
+  and size with different shapes (a thousand small keys against one large one), the extrapolation A-243 removed.
+- **Cost.** One decode a commit, the allocations of the record's decoded fields, beside the clone, encode, checksum,
+  copy and apply it already made; the replay saves a tail-sized list.
+- **Tests.** `a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode`
+  (`replay.rs`'s unit tests): 64 records of 1,024 one-byte keys, their replay in a recovery past a baseline held to
+  what the commits measured. The cadence and cost tests (`snapshot_cadence.rs`, `snapshot_cost.rs`, the model) are
+  filed for main.

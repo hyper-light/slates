@@ -2651,10 +2651,14 @@
 >   budget, which the design's bound does not (the decode plus the larger of the budget and a snapshot's size of tail),
 >   and a macOS CI runner failed its eighth check at 11.6 ms where a near-empty tail cost 1.7 ms (run 44260193629). It
 >   now judges each check past a baseline recovery of the settled segment, within the inner-quartile spread of five
->   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Open:** the
->   commits' measure of the tail's replay and the replay itself diverge by machine and moment (the commits about 1.7x
->   over on a Mac Studio, 0.4x to 1.25x on the CI runner), so where they under-measure the tail replays past the budget
->   before the trigger fires.
+>   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Fixed by
+>   A-420 (2026-11-18, g251):** the commits' measure of the tail's replay and the replay itself diverged by machine and
+>   moment (the commits about 1.7x over on a Mac Studio, 0.4x to 1.25x on the CI runner), since the commits timed each
+>   record's encode in place of the replay's decode and the replay held its whole tail decoded; a record of 1,024
+>   one-byte keys replayed in 1.49x what its commits measured (8.49 ms against 5.71 ms, the Mac Studio, debug). A commit
+>   now decodes its record as the replay will and times it with the encode, write and apply, and recovery replays a
+>   record at a time (`a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode`;
+>   `docs/bugs/2026-11-18-the-snapshot-trigger-timed-the-encode-in-place-of-the-replays-decode.md`).
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
