@@ -262,10 +262,11 @@ fn carry(target: u16, message: Control) -> Result<(), RtError> {
 
 /// Puts `message` behind what this shard keeps for `target`, counted as a wait for room: the carrier's waker, for the
 /// caller to wake once the keeper is let go, when this is the first message kept for `target` and the carrier waits
-/// (it must ask `target` for room, [`asked_for_room`]); a message kept behind others needs no wake, since the carrier
-/// asked `target` when it kept the first. The message back, unkept, when no carrier runs, the bound is reached (both
-/// counted `xshard.keep_refused`), or the keeper is borrowed, which nothing allows: the keeper is borrowed only inside
-/// this module's functions, and none of them keeps while it holds the borrow.
+/// (it must ask `target` for room, [`asked_for_room`]). A message kept behind others needs no wake: every poll of the
+/// carrier that leaves messages kept for `target` asks it, and the first one's wake brought such a poll. The message
+/// back, unkept, when no carrier runs, the bound is reached (both counted `xshard.keep_refused`), or the keeper is
+/// borrowed, which nothing allows: the keeper is borrowed only inside this module's functions, and none of them keeps
+/// while it holds the borrow.
 fn keep(target: u16, message: Control) -> Result<Option<Waker>, Control> {
   KEPT.with(|kept| {
     let Ok(mut kept) = kept.try_borrow_mut() else {
