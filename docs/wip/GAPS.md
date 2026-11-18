@@ -7,7 +7,8 @@
 >   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
 >   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
 >   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 5), every refusal typed, a move back
->   to the creator, a destroyed moved volume's exception dropped.
+>   to the creator, a destroyed moved volume's exception dropped; held in process by three-daemon tests of the move,
+>   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields).
 > - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
 >   seeds from kiln's runner directory); kiln's relocation of an
 >   agent with its volume (detach, move, attach on the target); an overlay's move (its base stays on its source host,

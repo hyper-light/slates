@@ -21576,7 +21576,12 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   - *A thaw only where no switch can come.* A reported move can commit later, so the old owner thaws only when the
     configuration shows the target gone and no exception moving the volume away (no entry can then apply it: a move's
     target must be a member, and a retired id never returns), or refuses an unreported move whose records were not
-    placed within the failover SLO.
+    placed within the failover SLO. A move once seen switched never thaws.
+  - *The target's takeover may hand the volume back.* When the target dies after the switch and the old owner is its
+    takeover's successor (the creator, so the takeover drops the exception), the old owner's frozen copy would shadow
+    what the takeover adopted, writes the target took included: `materialize_taken_over` returned early on the held id.
+    The adoption now supersedes the frozen copy (`moves::supersede_frozen`), and a switched move whose exception is gone
+    lets its copy go.
   - *A typed refusal.* Every refusal is `Refusal::MoveRefused { reason }`, a closed `MoveRefusal` a consumer matches
     (Ada, 2026-11-18: responses and errors are closed, typed enums, never strings).
 - **Evidence.** Unit: `a_moves_adoption_is_reported_by_its_new_owner_and_lets_the_member_it_left_go`,
@@ -21586,8 +21591,9 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` (`crates/cluster/src/config_group.rs`); the
   configuration's round trip and its lying-count and forged-flag tests (`crates/cluster/src/raft_wire.rs`);
   `the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch`
-  (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`
-  (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
+  (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`,
+  `a_move_completes_when_its_old_owner_dies_at_the_switch` and
+  `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
   (`crates/api/tests/api.rs`).
 - **Owed.** The automatic migration by the origin of the last N writes (AC-8.16's other half); an overlay's move; a
   move that carries snapshots other than the head; the multi-runner test with injected faults (GAPS).
