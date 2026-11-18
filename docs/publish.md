@@ -82,7 +82,8 @@ PDB GUID from the content, not the clock.
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and
 each step's time. Two more checks run on some targets. The musl binaries must pass a staticness
 gate (`ldd`). The Windows x86_64 binary must start in a process-isolated
-`nanoserver:ltsc2025` container, which has no Visual C++ runtime.
+`nanoserver:ltsc2025` container, which has no Visual C++ runtime. CI's Windows lane starts its own debug build there
+on every push too, so an import Nano Server lacks fails the push that adds it, not the next tag (A-357).
 
 In every run, a tag's or a dry run's, the `stage` job runs the release artifacts task
 (`cargo run -p xtask --bin release -- artifacts`, with `--tag TAG` or `--dry-run`). It refuses a release that lacks a

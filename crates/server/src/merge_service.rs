@@ -1662,6 +1662,10 @@ pub struct MergeRecordValue {
   /// completion record must move with it", Lee et al., SOSP 2015, §3). A green's successor records it, so the submit's
   /// resend after a takeover is answered its version. Appended.
   pub completion: Option<SubmitCompletion>,
+  /// How the signature of the submit that made this version was judged (A-321), as the version's chain entry records
+  /// it: a successor records it with the version, so the version's provenance outlives its owner. `None` for an
+  /// unsigned submit and for version 0, which no submit made. Appended.
+  pub signature: Option<slates_db::catalog::SignatureVerdict>,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2149,6 +2153,12 @@ fn enqueue_record_with(
   // answers above: there the head identity, a hash of every byte the green holds, had been made on
   // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
   let identity = identity_of(state);
+  // The version's provenance (A-321), recorded in the green's engine when its entry became durable.
+  let signature = state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.signature(version))
+    .map(crate::signed_work::shipped);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2160,6 +2170,7 @@ fn enqueue_record_with(
     require_evidence,
     owner,
     completion,
+    signature,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -2340,7 +2351,7 @@ const SHIPMENT_LENGTH_BYTES: usize = size_of::<u32>();
 
 /// A merge shipment (the bytes a holder is sent on [`MERGE_RECORD_STREAM`]): the record, then the content requests
 /// that place its inputs (an offer and its chunks), each frame behind its length.
-fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_shipment(frames: &[Vec<u8>]) -> Vec<u8> {
   let total = frames.iter().fold(SHIPMENT_LENGTH_BYTES, |sum, frame| {
     sum
       .saturating_add(SHIPMENT_LENGTH_BYTES)
@@ -3419,12 +3430,50 @@ fn record_standing(
   }
 }
 
+/// Whether `record` offers a different value at a position this holder's ledger holds one (A-373): a higher epoch's,
+/// once `fleet::check_held_record` admitted it.
+fn replaces_held_value(state: &ShardState, record: &Record) -> bool {
+  state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice())
+}
+
+/// Holds `record`, a green's merge record, in this holder's register before its inputs and its recomputation when it
+/// replaces a different value held at its position (A-373): admitted by `fleet::check_held_record`, it comes under a
+/// higher epoch than the held value, which therefore never committed. Until it is held the door refuses its inputs,
+/// since the held value names others at that position (`content_retention::admits`), and the replica built over the
+/// replaced value is rewound as it is held (`fleet::hold_checked_record`), so [`accept_merge_record`] then serves the
+/// record as the replica's next version. The acknowledgement this acceptance makes is not sent: the record is
+/// acknowledged once recomputed. Anything else (no value held there, the same one, a refused record, a green refused
+/// here or a test's withheld acknowledgement) is left to [`accept_merge_record`].
+pub(crate) fn hold_replacing_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) {
+  if !replaces_held_value(state, record)
+    || state.merge.refused.contains(&record.object)
+    || state.merge.fault.refuse_records
+    || MergeRecordValue::from_record_bytes(&record.value)
+      .is_none_or(|value| value.version != record.sequence)
+    || crate::fleet::check_held_record(state, local, peer_host, record).is_err()
+  {
+    return;
+  }
+  // The reply goes unsent: the version is answered by its recomputation, or not at all.
+  let _ = crate::fleet::accept_held_record(state, local, peer_host, record);
+}
+
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
 /// acknowledgement returned. A holder with the green's records and no replica (a warm restart) rebuilds the replica
-/// from them first (A-313). Every other case is an empty reply the owner counts as no
-/// acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
+/// from them first (A-313); a higher epoch's different value at a version this holder holds is held first, which
+/// rewinds the replica below it ([`hold_replacing_record`], A-373). Every other case is an empty reply the owner counts
+/// as no acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
 pub(crate) fn accept_merge_record(
   state: &mut ShardState,
   local: HostId,
@@ -3454,6 +3503,9 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
+  // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
+  // it replaces; the record is then served as the replica's next version (A-373).
+  hold_replacing_record(state, local, peer_host, record);
   match record_standing(state, object, value.version) {
     None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
@@ -3602,6 +3654,11 @@ fn recompute(
   if value.version == 0 && state.merge.replicas.contains_key(&object) {
     replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
   }
+  // The version's provenance (A-321), as the record carries it: the replica a takeover adopts (A-333) answers it as the
+  // owner judged it.
+  if let Some(signature) = value.signature {
+    replica.record_signature(value.version, crate::signed_work::adopted(signature));
+  }
   state.merge.replicas.insert(object, replica);
   Ok(())
 }
@@ -3740,6 +3797,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3838,6 +3896,7 @@ mod tests {
                 uid: 0,
               },
               completion: None,
+              signature: None,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3934,6 +3993,11 @@ mod tests {
         sequence: 13,
         work: Some(DbVolumeId { bytes: [14u8; 16] }),
       }),
+      signature: Some(slates_db::catalog::SignatureVerdict {
+        kind: 1,
+        detail: 0,
+        fingerprint: [15u8; 32],
+      }),
     }
   }
 
@@ -3957,6 +4021,7 @@ mod tests {
         uid: 0,
       },
       completion: None,
+      signature: None,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

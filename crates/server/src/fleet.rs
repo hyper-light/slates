@@ -1958,8 +1958,15 @@ fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
 /// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
 const RECORD_UNPUBLISHED: &str = "fleet.record.unpublished";
 
+/// The status count of held records accepted in place of a different value held at their position, a lower epoch's,
+/// which never committed (A-373): what a green's replica built over the replaced value follows. Format: a refusal name
+/// in the daemon's status report.
+const RECORD_REPLACED: &str = "fleet.record.replaced";
+
 /// Holds `record` from `peer_host` once its authority was checked ([`check_held_record`]): the acceptance into this
-/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply.
+/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply. A record
+/// that replaces a different value held at its position (a higher epoch's, A-373) rewinds this holder's replica of the
+/// green it belongs to past the value it replaced (`merge_origin::rewind_past_replaced`).
 pub(crate) fn hold_checked_record(
   state: &mut ShardState,
   local: HostId,
@@ -1967,6 +1974,11 @@ pub(crate) fn hold_checked_record(
   record: &Record,
 ) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
+  let replaces = state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice());
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
     None => {
@@ -2002,6 +2014,12 @@ pub(crate) fn hold_checked_record(
       // departed owner: the object has an authorized live owner again, and the promotion gate this holder
       // kept for it has served its purpose.
       state.departed_owners.remove(&record.object);
+      // The register holds the new value from here, acknowledged or not: a replica built over the one it replaced
+      // follows it now.
+      if replaces {
+        state.count(RECORD_REPLACED, 1);
+        crate::merge_origin::rewind_past_replaced(state, record);
+      }
       match state
         .fleet
         .track_object(record.object, peer_host, state.council.configuration())
@@ -2092,8 +2110,10 @@ fn serve_content_request(
 /// inputs (A-286): a content acknowledgement bound to them when it holds them whole (`merge_service::inputs_held`), to
 /// a peer that may place them here; else the content plane's answer to the shipment's offer asked again after its
 /// chunks, the chunks it still lacks; else nothing. So inputs larger than one shipment cross in as many as they take,
-/// each carrying only what this holder lacks.
-fn serve_merge_shipment(
+/// each carrying only what this holder lacks. A record that replaces a different value held at its position (a
+/// higher epoch's, A-373) is held before its content frames, whose inputs the door admits only once a held record names
+/// them (`merge_service::hold_replacing_record`).
+pub(crate) fn serve_merge_shipment(
   s: &mut ShardState,
   local: HostId,
   peer_host: HostId,
@@ -2108,6 +2128,7 @@ fn serve_merge_shipment(
   let Ok(record) = Record::decode(record) else {
     return Vec::new();
   };
+  crate::merge_service::hold_replacing_record(s, local, peer_host, &record);
   if !content.is_empty() {
     s.count(crate::merge_service::INPUTS_CARRIED, 1);
   }
@@ -4396,7 +4417,7 @@ async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
     };
     let round = paging_round(waited.waits_on_the_round(), departed, &paging);
     let given_up = state::with_state(|s| {
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_materializations.get_mut(&object)?;
       if round.is_some_and(|advances| pending.record_round(advances)) {
         // Its round moved on toward the register it waits for: progress, its attempts start again.
@@ -4693,7 +4714,7 @@ async fn adopt_pending_tombstones(origin: u16) {
     };
     let given_up = state::with_state(|s| {
       s.count(waited, 1);
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_tombstones.get_mut(&object)?;
       let attempts = pending.attempts.saturating_add(1);
       let given_up = pending.count_attempt(bound);
@@ -4779,7 +4800,7 @@ async fn materialize_pending_greens(
     }
     let round = paging_round(waited.waits_on_the_round(), pending.departed, &paging);
     let given_up = state::with_state(|s| {
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_green_materializations.get_mut(&object)?;
       if round.is_some_and(|advances| pending.record_round(advances)) {
         // Its round moved on toward the register it waits for: progress, its attempts start again.
@@ -4867,12 +4888,13 @@ impl GreenWait {
 }
 
 /// Derived: the materialization attempts without progress a taken-over volume or green gets before it is given up on:
-/// the failover SLO's worth of the fleet's periods (`failover_slo_ns / HEARTBEAT_NS`, at least one), each one attempt.
+/// the failover delay's worth of the fleet's periods (`failover_ns / HEARTBEAT_NS`, at least one), each one attempt.
 /// Counted in attempts, not wall time, so a loaded node whose periods run late is given its attempts all the same; the
-/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8). The same bound counts a
+/// failover delay is how long a takeover is expected to leave an object unserved, this node's live estimate (§4.8,
+/// A-363; it was the operator's 10 s placeholder). The same bound counts a
 /// learned object's wait for its recovery cohorts' promises in the takeover round itself (`takeover::PromiseWait`).
-pub(crate) fn takeover_attempts(failover_slo_ns: u64) -> u32 {
-  u32::try_from((failover_slo_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
+pub(crate) fn takeover_attempts(failover_ns: u64) -> u32 {
+  u32::try_from((failover_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
 }
 
 /// The page advances so far of the round a taken-over object's attempt waited on, when it waited on one: a wait for a
@@ -5104,6 +5126,9 @@ fn handed_green(
     owner: adopted.owner.clone(),
     access: catalog.access.clone(),
     catalog_sequence,
+    write: catalog.write,
+    write_version: catalog.write_version,
+    signers: catalog.signers.clone(),
     head: adopted.version,
     identity: adopted.identity,
     origin,
@@ -8963,6 +8988,7 @@ pub(crate) struct Delivered {
   root: u64,
   ready: Option<bool>,
   lease: u64,
+  failover: u64,
 }
 
 /// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
@@ -8997,11 +9023,13 @@ impl Fanned {
       root: (root.version > had.root).then(|| root.clone()),
       ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
       lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
+      failover: (state.failover_ns != had.failover).then_some(state.failover_ns),
       now: Delivered {
         placement: placement.version,
         root: root.version,
         ready: Some(state.consensus_ready),
         lease: self.lease_generation,
+        failover: state.failover_ns,
       },
     };
     fan.carries().then_some(fan)
@@ -9019,12 +9047,18 @@ struct Fan {
   root: Option<slates_db::register::RootConfiguration>,
   ready: Option<bool>,
   lease: Option<crate::lease::OwnerLease>,
+  /// The control shard's failover delay, in whole periods (A-363).
+  failover: Option<u64>,
   now: Delivered,
 }
 
 impl Fan {
   fn carries(&self) -> bool {
-    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
+    self.placement.is_some()
+      || self.root.is_some()
+      || self.ready.is_some()
+      || self.lease.is_some()
+      || self.failover.is_some()
   }
 
   fn delivered(&self) -> Delivered {
@@ -9060,6 +9094,10 @@ impl Fan {
     if let Some(lease) = self.lease {
       s.lease = lease;
     }
+    // The failover delay the control shard estimated, which this shard's waits read (A-363).
+    if let Some(failover_ns) = self.failover {
+      s.failover_ns = failover_ns;
+    }
   }
 }
 
@@ -9075,7 +9113,19 @@ fn refresh_failover(state: &mut ShardState) {
     .as_ref()
     .and_then(slates_cluster::member_plane::MemberPlane::detection);
   let timing = state.council_timing;
-  state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  let estimate = state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  // What this shard's waits read, and the fan carries to the others when it moves.
+  state.failover_ns = state
+    .injected_failover_ns
+    .unwrap_or_else(|| failover_in_periods(estimate.total_ns()));
+}
+
+/// Derived: a failover delay of `ns` in whole coordinator periods, rounded up (A-363): the granularity every wait that
+/// reads it acts at (a takeover counts its attempts a period at a time, and the forward lane and the location round
+/// look a period apart), so the fan carries the estimate only when it crosses a period, not at every jitter of its
+/// tails.
+pub(crate) fn failover_in_periods(ns: u64) -> u64 {
+  ns.div_ceil(HEARTBEAT_NS).saturating_mul(HEARTBEAT_NS)
 }
 
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
@@ -11154,6 +11204,41 @@ mod tests {
     });
   }
 
+  /// A-363. Do: fan a shard everything, then move the control shard's failover delay by a period, then deliver it, then
+  /// install a fan carrying a failover delay on a shard. Expect the first fan to carry the delay; a moved delay owed
+  /// alone, nothing else; nothing owed once it is delivered; and the receiver to read the delay it was fanned: every
+  /// shard's waits read the control shard's estimate, sent only when it moves.
+  #[test]
+  fn a_shard_is_fanned_the_failover_delay_when_it_moves() {
+    crate::daemon::audit_on_shard(|s| {
+      s.fanned.observe_lease(&s.lease);
+      let first = s.fanned.owed(s, OTHER_SHARD).expect("a first fan is owed");
+      assert_eq!(
+        first.failover,
+        Some(s.failover_ns),
+        "the first fan carries the delay"
+      );
+      s.fanned.record(OTHER_SHARD, first.delivered());
+      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "nothing moved");
+      s.failover_ns = s.failover_ns.saturating_add(HEARTBEAT_NS);
+      let moved = s.fanned.owed(s, OTHER_SHARD).expect("the delay moved");
+      assert_eq!(moved.failover, Some(s.failover_ns));
+      assert!(
+        moved.placement.is_none()
+          && moved.root.is_none()
+          && moved.ready.is_none()
+          && moved.lease.is_none(),
+        "the delay is owed alone"
+      );
+      s.fanned.record(OTHER_SHARD, moved.delivered());
+      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "delivered");
+      let fanned = s.failover_ns;
+      s.failover_ns = 0;
+      moved.install(s);
+      assert_eq!(s.failover_ns, fanned, "the receiver reads the fanned delay");
+    });
+  }
+
   /// AUD-29-29. Do: install a fan carrying only a lease on a shard whose lease is empty. Expect: the shard's
   /// lease is the fanned one and nothing else it holds changes.
   #[test]
@@ -11170,6 +11255,7 @@ mod tests {
         root: None,
         ready: None,
         lease: Some(fanned.clone()),
+        failover: None,
         now: Delivered::default(),
       }
       .install(s);

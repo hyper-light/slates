@@ -92,9 +92,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 29 (A-367, 2026-11-18) a held register is a head piece and a piece per accepted position, so a holder's publication
 /// carries the record it acknowledges and never the ledger it already carries (each version of a green had re-published
 /// every version its holders kept).
+/// 30 (A-376, 2026-11-18) the content hold is a piece per stored chunk, per held manifest and per stage instead of one
+/// whole image, so a holder's publication carries the content it changed (a green's every version had re-put the
+/// image of every input its holders kept).
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 29;
+pub const IMAGE_VERSION: u16 = 30;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

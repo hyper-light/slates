@@ -15,7 +15,8 @@ that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach AT
 term, the daemon's failover SLO (10 s unless `slates anchor` is given another), and every verb that names it renews the
 term. It ends at the term's lapse with the write lease it held. A verb that names it after is refused
 `AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
-and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
+and currently expects an externally supplied `SLATES_ROOT` naming an established root mount; on a host whose AppArmor
+restricts unprivileged user namespaces it needs slates' AppArmor profile and `--apparmor-profile` (below).
 There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)
 and the Python and Node SDKs are implemented (§4.12). On macOS a volume can be mounted for real
 over the loopback NFS bridge (`slates mount`) with no privilege, kernel extension or Apple
@@ -306,7 +307,9 @@ slates enroll [--account UID] [--json]
 slates revoke CONSUMER [--json]
 slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
-slates exec --volume V --at PATH -- CMD [ARG ...]
+slates exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+slates apparmor profile [--executable PATH]
+slates apparmor check [--json]
 slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
 slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
 slates attach ID [--read | --write] [--snapshot N] [--json]
@@ -520,6 +523,47 @@ a map). While the VM runs, `slates status` counts what its window does: maps sen
 (`virtiofs.dax_maps_sent`), runs of the guest's stores written into the volume (`virtiofs.dax_runs_ingested`), and the
 rest of the `virtiofs.dax_` counters. macOS and Windows refuse the form by kind (`AttachmentUnsupported`,
 `BindingNotBuilt`).
+
+## The launcher (`slates exec`) and AppArmor
+
+`slates exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]` runs `CMD` with the volume `V` shown at the
+existing directory `PATH`, in a user and mount namespace of its own (Linux; design §4.6 "The launcher"). The volume's
+directory is `$SLATES_ROOT/V`, under the daemon's root mount, which you name in `SLATES_ROOT` for now. Nothing outside
+the command sees the bind, and nothing is created: a `PATH` that does not exist is refused, naming it. No privilege is
+needed where unprivileged user namespaces are allowed, as Fedora, Debian and Arch allow them by default.
+
+Ubuntu 24.04 and later restrict them through AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`): the namespace
+gets no capability, and `exec` is refused, naming the setting. slates ships an AppArmor profile that lifts the
+restriction for its own binary alone (A-370), and the launcher uses it only when you ask:
+
+1. **Check the host.** `slates apparmor check` prints whether the host restricts user namespaces (`restricted:`),
+   whether this process is exempt (`privileged:`, root or `CAP_SYS_ADMIN`), the label this binary runs under, its path
+   as the kernel records it, and `readiness:`. Readiness is `unrestricted`
+   (nothing to do), `profile-loaded` (use `--apparmor-profile`), `profile-missing` or `unsupported` (not Linux). It
+   exits 0 where `exec` can make its namespace and 1 where it cannot; `--json` prints the same fields.
+2. **Load the profile, once, as root.** `check` prints the exact line for this binary, for example:
+   ```
+   /usr/local/bin/slates apparmor profile | sudo tee /etc/apparmor.d/usr.local.bin.slates >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.slates
+   ```
+   `slates apparmor profile` prints the profile for this binary's own path; `--executable PATH` names another. The
+   profile grants that path `userns,` and nothing else, so a copy of the binary at another path is not covered. The
+   file under `/etc/apparmor.d` keeps the profile loaded across reboots. slates never loads it itself: that needs root,
+   which slates never asks for.
+3. **Ask for it.** `slates exec --apparmor-profile --volume V --at PATH -- CMD`. The launcher makes its namespace under
+   the profile, then runs `CMD` outside it, so `CMD` runs unconfined and holds nothing the host withholds from other
+   programs.
+
+Without `--apparmor-profile` the launcher never uses the profile, even where it is loaded. It leaves the profile first,
+and is refused as on a host without it, the refusal naming the switch. With the switch and no profile loaded, the
+refusal names this binary's profile file and the command that loads it. Loading the profile is an administrator's
+choice: anyone on the host may then create user namespaces through it (by running the binary, and on Ubuntu 24.04 by
+entering the profile by name with `aa-exec`), as every program may on a host without the restriction. `slates apparmor check` prints the line that removes it
+(`sudo apparmor_parser -R /etc/apparmor.d/usr.local.bin.slates && sudo rm /etc/apparmor.d/usr.local.bin.slates`).
+
+The same option, off unless set, is `ExecSpec::apparmor` (`AppArmor::Profile`) in slates-api, whose `exec::command`
+builds the launcher's command for an embedding host's own executable (whose path the profile then names). It is
+`apparmor_profile=True` in the Python SDK's `slates.exec_command` and `{ apparmorProfile: true }` in the Node SDK's
+`execCommand`; each SDK renders the profile too (`apparmor_profile(path)`, `apparmorProfile(path)`).
 
 ## Planned interface corrections
 
