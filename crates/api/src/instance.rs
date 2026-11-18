@@ -1,112 +1,52 @@
-//! An instance as an embedding host holds it (§4.12 "Embedding", A-278): one client of one running daemon, and the
-//! verbs a host drives — the volume lifecycle of §4.4, the serving forms of §4.6, drift and landing of §4.15, and the
-//! observation of §4.14.
+//! An instance as an embedding host holds it (§4.12 "Embedding", A-278; "The consumer contract", A-299): one client of
+//! one running daemon, and every verb of the contract — provisioning and managing volumes (§4.4), serving them (§4.6),
+//! their drift and landings (§4.15), merges (§4.16), and observing the daemon (§4.14). Each verb answers a typed
+//! outcome or a typed [`Error`]; none answers text to parse.
 //!
 //! **One client, held.** An [`Instance`] is a connected `slates_client::Client`, so a host makes one and keeps it: a
-//! landing's presentation lives as long as the client that presented it (A-46), so a plan a person is shown can be
-//! granted and landed on the same client, which a command per verb could not do (kiln re-planned before every grant).
-//! The client reconnects under its own id when its daemon restarts and resends what it had in flight, which the daemon
-//! answers from its completion records (§4.9), so a held instance outlives a daemon restart.
+//! landing's presentation lives as long as the client that presented it (A-46), so a plan an approver is shown is
+//! approved on the same instance. The client reconnects under its own id when its daemon restarts and resends what it
+//! had in flight, which the daemon answers from its completion records (§4.9), so a held instance outlives a daemon
+//! restart.
 //!
-//! **Landing under a grant (§4.15, §4.13).** [`Instance::plan_landing`] presents a landing and returns its plan: the
-//! manifest hash a person approves, the summary of what it writes, and the conflicts found before any write. A grant
-//! binds exactly that manifest, its target and its volume, and the daemon issues one only under a proof of the human's
-//! authority over its claim ([`crate::grant`]): [`Instance::grant`] takes any proof form the daemon accepts, made by
-//! this process or out of band. [`Instance::land_approved`] is a synchronous confirmation surface's whole step: present
-//! the landing again, and prove, grant and land it only if its manifest is still the one the person approved, else
-//! return the new plan for them to see — so a grant never covers more than what a person said yes to, however long
-//! they took.
+//! **Write permission (A-299, Ada's rule of 2026-11-18).** A landing or a merge follows its caller's write mode
+//! ([`crate::WriteMode`]): bypass writes at once, ask answers [`LandOutcome::ApprovalRequired`] /
+//! [`MergeOutcome::ApprovalRequired`], forbid answers its `Refused` outcome. The launcher sets a volume's mode with
+//! [`Instance::set_write_policy`] under its authority (the instance's issuer); the daemon keeps and enforces it (A-285,
+//! kiln agent g220): a bypass volume lands in the presenting request, a forbidding one is refused before any host
+//! access, an unset one asks; a merge follows its work's and green's modes the same way. [`Instance::approve_landing`]
+//! and [`Instance::approve_merge`] approve an ask with the launcher's authority, never more than the manifest or the
+//! increment the approver was shown. A consumer's own mode and signed work are the daemon's next pieces (GAPS).
 
-use slates_client::{Attachment, Client, CreateSpec, Landing, ShardsStream, VhostUserDevice};
+use slates_client::{
+  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, Submitted,
+  VhostUserDevice,
+};
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, PlannedEntry, ReplyBody, RequestBody, SnapshotId, StatusReport, TelemetryReport,
-  VolumeId, VolumeSummary,
+  DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
+  RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId, VolumeSummary,
 };
 
-use crate::error::Error;
+use crate::error::{Error, Missing, ProtocolFault, Unsupported};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
+use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
+use crate::outcome::{
+  LandOutcome, LandingApproval, LandingConflict, MergeApproval, MergeConflict, MergeConflicts,
+  MergeOutcome, RebaseOutcome, Work, merge_class_of, report_of, summary_of,
+};
+use crate::policy::{PolicyRefusal, PolicySubject, WritePolicy};
+use crate::signed::{Verification, WorkSignature};
+use crate::volume::{
+  BaseState, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, status_of,
+};
 
-/// A client of one running instance, and every verb this crate offers.
+/// A client of one running instance, and every verb of the contract.
 #[derive(Debug)]
 pub struct Instance {
   /// The instance's name (its rendezvous, §4.7).
   pub(crate) name: String,
   /// The connected client.
   pub(crate) client: Client,
-}
-
-/// A landing a person is asked to approve (§4.15 step 2): its id, the manifest hash a grant must bind, what it would
-/// write, and the conflicts found before any write.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LandingPlan {
-  /// The landing's id on this client (a presentation lives as long as its client, A-46).
-  pub landing: u64,
-  /// The manifest hash a grant binds: what the person approves.
-  pub manifest: [u8; 32],
-  /// What the landing would write: entries per action, bytes, entries the filter left out.
-  pub summary: LandingSummary,
-  /// Conflicts found before any write: entries the disk changed under the volume (empty when the landing is clean).
-  pub conflicts: Vec<String>,
-}
-
-impl LandingPlan {
-  /// The grant claim that approves exactly this plan, for `scope` and `term_ns` ([`crate::GRANT_TERM_NS`] by default):
-  /// what a confirmation surface has proved ([`GrantAuthority`]) and passes to [`Instance::grant`].
-  pub fn claim(&self, scope: GrantScope, term_ns: u64) -> GrantClaim {
-    GrantClaim {
-      landing: self.landing,
-      manifest: self.manifest,
-      scope,
-      term_ns,
-    }
-  }
-
-  /// The manifest hash as text: 64 hexadecimal characters, as `slates land` prints it and `slates grant` takes it.
-  pub fn manifest_text(&self) -> String {
-    self
-      .manifest
-      .iter()
-      .map(|byte| format!("{byte:02x}"))
-      .collect()
-  }
-}
-
-/// What presenting a landing came to.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Planned {
-  /// A plan that needs a grant before anything is written.
-  Plan(LandingPlan),
-  /// Nothing needed a grant: the landing ran as it was (nothing to write, or a session grant covered it).
-  Landed(LandingOutcome),
-}
-
-/// What landing exactly what a person approved came to ([`Instance::land_approved`]).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Approved {
-  /// The landing ran under a grant bound to the approved manifest, or needed none.
-  Landed(LandingOutcome),
-  /// The landing's manifest is no longer the approved one (the volume or the disk changed since): nothing was
-  /// granted or written, and this is the new plan to show.
-  Changed(LandingPlan),
-}
-
-/// A `land` reply as this crate types it.
-fn planned(landing: Landing) -> Planned {
-  match landing {
-    Landing::Landed(outcome) => Planned::Landed(outcome),
-    Landing::GrantRequired {
-      landing,
-      manifest,
-      summary,
-      conflicts,
-    } => Planned::Plan(LandingPlan {
-      landing,
-      manifest,
-      summary,
-      conflicts,
-    }),
-  }
 }
 
 /// What a landing lands: a volume's snapshot (its head when `None`), into a host directory, through a filter.
@@ -118,15 +58,25 @@ pub struct LandingRequest {
   pub snapshot: Option<SnapshotId>,
   /// The host directory written: absolute, and outside every slates mount (§4.13).
   pub target: String,
-  /// Path prefixes to keep and to leave out (`/.git` left out keeps git's own files out of the target).
+  /// Path prefixes to keep and to leave out, any number of each (`/.git` left out keeps git's own files out of the
+  /// target).
   pub filter: Filter,
+}
+
+/// A presentation as the daemon answered it, typed: a plan to approve, or what needs none.
+enum Presented {
+  /// A plan with something to write and no conflict: its id, manifest and summary.
+  Plan(LandingApproval),
+  /// Anything else: written at once (nothing needed an approval), or conflicted.
+  Settled(LandOutcome),
 }
 
 impl Instance {
   /// Attaches to the running instance `name`: the rendezvous (§4.7), with the product's derived deadlines
   /// ([`crate::deadlines`]). Refused [`Error::Unavailable`] at once when no daemon serves the instance.
   pub fn attach(name: &str) -> Result<Instance, Error> {
-    let client = Client::connect(name, crate::deadlines()).map_err(|e| Error::of(name, e))?;
+    let client = Client::connect(name, crate::deadlines())
+      .map_err(|error| Error::of_client(name, error, None, slates_server::daemon::HEARTBEAT_NS))?;
     Ok(Instance {
       name: name.to_owned(),
       client,
@@ -146,7 +96,8 @@ impl Instance {
     &self.name
   }
 
-  /// The whole typed client, for the verbs this crate does not wrap (the merge verbs of §4.16, the file verbs).
+  /// The whole typed client, for the verbs the contract does not wrap (the file verbs, `edit` and `declare` on a work
+  /// volume).
   pub fn client(&mut self) -> &mut Client {
     &mut self.client
   }
@@ -156,9 +107,21 @@ impl Instance {
     self.client
   }
 
-  /// A client failure of a verb to this instance, typed.
-  pub(crate) fn error(&self, error: slates_client::ClientError) -> Error {
-    Error::of(&self.name, error)
+  /// The pause before retrying a call refused for now, after `previous_ns` (zero for the first): the client's own
+  /// pacing, from the daemon's published spin window doubling to a tenth of the reconnect budget. A
+  /// [`Error::Retry`] carries the first.
+  pub fn retry_pause_ns(&self, previous_ns: u64) -> u64 {
+    self.client.retry_pause_ns(previous_ns)
+  }
+
+  /// A client failure of a call that named `subject`, typed, with the client's first retry pause.
+  pub(crate) fn fail(&self, error: ClientError, subject: Option<Missing>) -> Error {
+    Error::of_client(&self.name, error, subject, self.client.retry_pause_ns(0))
+  }
+
+  /// A client failure of a call that names nothing that could be missing, typed.
+  pub(crate) fn error(&self, error: ClientError) -> Error {
+    self.fail(error, None)
   }
 
   /// Makes this node's consensus group the root of a one-node fleet (§4.8 `bootstrap root`), or finds it made: a new
@@ -171,39 +134,115 @@ impl Instance {
       .call(&RequestBody::Bootstrap { root: true, member })
     {
       Ok(ReplyBody::Acknowledged)
-      | Err(slates_client::ClientError::Refused(
-        slates_ipc::protocol::Refusal::ConsensusAlreadyInitialized,
-      )) => Ok(()),
-      Ok(_) => Err(Error::Channel(
-        slates_client::ClientError::UnexpectedReply { verb: "bootstrap" },
-      )),
+      | Err(ClientError::Refused(Refusal::ConsensusAlreadyInitialized)) => Ok(()),
+      Ok(_) => Err(Error::Protocol(ProtocolFault::UnexpectedReply {
+        verb: "bootstrap",
+      })),
       Err(error) => Err(self.error(error)),
     }
   }
 
-  /// Creates a volume (§4.4); its id. [`crate::overlay`] makes the spec of a volume laid over a host directory,
-  /// [`crate::scratch`] one with no base. Refused `AlreadyExists` naming the volume that holds the name.
-  pub fn create(&mut self, spec: &CreateSpec) -> Result<VolumeId, Error> {
-    self.client.create(spec).map_err(|e| self.error(e))
+  /// Makes the volume `spec` names (§4.4): an overlay over a host folder, an empty volume, a clone of a snapshot, a
+  /// green or a work volume over one ([`Source`]). Refused [`Error::AlreadyExists`] naming the volume that holds the
+  /// name; an overlay over a relative folder is refused [`crate::Invalid::Path`] before the daemon is asked.
+  pub fn provision(&mut self, spec: &VolumeSpec) -> Result<Provisioned, Error> {
+    let name = spec.name.as_str();
+    match &spec.source {
+      Source::Overlay {
+        folder,
+        max_bytes,
+        names,
+      } => self.create(&CreateSpec {
+        name: name.to_owned(),
+        size: SizeClass::Dynamic { max: *max_bytes },
+        names: *names,
+        require_locked: false,
+        base: Some(crate::absolute_text(folder)?),
+      }),
+      Source::Empty { limit_bytes, names } => self.create(&CreateSpec {
+        name: name.to_owned(),
+        size: SizeClass::Bounded {
+          limit: *limit_bytes,
+        },
+        names: *names,
+        require_locked: false,
+        base: None,
+      }),
+      Source::Clone { volume, snapshot } => self
+        .client
+        .clone_snapshot(*volume, *snapshot, name)
+        .map(Provisioned::Volume)
+        .map_err(|e| {
+          self.fail(
+            e,
+            Some(Missing::Snapshot {
+              volume: *volume,
+              snapshot: *snapshot,
+            }),
+          )
+        }),
+      Source::Green {
+        base,
+        require_evidence,
+      } => self.create_green(name, *base, *require_evidence),
+      Source::Work { green } => self
+        .client
+        .create_work(*green, name)
+        .map(|(volume, base)| Provisioned::Work {
+          work: Work {
+            volume,
+            green: *green,
+          },
+          base,
+        })
+        .map_err(|e| self.fail(e, Some(Missing::Volume(*green)))),
+    }
+  }
+
+  /// One `create`.
+  fn create(&mut self, spec: &CreateSpec) -> Result<Provisioned, Error> {
+    self
+      .client
+      .create(spec)
+      .map(Provisioned::Volume)
+      .map_err(|e| self.error(e))
+  }
+
+  /// One green, empty or over a snapshot.
+  fn create_green(
+    &mut self,
+    name: &str,
+    base: Option<slates_ipc::protocol::GreenBase>,
+    require_evidence: bool,
+  ) -> Result<Provisioned, Error> {
+    match base {
+      None => self
+        .client
+        .create_green(name, require_evidence)
+        .map(Provisioned::Volume)
+        .map_err(|e| self.error(e)),
+      Some(base) => self
+        .client
+        .create_green_over(name, require_evidence, base)
+        .map(Provisioned::Volume)
+        .map_err(|e| {
+          self.fail(
+            e,
+            Some(Missing::Snapshot {
+              volume: base.volume,
+              snapshot: base.snapshot,
+            }),
+          )
+        }),
+    }
   }
 
   /// Takes a snapshot of `volume`'s head (§4.4, D-5); its id.
   pub fn snapshot(&mut self, volume: VolumeId) -> Result<SnapshotId, Error> {
-    self.client.snapshot(volume).map_err(|e| self.error(e))
-  }
-
-  /// Clones `snapshot` of `volume` into a new volume named `name` (§4.4, D-5); the clone's id. The clone shares every
-  /// chunk with its origin until either writes.
-  pub fn clone_snapshot(
-    &mut self,
-    volume: VolumeId,
-    snapshot: SnapshotId,
-    name: &str,
-  ) -> Result<VolumeId, Error> {
     self
       .client
-      .clone_snapshot(volume, snapshot, name)
-      .map_err(|e| self.error(e))
+      .snapshot(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// Destroys a snapshot, returning what only it held to the shard; refused while a clone pins it.
@@ -211,30 +250,57 @@ impl Instance {
     self
       .client
       .destroy_snapshot(volume, snapshot)
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Snapshot { volume, snapshot })))
   }
 
   /// Destroys `volume` (§4.4): what it held is gone; its mounts and attachments end. The daemon tears it down in
   /// cooperative slices after it answers.
   pub fn destroy(&mut self, volume: VolumeId) -> Result<(), Error> {
-    self.client.destroy(volume).map_err(|e| self.error(e))
+    self
+      .client
+      .destroy(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// The caller's volumes.
+  /// The caller's volumes. The daemon answers them in one reply today; a paged listing is owed (GAPS, A-299).
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, Error> {
     self.client.list().map_err(|e| self.error(e))
   }
 
-  /// `volume`'s status (§4.14): its bytes, lease, attachments, head, the drift list of an overlay, its placement and
-  /// its mounts.
-  pub fn status(&mut self, volume: VolumeId) -> Result<StatusReport, Error> {
-    self.client.status(volume).map_err(|e| self.error(e))
+  /// `volume`'s status (§4.14), typed: its bytes, lease, attachments, head, placement, transports, mounts, journal, and
+  /// an overlay's base with its drift.
+  pub fn status(&mut self, volume: VolumeId) -> Result<VolumeStatus, Error> {
+    let report = self
+      .client
+      .status(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
+    status_of(report)
   }
 
-  /// The entries of an overlay that the disk changed after the volume changed them (§4.15 "Drift"): each a path and
-  /// what happened to it, as `slates status --drift` prints it. A landing of such an entry is a conflict.
-  pub fn drift(&mut self, volume: VolumeId) -> Result<Vec<String>, Error> {
-    Ok(self.status(volume)?.drifted)
+  /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
+  /// happened — landing it would conflict — and each whose re-check the host refused now. `None` for a volume with no
+  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now.
+  pub fn drift(&mut self, volume: VolumeId) -> Result<Option<DriftReport>, Error> {
+    match self.status(volume)?.base {
+      None => Ok(None),
+      Some(BaseState::Read(report)) => Ok(Some(report)),
+      Some(BaseState::Unreadable) => Err(Error::Host(crate::error::HostFault::BaseUnreadable)),
+    }
+  }
+
+  /// A file's bytes in `volume` (§4.4): at its head, at a green's version, or through an attachment's pinned view
+  /// ([`ReadAt`]). A reviewer reads each entry an approval lists at the head and checks it against the entry's hash
+  /// ([`Instance::approval_entries`]); a mismatch means the volume changed since, and the landing is presented again.
+  pub fn read(&mut self, volume: VolumeId, path: &str, at: ReadAt) -> Result<Vec<u8>, Error> {
+    self.client.read(volume, path, at).map_err(|e| {
+      self.fail(
+        e,
+        Some(Missing::Entry {
+          volume,
+          path: path.to_owned(),
+        }),
+      )
+    })
   }
 
   /// Takes the disk's present state of drifted entries as their new base (all of them when `paths` is `None`, §4.15
@@ -247,12 +313,15 @@ impl Instance {
     self
       .client
       .rewitness(volume, paths)
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// Ends an attachment (a mount's, a stream's, a device's): the daemon unmounts or closes what it served.
   pub fn detach(&mut self, attachment: u64) -> Result<(), Error> {
-    self.client.detach(attachment).map_err(|e| self.error(e))
+    self
+      .client
+      .detach(attachment)
+      .map_err(|e| self.fail(e, Some(Missing::Attachment { attachment })))
   }
 
   /// Serves `volume` to a Shards microVM over an anonymous stream (§4.6, the Shards route; A-161): the daemon serves
@@ -269,13 +338,13 @@ impl Instance {
     self
       .client
       .attach_shards(volume, intent, subtree)
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// Serves `volume` through slates' own virtio-fs device to an out-of-process VMM over vhost-user (§4.6; G-vhost): the
   /// returned end goes to the VMM as its front end's socket (crosvm takes `socket=/proc/self/fd/N`); the guest mounts
   /// `tag`; `dax_window` offers a DAX window of that many bytes (a power of two of at least 2 MiB). Linux only:
-  /// elsewhere refused `AttachmentUnsupported`.
+  /// elsewhere refused `Unsupported(Attachment)`.
   pub fn serve_vhost_user(
     &mut self,
     volume: VolumeId,
@@ -286,7 +355,7 @@ impl Instance {
     self
       .client
       .attach_vhost_user(volume, intent, (tag, subtree), dax_window)
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// Attaches `volume` in the record form (§4.4): a write intent takes the volume's write lease (D-16). What the file
@@ -295,42 +364,126 @@ impl Instance {
     self
       .client
       .attach(volume, None, intent)
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// Presents the landing of `request` (§4.15 steps 1–2): with nothing needing a grant it runs as it is
-  /// ([`Planned::Landed`]); otherwise its plan, for a person to approve.
-  pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<Planned, Error> {
-    self.land_with(request, None).map(planned)
+  /// Lands `request` under the caller's write mode (§4.15): [`LandOutcome::Written`] when it runs,
+  /// [`LandOutcome::ApprovalRequired`] when the mode asks (what would be written, for [`Instance::approve_landing`]),
+  /// [`LandOutcome::Conflicted`] when the disk changed entries the volume changed too, [`LandOutcome::Refused`] when a
+  /// policy forbids it. A `signature` makes the landing signed work ([`crate::signed`]); refused
+  /// `Unsupported(SignedWork)` until the daemon verifies signed work.
+  pub fn land(
+    &mut self,
+    request: &LandingRequest,
+    signature: Option<&WorkSignature>,
+  ) -> Result<LandOutcome, Error> {
+    if signature.is_some() {
+      return Err(Error::Unsupported(Unsupported::SignedWork));
+    }
+    let landing = self.land_with(request, None);
+    Ok(match self.presented(request, landing)? {
+      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
+      Presented::Settled(outcome) => outcome,
+    })
   }
 
-  /// Every entry `plan` would write (§4.15 step 2, "the full entry list on demand"; A-287): path by path in the
-  /// manifest's order, each create and replace with its bytes' BLAKE3 and length as the manifest binds them, a
+  /// Presents the landing of `request` without writing it, whatever the caller's write mode (§4.15 steps 1–2; the
+  /// daemon's present-only verb, A-285): the plan as an approval (its manifest, its summary), or the conflicts found
+  /// before any write. What a reviewer asks before approving: [`Instance::approval_entries`] lists the plan path by
+  /// path. A forbidding mode presents too, since a reviewer reads changes it may not land.
+  pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<LandOutcome, Error> {
+    let presented = self.present_only(request);
+    Ok(match self.presented(request, presented)? {
+      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
+      Presented::Settled(outcome) => outcome,
+    })
+  }
+
+  /// Every entry an approved landing would write (§4.15 step 2, "the full entry list on demand"; A-287): path by path
+  /// in the manifest's order, each create and replace with its bytes' BLAKE3 and length as the manifest binds them, a
   /// rename's origin, a symlink's target, the mode a file or directory lands with, and the conflict found at it. A
   /// reviewer with no mount of the volume builds the change from the list and the volume's files, checking each file it
-  /// reads against its entry: a volume reads only at its head, so a mismatch means it changed since `plan`'s snapshot
-  /// and the landing is presented again. Read from the presentation `plan` names, which lives until this client
-  /// presents the same volume and target again, lands it, or goes: `Refused(NotFound)` after that.
-  pub fn landing_entries(&mut self, plan: &LandingPlan) -> Result<Vec<PlannedEntry>, Error> {
+  /// reads against its entry: a volume reads only at its head, so a mismatch means it changed since the approval's
+  /// snapshot and the landing is presented again. Read from the presentation the approval names, which lives until
+  /// this client presents the same volume and target again, lands it, or goes: [`Missing::Presentation`] after that.
+  pub fn approval_entries(
+    &mut self,
+    approval: &LandingApproval,
+  ) -> Result<Vec<PlannedEntry>, Error> {
     self
       .client
-      .landing_entries(plan.landing, plan.manifest)
-      .map_err(|e| self.error(e))
+      .landing_entries(approval.presentation, approval.manifest)
+      .map_err(|e| {
+        self.fail(
+          e,
+          Some(Missing::Presentation {
+            id: approval.presentation,
+          }),
+        )
+      })
   }
 
-  /// Lands `request` under `grant` (§4.15 steps 3–6): the grant must bind this landing's volume, target and consumer,
-  /// or the landing is refused `GrantMismatch` before any write. A grant that does not cover the manifest planned now
-  /// (the volume or the disk changed since it was granted) writes nothing and answers with the new plan.
-  pub fn land(&mut self, request: &LandingRequest, grant: u64) -> Result<Planned, Error> {
-    self.land_with(request, Some(grant)).map(planned)
+  /// Approves exactly the landing `approval` showed (§4.13 "Grants", §4.15), with the launcher's `authority`:
+  /// presents the landing again (never writing), and when its manifest is still the approved one, has the authority
+  /// prove a grant of that manifest for one landing, and lands under it — [`LandOutcome::Written`]. When the volume or
+  /// the disk changed since, nothing is approved or written, and the answer is the new presentation
+  /// ([`LandOutcome::ApprovalRequired`] to show instead, or [`LandOutcome::Conflicted`]). An approval never covers more
+  /// than the manifest its approver saw, however long they took, and it works from any instance: it is bound to the
+  /// request and the manifest, never to the client that first presented it.
+  pub fn approve_landing(
+    &mut self,
+    approval: &LandingApproval,
+    authority: &dyn GrantAuthority,
+  ) -> Result<LandOutcome, Error> {
+    let request = &approval.request;
+    let presented = self.present_only(request);
+    let fresh = match self.presented(request, presented)? {
+      Presented::Plan(fresh) => fresh,
+      Presented::Settled(outcome) => return Ok(outcome),
+    };
+    if fresh.manifest != approval.manifest {
+      return Ok(LandOutcome::ApprovalRequired(fresh));
+    }
+    let claim = GrantClaim {
+      landing: fresh.presentation,
+      manifest: fresh.manifest,
+      scope: GrantScope::Once,
+      term_ns: crate::GRANT_TERM_NS,
+    };
+    let proof = authority.prove(&claim)?;
+    let grant = self.grant(&claim, &proof)?;
+    match self.land_with(request, Some(grant)) {
+      Ok(Landing::Landed(outcome)) => Ok(LandOutcome::Written(report_of(
+        outcome,
+        Verification::Unsigned,
+      )?)),
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
+        Ok(LandOutcome::Refused(PolicyRefusal::forbidden(act, by)))
+      }
+      // The grant does not cover what is planned now, or the disk moved between the grant and the landing's
+      // validation: nothing was written; what holds now is presented.
+      Ok(Landing::GrantRequired { .. })
+      | Err(ClientError::Refused(Refusal::GrantMismatch | Refusal::LandingConflict { .. })) => {
+        let again = self.present_only(request);
+        Ok(match self.presented(request, again)? {
+          Presented::Plan(again) => LandOutcome::ApprovalRequired(again),
+          Presented::Settled(outcome) => outcome,
+        })
+      }
+      Err(error) => Err(self.fail(
+        error,
+        Some(Missing::Presentation {
+          id: fresh.presentation,
+        }),
+      )),
+    }
   }
 
-  /// Asks the daemon to issue the grant `claim` describes, under `proof` (§4.13 "Grants"); the grant id, which
-  /// [`Instance::land`] then lands under. The call takes any proof form the daemon accepts ([`GrantProof`]), whoever
-  /// made it: a person's out-of-band assertion as much as a [`GrantAuthority`] of this process. Refused
-  /// `GrantIssuerUnverified` when the proof does not verify, `GrantMismatch` when the manifest is not the presented
-  /// one, `NotFound` when nothing awaits under the landing (its presentation was replaced, or its client went away:
-  /// present it again).
+  /// Asks the daemon to issue the grant `claim` describes, under `proof` (§4.13 "Grants"); the grant id. The call takes
+  /// any proof form the daemon accepts ([`GrantProof`]), whoever made it, and any client may issue a grant for a
+  /// presentation another client made; the presenting client then lands under it. Refused [`crate::Denied::Unproven`]
+  /// when the proof does not verify, [`crate::Stale::Approval`] when the manifest is not the presented one, and
+  /// [`Missing::Presentation`] when nothing awaits under the id (it was replaced, or its client went away).
   pub fn grant(&mut self, claim: &GrantClaim, proof: &GrantProof) -> Result<u64, Error> {
     self
       .client
@@ -341,48 +494,235 @@ impl Instance {
         claim.term_ns,
         proof.wire(),
       )
-      .map_err(|e| self.error(e))
+      .map_err(|e| self.fail(e, Some(Missing::Presentation { id: claim.landing })))
   }
 
-  /// Lands exactly what a person approved (§4.13 "Grants", §4.15): presents the landing again, and when its manifest
-  /// is still `approved`, has `authority` prove the grant (`scope`, for `term_ns`), has it issued and lands under it;
-  /// when the manifest changed, proves and writes nothing and returns the new plan to show. The grant binds the
-  /// manifest the person saw, so a plan that grew since cannot ride their approval.
-  pub fn land_approved(
+  /// A presentation's reply, typed: a plan to approve, conflicts, written at once, or refused by a policy.
+  fn presented(
     &mut self,
-    authority: &dyn GrantAuthority,
     request: &LandingRequest,
-    approved: &[u8; 32],
-    (scope, term_ns): (GrantScope, u64),
-  ) -> Result<Approved, Error> {
-    let plan = match self.plan_landing(request)? {
-      Planned::Landed(outcome) => return Ok(Approved::Landed(outcome)),
-      Planned::Plan(plan) => plan,
-    };
-    if &plan.manifest != approved {
-      return Ok(Approved::Changed(plan));
+    reply: Result<Landing, ClientError>,
+  ) -> Result<Presented, Error> {
+    match reply {
+      Ok(Landing::Landed(outcome)) => Ok(Presented::Settled(LandOutcome::Written(report_of(
+        outcome,
+        Verification::Unsigned,
+      )?))),
+      Ok(Landing::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      }) => {
+        let approval = LandingApproval {
+          request: request.clone(),
+          presentation: landing,
+          manifest,
+          summary: summary_of(&summary)?,
+          verification: Verification::Unsigned,
+        };
+        if conflicts.is_empty() {
+          Ok(Presented::Plan(approval))
+        } else {
+          self.conflicts_of(&approval).map(Presented::Settled)
+        }
+      }
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => Ok(Presented::Settled(
+        LandOutcome::Refused(PolicyRefusal::forbidden(act, by)),
+      )),
+      Err(error) => Err(self.fail(error, Some(Missing::Volume(request.volume)))),
     }
-    let claim = plan.claim(scope, term_ns);
-    let proof = authority.prove(&claim)?;
-    let grant = self.grant(&claim, &proof)?;
-    match self.land(request, grant)? {
-      Planned::Landed(outcome) => Ok(Approved::Landed(outcome)),
-      Planned::Plan(plan) => Ok(Approved::Changed(plan)),
-    }
+  }
+
+  /// A conflicted presentation's conflicts, typed, read from its entries (§4.15 step 2; A-287): each entry the
+  /// preliminary verdict found in conflict, with its class and the bytes the volume would land there.
+  fn conflicts_of(&mut self, approval: &LandingApproval) -> Result<LandOutcome, Error> {
+    let conflicts = self
+      .approval_entries(approval)?
+      .into_iter()
+      .filter_map(|entry| {
+        entry.conflict.map(|class| LandingConflict {
+          path: entry.path,
+          class,
+          planned: entry.content,
+        })
+      })
+      .collect();
+    Ok(LandOutcome::Conflicted(conflicts))
+  }
+
+  /// One presentation of `request` that never writes, whatever the mode (the daemon's `Present`, A-285).
+  fn present_only(&mut self, request: &LandingRequest) -> Result<Landing, ClientError> {
+    self.client.present(
+      request.volume,
+      request.snapshot,
+      &request.target,
+      request.filter.clone(),
+    )
   }
 
   /// One `land` call: presented without a grant, run with one.
-  fn land_with(&mut self, request: &LandingRequest, grant: Option<u64>) -> Result<Landing, Error> {
+  fn land_with(
+    &mut self,
+    request: &LandingRequest,
+    grant: Option<u64>,
+  ) -> Result<Landing, ClientError> {
+    self.client.land(
+      request.volume,
+      request.snapshot,
+      &request.target,
+      request.filter.clone(),
+      grant,
+    )
+  }
+
+  /// Merges `work` into its green under the caller's write mode (§4.16, D-27): [`MergeOutcome::Merged`] at the green's
+  /// new version, [`MergeOutcome::Conflicted`] with every conflict window typed and the green's head (rebase, resolve,
+  /// merge again), [`MergeOutcome::ApprovalRequired`] when the mode asks (the increment's identity, for
+  /// [`Instance::approve_merge`]), [`MergeOutcome::Refused`] when a policy forbids it. `evidence` is what a green that
+  /// requires evidence takes (§4.16; empty for one that does not). A `signature` makes the merge signed work; refused
+  /// `Unsupported(SignedWork)` until the daemon verifies signed work.
+  pub fn merge(
+    &mut self,
+    work: &Work,
+    evidence: &[[u8; 32]],
+    signature: Option<&WorkSignature>,
+  ) -> Result<MergeOutcome, Error> {
+    if signature.is_some() {
+      return Err(Error::Unsupported(Unsupported::SignedWork));
+    }
+    let submitted = self.client.submit_with_evidence(work.volume, evidence);
+    self.merged(work, evidence, submitted)
+  }
+
+  /// Merges exactly the increment `approval` showed (A-285), with the launcher's `authority`: the daemon merges it only
+  /// while the work's increment is still that identity. When the work changed since, nothing is merged and the merge is
+  /// asked again: the answer is what the work's mode gives now (a fresh [`MergeOutcome::ApprovalRequired`] to show
+  /// instead, or its conflicts).
+  pub fn approve_merge(
+    &mut self,
+    approval: &MergeApproval,
+    authority: &dyn GrantAuthority,
+  ) -> Result<MergeOutcome, Error> {
+    let work = approval.work;
+    let proof = authority.prove_merge(work.volume, &approval.identity)?;
+    let submitted = self.client.submit_approved(
+      work.volume,
+      &approval.evidence,
+      approval.identity,
+      proof.wire(),
+    );
+    match submitted {
+      // The work's increment is no longer the approved one: nothing was merged; what holds now is asked again.
+      Err(ClientError::Refused(Refusal::GrantMismatch)) => {
+        self.merge(&work, &approval.evidence, None)
+      }
+      other => self.merged(&work, &approval.evidence, other),
+    }
+  }
+
+  /// A submit's reply, typed.
+  fn merged(
+    &mut self,
+    work: &Work,
+    evidence: &[[u8; 32]],
+    reply: Result<Submitted, ClientError>,
+  ) -> Result<MergeOutcome, Error> {
+    match reply {
+      Ok(Submitted::Accepted(version)) => Ok(MergeOutcome::Merged {
+        version,
+        verification: Verification::Unsigned,
+      }),
+      Ok(Submitted::Conflict(windows)) => self
+        .merge_conflicts(work, windows)
+        .map(MergeOutcome::Conflicted),
+      Ok(Submitted::ApprovalRequired { identity, paths }) => {
+        Ok(MergeOutcome::ApprovalRequired(MergeApproval {
+          work: *work,
+          evidence: evidence.to_vec(),
+          identity,
+          paths,
+          verification: Verification::Unsigned,
+        }))
+      }
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
+        Ok(MergeOutcome::Refused(PolicyRefusal::forbidden(act, by)))
+      }
+      Err(error) => Err(self.fail(error, Some(Missing::Volume(work.volume)))),
+    }
+  }
+
+  /// Moves `work` onto its green's head (§4.16 "Rebase, the only corrective path"): [`RebaseOutcome::Rebased`] at the
+  /// head when every pending operation maps cleanly, [`RebaseOutcome::Conflicted`] with the windows to resolve
+  /// otherwise. The green is unchanged either way.
+  pub fn rebase(&mut self, work: &Work) -> Result<RebaseOutcome, Error> {
+    match self.client.rebase(work.volume) {
+      Ok(Rebased::Rebased(version)) => Ok(RebaseOutcome::Rebased { version }),
+      Ok(Rebased::Conflict(windows)) => self
+        .merge_conflicts(work, windows)
+        .map(RebaseOutcome::Conflicted),
+      Err(error) => Err(self.fail(error, Some(Missing::Volume(work.volume)))),
+    }
+  }
+
+  /// A verdict's windows, typed, with the green's head read right after.
+  fn merge_conflicts(
+    &mut self,
+    work: &Work,
+    windows: Vec<MergeWindow>,
+  ) -> Result<MergeConflicts, Error> {
+    let conflicts = windows
+      .into_iter()
+      .map(|window| {
+        merge_class_of(window.class).map(|class| MergeConflict {
+          path: window.path,
+          at: window.at,
+          len: window.len,
+          class,
+        })
+      })
+      .collect::<Result<Vec<_>, Error>>()?;
+    let head = self
+      .client
+      .versions(work.green)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(work.green))))?;
+    Ok(MergeConflicts { conflicts, head })
+  }
+
+  /// Sets `subject`'s write policy (A-299, A-285): the launcher's verb, proven by its authority (`launcher`, the
+  /// instance's issuer). The daemon refuses it on a consumer's own channel whatever the proof, so an agent never sets
+  /// or raises its own mode ([`crate::Denied::Rights`]); a proof that does not verify is [`crate::Denied::Unproven`]. A
+  /// policy that requires signed merges is refused `Unsupported(SignedWork)` before anything is sent, since the daemon
+  /// does not keep that requirement yet; a consumer's own policy is refused by the daemon as not built yet (A-285).
+  pub fn set_write_policy(
+    &mut self,
+    subject: PolicySubject,
+    policy: &WritePolicy,
+    launcher: &crate::Issuer,
+  ) -> Result<(), Error> {
+    let wire_policy = policy.wire()?;
+    let wire_subject = subject.wire();
+    // The setting names the version it replaces (A-285): read it, then set from it. One raced in between is refused
+    // `Stale::Policy`, and nothing changes.
+    let (_, version) = self
+      .client
+      .policy(wire_subject)
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))?;
+    let proof = launcher.policy_proof(&wire_subject, &wire_policy, version)?;
     self
       .client
-      .land(
-        request.volume,
-        request.snapshot,
-        &request.target,
-        request.filter.clone(),
-        grant,
-      )
-      .map_err(|e| self.error(e))
+      .set_policy(wire_subject, (wire_policy, version), proof)
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))
+  }
+
+  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which merges at once and
+  /// asks for landings ([`WritePolicy::UNSET`]).
+  pub fn write_policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, Error> {
+    self
+      .client
+      .policy(subject.wire())
+      .map(|(policy, _)| policy.map(WritePolicy::of_wire))
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 
   /// The daemon's status (§4.14 `slates.status`): its shards, health signals with their freshness, the fleet's view,
@@ -391,19 +731,43 @@ impl Instance {
     self.client.daemon_status().map_err(|e| self.error(e))
   }
 
-  /// The audit log from record `since` (§4.15, §4.14): grants, manifests and landing outcomes, in order.
-  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, Error> {
-    self.client.audit(since).map_err(|e| self.error(e))
+  /// The audit log from record `since` (§4.15, §4.14), typed: grants, presentations, validations, entries and
+  /// landings finished, in order.
+  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditRecord>, Error> {
+    self
+      .client
+      .audit(since)
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(audit_of)
+      .collect()
   }
 
-  /// The caller's grants (§4.13): each with its scope, term and state.
-  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, Error> {
-    self.client.grants().map_err(|e| self.error(e))
+  /// The caller's grants (§4.13), typed: each with its volume, target, manifest, scope and state.
+  pub fn grants(&mut self) -> Result<Vec<GrantRecord>, Error> {
+    self
+      .client
+      .grants()
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(grant_of)
+      .collect()
   }
 
   /// One shard's telemetry drain (§4.14): the chokepoint spans its bounded ring holds, up to one reply's quota, with
   /// the loss marker for the batch and every chokepoint's freshness. A read that consumes.
   pub fn telemetry(&mut self, partition: u16) -> Result<TelemetryReport, Error> {
-    self.client.telemetry(partition).map_err(|e| self.error(e))
+    self
+      .client
+      .telemetry(partition)
+      .map_err(|e| self.fail(e, Some(Missing::Shard { shard: partition })))
+  }
+}
+
+/// What a policy verb names, as a missing subject.
+fn missing_subject(subject: PolicySubject) -> Missing {
+  match subject {
+    PolicySubject::Consumer(consumer) => Missing::Consumer { consumer },
+    PolicySubject::Volume(volume) => Missing::Volume(volume),
   }
 }

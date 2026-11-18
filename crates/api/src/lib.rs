@@ -1,41 +1,52 @@
-//! `slates-api`: the library an embedding host drives slates through (§4.12 "Embedding", A-278). A host such as kiln
-//! vendors slates and reaches it only through this crate, never through the `slates` command: it attaches to an
-//! instance, creates, clones, snapshots and destroys volumes, serves a volume as a host mount or as a descriptor a VMM
-//! takes, reads what drifted under an overlay, plans a landing, lands it under a grant its own confirmation surface
-//! issues, and observes the daemon. Every failure is a typed refusal ([`Error`]).
+//! `slates-api`: the library an embedding host drives slates through, and its typed consumer contract (§4.12
+//! "Embedding", A-278; "The consumer contract", A-299). A host such as kiln vendors slates and reaches it only through
+//! this crate, never through the `slates` command: it starts or attaches to an instance, provisions and manages
+//! volumes, serves a volume as a host mount or as a descriptor a VMM takes, reads an overlay's drift, lands a volume
+//! and merges a work volume under the write permission its user granted, and observes the daemon. Every answer is a
+//! typed outcome and every failure a typed [`Error`]: closed enums a consumer matches and acts on, never text to parse.
 //!
 //! **Why a crate of its own.** The Rust client (`slates-client`, §2.4) is the ring protocol's one implementation and
 //! the base of every surface: the CLI, the MCP server and both SDKs. What an embedding host needs past it was the CLI's
-//! alone until 2026-11-18 — the host mount (`crates/cli/src/mount.rs`), the issuer authority a grant is proven under,
-//! the grant's term — so kiln ran the `slates` binary for every verb and parsed its JSON (kiln's
-//! `crates/kiln/src/workspace/slates.rs`: one process per verb, a plan held only while the command that made it ran,
-//! one `--exclude` a landing). Those pieces live here now and the CLI calls them, so there is one mount and one issuer,
-//! not a copy per front end (CLAUDE.md §2 item 7).
+//! alone until 2026-11-18 — the host mount, the issuer authority, the anchor and daemon roles — so kiln ran the
+//! `slates` binary for every verb and parsed its JSON. Those pieces live here now and the CLI calls them, so there is
+//! one implementation, not a copy per front end (CLAUDE.md §2 item 7).
+//!
+//! **The contract (A-299).**
+//! - *Volumes* ([`volume`]): one typed create for every source ([`VolumeSpec`], [`Source`]: an overlay over a host
+//!   folder, empty, a clone of a snapshot, a green, a work volume), snapshot, destroy, list, a typed status, and an
+//!   overlay's drift as typed entries.
+//! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
+//!   a descriptor a VMM takes.
+//! - *Write permission* ([`policy`]): a landing and a merge follow the mode the user gave the harness or agent asking to
+//!   write — bypass, ask, forbid ([`WriteMode`]) — set by the launcher per consumer or volume, never raised by an
+//!   agent. A landing answers [`LandOutcome`], a merge [`MergeOutcome`], a rebase [`RebaseOutcome`] ([`outcome`]).
+//! - *Conflicts* are verdicts, typed per path ([`LandingConflict`], [`MergeConflict`]); nothing is ever inferred (D-27).
+//! - *Signed work* ([`signed`]): a merge or a landing may carry a signature, and its outcome says how it was judged
+//!   ([`Verification`]); a volume's policy may require signed merges. Signatures never gate permission.
+//! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
-//! arguments after its `PREFIX` to [`role::main`], which serves the anchor and daemon roles the `slates` binary serves
-//! (they live here, and the binary calls them too). The anchor starts its daemon from the same executable and prefix.
+//! arguments after its `PREFIX` to [`role::main`], which serves the anchor and daemon roles the `slates` binary serves.
+//! The anchor starts its daemon from the same executable and prefix.
 //!
-//! **What a host holds.**
-//! - An [`Instance`]: a client of one running instance (the rendezvous, §4.7), and every verb this crate offers. Its
-//!   calls are the client's synchronous round trips, which spin and then park on the daemon's wake word (§4.7 "Wake
-//!   strategy"); a provisioning verb answers in microseconds (R9), and a long one — a granted landing, a FUSE mount —
-//!   waits while the daemon lives and fails `Unavailable` once it is gone (A-232). [`Instance::client`] lends the
-//!   whole typed client for the verbs this crate does not wrap (the merge verbs of §4.16, the file verbs).
-//! - A grant's proof ([`grant`]): [`Instance::grant`] takes a [`GrantClaim`] and any [`GrantProof`] the daemon
-//!   accepts, so the call stays as the proof's forms grow (Ada, 2026-11-18: a signature by a key only the human holds).
-//!   An [`Issuer`] is today's [`GrantAuthority`]: the anchor segment's issuer secret, which only a process holding the
-//!   segment can use, as `slates grant` does. The SDKs and the MCP server do not depend on this crate, so no grant
-//!   verb reaches them, which is the structural exclusion §4.12 asks for.
+//! **What a host holds.** An [`Instance`]: a client of one running instance (§4.7) and every verb of the contract. Its
+//! calls are the client's synchronous round trips, which spin and then park on the daemon's wake word (§4.7 "Wake
+//! strategy"); a provisioning verb answers in microseconds (R9), and a long one — a landing, a FUSE mount — waits while
+//! the daemon lives and fails [`Error::Unavailable`] once it is gone (A-232). The launcher's authority is an [`Issuer`]
+//! ([`grant`]): what approves a landing an agent's mode asks about.
 //!
-//! **Versioning.** The crate's version is the workspace's (`[workspace.package] version`, the one hand-edited
-//! version, §4.12 "One version"). The report types it re-exports are the wire's, which evolve append-only (D-15): a
-//! field or a variant is added, never changed or removed, so a host reads them and matches their enums with a
-//! wildcard arm.
+//! **Versioning.** Two numbers. [`VERSION`] is the workspace's one hand-edited version (§4.12 "One version").
+//! [`CONTRACT`] is the contract's: raised by one with every change to a type or a verb of the contract. No contract enum
+//! is `#[non_exhaustive]`, so a consumer that pins slates at a commit asserts the contract version it was written
+//! against and matches exhaustively; at its next vendoring a moved contract shows as that assertion failing beside the
+//! compile errors of the matches it must extend — never as a variant falling silently through a wildcard. The wire
+//! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
-//! **What is owed** (GAPS, the A-278 row): an async form over a host's reactor (R6); a seam trait with a simulator and
-//! a conformance suite for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
+//! **What is owed** (GAPS, the A-278 and A-299 rows): the starter handed the launcher's authority on every platform;
+//! the write modes, approvals of merges and signed work verified on the daemon's side (A-285); typed fields on the wire
+//! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
+//! listing; an async form over a host's reactor (R6); a seam trait with a simulator and a conformance suite.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -47,31 +58,64 @@ pub mod grant;
 pub mod instance;
 pub mod issuer;
 pub mod mount;
+pub mod observe;
+pub mod outcome;
+pub mod policy;
 pub mod role;
+pub mod signed;
 pub mod start;
+pub mod volume;
 
-pub use error::{Error, IssuerFault, MountFault, PathFault, StartFault};
+pub use error::{
+  Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
+  KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
+  Stale, StartFault, Unreported, Unsupported, Unusable,
+};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
-pub use instance::{Approved, Instance, LandingPlan, LandingRequest, Planned};
+pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use mount::{MountKind, MountOptions, Mounted};
+pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
+pub use outcome::{
+  ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
+  MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome,
+  Summary, Work,
+};
+pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
+pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
 pub use start::{Anchor, StartSpec, Started};
+pub use volume::{
+  BaseState, Drift, DriftKind, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, Watcher,
+};
 
 /// The crate's version: the workspace's one hand-edited version (§4.12 "One version"), which a host reports beside its
 /// own.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The typed client and its own types, for the verbs [`Instance::client`] lends.
-pub use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, Deadlines, ShardsStream, StreamEnd, VhostUserDevice,
-};
-/// The wire's types this crate's verbs take and return (§4.9; append-only, D-15).
+/// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
+/// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
+/// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
+/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
+/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
+/// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
+/// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
+/// `LandingApproval` approved by `approve_landing` (`Approval` and `approve` split by what they approve); `merge` takes
+/// evidence; `plan_landing` presents through the daemon's present-only verb whatever the mode (the same day).
+pub const CONTRACT: u32 = 6;
+
+/// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
+pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
+/// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  ActionCount, AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
-  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, NamePolicy, PlannedAction,
-  PlannedContent, PlannedEntry, Refusal, SizeClass, SnapshotId, StatusReport, TelemetryReport,
-  VolumeId, VolumeSummary,
+  AttachTransport, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase, HostAnswer,
+  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, MountReport,
+  NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal,
+  ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeSummary,
 };
+/// The rendezvous's and the channel's own typed refusals the contract carries.
+pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
 
 /// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
 /// for as long as the anchor waits for the daemon's heartbeat before it questions the daemon's liveness, and a
@@ -85,33 +129,6 @@ pub fn deadlines() -> Deadlines {
   .get()
 }
 
-/// A volume laid over the host directory `base` (§4.15, D-25): it reads every entry it has not changed from the
-/// directory as the directory is now and keeps its own changes in memory, growing as it needs up to `max_bytes`
-/// (§4.2's dynamic size class). Names are byte-exact (`NamePolicy::Exact`); a host that overlays a case-folding
-/// directory sets `names` itself. Refused [`PathFault::NotAbsolute`] for a relative `base`, which the daemon would
-/// resolve against its own working directory, and [`PathFault::NotUnicode`] for one the wire cannot carry.
-pub fn overlay(name: &str, base: &std::path::Path, max_bytes: u64) -> Result<CreateSpec, Error> {
-  let base = absolute_text(base)?;
-  Ok(CreateSpec {
-    name: name.to_owned(),
-    size: SizeClass::Dynamic { max: max_bytes },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: Some(base),
-  })
-}
-
-/// A scratch volume: no base, bounded at `limit_bytes` reserved at creation (§4.2's bounded size class).
-pub fn scratch(name: &str, limit_bytes: u64) -> CreateSpec {
-  CreateSpec {
-    name: name.to_owned(),
-    size: SizeClass::Bounded { limit: limit_bytes },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  }
-}
-
 /// A volume id as text: its sixteen bytes in hexadecimal, as `slates volume list` prints it and parses it back.
 pub fn volume_id_text(id: VolumeId) -> String {
   id.bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -120,13 +137,15 @@ pub fn volume_id_text(id: VolumeId) -> String {
 /// `path` as the wire carries it: absolute, and Unicode.
 pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
   if !path.is_absolute() {
-    return Err(Error::Path {
+    return Err(Error::Invalid(Invalid::Path {
       path: path.to_string_lossy().into_owned(),
       fault: PathFault::NotAbsolute,
-    });
+    }));
   }
-  path.to_str().map(str::to_owned).ok_or_else(|| Error::Path {
-    path: path.to_string_lossy().into_owned(),
-    fault: PathFault::NotUnicode,
+  path.to_str().map(str::to_owned).ok_or_else(|| {
+    Error::Invalid(Invalid::Path {
+      path: path.to_string_lossy().into_owned(),
+      fault: PathFault::NotUnicode,
+    })
   })
 }

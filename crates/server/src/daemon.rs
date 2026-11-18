@@ -3935,6 +3935,9 @@ async fn init_shard(
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
   let issuer_secret = segment.issuer_secret()?;
+  // The launcher secret its starter handed the anchor (A-285), published before the first daemon: a launcher-class
+  // proof verifies under it as under the issuer secret. `None` when the starter gave none.
+  let launcher_secret = segment.launcher_secret()?;
   // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
   // on the shard that serves it.
   let session_secret = crate::session_key::secret_of(&segment)?;
@@ -3947,6 +3950,7 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    launcher_secret,
     session_secret,
     seal_root,
     seal_state: sealing,
@@ -4147,6 +4151,7 @@ async fn init_shard(
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
     pending_tombstones: std::collections::BTreeMap::new(),
+    work_routes: crate::work_route::WorkRoutes::default(),
     seals: std::collections::BTreeMap::new(),
     mirror_seals: std::collections::BTreeMap::new(),
     mirror_neighbourhood: Vec::new(),
