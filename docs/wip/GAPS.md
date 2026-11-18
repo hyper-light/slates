@@ -448,7 +448,10 @@
 >   tests hold at zero). The measurer's A-324 longest steps (at most 12.0 ms over 1,000 live volumes, 42.0 ms over 4,000,
 >   one shard, 2026-11-18) grew with the volumes as one poll would; to be measured again.
 > - **Owed (siblings, one-turn walks of a whole volume):** a live log's whole record (`live_ship::payload` seals the
->   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
+>   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
+>   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
+>   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
+>   images (`refresh_image`) still one turn, owed); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -464,7 +467,13 @@
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
 >     steps (which function, owed: the trace asked of the measurer). g251 slices the takeover's rebuild and restore.
->   - **Plan (g230's item 3, not built):** capture the whole body in the publication's turn (`whole_record` and
+>   - **Built (A-377, 2026-11-18; see §4.10's status):** the plan below, with what its first run found: a refused
+>     append that dropped the rest of the queue into one owed whole state gave all those writers one position, 4 of 8
+>     were refused `DurabilityPending` (CI diag 44352143242); a sealed entry and its queue now wait in place for the
+>     credit, a genuine drop folds its writers onto the owed whole's position, and the period no longer owes a whole
+>     state while a build holds the chain. 8 of 8 answered, Linux x86_64 and macOS, 2 of 2 each.
+>   - **Plan (g230's item 3, as written before it was built):** capture the whole body in the publication's turn
+>     (`whole_record` and
 >     `content_runs`, a memcpy, about a tenth of the seal), then seal its pieces (`seal_body` already seals
 >     MAX_CHUNK_BYTES pieces independently) on a task of the owner shard driven through `xshard::Turns`, a quantum a
 >     turn, yielding between; queue the publications made meanwhile behind it, bounded by the credit; append the whole

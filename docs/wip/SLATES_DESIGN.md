@@ -7577,6 +7577,30 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > by the acknowledgement), red with the whole state counted. Owed (measurement): the 32-writer run's whole records and
 > step lengths again.
 >
+> **A whole entry of more than one piece is sealed in turns, and the writes made meanwhile follow it (A-377, 2026-11-18;
+> g230).** A live log's whole entry (its first, and every checkpoint) was made and sealed in the one turn of the owner
+> shard that published it: the volume's image, every extent read into it, then an AEAD and keyed names a byte, about a
+> second a GiB (g251's trace of a taken-over volume's first publication: 1.06 s in one turn). The publication's turn now
+> captures the plain body (a memcpy a byte) and begins a build (`live_ship::WholeBuild`): a task of the owner shard seals
+> it a piece a turn, a share of the shard's quantum each (`config::wrap_slice_ns`, as A-323's wrap and A-347's open), and
+> yields between. Each publication made meanwhile is captured in its own turn and queued behind it, held to the credit
+> the whole entry will set. Nothing is appended while it seals; then the whole entry when the credit admits a
+> checkpoint, and each queued publication in order as the credit admits it, waiting in its place otherwise and going on
+> when an acknowledgement frees the credit or at the record period (`append_ready`). Positions are taken at the append
+> in publication order: a barrier made meanwhile waits for the position its entry will take (`durable_target`), and a
+> restart's kept position counts the build and its queue (`owned_piece`). A build ends unappended only when its owner is
+> superseded (its writers were refused) or its keys are refused; the volume then owes a whole state, and every writer
+> waiting past its position waits for it (`fold_waiting_onto`). While a build or its queue holds the chain the record
+> period appends what the credit admits and makes nothing beside it, judged before the candidates' keys; and only a
+> whole entry pays an owed whole state (`append_entry`), so a queued delta captured before a refusal cannot. Held by
+> `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` (`crates/server/tests/fleet.rs`: a volume
+> of 3 MiB, its seal turns cut to a piece each, eight writers and one more write as it goes live): 8 of 8 answered at
+> durability, eight turns over two builds, eight publications queued, the log durable at its head 9 with nothing owed,
+> both holders at it, on Linux x86_64 (2 of 2) and macOS (2 of 2); red with the entry sealed in its publication's turn
+> (no build, no turn). Owed: an install image (`refresh_image`) is still made and sealed in one turn; a second whole
+> entry followed the first in every run of the test (twice the whole bytes), its trigger not yet read; and a
+> transport's barrier keeps the position it read across a dropped build, waiting for the log to pass it or its bound.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
@@ -28233,3 +28257,40 @@ Applied in the same change to: §4.16 "Position mapping", A-238's "Owed", GAPS (
 - **Still owed.** A holder's ledger records and held inputs still grow per version: releasing them below the floor needs
   a durable checkpoint of the replica on the holder (a rebuild recomputes from version 0, and a takeover adopts the
   records for its completions).
+
+### A-377 — A live whole entry of more than one piece is sealed in turns of its owner shard, and the publications made meanwhile follow it in order (2026-11-18, g230, scale-out; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere"; AC-8.9; A-323's and A-347's sibling)
+Applied in the same change to: §4.10 "Live shipping" (its status), GAPS (the one-turn walks entry: the whole entry's
+item closed, install images owed), and the code below.
+- **What was there.** A live log's whole entry (its first, after a refused publication, and every checkpoint) was built
+  and sealed in the one turn of the owner shard that published it: `live_ship::payload` made the volume's whole image,
+  read every extent into it and sealed it (an AEAD and keyed names a byte), about a second a GiB. g251's trace of the
+  nemesis spin kills found a taken-over volume's first publication at 1.06 s in one turn; the measurer's 32 writers on a
+  128 MiB volume lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms steps.
+- **The rule.** The publication's turn captures the whole body (the image and every extent copied, a memcpy a byte) and
+  begins a build (`WholeBuild`): a task of the owner shard seals it a piece a turn, a share of the shard's quantum each
+  (`config::wrap_slice_ns`, as A-323's wrap and A-347's open), yielding between. While it seals, each publication is
+  captured in its own turn and queued behind it; nothing is appended. Once sealed, the whole entry is appended when the
+  credit admits a checkpoint, then each queued publication in order as the credit admits it (`append_ready`), waiting in
+  its place otherwise and going on when an acknowledgement frees the credit (`fold_into`) or at the record period.
+  Positions are taken at the append in publication order, so a barrier made meanwhile waits for the position its entry
+  will take (`durable_target` counts the build and the queue) and a restart's kept position counts them
+  (`owned_piece`). A build ends unappended only when its owner is superseded (its writers were refused) or its keys are
+  refused; then the volume owes a whole state, and every writer waiting past that whole state's position waits for it
+  (`fold_waiting_onto`). While a build or its queue holds the chain, the record period makes no whole entry or image
+  beside it, and judges it before the candidates' keys, which would owe another whole state for a log whose first whole
+  entry is still sealing. A queued delta is held to the credit the whole entry ahead of it sets (its own size); only a
+  whole entry pays an owed whole state (`append_entry`).
+- **What the first build of this missed (diag-g230-whole-2, CI 44352143242).** Run with a refused append dropping the
+  rest of the queue into one owed whole state, and the period's keys check owing whole states while the first whole
+  entry sealed, 4 of 8 writes made during the build were refused `DurabilityPending` at the failover SLO: each queued
+  publication had been counted a position, and the one whole state took one.
+- **Tests.** `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` (`crates/server/tests/fleet.rs`:
+  three nodes at `f = 1`; a volume of 3 MiB, its seal turns cut to a piece each; live-shipped while eight writers and one
+  more write publish): green 2 of 2 on Linux x86_64 (CI diag 44361717827) and 2 of 2 on macOS (Mac Studio, kiln r135),
+  each run 8 of 8 writes answered at durability, eight build turns over two builds, eight publications queued, the log
+  durable at its head 9 with nothing owed and both holders at it; red with the entry sealed in its publication's turn
+  (no build, no turn; the same diag). The burst test (`a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`)
+  and the fleet binary's live filter (16 tests) green on the change.
+- **Owed.** Install images (`refresh_image`) are still made and sealed in one turn. A second whole entry followed the
+  first in every run of the test (twice the whole bytes); its trigger is not yet read. A transport's barrier keeps the
+  position it read across a dropped build and waits for the log to pass it or its bound.
