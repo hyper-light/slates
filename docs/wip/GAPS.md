@@ -79,6 +79,27 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A takeover round gave up two objects within tolerance: a superseded owner's shipper held its sessions every period
+> (2026-11-18, A-349, NoLoss; g250; the chaos nemesis, seed 6876545201569229162, CI diag 44311638654 on both Linux arches).**
+> Read with a status dump and three diagnostic lines (diag-g250-nemesis-2, CI run 44320668620, 5 of 6 rounds): the owner
+> X1, isolated, taken over and admitted again under host epoch 2, still shipped its fenced epoch-1 log every record
+> period (`fleet.live.install_built` 2,227 to 2,245, each refused `StaleEpoch`); the next fault retired its successor X2,
+> whose objects fell to X1; and X1's round never sent the other survivor its page, its record session out on that loan
+> at every period (`lent_to live_ship`, `fleet.takeover.pages_unsent` 213 to 928), until A-304's bound gave both objects
+> up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
+> (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
+>   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
+>   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
+>   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
+>   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
+>   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
+> - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
+>   takeover's fetch), so any borrower that takes it every period starves the round the same way.
+> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
 > gated by its lease alone: once it confirmed again, an NFS mount on the old owner answered reads from the copy the
