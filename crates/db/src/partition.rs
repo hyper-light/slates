@@ -2300,6 +2300,13 @@ impl Partition {
     Ok(())
   }
 
+  /// When the lease wheel next has a lease to pop ([`Partition::expired_leases`]), nanoseconds: the earliest armed
+  /// lease's term, rounded up to the wheel's tick, so a pass at that instant finds it lapsed (A-470: the reaper wakes for
+  /// it, rather than meeting it up to a tick late). `None` with no lease armed. The wheel's own query, never a scan.
+  pub fn next_lease_expiry_ns(&mut self) -> Option<u64> {
+    self.lease_expiry.next_deadline_ns()
+  }
+
   /// The volumes whose leases expired by `now_ns` (the caller records `LeaseReleased` for
   /// each; the wheel pops, it never scans).
   pub fn expired_leases(&mut self, now_ns: u64) -> Vec<VolumeId> {

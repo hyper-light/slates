@@ -220,6 +220,18 @@ impl Grants {
     self.records.retain(|id, _| held(*id));
   }
 
+  /// The first instant at which a usable grant is past its term ([`Grants::expired_at`] would name it), nanoseconds:
+  /// the earliest usable grant's term and a nanosecond, since a grant is past its term only after it. `None` with no
+  /// usable grant. The sweep that ends grants wakes for it (A-470), rather than meeting it up to a tick late.
+  pub fn next_expiry_ns(&self) -> Option<u64> {
+    self
+      .records
+      .values()
+      .filter(|g| g.state == GrantState::Issued)
+      .map(|g| g.expires_ns.saturating_add(1))
+      .min()
+  }
+
   /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them.
   pub fn expired_at(&self, now_ns: u64) -> Vec<GrantId> {
     self

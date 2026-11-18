@@ -15048,6 +15048,45 @@ pub fn expire_leases(state: &mut ShardState) -> usize {
   expire_leases_at(state, now)
 }
 
+/// The timed terms this shard keeps, ended or renewed as they fall due (A-470): its write leases ([`expire_leases`]), its
+/// CLI attachments' terms ([`expire_lapsed_attachments`]), its grants' terms (`crate::landing::end_expired_grants`) and
+/// its abandoned staging buffers. The reaper runs it at every wake ([`next_owed_expiry_ns`]); a refused end is counted
+/// where its pass counts it, and met again at the next wake.
+pub(crate) fn expire_owed(state: &mut ShardState) {
+  let _ = expire_leases(state);
+  let _ = expire_lapsed_attachments(state);
+  crate::landing::end_expired_grants(state);
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+}
+
+/// When the next timed term this shard keeps falls due after `now` (A-470, [`expire_owed`]), on the shard's clock: the
+/// lease wheel's next lease (its own query, rounded up to its tick), the earliest CLI attachment's term, the earliest
+/// grant's term (a nanosecond past it, when the grant is past it), and the earliest staging buffer's expiry. The reaper
+/// wakes then, so a term ends on time rather than up to a full tick late. A term already due and still standing (its
+/// end was refused) is not counted: it is met at the next wake, never woken for at once, so a refusal cannot spin the
+/// reaper. `None` with none kept.
+pub(crate) fn next_owed_expiry_ns(state: &mut ShardState, now: u64) -> Option<u64> {
+  let lease = state.db.partition_mut().next_lease_expiry_ns();
+  let attachment = state
+    .db
+    .partition()
+    .attachments()
+    .filter_map(|record| match record.consumer {
+      Consumer::Termed { expires_ns } => Some(expires_ns),
+      _ => None,
+    })
+    .filter(|expires_ns| *expires_ns > now)
+    .min();
+  let grant = state.landing.grants.next_expiry_ns();
+  let staging = state.staging.next_expiry_ns();
+  [lease, attachment, grant, staging]
+    .into_iter()
+    .flatten()
+    .filter(|due| *due > now)
+    .min()
+}
+
 /// [`expire_leases`] at `now`, on the shard's clock. A record the database refuses is counted
 /// ([`DB_SECONDARY_REFUSED`]), never dropped silently; the lease then stands as recorded, and another principal's take
 /// judges it as this pass would have ([`take_write_lease`]).

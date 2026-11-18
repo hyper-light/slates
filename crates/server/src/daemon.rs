@@ -4864,35 +4864,53 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
-/// budget the anchor allows the daemon's own heartbeat, so a peer silent that long is asked
-/// about (§4.7 "Failure matrix"). Derived: the cadence is the budget; a client is asked about
-/// once silent for the budget, so a death is seen within two budgets at most.
+/// The shard's sweep for dead clients and expired terms (A-470). Its full tick comes once a shard window
+/// ([`reap_window_ns`]): the window the watchdog judges this shard by (A-455), the liveness window raised to the overrun
+/// the shard measures. That tick asks the daemon's liveness question of its clients, at the cadence the anchor asks it
+/// of the daemon and the watchdog of the shard (§4.7 "Failure matrix"): a client silent for the window and gone is
+/// retired, so a death is seen within two windows at most. It also steps owed destroys and audits, samples the host's
+/// pressure, drains the base plane's hints, ages and seals idle content and purges an idle arena, so "idle a whole
+/// tick" (A-99, A-105) means idle a shard window. A shard the host holds off its CPU longer than the liveness window
+/// could not tick sooner anyway, and a client's silence it measures then includes its own absence.
+/// Between full ticks the reaper wakes for what it owes on time ([`verbs::next_owed_expiry_ns`]): a write lease's
+/// term, a CLI attachment's, a grant's, a staging buffer's. Each ends when it falls due, never sooner than one of the
+/// shard's measured idle turns after the last wake ([`reap_wake_ns`]), where it ended up to a tick late. The retries a
+/// tick owes (a client's retirement, a destroy, an audit) stay at the full tick: each waits on another shard's answer,
+/// judged in that shard's own time (A-432), so asking sooner would ask a shard that has not answered.
 async fn reap_loop() {
-  let cadence = derived!(
-    LIVENESS_BUDGET_NS,
-    "the liveness budget (the anchor's question of the daemon, asked of the daemon's clients)",
-    ["LIVENESS_BUDGET_NS"]
-  )
-  .get();
+  let started = state::with_state(|s| s.clock.monotonic_ns()).unwrap_or(0);
+  let mut full_due = started.saturating_add(reap_window_ns());
+  let mut last_wake = started;
   loop {
-    pace(cadence).await;
+    let (now, owed) = state::with_state(|s| {
+      let now = s.clock.monotonic_ns();
+      (now, verbs::next_owed_expiry_ns(s, now))
+    })
+    .unwrap_or((last_wake, None));
+    let wake = reap_wake_ns(full_due, owed, (last_wake, idle_turn_ns()));
+    pace(wake.saturating_sub(now)).await;
+    // The terms owed, at every wake.
+    last_wake = state::with_state(|s| {
+      verbs::expire_owed(s);
+      s.clock.monotonic_ns()
+    })
+    .unwrap_or(wake);
+    if last_wake < full_due {
+      continue;
+    }
+    let window = reap_window_ns();
+    full_due = last_wake.saturating_add(window);
     state::with_state(|s| {
-      let _ = verbs::expire_leases(s);
-      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
-      let _ = verbs::expire_lapsed_attachments(s);
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
       // (`verbs::step_destroys`), rather than in a busy serve round.
       let _ = verbs::step_destroys(s);
-      // A grant past its term leaves the tables (A-266); its history is the audit log.
-      crate::landing::end_expired_grants(s);
       // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
       // crash, a restart or an unanswered wait reaches the control partition, which appends nothing twice.
       crate::landing::resend_stuck_audit(s);
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;
-    let reaped = crate::reap::sweep(cadence).await;
+    let reaped = crate::reap::sweep(window).await;
     // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
     #[cfg(target_os = "linux")]
     let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
@@ -4914,6 +4932,32 @@ async fn reap_loop() {
     // does cold work at, so a host that frees memory has its ranges placed again within one tick.
     state::with_state(|s| s.store.shards_backings.rearm_placement());
   }
+}
+
+/// Derived: the reaper's full tick on this shard (A-470): the window the watchdog judges the shard by (A-455,
+/// `crate::watchdog::watch_window_ns` over the overrun the shard measures), read at each tick.
+fn reap_window_ns() -> u64 {
+  crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns())
+}
+
+/// The idle turn this shard has measured (A-387, `slates_rt::held_turn`): how long a turn of its idle spin takes, as a
+/// request meets it; zero before its first. The reaper's early wakes come no closer together ([`reap_wake_ns`]).
+fn idle_turn_ns() -> u64 {
+  slates_rt::registry::with_current(|context| context.counters().held_turn_ns).unwrap_or(0)
+}
+
+/// When the reaper next wakes (A-470), on the shard's clock: its next full tick (`full_due_ns`), or sooner the earliest
+/// timed term it owes (`owed_ns`, [`verbs::next_owed_expiry_ns`]), and never sooner than one of the shard's measured
+/// idle turns (`idle_turn_ns`) after its last wake (`last_wake_ns`), so its early wakes come no closer together than
+/// the shard's own idle spin turns round. Pure, so the rule is tested on every host.
+fn reap_wake_ns(
+  full_due_ns: u64,
+  owed_ns: Option<u64>,
+  (last_wake_ns, idle_turn_ns): (u64, u64),
+) -> u64 {
+  owed_ns
+    .map_or(full_due_ns, |owed| owed.min(full_due_ns))
+    .max(last_wake_ns.saturating_add(idle_turn_ns))
 }
 
 /// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
@@ -6410,9 +6454,10 @@ pub(crate) struct StopWatch {
   wake: std::sync::mpsc::SyncSender<()>,
 }
 
-/// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14
-/// `daemon.alive`): the shard went that long without running its heartbeat task, and past the budget the anchor
-/// kills it. With the gap goes what the shard did in it, from its counters `before` and `after`: its steps and
+/// Logs a beat that came late, [`LATE_BEAT_SHARE`] of the window the watchdog judges the control shard by or more after
+/// the one before ([`beat_is_late`], A-470; §4.14 `daemon.alive`): the shard went that long without running its heartbeat
+/// task, and past its window the watchdog judges it. With the gap goes what the shard did in it, from its counters
+/// `before` and `after`: its steps and
 /// polls, each long poll by what held it (a task's own CPU past the quantum, the thread blocked in the kernel,
 /// the host keeping a runnable thread off the CPU, or unattributed), the timers it fired, the times it waited,
 /// the tasks it spawned and finished and those live, its longest poll and its measured timer overrun. So a near
@@ -6424,19 +6469,21 @@ fn log_late_beat(
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
 ) {
-  if gap < LIVENESS_BUDGET_NS / LATE_BEAT_SHARE {
+  // The window the watchdog judges this shard by now: the liveness window raised to the overrun the shard measured.
+  let window_ns = crate::watchdog::watch_window_ns(after.scheduler_overrun_ns);
+  if !beat_is_late(gap, window_ns) {
     return;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   slates_machine::log_line!(
-    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against a {} ms window; \
+    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against its {} ms window; \
      the anchor's beat is the watchdog's now): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
      longest poll is {} ms and its timer overrun {} ms",
     gap / NS_PER_MS,
-    LIVENESS_BUDGET_NS / NS_PER_MS,
+    window_ns / NS_PER_MS,
     delta(|c| c.steps),
     delta(|c| c.polls),
     delta(|c| c.long_steps),
@@ -6453,10 +6500,21 @@ fn log_late_beat(
   );
 }
 
-/// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A scatter's part
+/// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
+/// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part
 /// waits for room a window of that share at a time (`crate::verbs::PART_ROOM_BUDGET_NS`, A-426).
 pub(crate) const LATE_BEAT_SHARE: u64 = 2;
+
+/// Whether the control shard's beat task, run `gap_ns` after its last turn, ran late ([`log_late_beat`], A-470): a
+/// [`LATE_BEAT_SHARE`] or more of `window_ns`, the window the watchdog judges that shard by now
+/// (`crate::watchdog::watch_window_ns` over its measured scheduler overrun, A-455). A gap is a near miss against the
+/// verdict the watchdog would reach, and the watchdog reaches it at the shard's own window: on a host that holds the
+/// shard off its CPU longer than the liveness window, a gap the window explains is no near miss, and before A-470 every
+/// such turn was logged as one, against a window the watchdog no longer judged the shard by. Pure, so the rule is tested
+/// on every host.
+pub(crate) fn beat_is_late(gap_ns: u64, window_ns: u64) -> bool {
+  gap_ns >= window_ns / LATE_BEAT_SHARE
+}
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;

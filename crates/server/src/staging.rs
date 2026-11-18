@@ -163,6 +163,12 @@ impl Staging {
     (u64::try_from(buffer.bytes.len()).ok()? == buffer.len).then_some(buffer.bytes.as_slice())
   }
 
+  /// When the next buffer expires, nanoseconds on the shard's clock (the earliest in the expiry index), `None` with none
+  /// held: the reaper wakes for it (A-470).
+  pub(crate) fn next_expiry_ns(&self) -> Option<u64> {
+    self.by_expiry.first().map(|(expires, _)| *expires)
+  }
+
   /// Releases every buffer expired at `now`.
   pub(crate) fn expire(&mut self, now: u64, budget: &mut MetadataBudget) {
     let expired: Vec<u64> = self
