@@ -952,9 +952,7 @@ fn not_landed(
       refused(Refusal::GrantMismatch)
     }
     LandingRefusal::Grant(_) => refused(Refusal::GrantInvalid),
-    LandingRefusal::Target(e) => refused(Refusal::TargetUnavailable {
-      reason: format!("{e:?}"),
-    }),
+    LandingRefusal::Target(e) => refused(crate::error::target(crate::error::target_of_host(&e))),
     LandingRefusal::Volume(e) => {
       state.count(LANDING_VOLUME_REFUSED, 1);
       refused(refusal_of_vfs(&e))
@@ -993,9 +991,7 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
       inode: identity.ino,
     }),
     Err(e) => {
-      return refused(Refusal::TargetUnavailable {
-        reason: format!("{e:?}"),
-      });
+      return refused(crate::error::target(crate::error::target_of_host(&e)));
     }
   };
   // The attempt is numbered in the landing-id shape — its partition in the high bits — so attempts of two
@@ -3335,21 +3331,20 @@ fn summary_of(manifest: &Manifest) -> LandingSummary {
 
 #[cfg(unix)]
 fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
-  if matches!(refusal, TargetRefusal::OwnMount) {
-    return Refusal::OwnMount {
-      path: target.to_owned(),
-      used_as: slates_ipc::protocol::OwnMountUse::LandingTarget,
-    };
-  }
-  Refusal::TargetUnavailable {
-    reason: match refusal {
-      TargetRefusal::NotAbsolute => "the target path is not absolute".to_owned(),
-      TargetRefusal::EscapesTarget => "a component escapes the target directory".to_owned(),
-      TargetRefusal::TargetNotOwned => "the target is owned by another user".to_owned(),
-      TargetRefusal::OwnMount => "a component lies on a mount this daemon serves".to_owned(),
-      TargetRefusal::Unavailable(e) => format!("{e:?}"),
-    },
-  }
+  use slates_ipc::protocol::TargetRefusal as Typed;
+  let typed = match refusal {
+    TargetRefusal::OwnMount => {
+      return Refusal::OwnMount {
+        path: target.to_owned(),
+        used_as: slates_ipc::protocol::OwnMountUse::LandingTarget,
+      };
+    }
+    TargetRefusal::NotAbsolute => Typed::NotAbsolute,
+    TargetRefusal::EscapesTarget => Typed::Escapes,
+    TargetRefusal::TargetNotOwned => Typed::OwnedByAnother { owner: None },
+    TargetRefusal::Unavailable(e) => crate::error::target_of_host(e),
+  };
+  crate::error::target(typed)
 }
 
 #[cfg(unix)]

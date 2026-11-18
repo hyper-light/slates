@@ -71,7 +71,7 @@
 > target with its length, the manifest), which every presentation states; the volume's owner judges it under the
 > volume's signers against the manifest presented and again against the one written, records the verdict on the
 > landing's planned and finished audit records and answers it; `Audit` reads it back; an asking agent's landing keeps
-> its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 17). Proven by four
+> its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
 > - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
@@ -80,10 +80,38 @@
 >   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
 >   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
 >   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - **a sibling found here, open (§4.15's audit, not signed work's):** a presented-then-granted landing's presentation
+>   record is durable twice: `present` appends its `LandingPlanned`, and `finish` mirrors every record the engine's
+>   in-memory ring (`state.landing.audit`) holds for the landing's id, the presentation's own among them; a resumed
+>   landing's second finish would mirror the first attempt's records again the same way. Measured on the Mac Studio
+>   (2026-11-18, `a_signed_landing_is_judged_recorded_and_read_back` with its records printed): the landing's audit read
+>   planned (no grant), grant issued, planned (no grant), planned (grant 1), validated, entry written, finished. The
+>   verdicts agree, so signed work reads true; the trail should mirror each engine record once;
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
 >   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).
+
+> **A takeover round gave up two objects within tolerance: a superseded owner's shipper held its sessions every period
+> (2026-11-18, A-349, NoLoss; g250; the chaos nemesis, seed 6876545201569229162, CI diag 44311638654 on both Linux arches).**
+> Read with a status dump and three diagnostic lines (diag-g250-nemesis-2, CI run 44320668620, 5 of 6 rounds): the owner
+> X1, isolated, taken over and admitted again under host epoch 2, still shipped its fenced epoch-1 log every record
+> period (`fleet.live.install_built` 2,227 to 2,245, each refused `StaleEpoch`); the next fault retired its successor X2,
+> whose objects fell to X1; and X1's round never sent the other survivor its page, its record session out on that loan
+> at every period (`lent_to live_ship`, `fleet.takeover.pages_unsent` 213 to 928), until A-304's bound gave both objects
+> up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
+> (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
+>   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
+>   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
+>   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
+>   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
+>   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
+> - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
+>   takeover's fetch), so any borrower that takes it every period starves the round the same way.
+> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
 
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
@@ -487,19 +515,26 @@
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
->   13), signed landings built (A-321, `CONTRACT` = 17);
-> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
->   the integrator's two Windows failures; the sibling sweep, 2026-11-18: five arms that bypassed `refusal_of_vfs`
->   and answered a directory in words now go through it: a read map's (`direct_map.rs`, two arms, one variant
->   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
->   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
->   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. Owed: `refusal_of_db`'s last catch-all sends `Corrupt`, `NfsInstanceRegressed`,
->   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as `BadRequest` words;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
->   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
->   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
->   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
+>   13), signed landings built (A-321, `CONTRACT` = 20);
+> - built: every refusal typed, never words (A-299's sweep, 2026-11-18):
+>   - `CONTRACT` = 15: the volume core's refusals (`Refusal::Volume`), no catch-all left in `refusal_of_vfs`;
+>   - `CONTRACT` = 16: an unmount's unasked volumes answered, and a host refusal rendered in words (the integrator's two
+>     Windows failures);
+>   - five arms that answered a directory in words now go through `refusal_of_vfs`: a read map's (`direct_map.rs`),
+>     a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`); tests in
+>     `crates/client/tests/client.rs`;
+>   - the 11 admission arms that sent a memory error in words, the two that answered a full registry, and a
+>     database's memory refusal now go through `refusal_of_mem`;
+>   - `CONTRACT` = 17: the database's last words (`Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
+>     `SealKeyMalformed`, `Wire`) are `Refusal::Database { DatabaseRefusal }`, `Unusable::Database`;
+>   - `CONTRACT` = 18: a snapshot's retention refused is `VolumeRefusal::RetentionExceeded`, apart from the quota's
+>     `NoSpace`;
+>   - `CONTRACT` = 19: a target's refusal is `Refusal::Target { TargetRefusal }`, where `TargetUnavailable` carried
+>     words (a landing target's, a mount point's, a mount's);
+> - owed: typed fields on the wire for a merge's versions (the work's base beside the head), and for the words the crate
+>   still reads from the daemon's closed tables (a landing's state, a summary's actions, the audit's kinds, a grant's
+>   state); an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read
+>   typed from its entries;
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
@@ -1320,11 +1355,44 @@
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
->   owns is placed on the new neighbourhood.
+>   owns is placed on the new neighbourhood. **Wrong as stated (A-335, g250, 2026-11-18):** the settle report covers
+>   records, not content; the head goes on naming its content's holders, the healer leaves a named holder outside the
+>   candidates and relies on it keeping the copy (A-276's open item), and a holder that dropped its content at the
+>   settle would leave the owner's head naming a holder without it. Owed now, in order: register copies whose content
+>   no head the holder holds names go on that rule (g250's next piece); content goes only on the content's own
+>   certificate, the release below.
+> - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
+>   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
+>   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
+>   alone; at `f = 1`, with the dead owner the head's only other holder, one failure lost the volume. A stale copy now
+>   goes only once its retention rule leaves no content held for it, else it is kept whole
+>   (`fleet.takeover.kept_holding_content`). Tests: `a_holder_outside_the_successors_placement_keeps_the_content_its_
+>   head_names`, `a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes`
+>   (`crates/server/src/daemon.rs`), red before. Bug record:
+>   `docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`.
+> - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
+>   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
+>   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
+>   content is re-placed under its own placement (the head republished naming that set, as the healer's replace does),
+>   and an owner's settle certifies its content as well as its records; a holder outside the placement then lets go.
+>   With it, A-276's open item (a named holder outside the candidates) closes the same way.
 > - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
 >   there is neither learned nor let go.
+> - **Fixed (A-340, g250, 2026-11-18): the bound's drop is typed and counted.** Why it must drop is stated (the
+>   configuration is bounded by its members; keeping every outstanding retirement grows it with every restart while one
+>   share stays open, refusing admissions stalls the region while one round is stuck, refusing a takeover leaves a dead
+>   host unfenced). The rounds it ends give every object they learned and did not adopt up by name: `NotRecovered
+>   { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted `fleet.takeover.given_up.retirement_dropped`;
+>   before, the rounds were forgotten silently and such a volume answered a retryable `OwnerUnreachable` for good. Every
+>   holder counts the copies it keeps on an unresolved line (`fleet.takeover.kept_unresolved`) or a lost one
+>   (`fleet.takeover.kept_lost`). Tests: `a_round_the_retirement_bound_ended_names_what_it_had_learned`,
+>   `a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (`crates/server/src/takeover.rs`).
+> - **Open (A-340): a volume no round had learned when its retirement went** is served by no member and answers
+>   `OwnerUnreachable` once the lookup's bound passes; only its holders' `kept_unresolved` shows it. Owed: a holder
+>   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
+>   `NotRecovered` by name.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
@@ -1687,6 +1755,19 @@
 >   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
 >   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
 >   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+> - **A shard count past the runtime's registry was started and restarted for good (found 2026-11-18 by the
+>   integrator, fixed 2026-11-18, g251).** The test sized its start at three windows' worth of shards with no bound, and
+>   a 4-CPU runner's cheap shard starts asked 1,417 (ubuntu, run 44298844583) and 1,574 (macOS, run 44310013691): past
+>   the 1,024 one process registers (`slates_rt::registry::MAX_SHARDS`). The runtime refused the registration in the
+>   daemon ("too many shards: at most 1024 per process"), after the anchor had started it, so every start failed and the
+>   anchor, which gives no daemon up (A-119, A-311), backed it off for good. Now a `--shards` count past the registry is
+>   refused where it is given, before anything starts: as a bad `--shards` by the roles (`slates_api::role::shard_count`,
+>   which an anchor's own daemon and an embedding host's start read their arguments through) and by the `slates`
+>   command (`a_shard_count_past_the_runtimes_registry_is_refused_before_any_start`, `..._as_usage`, red before: both
+>   parsed 1,025). The test runs the most shards one process runs where three windows ask more, says how many windows
+>   they sum, and skips loudly where they do not pass one. The ring mesh stays quadratic, as A-312 chose (a beat per
+>   ring rather than fewer rings): at the registry's bound 1,047,552 rings, made and charged to no budget the daemon
+>   derives; a count that large is a test's override, never a derived one.
 
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
@@ -1799,12 +1880,41 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
-> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
-> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
+> pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
+> Also from the same report, a test's
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **A shard waiting on memory was judged wedged (found 2026-11-17, decided and fixed 2026-11-18, A-336).** A thread
+> waiting on a page-in, a reclaim or a refault is neither running nor runnable, so A-228's rule called it wedged: a lone
+> daemon at a few hundred megabytes free ended itself (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+> g231), and an anchor that found a daemon's watchdog silent judged the paging process stuck and killed it. Decided by
+> the supervisor by A-228's rule: at a look that suspects a shard the watchdog reads the host's memory stall (Linux PSI
+> memory `some` risen, macOS `kern.memorystatus_vm_pressure_level` above normal, Windows' low-memory notification), and
+> a still shard off the CPU in a wait memory shows as (Linux `D`; any blocked wait where the platform does not tell)
+> while the host stalled is `Starved { of: Memory }`, which beats; it is judged wedged a window after the stall clears.
+> The anchor's start and lapse judgment apply it to the whole process. `some`, not the decision's `full`: FULL never
+> holds on a busy machine's CPU that runs anything else (`kernel/sched/psi.c`), which is the case the rule is for.
+> Regressions: the watchdog's replays and table (`crates/server/src/watchdog.rs`), the watchdog's loop with the host's
+> reading put in its place and a shard held in the kernel by a vfork's wait (`crates/server/tests/liveness.rs`), the
+> anchor's judgment of a held child process (`crates/api/src/role/anchor.rs`), and the readers' tests. Open:
+> - **The waits judged in a shard's own time (A-228's sibling).** An observation and a cross-shard call
+>   (`observe::ShardTime`) still give up on a shard that waits on memory through a window: an observation ends
+>   `Deadline`, a cross-shard verb is refused. Next piece (g251).
+> - **A shard asleep on a lock whose holder pages (Linux).** Its own state is `S`, so it is judged wedged however the
+>   host stalls; the holder is not named, as for a starved holder ("the lock a starved test thread held is not named").
+>   macOS and Windows excuse any blocked wait while the host stalls, so they do not judge it.
+> - **Windows' per-thread wait reason.** The snapshot the watchdog already takes holds each thread's `WaitReason`
+>   (`WrPageIn`, `WrFreePage`, `WrVirtualMemory` and their kin), which would be the thread's own reading there, as `D` is
+>   on Linux. Not read; needs a Windows run.
+> - **A spinning verdict for the kernel's reclaim.** A poll whose CPU is direct reclaim on its behalf runs CPU without a
+>   step and can be judged spinning; not seen.
+> - **Evidence under real pressure.** The rule is proven by the readings put in place and by a thread held in the
+>   kernel; a daemon in a host truly short of memory (a bounded container with swap, a few hundred MB) is the
+>   measurer's run.
 
 > **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
 > Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
@@ -2429,11 +2539,16 @@
 >   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
 >   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
 >   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
->   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
->   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
->   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
->   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
->   this. The anchor's start judgment
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Its two siblings, reported then,
+>   closed 2026-11-18 (g251):** the watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment
+>   (`judge_start_of`) read in the same order, so a shard or a start blocked in a call for most of a window, whose call
+>   returned between the first read and the scheduler's answer, was judged stuck as it parked. Each now reads again after
+>   the answer (`watchdog::after_the_answer`; `anchor::judge_start_by`, when the answer is a block): a step, a park or a
+>   clock risen at the second read is movement. Red with the second read ignored, each at its own assertion
+>   (`a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved`: `Wedged` where `Alive` was due;
+>   `a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved`: likewise). Still open: no `ci.yml` lane
+>   runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw the first.
+>   The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
@@ -2566,10 +2681,23 @@
 > - Owed for each: a refusal (typed) of a path on a mount this daemon serves, decided before any open, with a test that
 >   asks for one.
 
-> **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open).** Diagnostics run
+> **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open; arm64 alone since
+> 2026-11-18).** Diagnostics run
 > 42130583401 (BENCHMARKS, "Step 7's measured state") measured main's one-worker receiver against `71cf09ac`'s DLL
 > dispatcher, five runs a runner, quiet and loaded. It was beyond the DLL's spread in 13 cells on arm64 (quiet stat p50
 > 147.3 against at most 117.1 µs; loaded write p50 212.0 against 102.6) and in 15 on x86_64.
+> - **2026-11-18, after cut (c) (goal g258; BENCHMARKS, "Step 7, continued"):** ten runs a runner against the DLL arm
+>   (diag-g258-6, run 44292211799). x86_64: 5 cells of 36 beyond its spread, four by under 5 µs (quiet close, open and
+>   read p50, loaded close p50) and the loaded rename p99; loaded, main is faster than the DLL arm at every other p50.
+>   arm64: 10 cells of 36, within each run a quiet stat +42.4 µs, rename +81.5, unlink +40.2, and loaded write +86.9,
+>   rename +74.8, unlink +31.2. Cut (c)'s no-wake variant and cut (b), the per-kind spin choice, were measured and
+>   rejected; the request channel's bound was fixed (A-348). Main lost no more than about 9 µs of this since cut (c)
+>   (diag-g258-5).
+> - **Open, the levers left** (each in BENCHMARKS' record): a spin choice that reads contention (the per-kind median form
+>   took 42.3 µs off arm64's loaded write p50 and lost a wake on x86_64); a fresh per-phase profile of arm64's quiet stat,
+>   rename and unlink (the last attributed 18 µs of a stat to crash safety); and, **a decision for Ada**, the shard threads
+>   above normal priority on Windows (one instrumented arm64 run: a loaded SetSize hop 67.6 to 15.7 µs), which changes how
+>   the whole daemon competes with the user's programs. Or Ada accepts what remains on arm64.
 > - A-219's second worker found no win in any form timed. Its probe, run off the mount's path, put the daemon's own I/O
 >   on a volume the daemon serves, and a kill then strands it. WinFsp's processing queue is never cancelled
 >   (`FSP_IOQ_PROCESS_NO_CANCEL`), so every killed probing role outlived the 10 s reap. So A-219's runtime (`e070f31e`,
@@ -2580,12 +2708,9 @@
 >   purged range through it. A kill while one of those requests is delivered strands the daemon as the probe did, for one
 >   purge's request rather than a whole probe; no run has been seen to hit it. The fix is to run the purge's client in a
 >   child process. Bug record: `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`.
-> - **Owed:** the five-arm A/B with every worker count fixed at build time and no probe: the DLL, the separate form at
->   one and two workers, and A-215's combined form at one and two (diagnostics run on `diag-winfsp-overlap-24`, with the
->   combined form's live oracles at both counts).
->   - If combined + 2 is within the DLL's spread at the p50 and p99 on both runners, quiet and loaded, it replaces the
->     separate form.
->   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
+> - ~~**Owed:** the five-arm A/B with every worker count fixed at build time and no probe~~ **done 2026-11-07**
+>   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
+>   and A-215's combined form is measured and rejected; main's separate form ships.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
@@ -10977,7 +11102,9 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     the cohort) refuses a placement from the owner (`content_authority`), so it can be neither re-offered to nor
     verified: the heal leaves it named and counts `fleet.heal.named_outside_candidates`. If it loses its copy, the head
     names a holder without the content. Recommended: replace it as a departed holder is (one republish per volume per
-    such change), so every holder a head names is one the owner can restore.
+    such change), so every holder a head names is one the owner can restore. (Since A-335, 2026-11-18, a takeover's
+    stale-copy reclaim no longer drops such a holder's content either: it keeps the copy whole while it holds content;
+    the release that ends it is owed with this replace, g250.)
   - A departure is healed at the healer's cadence, one placed snapshot per hundred periods at rest, so a node owning
     many volumes leaves the last of them naming the departed holder for a long walk; a second failure inside that walk
     loses them at `f = 1`. Recommended: on a retirement, heal first the volumes whose placement names the retired host.

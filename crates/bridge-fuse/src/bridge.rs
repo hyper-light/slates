@@ -676,7 +676,7 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::NotDirectory => ENOTDIR,
     VfsError::IsDirectory => EISDIR,
     VfsError::NotEmpty => ENOTEMPTY,
-    VfsError::NoSpace => ENOSPC,
+    VfsError::NoSpace | VfsError::RetentionExceeded => ENOSPC,
     VfsError::FileTooLarge => EFBIG,
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
