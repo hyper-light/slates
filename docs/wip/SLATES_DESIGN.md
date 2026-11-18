@@ -5228,6 +5228,13 @@ to ask once that voter left (2026-11-08). Any member can answer, since what it s
 adoption only moves forward.
 A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
 voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
+A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
+forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
+council admitted it, or a member retired while it was away. Judged by the member rule it kept no peer at all: it is no
+one's neighbour, holds nothing, and may know as a voter only the member it replaced, since a learner's join state names
+the voters of its own join. So it held no record session and its learner, which fetches over those, never learned the
+configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of main's first
+gated runs, 2026-11-18).
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -23694,3 +23701,30 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   Subversion workload's own paths are already in the drive form, `pwd -W`).
 - **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
   runs Git for Windows. Its next run is the check.
+
+### A-331 — A node the council configuration it holds does not name keeps direct contact with every member it holds alive, until it holds one that names it (2026-11-18, goal g225: a forming fleet reaches every candidate at start)
+Applied in the same change to: §4.8 "Consensus lifetime" (the learner paragraph), GAPS (the entry for this stall),
+`crates/server/src/fleet.rs` (`DirectContact::Unadmitted`, `joining_contact`), `crates/server/src/consensus.rs` (the
+test), and the bug record `docs/bugs/2026-11-18-a-fresh-member-joined-before-its-admission-kept-contact-with-no-one.md`.
+- **Why.** The direct-contact rule (§4.8, amended 2026-10-10) keeps a record session and a probe of its own only with
+  a node's neighbours, the members it holds for, the voters, and a member being staged; everyone is contacted only
+  while the consensus groups form. It assumes the node is a member of the configuration it judges by. A fresh member
+  whose first fetch was answered before the council admitted it holds a configuration that does not name it: it is
+  no one's neighbour, holds nothing, and the voters it knows are its join donor's, which on a learner donor are the
+  voters of that learner's own join, so the bootstrapper alone when the bootstrapper is the member it replaced. The
+  rule then kept no peer: every record link idled, the learner (which fetches over record sessions) found none, and
+  the node never learned the configuration that admits it. live_chaos's fresh-member flow hit it in 2 of 48 runs at
+  one CPU on 2026-11-09 and in both of main's first gated runs on 2026-11-18; diag-raft-chaos-ab-68b-2 showed the
+  node at council version 8, in contact with none of the four members it held alive, `fleet.learner.no_session` 113 in
+  48 s.
+- **The rule.** Before the member rule, `joining_contact` judges this node alone: `Forming` while either group is
+  uninitialized (as before), `Unadmitted` while the council configuration it holds does not name it. Either keeps
+  contact with every member it holds alive; a member it holds dead is still dropped, as before. Once it holds a
+  configuration that names it, the member rule applies.
+- **Cost.** An unadmitted node keeps O(N) sessions and probes for the periods until it learns its admission, as a
+  forming node does; the others contact it already (`NotInCouncilConfiguration`), so the pair is kept from both sides,
+  which the 2026-10-10 amendment found keying needs. A node the council never admits keeps them for as long as it
+  runs, bounded by the members it holds alive.
+- **What it does not change.** Who the council admits, who votes, and what a learner adopts. A learner's known voters
+  can still go back through another learner's answer (the bug record's sibling); an admitted member has its
+  neighbourhood to fetch through, so that no longer strands anyone.
