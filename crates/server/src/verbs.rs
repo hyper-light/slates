@@ -6441,6 +6441,249 @@ fn release_credits(
   }
 }
 
+/// A candidate's claim on the shard that would restore a live volume this node holds the log of (§4.2: "a remote holder
+/// makes the same admission against its own machine before acknowledging placement"; g229, 2026-11-18): the credits a
+/// successor's restore takes ([`make_restored`]), reserved when the candidate takes the log's first entry
+/// (`live_ship::admit_claim`), taken over by the restore ([`take_claim_or_admit`]), and released once the copy goes
+/// (`live_ship::reconcile_claims`). Before, a candidate reserved nothing and a successor made the admission only at its
+/// restore, so one whose shard had filled since gave the volume up while a survivor held every acknowledged write (CI's
+/// 7 GB macOS runner, diag-supervisor-live-2: refused `BudgetExceeded` for 100 periods, then `NotRecovered`).
+pub(crate) struct CandidateClaim {
+  /// The credits the restore takes over.
+  credits: Credits,
+  /// When the claim was reserved ([`slates_rt::futures::now_ns`]): a reconciliation that read the control shard's copies
+  /// before it never releases it ([`reconcile_candidate_claims`]).
+  reserved_ns: u64,
+}
+
+/// Where a reconciliation found a copy's claim on this shard ([`reconcile_candidate_claims`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimFound {
+  /// A candidate claim holding these bytes.
+  Claimed(u64),
+  /// No claim: this shard serves the volume itself, whose own credits hold its room (a successor's restore took the
+  /// claim over).
+  Served,
+  /// No claim and no volume: the control shard admits it again (a warm restart's copies).
+  Missing,
+}
+
+/// Counter: a candidate claim reserved for a live log this node holds (§4.2, [`CandidateClaim`]).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_ADMITTED: &str = "fleet.live.claim_admitted";
+/// Counter: a candidate claim refused for room: the holder answered `NoRoom` and took nothing.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_REFUSED: &str = "fleet.live.claim_refused";
+/// Counter: a taken-over volume made from this node's candidate claim, which no admission since could take.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_TAKEN_OVER: &str = "fleet.live.claim_taken_over";
+/// Counter: a candidate claim released because its copy went (or its admission's copy was never taken).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RELEASED: &str = "fleet.live.claim_released";
+/// Counter: a taken-over volume's making that failed after it took its credits, which went back to its claim.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RETURNED: &str = "fleet.live.claim_returned";
+
+/// The credits a taken-over volume of `size` holds from its making ([`make_restored`]), as a create admits them: a
+/// bounded claim's bytes and inode allowance, the volume's records against the metadata ledger, and a strict volume's
+/// locked entitlement; whole or none, a refusal giving back what was taken. A dynamic volume reserves no bytes and no
+/// slots: it holds the slots of the inodes it is restored with, and grows from what is unpromised (A-342).
+fn restore_credits(
+  state: &mut ShardState,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Refusal> {
+  let reservation = match size {
+    SizeClass::Bounded { limit } => {
+      Some(state.store.reserve(limit).map_err(|e| budget_refusal(&e))?)
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let version = match size {
+    SizeClass::Bounded { .. } => {
+      let allowance = inode_allowance(state, size);
+      match state.store.versions.reserve(allowance) {
+        Ok(credit) => Some(credit),
+        Err(e) => {
+          release_credits(state, reservation, None, None);
+          return Err(budget_refusal(&e));
+        }
+      }
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let metadata = match reserve_metadata(state, journal_floor_bytes(state)) {
+    Ok(credit) => credit,
+    Err(refusal) => {
+      release_credits(state, reservation, version, None);
+      return Err(refusal);
+    }
+  };
+  let lock = match require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
+  {
+    Ok(lock) => lock,
+    Err(refusal) => {
+      release_credits(state, reservation, version, Some(metadata));
+      return Err(refusal);
+    }
+  };
+  Ok(Credits {
+    reservation,
+    version,
+    metadata: Some(metadata),
+    lock,
+  })
+}
+
+/// A ledger's refusal as a verb answers it: `BudgetExceeded` with what could be admitted, else the memory error's own.
+fn budget_refusal(error: &slates_mem::MemError) -> Refusal {
+  match error {
+    slates_mem::MemError::BudgetExceeded { available, .. } => Refusal::BudgetExceeded {
+      available: *available,
+    },
+    other => refusal_of_mem(other),
+  }
+}
+
+/// The bytes credits hold for a volume's content: a bounded claim's reservation, none for a dynamic volume.
+fn credit_bytes(credits: &Credits) -> u64 {
+  credits
+    .reservation
+    .map_or(0, |reservation| reservation.bytes)
+}
+
+/// Returns credits to the shard's ledgers, its locked entitlement with them.
+fn release_all(state: &mut ShardState, credits: Credits) {
+  let Credits {
+    reservation,
+    version,
+    metadata,
+    lock,
+  } = credits;
+  release_credits(state, reservation, version, metadata);
+  drop(lock);
+}
+
+/// Reserves this node's candidate claim on live volume `id` of `size` on this shard, the one its id routes to
+/// ([`CandidateClaim`]): the bytes it holds for the volume's content, its bound for a bounded claim and none for a
+/// dynamic volume. Idempotent: a claim reserved already answers its bytes. Refused typed, nothing kept, when the shard
+/// cannot make the admission a successor's restore would make.
+pub(crate) fn admit_candidate_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<u64, Refusal> {
+  if let Some(claim) = state.candidate_claims.get(&id) {
+    return Ok(credit_bytes(&claim.credits));
+  }
+  match restore_credits(state, size, require_locked) {
+    Ok(credits) => {
+      let bytes = credit_bytes(&credits);
+      let reserved_ns = slates_rt::futures::now_ns();
+      state.candidate_claims.insert(
+        id,
+        CandidateClaim {
+          credits,
+          reserved_ns,
+        },
+      );
+      state.count(CLAIM_ADMITTED, 1);
+      Ok(bytes)
+    }
+    Err(refusal) => {
+      state.count(CLAIM_REFUSED, 1);
+      Err(refusal)
+    }
+  }
+}
+
+/// Releases this shard's candidate claims that `kept` does not name and that were reserved before `read_ns`, when the
+/// control shard read the live copies this node holds (`live_ship::reconcile_claims`): their copies went (a destroy's
+/// tombstone let them go), or their admission's copy was never taken. Answers where each of `kept` stands here, so the
+/// control shard admits a missing one again.
+pub(crate) fn reconcile_candidate_claims(
+  state: &mut ShardState,
+  kept: &std::collections::BTreeSet<DbVolumeId>,
+  read_ns: u64,
+) -> Vec<(DbVolumeId, ClaimFound)> {
+  let released: Vec<DbVolumeId> = state
+    .candidate_claims
+    .iter()
+    .filter(|(id, claim)| !kept.contains(id) && claim.reserved_ns < read_ns)
+    .map(|(id, _)| *id)
+    .collect();
+  for id in released {
+    if let Some(claim) = state.candidate_claims.remove(&id) {
+      release_all(state, claim.credits);
+      state.count(CLAIM_RELEASED, 1);
+    }
+  }
+  kept
+    .iter()
+    .map(|id| {
+      let found = match state.candidate_claims.get(id) {
+        Some(claim) => ClaimFound::Claimed(credit_bytes(&claim.credits)),
+        None if state.by_id.contains_key(id) && !lost_to_a_successor(state, *id) => {
+          ClaimFound::Served
+        }
+        None => ClaimFound::Missing,
+      };
+      (*id, found)
+    })
+    .collect()
+}
+
+/// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
+  state
+    .candidate_claims
+    .get(&id)
+    .map_or(0, |claim| credit_bytes(&claim.credits))
+}
+
+/// The credits a taken-over volume's making takes ([`make_restored`]): this node's candidate claim on it, taken over
+/// whole and counted, else the admission a create makes, refused typed. A successor that held the volume's log
+/// reserved its claim when it took the log's first entry, so nothing admitted since took its room.
+fn take_claim_or_admit(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Box<ReplyBody>> {
+  if let Some(claim) = state.candidate_claims.remove(&id) {
+    state.count(CLAIM_TAKEN_OVER, 1);
+    return Ok(claim.credits);
+  }
+  restore_credits(state, size, require_locked).map_err(|refusal| Box::new(refused(refusal)))
+}
+
+/// Puts the credits a failed making of `id` took back as its candidate claim, answering `refusal`
+/// ([`take_claim_or_admit`]): the next attempt finds the room this one had, whichever way the credits came. Released, as
+/// any claim is, once this node holds no copy of the volume's log ([`reconcile_candidate_claims`]).
+fn return_to_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  credits: Credits,
+  refusal: Refusal,
+) -> ReplyBody {
+  let reserved_ns = slates_rt::futures::now_ns();
+  if let Some(earlier) = state.candidate_claims.insert(
+    id,
+    CandidateClaim {
+      credits,
+      reserved_ns,
+    },
+  ) {
+    release_all(state, earlier.credits);
+  }
+  state.count(CLAIM_RETURNED, 1);
+  refused(refusal)
+}
+
 /// Reserves a volume's records against the shard's metadata ledger (§4.2 metadata dimension) before
 /// the volume exists: its journal's whole retention budget, its object and its snapshot slab's first
 /// segment, whole or not at all, so the sum of every volume's metadata stays inside the class.
@@ -12825,7 +13068,7 @@ pub(crate) fn materialize_taken_over(
   if made_already(state, id, taken.catalog)? {
     return Ok(());
   }
-  let restored = restore_taken_over(state, taken.catalog, archive)?;
+  let restored = restore_taken_over(state, id, taken.catalog, archive)?;
   make_restored(state, id, taken, region, restored.as_ref())
 }
 
@@ -12879,7 +13122,7 @@ pub(crate) fn made_already(
 }
 
 /// The size class a taken-over volume's catalog names.
-fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
+pub(crate) fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
   match catalog.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
@@ -12894,6 +13137,7 @@ fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
 /// catalog registers.
 pub(crate) fn restore_taken_over(
   state: &mut ShardState,
+  id: DbVolumeId,
   catalog: &crate::catalog::CatalogValue,
   archive: Option<&slates_archive::Archive>,
 ) -> Result<Option<slates_archive::Restored>, Box<ReplyBody>> {
@@ -12909,10 +13153,13 @@ pub(crate) fn restore_taken_over(
   if let Ok(needed) = slates_archive::restore_needed(archive) {
     state.store.make_room(needed.min(volume_cap));
   }
-  let restore_budget = volume_cap.min(state.store.budget.admittable());
+  // The room this node's candidate claim holds for the volume is the restore's own (§4.2, g229): what the shard could
+  // admit beside it no longer counts it.
+  let claimed = claimed_bytes(state, id);
+  let restore_budget = volume_cap.min(state.store.budget.admittable().saturating_add(claimed));
   // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
   // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
-  let room = volume_cap.min(state.store.admittable());
+  let room = volume_cap.min(state.store.admittable().saturating_add(claimed));
   slates_archive::restore(archive, restore_budget)
     .map(Some)
     .map_err(|e| {
@@ -12939,88 +13186,22 @@ fn make_restored(
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   let size = taken_over_size(catalog);
-  let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
-      Ok(r) => Some(r),
-      Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
-      }
-      Err(e) => {
-        return Err(Box::new(refused(refusal_of_mem(&e))));
-      }
-    },
-    SizeClass::Dynamic { .. } => None,
-  };
-  // A bounded claim reserves its whole inode allowance; a dynamic volume holds slots for the inodes it is restored with
-  // (taken below, once they are in) and grows its hold as it makes more (A-342).
-  let reserved = match size {
-    SizeClass::Bounded { .. } => Some(state.store.versions.reserve(inode_allowance(state, size))),
-    SizeClass::Dynamic { .. } => None,
-  };
-  let version_credit = match reserved {
-    None => None,
-    Some(Ok(c)) => Some(c),
-    Some(Err(slates_mem::MemError::BudgetExceeded { available, .. })) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::BudgetExceeded { available },
-      )));
-    }
-    Some(Err(e)) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        refusal_of_mem(&e),
-      )));
-    }
-  };
+  // The candidate claim this node reserved as it took the volume's log (§4.2, g229), else the admission a create makes:
+  // a bounded claim's bytes and inode allowance, its records, and a volume that must live in locked RAM keeps that
+  // guarantee on its successor (AUD-29-17): a successor that cannot promise it refuses the takeover typed rather than
+  // serve the volume swappable. A dynamic volume holds slots for the inodes it is restored with (taken below, once
+  // they are in) and grows its hold as it makes more (A-342). A failure after this point returns the credits to the
+  // claim ([`return_to_claim`]), so the next attempt finds the room this one had.
+  let credits = take_claim_or_admit(state, id, size, catalog.require_locked)?;
   let names = wire_names(catalog.names);
   let config = volume_config(state, names, quota_for(size));
-  // The taken-over volume's records are reserved against the metadata ledger before it exists (§4.2).
-  let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
-    Ok(credit) => Some(credit),
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        None,
-        refusal,
-      )));
-    }
-  };
-  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): its entitlement
-  // is reserved against this process's lock capacity as a strict create reserves it, and a successor that cannot
-  // promise it refuses the takeover typed rather than serve the volume swappable.
-  let lock_credit = match catalog
-    .require_locked
-    .then(|| reserve_locked(state, size))
-    .transpose()
-  {
-    Ok(credit) => credit,
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        metadata_credit,
-        refusal,
-      )));
-    }
-  };
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
-      return Err(Box::new(give_back(
+      return Err(Box::new(return_to_claim(
         state,
-        reservation,
-        version_credit,
-        metadata_credit,
+        id,
+        credits,
         refusal_of_vfs(&e),
       )));
     }
@@ -13029,11 +13210,10 @@ fn make_restored(
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
@@ -13042,11 +13222,10 @@ fn make_restored(
   {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
@@ -13056,14 +13235,19 @@ fn make_restored(
   {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
+  let Credits {
+    reservation,
+    version: version_credit,
+    metadata: metadata_credit,
+    lock: lock_credit,
+  } = credits;
   let now = state.clock.monotonic_ns();
   let record = VolumeRecord {
     id,
