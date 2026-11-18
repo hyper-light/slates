@@ -27,6 +27,9 @@ slates-db = { workspace = true }
 slates-ipc = { workspace = true }
 slates-server = { workspace = true }
 slates-client = { workspace = true }
+# The library an embedding host drives slates through (A-278): the CLI's mount, issuer and grant term are its, so the
+# command and a host such as kiln mount and grant through one implementation.
+slates-api = { workspace = true }
 # The MCP HTTP edge's bearer token comes from the platform's secure random (AUD-29-24).
 slates-transport = { workspace = true }
 slates-mcp = { workspace = true }
