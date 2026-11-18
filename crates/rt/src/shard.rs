@@ -821,8 +821,10 @@ impl ShardContext {
       future,
       parent,
       receipt,
+      diag_site,
     } = request;
     let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+    crate::diag_site::set_next(diag_site);
     let admitted = self.admit(future, parent, false);
     receipt.answer(match &admitted {
       Ok(task) => Admission::Admitted(*task),
@@ -1878,7 +1880,9 @@ impl ShardContext {
           future,
           parent,
           receipt,
+          diag_site,
         } = *request;
+        crate::diag_site::set_next(diag_site);
         if inner.shutting_down {
           // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
           // — so the request is refused unadmitted: its receipt answered, its future dropped here.
@@ -1966,9 +1970,18 @@ impl ShardContext {
     self.current_task.set(Some(slot));
     let start = self.now_ns();
     if let Some(entry) = self.entry {
+      let site = self
+        .with_inner(|inner| {
+          handle_at(&inner.arena, slot)
+            .and_then(|handle| inner.arena.get(handle).ok())
+            .map(|task| task.diag_site)
+        })
+        .flatten()
+        .unwrap_or(0);
       entry
         .pulse
         .diag_polling(u64::from(slot).saturating_add(1), start);
+      entry.pulse.diag_site(site);
     }
     let poll = future.as_mut().poll(&mut cx);
     let ended = self.now_ns();

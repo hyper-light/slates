@@ -2043,6 +2043,7 @@ mod diag_spin {
     let mut stuck_tid = None;
     for (index, holder) in holders.iter().enumerate() {
       let words = slates_rt::registry::diag_pulse_words(*holder);
+      let site = slates_rt::registry::diag_site_name(*holder);
       let tid = slates_rt::registry::diag_shard_tid(*holder);
       let cpu = slates_rt::registry::shard_cpu(*holder);
       let (stat, wchan, status) = tid.map_or_else(Default::default, |tid| {
@@ -2057,7 +2058,7 @@ mod diag_spin {
         .filter(|line| line.contains("ctxt_switches"))
         .collect();
       write_stderr(&format!(
-        "DIAG shard {} (index {index}{}): pulse [steps, waits, spawns, completed, longest_ns, polling slot+1, poll_began_ns, phase, full_turns, overrun_ns] = {words:?}; cpu {cpu:?}; watchdog now {now_ns}; tid {tid:?}; stat {stat:?}; wchan {wchan:?}; {switches:?}\n",
+        "DIAG shard {} (index {index}{}): pulse [steps, waits, spawns, completed, longest_ns, polling slot+1, poll_began_ns, phase, full_turns, overrun_ns] = {words:?}; task site {site:?}; cpu {cpu:?}; watchdog now {now_ns}; tid {tid:?}; stat {stat:?}; wchan {wchan:?}; {switches:?}\n",
         holder.shard(),
         if index == stuck { ", STUCK" } else { "" },
       ));
@@ -2070,7 +2071,8 @@ mod diag_spin {
       for (index, holder) in holders.iter().enumerate() {
         let words = slates_rt::registry::diag_pulse_words(*holder);
         write_stderr(&format!(
-          "DIAG after samples, shard index {index}: pulse {words:?}; cpu {:?}\n",
+          "DIAG after samples, shard index {index}: pulse {words:?}; task site {:?}; cpu {:?}\n",
+          slates_rt::registry::diag_site_name(*holder),
           slates_rt::registry::shard_cpu(*holder)
         ));
       }

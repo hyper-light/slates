@@ -157,6 +157,8 @@ pub struct Pulse {
   diag_phase: AtomicU64,
   /// DIAG: turns a send spent waiting on a full ring, cumulative.
   diag_full_turns: AtomicU64,
+  /// DIAG: the polled task's site number (`crate::diag_site`).
+  diag_site: AtomicU64,
 }
 
 impl Pulse {
@@ -169,6 +171,16 @@ impl Pulse {
   /// DIAG: the loop's phase now.
   pub fn diag_phase(&self, phase: u64) {
     self.diag_phase.store(phase, Ordering::Relaxed);
+  }
+
+  /// DIAG: the polled task's site number.
+  pub fn diag_site(&self, site: u64) {
+    self.diag_site.store(site, Ordering::Relaxed);
+  }
+
+  /// DIAG: the polled task's site, named.
+  pub fn diag_site_name(&self) -> &'static str {
+    crate::diag_site::name(self.diag_site.load(Ordering::Relaxed))
   }
 
   /// DIAG: one more turn waiting on a full ring.
@@ -812,6 +824,14 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
 pub fn diag_pulse_words(holder: SlotHolder) -> Option<[u64; 10]> {
   with_entry(holder.shard, |entry| {
     (entry.holder() == holder).then(|| entry.pulse.diag_words())
+  })
+  .flatten()
+}
+
+/// DIAG (diag-g251-spin, never main): the site of the task the shard `holder` names polls now, or polled last.
+pub fn diag_site_name(holder: SlotHolder) -> Option<&'static str> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.pulse.diag_site_name())
   })
   .flatten()
 }
