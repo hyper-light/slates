@@ -56,7 +56,10 @@ pub(crate) fn install_placement(
 }
 
 /// Marks every volume this shard catalogues as yielded, after pruning the set to the catalog (so it stays within the
-/// partition's volume cap), and counts the volumes it adds.
+/// partition's volume cap), counts the volumes it adds, and ends each newly yielded volume's FUSE mounts here at once
+/// (`crate::fuse::superseded`, A-346), as a learned fence does: an idle mount sends no request that would find the yield,
+/// so without the word it would keep its kernel's cached view of the stale copy. An NFS mount answers `NFS3ERR_STALE` at
+/// its next request (`crate::nfs`'s gate reads `verbs::lost_to_a_successor`).
 fn yield_catalogued(state: &mut ShardState) {
   let catalogued: BTreeSet<VolumeId> = state
     .db
@@ -66,8 +69,14 @@ fn yield_catalogued(state: &mut ShardState) {
     .map(|record| record.id)
     .collect();
   state.yielded.retain(|volume| catalogued.contains(volume));
-  let before = state.yielded.len();
-  state.yielded.extend(catalogued);
-  let added = state.yielded.len().saturating_sub(before);
-  state.count(YIELDED, u64::try_from(added).unwrap_or(u64::MAX));
+  let newly: Vec<VolumeId> = catalogued
+    .into_iter()
+    .filter(|volume| !state.yielded.contains(volume))
+    .collect();
+  state.yielded.extend(newly.iter().copied());
+  state.count(YIELDED, u64::try_from(newly.len()).unwrap_or(u64::MAX));
+  #[cfg(target_os = "linux")]
+  for volume in newly {
+    crate::fuse::superseded(state, volume);
+  }
 }

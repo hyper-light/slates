@@ -31,8 +31,8 @@ use slates_anchor::{AnchorSegment, Geometry};
 use slates_db::HostId;
 use slates_db::register::{DomainId, ObjectId, Quorum, RegionId, candidates_for, rendezvous_first};
 use slates_ipc::protocol::{
-  AttachRequest, Direction, Intent, NamePolicy, ReadAt, Refusal, ReplyBody, RequestBody, Scope,
-  SizeClass, SnapshotId, VolumeId, pack, unpack,
+  AttachRequest, Direction, Intent, LiveReport, NamePolicy, ReadAt, Refusal, ReplyBody,
+  RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
@@ -55,7 +55,7 @@ use std::net::TcpStream;
 use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
   NFS3ERR_JUKEBOX, create, lookup, lookup_carries_attributes, lookup_status, mount,
-  owner_and_mode_status, read_bytes_status, read_status, write,
+  owner_and_mode_status, read_bytes_status, read_status, write, write_status,
 };
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
@@ -11091,7 +11091,9 @@ const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 /// A-330), until `successor` has taken the volume over from its live log (counted `fleet.live.taken_over`); then gives
 /// it its probe plane back. Whether the takeover was counted.
 fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor: &Daemon) -> bool {
-  let before = refusal_count(successor, LIVE_TAKEN_OVER).unwrap_or(0);
+  // Summed over the successor's shards: the takeover is counted on the volume's owner shard, which is not the control
+  // shard on a daemon of more than one.
+  let before = taken_over_count(successor);
   let cut = daemons[0]
     .inject_probe_deafness(&[hosts[1], hosts[2]])
     .and_then(|()| daemons[1].inject_probe_deafness(&[hosts[0]]))
@@ -11099,7 +11101,7 @@ fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let taken = cut.is_ok()
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
-      refusal_count(successor, LIVE_TAKEN_OVER).map(|count| count > before)
+      Ok(taken_over_count(successor) > before)
     });
   let healed = daemons
     .iter()
@@ -14038,6 +14040,455 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
   assert!(
     read.iter().all(|read| *read),
     "every file reads back through the restarted successor: {read:?}"
+  );
+}
+
+/// A write of continuity file `file` through `instance` to `volume`, its attachment let go after: the write's reply.
+fn continuity_write(instance: &str, volume: VolumeId, file: usize) -> ReplyBody {
+  let mut client = Client::connect(instance);
+  let attachment = write_attachment(&mut client, volume);
+  let written = client.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: format!("/continuity-{file}"),
+    bytes: continuity_body(file),
+    mode: 0o644,
+  });
+  client.call(&RequestBody::DetachOf { volume, attachment });
+  written
+}
+
+/// Whether each of the continuity files `0..files` reads back through `instance` as written.
+fn continuity_read(instance: &str, volume: VolumeId, files: usize) -> Vec<bool> {
+  let mut reader = Client::connect(instance);
+  (0..files)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, volume, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+    })
+    .collect()
+}
+
+/// The `fleet.live.taken_over` count summed over `daemon`'s shards.
+fn taken_over_count(daemon: &Daemon) -> u64 {
+  summed_counters(daemon)
+    .get(LIVE_TAKEN_OVER)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// Waits until `daemons[index]` counts a live takeover past `before`: whether it did within the serve deadline.
+fn taken_over_past(daemons: &[Daemon], index: usize, before: u64) -> bool {
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  poll_until(&observed, SERVE_DEADLINE, || {
+    Ok(taken_over_count(&daemons[index]) > before)
+  })
+}
+
+/// A-344 (§4.10; §4.8 "Recovery"; NoLoss, T-8.x): a write answered after a live owner's warm restart survives the
+/// owner's later loss. Do: three nodes at `f = 1` over anchors that outlive their daemons, two shards each; on a, a live
+/// volume written six files; restart a warm at once; write a seventh file through it; stop a for good; once the survivor
+/// the volume ranks first counts its takeover, read all seven through it. Expect the seventh write answered and every
+/// file read back. Before, a's restarted shipper began a new chain at position 0 under its unchanged epoch: a holder
+/// that held nothing took it and made the write durable, the holder at the old chain's head kept that chain and refused
+/// the new, and a takeover adopted the old chain's greater head without the seventh file.
+#[test]
+fn a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, (id, written)) = anchored_fleet_with_a_live_volume(
+    &["owner-restart-a", "owner-restart-b", "owner-restart-c"],
+    "owner-restart",
+  );
+  daemons.remove(0).stop();
+  daemons.insert(0, fleet.start(0));
+  let owner = daemons[0].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &owner, id);
+  let after = continuity_write(&owner, id, CONTINUITY_FILES);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = taken_over_count(&daemons[index + 1]);
+  daemons.remove(0).stop();
+  let taken = taken_over_past(&daemons, index, before);
+  let instance = daemons[index].instance().to_owned();
+  let read = continuity_read(&instance, id, CONTINUITY_FILES + 1);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a write after the owner's warm restart: served {served}, written {after:?}, taken {taken}, read {read:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write before the restart was answered: {written:?}"
+  );
+  assert!(served, "the owner serves the volume after its warm restart");
+  assert!(
+    matches!(after, ReplyBody::FsDone { .. }),
+    "the write after the restart was answered: {after:?}"
+  );
+  assert!(taken, "a survivor took the volume over from its live log");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file, the one written after the restart too, reads back through the successor: {read:?}"
+  );
+}
+
+/// The anchored fleet of [`anchored_fleet_with_a_live_volume`] with its live volume taken over by the survivor it ranks
+/// first and that successor restarted warm at once: the fleet, its daemons (a stopped and gone), the successor's index
+/// among them, the volume, its writes' replies, whether the takeover was counted and the volume served after the
+/// restart, and the successor's own copy of the log, as its status reports it, before the restart and after it. The
+/// fleet's anchors outlive the daemons: stop the daemons before the scene is dropped.
+struct RestartedSuccessor {
+  _fleet: AnchoredFleet,
+  daemons: Vec<Daemon>,
+  index: usize,
+  volume: VolumeId,
+  written: Vec<ReplyBody>,
+  taken: bool,
+  served: bool,
+  copy_before: Option<LiveReport>,
+  copy_after: Option<LiveReport>,
+}
+
+/// `instance`'s own copy of `volume`'s log as a candidate, as its status reports it (`holding`).
+fn held_copy(instance: &str, volume: VolumeId) -> Option<LiveReport> {
+  let mut client = Client::connect(instance);
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && live.holding)
+    .cloned()
+}
+
+/// Builds the [`RestartedSuccessor`] scene under fixture names from `prefix`.
+fn restarted_successor(prefix: &str) -> RestartedSuccessor {
+  let names: Vec<String> = ["a", "b", "c"]
+    .iter()
+    .map(|node| format!("{prefix}-{node}"))
+    .collect();
+  let names: Vec<&str> = names.iter().map(String::as_str).collect();
+  let (mut fleet, mut daemons, hosts, (volume, written)) =
+    anchored_fleet_with_a_live_volume(&names, prefix);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(volume.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = taken_over_count(&daemons[index + 1]);
+  daemons.remove(0).stop();
+  let taken = taken_over_past(&daemons, index, before);
+  let instance = daemons[index].instance().to_owned();
+  let copy_before = held_copy(&instance, volume);
+  daemons.remove(index).stop();
+  daemons.insert(index, fleet.start(index + 1));
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, volume);
+  let copy_after = held_copy(&instance, volume);
+  RestartedSuccessor {
+    _fleet: fleet,
+    daemons,
+    index,
+    volume,
+    written,
+    taken,
+    served,
+    copy_before,
+    copy_after,
+  }
+}
+
+/// A-344 (§4.10; §4.8 "Recovery"): a successor restarted warm after its live takeover takes a write to the volume. Do: the
+/// [`RestartedSuccessor`] scene; write a seventh file through the successor; read all seven back through it. Expect the
+/// write answered and every file read. Before, the restart forgot the promotion epoch (`placed_heads`): its shipper and
+/// its records ran at its host's epoch, 1, under the fence 2 its takeover had raised at the holders, and the write was
+/// not answered within the client's deadline.
+#[test]
+fn a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over() {
+  let _serial = serialize_fleet_tests();
+  let scene = restarted_successor("successor-write");
+  let instance = scene.daemons[scene.index].instance().to_owned();
+  let after = continuity_write(&instance, scene.volume, CONTINUITY_FILES);
+  let read = continuity_read(&instance, scene.volume, CONTINUITY_FILES + 1);
+  for daemon in scene.daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a write after the successor's warm restart: taken {}, served {}, written {after:?}, read {read:?}",
+    scene.taken, scene.served
+  );
+  assert!(
+    scene
+      .written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {:?}",
+    scene.written
+  );
+  assert!(scene.taken, "the successor took the volume over");
+  assert!(scene.served, "the successor serves it after its restart");
+  assert!(
+    matches!(after, ReplyBody::FsDone { .. }),
+    "the write after the successor's restart was answered: {after:?}"
+  );
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+}
+
+/// A-344 (§4.10 phase one; §4.8 "Recovery": a raised fence is a promise kept across a restart): a successor's own copy of
+/// the log it took over keeps the fence its takeover raised across the successor's warm restart. Do: the
+/// [`RestartedSuccessor`] scene, reading the successor's own copy (its `holding` line) before the restart and after.
+/// Expect the same fence both times, above the first epoch. Before, the successor raised its own copy's fence in memory
+/// alone and nothing published it: the copy came back at fence 1 after a takeover at 2, where a superseded owner resumed
+/// could have its entries taken.
+#[test]
+fn a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart() {
+  let _serial = serialize_fleet_tests();
+  let scene = restarted_successor("successor-fence");
+  for daemon in scene.daemons {
+    daemon.stop();
+  }
+  let fence = |copy: &Option<LiveReport>| copy.as_ref().map(|copy| copy.fence);
+  eprintln!(
+    "the successor's own copy: taken {}, served {}, before {:?}, after {:?}",
+    scene.taken, scene.served, scene.copy_before, scene.copy_after
+  );
+  assert!(scene.taken, "the successor took the volume over");
+  assert!(
+    fence(&scene.copy_before).is_some_and(|fence| fence > 1),
+    "the takeover raised the successor's own copy's fence: {:?}",
+    scene.copy_before
+  );
+  assert_eq!(
+    fence(&scene.copy_after),
+    fence(&scene.copy_before),
+    "the successor's own copy keeps its raised fence across its warm restart"
+  );
+}
+
+/// A-344 (§4.10; §4.8 "Recovery", "Leases and reads": ReadSafety): a superseded owner restarted warm stays superseded,
+/// so a read through it answers its successor's writes. Do: three nodes at `f = 1` over anchors, two shards each; on a, a
+/// live volume written six files; cut a off on the probe plane alone until the survivor the volume ranks first takes it
+/// over, then give it back; write a file through the successor; write once through a, which finds a's fence and is
+/// refused (A-338), its attachment and its client kept, so no later verb of a's publishes; restart a warm; read the
+/// successor's file through a client of a. Expect the read to answer the file's bytes. Before, a's fence lived in its
+/// shipper's memory alone: restarted, a took the volume for its own again and answered from its own copy, which the
+/// successor's writes had passed (`NotFound`).
+#[test]
+fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, (id, written)) = anchored_fleet_with_a_live_volume(
+    &[
+      "superseded-restart-a",
+      "superseded-restart-b",
+      "superseded-restart-c",
+    ],
+    "superseded-restart",
+  );
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let successor = if successor == hosts[1] { 1 } else { 2 };
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[successor]);
+  let on_the_successor = continuity_write(daemons[successor].instance(), id, CONTINUITY_FILES);
+  let mut through_a = Client::connect(daemons[0].instance());
+  let attachment = write_attachment(&mut through_a, id);
+  let fenced = through_a.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/through-the-old-owner".to_owned(),
+    bytes: b"through the old owner".to_vec(),
+    mode: 0o644,
+  });
+  // The client stays until a's daemon is gone: its leaving would reap its attachment, a verb that publishes a's shard.
+  daemons.remove(0).stop();
+  drop(through_a);
+  daemons.insert(0, fleet.start(0));
+  let mut reader = Client::connect(daemons[0].instance());
+  let path = format!("/continuity-{CONTINUITY_FILES}");
+  let mut last = None;
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let read = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+    let reply = read_at_head(&mut reader, id, &path);
+    let answered = matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == continuity_body(CONTINUITY_FILES));
+    last = Some(reply);
+    Ok(answered)
+  });
+  drop(observed);
+  drop(reader);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a superseded owner's warm restart: taken {taken}, written on the successor {on_the_successor:?}, through a \
+     {fenced:?}, the read through a after its restart answered {last:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    matches!(on_the_successor, ReplyBody::FsDone { .. }),
+    "the successor took a write: {on_the_successor:?}"
+  );
+  assert!(
+    matches!(
+      fenced,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. }
+      }
+    ),
+    "a's write found its fence: {fenced:?}"
+  );
+  assert!(
+    read,
+    "a read through a after its warm restart answers the successor's write: {last:?}"
+  );
+}
+
+/// A live-shipped volume named `name` through `client`, shared with `fleet`, with nothing written: the volume.
+fn live_volume_named(client: &mut Client, fleet: &[Daemon], name: &str) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume {name} was created");
+  };
+  share_with_fleet(client, id, fleet);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  id
+}
+
+/// A-346 (§4.8 "Leases and reads", A-338, A-344): an NFS mount on a superseded owner learns of the takeover: once the old
+/// owner knows its log is fenced, a request through its mount answers `NFS3ERR_STALE`, as a non-owner node's mount
+/// answers its handles. Do: three nodes at `f = 1`; on a, a live-shipped volume shared with the fleet; mount it over NFS
+/// on a's port, create a file there and write it; cut a off on the probe plane alone until the survivor the volume ranks
+/// first takes it over, then give it back; then read the file through the same mount, writing it once more between reads
+/// so a's log meets the fence. Expect a read answered `NFS3ERR_STALE` within the wait. Before, the mount answered the
+/// reads from a's own copy, which the successor's writes may have passed, and the writes retry-later for good.
+#[test]
+fn a_superseded_owners_nfs_mount_answers_stale() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let name = "superseded-nfs";
+  let mut client = Client::connect(daemons[0].instance());
+  let id = live_volume_named(&mut client, &daemons, name);
+  drop(client);
+  let port = daemons[0].nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability_path(&daemons[0], name), 1);
+  let file_fh = create(&mut stream, &root_fh, "over-nfs.txt", 2);
+  write(&mut stream, &file_fh, b"before the takeover", 3);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let successor = &daemons[if successor == hosts[1] { 1 } else { 2 }];
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, successor);
+  let mut xid = 3;
+  let mut statuses = Vec::new();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let stale = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+    xid += 1;
+    let read = read_status(&mut stream, &file_fh, xid);
+    statuses.push(("read", read));
+    if read == NFS3ERR_STALE {
+      return Ok(true);
+    }
+    xid += 1;
+    statuses.push((
+      "write",
+      write_status(&mut stream, &file_fh, b"after the takeover", xid),
+    ));
+    Ok(false)
+  });
+  drop(observed);
+  drop(stream);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a superseded owner's NFS mount: taken {taken}, statuses {:?}",
+    statuses.iter().rev().take(6).collect::<Vec<_>>()
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    stale,
+    "a read through the old owner's mount answered NFS3ERR_STALE: {statuses:?}"
+  );
+}
+
+/// A-334 with A-346 (§4.8 "Leases and reads", "Authority scope"): an idle volume's NFS mount on an owner admitted again
+/// learns of the takeover at the re-admission's yield, with no write to meet a holder's fence. Do: three nodes at
+/// `f = 1`; on a, a live-shipped volume shared with the fleet; mount it over NFS on a's port, create a file there and
+/// write it; cut a off the probe plane both ways until a survivor takes the volume over, then heal and wait until a,
+/// refuting its death, is admitted again at a newer host epoch; then only read the file through the same mount. Expect a
+/// read answered `NFS3ERR_STALE` within the wait, and a counted the volume yielded. Before, the gate read the fenced
+/// log alone, which a never learns without a write, so its mount answered the reads from its own copy once its lease
+/// confirmed again.
+#[test]
+fn an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let name = "yielded-nfs";
+  let mut client = Client::connect(daemons[0].instance());
+  let id = live_volume_named(&mut client, &daemons, name);
+  drop(client);
+  let port = daemons[0].nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability_path(&daemons[0], name), 1);
+  let file_fh = create(&mut stream, &root_fh, "idle-over-nfs.txt", 2);
+  write(&mut stream, &file_fh, b"before the takeover", 3);
+  let successor = falsely_taken_over(&daemons, &hosts);
+  heal_the_probe_plane(&daemons);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  let mut xid = 3;
+  let mut statuses = Vec::new();
+  let stale = readmitted
+    && poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+      xid += 1;
+      let read = read_status(&mut stream, &file_fh, xid);
+      statuses.push(read);
+      Ok(read == NFS3ERR_STALE)
+    });
+  drop(observed);
+  drop(stream);
+  let yielded = refusal_count(&daemons[0], READMISSION_YIELDED);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "an idle volume's NFS mount on an owner admitted again: taken over by node {successor}, readmitted {readmitted}, \
+     yielded {yielded:?}, the last statuses {:?}",
+    statuses.iter().rev().take(6).collect::<Vec<_>>()
+  );
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  assert!(
+    matches!(yielded, Ok(count) if count > 0),
+    "the owner admitted again yielded its volume: {yielded:?}"
+  );
+  assert!(
+    stale,
+    "a read through the owner admitted again answered NFS3ERR_STALE with nothing written after the takeover: \
+     {statuses:?}"
   );
 }
 
