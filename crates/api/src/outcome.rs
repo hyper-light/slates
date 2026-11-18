@@ -137,8 +137,16 @@ pub struct LandingApproval {
   pub manifest: [u8; 32],
   /// What would be written.
   pub summary: Summary,
-  /// How the landing's signature was judged.
+  /// How the landing's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
   pub verification: Verification,
+  /// The landing's statement (A-321): the exact bytes a signature over this landing signs, as the daemon states them —
+  /// the volume, the target as the request names it and this manifest, one field a line. Sign it under the namespace
+  /// `slates-work` (`ssh-keygen -Y sign -n slates-work -f KEY FILE`); the signature verifies for this manifest alone.
+  pub statement: Vec<u8>,
+  /// The signature the landing carried, carried again by its approval (A-321): [`crate::Instance::approve_landing`]
+  /// presents and lands with it, so the landing is recorded with its verdict. An approver may set one made over
+  /// [`LandingApproval::statement`] before approving; a signature permits nothing either way.
+  pub signature: Option<WorkSignature>,
 }
 
 impl LandingApproval {
@@ -246,7 +254,8 @@ pub struct LandingReport {
   pub degraded: Vec<LandingDegradation>,
   /// The batch barriers taken (A-130).
   pub barriers: u64,
-  /// The landing's signature, as judged.
+  /// How the landing's signature was judged against the manifest it wrote (A-321), as its finished audit record keeps
+  /// it ([`crate::Instance::audit`]): `Unsigned` when it carried none.
   pub verification: Verification,
 }
 
@@ -283,11 +292,8 @@ impl LandingState {
   }
 }
 
-/// The daemon's landing outcome as the contract types it.
-pub(crate) fn report_of(
-  outcome: LandingOutcome,
-  verification: Verification,
-) -> Result<LandingReport, Error> {
+/// The daemon's landing outcome as the contract types it, with how its signature was judged (A-321).
+pub(crate) fn report_of(outcome: LandingOutcome) -> Result<LandingReport, Error> {
   let state =
     LandingState::of_stage(outcome.stage).ok_or(Error::Protocol(ProtocolFault::UnknownName {
       field: "landing state",
@@ -304,7 +310,7 @@ pub(crate) fn report_of(
     durability: outcome.durability,
     degraded: outcome.degraded,
     barriers: outcome.barriers,
-    verification,
+    verification: Verification::of_wire(outcome.verification),
   })
 }
 
