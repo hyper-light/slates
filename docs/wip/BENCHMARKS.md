@@ -14134,6 +14134,41 @@ Every one of the 12 runs had 0 oracle failures and exited 0.
 the 12 runs (after, 50,000 round 1; before, 20,000 round 3), and 14 to 30 clients gave up in every run. The given-up clients are the next point to read (the fs/ rung under A-416's set rule is filed); the owner's
 one thread for verdicts and rebases is the next wall (A-273).
 
+## A load-test worker that parks between replies: measured and rejected (A-421; goals 231 and 257; 2026-11-18)
+
+**What it was.** A-421: a `load_bench` worker whose sweep took no reply and sent nothing swept on for the daemon's
+published spin window, then armed its connections' completions and parked (`poll(2)`) until a reply or its next
+deadline, waking early by the spin window and its parks' measured lateness. The workers had spun for the whole level
+(eight of the Studio's 32 cores), and under load their sweeps had taken 25 to 127 ms with clients held (g083's trace).
+
+**Environment and command.** The supervisor's A/B, kiln run r155: Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra,
+32 cores, macOS 26.4), release, the daemon in the harness's process, `fs/` of linux v7.4-rc1 (2,210 files long enough
+to edit), 1,000 clients, `--hot-files 800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us <Z>`
+(`ab2.sh`, `~/.cache/g083-scripts/` on the Studio). Spin is main just before A-421 (`3f4700745`), park is that commit
+with A-421 alone (`656826e26`), run back to back with the order alternating by round; the load rose from 6 to 27 over
+the run. p50 / p99 in µs.
+
+| Z µs, round (load) | Edit spin | Edit park | Submit spin | Submit park | max sweep ms, spin / park | parks |
+|---|---|---|---|---|---|---|
+| 50,000, 1 (6-8) | 118 / 299 | 95 / 312 | 220 / 429 | 200 / 1,307 | 2.6 / 4.3 | 113,003 |
+| 20,000, 1 (9-10) | 146 / 579 | 140 / 578 | 284 / 719 | 280 / 795 | 3.7 / 4.3 | 14,514 |
+| 50,000, 2 (10-11) | 123 / 290 | 93 / 250 | 226 / 407 | 193 / 355 | 3.2 / 2.8 | 113,101 |
+| 20,000, 2 (11-14) | 203 / 3,410 | 186 / 3,972 | 497 / 5,221 | 425 / 5,161 | 6.5 / 17.7 | 11,122 |
+| 50,000, 3 (17-25) | 125 / 4,501 | 180 / 8,263 | 318 / 9,220 | 417 / 11,264 | 30.8 / 42.8 | 93,432 |
+| 20,000, 3 (25-28) | 442 / 8,612 | 623 / 26,863 | 1,164 / 11,320 | 1,901 / 34,586 | 18.6 / 39.4 | 6,760 |
+
+No client was held in any of the twelve runs (0.0), and none gave up, with 0 oracle failures (A-416's hot set).
+
+**Why rejected.** The workers parked (113,003 times in a 50 ms run) and bought nothing the A/B could see: the longest
+sweep was shorter in 1 pair of 6, the held clients were the same (none either way), and once the box was loaded the
+p99 was worse (an edit's 26.9 ms against 8.6 ms at load 25 to 28). A dead-even or worse A/B does not land, so the
+workers spin again (`load_bench.rs`, "Workers spin"); A-421's lint fixes stay (the stamp tests' preemption is a
+yielding wait, and the span drain keeps no name it never reads).
+
+**What it says about goals 231 and 257.** At the lightest load (50,000 µs, rounds 1 and 2, load 6 to 11) the edit's
+p99 was 250 to 312 µs and the submit's 355 to 429 µs in three of the four runs (park's first round: 1,307 µs); from
+load 11 to 28 the p99 was 3 to 35 ms. The gap left is the p99 under load, which A-273's replicas target.
+
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 
 **What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
