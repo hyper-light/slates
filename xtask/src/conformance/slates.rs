@@ -567,7 +567,7 @@ impl Reach {
 
 /// How a mount was made, which decides how it is unmade.
 enum MountMethod {
-  /// `slates mount`; unmade with `umount` (as the CLI test's guard).
+  /// `slates mount`; unmade with `umount`, forced if refused (as the CLI tests' guards).
   Slates,
   /// A root `mount -t nfs`; unmade with `sudo umount -l`.
   LinuxRoot,
@@ -602,8 +602,14 @@ impl Mount {
 impl Drop for Mount {
   fn drop(&mut self) {
     match self.method {
+      // A plain unmount first, forced if refused (a file still open on it, as a suite killed mid-run leaves its
+      // files), as the CLI tests' guards do (`MountPoint`, `KernelMount`): the macOS mount is hard (A-229), so one left
+      // behind once its daemon is gone hangs whatever touches it (on CI, the cache's walk of `target/`).
       MountMethod::Slates => {
-        let _ = Command::new("umount").arg(&self.path).output();
+        let plain = Command::new("umount").arg(&self.path).output();
+        if !plain.is_ok_and(|out| out.status.success()) {
+          let _ = Command::new("umount").arg("-f").arg(&self.path).output();
+        }
       }
       MountMethod::LinuxRoot => {
         let _ = Command::new("sudo")
