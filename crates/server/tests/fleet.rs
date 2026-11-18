@@ -12545,12 +12545,268 @@ fn expect_the_sealed_file_alone_survived(
   );
 }
 
+/// One write of `path`'s own name as its bytes through `attachment` of `volume`: the reply.
+fn write_own_name(client: &mut Client, volume: VolumeId, attachment: u64, path: &str) -> ReplyBody {
+  client.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: path.to_owned(),
+    bytes: path.as_bytes().to_vec(),
+    mode: 0o644,
+  })
+}
+
 /// A snapshot of `volume` through `client`: its id, or none when it was refused.
 fn snapshot_taken(client: &mut Client, volume: VolumeId) -> Option<SnapshotId> {
   match client.call(&RequestBody::Snapshot { volume }) {
     ReplyBody::Snapshotted { id, .. } => Some(id),
     _ => None,
   }
+}
+
+/// A read of `path` at `volume`'s head through `client`: the reply.
+fn read_at_head(client: &mut Client, volume: VolumeId, path: &str) -> ReplyBody {
+  client.call(&RequestBody::Read {
+    volume,
+    path: path.to_owned(),
+    at: ReadAt::Head,
+  })
+}
+
+/// Three or more fleet nodes over anchor segments that outlive their daemons (each with its content object, so a
+/// volume's content lives in anchor-owned RAM), so a node can be stopped and started warm over its anchor: each node's
+/// profile, anchor, generation-0 seed, the identities left for its starts (one certificate, a fresh identity a start),
+/// serve ports, configuration, segment and held rendezvous.
+struct AnchoredFleet {
+  profiles: Vec<MachineProfile>,
+  anchors: Vec<HostId>,
+  seeds: Vec<HostId>,
+  identities: Vec<Vec<Identity>>,
+  certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+  _ports_lease: PortLease,
+  ports: Vec<(u16, u16)>,
+  configs: Vec<DaemonConfig>,
+  segments: Vec<AnchorSegment>,
+  rendezvous: Vec<HeldRendezvous>,
+}
+
+/// Shape: the starts each node of an [`AnchoredFleet`] has an identity for: its first, and one warm restart.
+const ANCHORED_STARTS: usize = 2;
+
+impl AnchoredFleet {
+  /// The fleet `names` under fixture objects named from `prefix`, at `f = 1`; nothing started.
+  fn new(prefix: &str, names: &[&str]) -> AnchoredFleet {
+    let profiles: Vec<_> = names.iter().copied().map(profile).collect();
+    let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+    let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+    let identities: Vec<_> = profiles
+      .iter()
+      .map(|_| same_identity(ANCHORED_STARTS))
+      .collect();
+    let certificates: Vec<_> = identities
+      .iter()
+      .map(|pair| pair[0].certificate())
+      .collect();
+    let (ports_lease, ports) = mesh_serve_ports(profiles.len());
+    let mut fleet = AnchoredFleet {
+      profiles,
+      anchors,
+      seeds,
+      identities,
+      certificates,
+      _ports_lease: ports_lease,
+      ports,
+      configs: Vec::new(),
+      segments: Vec::new(),
+      rendezvous: Vec::new(),
+    };
+    for node in 0..names.len() {
+      let config = fleet_config(
+        &fleet.profiles[node],
+        &common::fixture_object(prefix, &node.to_string()),
+        fleet.anchors[node],
+        fleet.seeds[node],
+        &fleet.peers(node),
+        &Default::default(),
+      );
+      let segment = AnchorSegment::create(
+        &common::fixture_object(prefix, &node.to_string()),
+        &fleet.profiles[node].facts.identity,
+        config.geometry,
+      )
+      .unwrap()
+      .with_content(
+        &common::fixture_object(&format!("{prefix}-con"), &node.to_string()),
+        config.content_bytes(),
+      )
+      .unwrap();
+      fleet
+        .rendezvous
+        .push(HeldRendezvous::hold(&config.instance).unwrap());
+      fleet.configs.push(config);
+      fleet.segments.push(segment);
+    }
+    fleet
+  }
+
+  /// Node `node`'s peers: every other node, at its anchor, seed and serve ports.
+  fn peers(&self, node: usize) -> Vec<FleetPeer> {
+    (0..self.profiles.len())
+      .filter(|peer| *peer != node)
+      .map(|peer| {
+        fleet_peer_at(
+          self.anchors[peer],
+          self.seeds[peer],
+          self.ports[peer],
+          &self.certificates[peer],
+        )
+      })
+      .collect()
+  }
+
+  /// Starts node `node`'s daemon over its anchor: its first start, or a warm restart after a stop.
+  fn start(&mut self, node: usize) -> Daemon {
+    let (handoff, len) = self.segments[node].handoff().unwrap();
+    let source = SegmentSource::Handoff {
+      handoff,
+      len,
+      content: self.segments[node].content_handoff().unwrap(),
+      rendezvous: self.rendezvous[node].adoption(),
+    };
+    let identity = self.identities[node]
+      .pop()
+      .expect("an identity is left for this start");
+    start_fleet_node(
+      &self.profiles[node],
+      self.configs[node].clone(),
+      identity,
+      self.ports[node],
+      self.peers(node),
+      source,
+    )
+  }
+}
+
+/// Creates a volume named `name` on `daemons[0]`, shares it with the account on every other node (so a successor's client
+/// may read it), writes `path` with its own name as its bytes, and seals it: the volume, once the seal placed and both
+/// other nodes hold its head; else what did not hold.
+fn sealed_and_held(daemons: &[Daemon], name: &str, path: &str) -> Result<VolumeId, String> {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("create on the owner".to_owned());
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let attachment = write_attachment(&mut client, id);
+  let written = write_own_name(&mut client, id, attachment, path);
+  let detached = client.call(&RequestBody::Detach { attachment });
+  let snapshot = snapshot_taken(&mut client, id).ok_or("snapshot on the owner")?;
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&observed, &mut client, id, snapshot);
+  let held = poll_all_hold(&[&daemons[1], &daemons[2]], ObjectId(id.bytes));
+  if matches!(written, ReplyBody::FsDone { .. })
+    && matches!(detached, ReplyBody::Detached)
+    && placed
+    && held
+  {
+    Ok(id)
+  } else {
+    Err(format!(
+      "written {written:?}, detached {detached:?}, placed {placed}, held by both others {held}"
+    ))
+  }
+}
+
+/// The anchored three-node fleet the takeover-report test runs on, formed at `f = 1`, with a volume sealed on a and held
+/// by both others ([`sealed_and_held`]): the fleet, its daemons, their member ids and the volume. A setup that does not
+/// hold stops the daemons and fails the test there.
+fn anchored_fleet_with_a_sealed_volume(
+  names: &[&str],
+  prefix: &str,
+) -> (AnchoredFleet, Vec<Daemon>, Vec<HostId>, VolumeId) {
+  let mut fleet = AnchoredFleet::new(prefix, names);
+  let daemons: Vec<Daemon> = (0..names.len()).map(|node| fleet.start(node)).collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &fleet.seeds, &Default::default(), Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, names);
+  match sealed_and_held(&daemons, prefix, "/taken") {
+    Ok(id) => (fleet, daemons, hosts, id),
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  }
+}
+
+/// Whether the node serving `instance` answers `status` for `volume` (polled over `daemons`), and its loss report then.
+fn served_loss(
+  daemons: &[Daemon],
+  instance: &str,
+  volume: VolumeId,
+) -> (bool, Option<(slates_ipc::protocol::LossReport, u64)>) {
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), instance, volume);
+  (served, loss_of(&mut Client::connect(instance), volume))
+}
+
+/// AC-8.3, A-325: a successor's report of the takeover that made it a volume's owner survives its warm restart. Do: three
+/// nodes at `f = 1` over anchors that outlive their daemons; on a, a volume with one file, sealed, placed and held by
+/// both others; a stops for good; once the survivor the volume ranks first serves it, read its loss report; restart that
+/// successor warm over its anchor and, once it serves the volume again, read the report and the file. Expect the report
+/// to name the takeover before the restart (served from the seal, not a live log) and the very same takeover after it,
+/// the successor's member id unchanged by the restart, and the file read back. Before, the takeover lived in the shard's
+/// memory: the restarted successor reported none, though the window it reported was still the one the takeover left.
+#[test]
+fn a_successors_takeover_report_survives_its_warm_restart() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, id) =
+    anchored_fleet_with_a_sealed_volume(&["taken-a", "taken-b", "taken-c"], "taken-report");
+  daemons.remove(0).stop();
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let instance = daemons[index].instance().to_owned();
+  let (served, before) = served_loss(&daemons, &instance, id);
+  daemons.remove(index).stop();
+  daemons.insert(index, fleet.start(index + 1));
+  let member_after = daemons[index].member_identity();
+  let (served_again, after) = served_loss(&daemons, &instance, id);
+  let read = read_at_head(&mut Client::connect(&instance), id, "/taken");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "takeover report across a warm restart: before {before:?}, after {after:?}, read {read:?}"
+  );
+  assert!(
+    served && served_again,
+    "the successor served the volume before and after its restart"
+  );
+  let taken_before = before
+    .and_then(|(loss, _)| loss.taken_over)
+    .expect("the successor reports its takeover");
+  assert!(
+    !taken_before.from_live_log && taken_before.head_sequence >= 1,
+    "served from the seal a placed: {taken_before:?}"
+  );
+  assert_eq!(
+    after.and_then(|(loss, _)| loss.taken_over),
+    Some(taken_before),
+    "the restarted successor reports the very takeover it reported before"
+  );
+  assert_eq!(
+    member_after,
+    Ok(successor),
+    "a warm restart keeps the successor's member id"
+  );
+  assert!(
+    matches!(&read, ReplyBody::ReadBytes { bytes } if bytes == b"/taken"),
+    "the file reads back after the restart: {read:?}"
+  );
 }
 
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
