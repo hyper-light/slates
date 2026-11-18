@@ -1,0 +1,85 @@
+name: DIAG g258 -- WinFsp driver with the hard-link series (0001, 0002), built from v2.1 and test-signed (not for main)
+
+# Goal g258, WinFsp hard links (2026-11-18). WinFsp's driver answers FileLinkInformation STATUS_NOT_SUPPORTED itself
+# (src/sys/fileinfo.c, v2.1 to v2.2B5 and master), so no file system can make a hard link. This builds v2.1 (the
+# version slates' CI pins, 2.1.25156) with docs/wip/winfsp-patches/0001 applied, for x64, with the latest SDK as
+# WinFsp's build.version.props documents for Windows 10 and later (10.0.26100.0, NTDDI 0x0A000006); the windows-2022
+# image has the WDK 10.1.26100 alone, not 19041's. The driver is test-signed with a certificate made here, for a VM in
+# test-signing mode (adacachy's KVM lane), and published with the certificate and the build log.
+# Derived: the job's bound is CI's Windows build's order (60 minutes) for one driver project.
+
+on:
+  push:
+    branches: ['diag-g258-[0-9]*']
+
+permissions:
+  contents: write
+
+jobs:
+  driver:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      RESULTS_BRANCH: diag-results/g258-${{ github.run_id }}-driver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: WinFsp v2.1 with the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b v2.1 https://github.com/winfsp/winfsp.git "$RUNNER_TEMP/winfsp"
+          cd "$RUNNER_TEMP/winfsp"
+          git -c user.name=diag -c user.email=diag@users.noreply.github.com am \
+            "$GITHUB_WORKSPACE"/docs/wip/winfsp-patches/*.patch
+          git log --oneline -3 | tee "$GITHUB_WORKSPACE/source.txt"
+          cd build/VStudio
+          sed -i 's|<MyTargetPlatformVersion>10.0.19041.0</MyTargetPlatformVersion>|<MyTargetPlatformVersion>10.0.26100.0</MyTargetPlatformVersion>|; s|<MyNtddiVersion>0x06010000</MyNtddiVersion>|<MyNtddiVersion>0x0A000006</MyNtddiVersion>|; s|<MyWin32Version>0x0601</MyWin32Version>|<MyWin32Version>0x0A00</MyWin32Version>|' build.version.props
+          grep -E '<My(TargetPlatformVersion|NtddiVersion|Win32Version)>' build.version.props | tee -a "$GITHUB_WORKSPACE/source.txt"
+          grep -q '<MyNtddiVersion>0x0A000006</MyNtddiVersion>' build.version.props
+      - name: Build the driver, x64 Release
+        shell: pwsh
+        run: |
+          Set-Location "$env:RUNNER_TEMP\winfsp\build\VStudio"
+          msbuild winfsp.sln /t:winfsp_sys /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /v:m `
+            "/flp:logfile=$env:GITHUB_WORKSPACE\driver-build.log;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { throw "msbuild answered $LASTEXITCODE" }
+          Get-ChildItem build\Release\winfsp-x64.sys | Format-List Name, Length, LastWriteTime
+      - name: Test-sign it with a certificate made here
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=slates g258 WinFsp hard-link test' `
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(60)
+          Export-Certificate -Cert $cert -FilePath "$env:GITHUB_WORKSPACE\g258-test.cer" | Out-Null
+          $sys = "$env:RUNNER_TEMP\winfsp\build\VStudio\build\Release\winfsp-x64.sys"
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe' | Select-Object -First 1
+          & $signtool.FullName sign /fd sha256 /sha1 $cert.Thumbprint /s My $sys
+          if ($LASTEXITCODE -ne 0) { throw "signtool answered $LASTEXITCODE" }
+          Copy-Item $sys "$env:GITHUB_WORKSPACE\winfsp-x64.sys"
+          Get-FileHash "$env:GITHUB_WORKSPACE\winfsp-x64.sys", "$env:GITHUB_WORKSPACE\g258-test.cer" -Algorithm SHA256 |
+            Format-Table -AutoSize | Out-String -Width 200 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\hashes.txt"
+      - name: Publish the driver, its certificate and the build log
+        if: always()
+        shell: bash
+        run: |
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          entries=""
+          for f in winfsp-x64.sys g258-test.cer driver-build.log source.txt hashes.txt; do
+            [ -f "$f" ] || continue
+            blob=$(git hash-object -w "$f")
+            entries="${entries}100644 blob ${blob}"$'\t'"${f}"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree)
+          commit=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID")
+          git push origin "$commit:refs/heads/$RESULTS_BRANCH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winfsp-hard-links-driver
+          path: |
+            winfsp-x64.sys
+            g258-test.cer
+            driver-build.log
+            source.txt
+            hashes.txt
