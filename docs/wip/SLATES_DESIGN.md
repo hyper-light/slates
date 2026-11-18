@@ -28813,5 +28813,8 @@ owner's measurements), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-inste
   later than 2F (R9's tail aside), with holds kept A-326's verdict; the paced cycles ask no hold. The first form's runs
   on the Mac Studio (debug, load 25–31): with every hold kept (main before A-387) the owners kept 261 and 164 holds and
   parked 173 and 315 times over 198 returns later than 2F; with no hold asked, 416–419 parks over the same 198; on
-  ubuntu-latest every owner kept holds (329–394 of 400 forwards; CI run 44367421244). Owed: the A/B of this rule against
-  main (provision_bench and the closed loop on the quiet M4 Max and the 23-shard Studio; the run request of 2026-11-18).
+  ubuntu-latest every owner kept holds (329–394 of 400 forwards; CI run 44367421244). This rule on the Mac Studio (debug,
+  load 14): the owners' learned turns 14.7 and 16.2 µs against wakes of 5.7 and 5.8 µs, 188 and 192 holds declined and
+  none kept in the loop, 416 parks over 198 late returns; red once with the decision forced to hold (192 and 196 kept);
+  the `held_turn` unit tests 5 of 5. Owed: the A/B of this rule against main (provision_bench and the closed loop on the
+  quiet M4 Max and the 23-shard Studio; the run request of 2026-11-18).

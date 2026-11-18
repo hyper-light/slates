@@ -344,7 +344,9 @@ fn run_scenario() -> Scenario {
 /// A-326, the owners parked 460 times over 200 returns (the Mac Studio, a debug cycle 272 µs). On the Mac Studio with
 /// every hold kept (main before A-387) the owners kept 261 and 164 holds and parked 173 and 315 times over 198 returns
 /// later than 2F; with no hold asked (A-387's first form) they parked 416 to 419 times over the same 198 (2026-11-18,
-/// debug, load 25 to 31).
+/// debug, load 25 to 31). With the decision (debug, load 14): the owners' learned turns 14.7 and 16.2 µs against wakes
+/// of 5.7 and 5.8 µs, 188 and 192 holds declined and none kept in the loop, 416 parks over 198 late returns; with the
+/// decision forced to hold, they kept 192 and 196 holds while their turns stayed over their wakes, and the test failed.
 #[test]
 fn a_closed_loops_owners_hold_only_while_their_idle_turns_poll_faster_than_they_wake() {
   let scenario = run_scenario();
