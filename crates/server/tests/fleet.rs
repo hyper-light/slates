@@ -14055,6 +14055,115 @@ fn every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter()
   judge_retaken(&retaken_from_its_adopter(false));
 }
 
+/// Shape: the volumes the install-walk test places on its holders. Each puts two register copies on a holder (its
+/// catalog and its head), so a holder's walk spans more copies than one turn takes once each turn is cut to one copy.
+const INSTALL_WALK_VOLUMES: usize = 4;
+
+/// Format: a node's count of its install walks' turns (`fleet::install_slice`, A-398).
+const INSTALL_SLICES: &str = "fleet.config.install_slices";
+/// Format: a node's count of install walks that reached every held copy.
+const INSTALLS_WALKED: &str = "fleet.config.installs_walked";
+
+/// The register copies `daemon` holds as a candidate holder (`fleet_held_records` in its status), `None` while it does
+/// not answer.
+fn held_record_count(daemon: &Daemon) -> Option<u64> {
+  let ReplyBody::DaemonStatus { report } =
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+  else {
+    return None;
+  };
+  Some(report.fleet.held_records)
+}
+
+/// A-398 (§4.8 "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere";
+/// `docs/wip/models/InstallInTurns.tla`): an installed configuration reaches a holder's register copies by a walk a
+/// slice a turn, and the copies still follow it. Do: three nodes at `f = 1`; on a, [`INSTALL_WALK_VOLUMES`] volumes
+/// shared with the fleet, each head held by b and c; cut b's and c's install walks to one copy a turn; cut a off on the
+/// probe plane until every volume's head is placed on the survivor it ranks first, then give it back. Expect b to have
+/// walked an install to its end, in at least as many turns as the copies it held, each turn a poll of its own
+/// (`xshard.turns_shared` unchanged), and every volume's head placed on its successor (a takeover over copies the walk
+/// reached one a turn). Before, the turn that installed a version moved every held copy at once.
+#[test]
+fn a_holders_copies_take_an_install_in_turns_and_every_copy_follows() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let volumes: Vec<VolumeId> = (0..INSTALL_WALK_VOLUMES)
+    .map(|index| {
+      let created = client.call(&scratch(&format!("install-walk-{index}")));
+      let ReplyBody::Created { id } = created else {
+        panic!("volume {index} was created: {created:?}");
+      };
+      share_with_fleet(&mut client, id, &daemons);
+      id
+    })
+    .collect();
+  drop(client);
+  let held = volumes
+    .iter()
+    .all(|id| poll_all_hold(&[&daemons[1], &daemons[2]], ObjectId(id.bytes)));
+  let copies = held_record_count(&daemons[1]).unwrap_or(0);
+  for daemon in &daemons[1..] {
+    daemon.inject_install_walk_quantum(Some(0)).unwrap();
+  }
+  let counted = |daemon: &Daemon| {
+    let counters = summed_counters(daemon);
+    [INSTALL_SLICES, INSTALLS_WALKED, TURNS_SHARED]
+      .map(|name| counters.get(name).copied().unwrap_or(0))
+  };
+  let before = counted(&daemons[1]);
+  let cut = daemons[0]
+    .inject_probe_deafness(&[hosts[1], hosts[2]])
+    .and_then(|()| daemons[1].inject_probe_deafness(&[hosts[0]]))
+    .and_then(|()| daemons[2].inject_probe_deafness(&[hosts[0]]));
+  let survivors = [&daemons[1], &daemons[2]];
+  let placed: Vec<bool> = volumes
+    .iter()
+    .map(|id| {
+      let object = ObjectId(id.bytes);
+      let successor =
+        rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+      let successor = if successor == hosts[1] {
+        &daemons[1]
+      } else {
+        &daemons[2]
+      };
+      poll_head_placed(&survivors, successor, object)
+    })
+    .collect();
+  let healed = daemons
+    .iter()
+    .all(|daemon| daemon.inject_probe_deafness(&[]).is_ok());
+  let after = counted(&daemons[1]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let [slices, walked, shared] = [0, 1, 2].map(|kind| after[kind].saturating_sub(before[kind]));
+  eprintln!(
+    "install in turns: held by both {held}, b's copies {copies}; cut {cut:?}, placed {placed:?}, healed {healed}; b's \
+     install turns {slices}, walks ended {walked}, turns shared {shared}"
+  );
+  assert!(held, "both holders held every volume's head");
+  assert!(
+    cut.is_ok() && healed,
+    "a was cut off and given back: {cut:?}"
+  );
+  assert!(
+    placed.iter().all(|placed| *placed),
+    "every volume's head was placed on its successor: {placed:?}"
+  );
+  assert!(
+    copies >= u64::try_from(INSTALL_WALK_VOLUMES).unwrap(),
+    "b held a copy of every volume: {copies}"
+  );
+  assert!(walked >= 1, "b walked an install to its end");
+  assert!(
+    slices >= copies,
+    "b walked its {copies} copies one a turn: {slices} turns"
+  );
+  assert_eq!(shared, 0, "each turn of the walk was a poll of its own");
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.
