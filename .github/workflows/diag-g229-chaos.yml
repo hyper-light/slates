@@ -1,0 +1,38 @@
+# DIAG (not for main): live_chaos (g229) on Linux x86_64 and arm64 with A-330 (a node announces its record plane where it
+# advertises it), the relay's record-plane non-vacuity, the big-entry successor and the missing-read diagnosis.
+name: diag-g229-chaos
+on:
+  push:
+    branches: ['diag-g229-chaos-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  live-chaos-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: live_chaos, every flow, one at a time
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); $(free -g | sed -n 2p); load $(cat /proc/loadavg)"
+          cargo test --locked --release -p slates-cli --test live_chaos -- --test-threads=1 --nocapture 2>&1 | tee target/live-chaos.log
+          exit "${PIPESTATUS[0]}"
+      - name: Upload the chaos log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-chaos-log-${{ matrix.os }}
+          path: target/live-chaos.log
