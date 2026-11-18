@@ -2774,10 +2774,12 @@
 > - a holder's seed gathers the size its held manifest declares, at most a chunk's bytes an extent, uncharged, as the
 >   one-call restore before it was: an owner's manifest naming one chunk many times makes a holder gather that many
 >   copies. The seed's transient bytes (gathered, decoded, seeded) want charging to the shard's budget;
-> - sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
+> - ~~sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
 >   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
->   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
+>   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.~~ Closed by A-383
+>   (2026-11-18): such inputs were refused `merge.inputs_unheld` (not `undecodable`) at every shipment; a holder now
+>   gathers them extent by extent, charged to its shard's budget while it recomputes.
 >
 > **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
 > a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
@@ -2793,6 +2795,17 @@
 >   holder rebuilds such a green and refuses it again only at the version that mismatched;
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
+>
+> **Fixed 2026-11-18 (g232, A-383): a version whose inputs repeat a chunk was refused by every holder, for good.** A
+> holder restored a version's inputs within the archive's distinct chunks' bytes and one chunk more; inputs cut at fixed
+> offsets name a chunk at several extents wherever they repeat a chunk's bytes at the cut (a run of one byte three chunks
+> long is enough), so every holder refused the version `merge.inputs_unheld` at every shipment and, at `f = 1`, it never
+> placed. Now a holder gathers the inputs extent by extent and charges what the recomputation holds (twice their declared
+> size) to its shard's budget first, refusing `merge.inputs_over_budget` past what it can admit. Test:
+> `a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder` (`crates/server/tests/fleet.rs`): passed in
+> 4.15 s; red on main's holder code, the submit `DeadlineExceeded` after 60 s and each holder 4,583 refusals (kiln r49,
+> Mac Studio; `docs/bugs/2026-11-18-inputs-repeating-a-chunk-were-refused-by-every-holder-for-good.md`). Still open:
+> the recomputation of one version, gather included, is one call, costing what the increment's size costs.
 >
 > **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
 > `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median

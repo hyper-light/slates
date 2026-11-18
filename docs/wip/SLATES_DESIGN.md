@@ -10005,7 +10005,11 @@ manifest identity from the record's inputs before serving the version to any att
 compares its head identity with the record at every version; a mismatch refuses that version on
 that holder, fatal-and-loud, before any read. On a laptop the owner is the only holder and no
 second computation exists; that is the derived N=1 case, and the differential test proves the
-fleet path computes the same answers.
+fleet path computes the same answers. A holder reads a version's inputs from its content hold extent by extent, as
+the inputs were cut, so inputs that repeat a chunk's bytes (one chunk named at several extents) read as the file
+they are; what the recomputation holds of them, the gathered bytes and the increment decoded from them, is charged to
+the holder's shard's budget before a byte is reserved and released once it has recomputed, and a record whose inputs
+the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose inputs are not yet held (A-383).
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -28008,3 +28012,41 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
   the plain register stays ((true, true, true)); `takeover::` and the holder tests 21 of 21, the register tests 76 of 76.
 - **Still owed (GAPS).** A copy first judged on a completion record (every object of the last successor to confirm)
   or past tolerance stays; the completion record would need the retired host's settled neighbourhood to judge it.
+
+### A-383 — A holder reads a version's inputs extent by extent, charged to its shard's budget, never refused for good by a cap of distinct chunks (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders")
+
+Applied in the same change to: §4.16 "Apply on holders", GAPS (the load test's ledger: `held_inputs`'s sibling, closed),
+`docs/bugs/2026-11-18-inputs-repeating-a-chunk-were-refused-by-every-holder-for-good.md`,
+`crates/server/src/merge_service.rs` (`held_inputs`, `HeldInputs`, `INPUTS_OVER_BUDGET`, `RECOMPUTE_COPIES`, the record
+path's release of the charge), `crates/server/src/merge_origin.rs` (`Gather::planned` and `Gather::reserve`,
+`PlannedInputs`), and the tests below.
+- **What was there.** A holder recomputing a version restored its inputs archive with `slates_archive::restore` within
+  the bytes of the archive's distinct chunks and one chunk more, on the rule that an inputs archive names each chunk
+  once (AUD-29-13: a hostile archive naming a chunk many times was refused before allocating). An inputs archive is cut
+  at fixed offsets (`merge_origin::InputsBuilder`, chunks of `MAX_CHUNK_BYTES`), so inputs that repeat a chunk's bytes at
+  the cut — a run of one byte three chunks long covers at least two whole chunks wherever it lies — name one chunk at
+  several extents and restore to more than the cap: every holder refused such a version at every shipment, counted
+  `merge.inputs_unheld` though it held the inputs, and at `f = 1` the version never placed.
+- **The rule.** The holder reads the inputs as the replica's rebuild and seed do: the held manifest planned first (its
+  one file's extents and declared size, the size no more than its extents can hold), then gathered extent by extent
+  from the hold. Before a byte is reserved, what the recomputation holds — the gathered bytes and the increment decoded
+  from them, whose post-state copies at most as many (`RECOMPUTE_COPIES`, two) — is charged to the shard's budget
+  (`Store::grow`) and released once the version is recomputed, on every path. A shard that cannot admit it refuses the
+  record `merge.inputs_over_budget`; the owner ships it again, and the holder recomputes it once it has room. The
+  hostile manifest AUD-29-13 refused is still refused before anything is allocated, now at what the shard can admit,
+  and an honest one is read whole.
+- **Tests.** `a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`, a work writes a run of one byte three chunks long, a page a request, and submits; the version is
+  accepted, both holders recompute it, and each holder's held inputs name one chunk at more than one extent, the case
+  meant); `a_holder_reads_inputs_that_repeat_a_chunk_and_charges_them_while_it_holds_them` and
+  `inputs_naming_a_chunk_past_what_the_shard_admits_are_refused_before_any_is_gathered` (`merge_service.rs`: the very
+  bytes read, twice their size charged and all of it given back; a manifest naming one chunk past what a reduced shard
+  admits refused, the budget unchanged).
+- **Measured.** Kiln r49, the Mac Studio, 2026-11-18, debug build: the fleet test passed in 4.15 s (780 edits of about
+  4 KiB; both holders at version 1; both holders' inputs name a chunk twice). Red, with the change's server code
+  reverted: the submit ended `DeadlineExceeded` at the test's 60 s, both holders stayed at version 0 and counted
+  `merge.inputs_unheld` 4,583 and 4,582 times, and the test failed after 470.8 s; with the charge taken as zero both unit
+  tests failed. The holder fleet tests the record path reaches (the mismatch, the inputs in one exchange, the record
+  issued once placed, the restarted holder, the successor one version behind, the late submit) passed on the same
+  server code, 6 of 6 (r3646).
+- **Still owed.** A version's recomputation, its gather included, is one call, costing what its increment's size costs.
