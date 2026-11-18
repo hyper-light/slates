@@ -172,6 +172,13 @@ pub fn installed() -> bool {
   ffi::api().is_ok()
 }
 
+/// Whether this machine lets WinFsp's driver make the drive a mount needs (A-369): `MountUseMountmgrFromFSD`, which an
+/// Administrator sets once and the driver reads at every mount, by the driver's own rule, so a host learns before it
+/// mounts what the mount would be refused for (`WinFspError::MountManagerNotAllowed`; A-417). Read at each call.
+pub fn mount_manager_allowed() -> bool {
+  ffi::mount_manager_allowed()
+}
+
 /// Format: the sector size the mount reports — 4096 bytes, the volume core's chunk/page unit, so an
 /// allocation unit is one page.
 const SECTOR_SIZE: u16 = 4096;

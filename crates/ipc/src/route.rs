@@ -953,6 +953,18 @@ mod tests {
     rustix::io::read(received, &mut back).is_ok_and(|read| back.get(..read) == Some(bytes))
   }
 
+  /// A stream's claim of a confirmation sent with its resync end: the end and then the resync end, each the very
+  /// socket sent (bytes written on its peer read back through it) and close-on-exec.
+  fn assert_both_ends_claimed(claimed: Claimed, stream_peer: &OwnedFd, resync_peer: &OwnedFd) {
+    let resync = claimed.resync.expect("the resync end rides beside the end");
+    assert!(reads_through(stream_peer, &claimed.descriptor, b"end"));
+    assert!(reads_through(resync_peer, &resync, b"resync"));
+    for received in [&claimed.descriptor, &resync] {
+      let flags = rustix::io::fcntl_getfd(received).unwrap();
+      assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+  }
+
   /// A-339. Do: send a stream's confirmation with its resync end beside its end, and one with its end alone; read each
   /// as a stream's claim and as a map's. Expect a stream's claim of the first to take the end and then the resync end,
   /// each the very socket sent (bytes written on its peer read back through it) and close-on-exec; a map's claim of it
@@ -980,13 +992,7 @@ mod tests {
       match (kind, receive_confirmation(client.as_fd(), kind, &mut alive)) {
         (OfferKind::Stream, Ok((confirmed, claimed))) => {
           assert_eq!(confirmed, confirmation);
-          let resync = claimed.resync.expect("the resync end rides beside the end");
-          assert!(reads_through(&stream_peer, &claimed.descriptor, b"end"));
-          assert!(reads_through(&resync_peer, &resync, b"resync"));
-          for received in [&claimed.descriptor, &resync] {
-            let flags = rustix::io::fcntl_getfd(received).unwrap();
-            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
-          }
+          assert_both_ends_claimed(claimed, &stream_peer, &resync_peer);
         }
         (OfferKind::Map, Err(refused)) => assert_eq!(refused, malformed),
         (kind, other) => panic!("a {kind:?} claim of a stream's two ends: {other:?}"),

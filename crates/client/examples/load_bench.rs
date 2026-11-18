@@ -5,8 +5,10 @@
 //! moment its request is sent to the moment its reply is taken, and reported per kind as p50, p99, p999 and max.
 //!
 //! **The workload.** Each client runs `rounds` rounds. A round picks `edits` slots — a fixed-length, slot-aligned
-//! range of one file — from a small hot set of files (so clients collide) or from the whole tree (so most work is
-//! disjoint), overwrites each with bytes that name the client and the round, and submits. One hot slot is written
+//! range of one file — from a hot set of files (so clients collide) or from the whole tree (so most work is
+//! disjoint), overwrites each with bytes that name the client and the round, and submits. The hot set is `--hot-files`
+//! distinct files, each as hot as the next, and at most half the files long enough to edit, so a pick from the whole
+//! tree misses it at least half the time; a larger one is refused (a `refused` row, exit 1). One hot slot is written
 //! with the same bytes by every client that picks it, so the per-range identity rule (pass two's memcmp) is driven
 //! too: those overlaps must be accepted, never reported as conflicts. Edits are length-preserving and slot-aligned,
 //! so a conflict window, the client's range and the intervening range coincide, and the oracle below states the
@@ -63,12 +65,16 @@
 //! 10³ verdicts a second, the floor of §1.4's fleet-session row ("Increments per green volume per second: thousands").
 //! A level meets it when every kind's p99, each attempt's (`latency`) and each operation's (`operation`), is under 1 ms
 //! while the level's verdicts a second are at least 10³, with no oracle failure and no client given up or starved. The
-//! row names the worst row and kind with its p99, and the held clients beside them, whose wait no latency row holds. A
-//! cycle and a round leave out their client's own think pauses, which are the client's time, not the service's: left
-//! in, a cycle at the pace that offers 10³ verdicts a second from 1,000 clients holds five pauses of about 200 ms, and
-//! no paced level could meet the bound. At a think mean of 0 they are the cycle's and the round's wall.
+//! kinds are every request and the cycle, a whole edit and merge (§1.4's status under A-297). The round is reported in
+//! the `latency` row and not judged (A-416): it holds as many edits and merges as its conflicts make, so its p99 grows
+//! with the conflict rate the hot set sets, not with any one request's time. The row names the worst row and kind with
+//! its p99, and the held clients beside them, whose wait no latency row holds. A cycle and a round leave out their
+//! client's own think pauses, which are the client's time, not the service's: left in, a cycle at the pace that offers
+//! 10³ verdicts a second from 1,000 clients holds five pauses of about 200 ms, and no paced level could meet the bound.
+//! At a think mean of 0 they are the cycle's and the round's wall.
 //!
-//! Rows: `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
+//! Rows: `refused\t<n>\t<why>` for a level whose arguments cannot be run as they say (a hot set past its share, above),
+//! which runs nothing and exits 1; `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
 //! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
 //! answer, refusals for now and resends included; then `floor\t…` in the same columns, each attempt's floor (above);
 //! then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
@@ -116,6 +122,10 @@ const SLOT_BYTES: u64 = 64;
 const SLOT_STRIDE: u64 = 2 * SLOT_BYTES;
 /// Shape: the chance, in parts per thousand, that an edit lands in the hot set.
 const HOT_PERMILLE: u64 = 500;
+/// Shape: the hot set's largest share of the eligible files, as one over this: half. A pick from the whole tree then
+/// misses the hot set at least half the time, so the tree's picks stay mostly disjoint, the workload's other half (the
+/// module's "The workload"); a larger `--hot-files` is refused ([`hot_set`]).
+const HOT_SET_SHARE_DIVISOR: usize = 2;
 /// Shape: how many times a round resolves a conflict and submits again before the client counts as starved.
 const MAX_RESOLUTIONS: usize = 64;
 /// Shape: how long a client retries the rendezvous while the daemon comes up or its claim slots clear under a
@@ -152,8 +162,17 @@ enum Kind {
   /// edit and merge). A refusal's pause and a held send stay in: the service or the harness kept the client waiting.
   Cycle,
   /// A round from its first edit to its accept, conflicts and their resolution included, its own think pauses left
-  /// out as the cycle's are.
+  /// out as the cycle's are. Reported, never judged against the bound ([`Kind::judged`]).
   Round,
+}
+
+impl Kind {
+  /// Whether the bound judges this kind (A-297, A-416): every request and the cycle, a whole edit and merge. Not the
+  /// round, which holds as many edits and merges as its conflicts make, so its time grows with the conflict rate the
+  /// hot set sets rather than with any one request's.
+  fn judged(self) -> bool {
+    self != Kind::Round
+  }
 }
 
 /// What a client is doing.
@@ -490,7 +509,32 @@ fn slot_bytes(agent: usize, round: usize, shared: bool) -> Vec<u8> {
   bytes
 }
 
-/// One round's slots for one client: `EDITS_PER_ROUND` distinct `(file, slot)` pairs.
+/// The level's hot set (the module's "The workload"): `hot_files` distinct indices into the `eligible` files, drawn
+/// without replacement by the plan's own draws (the first `hot_files` places of a Fisher–Yates shuffle), or why there
+/// can be none. A hot pick is uniform over the set's entries, so a file drawn twice was twice as hot as the rest: 800
+/// draws with replacement over `kernel/`'s 700-odd eligible files named every file, some three to five times, and 19 to
+/// 28 of 1,000 clients starved (the Mac Studio, 2026-11-18). And a set of more than one `HOT_SET_SHARE_DIVISOR`th of
+/// the eligible files leaves the whole tree's picks no longer mostly outside it, so it is refused, never shrunk: a run
+/// is what its arguments say or does not run.
+fn hot_set(rng: &mut Rng, eligible: usize, hot_files: usize) -> Result<Vec<usize>, String> {
+  if hot_files > eligible / HOT_SET_SHARE_DIVISOR {
+    return Err(format!(
+      "--hot-files {hot_files} is more than 1/{HOT_SET_SHARE_DIVISOR} of the {eligible} files long enough to edit: a hot set is at most {} of them",
+      eligible / HOT_SET_SHARE_DIVISOR
+    ));
+  }
+  let mut order: Vec<usize> = (0..eligible).collect();
+  for place in 0..hot_files {
+    let rest = u64::try_from(eligible - place).map_err(|e| e.to_string())?;
+    let drawn = place + usize::try_from(rng.below(rest)).map_err(|e| e.to_string())?;
+    order.swap(place, drawn);
+  }
+  order.truncate(hot_files);
+  Ok(order)
+}
+
+/// One round's slots for one client: `EDITS_PER_ROUND` distinct `(file, slot)` pairs. With no hot set every pick is
+/// from the whole tree.
 fn plan_round(
   rng: &mut Rng,
   files: &[(String, u64)],
@@ -500,7 +544,7 @@ fn plan_round(
 ) -> Vec<Slot> {
   let mut picked: BTreeSet<(usize, u64)> = BTreeSet::new();
   while picked.len() < EDITS_PER_ROUND {
-    let file = if rng.below(PERMILLE) < HOT_PERMILLE {
+    let file = if !hot.is_empty() && rng.below(PERMILLE) < HOT_PERMILLE {
       hot[usize::try_from(rng.below(hot.len() as u64)).unwrap()]
     } else {
       usize::try_from(rng.below(files.len() as u64)).unwrap()
@@ -1659,10 +1703,11 @@ fn verdicts(tally: &Tally) -> u64 {
 }
 
 /// The level judged against the bound (the module's "The bound"; Ada's decision of 2026-11-18): the bound and the
-/// verdicts a second it is stated at; the level's own verdicts a second; the worst p99 of every kind, each attempt's
-/// (`latency`) and each operation's (`operation`), with its row and kind; the clients held, time-averaged as in the
-/// `offered` row, whose wait no latency row holds; the clients given up or starved; the oracle's failures; and
-/// `met\tyes` when the level met the bound, else `met\tno`. A level that timed nothing meets nothing.
+/// verdicts a second it is stated at; the level's own verdicts a second; the worst p99 of every judged kind
+/// ([`Kind::judged`]: every request and the cycle, not the round), each attempt's (`latency`) and each operation's
+/// (`operation`), with its row and kind; the clients held, time-averaged as in the `offered` row, whose wait no latency
+/// row holds; the clients given up or starved; the oracle's failures; and `met\tyes` when the level met the bound,
+/// else `met\tno`. A level that timed nothing meets nothing.
 fn bound_row(n: usize, wall_ns: u64, tally: &Tally, oracle_failures: u64) -> String {
   let verdicts_per_s = per_second(verdicts(tally), wall_ns);
   let worst = [
@@ -1671,11 +1716,14 @@ fn bound_row(n: usize, wall_ns: u64, tally: &Tally, oracle_failures: u64) -> Str
   ]
   .into_iter()
   .flat_map(|(row, kinds)| {
-    kinds.iter().map(move |(kind, samples)| {
-      let mut sorted = samples.clone();
-      sorted.sort_unstable();
-      (percentile(&sorted, BOUND_PERMILLE), row, *kind)
-    })
+    kinds
+      .iter()
+      .filter(|(kind, _)| kind.judged())
+      .map(move |(kind, samples)| {
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        (percentile(&sorted, BOUND_PERMILLE), row, *kind)
+      })
   })
   .max();
   let gave_up = tally
@@ -1926,9 +1974,13 @@ fn level(
     return 1;
   };
   let mut rng = Rng(SEED ^ n as u64);
-  let hot: Vec<usize> = (0..hot_files)
-    .map(|_| usize::try_from(rng.below(eligible.len() as u64)).unwrap())
-    .collect();
+  let hot = match hot_set(&mut rng, eligible.len(), hot_files) {
+    Ok(hot) => hot,
+    Err(why) => {
+      println!("refused\t{n}\t{why}");
+      return 1;
+    }
+  };
   let plans: Vec<Vec<Vec<Slot>>> = (0..n)
     .map(|agent| {
       (0..rounds)
@@ -2592,6 +2644,90 @@ mod tests {
       "{empty:?}"
     );
     assert!(empty.ends_with("\tmet\tno"), "{empty:?}");
+  }
+
+  /// AC-9.1 (A-416): a round, which holds as many edits and merges as its conflicts make, is reported and never judged:
+  /// a level whose rounds' p99 is 191 ms (the Mac Studio's at 1,000 clients, 2026-11-18) with every request and cycle
+  /// under the bound meets it, naming a judged kind as its worst; a cycle over the bound, a whole edit and merge, fails
+  /// it and is named.
+  #[test]
+  fn a_round_is_reported_and_not_judged_and_a_cycle_is_judged() {
+    let mut tally = tally_of(1_000, 400_000, 90_000);
+    for _ in 0..100 {
+      record(&mut tally, Kind::Round, 191_000_000);
+      record(&mut tally, Kind::Cycle, 900_000);
+    }
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
+    assert!(
+      row.contains("\tworst\tlatency\tCycle\tworst_p99_ns\t900000\t"),
+      "{row:?}"
+    );
+    assert!(row.ends_with("\tmet\tyes"), "{row:?}");
+    for _ in 0..100 {
+      record(&mut tally, Kind::Cycle, 1_200_000);
+    }
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
+    assert!(
+      row.contains("\tworst\tlatency\tCycle\tworst_p99_ns\t1200000\t"),
+      "{row:?}"
+    );
+    assert!(row.ends_with("\tmet\tno"), "{row:?}");
+  }
+
+  /// Shape: the eligible files of the hot-set tests, about as many as `fs/` of linux v7.4-rc1 holds (2,365 files).
+  const ELIGIBLE: usize = 2_000;
+  /// Shape: the hot set the 1,000-client rung asks for (`--hot-files 800`).
+  const RUNG_HOT_FILES: usize = 800;
+
+  /// The module's "The workload": a hot set names each file once, inside the eligible files, and the same seed draws
+  /// the same set. Drawn with replacement, 800 draws over 2,000 files name only about 660 of them, so about 140 draws
+  /// repeat a file, each such file twice as hot as the rest of the set.
+  #[test]
+  fn a_hot_set_names_each_file_once() {
+    let hot = hot_set(&mut Rng(SEED), ELIGIBLE, RUNG_HOT_FILES).unwrap();
+    let distinct: BTreeSet<usize> = hot.iter().copied().collect();
+    assert_eq!(hot.len(), RUNG_HOT_FILES);
+    assert_eq!(distinct.len(), RUNG_HOT_FILES, "a file named twice");
+    assert!(hot.iter().all(|file| *file < ELIGIBLE));
+    assert_eq!(
+      hot_set(&mut Rng(SEED), ELIGIBLE, RUNG_HOT_FILES).unwrap(),
+      hot
+    );
+    let all = hot_set(&mut Rng(SEED), ELIGIBLE, ELIGIBLE / HOT_SET_SHARE_DIVISOR).unwrap();
+    let distinct: BTreeSet<usize> = all.iter().copied().collect();
+    assert_eq!(distinct.len(), ELIGIBLE / HOT_SET_SHARE_DIVISOR);
+  }
+
+  /// The module's "The workload": a hot set past half the files long enough to edit is refused, never shrunk to fit
+  /// (`kernel/`'s 700-odd files and the rung's 800 named every file hot); exactly half is a hot set.
+  #[test]
+  fn a_hot_set_past_half_the_eligible_files_is_refused() {
+    let why = hot_set(&mut Rng(SEED), 701, RUNG_HOT_FILES).unwrap_err();
+    assert!(
+      why.contains("--hot-files 800") && why.contains("701"),
+      "{why}"
+    );
+    assert!(hot_set(&mut Rng(SEED), 701, 351).is_err());
+    assert_eq!(hot_set(&mut Rng(SEED), 701, 350).unwrap().len(), 350);
+    assert_eq!(hot_set(&mut Rng(SEED), 1, 0).unwrap(), Vec::<usize>::new());
+  }
+
+  /// The module's "The workload": with no hot set (`--hot-files 0`) every pick is from the whole tree, and no shared
+  /// slot is written; it indexed an empty set before.
+  #[test]
+  fn with_no_hot_set_every_pick_is_from_the_whole_tree() {
+    let files: Vec<(String, u64)> = (0..ELIGIBLE)
+      .map(|file| (format!("/f{file}"), SLOTS_PER_FILE * SLOT_STRIDE))
+      .collect();
+    let mut rng = Rng(SEED);
+    let shared = slot_bytes(0, 0, true);
+    for agent in 0..RUNG_HOT_FILES {
+      let slots = plan_round(&mut rng, &files, &[], agent, 0);
+      assert_eq!(slots.len(), EDITS_PER_ROUND);
+      for slot in slots {
+        assert_ne!(slot.bytes, shared, "a shared slot with no hot set");
+      }
+    }
   }
 
   /// Shape: shards of the stamp tests' daemon: one, so a request is served on the shard that reads its slot, and holding

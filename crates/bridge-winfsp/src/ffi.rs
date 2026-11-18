@@ -462,28 +462,51 @@ fn load_library() -> Option<windows_sys::Win32::Foundation::HMODULE> {
 const DEVELOPER_MODE_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock";
 /// Format: see [`DEVELOPER_MODE_KEY`].
 const DEVELOPER_MODE_VALUE: &str = "AllowDevelopmentWithoutDevLicense";
+/// Format: the word [`DEVELOPER_MODE_VALUE`] holds while Developer Mode is on.
+const DEVELOPER_MODE_ON: u32 = 1;
+/// Format: the value WinFsp's driver reads under [`REGISTRY_KEY`] (its `FSP_REGKEY`, `\Registry\Machine\Software\
+/// WOW6432Node\WinFsp` on every 64-bit Windows, arm64 included: WinFsp v2.1 `src/sys/driver.h`) each time a volume asks
+/// it for a Mount Manager drive (`FspVolumeUseMountmgr`, `src/sys/volume.c`), the request every slates mount makes
+/// (A-369).
+const MOUNT_MANAGER_VALUE: &str = "MountUseMountmgrFromFSD";
+/// Format: the one word [`MOUNT_MANAGER_VALUE`] lets the drive be made at: the driver refuses `STATUS_ACCESS_DENIED`
+/// when the read fails, the value is not a `REG_DWORD`, or it is anything but 1 (`src/sys/volume.c`).
+const MOUNT_MANAGER_ALLOWED: u32 = 1;
 
 /// Whether Developer Mode is on (A-275), read at each symbolic link set, which is rare: a link may be made without
 /// `SeCreateSymbolicLinkPrivilege` while it is. An unreadable value is off.
 pub(crate) fn developer_mode() -> bool {
+  machine_word(DEVELOPER_MODE_KEY, DEVELOPER_MODE_VALUE) == Some(DEVELOPER_MODE_ON)
+}
+
+/// Whether this machine lets WinFsp's driver make a Mount Manager drive for a volume that an unprivileged process
+/// serves (A-369, A-417): the driver's own rule over the value it reads at every such mount, so the answer is the one
+/// the mount would meet. Read at each call, since an Administrator may set it while a host runs.
+pub(crate) fn mount_manager_allowed() -> bool {
+  machine_word(REGISTRY_KEY, MOUNT_MANAGER_VALUE) == Some(MOUNT_MANAGER_ALLOWED)
+}
+
+/// The `REG_DWORD` named `name` under `key` in `HKEY_LOCAL_MACHINE`, or `None` when it cannot be read: missing, of
+/// another type (`RRF_RT_REG_DWORD` refuses every other, as WinFsp's driver does), or refused.
+fn machine_word(key: &str, name: &str) -> Option<u32> {
   use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
-  let key = wide(DEVELOPER_MODE_KEY);
-  let value = wide(DEVELOPER_MODE_VALUE);
+  let key = wide(key);
+  let name = wide(name);
   let mut word = 0u32;
-  let mut bytes = u32::try_from(size_of::<u32>()).unwrap_or(0);
-  // SAFETY: `key` and `value` are NUL-terminated; `word` holds `bytes` bytes, the most the call writes.
+  let mut bytes = u32::try_from(size_of::<u32>()).ok()?;
+  // SAFETY: `key` and `name` are NUL-terminated; `word` holds `bytes` bytes, the most the call writes.
   let status = unsafe {
     RegGetValueW(
       HKEY_LOCAL_MACHINE,
       key.as_ptr(),
-      value.as_ptr(),
+      name.as_ptr(),
       RRF_RT_REG_DWORD,
       std::ptr::null_mut(),
       std::ptr::from_mut(&mut word).cast(),
       &mut bytes,
     )
   };
-  status == 0 && word == 1
+  (status == 0).then_some(word)
 }
 
 /// The install directory WinFsp's installer recorded (with its trailing separator), or `None`.

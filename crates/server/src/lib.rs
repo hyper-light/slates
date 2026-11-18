@@ -80,6 +80,7 @@ pub mod landing;
 mod landing_entries;
 pub mod lease;
 mod lease_wait;
+mod live_hold;
 mod live_ship;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).

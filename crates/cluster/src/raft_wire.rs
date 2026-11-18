@@ -726,12 +726,15 @@ const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// way, `LengthMismatch` the other), and a change that kept the length would have been read with a field defaulted
 /// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
 /// kept, and A-291's when no object is moved, which only the version tells apart.
+/// Format: the regional layout's version, raised with each change of its fields' meaning (4 since A-291).
 const REGIONAL_LAYOUT: u32 = 4;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
-/// Format: the root configuration's layout version: 1, the first versioned layout.
-const ROOT_LAYOUT: u32 = 1;
+/// Format: the root configuration's layout version: 2 since A-406, which appended the root group's recorded voters
+/// (`voters`, a host set) after the promotions. Layout 1 was the first versioned layout. A decoder refuses any other by
+/// name ([`RaftWireError::LayoutVersion`]).
+const ROOT_LAYOUT: u32 = 2;
 
 /// Reads a configuration's magic and layout version and refuses either when it is not `(magic, layout)`, by name.
 fn take_layout(bytes: &[u8], (magic, layout): (u32, u32)) -> Result<&[u8], RaftWireError> {
@@ -1088,7 +1091,7 @@ fn decode_domains(
 /// [`encode_regional_configuration`], carried when a region catches up on the root group's committed state
 /// (§4.8, D-14). Little-endian throughout, each collection as a count then its entries, so two nodes encode
 /// it identically: its magic and layout version ([`ROOT_MAGIC`], [`ROOT_LAYOUT`]), the version, the regions, the moved
-/// homes (`(volume, region)` each), and the promotions (`(lost, mirror)` each).
+/// homes (`(volume, region)` each), the promotions (`(lost, mirror)` each), and the recorded voters (A-406).
 pub fn encode_root_configuration(config: &RootConfiguration) -> Vec<u8> {
   let mut out = Vec::new();
   put_u32(&mut out, ROOT_MAGIC);
@@ -1117,6 +1120,7 @@ pub fn encode_root_configuration(config: &RootConfiguration) -> Vec<u8> {
     put_u64(&mut out, lost.0);
     put_u64(&mut out, mirror.0);
   }
+  encode_hosts(&mut out, &config.voters);
   out
 }
 
@@ -1130,12 +1134,14 @@ pub fn decode_root_configuration(bytes: &[u8]) -> Result<RootConfiguration, Raft
   let (regions, rest) = decode_regions(rest)?;
   let (homes, rest) = decode_homes(rest)?;
   let (promotions, rest) = decode_promotions(rest)?;
+  let (voters, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
   Ok(RootConfiguration {
     version,
     regions,
     homes,
     promotions,
+    voters,
   })
 }
 
@@ -2116,13 +2122,14 @@ mod tests {
     );
   }
 
-  /// A root configuration round-trips through encode/decode unchanged — regions, moved homes and promotions —
-  /// so a region decodes exactly what the root group encoded.
+  /// A root configuration round-trips through encode/decode unchanged — regions, moved homes, promotions and the
+  /// recorded voters (A-406) — so a region decodes exactly what the root group encoded.
   #[test]
   fn a_root_configuration_round_trips() {
     let mut config = RootConfiguration::formed(vec![RegionId(0), RegionId(1), RegionId(2)]);
     assert!(config.move_home(ObjectId::new(HostId(1), 7), RegionId(1)));
     assert!(config.promote_region(RegionId(2), RegionId(0)));
+    assert!(config.seat(&[HostId(5), HostId(1)]));
     let bytes = encode_root_configuration(&config);
     assert_eq!(
       decode_root_configuration(&bytes),
@@ -2171,9 +2178,9 @@ mod tests {
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
         Some(b"RCFG\x04\x00\x00\x00".as_slice()),
-        Some(b"RTCF\x01\x00\x00\x00".as_slice())
+        Some(b"RTCF\x02\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 4 since A-291, which gave each moved object its member left and cohort (3 since A-380, 2 since A-309)"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 4 since A-291, which gave each moved object its member left and cohort (3 since A-380, 2 since A-309); the root one's 2 since A-406, which added the recorded voters"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
