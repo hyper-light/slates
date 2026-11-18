@@ -10000,8 +10000,46 @@ Open:
   against a ledger of the send in flight (A-113) before it may resume one.
 - The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
   so it waits for Ada.
+  - **2026-11-18 (g079), Ada's go.** On Adas-Mac-Studio-2 (b24c5c95: M4 Max, macOS 26.2, no memory tagging),
+    17 `SIGKILL`s over two runs of `docs/wip/bench/kill_fsync_macos.sh` with main's binary and its traced build caused
+    no panic and no reconnect (one held connection each).
+  - The next run, with A-358's binary, lost the machine right after its first kill, at 15:25:39.688 UTC. It answered no
+    ping and waits at FileVault's unlock screen. A panic is suspected and not yet read.
+  - Its report (`/Library/Logs/DiagnosticReports/panic-full-*.panic`) is the next step: the GAPS entry below.
 
-### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (open)
+### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; the kernel-client run with the fix open)
+
+> **2026-11-18 (g079): reproduced through Apple's kernel client, traced, and fixed server-side (A-358).**
+> - **Machine.** Adas-Mac-Studio-2 (kiln b24c5c95): M4 Max, macOS 26.2 (25C56), xnu-12377.61.12, NFS kext
+>   B922B1FE-2CDC-3A5B-8757-37D99A870355. `docs/wip/bench/kill_fsync_macos.sh` (new) is `kill_fsync.sh`'s writer and
+>   killer through `slates mount`; afterwards an unmount while a daemon serves, a mount again, and every file read back.
+>
+> | binary | kills | files checked | intact | empty | missing | resurrected | panics |
+> |---|---|---|---|---|---|---|---|
+> | main `1cd57d18b` | 2 | 3,025 | 3,024 | 1 | 0 | 0 | 0 |
+> | main + one line per NFS call (`59c43709c`) | 15 | 6,607 | 6,606 | 1 | 0 | 0 | 0 |
+>
+> - **The cause, from the per-call log.** The empty file's only WRITE was answered `UNSTABLE` by daemon D1, and D1 was
+>   killed 5 ms later, before any publication carried the bytes. D2 answered the COMMIT with a new write verifier, as
+>   RFC 1813 §3.3.7 asks, and Apple's client never wrote the bytes again. Its `fsync` and `close` returned 0.
+>   - Over the run, 3 COMMITs answered a verifier other than their WRITE's, and 0 were followed by a WRITE.
+>   - All 17,631 COMMITs started where their WRITE's bytes ended, and all 19,324 WRITEs asked for `UNSTABLE`.
+>   - So it is Apple's client, and not its reconnect path (A-113 holds the connection: no reconnects).
+>   - Bug record: docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md.
+> - **The fix (A-358).** Every WRITE is published before its reply, whatever stability it asked for. The reply still
+>   says what was asked, and only a stability claim waits for a live-shipped volume's candidates.
+>   - `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite` (`crates/cli/tests/nfs_held.rs`) plays Apple's
+>     client. It lost 6 of 6 files on main (0 of 52,177 bytes each) and 0 of 6 with the fix; all 6 COMMITs met a
+>     successor's verifier.
+>   - With the fix (d1323898, 2026-11-18): `nfs_held` 6/6, the live-shipped v4 COMMIT flow 1/1, `nfs_writeback` 7/7,
+>     `nfs_mount` 40/40, the recovery tests on acknowledged content and retried compounds 2/2, the server's nfs unit
+>     tests 10/10, bridge-nfs `procedures` 52/52, and the v4 COPY test 1/1.
+> - **Open: the kernel client with the fix.** Its first run (8 rounds of 15 kills planned) lost the machine right after
+>   its first kill: b24c5c95 went offline about 15:26 UTC and answered no ping. FileVault holds it at the unlock screen.
+>   Next steps, in order:
+>   1. Parse its panic report (the A-113 entry above).
+>   2. Run the round again, its log streamed without a filter (that run's was behind a block-buffered `grep`).
+>   3. Close this entry with the counts.
 
 > **2026-11-06 (bug-sweep): not reproduced server-side by the Linux kernel client.** The 10-06 run, step for step:
 > files of 100 B to 300 KB written whole and fsynced, each hashed only once its fsync returned, an old one deleted every
