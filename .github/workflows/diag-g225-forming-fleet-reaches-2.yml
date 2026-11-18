@@ -1,0 +1,89 @@
+name: DIAG g225 the learner and fresh-member fleet tests looped at one CPU, main against A-331 (not for main)
+
+# Diagnostics branch of g225 (a forming fleet reaches every candidate); never merged. It looks for the 409 s learner stall
+# (`a_learner_fetches_the_councils_committed_configuration_over_the_transport` silent for 4,000 periods on Windows arm64,
+# nightly 42609672766, 2026-11-09, before its waits were bounded) and for the learner and fresh-member waits that have
+# given up since, by looping them under load: each test alone in its process, pinned with its daemons to CPU 0 beside two
+# busy loops there. Two arms, interleaved per round, the first swapped between samples: before = origin/main 1e8f4a49e,
+# after = A-331 on it (agents/g225-forming-fleet-reaches-formation a14faa448). Every give-up prints its site, verdict,
+# wall time, each daemon's period advance and pulses (936e888bd); a failure keeps its last 150 lines.
+
+on:
+  push:
+    branches: [diag-g225-forming-fleet-reaches-2]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  loop:
+    name: ${{ matrix.os }} sample ${{ matrix.sample }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        sample: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The before arm's tree
+        run: |
+          git worktree add -q ../before 1e8f4a49e5e160b00c9849305054c1923ddeec15
+          git -C ../before log -1 --oneline
+          git log -1 --oneline
+      - name: Build both arms' fleet test binary
+        run: |
+          CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-after cargo test --locked -p slates-server --test fleet --no-run
+          (cd ../before && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-before cargo test --locked -p slates-server --test fleet --no-run)
+      - name: Interleaved runs at one CPU
+        shell: bash
+        run: |
+          set +e +o pipefail
+          R=$GITHUB_WORKSPACE/../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), after $(git rev-parse --short=9 HEAD), before $(git -C ../before rev-parse --short=9 HEAD), sample ${{ matrix.sample }}" > $R
+          bin_of() { ls -t $GITHUB_WORKSPACE/../$1/debug/deps/fleet-* | grep -v '\.d$' | head -1; }
+          AFTER=$(bin_of t-after); BEFORE=$(bin_of t-before)
+          echo "before $BEFORE" >> $R; echo "after $AFTER" >> $R
+          if [ $(( ${{ matrix.sample }} % 2 )) -eq 0 ]; then ORDER="after before"; else ORDER="before after"; fi
+          TESTS="a_learner_fetches_the_councils_committed_configuration_over_the_transport
+          a_learner_learns_configurations_that_leave_the_membership_alone
+          a_learner_learns_configurations_once_the_voter_it_joined_from_is_gone
+          a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone
+          a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone
+          a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss"
+          for round in 1 2 3; do
+            for arm in $ORDER; do
+              if [ $arm = after ]; then BIN=$AFTER; else BIN=$BEFORE; fi
+              for t in $TESTS; do
+                LOADPG=""
+                for i in 1 2; do setsid taskset -c 0 bash -c 'while :; do :; done' & LOADPG="$LOADPG $!"; done
+                started=$(date +%s)
+                status=0
+                timeout 900 taskset -c 0 "$BIN" --exact "$t" --nocapture --test-threads=1 > ../run.log 2>&1 || status=$?
+                took=$(( $(date +%s) - started ))
+                for g in $LOADPG; do kill -KILL -- -$g 2>/dev/null; done
+                wait 2>/dev/null
+                echo "RUN round=$round arm=$arm status=$status took=${took}s load=$(cut -d' ' -f1-3 /proc/loadavg) $t" >> $R
+                grep -E '^fleet wait gave up' ../run.log | cut -c1-20000 >> $R || true
+                if [ $status -ne 0 ]; then echo "-- failure lines ($t, $arm, round $round)" >> $R; grep -v 'holds HostId.*alive: None -> MemberState' ../run.log | tail -150 | cut -c1-20000 >> $R; fi
+              done
+            done
+          done
+          echo "SUMMARY" >> $R
+          grep '^RUN ' $R | awk '{print $3, $4, $NF}' | sort | uniq -c >> $R
+      - name: Copy the results into the workspace
+        if: always()
+        run: cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.os }}-${{ matrix.sample }}
+          path: results.txt
+          if-no-files-found: warn
