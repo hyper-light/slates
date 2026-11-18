@@ -1658,6 +1658,59 @@ mod imp {
       self.len == 0
     }
 
+    /// The section `section` names, one [`DaxObject::create`] made in another process of this daemon's line (the anchor
+    /// held a duplicate of it across its maker's death, [`DaxObject::held`], A-448, as A-365 holds a Unix object), of
+    /// which slates may map at most `most_views` ranges at once. Refused `NotADaxObject` unless the handle reaches the
+    /// whole section with the access slates works it by: a writable view of its last range maps, so it spans
+    /// [`super::dax_object_bytes`], and a duplicate that maps read and write and may ask the size is granted, which the
+    /// section's descriptor grants no handle lacking any of it (A-175). Any other layout is refused `OsRefused`, as
+    /// [`DaxObject::create`] refuses one. A commit is the section's, so every range its maker committed stays committed,
+    /// and its bytes are those its maker and its VMM stored. The handle keeps the access it was held with, and the
+    /// descriptor still refuses any duplicate of more.
+    pub fn adopt(
+      section: OwnedHandle,
+      most_views: usize,
+      layout: super::DaxLayout,
+    ) -> Result<DaxObject, MemError> {
+      if layout != super::DaxLayout::Identity {
+        return Err(MemError::OsRefused {
+          call: "a guarded DAX object off Linux",
+          code: None,
+        });
+      }
+      let len = super::dax_object_bytes();
+      let none = MemError::NotADaxObject { object_bytes: 0 };
+      // A duplicate of no more than its source's access is never checked against the descriptor, and one of more is
+      // refused by it: granted, the handle holds every access slates' own work and its handed duplicates take.
+      drop(
+        duplicate_here(
+          section.as_handle(),
+          FILE_MAP_READ | FILE_MAP_WRITE | SECTION_QUERY,
+        )
+        .map_err(|_| none.clone())?,
+      );
+      let last = len
+        .checked_sub(super::DAX_RANGE_BYTES)
+        .ok_or(none.clone())?;
+      let span = usize::try_from(super::DAX_RANGE_BYTES).map_err(|_| none.clone())?;
+      // Mapping reserves address space alone: nothing of the range is touched or committed, and the view goes at once.
+      drop(
+        SectionView::map_at(
+          section.as_handle(),
+          FILE_MAP_WRITE | FILE_MAP_READ,
+          last,
+          span,
+        )
+        .map_err(|_| none)?,
+      );
+      Ok(DaxObject {
+        section,
+        len,
+        views: BTreeMap::new(),
+        most_views,
+      })
+    }
+
     /// A duplicate of the section's handle in this process that maps it read alone, or read and write where
     /// `writable`, and may ask its size (`SECTION_QUERY`): what a VMM is handed, duplicated again into its process.
     /// The section's own handle never leaves the object.
@@ -1668,6 +1721,14 @@ mod imp {
         FILE_MAP_READ | SECTION_QUERY
       };
       duplicate_here(self.section.as_handle(), access)
+    }
+
+    /// A duplicate of the section's handle in this process for the anchor to hold across this process's death (A-448):
+    /// the access a successor's [`DaxObject::adopt`] takes, mapping read and write and asking the size, a writable ask's
+    /// ([`DaxObject::handed`]). The anchor duplicates it with the same access, and the section's descriptor lets it, or
+    /// the successor it hands it to, widen it no more than any holder.
+    pub fn held(&self) -> Result<OwnedHandle, MemError> {
+      self.handed(true)
     }
 
     /// How many ranges slates maps now.

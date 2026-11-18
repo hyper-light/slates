@@ -801,8 +801,16 @@
 >   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
 >   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
 >   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
->   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
->   first map). **Built since (A-402, 2026-11-18):** the write log on
+>   `{resync}` stands; and its DAX sections (A-448, the same day): the anchor holds a duplicate of each section a
+>   resynced stream's guest maps (read, write and query, under the section's confining descriptor) before the answer
+>   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
+>   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
+>   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
+>   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
+>   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
+>   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
+>   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:

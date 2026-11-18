@@ -1,6 +1,6 @@
-//! A shard's DAX range table in anchor-owned RAM (§4.6, the Shards form; A-365): each range a Shards stream's held DAX
-//! backing has answered, with whether it was asked writable, so a successor daemon knows what of each object the anchor
-//! held across the death is the file's and what the guest may have stored into.
+//! A shard's DAX range table in anchor-owned RAM (§4.6, the Shards form; A-365; Windows' sections, A-448): each range a
+//! Shards stream's held DAX backing has answered, with whether it was asked writable, so a successor daemon knows what of
+//! each object the anchor held across the death is the file's and what the guest may have stored into.
 //!
 //! **Why a successor needs it.** A backing is filled a range at a time, as a guest asks (`slates_bridge_core::
 //! dax_backing`). A successor that adopts the object must ingest the ranges asked writable, where the guest's stores

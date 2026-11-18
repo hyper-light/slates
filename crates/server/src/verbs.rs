@@ -15480,13 +15480,10 @@ pub(crate) async fn rebuild_recovered(
   slices.unit_done().await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
   // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
-  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365), in one ascending order of
-  // their backings' handles (A-389).
-  #[cfg(unix)]
-  {
-    rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
-    slices.unit_done().await;
-  }
+  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365; Windows' sections, A-448), in
+  // one ascending order of their backings' handles (A-389).
+  rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
+  slices.unit_done().await;
   // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
   // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
   rebuilt.writes_replayed = replay_writes(state, slices).await;

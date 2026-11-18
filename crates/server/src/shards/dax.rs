@@ -42,7 +42,8 @@
 //! claimant that fails is refused `EACCES`, counted `shards.dax_claim_refused`, and nothing is put into its process. The
 //! duplicate maps read alone, or read and write for a writable ask, and its section's descriptor lets no holder widen
 //! it (A-175's discipline). A hand-off the OS refuses at the end is refused `EIO`, counted
-//! `shards.dax_hand_refused`.
+//! `shards.dax_hand_refused`. On a stream whose resync the anchor holds, the answer waits for the anchor to hold the
+//! section (A-448, `super::dax_hold::hold_owed`), so a successor takes it back as Unix's takes an object (A-365).
 //!
 //! An answered ask counts `shards.dax_answered`; an ingest's written runs `shards.dax_ingested`, and one the bridge
 //! refused `shards.dax_ingest_refused`. A refilled backing counts `shards.dax_refilled`; a range the volume refused to
@@ -325,17 +326,19 @@ fn answer(s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor, ino
   super::keep_resync_through_dax(s, stream, inode);
 }
 
-/// Answers the filled ask with the value of the section's duplicate in the claimant's process (Windows), and remembers
-/// the claimant as a holder; the daemon's own duplicate closes here. With no claimant (never expected: every ask is
-/// claimed before it is taken), or the OS refusing the duplicate, the ask is refused `EIO`, counted. A section handed
-/// gives the stream's resync up (A-427): its guest's stores through it live where only the device maps them once this
-/// daemon is gone.
+/// Answers the filled ask of `inode` with the value of the section's duplicate in the claimant's process (Windows), and
+/// remembers the claimant as a holder; the daemon's own duplicate closes here. With no claimant (never expected: every
+/// ask is claimed before it is taken), or the OS refusing the duplicate, the ask is refused `EIO`, counted. The guest's
+/// stores through a section handed live where only the device maps them once this daemon is gone, so a stream whose
+/// resync the anchor holds keeps what a successor needs to take it back, as on Unix: the anchor holds the section,
+/// asked before the answer goes out, and the range table records the ranges answered (A-448); where either is refused,
+/// the stream gives its resync up.
 #[cfg(windows)]
 fn answer(
   s: &mut ShardState,
   stream: &mut ShardsStream,
   handed: slates_vfs::shards_backing::HandedObject,
-  _inode: Option<u64>,
+  inode: Option<u64>,
 ) {
   use std::os::windows::io::AsHandle;
   let value = stream.claimant.take().and_then(|claimant| {
@@ -349,7 +352,7 @@ fn answer(
         stream,
         &slates_bridge_fuse::shards_fs::descriptor_handle_answer(value),
       );
-      super::give_up_resync_for_dax(s, stream);
+      super::keep_resync_through_dax(s, stream, inode);
     }
     None => {
       owe(
@@ -372,18 +375,16 @@ fn refuse(s: &mut ShardState, stream: &mut ShardsStream, refused: &Refused) {
 }
 
 /// Lets go of `inode`'s backing on `stream`, if it has one, and gives its charge back: the guest forgot the node. What
-/// the anchor held of it for a successor goes too (A-365).
+/// the anchor held of it for a successor goes too (A-365; Windows, A-448).
 pub(super) fn release(s: &mut ShardState, stream: &mut ShardsStream, inode: u64) {
   stream.dax.release(&mut s.store.shards_backings, inode);
-  #[cfg(unix)]
   super::dax_hold::let_go(s, stream, inode);
 }
 
 /// Lets go of every backing on `stream`, and of its pending fill and ingest: the stream ended. What the anchor held of
-/// them for a successor goes too (A-365).
+/// them for a successor goes too (A-365; Windows, A-448).
 pub(super) fn release_all(s: &mut ShardState, stream: &mut ShardsStream) {
   stream.dax.release_all(&mut s.store.shards_backings);
-  #[cfg(unix)]
   super::dax_hold::let_go_all(s, stream);
 }
 
