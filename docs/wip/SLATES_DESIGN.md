@@ -30412,6 +30412,37 @@ no new contract number); `unsafe-budget.toml` (`slates-ipc` 139 → 140); and:
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
 {told,state,daemon,virtiofs,verbs}.rs`.
 
+### A-432 — The reaper's cleanup calls and a granted landing's lease and audit waits wait in their target's own time; the live log's admission, reconciliation and dispatch waits are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-426)
+
+- **What was there.** Fifteen of the cross-shard calls A-408 left (g255's list at main 4553e8650) waited their budget on
+  the wall. The reaper's five (`reap::remove_on_owners`: a client's held maps written back, its presentations
+  abandoned, its attachments read and removed a batch at a time, its maps let go) waited the liveness window each, and a
+  shard alive and busy deferred the reap `Overloaded`, the next sweep sending the same write-back again beside the
+  first. A granted landing's five (`landing.rs`: the target lease's take, its compensation, its renewal between
+  slices, its release before the reply, and the audit append the reply waits on, A-265) waited the lease's term, so a
+  busy control shard refused the take `Overloaded` after a compensation, left a lease to its term, or sent a reply
+  without its audit record. The live log's five (`live_ship.rs`) waited a record period or the live budget.
+- **The rule.** The reaper's and the landing's calls wait by `xshard::call_in_shard_time` and `task_in_shard_time`
+  (A-65's rule, as A-403 and A-408): their budget's window, then on while the target works or waits for a CPU, until it
+  has run the budget's CPU (held to this build), so only a target that stopped, or ran its budget without answering,
+  ends the wait with the same typed refusal as before. A take run past its own deadline still refuses itself
+  (`take_target_lease`), so a take waited longer is answered or refused typed, never left unknown. The live log's
+  waits stay on the wall, each for a stated reason beside it: a claim admission (`admit_claim`, `serve_admit`) runs
+  inside the record plane's serve of a peer's message, which serves that peer one request at a time, and its owner asks
+  again at the record period (`ADMISSION_WAIT_NS`), while the admission's closure, idempotent, still runs on its shard;
+  the claim reconciliation and re-admission (`reconcile_claims`, `readmit`) run in the control shard's record period
+  before its materializations, a shard unanswered staying marked for the next; and the live dispatch's wait
+  (`send_from_control`) has lanes bounded on the wall by the live budget and an answer nothing reads, and bounds how
+  long the owner's task that sent it stays, a lane being taken free again at the same bound.
+- **Tests.** `a_reaps_calls_wait_for_a_shard_that_works_past_their_first_window` (`reap.rs`) and
+  `a_lease_take_waits_for_a_control_shard_that_works_past_its_term` (`landing.rs`): a two-shard daemon whose second
+  shard runs one poll of three windows on the wall, on its CPU a fifth of it (`daemon::hold_busy`), the reap and the take
+  sent behind it. Red: each waited one window on the wall, the reap deferred `Overloaded` and the take refused
+  `Overloaded` with its lease released by its compensation.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{reap,landing,
+live_ship,daemon}.rs`.
+
 ### A-434 — A work's verb held for its quorum commit, or for its work's route, waits the failover delay, a held reply's total (2026-11-18, built for goal g255; R3's class B; AUD-11, A-247, A-298, A-354, A-363, A-375)
 - **What was there.** A work's verb whose verdict its green's owner takes to answer at its quorum commit (AUD-11), or
   that waits for its work's route to commit (A-298), was held up to the owner lease's bound (`lease::lease_bound_ns`,
