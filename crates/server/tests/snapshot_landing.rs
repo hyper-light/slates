@@ -8,7 +8,6 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
 
 use std::net::TcpStream;
 
@@ -90,7 +89,7 @@ fn a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it() {
 
   let state = land(&mut client, &secret, volume, Some(snapshot), &target.path);
   assert_eq!(state, "done");
-  let landed = format!("{}/f", target.path);
+  let landed = std::path::Path::new(&target.path).join("f");
   assert_eq!(std::fs::read(&landed).unwrap(), SNAPSHOT_BYTES);
   let (mut stream, root) = mounted(&daemon);
   let file = lookup(&mut stream, &root, "f", 5);
@@ -169,7 +168,7 @@ fn a_landing_of_an_overlay_into_its_base_serves_both_files_afterwards() {
   let state = land(&mut client, &secret, volume, None, &target.path);
   assert_eq!(state, "done");
   assert_eq!(
-    std::fs::read(format!("{}/new", target.path)).unwrap(),
+    std::fs::read(std::path::Path::new(&target.path).join("new")).unwrap(),
     NEW_BYTES
   );
   let (mut stream, root) = mounted_overlay(&daemon);
@@ -236,7 +235,7 @@ fn a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_
   let mut expected = original.clone();
   expected[..NEW_BYTES.len()].copy_from_slice(NEW_BYTES);
   assert_eq!(
-    std::fs::read(format!("{}/large", target.path)).unwrap(),
+    std::fs::read(std::path::Path::new(&target.path).join("large")).unwrap(),
     expected,
     "the edit, then the base's own bytes"
   );

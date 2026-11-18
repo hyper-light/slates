@@ -1683,6 +1683,37 @@ pub struct TakeoverReport {
   /// How many members the regional configuration holds: the council's committed membership, where the fleet
   /// block's `members` is the ones this node's detector holds alive.
   pub members: u64,
+  /// The last object each of this node's takeovers judged lost, with the cohort that fell short: one per
+  /// retirement whose takeover this node runs, so a takeover that counts `fleet.takeover.lost` says which members
+  /// it judged and why.
+  pub lost: Vec<LostReport>,
+}
+
+/// A takeover's judgement that an object is lost (§4.8 "Promotion and takeover"): one of its recovery cohorts had
+/// fewer members left than its recovery quorum.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LostReport {
+  /// The retired host whose takeover judged it.
+  pub departed: u64,
+  /// The object.
+  pub object: [u8; 16],
+  /// The recovery owner whose settled cohort fell short: `departed`, or a retired host whose takeover it had not
+  /// confirmed.
+  pub owner: u64,
+  /// The configuration version that retired `owner`.
+  pub retired_at: u64,
+  /// The configuration version `owner`'s settled neighbourhood was fixed at: the one the cohort came from.
+  pub settled_generation: u64,
+  /// The configuration version the judgement ran under.
+  pub configuration_version: u64,
+  /// The cohort's recovery quorum.
+  pub needed: u64,
+  /// The cohort's hosts that are members of that configuration.
+  pub current: Vec<u64>,
+  /// The cohort's hosts it keeps a retirement for.
+  pub retired: Vec<u64>,
+  /// The cohort's hosts it neither holds as members nor keeps a retirement for.
+  pub departed_hosts: Vec<u64>,
 }
 
 /// One retirement the configuration keeps (§4.8 "Promotion and takeover").

@@ -668,6 +668,26 @@ fn takeover_report(state: &ShardState) -> slates_ipc::protocol::TakeoverReport {
       .map_or(0, |neighbourhood| neighbourhood.generation),
     retirements,
     members: u64::try_from(regional.members.len()).unwrap_or(u64::MAX),
+    lost: state
+      .host_takeovers
+      .iter()
+      .filter_map(|(departed, take)| {
+        take
+          .last_lost()
+          .map(|judged| slates_ipc::protocol::LostReport {
+            departed: departed.0,
+            object: judged.object.0,
+            owner: judged.owner.0,
+            retired_at: judged.retired_at,
+            settled_generation: judged.settled_generation,
+            configuration_version: judged.configuration_version,
+            needed: u64::try_from(judged.needed).unwrap_or(u64::MAX),
+            current: ids(&judged.current),
+            retired: ids(&judged.retired),
+            departed_hosts: ids(&judged.departed),
+          })
+      })
+      .collect(),
   }
 }
 

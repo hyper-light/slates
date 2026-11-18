@@ -137,11 +137,71 @@ pub struct HostTakeover {
   adopted: BTreeSet<ObjectId>,
   /// The objects no survivor can recover.
   lost: BTreeSet<ObjectId>,
+  /// The last object this takeover judged lost and the cohort that fell short, kept across restarts for the
+  /// status report: the evidence for `fleet.takeover.lost`.
+  last_lost: Option<LostJudgement>,
   /// The highest fence a holder reported above the epoch; the next round runs above it.
   fenced: Option<HostEpoch>,
   /// Per learned object, the members that answered for it by name holding nothing of it (A-251 (b)): their promise of
   /// that object alone. A member's complete pages promise nothing of an object they did not list.
   named_nothing: BTreeMap<ObjectId, BTreeSet<HostId>>,
+}
+
+/// A takeover's judgement that an object is lost: the recovery cohort that had fewer members left than its
+/// recovery quorum, each of its hosts as the judging configuration holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LostJudgement {
+  /// The object.
+  pub object: ObjectId,
+  /// The recovery owner whose settled cohort fell short.
+  pub owner: HostId,
+  /// The configuration version that retired `owner`.
+  pub retired_at: u64,
+  /// The configuration version `owner`'s settled neighbourhood was fixed at: the one the cohort came from.
+  pub settled_generation: u64,
+  /// The configuration version the judgement ran under.
+  pub configuration_version: u64,
+  /// The cohort's recovery quorum.
+  pub needed: usize,
+  /// The cohort's hosts that are members.
+  pub current: Vec<HostId>,
+  /// The cohort's hosts the configuration keeps a retirement for.
+  pub retired: Vec<HostId>,
+  /// The cohort's hosts that are neither.
+  pub departed: Vec<HostId>,
+}
+
+impl LostJudgement {
+  /// Judges `cohort`, settled for `owner`, under `regional`: `None` while at least `needed` of its hosts are members.
+  fn of(
+    regional: &slates_db::register::RegionalConfiguration,
+    object: ObjectId,
+    owner: HostId,
+    cohort: &[HostId],
+  ) -> Option<LostJudgement> {
+    let needed = regional.quorum.recovery(cohort.len());
+    let (current, absent): (Vec<HostId>, Vec<HostId>) = cohort
+      .iter()
+      .partition(|host| regional.members.contains(host));
+    if current.len() >= needed {
+      return None;
+    }
+    let (retired, departed) = absent
+      .into_iter()
+      .partition(|host| regional.retired.contains_key(host));
+    let retirement = regional.retired.get(&owner);
+    Some(LostJudgement {
+      object,
+      owner,
+      retired_at: retirement.map_or(0, |kept| kept.version),
+      settled_generation: retirement.map_or(0, |kept| kept.settled.generation),
+      configuration_version: regional.version,
+      needed,
+      current,
+      retired,
+      departed,
+    })
+  }
 }
 
 /// One asked member's progress through its answer: the object its next page starts after, and whether its
@@ -162,6 +222,7 @@ impl HostTakeover {
       learned: BTreeMap::new(),
       adopted: BTreeSet::new(),
       lost: BTreeSet::new(),
+      last_lost: None,
       fenced: None,
       named_nothing: BTreeMap::new(),
     }
@@ -182,6 +243,11 @@ impl HostTakeover {
   /// The objects learned and not yet adopted.
   pub fn outstanding(&self) -> usize {
     self.learned.len()
+  }
+
+  /// The last object this takeover judged lost, and why.
+  pub fn last_lost(&self) -> Option<&LostJudgement> {
+    self.last_lost.as_ref()
   }
 }
 
@@ -929,7 +995,22 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::Lost { .. } => lost.push(*object),
+      // What was judged, named (the owner, its settled cohort, which of its hosts are members, retired or gone), so
+      // status and the log say why the object is lost (live-fixes, KIND diag-14; re-applied on A-251's readiness).
+      Readiness::Lost { cohort, .. } => {
+        let judged = regional
+          .recovery_owners(departed)
+          .get(cohort)
+          .copied()
+          .zip(cohorts.get(cohort))
+          .and_then(|(owner, hosts)| LostJudgement::of(&regional, *object, owner, hosts));
+        match judged {
+          Some(judgement) => lost.push(judgement),
+          // `readiness` and `LostJudgement::of` judge a cohort by one rule over one configuration, so this arm is the
+          // owners and cohorts disagreeing in length: the object waits, counted, rather than being judged blind.
+          None => unpromised = unpromised.saturating_add(1),
+        }
+      }
       Readiness::Waiting => unpromised = unpromised.saturating_add(1),
     }
   }
@@ -937,12 +1018,26 @@ pub(crate) fn ready_objects(
     let count = state.refusals.entry(TAKEOVER_UNPROMISED).or_insert(0);
     *count = count.saturating_add(unpromised);
   }
-  for object in lost {
-    take.learned.remove(&object);
-    if take.lost.insert(object) {
+  for judgement in lost {
+    take.learned.remove(&judgement.object);
+    if take.lost.insert(judgement.object) {
       let count = state.refusals.entry(TAKEOVER_LOST).or_insert(0);
       *count = count.saturating_add(1);
+      slates_machine::log_line!(
+        "slates-server: takeover: {departed:?}'s object {:?} lost: owner {:?}'s cohort settled at version {} (retired at {}) has {} of {} needed under version {}: current {:?}, retired {:?}, departed {:?}",
+        judgement.object,
+        judgement.owner,
+        judgement.settled_generation,
+        judgement.retired_at,
+        judgement.current.len(),
+        judgement.needed,
+        judgement.configuration_version,
+        judgement.current,
+        judgement.retired,
+        judgement.departed
+      );
     }
+    take.last_lost = Some(judgement);
   }
   ready
 }
@@ -1420,6 +1515,57 @@ mod tests {
       .and_then(|value| value.sealing)
       .map(|sealing| sealing.keys.iter().map(|key| key.anchor).collect())
       .unwrap_or_default()
+  }
+
+  /// §4.8 "Promotion and takeover", the evidence for `fleet.takeover.lost`: do judge an owner's settled cohort at f = 1
+  /// once the owner alone has retired, and once a second host of the cohort has retired too. Expect no judgement while
+  /// `cohort − f` of it are members, and then one naming the cohort's member, the two retired hosts, the quorum of
+  /// two, and the versions the cohort came from and was judged under.
+  #[test]
+  fn a_lost_judgement_names_the_cohort_that_fell_short() {
+    use slates_db::register::{Quorum, RegionalConfiguration};
+    let quorum = Quorum { f: 1 };
+    let scatter = 3;
+    let hosts: Vec<HostId> = (1..=5).map(HostId).collect();
+    let mut regional =
+      RegionalConfiguration::formed(hosts, quorum, BTreeMap::new(), scatter, false);
+    let owner = HostId(1);
+    let object = ObjectId([4; 16]);
+    assert!(regional.retire(owner, scatter));
+    let settled = regional.retired.get(&owner).unwrap().settled.clone();
+    let cohort = settled.cohort(owner, object, quorum);
+    assert_eq!(cohort.len(), 3, "the candidate floor at f = 1");
+    assert_eq!(
+      LostJudgement::of(&regional, object, owner, &cohort),
+      None,
+      "two of three are members: f + 1 can still promise"
+    );
+    let second = *cohort.iter().find(|host| **host != owner).unwrap();
+    assert!(regional.retire(second, scatter));
+    let judged = LostJudgement::of(&regional, object, owner, &cohort).unwrap();
+    let mut retired = vec![owner, second];
+    retired.sort_unstable_by_key(|host| host.0);
+    assert_eq!(
+      (
+        judged.needed,
+        judged.current.len(),
+        judged.retired.clone(),
+        judged.departed.clone()
+      ),
+      (2, 1, retired, Vec::new())
+    );
+    assert_eq!(
+      (
+        judged.settled_generation,
+        judged.retired_at,
+        judged.configuration_version
+      ),
+      (
+        settled.generation,
+        regional.retired.get(&owner).unwrap().version,
+        regional.version
+      )
+    );
   }
 
   /// A-92 piece 4c: two tied copies of a sealed head, one written before a member joined (entries 1, 2) and one after

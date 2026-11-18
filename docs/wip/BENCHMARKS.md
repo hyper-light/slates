@@ -8645,7 +8645,9 @@ runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the k
 is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
 dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
 that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
-for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+for the seat (`wait_recovered`, `crates/cli/tests/live_chaos.rs`; until 2026-11-09 `wait_council_seated`, which
+judged the joint flag and voter agreement alone: those hold before the change begins, so on CI it passed before the
+replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the owner inside
 it in 6 of 6 x86 runs.
 
 ### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)

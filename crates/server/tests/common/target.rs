@@ -20,7 +20,7 @@ impl TargetDir {
   #[allow(dead_code)]
   pub(crate) fn seed(&self, name: &str, bytes: &[u8]) {
     #[allow(clippy::disallowed_methods)]
-    std::fs::write(format!("{}/{name}", self.path), bytes).unwrap();
+    std::fs::write(std::path::Path::new(&self.path).join(name), bytes).unwrap();
   }
 }
 

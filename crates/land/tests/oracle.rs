@@ -886,13 +886,11 @@ fn t_1_15_named_temporaries_crash_at_every_write_instruction_then_resume() {
   crash_at_every_instruction(MACOS);
 }
 
-/// The same on a filesystem with named temporaries and no exchange.
+/// The same on a filesystem with named temporaries and no exchange: NTFS, as the Windows writer reports it
+/// (`crates/land/src/os_windows.rs`, A-185). Its real kill is `t_1_15_kill_9_on_the_disk_leaves_every_file_old_or_new`.
 #[test]
 fn t_1_15_named_temporaries_without_exchange_crash_at_every_write_instruction_then_resume() {
-  let set_aside = crash_at_every_instruction(Filesystem {
-    exchange: false,
-    unnamed_temporaries: false,
-  });
+  let set_aside = crash_at_every_instruction(NTFS);
   assert!(set_aside > 0, "no crash fell inside a window");
 }
 
@@ -904,6 +902,11 @@ const LINUX: Filesystem = Filesystem {
 /// Format: APFS: the exchange (`RENAME_SWAP`), temporaries named from creation.
 const MACOS: Filesystem = Filesystem {
   exchange: true,
+  unnamed_temporaries: false,
+};
+/// Format: NTFS: no exchange of two names, temporaries named from creation (`OsLand::capabilities` on Windows).
+const NTFS: Filesystem = Filesystem {
+  exchange: false,
   unnamed_temporaries: false,
 };
 
