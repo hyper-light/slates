@@ -6237,6 +6237,18 @@ reconstruction budget are derived, never fixed (D-O6).
 > and counting it). Owed: probation of a repeatedly late candidate; the mirror's healer (AC-8.15); a named holder that
 > stays a member outside the candidates (GAPS).
 
+> **Status (2026-11-17, g230: the seal walk in turns).** Each record period the owner shard walks its volumes to start,
+> advance and put their seals (and, with a mirror, their mirror shipments). That walk ran in one turn: every volume
+> visited and every seal job's archive advanced a slice, each slice sized to the shard's step quantum, so a shard sealing
+> `n` volumes at once held its clients for `n` quanta. It now runs in turns of about one step quantum each
+> (`fleet::seal_walk_slice`, the live period's shape), resuming after the last volume visited, each turn's content puts
+> dispatched before the next; the first volume of a turn is always visited, so a walk always ends, and the healer steps
+> once at the walk's end. Counted `fleet.seal.walks` / `fleet.seal.walk_slices` (`fleet.mirror.*` for the mirror
+> track). Held by `a_shards_seals_are_walked_in_turns_and_every_one_places` (`crates/server/tests/fleet.rs`: 12 volumes
+> sealed at once with the turn cut to one volume, every snapshot placed). Owed (measurement): the owner shard's longest
+> step while hundreds of volumes seal at once, before and after; and the envelope wrap at a seal's end
+> (`fleet::envelope_of`) is still one turn of the whole archive's new chunks (64 MiB took 98 ms, 2026-10-05).
+
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
 attachment flush barriers, hashing and puts have separately measured costs. An auto-seal

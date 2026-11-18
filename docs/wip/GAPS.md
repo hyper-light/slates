@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The seal walk held its shard for every seal at once: in turns (2026-11-17, §4.10 "Content replication", CLAUDE.md
+> "Bounded work everywhere"; g230, the sibling of the live period's slicing below).** Each record period the owner
+> shard's seal walk (`fleet::advance_seals`, and `advance_mirror_seals` for a mirror) visited every volume in one turn
+> and advanced every seal job's archive a slice, each slice sized to the shard's step quantum: `n` volumes sealing at
+> once held the shard's clients for `n` quanta. It now runs in turns of about a step quantum
+> (`fleet::seal_walk_slice`, counted `fleet.seal.walk_slices` against `fleet.seal.walks`), each turn's content puts
+> dispatched before the next. Test: `a_shards_seals_are_walked_in_turns_and_every_one_places` (the turn injected to one
+> volume, `Daemon::inject_seal_walk_quantum`). **Owed:** the owner shard's longest step with hundreds of volumes sealing
+> at once (measurement, the supervisor's); and the envelope wrap at a seal's end (`fleet::envelope_of`) still seals the
+> archive's new chunks in one turn (64 MiB took 98 ms, 2026-10-05): a seal of a large new volume holds its shard for
+> the whole wrap.
+
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
 > Designed, not built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
