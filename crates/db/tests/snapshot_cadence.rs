@@ -481,7 +481,10 @@ fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
       first.replayed
     );
     let mut chunk_bytes = 0u64;
-    let mut chunk = (first.replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / first_ns.max(1)).max(1);
+    // Paced by the whole recovery's cost, the decode in it, so the checks step at most an eighth of the budget apart
+    // however small the tail's own share reads.
+    let mut chunk =
+      (first.replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / first.median_ns.max(1)).max(1);
     while db.stats().snapshots == settled.snapshots {
       n += 1;
       chunk_bytes += account(&mut db, &mut seg, id, n);
@@ -516,7 +519,7 @@ fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
         replayed < BUDGET_LOG_BYTES / 2,
         "the tail reached {replayed} bytes with no snapshot"
       );
-      chunk = (replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / replay_ns.max(1)).max(1);
+      chunk = (replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / timed.median_ns.max(1)).max(1);
     }
   }
   println!(
