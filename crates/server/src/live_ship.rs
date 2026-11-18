@@ -3840,11 +3840,7 @@ mod tests {
   /// that names this node, not the first payload (A-271's named fallback).
   #[test]
   fn a_holders_log_begins_at_the_newest_whole_entry_it_holds() {
-    let mut held = Held {
-      replica: Replica::new(HostId(1), ObjectId([4; 16])),
-      entries: VecDeque::new(),
-      bytes: 0,
-    };
+    let mut held = Held::for_test(HostId(1), ObjectId([4; 16]), 0);
     for payload in [
       vec![KIND_DELTA, 1],
       vec![KIND_DELTA, 2],
