@@ -31134,13 +31134,22 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), 
   the ceiling) and `a_shards_status_names_the_window_its_watchdog_judges_it_by` (a running daemon's shard reports the
   rule's window over the overrun it measured, at the report), both in `crates/server/src/watchdog.rs`.
   `crates/client/tests/lone_daemon.rs` now reads the window its stuck shard's end line names, as the bound's `W`, and
-  the start line's new words for the least spin window.
+  the start line's new words for the least spin window; `crates/server/tests/liveness.rs` holds a wedged shard's stop
+  to the window read from its pulse while it is held.
 - **Not yet (class D, each its own change).** The anchor's start and lapse judgments (`crates/api/src/role/anchor.rs`,
   D-b), the daemon's other supervision waits (D-c) and a laptop's failover detection term (A-405's supervision window)
   still read `W` itself.
-- EVIDENCE_A455
+- **Evidence.** Built and run on the Mac Studio (kiln r331 and r334, 2026-11-18, load 3.8-7.3, debug build):
+  `cargo test --locked -p slates-server --lib -- watchdog` 27 of 27; `cargo test --locked -p slates-ipc --lib --
+  health_signal` 5 of 5 (the registry's doc-truth tests; the writer ignored); `cargo test --locked -p slates-api --lib --
+  a_lapse_kills` 1 of 1; the lone-daemon and liveness suites build (`--no-run`; their runs are main's). Red-checked
+  once: with the window held at `W` whatever the overrun (the ceiling in `watch_window_ns` taken as zero), the rule's
+  test failed, a shard under a host that kept it off its CPU 2.5 s judged wedged after 1.0 s and spinning at 1.0 s of
+  CPU where its window is 2.5 s. The start line on that machine: a 1,000 ms liveness window, a 10,000 ms ceiling, and
+  3,512 ms of CPU at least, the build 3.5 times as slow as machine code.
 
 Applied in the same change to: §4.14 (the health signal catalog; a status block on `daemon.alive`), GAPS (the
 `LIVENESS_BUDGET_NS` entry), `docs/wip/observability.md` (the health-signal table), `crates/server/src/{watchdog,
 verbs,daemon,config}.rs`, `crates/ipc/src/protocol.rs` (`HealthSignal::WatchWindowNs`), `crates/api/src/role/anchor.rs`
-(`start_spin_window_ns` names the window it holds to the build), `crates/client/tests/lone_daemon.rs`.
+(`start_spin_window_ns` names the window it holds to the build), `crates/client/tests/lone_daemon.rs`,
+`crates/server/tests/liveness.rs`.
