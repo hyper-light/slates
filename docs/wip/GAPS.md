@@ -15339,8 +15339,8 @@ its target), and the volume's head was not yet placed when the wall clock reache
 Fixed (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`; found and built by bug-sweep
 on `agents/bug-sweep-2`, landed by g244-healthy-fsync-live): a held reply gives up only after a whole window of the
 liveness budget in which nothing moved its volume's durability forward (`live_ship::LiveVolume::heard`), and at most the
-failover SLO's worth of windows whatever it hears (`DurableBound::windows_within`, 10 at the default 10 s; the
-supervisor's landing condition of 2026-11-11, banned item 8). The rule is one pure module,
+failover SLO from its hold whatever it hears (10 s by default; the supervisor's landing condition of 2026-11-11, banned
+item 8; counted as that many windows until the starved-owner fix below put it on the clock). The rule is one pure module,
 `slates_bridge_core::durable_bound`, and every Unix transport judges a held durable reply by it: the FUSE `fsync`,
 `live_ship::wait_durable` (an NFS stable write or `COMMIT`, a Shards `FSYNC`), and the virtio-fs device's `FSYNC`, which
 had kept its own single deadline (`BridgeAccess::durable_bound`, `durable_heard`). Evidence:
@@ -15351,7 +15351,8 @@ had kept its own single deadline (`BridgeAccess::durable_bound`, `durable_heard`
   a guest's `FSYNC` whose volume hears progress every half window is answered `0` after a window and a half.
 - `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly` (`crates/cli/tests/live_fleet.rs`, gated on
   `SLATES_TEST_CLI=1`): red 3 of 3 and green 6 of 6 on adacachy2 (2026-11-09); the stopped-candidates flow still refuses
-  after one window (1.0004–1.0017 s, 3 of 3). Owed: the supervisor's run of both live FUSE flows under load on main.
+  after one window (1.0004–1.0017 s, 3 of 3, before the starved-owner fix below added its confirming looks). Owed: the
+  supervisor's run of both live FUSE flows under load on main.
 
 WinFsp's held flush judges by the same rule since 2026-11-17 (`winfsp::settle_held`; it had answered
 `STATUS_UNEXPECTED_IO_ERROR` at one liveness budget from its hold, however its candidates were answering). jupiter takes

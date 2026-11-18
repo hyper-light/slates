@@ -42,18 +42,23 @@ wait, so load that stretched the exchanges spent it.
   acknowledged position advancing (`fold_into`), or its head's or catalog's placement gaining an acknowledgement or a
   newer sequence (`fleet::record_acks_in` through `live_ship::heard`).
 - `slates_bridge_core::durable_bound::DurableBound`: a held reply's wait in windows of `DURABLE_WAIT_NS`, pure (the
-  caller hands it the heard count and the clock), begun by `live_ship::begin_durable_bound` and judged by
-  `live_ship::judge_durable_bound`. A window that ends with `heard` moved starts another; one that ends with nothing
-  heard gives up. `fuse::settle_held`, `live_ship::wait_durable` and the virtio-fs device (`Device::settle_durable`,
-  through `BridgeAccess::durable_bound` and `durable_heard`) judge by it. Each extension needs a forward step on the
-  volume's own log or registers, so a wait with no live holder ends after one window.
-- **A total bound** (the supervisor's landing condition, 2026-11-11; banned item 8): a wait begins at most the failover
-  SLO's worth of windows (`DurableBound::windows_within`, `failover_slo_ns / DURABLE_WAIT_NS`, at least one; 10 at the
-  default 10 s), whatever it hears. Without it, other writes' acknowledgements and placements could keep moving `heard`
-  while this reply's own position was never acknowledged, and its wait would never end. The bound's judgment is pure
-  (`DurableBound::judge`, over the heard count and the clock) and unit-tested: silence ends a wait after one window,
-  a window that heard starts the next, and trickling acknowledgements end it `AtTheBound` after exactly ten windows (red
-  with the bound removed: a thousand windows, no end). The give-up's record names which ended it.
+  caller hands it what the volume has heard, `Heard`, and the clock), begun by `live_ship::begin_durable_bound` and
+  judged by `live_ship::judge_durable_bound`. A window that ends with `heard` moved starts another; one that ends with
+  nothing heard gives up once the daemon's control shard has read what came (the starved-owner sibling below, fixed
+  2026-11-17: two of its driver waits since the silence was seen, then one more look). `fuse::settle_held`,
+  `live_ship::wait_durable`, WinFsp's `winfsp::settle_held` and the virtio-fs device (`Device::settle_durable`, through
+  `BridgeAccess::durable_bound` and `durable_heard`) judge by it. Each extension needs a forward step on the volume's
+  own log or registers, so a wait with no live holder ends after one window and its confirming looks, a heartbeat
+  apart (`live_ship::DURABLE_LOOK_NS`).
+- **A total bound** (the supervisor's landing condition, 2026-11-11; banned item 8): a wait ends at the failover SLO from
+  its hold (10 s by default), whatever it hears. Without it, other writes' acknowledgements and placements could keep
+  moving `heard` while this reply's own position was never acknowledged, and its wait would never end. Until the
+  starved-owner fix it was counted in windows (`failover_slo_ns / DURABLE_WAIT_NS`); it is kept on the clock since then,
+  since a window whose silence awaits its receiver lasts longer than a window. The judgment is pure
+  (`DurableBound::judge`, over `Heard` and the clock) and unit-tested: a silent window ends a wait once its receiver has
+  drained, a window that heard starts the next, and trickling acknowledgements end it `AtTheBound` at the SLO, after
+  exactly ten windows (red with the bound removed: a thousand windows, no end). The give-up's record names which ended
+  it.
 - A give-up logs what durability still lacked: the head, the durable position, the whole entry, each holder's
   acknowledged head, the lanes in flight and their age, the unreachable holders, and each condition of `answerable`.
 
@@ -67,10 +72,13 @@ wait, so load that stretched the exchanges spent it.
   five after two windows with nothing heard, which is the rule; a longer one (150 ms) let it finish in one spell, under
   the budget, in 2 runs of 5, which tests nothing; hence the shape.
 - `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`: still refuses with both candidates stopped,
-  after one window (1.0004–1.0017 s, 3 of 3), and succeeds healthy and after the resume.
-- The rule's own unit tests (`crates/bridge-core/src/durable_bound.rs`): silence ends a wait after one window, a window
-  that heard starts the next from the moment it was judged, and trickling acknowledgements end it `AtTheBound` after
-  exactly the failover SLO's worth of windows.
+  after one window (1.0004–1.0017 s, 3 of 3, measured before the starved-owner fix; with it, a window and two or three
+  looks, 1.2 to 1.3 s by construction), and succeeds healthy and after the resume. The test asserts the `EIO`, not its
+  time.
+- The rule's own unit tests (`crates/bridge-core/src/durable_bound.rs`): a silent window gives up only once its
+  receiver has drained, a window that heard starts the next from the moment it was judged, acknowledgements read after a
+  late window's end start the next window, a receiver that never drains holds the verdict only to the total bound, and
+  trickling acknowledgements end it `AtTheBound` at the failover SLO from the hold.
 - New: `a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing` (`crates/bridge-virtiofs/tests/serve.rs`):
   the stand-in volume hears an acknowledgement every half window, three times, and then becomes durable; the guest's
   `FSYNC` is answered `0` after a window and a half, counted as waited.
