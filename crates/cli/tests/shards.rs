@@ -19,7 +19,7 @@
 )]
 
 use std::io::{BufRead, Write};
-use std::os::windows::io::{AsHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -544,12 +544,61 @@ struct ShardsDevice {
 
 impl ShardsDevice {
   fn mount_and_read(&mut self, path: &str) -> Vec<u8> {
+    self.init();
+    self.read_file(path)
+  }
+
+  /// The mount's `INIT`.
+  fn init(&mut self) {
     let mut init = Vec::new();
     for word in [FUSE_MAJOR, FUSE_MINOR, READAHEAD, 0] {
       init.extend_from_slice(&word.to_le_bytes());
     }
     assert_eq!(errno(&self.ask(Opcode::Init, 0, &init)), 0, "INIT");
-    self.read_file(path)
+  }
+
+  /// `path`'s node under the root.
+  fn lookup(&mut self, path: &str) -> u64 {
+    let mut name = path.as_bytes().to_vec();
+    name.push(0);
+    let found = self.ask(Opcode::Lookup, ROOT_NODE, &name);
+    assert_eq!(errno(&found), 0, "LOOKUP {path}");
+    word_at(&found, OUT_HEADER_LEN)
+  }
+
+  /// A Windows DESCRIPTOR ask for `node`'s first range, writable, this process claiming the stream by its own handle of
+  /// it (`docs/wip/shards/dax-protocol.md`, "Windows"): the section the daemon duplicates into this process.
+  fn section(&mut self, node: u64) -> OwnedHandle {
+    use slates_bridge_fuse::shards_fs::{ASK_DESCRIPTOR, CONTROL_FRAME};
+    let mut ask = vec![ASK_DESCRIPTOR];
+    ask.extend_from_slice(&node.to_le_bytes());
+    ask.push(1);
+    ask.extend_from_slice(&0u64.to_le_bytes());
+    ask.extend_from_slice(&DAX_RANGE.to_le_bytes());
+    ask.extend_from_slice(&std::process::id().to_le_bytes());
+    let stream = u64::try_from(self.end.as_raw_handle().expose_provenance()).unwrap();
+    ask.extend_from_slice(&stream.to_le_bytes());
+    let word = u32::try_from(ask.len()).unwrap() | CONTROL_FRAME;
+    self.write_all(&word.to_le_bytes());
+    self.write_all(&ask);
+    let mut header = [0u8; 5];
+    self.read_exact(&mut header);
+    let mut payload =
+      vec![0u8; usize::try_from(u32::from_be_bytes(header[1..5].try_into().unwrap())).unwrap()];
+    self.read_exact(&mut payload);
+    assert_eq!(
+      header[0],
+      0,
+      "the DAX ask answered with errno {}",
+      i32::from_le_bytes(payload[..4].try_into().unwrap())
+    );
+    let value = u64::from_le_bytes(payload.try_into().unwrap());
+    // SAFETY: the value the daemon duplicated into this process for this ask, taken as this probe's own.
+    unsafe {
+      OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+        usize::try_from(value).unwrap(),
+      ))
+    }
   }
 
   /// LOOKUP, OPEN, READ and RELEASE of `path` under the root: its first bytes.
@@ -656,17 +705,36 @@ fn slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed() {
     return;
   }
   let instance = format!("cr{}", std::process::id());
-  let _anchor = start_anchor(&instance);
-  let id = a_volume_with_the_file(&instance);
+  let (read, code, _anchor) = read_across_a_kill(&instance, RESYNC_TEST, RESYNCER);
+  assert_eq!(read, SHARDS_FILE);
+  assert_eq!(code, Some(0), "the command's exit");
+  assert!(
+    counter(&instance, "shards.resynced") >= 1,
+    "the next daemon resynced the stream"
+  );
+}
+
+/// Runs `slates shards` under a fresh anchor of `instance` over a volume holding the file, the command this test binary
+/// re-invoked as `test` in `role` with its stream and resync ends as its last two arguments; once the probe says it is
+/// ready, kills the daemon (`TerminateProcess`, as `kill -9`) and waits, within [`RESYNC_WAIT`], for the bytes the
+/// probe reads through its resynced stream. The bytes, the command's exit, and the anchor's guard, so the caller reads
+/// the next daemon's counters before it goes.
+fn read_across_a_kill(
+  instance: &str,
+  test: &str,
+  role: &str,
+) -> (Vec<u8>, Option<i32>, AnchorProcess) {
+  let anchor = start_anchor(instance);
+  let id = a_volume_with_the_file(instance);
   let mut command = slates();
   let mut child = command
-    .args(["--instance", &instance, "shards", &id, "--"])
+    .args(["--instance", instance, "shards", &id, "--"])
     .arg(std::env::current_exe().unwrap())
     .args([
       "--exact",
-      RESYNC_TEST,
+      test,
       "--nocapture",
-      RESYNCER,
+      role,
       PLACEHOLDER,
       RESYNC_PLACEHOLDER,
     ])
@@ -685,7 +753,7 @@ fn slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed() {
       break;
     }
   }
-  let (code, status, error) = run(&instance, &["status"]);
+  let (code, status, error) = run(instance, &["status"]);
   assert_eq!(code, 0, "status: {error}");
   kill_hard(value_of(&status, "pid").parse().unwrap());
   let started = Instant::now();
@@ -704,12 +772,11 @@ fn slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed() {
       "the resync came within the bound"
     );
   }
-  assert_eq!(read.as_deref(), Some(SHARDS_FILE));
-  assert_eq!(child.wait().unwrap().code(), Some(0), "the command's exit");
-  assert!(
-    counter(&instance, "shards.resynced") >= 1,
-    "the next daemon resynced the stream"
-  );
+  (
+    read.unwrap_or_default(),
+    child.wait().unwrap().code(),
+    anchor,
+  )
 }
 
 /// The resyncer probe (A-433): its stream and resync ends are its last two arguments. Reads `Attached`, the file through
@@ -756,6 +823,157 @@ fn resyncer() -> ! {
   println!("{READ_TAG}{hex}");
   std::io::stdout().flush().unwrap();
   std::process::exit(0);
+}
+
+/// Format: the role of the probe whose DAX section outlives its daemon's kill (A-448).
+const DAX_RESYNCER: &str = "role=dax-resyncer";
+/// Format: the test the DAX probe is re-invoked as.
+const DAX_RESYNC_TEST: &str =
+  "slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill";
+/// Format: a DAX range, 2 MiB (`FUSE_DAX_SZ`, slates' `DAX_RANGE_BYTES`), the span the probe's ask maps.
+const DAX_RANGE: u64 = 2 << 20;
+/// Format: what the probe stores through its mapped section, over the file's first bytes, and never syncs.
+const DAX_STORED: &[u8] = b"stored through the section";
+
+/// A-448, a Windows stream's DAX section across a real daemon's death (§4.6, A-365's object on Windows). Do: under
+/// `slates anchor`, run `slates shards ID -- <this binary> ... {handle} {resync}`, the probe mapping a writable section
+/// of the file and storing over its first bytes without a sync; kill the daemon; let the anchor start the next. Expect:
+/// the probe reads its `Resync`, asks for the file's section again through the fresh stream and is handed the very
+/// section it maps (`CompareObjectHandles`), and reads the file through that stream with its store in it; the command
+/// exits 0; the next daemon counts `shards.resynced` and `shards.dax_adopted`. Red before A-448: the first map gave the
+/// stream's resync up, so the probe read its channel's end and failed; and a fresh ask after a `Resync` was refused
+/// `EACCES`, the holder's fresh stream being no known holder's.
+#[test]
+fn slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill() {
+  if std::env::args().any(|argument| argument == DAX_RESYNCER) {
+    dax_resyncer();
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "SKIP: the shards DAX resync needs SLATES_TEST_CLI=1 (an anchor and its daemon on this runner)"
+    );
+    return;
+  }
+  let instance = format!("cd{}", std::process::id());
+  let (read, code, _anchor) = read_across_a_kill(&instance, DAX_RESYNC_TEST, DAX_RESYNCER);
+  let mut expected = DAX_STORED.to_vec();
+  expected.extend_from_slice(&SHARDS_FILE[DAX_STORED.len()..]);
+  assert_eq!(
+    read, expected,
+    "the store through the section reached the file"
+  );
+  assert_eq!(code, Some(0), "the command's exit");
+  assert!(
+    counter(&instance, "shards.resynced") >= 1,
+    "the next daemon resynced the stream"
+  );
+  assert!(
+    counter(&instance, "shards.dax_adopted") >= 1,
+    "the next daemon took the section back"
+  );
+}
+
+/// The DAX probe (A-448): its stream and resync ends are its last two arguments. Reads `Attached`, mounts, maps a
+/// writable section of the file and stores over its first bytes through it with no sync, says it is ready, then waits on
+/// the channel for a `Resync`, takes the fresh stream, asks for the file's section again through it, checks it is the
+/// section it maps, and reads the file through the fresh stream. Never returns.
+fn dax_resyncer() -> ! {
+  use slates_bridge_fuse::shards_resync::{
+    HandedResync, RESYNC_HANDLE_MESSAGE_BYTES, ResyncKind, ResyncMessage,
+  };
+  let values: Vec<u64> = std::env::args()
+    .rev()
+    .take(2)
+    .map(|value| value.parse().unwrap())
+    .collect();
+  let (resync, stream) = (values[0], values[1]);
+  let channel = slates_ipc::handle_route::adopt_stream(resync).unwrap();
+  let end = slates_ipc::handle_route::adopt_stream(stream).unwrap();
+  let mut message = [0u8; RESYNC_HANDLE_MESSAGE_BYTES];
+  let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
+  let attached = ResyncMessage::parse(&message[..read]).unwrap();
+  assert_eq!(attached.kind, ResyncKind::Attached);
+  let mut device = ShardsDevice { end, unique: 0 };
+  device.init();
+  let node = device.lookup("hello.txt");
+  let section = device.section(node);
+  let view = SectionView::map(&section);
+  view.store(0, DAX_STORED);
+  println!("{READY_LINE}");
+  std::io::stdout().flush().unwrap();
+  let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
+  let resync = HandedResync::parse(&message[..read]).unwrap();
+  assert!(
+    resync.resyncs(&attached),
+    "the resync names its attachment and token"
+  );
+  let fresh = slates_ipc::handle_route::adopt_stream(resync.handle).unwrap();
+  let mut device = ShardsDevice {
+    end: fresh,
+    unique: device.unique,
+  };
+  let again = device.section(node);
+  // SAFETY: two live section handles of this process; the call compares the objects they name and touches nothing.
+  let same = unsafe {
+    windows_sys::Win32::Foundation::CompareObjectHandles(
+      section.as_raw_handle(),
+      again.as_raw_handle(),
+    )
+  };
+  assert_ne!(same, 0, "the successor hands the section the anchor kept");
+  let bytes = device.read_file("hello.txt");
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  println!("{READ_TAG}{hex}");
+  std::io::stdout().flush().unwrap();
+  drop(view);
+  std::process::exit(0);
+}
+
+/// A writable view of a section's first DAX range, as a VMM's window maps one; unmapped on drop.
+struct SectionView(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS);
+
+impl SectionView {
+  fn map(section: &OwnedHandle) -> SectionView {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile};
+    // SAFETY: a view at an address the system chooses of a live section handle this process holds; a refused view is
+    // null, asserted below.
+    let view = unsafe {
+      MapViewOfFile(
+        section.as_raw_handle(),
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        0,
+        0,
+        usize::try_from(DAX_RANGE).unwrap(),
+      )
+    };
+    assert!(!view.Value.is_null(), "the probe maps its section");
+    SectionView(view)
+  }
+
+  /// Stores `bytes` at `at` through the view, a byte at a time through atomics: the daemon reads and writes the same
+  /// pages from its own process.
+  fn store(&self, at: usize, bytes: &[u8]) {
+    for (offset, byte) in bytes.iter().enumerate() {
+      assert!(at + offset < usize::try_from(DAX_RANGE).unwrap());
+      // SAFETY: inside this live view, which outlives the borrow; an `AtomicU8` has no alignment need.
+      let cell = unsafe {
+        &*self
+          .0
+          .Value
+          .cast::<u8>()
+          .add(at + offset)
+          .cast::<std::sync::atomic::AtomicU8>()
+      };
+      cell.store(*byte, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
+}
+
+impl Drop for SectionView {
+  fn drop(&mut self) {
+    // SAFETY: the view this value mapped, unmapped once.
+    unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.0) };
+  }
 }
 
 /// Ends process `pid` at once, as `kill -9` does (`TerminateProcess`).

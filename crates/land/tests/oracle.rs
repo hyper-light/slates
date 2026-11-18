@@ -18,12 +18,13 @@ use slates_land::verdict::{ConflictClass, Verdict};
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::host::{HostFs, HostKind};
+use slates_vfs::inode::{Kind, WindowsAttributes};
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
 use common::{
   LARGE, Session, Setup, TERM_NS, config, mkdir, read_through, rename, request, rm_r, scratch,
-  split, store, symlink, unlink, write_file,
+  set_windows_bits, split, store, symlink, unlink, write_file,
 };
 
 fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
@@ -1785,33 +1786,16 @@ fn a_session_grant_covers_the_next_landing() {
   assert_eq!(finished, 2);
 }
 
-/// Sets the Windows attribute bits `bits` (a Win32 word) on the file at `path` through the overlay, as the WinFsp
-/// drive's `SetFileAttributes` does (A-262).
-fn set_windows_bits(
-  vol: &mut Volume,
-  host: &mut SimHost,
-  store: &mut Store,
-  path: &str,
-  bits: u32,
-) {
-  let (dir, name) = split(path);
-  let d = common::dir_of(vol, host, store, dir);
-  let mut o = vol.with_host(host);
-  let no = o.lookup(store, d, name).unwrap().inode;
-  o.set_windows_attributes(
-    store,
-    no,
-    slates_vfs::inode::WindowsAttributes::kept(bits, slates_vfs::inode::Kind::File),
-  )
-  .unwrap();
-}
-
-/// A-262, stage 1 (no landing applies the bits yet). Do: run §4.15's worked example twice over the same base, the second
-/// time with Windows attribute bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the
-/// work never otherwise touched. Expect: both landings are `Done` with nothing refused, and they leave the same disk,
-/// byte for byte and kind for kind: a landing carries the bits nowhere and fails on none of them.
+/// A-262, A-451. Do: run §4.15's worked example twice over the same base, the second time with Windows attribute bits
+/// set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the work never otherwise touched.
+/// Expect: both landings are `Done` with nothing refused, leave the same disk, byte for byte and kind for kind, and
+/// write the same count; the edited and the created file hold the bits on the disk, and without them what the volume
+/// kept (the base file's none, a created file's `ARCHIVE`). The untouched base file is passed by: a landing judges a base
+/// file by its bytes, so a change of its bits alone lands nothing, as a change of its mode alone does not (GAPS, A-451).
 #[test]
-fn a_landing_ignores_windows_attribute_bits_without_error() {
+fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
+  /// Format: `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`.
+  const HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
   let land = |with_bits: bool| {
     let mut host = SimHost::new();
     example_base(&mut host, 16);
@@ -1820,7 +1804,14 @@ fn a_landing_ignores_windows_attribute_bits_without_error() {
     example_edits(&mut vol, &mut host, &mut store);
     if with_bits {
       for path in ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"] {
-        set_windows_bits(&mut vol, &mut host, &mut store, path, 0x2 | 0x4);
+        set_windows_bits(
+          &mut vol,
+          &mut host,
+          &mut store,
+          path,
+          HIDDEN_SYSTEM,
+          Kind::File,
+        );
       }
     }
     let target = root_target(&mut host);
@@ -1834,18 +1825,96 @@ fn a_landing_ignores_windows_attribute_bits_without_error() {
     };
     let report = setup.land(example_request(1)).unwrap();
     assert_eq!(report.state, LandingState::Done, "{report:?}");
-    (disk(&host), report.written)
+    let bits = ["/src/lib.rs", "/src/new1.rs"].map(|path| host.windows_attributes(path));
+    (disk(&host), report.written, bits)
   };
-  let (with_bits, written_with_bits) = land(true);
-  let (without, written_without) = land(false);
+  let (with_bits, written_with_bits, bits_with) = land(true);
+  let (without, written_without, bits_without) = land(false);
   assert_eq!(
     with_bits, without,
-    "the bits change nothing a landing writes, and refuse nothing"
+    "the bits change no byte and no kind a landing writes, and refuse nothing"
   );
   assert_eq!(
     written_with_bits, written_without,
     "nor how many entries it writes ({written_without})"
   );
+  let hidden_system = u16::try_from(HIDDEN_SYSTEM).unwrap();
+  assert_eq!(
+    bits_with,
+    [Some(hidden_system), Some(hidden_system)],
+    "the edited and the created file land with the bits the volume keeps"
+  );
+  assert_eq!(
+    bits_without,
+    [Some(0), Some(WindowsAttributes::ARCHIVE)],
+    "without them, what the volume kept: the base file's none, a created file's ARCHIVE"
+  );
+}
+
+/// A-451 (a directory link lands as one). Do: land a scratch volume holding a directory the drive made hidden and
+/// read-only, a file in it the drive made system, a link to the directory Windows made as a directory link and hidden,
+/// a link to the file with no bits, and a plain file. Expect each landed object to hold on the disk the bits the volume
+/// keeps for it, every one: the directory its read-only and hidden bits, the directory link its kind and its hidden bit,
+/// the file link none, and a file the drive never touched the `ARCHIVE` a new file is made with.
+#[test]
+fn a_landing_gives_each_object_the_bits_the_volume_keeps_and_a_directory_link_its_kind() {
+  let mut host = SimHost::new();
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/d");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
+  write_file(&mut vol, &mut host, &mut store, "/plain.rs", b"plain");
+  symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+  symlink(&mut vol, &mut host, &mut store, "/to_f", "d/f.rs");
+  let hidden = u32::from(WindowsAttributes::HIDDEN);
+  let marks = [
+    (
+      "/d",
+      u32::from(WindowsAttributes::READONLY) | hidden,
+      Kind::Dir,
+    ),
+    ("/d/f.rs", u32::from(WindowsAttributes::SYSTEM), Kind::File),
+    (
+      "/to_d",
+      u32::from(WindowsAttributes::LINK_DIRECTORY) | hidden,
+      Kind::Symlink,
+    ),
+  ];
+  for (path, bits, kind) in marks {
+    set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
+  }
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(1))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let landed = |path: &str| host.windows_attributes(path);
+  assert_eq!(
+    landed("/d"),
+    Some(WindowsAttributes::READONLY | WindowsAttributes::HIDDEN),
+    "a directory's read-only and hidden bits"
+  );
+  assert_eq!(landed("/d/f.rs"), Some(WindowsAttributes::SYSTEM));
+  assert_eq!(
+    landed("/to_d"),
+    Some(WindowsAttributes::LINK_DIRECTORY | WindowsAttributes::HIDDEN),
+    "a directory link's kind and its hidden bit"
+  );
+  assert_eq!(landed("/to_f"), Some(0), "a file link, no bit");
+  assert_eq!(landed("/plain.rs"), Some(WindowsAttributes::ARCHIVE));
 }
 
 /// §4.15 step 6, A-445 (a reflink in a landing). Do: land a scratch volume holding two files with the same bytes and a

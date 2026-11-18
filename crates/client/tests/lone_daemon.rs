@@ -8,11 +8,12 @@
 //! poll: asleep for good (wedged) or on the CPU for good (spinning). The parent then submits a call, which the client
 //! waits for while its daemon lives (A-232's one rule), so the call is outstanding behind the hold, and drives the
 //! driver as an SDK's loop does while it watches the child. The bound is the rule's, from its named terms (A-232 step 5):
-//! the verdict comes within `W + B + L` of the hold, where `W` is the liveness budget, `B` the beat and `L` the verdict's
-//! own lateness, which the watchdog measures and names in its end line: how far past a window and a beat its verdict
-//! came after its last look before the shard last moved (step 2's rule). The shard last moved after that look, so the
-//! hold did too. `L` holds the look's phase against the hold and the lateness of the watchdog's thread. The end then
-//! takes its own
+//! the verdict comes within `W + B + L` of the hold, where `W` is the held shard's window, `B` the beat and `L` the
+//! verdict's own lateness, each named in the watchdog's end line: `W` the window the shard was judged by (the liveness
+//! budget, raised to the scheduler overrun the shard measured where that is longer, A-455), `L` how far past its window
+//! and a beat the verdict came after its last look before the shard last moved (step 2's rule). The shard last moved
+//! after that look, so the hold did too. `L` holds the look's phase against the hold and the lateness of the watchdog's
+//! thread. The end then takes its own
 //! time, `end`: from the verdict's line to the client's liveness answering gone, measured. The hold's time `t0` is the
 //! host's monotonic clock read inside the held poll, which every process on the host shares.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -52,7 +53,7 @@ const AT_WORD: &str = "at_ns=";
 const PROBE_MS: u64 = 5;
 /// Shape: shards in the child's daemon: two, so the held shard is one of several.
 const TEST_SHARDS: u16 = 2;
-/// Shape: the window, the beat.
+/// Shape: the least window a shard is judged by (the liveness budget, A-455), the beat.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 const BEAT: Duration = Duration::from_nanos(HEARTBEAT_NS);
 /// Shape: how long the child may take to start and the client to connect: a hundred windows, a backstop far past any
@@ -541,11 +542,15 @@ fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64
   found
 }
 
-/// Format: the words of the watchdog's start line right after the spin window's milliseconds (A-318).
-const SPIN_WINDOW_WORDS: &str = " ms of CPU without a step (the window is the liveness budget";
+/// Format: the words of the watchdog's start line right after the least spin window's milliseconds (A-318, A-455).
+const SPIN_WINDOW_WORDS: &str = " ms of CPU at least";
+/// Format: the words of the end line right before the window the stuck shard was judged by (A-455), and right after it.
+const JUDGED_BY_WORDS: &str = "against its ";
+const WINDOW_END_WORDS: &str = " ms window";
 
-/// The CPU a poll may run without a step before the child's watchdog calls its shard spinning: the budget held to the
-/// child's build (A-318), read from the watchdog's start line, which comes before the role says it is ready.
+/// The least CPU a poll may run without a step before the child's watchdog calls its shard spinning: the budget held to
+/// the child's build (A-318), read from the watchdog's start line, which comes before the role says it is ready. A
+/// shard whose host overran the budget is held to its own window's, longer, which the end line names (A-455).
 fn spin_window_of(stderr: &Receiver<(u64, String)>) -> Duration {
   let line = await_tag(stderr, SPIN_WINDOW_WORDS, START_WAIT);
   let ms: u64 = line
@@ -568,6 +573,18 @@ fn spun_for(line: &str) -> Duration {
   Duration::from_millis(ms)
 }
 
+/// The window the end line names its stuck shard judged by (A-455): a wedge's on the wall, a spin's of CPU held to the
+/// build.
+fn judged_by(line: &str) -> Duration {
+  let ms: u64 = line
+    .split(JUDGED_BY_WORDS)
+    .nth(1)
+    .and_then(|rest| rest.split(WINDOW_END_WORDS).next())
+    .and_then(|number| number.parse().ok())
+    .unwrap_or_else(|| panic!("the end line names the window its shard was judged by: {line}"));
+  Duration::from_millis(ms)
+}
+
 /// One lone daemon held `hold` with a call outstanding: the daemon must end itself within the rule's bound, with the
 /// failed exit code, and the call must end `DaemonGone`.
 ///
@@ -576,18 +593,24 @@ fn spun_for(line: &str) -> Duration {
 /// verdict's time from above, and the test asserts that bound: the end line read by `t0 + W + B + L`. Then `end`, the
 /// time from that line to the client's liveness answering gone, is measured, and the client's gone time is reported
 /// against `t0 + W + B + L + end` and against the plan's `t0 + W + B + L` without it. A spin is judged in the shard's
-/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least the spin
-/// window of CPU (the budget held to this build, A-318) and at most that and one look's (`B + L`). The call then ends at its next deadline after the exit, past
-/// the reconnect budget: within `exit + reply + reconnect` and one of the reconnect's paced attempts (`reconnect / 10`,
-/// the driver's pacing).
+/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least the window
+/// of CPU it was judged by, itself at least the budget held to this build (A-318, from the start line), and at most
+/// that and one look's (`B + L`). `W` is the window the end line names (A-455). The call then ends at its next deadline
+/// after the exit, past the reconnect budget: within `exit + reply + reconnect` and one of the reconnect's paced
+/// attempts (`reconnect / 10`, the driver's pacing).
 fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let instance = format!("lone-{name}-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, hold);
   await_tag(&daemon.stdout, READY_TAG, START_WAIT);
   let spin_window = spin_window_of(&daemon.stderr);
   // A spin's verdict needs the spin window of the shard's CPU, longer than the budget in a build slower than machine
-  // code (A-318), so the test's bound is past it by its own ten windows.
-  let give_up = GIVE_UP + spin_window;
+  // code (A-318), and a shard's window may be held as long as the ceiling where its host overran it (A-455), so the
+  // test's bound is past the ceiling's spin window by its own ten windows. The child is this binary, so its build's.
+  let give_up = GIVE_UP
+    + Duration::from_nanos(slates_server::watchdog::spin_window_ns(
+      slates_machine::build_cost::build_cost(),
+      slates_server::watchdog::WINDOW_CEILING_NS,
+    ));
   let mut client = connect(&instance);
   let stdin = daemon.stdin.as_mut().unwrap();
   writeln!(stdin, "{}", client.client_id()).unwrap();
@@ -622,7 +645,12 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let gone_ns = ended
     .gone_at_ns
     .unwrap_or_else(|| panic!("{name}: the client's liveness never answered the daemon gone"));
-  let rule = WINDOW + BEAT + late;
+  let window = judged_by(&line);
+  assert!(
+    window >= WINDOW,
+    "{name}: the end line named a {window:?} window, under the liveness budget {WINDOW:?}: {line}"
+  );
+  let rule = window + BEAT + late;
   let line_after = Duration::from_nanos(line_read_ns.saturating_sub(t0_ns));
   let gone_after = Duration::from_nanos(gone_ns.saturating_sub(t0_ns));
   let end = Duration::from_nanos(gone_ns.saturating_sub(line_read_ns));
@@ -631,7 +659,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     i128::try_from(after.as_nanos()).unwrap() - i128::try_from(bound.as_nanos()).unwrap()
   };
   println!(
-    "A232-UNSUPERVISED {name}: W = {WINDOW:?}, B = {BEAT:?}, L = {late:?}, so W + B + L = {rule:?}; the verdict's line \
+    "A232-UNSUPERVISED {name}: W = {window:?}, B = {BEAT:?}, L = {late:?}, so W + B + L = {rule:?}; the verdict's line \
      read {line_after:?} after t0 (margin {} ns); end = {end:?}; DaemonGone (the client's liveness) {gone_after:?} \
      after t0: minus (W + B + L + end) = {} ns, minus (W + B + L) = {} ns; exit {status} seen {exited_after:?} after \
      the hold was read; the call ended {:?} after {:?}, bound {call_bound:?}; the watchdog said: {line}",
@@ -660,10 +688,10 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
       let look = BEAT + looks_late;
       let spun = spun_for(&line);
       assert!(
-        spun >= spin_window && spun <= spin_window + look,
-        "{name}: the verdict named {spun:?} of CPU, outside the spin window ({spin_window:?}, the budget held to this \
-         build) to the spin window and a look ({:?})",
-        spin_window + look
+        window >= spin_window && spun >= window && spun <= window + look,
+        "{name}: the verdict named {spun:?} of CPU against its {window:?} window, outside that window (at least the \
+         start line's {spin_window:?}, the budget held to this build) to the window and a look ({:?})",
+        window + look
       );
     }
   }

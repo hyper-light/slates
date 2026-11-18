@@ -26,11 +26,14 @@ use slates_anchor::{AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Su
 use slates_machine::facts::Identity;
 
 use slates_anchor::handles::{
-  HandleMessage, HandleRefusal, MESSAGE_BYTES, WHAT_WINFSP_MOUNT, encode, parse_env,
+  HandedEntry, HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, RECORD_CAP,
+  WHAT_WINFSP_MOUNT, check_owners, encode, parse_env, parse_handoff,
 };
-use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
+use slates_anchor::held_windows::{
+  Channel, Handoff, Held, channel, handle_from_value, handle_value, read_table,
+};
 use slates_ipc::win_spawn::{
-  Process, Spawn, StandardOutput, duplicate_inheritable, environment_block,
+  Process, Spawn, StandardOutput, duplicate_from, duplicate_inheritable, environment_block,
 };
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -72,6 +75,20 @@ const ANCHORED_ROLE: &str = "SLATES_HANDLE_TEST_ANCHORED_ROLE";
 const REFUSALS_TAG: &str = "ANCHOR_REFUSALS=";
 /// Format: the words of the anchor's log line for a refused message, counted by the log's test.
 const REFUSAL_LINE: &str = "a hold message was refused";
+/// Bounds of `count` entries an attachment holds and no DAX section (A-448): these fixtures hold mounts alone.
+fn attachments(count: usize) -> HoldBounds {
+  HoldBounds {
+    attachments: count,
+    sections: 0,
+  }
+}
+
+/// Format: the supervised child whose first process holds [`FULL_MOUNTS`] events with records of the whole cap (A-460).
+const ROLE_FULL: &str = "full_role";
+/// Shape: the mounts the full child holds, each with a record of [`RECORD_CAP`] bytes: about 1,070 characters each in
+/// the handoff's table, so 40 pass a user-defined environment variable's 32,767 characters by a third.
+const FULL_MOUNTS: usize = 40;
+
 /// Shape: how many short and how many corrupted hold messages the garbling child writes (each kind this many).
 const GARBLED_EACH: usize = 10;
 /// Shape: the entries a garbling child holds: one before its bad messages, so they must leave it held, and one after,
@@ -89,6 +106,35 @@ const ENTRY_ID: u64 = 1;
 const ROLE_EXIT: i32 = 3;
 /// Shape: how long a receive or a child wait may take (milliseconds): generous for a loaded runner.
 const WAIT_MS: u32 = 10_000;
+
+/// The channel's value and the entries the anchor handed this process (A-460): the table's section, which
+/// [`slates_anchor::handles::ENV_HANDLES`] names, taken as this process's own and read as the daemon reads it.
+fn inherited_handoff(bound: usize) -> (u64, Vec<HandedEntry>) {
+  let pointer = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
+  let (section, len) = parse_handoff(&pointer, bound).unwrap();
+  // SAFETY: the supervisor's explicit handle list handed this process the table's section at this value, which
+  // nothing else here takes.
+  let owned = unsafe { OwnedHandle::from_raw_handle(handle_from_value(section).unwrap()) };
+  let table = read_table(owned, len).unwrap();
+  let (channel, entries) = parse_env(&table, bound).unwrap();
+  check_owners(section, channel, &entries).unwrap();
+  (channel, entries)
+}
+
+/// The entries `handoff` hands a spawn, read in this process through a duplicate of its table's section, since the
+/// handoff's guard closes its own (A-460).
+fn handed_entries(handoff: &Handoff, bound: usize) -> Vec<HandedEntry> {
+  let (section, len) = parse_handoff(handoff.env(), bound).unwrap();
+  // SAFETY: the current process's pseudo-handle, which needs no closing.
+  let myself = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+  let duplicate = duplicate_from(myself, handle_from_value(section).unwrap()).unwrap();
+  // SAFETY: the duplicate this process just made, owned from here alone.
+  let owned = unsafe { OwnedHandle::from_raw_handle(duplicate.into_raw()) };
+  let table = read_table(owned, len).unwrap();
+  let (channel, entries) = parse_env(&table, bound).unwrap();
+  check_owners(section, channel, &entries).unwrap();
+  entries
+}
 
 /// This test binary's path, to re-invoke as a child.
 fn own_exe() -> OsString {
@@ -223,7 +269,7 @@ fn a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor() {
       sender.try_wait()
     ),
   };
-  let mut held = Held::new(8);
+  let mut held = Held::new(attachments(8));
   let answer = held.apply(sender.raw_handle(), message);
   assert_eq!(answer, Some(HandleMessage::Held { id: ENTRY_ID }));
   anchor.send(&answer.unwrap(), WAIT_MS).unwrap();
@@ -237,7 +283,7 @@ fn a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor() {
   // Hand the held event to a checker, which inherits it and finds it live. The anchor keeps its own channel; the
   // successor gets a duplicate of the daemon end, as a real successor would.
   let handoff = held.handoff(&daemon).unwrap();
-  let (_channel, entries) = parse_env(handoff.env(), 8).unwrap();
+  let entries = handed_entries(&handoff, 8);
   assert_eq!(entries.len(), 1);
   assert_eq!(entries[0].id, ENTRY_ID);
   let env = handoff.env().to_owned();
@@ -370,7 +416,7 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
   // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
   // a crash loop (A-311), which ends the fixture's observation.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(1).unwrap();
+  anchor.0.hold_handles(attachments(1)).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_SUPERVISED.to_owned());
   anchor
     .0
@@ -400,6 +446,55 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
     "the two supervised processes did not finish inside the fixture budget"
   );
   assert_eq!(anchor.0.held_handles(), 1);
+  assert_eq!(
+    anchor
+      .0
+      .segment()
+      .read_published(RegionKind::Profile)
+      .unwrap()
+      .as_deref(),
+    Some(b"checked".as_slice())
+  );
+}
+
+/// A-460, the handoff past an environment variable's limit across a real restart. Do: let a supervised child hold
+/// [`FULL_MOUNTS`] events, each with a record of the whole cap, so the handoff's table passes the 32,767 characters a
+/// user-defined environment variable holds (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue`); let it exit and the
+/// supervisor restart it. Expect the successor to read every entry from the table's section, each record whole and each
+/// inherited event live, and to publish its check, with the anchor holding all of them. Before A-460 the table rode the
+/// environment variable itself.
+#[test]
+fn a_table_past_an_environment_variables_limit_reaches_the_successor_whole() {
+  let args: Vec<String> = role_args(ROLE_FULL)
+    .iter()
+    .map(|argument| argument.to_string_lossy().into_owned())
+    .collect();
+  // As the supervised test: the child never serves, so its second departure is a crash loop, which ends the watch.
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
+  anchor.0.hold_handles(attachments(FULL_MOUNTS)).unwrap();
+  anchor.0.hold_environment(ROLE, ROLE_FULL.to_owned());
+  anchor.0.start(0).unwrap();
+  let clock = Instant::now();
+  let mut completed = false;
+  while clock.elapsed() < Duration::from_millis(u64::from(WAIT_MS)) {
+    let now = u64::try_from(clock.elapsed().as_nanos()).unwrap();
+    if let Step::CrashLoop { exit_code, .. } = anchor.0.step(now).unwrap() {
+      assert_eq!(
+        exit_code,
+        Some(ROLE_EXIT),
+        "the successor body must execute"
+      );
+      completed = true;
+      break;
+    }
+    // Shape: a short harness poll; the production observation loop chooses its wait from liveness.
+    std::thread::park_timeout(Duration::from_millis(1));
+  }
+  assert!(
+    completed,
+    "the two supervised processes did not finish inside the fixture budget"
+  );
+  assert_eq!(anchor.0.held_handles(), FULL_MOUNTS);
   assert_eq!(
     anchor
       .0
@@ -506,7 +601,7 @@ fn refusals_while_supervising(role: &str) -> u64 {
   // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
   // a crash loop (A-311), which ends the fixture's observation.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(GARBLERS_HOLDS).unwrap();
+  anchor.0.hold_handles(attachments(GARBLERS_HOLDS)).unwrap();
   anchor.0.hold_environment(ROLE, role.to_owned());
   anchor
     .0
@@ -567,7 +662,7 @@ fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
   // observation. Its successor's first hold waits on an anchor that steps no more, so it publishes nothing over the
   // first child's answers, and the fixture's drop stops it.
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
-  anchor.0.hold_handles(PROMPT_HOLDS).unwrap();
+  anchor.0.hold_handles(attachments(PROMPT_HOLDS)).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_PROMPT.to_owned());
   anchor
     .0
@@ -617,8 +712,7 @@ fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
 fn prompt_role() {
   assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_PROMPT));
   let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
-  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
-  let (channel_value, _) = parse_env(&env, PROMPT_HOLDS).unwrap();
+  let (channel_value, _) = inherited_handoff(PROMPT_HOLDS);
   // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
   let channel = Channel::adopt(unsafe {
     OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
@@ -707,8 +801,7 @@ fn refuse_new_duplicate_access(pid: u32) {
 fn supervised_role() {
   assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_SUPERVISED));
   let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
-  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
-  let (channel_value, entries) = parse_env(&env, 1).unwrap();
+  let (channel_value, entries) = inherited_handoff(1);
   // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
   let channel = Channel::adopt(unsafe {
     OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
@@ -743,6 +836,61 @@ fn supervised_role() {
       channel.recv(WAIT_MS).unwrap(),
       Some(HandleMessage::Held { id: ENTRY_ID })
     );
+    segment.publish(RegionKind::Profile, b"committed").unwrap();
+  }
+  std::process::exit(ROLE_EXIT);
+}
+
+/// The full supervised child (A-460): the first process holds [`FULL_MOUNTS`] events, each with a record of the whole
+/// cap, commits and exits; the second reads every entry from the handoff's table section, checks each record and each
+/// event, and publishes its check. Both exit with ROLE_EXIT.
+#[test]
+#[ignore = "the full-table hold fixture; run by its parent"]
+fn full_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_FULL));
+  let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
+  let (channel_value, entries) = inherited_handoff(FULL_MOUNTS);
+  // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
+  let channel = Channel::adopt(unsafe {
+    OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
+  });
+  let record = |id: u64| vec![u8::try_from(id).unwrap(); RECORD_CAP];
+  if segment
+    .read_published(RegionKind::Profile)
+    .unwrap()
+    .is_some()
+  {
+    assert_eq!(
+      entries.len(),
+      FULL_MOUNTS,
+      "every held entry reached the successor"
+    );
+    for (entry, id) in entries.iter().zip(1u64..) {
+      assert_eq!((entry.id, entry.values.len()), (id, 1));
+      assert_eq!(entry.record, record(id));
+      let inherited = handle_from_value(*entry.values.first().unwrap()).unwrap();
+      assert!(signalled(inherited), "entry {id}'s event is live");
+    }
+    segment.publish(RegionKind::Profile, b"checked").unwrap();
+  } else {
+    let mut events = Vec::new();
+    for id in 1..=u64::try_from(FULL_MOUNTS).unwrap() {
+      let live = event(None);
+      // SAFETY: a live event owned in this process until the hold is acknowledged.
+      assert_ne!(unsafe { SetEvent(live.as_raw_handle()) }, 0);
+      let hold = HandleMessage::Hold {
+        id,
+        what: WHAT_WINFSP_MOUNT,
+        values: vec![handle_value(live.as_raw_handle())],
+        record: record(id),
+      };
+      channel.send(&hold, WAIT_MS).unwrap();
+      assert_eq!(
+        channel.recv(WAIT_MS).unwrap(),
+        Some(HandleMessage::Held { id })
+      );
+      events.push(live);
+    }
     segment.publish(RegionKind::Profile, b"committed").unwrap();
   }
   std::process::exit(ROLE_EXIT);
@@ -839,8 +987,7 @@ fn hold_event(channel: &Channel, id: u64, name: String) -> (OwnedHandle, [u8; ME
 /// Both exit with ROLE_EXIT.
 fn garbled_body(garble: impl FnOnce(&Channel, &[u8])) {
   let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
-  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
-  let (channel_value, entries) = parse_env(&env, GARBLERS_HOLDS).unwrap();
+  let (channel_value, entries) = inherited_handoff(GARBLERS_HOLDS);
   // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
   let channel = Channel::adopt(unsafe {
     OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
@@ -912,9 +1059,8 @@ fn checker_role() {
   if std::env::var(ROLE).as_deref() != Ok(ROLE_CHECKER) {
     return;
   }
-  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
   let name = std::env::var(EVENT_NAME).unwrap();
-  let (_channel, entries) = parse_env(&env, 8).unwrap();
+  let (_channel, entries) = inherited_handoff(8);
   let entry = entries
     .iter()
     .find(|e| e.id == ENTRY_ID)

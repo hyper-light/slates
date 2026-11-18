@@ -4204,12 +4204,11 @@ pub mod platform {
     /// and this process alone; the answer names nothing.
     #[cfg(target_os = "macos")]
     fn region(&self, _name: String, len: usize) -> Result<ClientRegion, IpcError> {
-      let wait_ms = u32::try_from(CLAIM_WAIT_NS.div_ceil(NS_PER_MS)).unwrap_or(u32::MAX);
+      // Waited for while the owner lives (A-452).
       let fd = crate::mach_claim::fetch(
         &self.instance,
         &owner_token_name(&self.instance),
         self.index,
-        wait_ms,
       )?;
       ClientRegion::from_descriptor(fd, len)
     }
@@ -4220,10 +4219,6 @@ pub mod platform {
       ClientRegion::open(&Handoff::Name(name), len)
     }
   }
-
-  /// Format: nanoseconds in a millisecond, a Mach timeout's unit.
-  #[cfg(target_os = "macos")]
-  const NS_PER_MS: u64 = 1_000_000;
 
   impl Drop for Claim {
     /// A claim dropped unanswered (a cancelled connect) gives its slot back, only while it is still

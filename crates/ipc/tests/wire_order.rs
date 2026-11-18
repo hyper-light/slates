@@ -25,13 +25,14 @@
 mod order;
 
 use slates_ipc::protocol::{
-  AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass, Conformance,
-  DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established, GrantScope,
-  GrantState, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation,
-  LandingStage, MoveRefusal, NamePolicy, OwnMountUse, PlannedAction, PolicySubject, Principal,
-  ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
-  SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal,
-  UnsupportedReason, Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
+  ArchiveFault, AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass,
+  Conformance, DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established,
+  GrantScope, GrantState, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache,
+  LandingDegradation, LandingStage, MoveRefusal, NamePolicy, OwnMountUse, PlannedAction,
+  PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody,
+  RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass, SnapshotBoundary,
+  TargetPathConstraint, TargetRefusal, UnsupportedReason, Verification, VolumeRefusal,
+  WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -41,6 +42,7 @@ const PUBLISHED: &str = include_str!("wire_order.txt");
 /// Each wire enum's schema (`enum Name{Variant{field:Type,..},..}`), which names its variants in tag order.
 fn schemas() -> Vec<&'static str> {
   vec![
+    <ArchiveFault as Wire>::SCHEMA,
     <AttachRequest as Wire>::SCHEMA,
     <AttachTransport as Wire>::SCHEMA,
     <AuditKind as Wire>::SCHEMA,

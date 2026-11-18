@@ -54,6 +54,19 @@ impl Source {
     }
   }
 
+  /// Inode `no`'s Windows attribute bits (A-262), which its landing carries (A-451).
+  pub(crate) fn windows(
+    self,
+    vol: &Volume,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<slates_vfs::inode::WindowsAttributes, VfsError> {
+    match self {
+      Source::Head => vol.windows_attributes(store, no),
+      Source::Snapshot(id) => vol.windows_attributes_in(store, id, no),
+    }
+  }
+
   /// Symlink `no`'s target.
   pub(crate) fn readlink(
     self,

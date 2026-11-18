@@ -763,6 +763,12 @@ impl SimHost {
     }
   }
 
+  /// An entry's Windows attribute bits as the simulated disk holds them (A-262), none for a missing one: what a test of
+  /// a landing's bits reads (A-451).
+  pub fn windows_attributes(&self, path: &str) -> Option<u16> {
+    self.node(&Self::split(path)).map(|n| n.windows)
+  }
+
   /// Changes a file's mode (a metadata-only change).
   pub fn chmod(&mut self, path: &str, mode: u32) {
     let parts = Self::split(path);
@@ -1209,6 +1215,37 @@ impl LandFs for SimHost {
     }
   }
 
+  /// The temporary's Windows bits, as a Windows disk keeps them (A-451): a write step, as a mode's change is.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
+    self.write_step()?;
+    let now = self.now_ns;
+    match self.opens.get_mut(&file.0) {
+      Some(Open::Temp { node, placed }) => {
+        node.windows = windows;
+        node.ctime_ns = now;
+        let placed = placed.clone();
+        let ino = node.ino;
+        self.temp_changed(ino);
+        if let Some(parts) = placed
+          && let Some(n) = self.node_mut(&parts)
+          && n.ino == ino
+        {
+          n.windows = windows;
+        }
+        Ok(())
+      }
+      Some(Open::File { ino, .. }) => {
+        let ino = *ino;
+        if let Some(n) = self.node_by_ino_mut(ino) {
+          n.windows = windows;
+          n.ctime_ns = now;
+        }
+        Ok(())
+      }
+      _ => Err(HostError::StaleHandle),
+    }
+  }
+
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
     self.write_step()?;
     match self.opens.get_mut(&file.0) {
@@ -1365,7 +1402,8 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  /// A directory with its mode and, as a Windows disk holds them, its Windows bits (A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError> {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
@@ -1375,6 +1413,7 @@ impl LandFs for SimHost {
     SimHost::mkdir(self, &path);
     if let Some(n) = self.node_mut(&parts) {
       n.mode = mode;
+      n.windows = windows;
     }
     Ok(())
   }
@@ -1393,13 +1432,15 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  /// One step, as `symlinkat` makes a link: `staged` is not used (see the seam).
+  /// One step, as `symlinkat` makes a link: `staged` is not used (see the seam); the link keeps its Windows bits, as a
+  /// Windows disk keeps a link's kind and attributes (A-451).
   fn symlink(
     &mut self,
     dir: HostDir,
     name: &str,
     target: &str,
     _staged: &str,
+    windows: u16,
   ) -> Result<(), HostError> {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
@@ -1408,6 +1449,9 @@ impl LandFs for SimHost {
     }
     let path = format!("/{}", parts.join("/"));
     SimHost::symlink(self, &path, target);
+    if let Some(n) = self.node_mut(&parts) {
+      n.windows = windows;
+    }
     Ok(())
   }
 

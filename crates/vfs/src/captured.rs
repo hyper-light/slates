@@ -31,7 +31,7 @@ use slates_mem::Handle;
 use crate::dir::{Child, DirNode};
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
-use crate::inode::{Body, Inode, Kind};
+use crate::inode::{Body, Inode, Kind, WindowsAttributes};
 use crate::names::NameEquivalence;
 use crate::trie::{self, ChangedRecord, TrieNode};
 use crate::volume::{Store, Volume, snapshot_handle};
@@ -90,11 +90,15 @@ pub enum Held {
     mode: u32,
     /// Its modification time, nanoseconds.
     mtime_ns: i64,
+    /// Its Windows attribute bits (A-262), which a landing carries (A-451).
+    windows: WindowsAttributes,
   },
   /// A symlink.
   Symlink {
     /// Its target.
     target: Box<str>,
+    /// Its Windows attribute bits, a directory link's kind among them (A-275), which a landing carries (A-451).
+    windows: WindowsAttributes,
   },
   /// A directory.
   Dir {
@@ -102,6 +106,8 @@ pub enum Held {
     mode: u32,
     /// Its modification time, nanoseconds.
     mtime_ns: i64,
+    /// Its Windows attribute bits (A-262), which a landing carries (A-451).
+    windows: WindowsAttributes,
   },
   /// A FIFO, socket or device node: a name with no bytes, which no landing writes.
   Special,
@@ -176,27 +182,31 @@ fn record(store: &Store, tree: FrozenTree, no: InodeNo) -> Result<&Inode, VfsErr
 }
 
 fn directory_held(store: &Store, tree: FrozenTree, no: InodeNo) -> Result<Held, VfsError> {
-  let attrs = record(store, tree, no)?.attrs;
+  let inode = record(store, tree, no)?;
   Ok(Held::Dir {
-    mode: attrs.mode,
-    mtime_ns: attrs.mtime,
+    mode: inode.attrs.mode,
+    mtime_ns: inode.attrs.mtime,
+    windows: inode.windows,
   })
 }
 
 fn file_held(store: &Store, tree: FrozenTree, no: InodeNo) -> Result<Held, VfsError> {
-  let attrs = record(store, tree, no)?.attrs;
+  let inode = record(store, tree, no)?;
   Ok(Held::File {
     no,
-    size: attrs.size,
-    mode: attrs.mode,
-    mtime_ns: attrs.mtime,
+    size: inode.attrs.size,
+    mode: inode.attrs.mode,
+    mtime_ns: inode.attrs.mtime,
+    windows: inode.windows,
   })
 }
 
 fn symlink_held(store: &Store, tree: FrozenTree, no: InodeNo) -> Result<Held, VfsError> {
-  match &record(store, tree, no)?.body {
+  let inode = record(store, tree, no)?;
+  match &inode.body {
     Body::Symlink(target) | Body::BaseLink(target) => Ok(Held::Symlink {
       target: target.clone(),
+      windows: inode.windows,
     }),
     _ => Err(VfsError::Invalid),
   }
@@ -525,7 +535,7 @@ mod tests {
             format!("file {}", blake3::hash(&bytes))
           }
           Held::Dir { .. } => "directory".to_owned(),
-          Held::Symlink { target } => format!("symlink {target}"),
+          Held::Symlink { target, .. } => format!("symlink {target}"),
           other => format!("{other:?}"),
         };
         out.insert(path, held);
@@ -687,12 +697,7 @@ mod tests {
     assert!(matches!(at("/d/f"), Held::File { size: 4, .. }));
     assert!(matches!(at("/d"), Held::Dir { .. }));
     assert!(matches!(at("/"), Held::Dir { .. }));
-    assert_eq!(
-      at("/s"),
-      Held::Symlink {
-        target: "d/f".into()
-      }
-    );
+    assert!(matches!(at("/s"), Held::Symlink { target, .. } if &*target == "d/f"));
     assert_eq!(at("/missing"), Held::Absent);
     assert_eq!(at("/d/f/beneath"), Held::Absent);
     let Held::File { no, .. } = at("/d/f") else {
