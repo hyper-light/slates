@@ -40,7 +40,7 @@ use slates_wire::Wire;
 use slates_wire::observe::{Chokepoint, SpanContext};
 use slates_wire::request::{RequestId, Seen};
 
-use crate::error::{refusal_of_db, refusal_of_vfs};
+use crate::error::{refusal_of_db, refusal_of_mem, refusal_of_vfs};
 use crate::state::{ClientSlot, Deferred, PendingForward, ShardState, VolumeSlot};
 
 /// Format: parts per thousand.
@@ -5890,9 +5890,7 @@ pub(crate) fn admit(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -5935,9 +5933,7 @@ pub(crate) fn admit(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -6126,9 +6122,7 @@ pub(crate) fn publish_created_volume(
       reservation,
       version_credit,
       metadata_credit,
-      Refusal::BadRequest {
-        reason: format!("volume registry full at {full}"),
-      },
+      refusal_of_mem(&slates_mem::MemError::SlabFull { capacity: full }),
     );
   }
   let mut volume = volume;
@@ -6159,9 +6153,7 @@ pub(crate) fn publish_created_volume(
         reservation,
         version_credit,
         metadata_credit,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )
     }
   }
@@ -6245,9 +6237,7 @@ pub(crate) fn reserve_metadata(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
 }
 
@@ -9239,9 +9229,7 @@ pub(crate) fn admit_clone(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -9288,9 +9276,7 @@ pub(crate) fn admit_clone(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -9470,9 +9456,9 @@ pub(crate) fn publish_clone_as(
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
     discard_clone(state, origin, snapshot, admitted);
-    return Err(Refusal::BadRequest {
-      reason: format!("volume registry full at {full}"),
-    });
+    return Err(refusal_of_mem(&slates_mem::MemError::SlabFull {
+      capacity: full,
+    }));
   }
   let Admitted {
     volume: mut volume_core,
@@ -9504,9 +9490,7 @@ pub(crate) fn publish_clone_as(
         credits.version,
         credits.metadata,
       );
-      Err(Refusal::BadRequest {
-        reason: e.to_string(),
-      })
+      Err(refusal_of_mem(&e))
     }
   }
 }
@@ -10728,9 +10712,7 @@ fn grow_version_reservation(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
 }
 
@@ -10827,9 +10809,7 @@ fn resize(
         if let Some(v) = version_grown {
           state.store.versions.release(v);
         }
-        return refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        });
+        return refused(refusal_of_mem(&e));
       }
     }
   } else {
@@ -12228,9 +12208,7 @@ pub(crate) fn materialize_taken_over(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -12259,9 +12237,7 @@ pub(crate) fn materialize_taken_over(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
