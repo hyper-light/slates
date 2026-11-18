@@ -5520,6 +5520,27 @@ placement records bind both scopes; cached configuration/attachment generations 
 ordinary writes. A region-home move also carries root-group authority. The id still routes by
 creator plus these exceptions; this adds no global lookup catalog or per-write coordination.
 
+> **Status (2026-11-18, the moved-object exceptions; the configuration's half of an explicit move).**
+> `RegionalConfiguration::moved` holds, for each moved object only, its owner and the configuration version its move
+> committed at, its ownership generation (`slates_db::register::Moved`). An object's line starts at its exception's
+> owner, else at its creator, and a retired host hands it on along the takeover's lineage
+> (`RegionalConfiguration::owner_of`). A member reports a move through the council's report stream
+> (`ConfigCommand::Move`, `MovedForgotten` once the object is destroyed); the leader proposes it only when the
+> configuration names the reporter as the owner, or names no owner because the object's line runs through a takeover
+> that is done (the configuration no longer keeps that successor, and a host that lost its authority never reports
+> again under its id), and never for a lost or unresolved line. A move that would add an exception past the bound the
+> leader derives is answered `ReportOutcome::Full` and not proposed (`fleet::moved_bound`: the members times one
+> member's volume slots, at the leader's size). A move back to the creator drops the exception. An exception follows
+> its owner's takeover at the successor's confirmation, through a takeover carried into another's too, so no line
+> starts at a retirement the configuration dropped. The encoding carries the exceptions last (the encoding itself is
+> still unversioned; GAPS). Held by four tests in `crates/db/src/register.rs` (`a_move_names_the_objects_owner_and_only_its_owner_moves_it`,
+> `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`,
+> `a_moved_objects_exception_follows_a_takeover_carried_into_another`,
+> `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`), the council's
+> `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` and the encoding's round trip and lying-count tests.
+> Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
+> old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its

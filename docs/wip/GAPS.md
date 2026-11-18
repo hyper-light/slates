@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
+> agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
+> planned handoff ("Ownership follows the writer", Phase 8 task 9, AC-8.16, T-8.14), then kiln as the fleet's operator.
+> - **Built:** a local clone of an overlay (below, 2026-11-05's list) and the configuration's moved-object exceptions
+>   (§4.8 "Authority scope", its status of this date): a move is reported, bounded, committed, followed through
+>   takeovers and dropped at a destroy.
+> - **Owed, in order:** the holders' side of a committed move (the object's copies take the new owner's authority and
+>   refuse the old owner); the handoff in the daemon (drain, the head or live log durable, the report, the new owner's
+>   phase one for the one object, materialize, serve; routing follows the exception; a `slates volume move` verb); an
+>   overlay's move (its base stays on its source host, §4.10 "Overlay volumes in a fleet", so it is refused typed
+>   until a remote base service or a captured base exists); kiln's runners as members (certificates under kiln's CA,
+>   seeds from kiln's runner directory); a multi-runner test with injected faults.
+> - **Decision owed (Ada):** Hex's D281 reads "Volumes stay per machine (2026-11-14)", while this goal replicates a
+>   volume's changes to copies on other runners and moves a volume with its agent.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
