@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'diag-b13-*']
   pull_request:
   # The nightly run (Part 6: shuttle, TSan and the long lanes "nightly"; AUD-29-32; Ada authorized the
   # schedule 2026-10-03). Every job runs on it, on main, so a day with no push still meets a moving
