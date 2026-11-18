@@ -512,6 +512,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The keys the human registered to sign grants with (A-285; `crate::grant_signature`). A signed `Grant` verifies
+  /// only under one of them; none are registered until the human's surface registers the first.
+  pub grant_keys: Vec<crate::grant_signature::RegisteredKey>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],

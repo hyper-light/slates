@@ -7067,9 +7067,10 @@ server, not inferred from command names.
 
 > **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
 > signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
-> assertion over the same statement; the anchor's own terminal where no key is registered. The statement and the SSH
-> verifier are built (`crates/server/src/grant_signature.rs`); the wire, the nonce, key registration and the CLI are
-> owed, and the issuer secret still proves grants until they land. Record: A-285, GAPS (2026-11-18).
+> assertion over the same statement; the anchor's own terminal where no key is registered. The statement, the SSH
+> verifier, the presentation's nonce and the signed `Grant` are built (`crates/server/src/grant_signature.rs`,
+> `landing::verify_signed_grant`); key registration and the CLI are owed, and the issuer secret still proves grants
+> until they land. Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -20911,8 +20912,8 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
 ### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
 Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
 `crates/server/src/grant_signature.rs`.
-Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested). Owed, in order: the presentation's
-nonce, the signed `Grant` on the wire and the nonce spent once (replay); durable key registration (the first key only
+Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested); piece 2 built (the presentation's
+nonce, the signed `Grant` on the wire, the nonce spent once). Owed, in order: durable key registration (the first key only
 through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
 sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
 GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.

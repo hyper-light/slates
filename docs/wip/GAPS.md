@@ -5,8 +5,12 @@
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
 > (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
 > `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Owed, in order:**
-> - the presentation's nonce, a signed `Grant` on the wire, the nonce spent once (a replay refused);
+> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
+> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
+> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
+> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
+> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
+> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
 > - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
 >   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
 >   registered key; no agent channel adds one;
