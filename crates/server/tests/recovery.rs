@@ -4770,6 +4770,125 @@ fn a_created_and_pinned_overlay_survives_a_restart() {
   second.stop();
 }
 
+/// A clone name for an origin named `origin_name` that hashes to a partition other than the origin's (A-236's alias
+/// path), or `stem` itself when every candidate lands on the origin's.
+fn clone_name_on_another_partition(origin_name: &str, stem: &str) -> String {
+  let partitions = usize::from(TEST_SHARDS);
+  let origin = slates_server::verbs::owner_of_name(origin_name, partitions);
+  (0..16)
+    .map(|suffix| format!("{stem}-{suffix}"))
+    .find(|candidate| slates_server::verbs::owner_of_name(candidate, partitions) != origin)
+    .unwrap_or_else(|| stem.to_owned())
+}
+
+/// AC-1.16 and AC-2.12 (GAPS 2026-11-05, "The daemon cannot clone an overlay volume": `admit_clone` gave every clone
+/// no host, so an overlay's clone could not image its base and `volume clone` was refused `ContentUnavailable`, pinned
+/// or not; kiln's agentic.md W3 and W7 wait on it). Do: an overlay over a directory holding `base.txt` and `edit.txt`;
+/// through the volume rewrite `edit.txt` and create `new.txt`; snapshot; clone the snapshot twice, one name on the
+/// origin's partition and one on the other (A-236's alias path); write `clone.txt` into the first clone; restart the
+/// daemon over the same segment. Expect both clones made; each reads `base.txt` from the directory and the snapshot's
+/// `edit.txt` and `new.txt`; `clone.txt` is in the clone that wrote it and in neither the origin nor the other clone;
+/// and after the restart the same, every base byte read again from the directory.
+#[test]
+fn an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-overlayclone-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("overlayclone", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("base.txt", BEFORE);
+  target.seed("edit.txt", b"edit.txt as the disk holds it");
+  let mut client = connect(&instance);
+  let origin = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("overlay-origin")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(origin, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((origin, attachment), "edit.txt", AFTER, 0o644)
+    .unwrap();
+  client
+    .fs_write((origin, attachment), "new.txt", DIVERGED, 0o644)
+    .unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  let near = clone_name_on_origin_partition("overlay-origin", "overlay-clone");
+  let far = clone_name_on_another_partition("overlay-origin", "overlay-far");
+  let clone = client.clone_snapshot(origin, snapshot, &near);
+  assert!(
+    clone.is_ok(),
+    "an overlay's snapshot clones on its own partition: {clone:?}"
+  );
+  let clone = clone.unwrap();
+  let other = client.clone_snapshot(origin, snapshot, &far);
+  assert!(
+    other.is_ok(),
+    "an overlay's snapshot clones under a name held on another partition: {other:?}"
+  );
+  let other = other.unwrap();
+  let clone_attachment = client
+    .attach(clone, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write(
+      (clone, clone_attachment),
+      "clone.txt",
+      b"the clone's own",
+      0o644,
+    )
+    .unwrap();
+  overlay_clones_read(&mut client, origin, (clone, other), "before the restart");
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  overlay_clones_read(&mut client, origin, (clone, other), "after the restart");
+  drop(client);
+  second.stop();
+}
+
+/// What the overlay-clone test expects each volume to read, `when` naming the moment for a failure's message.
+fn overlay_clones_read(
+  client: &mut Client,
+  origin: VolumeId,
+  (clone, other): (VolumeId, VolumeId),
+  when: &str,
+) {
+  for volume in [clone, other] {
+    for (name, expected) in [
+      ("base.txt", BEFORE),
+      ("edit.txt", AFTER),
+      ("new.txt", DIVERGED),
+    ] {
+      let held = read_answered(client, volume, name);
+      assert!(
+        matches!(held.as_deref(), Ok(bytes) if bytes == expected),
+        "{when}: clone {volume:?} reads {name} from its base or snapshot: {held:?}"
+      );
+    }
+  }
+  let own = read_answered(client, clone, "clone.txt");
+  assert!(
+    matches!(own.as_deref(), Ok(bytes) if bytes == b"the clone's own"),
+    "{when}: the clone reads its own file: {own:?}"
+  );
+  for volume in [origin, other] {
+    let absent = read_answered(client, volume, "clone.txt");
+    assert!(
+      matches!(absent, Err(ClientError::Refused(Refusal::NotFound))),
+      "{when}: a file one clone wrote is in no other volume: {absent:?}"
+    );
+  }
+}
+
 /// A-217 (a green's origin is a reference to its base snapshot, held while the green lives; §4.16, D-18). Do: a green
 /// over a bounded overlay's snapshot (two files), one accepted increment; destroy the snapshot, and destroy the overlay;
 /// restart the daemon over the same segment; read the green and destroy both again; then destroy the green and the
