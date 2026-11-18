@@ -7,7 +7,9 @@
 //! maker on it is one account: a Windows daemon's clients are its own user, since its rendezvous section and events
 //! admit that user's SID alone (§4.6 "Rendezvous") and the account is recorded as uid 0 (A-237). So the drive's one
 //! descriptor names that account as owner and its primary group as group, which is what NTFS gives a file the account
-//! makes without elevation, and keeps the access list the volume's rule needs ([`DACL_SDDL`]).
+//! makes without elevation. Its access list is the one NTFS gives that account's own folder (A-368, [`drive_sddl`]):
+//! the account, SYSTEM and the Administrators, and no other account, which reached the drive with full access through
+//! its kernel name until A-368, whatever session it was in.
 //!
 //! The SIDs come from the daemon's token as bytes; their text is written here, by the rules of MS-DTYP 2.4.2, so the
 //! parse is pure and its hostile inputs are tested on every host. The token read is Windows' (`crate::host`).
@@ -31,15 +33,16 @@ const SUB_AUTHORITY_BYTES: usize = 4;
 /// (MS-DTYP 2.4.2.1).
 const DECIMAL_AUTHORITY_LIMIT: u64 = 1 << 32;
 
-/// Format: the drive's discretionary access list in SDDL: protected (`P`, nothing inherited) and one entry granting
-/// full access (`FA`) to Everyone (`WD`). WinFsp checks every open against a descriptor, and the volume's own rights are
-/// the attachment's, enforced by the shard on every request, so the list lets the shard decide; an access list set or
-/// asked for at a create is not kept (§4.6, the stated SECURITY difference).
-pub const DACL_SDDL: &str = "D:P(A;;FA;;;WD)";
-
-/// The SDDL of the drive's one descriptor: `owner` and `group`, each a SID's text, and [`DACL_SDDL`].
-pub fn drive_sddl(owner: &str, group: &str) -> String {
-  format!("O:{owner}G:{group}{DACL_SDDL}")
+/// The SDDL of the drive's one descriptor: `owner` and `group`, each a SID's text, and a protected access list (`P`,
+/// nothing inherited) granting full access (`FA`) to the owner, SYSTEM (`SY`) and the Administrators (`BA`), the list
+/// NTFS gives an account's own folder (`C:\Users\<name>`), and to `marker`, the mount's purge marker: the mount's own
+/// purge client opens files with a token restricted to Everyone and that marker (`crate::purge_token`), and Windows
+/// grants a restricted token only what both its user and one of its restricting SIDs are granted. WinFsp checks every
+/// open against this list (`GetSecurityByName`); within it the volume's rights are the attachment's, enforced by the
+/// shard on every request, and an access list set or asked for at a create is not kept (§4.6, the stated SECURITY
+/// difference).
+pub fn drive_sddl(owner: &str, group: &str, marker: &str) -> String {
+  format!("O:{owner}G:{group}D:P(A;;FA;;;{owner})(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{marker})")
 }
 
 /// A SID's text (`S-1-5-21-…`, MS-DTYP 2.4.2.1) from the bytes it starts (MS-DTYP 2.4.2.2); bytes after it are not

@@ -3789,6 +3789,13 @@ pub enum TargetRefusal {
   AnchorHold,
   /// A detach of this drive already waits for the anchor's release.
   DetachPending,
+  /// This machine does not let WinFsp's driver make a Mount Manager drive (A-369), which a WinFsp drive must be for
+  /// Windows to resolve its files' final paths: an Administrator allows it once, with `MountUseMountmgrFromFSD` set to
+  /// 1 under WinFsp's key, as WinFsp itself is installed once.
+  MountManagerNotAllowed,
+  /// The drive letter names another volume: the Mount Manager gave it to another, or a definition local to the
+  /// daemon's session hides the machine's (A-369).
+  DriveLetterTaken,
 }
 
 /// What the daemon's database refused, where the refusals before [`Refusal::Database`] name nothing closer (A-299):

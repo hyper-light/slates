@@ -3256,7 +3256,8 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > judged against NTFS with the drive's one stated difference: no hard links. Their first run (CI 44260193629,
 > 2026-11-18, both architectures) found Mercurial identical but for that difference, and the drive's one limitation
 > (A-327): Windows answers no final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, error 1005) for a file on
-> a drive that `DefineDosDeviceW` made rather than the Mount Manager, which only Administrators may ask, so git with
+> a drive that `DefineDosDeviceW` made rather than the Mount Manager (resolved by A-369: the drive is a Mount Manager
+> drive WinFsp's driver makes for the daemon, once the machine allows it), which only Administrators may ask, so git with
 > its own symbolic links on cannot change directory there. The lanes run git as Git for Windows ships it.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
@@ -16464,7 +16465,10 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     Administrators group), and a security query is answered with it (before, WinFsp's DLL refused every query, and
     Windows reported its world descriptor: owner Everyone, no access list), so git trusts a repository on the drive. The
     reason stands for access lists and for an owner or group set after the create; three winfstest cases that ask for
-    exactly the drive's access list pass and are off the list.
+    exactly the drive's access list pass and are off the list. **Amended by A-368 (2026-11-18):** the one access list
+    grants the account, SYSTEM and the Administrators alone (and the mount's purge marker), as NTFS grants an account's
+    own folder; it granted Everyone, and another account reached the drive through its volume's kernel name. The three
+    cases fail again, listed under this reason.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
@@ -18159,7 +18163,8 @@ and failed-then-passing oracles distinguish those results from the initial sourc
      serves.
 
   A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
-  its volume and its drive at once. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
+  its volume and its drive at once. **Superseded by A-369 (2026-11-18):** two handles, the control handle and the
+  ledger; the drive is a Mount Manager drive the volume keeps, so no link is held. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
   anchor refused or did not answer.
 - **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
   `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
@@ -18167,6 +18172,9 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   releases its own link handle at teardown; the temporary link disappears when its final owner closes it. Only a
   partially failed construction removes its exact definition explicitly. Thus a dead or replaced daemon cannot
   remove the anchor-held drive. The DLL's `MountPoint` stays null, so deletion owns no drive definition.
+  **Superseded by A-369 (2026-11-18):** the daemon asks WinFsp's driver for a Mount Manager drive on the volume
+  (`FSP_FSCTL_MOUNTMGR`), which lives as long as the volume does, so a dead or replaced daemon still cannot remove the
+  anchor-held drive, and Windows resolves its files' final paths, which it does for no drive `DefineDosDeviceW` made.
 - **The next daemon serves the held volume.** It inherits the three handles and nothing else (A-183), with the held
   records naming each mount.
   - For each restored WinFsp attachment with a held volume, it calls `FspFileSystemCreate` with the mount's parameters.
@@ -24897,7 +24905,8 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   symbolic links on cannot change directory, and any program that asks a file's final path with `VOLUME_NAME_DOS` is
   refused alike. Mounting through the Mount Manager would need an Administrator, which R10 never requires; a WinFsp
   network file system would have a final path, a UNC one every tool would then print in place of the drive. Which, if
-  either, to offer is Ada's decision (GAPS).
+  either, to offer is Ada's decision (GAPS). **Resolved by A-369 (2026-11-18), without Ada:** the drive is a Mount
+  Manager drive WinFsp's driver makes for the unprivileged daemon, once the machine allows it.
 - **Why Subversion failed: the shell rewrote its argument.** Git for Windows' shell rewrites an argument that looks
   like a POSIX path before it starts a Windows program, and it took Subversion's repository-relative URL `^/trunk` for
   one. The shared environment now sets `MSYS_NO_PATHCONV=1`, Git for Windows' switch for handing every argument on as
@@ -26551,7 +26560,8 @@ the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_
   records the account as uid 0). So the drive's one descriptor names that account, the user of the daemon's token, as
   owner and the token's primary group as group, which is what NTFS gives a file the account makes unelevated; and the
   host answers `GetSecurity` with it, on the receiving thread and without the shard, since every object reports the
-  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before.
+  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before
+  (**superseded the same day by A-368:** the account, SYSTEM and the Administrators alone).
   Rejected: the Administrators group as owner, which git trusts only for an elevated administrator's process, so an
   unelevated user's repository stays refused; a descriptor kept per object in the volume, a format change for an owner
   that is the same account on every object; and each object's uid mapped to a SID by WinFsp's POSIX map

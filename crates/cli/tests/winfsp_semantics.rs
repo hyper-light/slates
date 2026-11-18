@@ -1258,3 +1258,252 @@ fn what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does() {
     );
   }
 }
+
+/// Format: Win32's `ERROR_ACCESS_DENIED` as `CreateFileW` reports a refused open (winerror.h).
+const ACCESS_DENIED: i32 = 5;
+
+/// The kernel name a drive letter names in this session (`QueryDosDeviceW`), the volume WinFsp made for the mount.
+fn kernel_name_of(drive: &str) -> String {
+  let name = wide(drive);
+  let mut target = vec![0u16; 1024];
+  // SAFETY: `name` is terminated and `target` has the reported writable capacity in UTF-16 units.
+  let length = unsafe {
+    windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW(
+      name.as_ptr(),
+      target.as_mut_ptr(),
+      u32::try_from(target.len()).unwrap(),
+    )
+  };
+  assert!(
+    length > 0,
+    "QueryDosDeviceW({drive}): {}",
+    std::io::Error::last_os_error()
+  );
+  let end = target.iter().position(|&unit| unit == 0).unwrap();
+  String::from_utf16(&target[..end]).unwrap()
+}
+
+/// A local account this test makes (`NetUserAdd`), logged on over the network for impersonation, and deleted when
+/// dropped.
+struct OtherAccount {
+  name: String,
+  token: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl OtherAccount {
+  /// Makes the account and logs it on; `None` where this process may not make a local account (not an Administrator).
+  fn make() -> Option<OtherAccount> {
+    let name = format!("slw{}", std::process::id());
+    let password = format!(
+      "Sl-{}-{}!aA9",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    );
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+      NetUserAdd, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
+    };
+    let (mut wide_name, mut wide_password) = (wide(&name), wide(&password));
+    let info = USER_INFO_1 {
+      usri1_name: wide_name.as_mut_ptr(),
+      usri1_password: wide_password.as_mut_ptr(),
+      usri1_password_age: 0,
+      usri1_priv: USER_PRIV_USER,
+      usri1_home_dir: std::ptr::null_mut(),
+      usri1_comment: std::ptr::null_mut(),
+      usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
+      usri1_script_path: std::ptr::null_mut(),
+    };
+    let mut wrong = 0u32;
+    // SAFETY: the local machine (no server name), level 1 with a `USER_INFO_1` whose strings live across the call.
+    let made = unsafe { NetUserAdd(std::ptr::null(), 1, (&raw const info).cast(), &mut wrong) };
+    if made != 0 {
+      eprintln!(
+        "SKIP: another account's open needs a local account this process may make (NetUserAdd answered {made}, \
+         parameter {wrong})"
+      );
+      return None;
+    }
+    let mut account = OtherAccount {
+      name,
+      token: std::ptr::null_mut(),
+    };
+    let (user, domain, secret) = (wide(&account.name), wide("."), wide(&password));
+    // SAFETY: three terminated strings and an out-pointer to the account's token field; the token is closed on drop.
+    let logged = unsafe {
+      windows_sys::Win32::Security::LogonUserW(
+        user.as_ptr(),
+        domain.as_ptr(),
+        secret.as_ptr(),
+        windows_sys::Win32::Security::LOGON32_LOGON_NETWORK,
+        windows_sys::Win32::Security::LOGON32_PROVIDER_DEFAULT,
+        &mut account.token,
+      )
+    };
+    assert!(
+      logged != 0,
+      "LogonUserW: {}",
+      std::io::Error::last_os_error()
+    );
+    Some(account)
+  }
+
+  /// Opens `path` for reading as this account (this thread impersonates it for the one call): `Ok` or the Win32 error.
+  fn open(&self, path: &str) -> Result<(), i32> {
+    let name = wide(path);
+    // SAFETY: the account's live token; this thread reverts below before anything else runs on it.
+    let impersonated = unsafe { windows_sys::Win32::Security::ImpersonateLoggedOnUser(self.token) };
+    assert!(
+      impersonated != 0,
+      "ImpersonateLoggedOnUser: {}",
+      std::io::Error::last_os_error()
+    );
+    // SAFETY: a terminated path, no security attributes and no template; a valid handle is closed at once.
+    let handle = unsafe {
+      windows_sys::Win32::Storage::FileSystem::CreateFileW(
+        name.as_ptr(),
+        windows_sys::Win32::Foundation::GENERIC_READ,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+        std::ptr::null(),
+        windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+        0,
+        std::ptr::null_mut(),
+      )
+    };
+    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    // SAFETY: ends this thread's impersonation, which the call above began.
+    let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
+    assert!(
+      reverted != 0,
+      "RevertToSelf: {}",
+      std::io::Error::last_os_error()
+    );
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+      return Err(error);
+    }
+    // SAFETY: the handle the open returned, closed once.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    Ok(())
+  }
+}
+
+impl Drop for OtherAccount {
+  fn drop(&mut self) {
+    if !self.token.is_null() {
+      // SAFETY: the token LogonUserW returned, closed once.
+      unsafe { windows_sys::Win32::Foundation::CloseHandle(self.token) };
+    }
+    let name = wide(&self.name);
+    // SAFETY: the local machine (no server name) and the account's terminated name, for the one call.
+    let _ = unsafe {
+      windows_sys::Win32::NetworkManagement::NetManagement::NetUserDel(
+        std::ptr::null(),
+        name.as_ptr(),
+      )
+    };
+  }
+}
+
+/// A-368. A drive is the account's own: its access list grants that account, SYSTEM and the Administrators alone, as
+/// NTFS grants an account's own folder. Before A-368 it granted Everyone full access, and any account of any session
+/// could name the drive's volume (`\\?\GLOBALROOT\Device\…`) and read and write it. Do: make a file through the drive;
+/// open it through the volume's kernel name as this account, then as another local account this test makes. Expect
+/// this account's open to succeed and the other's to be refused `ERROR_ACCESS_DENIED`. Skips loudly where this process
+/// may not make a local account.
+#[test]
+fn another_account_cannot_open_a_file_on_the_drive() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("account");
+  std::fs::write(drive.path("private.txt"), b"the account's own").unwrap();
+  let path = format!(
+    "\\\\?\\GLOBALROOT{}\\private.txt",
+    kernel_name_of(&drive.letter)
+  );
+  assert_eq!(
+    std::fs::read(&path).unwrap(),
+    b"the account's own",
+    "this account reads its file through the volume's kernel name"
+  );
+  let Some(other) = OtherAccount::make() else {
+    return;
+  };
+  let opened = other.open(&path);
+  eprintln!("A-368 another account opening {path}: {opened:?}");
+  assert_eq!(
+    opened,
+    Err(ACCESS_DENIED),
+    "another account is refused the drive's file"
+  );
+}
+
+/// A-369. Windows resolves a file's final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, which Rust's
+/// `canonicalize`, Python's `realpath` and git with its symbolic links on each ask) only on a drive the Mount Manager
+/// made, and the mount's was made by `DefineDosDeviceW` until A-369, so each was answered `ERROR_UNRECOGNIZED_VOLUME`
+/// (1005). Do: make a file in a directory through the drive and canonicalize its path. Expect the drive's own path,
+/// `\\?\X:\dir\file.txt`.
+#[test]
+fn a_file_on_the_drive_has_its_drive_path_as_its_final_path() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("final");
+  std::fs::create_dir(drive.path("dir")).unwrap();
+  std::fs::write(drive.path("dir\\file.txt"), b"its final path").unwrap();
+  let canonical = std::fs::canonicalize(drive.path("dir\\file.txt"))
+    .map(|path| path.display().to_string())
+    .map_err(|error| error.raw_os_error());
+  eprintln!("A-369 the file's final path: {canonical:?}");
+  assert_eq!(
+    canonical,
+    Ok(format!("\\\\?\\{}\\dir\\file.txt", drive.letter))
+  );
+}
+
+/// A-369. Git for Windows with its own symbolic links on (its installer's option, `core.symlinks`, or `MSYS` naming
+/// `winsymlinks:nativestrict`) changes directory through each directory's final path (`compat/mingw.c`
+/// `mingw_chdir`), which a drive `DefineDosDeviceW` made has none of, so every git command on the drive failed (`fatal:
+/// cannot chdir to repo: No such device`; CI run 44260193629, A-327). Do: with `MSYS=winsymlinks:nativestrict`, make
+/// a repository on the drive with `git init`, then ask its state and its top level. Expect each to succeed and the top
+/// level spelled with the drive. Skips loudly without git on the `PATH`.
+#[test]
+fn git_with_its_symbolic_links_on_works_on_the_drive() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !Command::new("git")
+    .arg("--version")
+    .output()
+    .is_ok_and(|output| output.status.success())
+  {
+    eprintln!("SKIP: git with its symbolic links on needs git on the PATH");
+    return;
+  }
+  let drive = Drive::mount("gitlinks");
+  let repository = drive.path("repo");
+  let git = |args: &[&str]| {
+    let output = Command::new("git")
+      .args(args)
+      .env("MSYS", "winsymlinks:nativestrict")
+      .env("GIT_CONFIG_NOSYSTEM", "1")
+      .output()
+      .unwrap();
+    let words = format!(
+      "{}{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("A-369 git {args:?}: {} {}", output.status, words.trim());
+    (output.status.success(), words)
+  };
+  let (made, words) = git(&["init", "-q", &repository]);
+  assert!(made, "git init on the drive: {words}");
+  let (answered, words) = git(&["-C", &repository, "status", "--short"]);
+  assert!(answered, "git status on the drive: {words}");
+  let (found, words) = git(&["-C", &repository, "rev-parse", "--show-toplevel"]);
+  assert!(found, "git rev-parse on the drive: {words}");
+  assert_eq!(words.trim(), format!("{}/repo", drive.letter));
+}
