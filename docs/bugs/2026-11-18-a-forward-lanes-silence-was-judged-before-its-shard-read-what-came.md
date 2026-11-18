@@ -43,6 +43,7 @@ a budget, and b's control shard held for one and a half budgets as soon as b has
 | A-315's first form, the shard's waits alone (`-green-1`, run 44253484990; `-green-2`, run 44254220660) | passed 5 of 6 | passed 5 of 6 | passed 6 of 6 |
 | A-315's third form, a turn after the shard's waits that read its queue empty (`-green-5`, run 44257173978) | passed 8 of 8 | not run | passed 8 of 8 |
 | A-315 as landed, a turn begun after the silence that read its own socket empty, merged tree (`-green-7`, run 44260700333) | passed 8 of 8 | not run | passed 8 of 8 |
+| A-315 with the sessionless turn, A-317 over it, merged with main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893) | passed 3 of 3 | passed 3 of 3 | passed 3 of 3 |
 
 On main every run gave up 7 of the 8 batches and resent them (`fleet.forward.batch_given_up` 7, `fleet.forward.retried`
 7, 15 forwards begun): every forwarder but the lane's driver, whose own turn reads first. With A-315 none was given up
@@ -175,11 +176,12 @@ The other forward tests keep their results with the form that landed (`-green-7`
 `an_unanswered_forward_is_sent_again_within_the_takeover_bound` (the test the poll clock failed on Windows) 6 of 6,
 `a_silent_forward_gives_up_while_its_session_carries_others` (the 298 forwards' regression: an open forward is still
 given up while other replies flow) 12 of 12, `a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one` and
-`a_read_through_a_dead_session_keeps_its_place_behind_a_burst` 6 of 6 each. The macOS runners' queue held their jobs past
-landing; the first form ran all four 9 of 9 on the three runners (`-green-2`). With the sessionless turn
-(`diag-g255-fix-1`, run 44271632046) the held-origin and silent-forward tests passed 6 of 6 each, the other three
-forward tests and `a_forward_waits_for_the_owners_session_while_it_is_out` (a session lent out, which the sessionless
-turn must not count) 3 of 3 each, on ubuntu-latest and windows-latest alike.
+`a_read_through_a_dead_session_keeps_its_place_behind_a_burst` 6 of 6 each. The macOS runners' queue held those jobs;
+the first form ran all four 9 of 9 on the three runners (`-green-2`), and on macos-latest the landed form, with A-317
+over it, passed the held-origin test 3 of 3 and the left-out-head takeover test 6 of 6 (`diag-g255-land2-1`). With the
+sessionless turn (`diag-g255-fix-1`, run 44271632046) the held-origin and silent-forward tests passed 6 of 6 each, the
+other three forward tests and `a_forward_waits_for_the_owners_session_while_it_is_out` (a session lent out, which the
+sessionless turn must not count) 3 of 3 each, on ubuntu-latest and windows-latest alike.
 
 The left-out-head takeover test reads c's held position once both volumes are served and wants exactly the second
 head, while its own words ask only that c hold the second, not the first. Each of the 8 runs that served late (10 s)

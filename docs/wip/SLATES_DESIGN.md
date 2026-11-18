@@ -23169,7 +23169,9 @@ Applied in the same change to:
   sessionless turn, its serve poll lasting 10.01 s, the bound (run 44269560693), where main passed it 8 of 8 (run
   44269560657); with it, 8 of 8, and 4 of 4 on windows-latest where it had failed 3 of 3 (runs 44271632046 and
   44271632037), the lane's other tests unchanged, and sixteen runs a side served its volumes in 2.11 to 3.13 s, main
-  in 2.15 to 3.37 s (runs 44272364924 and 44272413371). The bug record has the forms that did not land.
+  in 2.15 to 3.37 s (runs 44272364924 and 44272413371). With A-317 over it, the held-origin test passed 3 of 3 on each
+  of the three runners, macos-latest among them, and the takeover test 6 of 6 on each (run 44273659893). The bug
+  record has the forms that did not land.
 - **Cost.** A look reads the lane's two turn counts. A silence awaiting its receiver looks again every poll interval
   while it lasts, and a turn that read a datagram makes one more receive that does not wait. The lane's progress is one
   stored instant per begin, reply and byte-bearing turn.
