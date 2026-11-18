@@ -24,14 +24,13 @@ pub(crate) fn await_recovered(
   wait: Duration,
 ) -> u32 {
   let started = Instant::now();
-  let mut last = String::from("no status asked yet");
   loop {
     let output = Command::new(env!("CARGO_BIN_EXE_slates"))
       .args(["--instance", instance, "status", "--json"])
       .output()
       .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
+    let last = if output.status.success() {
       let pid = after(&text, PID_KEY).and_then(|rest| {
         rest
           .split(|c: char| !c.is_ascii_digit())
@@ -43,10 +42,10 @@ pub(crate) fn await_recovered(
       if let Some(pid) = pid.filter(|pid| recovered && wanted(*pid)) {
         return pid;
       }
-      last = format!("pid {pid:?}, recovered {recovered}");
+      format!("pid {pid:?}, recovered {recovered}")
     } else {
-      last = format!("status exited {:?}", output.status.code());
-    }
+      format!("status exited {:?}", output.status.code())
+    };
     assert!(
       started.elapsed() < wait,
       "no daemon of {instance} the test wanted was judged recovered within {wait:?} (last: {last})"
