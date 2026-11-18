@@ -1316,7 +1316,9 @@ dependencies = [
  "slates-merge",
  "slates-rt",
  "slates-server",
+ "slates-transport",
  "slates-vfs",
+ "slates-wire",
  "windows-sys 0.60.2",
 ]
 

@@ -1179,7 +1179,7 @@ impl Partition {
         }
         Ok(())
       }
-      Op::ConsumerRevoked { consumer } => self
+      Op::ConsumerRevoked { consumer } | Op::ConsumerWritePolicySet { consumer, .. } => self
         .consumers
         .get(consumer)
         .map(|_| ())
@@ -1623,6 +1623,12 @@ impl Partition {
           .get_mut(consumer)
           .ok_or(DbError::NotFound)?
           .revoked = true;
+        Ok(())
+      }
+      Op::ConsumerWritePolicySet { consumer, policy } => {
+        let record = self.consumers.get_mut(consumer).ok_or(DbError::NotFound)?;
+        record.write = Some(*policy);
+        record.write_version = record.write_version.saturating_add(1);
         Ok(())
       }
       Op::LandingLeaseTaken { record } => {

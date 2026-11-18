@@ -46,8 +46,12 @@ fn main() -> ExitCode {
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
   find exactly its own instance's processes.
 - The starter is the launcher: it sets its agents' write modes and approves what an ask mode holds.
-  Handing it the instance's issuer on every platform is owed (A-299); today it holds the issuer where
-  the anchor's handoff reaches it.
+  Its authority is a secret of its own: make one once with `LauncherSecret::generate()`, keep its
+  `bytes()` where the host keeps its secrets, and start with
+  `StartSpec::new(..).with_launcher(LauncherSecret::from_bytes(kept)?)` at every start; then
+  `Issuer::from_launcher_secret(&secret)` is the authority `approve_landing`, `approve_merge` and
+  `set_write_policy` take, after the host's restart as before it. (The daemon's verification of it is
+  being built, A-285.)
 
 ## The consumer contract
 
