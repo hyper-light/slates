@@ -1,20 +1,19 @@
-//! A grant's claim and its proof (§4.13 "Grants", R10), kept apart from what makes the proof, so the library's grant
-//! call takes any proof the daemon accepts.
+//! A grant's claim and its proof (§4.13 "Grants", R10; A-299), kept apart from what makes the proof, so the library's
+//! grant call takes any proof the daemon accepts.
 //!
-//! **The claim** is exactly what a grant authorizes: one presented landing, by its id, the manifest hash a person
-//! approved, the scope and the term. **The proof** is the human authority's word over that claim. Today the daemon
-//! accepts one form, the keyed hash under the anchor's issuer secret that an [`crate::Issuer`] makes. Ada chose the
-//! proof's next form on 2026-11-18: a signature by a key only the human holds — an ssh-agent key with confirmation on
-//! each use, or a FIDO touch, with a prompt on the anchor's terminal where there is neither, on every platform; an
-//! embedding host's interface may present a WebAuthn assertion as one form of it. Those arrive as further
-//! [`GrantProof`] variants and [`GrantAuthority`] implementations; [`crate::Instance::grant`] and
-//! [`crate::Instance::land_approved`] do not change.
+//! **The claim** is exactly what a grant authorizes: one presented landing, by its id, the manifest hash its approver
+//! saw, the scope and the term. **The proof** is the authority's word over that claim. Under Ada's rule of 2026-11-18
+//! (A-299) the authority is the launcher's — whoever started the instance, or the harness it hands an agent's write
+//! mode — and never an agent's own: an agent holds only its consumer's capability. Today the daemon accepts one form,
+//! the keyed hash under the anchor's issuer secret that an [`crate::Issuer`] makes. No person-only key is required;
+//! signatures are for signed work ([`crate::signed`]), which never gates permission.
 //!
-//! A host whose person proves out of band (a browser's assertion) holds the presented plan on its [`crate::Instance`],
-//! asks for the proof over the plan's [`GrantClaim`], and calls `grant` with what comes back; one with a synchronous
-//! authority calls `land_approved`, which presents again, compares, proves and lands in one step.
+//! [`crate::Instance::approve_landing`] is the whole step for a consumer: it presents the landing again, compares the
+//! manifest with the approved one, has a [`GrantAuthority`] prove the claim, grants and lands. A host whose approver
+//! answers on another client issues the grant there with [`crate::Instance::grant`] from the presentation's id and
+//! manifest ([`crate::LandingApproval`]); the presenting client then lands under it.
 
-use slates_ipc::protocol::GrantScope;
+use slates_ipc::protocol::{GrantScope, VolumeId};
 
 use crate::error::Error;
 
@@ -22,9 +21,9 @@ use crate::error::Error;
 /// term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrantClaim {
-  /// The presented landing's id ([`crate::LandingPlan::landing`]).
+  /// The presented landing's id ([`crate::LandingApproval::presentation`]).
   pub landing: u64,
-  /// The manifest hash the person approved ([`crate::LandingPlan::manifest`]).
+  /// The manifest hash the approver saw ([`crate::LandingApproval::manifest`]).
   pub manifest: [u8; 32],
   /// One landing of exactly this manifest, or the session's later landings of the volume into the target.
   pub scope: GrantScope,
@@ -32,10 +31,8 @@ pub struct GrantClaim {
   pub term_ns: u64,
 }
 
-/// The human authority's proof over a [`GrantClaim`], in a form the daemon verifies before it issues the grant. Further
-/// forms are added (see the module doc), so match it with a wildcard arm.
+/// The authority's proof over a [`GrantClaim`], in a form the daemon verifies before it issues the grant.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum GrantProof {
   /// The keyed hash of the claim under the anchor's issuer secret (`slates_server::landing::grant_proof`), which the
   /// daemon that minted the secret verifies.
@@ -60,10 +57,13 @@ impl std::fmt::Debug for GrantProof {
   }
 }
 
-/// What can prove a claim when asked, in this process: the issuer secret's holder ([`crate::Issuer`]) today; a
-/// human-held key's agent once the daemon accepts its signatures.
+/// What can prove a claim when asked, in this process: the launcher's authority, the issuer secret's holder
+/// ([`crate::Issuer`]).
 pub trait GrantAuthority {
-  /// The proof of `claim`. Refused typed when this authority cannot prove now (no handoff, no published secret, the
-  /// person declined).
+  /// The proof of `claim`. Refused typed when this authority cannot prove now (no handoff, no published secret).
   fn prove(&self, claim: &GrantClaim) -> Result<GrantProof, Error>;
+
+  /// The proof that approves merging the increment `identity` of `work` (A-285: a merge an ask mode held). Refused
+  /// typed as [`GrantAuthority::prove`] is.
+  fn prove_merge(&self, work: VolumeId, identity: &[u8; 32]) -> Result<GrantProof, Error>;
 }

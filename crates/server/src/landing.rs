@@ -29,7 +29,8 @@ use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
 };
 use slates_ipc::protocol::{
-  AuditEntry, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
+  AuditEntry, GrantScope, GrantSummary, PolicySubject, Refusal, ReplyBody, SnapshotId, VolumeId,
+  WriteAct, WriteMode, WritePolicy,
 };
 use slates_land::engine::Audit;
 #[cfg(unix)]
@@ -236,6 +237,8 @@ pub struct LandCall<'a> {
   pub filter: &'a slates_ipc::protocol::Filter,
   /// The grant, when one was issued.
   pub grant: Option<u64>,
+  /// Present only (`Present`, A-285): answer the presentation whatever the write policy, never land.
+  pub present_only: bool,
 }
 
 /// Lands `volume`'s snapshot into `target` (§4.15). Without a grant covering the planned
@@ -495,6 +498,7 @@ fn land_verb_unix(
     target,
     filter,
     grant,
+    present_only,
   } = call;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
@@ -503,6 +507,17 @@ fn land_verb_unix(
   if !rights_of(&record, principal).write {
     return forbidden("land");
   }
+  // The write policy (A-285): a forbidding mode refuses every landing, granted or not, before any host access; a
+  // bypass mode grants the landing the daemon presents and lands it in the same request.
+  let mode = land_mode(&record);
+  if mode == slates_db::catalog::WriteMode::Forbid && !present_only {
+    state.count(POLICY_FORBIDS_LAND, 1);
+    return refused(Refusal::PolicyForbids {
+      act: WriteAct::Land,
+      by: PolicySubject::Volume { volume },
+    });
+  }
+  let bypass = !present_only && grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
   let db_volume = to_db_volume(volume);
   // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
   // is refused before any host access, id or record (AUD-29-07).
@@ -538,6 +553,11 @@ fn land_verb_unix(
     principal: principal.clone(),
     client: client_id,
     grant,
+    bypass: bypass.then(|| Requested {
+      volume,
+      snapshot,
+      filter: filter.clone(),
+    }),
   };
   match grant {
     // A presentation writes nothing and takes no lease; it is planned in slices and answered when planned.
@@ -545,6 +565,22 @@ fn land_verb_unix(
     // A granted landing runs as an owned task under its target's lease (AUD-29-03).
     Some(_) => defer_granted_landing(state, prepared),
   }
+}
+
+/// Format: the counter of landings a forbidding write policy refused (A-285).
+#[cfg(unix)]
+const POLICY_FORBIDS_LAND: &str = "policy_forbids.land";
+/// Format: the counter of landings a bypass write policy granted (A-285).
+#[cfg(unix)]
+const POLICY_GRANTED_LAND: &str = "policy_granted.land";
+
+/// What a landing request named, kept by a bypass presentation (A-285) to land it under the grant the policy issues:
+/// the request's own volume, snapshot (the head when `None`) and filter.
+#[cfg(unix)]
+struct Requested {
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  filter: slates_ipc::protocol::Filter,
 }
 
 /// A landing ready to run: its volume, its opened target and what its request and records name.
@@ -561,6 +597,9 @@ struct Prepared {
   principal: Principal,
   client: u32,
   grant: Option<u64>,
+  /// What to land under the grant a bypass policy issues once the presentation is planned (A-285); `None` for a
+  /// presentation that waits for an approval, and for a granted landing.
+  bypass: Option<Requested>,
 }
 
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
@@ -671,6 +710,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     implicit,
     writer,
     beginning,
+    bypass: prepared.bypass,
   };
   crate::image::defer(state, run_presentation(job))
 }
@@ -700,6 +740,7 @@ struct PresentJob {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   writer: Writer,
   beginning: slates_land::engine::Beginning,
+  bypass: Option<Requested>,
 }
 
 #[cfg(unix)]
@@ -741,6 +782,14 @@ async fn run_presentation(mut job: PresentJob) {
   let request = job.request_id;
   let _ = crate::state::with_state(|s| {
     job.settle(s);
+    // A bypass policy (A-285): a planned presentation is granted by the policy and landed in this same request.
+    let ended = match (job.bypass.take(), ended) {
+      (Some(requested), Some(Ok(slates_land::engine::Planned::Presented(plan)))) => {
+        land_under_policy(s, &job, request, requested, plan);
+        return;
+      }
+      (_, ended) => ended,
+    };
     let (reply, route) = crate::image::complete(s, request, |s| {
       let ids = LandingIds {
         landing_id: job.landing_id,
@@ -768,6 +817,90 @@ async fn run_presentation(mut job: PresentJob) {
     });
     crate::image::deliver(s, reply, route);
   });
+}
+
+/// Lands a planned presentation under a bypass policy (A-285): the presentation is recorded, the policy issues its
+/// grant (`Issuer::Policy`), and the landing runs under that grant in the request that presented it, as a granted
+/// landing's request does (`defer_granted_landing` takes the request and its reply route over). One transaction holds
+/// the presentation, the grant and, when the landing could not start, the request's completion: a landing that starts
+/// answers the request itself when it ends. The landing plans again under the grant, so a volume changed since the
+/// presentation lands what the grant bound or is refused `GrantMismatch`, never something no one planned.
+#[cfg(unix)]
+fn land_under_policy(
+  s: &mut ShardState,
+  job: &PresentJob,
+  request: (u64, slates_wire::request::RequestId),
+  requested: Requested,
+  plan: Box<slates_land::engine::Presented>,
+) {
+  let route = crate::image::take_in_flight(s, request);
+  s.db.begin();
+  s.current_request = Some(request);
+  s.reply_route = route;
+  let ids = LandingIds {
+    landing_id: job.landing_id,
+    fresh: true,
+    volume: job.volume,
+    snapshot: job.snapshot,
+    target: &job.target,
+    rebased: false,
+  };
+  let presenter = Presenter {
+    client: job.client,
+    principal: &job.principal,
+  };
+  let presented = present(s, presenter, &ids, plan);
+  let reply = if matches!(presented, ReplyBody::GrantRequired { .. }) {
+    // The grant needs to stand only until the landing that follows checks it: the operator's failover bound, the
+    // term the landing's own target lease runs under.
+    let term = s.config.failover_slo_ns;
+    match issue_grant(
+      s,
+      &job.principal,
+      job.landing_id,
+      (GrantScope::Once, term),
+      Issuer::Policy,
+    ) {
+      Ok(grant) => {
+        s.count(POLICY_GRANTED_LAND, 1);
+        land_verb_unix(
+          s,
+          job.client,
+          &job.principal,
+          LandCall {
+            volume: requested.volume,
+            snapshot: requested.snapshot,
+            target: &job.target,
+            filter: &requested.filter,
+            grant: Some(grant),
+            present_only: false,
+          },
+        )
+      }
+      Err(refusal) => refused(refusal),
+    }
+  } else {
+    presented
+  };
+  s.current_request = None;
+  let route = s.reply_route.take();
+  let (origin, id) = request;
+  if std::mem::take(&mut s.acceptance_deferred) {
+    // The granted landing took the request over and answers it when it ends; what led to it commits now.
+    if s.db.commit(&mut s.segment).is_err() {
+      crate::verbs::reconcile_unpublished_effects(s);
+    }
+    return;
+  }
+  let reply = crate::verbs::record_completion(s, origin, id, reply);
+  let reply = match s.db.commit(&mut s.segment) {
+    Ok(_) => reply,
+    Err(e) => {
+      crate::verbs::reconcile_unpublished_effects(s);
+      refused(crate::error::refusal_of_db(&e))
+    }
+  };
+  crate::image::deliver(s, reply, route);
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
@@ -2548,15 +2681,24 @@ pub fn grant_verb(
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| grant_proof(secret, landing_id, &manifest, scope, term_ns),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   if awaiting.manifest != manifest {
     return crate::verbs::refused(Refusal::GrantMismatch);
   }
-  match issue_grant(state, principal, landing_id, scope, term_ns) {
+  match issue_grant(
+    state,
+    principal,
+    landing_id,
+    (scope, term_ns),
+    Issuer::Human,
+  ) {
     Ok(grant) => ReplyBody::Granted { grant },
     Err(refusal) => crate::verbs::refused(refusal),
   }
@@ -2614,17 +2756,221 @@ pub(crate) fn constant_time_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool
   difference == 0
 }
 
-/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached only through
-/// [`grant_verb`], whose proof of issuer authority has verified, so a grant a human did not make cannot
-/// exist. The grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
-/// record gains the grant. Returns the grant id.
+/// Who issues a grant (A-285, R10): the launcher's or the harness's approval, proven under the issuer secret
+/// ([`grant_verb`]), or the volume's bypass policy, which that same authority set ([`set_policy_verb`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Issuer {
+  /// An approval proven under the issuer secret, recorded as the command line's surface.
+  Human,
+  /// The daemon itself, under the volume's bypass policy, recorded as the policy's surface.
+  Policy,
+}
+
+/// Format: the domain tag of a policy proof, so it never verifies as a grant, enrollment or revocation proof.
+const POLICY_DOMAIN: &[u8] = b"slates.policy";
+
+/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the launcher's secret, of the policy domain
+/// tag, the subject and the policy in their wire encodings, and the policy version the setter read. Only the launcher
+/// or the harness can make one; an agent's consumer channel never holds the secret. The version makes a captured proof
+/// good for one change: once the policy has moved past it, the proof is refused `PolicyChanged`.
+pub fn policy_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  subject: &PolicySubject,
+  policy: &WritePolicy,
+  version: u64,
+) -> [u8; 32] {
+  let mut bytes = Vec::new();
+  slates_wire::Wire::encode(subject, &mut bytes);
+  slates_wire::Wire::encode(policy, &mut bytes);
+  bytes.extend_from_slice(&version.to_le_bytes());
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(POLICY_DOMAIN);
+  hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Whether `proof` is the launcher's (A-285, R10): `make`'s proof under the secret this daemon minted at its start (the
+/// issuer, held by the anchor's tree), or under the launcher secret its starter handed the anchor (kept by the launcher
+/// across its own restarts and the daemon's), compared in constant time. The same formula and domain under either:
+/// the launcher's authority is one, however it is held.
+pub(crate) fn proven_by_launcher(
+  state: &ShardState,
+  make: impl Fn(&[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> [u8; 32],
+  proof: &[u8; 32],
+) -> bool {
+  let by_issuer = constant_time_eq(&make(&state.issuer_secret), proof);
+  let by_launcher = state
+    .launcher_secret
+    .as_ref()
+    .is_some_and(|secret| constant_time_eq(&make(secret), proof));
+  by_issuer | by_launcher
+}
+
+/// Format: the domain tag of a merge approval's proof.
+const MERGE_APPROVAL_DOMAIN: &[u8] = b"slates.merge-approval";
+
+/// The proof a `SubmitApproved` request carries (A-285): the keyed hash, under the issuer secret, of the merge approval
+/// domain tag, the work volume and the approved increment's identity.
+pub fn merge_approval_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  work: VolumeId,
+  identity: &[u8; 32],
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(MERGE_APPROVAL_DOMAIN);
+  hasher.update(&work.bytes);
+  hasher.update(identity);
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves `SetPolicy` (A-285): refused `Forbidden` on a consumer-bound channel, whatever its proof, so an agent never
+/// sets (and so never raises) its own policy, counted `policy_set_by_consumer`; `GrantIssuerUnverified` when the proof
+/// does not verify; a volume's policy recorded durably in its record. A consumer's own policy is not built yet
+/// (GAPS, A-285) and is refused `Unsupported`.
+pub fn set_policy_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  (subject, policy, version): (PolicySubject, WritePolicy, u64),
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("policy_set_by_consumer", 1);
+    return crate::verbs::forbidden("set_policy");
+  }
+  if !proven_by_launcher(
+    state,
+    |secret| policy_proof(secret, &subject, &policy, version),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::Unsupported {
+      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    });
+  };
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  // The setter's version is the one the policy is at (A-285): a proof made for an earlier state of the policy, a
+  // replayed or a raced one, changes nothing.
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::VolumeWritePolicySet {
+    id: crate::verbs::to_db_volume(volume),
+    policy: db_policy(policy),
+  };
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => ReplyBody::PolicySet,
+    Err(e) => crate::verbs::refused(crate::error::refusal_of_db(&e)),
+  }
+}
+
+/// Serves `Policy` (A-285): a volume's write policy to a principal that may read the volume, `None` while none is set
+/// (which is ask). A consumer's own policy is not built yet and is refused `Unsupported`.
+pub fn policy_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  subject: PolicySubject,
+) -> ReplyBody {
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::Unsupported {
+      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    });
+  };
+  let record = match policy_record(state, volume) {
+    Ok(record) => record,
+    Err(reply) => return *reply,
+  };
+  if !crate::verbs::rights_of(&record, principal).read {
+    return crate::verbs::forbidden("policy");
+  }
+  ReplyBody::Policy {
+    policy: record.policy.write.map(wire_policy),
+    version: record.policy.write_version,
+  }
+}
+
+/// The catalog record a policy is set on or read from (A-285): any volume this shard holds — a store-backed volume, a
+/// green or a work, which holds no store slot — refused `NotFound` for one it does not and `Destroying` for one going.
+fn policy_record(
+  state: &ShardState,
+  volume: VolumeId,
+) -> Result<slates_db::catalog::VolumeRecord, Box<ReplyBody>> {
+  let record = state
+    .db
+    .partition()
+    .volume(crate::verbs::to_db_volume(volume))
+    .cloned()
+    .ok_or_else(|| Box::new(crate::verbs::refused(Refusal::NotFound)))?;
+  if matches!(
+    record.state,
+    slates_db::catalog::VolumeState::Destroying | slates_db::catalog::VolumeState::Destroyed
+  ) {
+    return Err(Box::new(crate::verbs::refused(Refusal::Destroying)));
+  }
+  Ok(record)
+}
+
+/// A volume's landing mode (A-285): its policy's, or ask while none is set.
+#[cfg(unix)]
+fn land_mode(record: &slates_db::catalog::VolumeRecord) -> slates_db::catalog::WriteMode {
+  record
+    .policy
+    .write
+    .map_or(slates_db::catalog::WriteMode::Ask, |policy| policy.land)
+}
+
+/// A wire policy as the catalog records it.
+fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy {
+  slates_db::catalog::WritePolicy {
+    merge: db_mode(policy.merge),
+    land: db_mode(policy.land),
+  }
+}
+
+/// A wire mode as the catalog records it.
+fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
+  match mode {
+    WriteMode::Bypass => slates_db::catalog::WriteMode::Bypass,
+    WriteMode::Ask => slates_db::catalog::WriteMode::Ask,
+    WriteMode::Forbid => slates_db::catalog::WriteMode::Forbid,
+  }
+}
+
+/// A recorded policy as the wire carries it.
+fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
+  let mode = |mode| match mode {
+    slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
+    slates_db::catalog::WriteMode::Ask => WriteMode::Ask,
+    slates_db::catalog::WriteMode::Forbid => WriteMode::Forbid,
+  };
+  WritePolicy {
+    merge: mode(policy.merge),
+    land: mode(policy.land),
+  }
+}
+
+/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached through [`grant_verb`],
+/// whose proof of the launcher's authority has verified, or a bypass presentation, under the policy that authority set
+/// (A-285); `issuer` says which, for the record. The grant is issued into the runtime grants and persisted as a
+/// `GrantRecord`; the landing's record gains the grant. Returns the grant id.
 pub fn issue_grant(
   state: &mut ShardState,
   principal: &Principal,
   landing_id: u64,
-  scope: GrantScope,
-  term_ns: u64,
+  (scope, term_ns): (GrantScope, u64),
+  issuer: Issuer,
 ) -> Result<u64, Refusal> {
+  let (surface, grant_surface) = match issuer {
+    Issuer::Human => (Surface::Cli, GrantSurface::Cli),
+    Issuer::Policy => (Surface::Policy, GrantSurface::Policy),
+  };
   let awaiting = state
     .landing
     .awaiting
@@ -2643,7 +2989,7 @@ pub fn issue_grant(
     .landing
     .grants
     .issue(
-      Surface::Cli,
+      surface,
       awaiting.manifest,
       awaiting.binding.clone(),
       land_scope,
@@ -2657,7 +3003,7 @@ pub fn issue_grant(
   let record = DbGrantRecord {
     id: id.0,
     principal: awaiting.principal.clone(),
-    surface: GrantSurface::Cli,
+    surface: grant_surface,
     volume: awaiting.volume,
     snapshot: awaiting.snapshot,
     target: awaiting.target.clone(),
@@ -2705,6 +3051,7 @@ pub fn restore_grants(state: &mut ShardState) {
       surface: match record.surface {
         GrantSurface::Cli => Surface::Cli,
         GrantSurface::Confirmation { .. } => Surface::Confirmation,
+        GrantSurface::Policy => Surface::Policy,
       },
       manifest: record.manifest,
       binding: GrantBinding {

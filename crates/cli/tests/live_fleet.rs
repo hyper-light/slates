@@ -1901,6 +1901,141 @@ fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   );
 }
 
+/// Shape: how long each slow candidate is stopped in its cycle ([`a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`]):
+/// seven tenths of the liveness budget, so every window of a held reply's wait holds one of the candidates' running
+/// spells.
+#[cfg(target_os = "linux")]
+const SLOW_STOPPED_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 10 * 7;
+/// Shape: how long each slow candidate runs in its cycle: a tenth of the liveness budget, room for an answer in each
+/// window of a held reply's wait but not for every exchange a first `fsync` waits on (its head's placement took about
+/// 105 ms of running candidates on adacachy2), so it waits through two cycles, past the liveness budget.
+#[cfg(target_os = "linux")]
+const SLOW_RUNNING_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 10;
+
+/// Shape: the most rounds made while the candidates are slow, each a fresh live volume whose first `fsync` waits for its
+/// head's placement as well as its log: until one outlasts the liveness budget, which a first `fsync` did in 6 of 9
+/// runs of this shape on adacachy2.
+#[cfg(target_os = "linux")]
+const SLOW_ROUNDS: usize = 6;
+
+/// Cycles the processes `pids` between stopped for [`SLOW_STOPPED_NS`] and running for [`SLOW_RUNNING_NS`] until `stop`
+/// is dropped, then leaves them running. Each spell is a wait on the channel, so the cycle ends at once.
+#[cfg(target_os = "linux")]
+fn cycle_slowly(pids: Vec<i32>, stopped: std::sync::mpsc::Receiver<()>) {
+  let each = |signal: rustix::process::Signal| {
+    for pid in &pids {
+      if let Some(pid) = rustix::process::Pid::from_raw(*pid) {
+        let _ = rustix::process::kill_process(pid, signal);
+      }
+    }
+  };
+  let spell = |ns: u64| {
+    matches!(
+      stopped.recv_timeout(Duration::from_nanos(ns)),
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+  };
+  loop {
+    each(rustix::process::Signal::STOP);
+    let on = spell(SLOW_STOPPED_NS);
+    each(rustix::process::Signal::CONT);
+    if !on || !spell(SLOW_RUNNING_NS) {
+      return;
+    }
+  }
+}
+
+/// One round of [`a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`]: a fresh live volume on
+/// `owner`, mounted, a file written, then `fsync`ed while the candidates `pids` cycle slowly. The `fsync`'s answer and how
+/// long it took.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // the test's own files, under the fleet's scratch and the slates mount
+fn slow_round(
+  fleet: &Fleet,
+  owner: &str,
+  pids: &[i32],
+  round: usize,
+) -> (std::io::Result<()>, Duration) {
+  use std::io::Write;
+  let id = create_live_volume(owner, &format!("slowly{round}"));
+  let mount = format!("{}/mount{round}", fleet.scratch.path);
+  std::fs::create_dir_all(&mount).unwrap();
+  let (code, _, err) = run(owner, &["mount", &id, &mount]);
+  assert_eq!(code, 0, "mount: {err}");
+  let mut file = std::fs::File::create(format!("{mount}/slow")).unwrap();
+  file.write_all(b"held by a slow candidate").unwrap();
+  let (stop, stopped) = std::sync::mpsc::channel::<()>();
+  let cycled = pids.to_vec();
+  let cycler = std::thread::spawn(move || cycle_slowly(cycled, stopped));
+  let began = Instant::now();
+  let synced = file.sync_all();
+  let took = began.elapsed();
+  drop(stop);
+  cycler.join().unwrap();
+  drop(file);
+  let unmounted = Command::new("fusermount3").args(["-u", &mount]).status();
+  if !unmounted.is_ok_and(|status| status.success()) {
+    let _ = Command::new("fusermount3")
+      .args(["-u", "-z", &mount])
+      .status();
+  }
+  (synced, took)
+}
+
+/// A-200 under load (2026-11-09; the supervisor's order after a healthy `fsync` answered `EIO` 1 in 6 runs on main and
+/// 2 in 9 on raft-7): do, round by round, make a live-shipped volume, mount it and write a file, then `fsync` it with both
+/// candidates' processes cycling between stopped (seven tenths of the liveness budget) and running (three twentieths);
+/// stop after the round whose `fsync` took longer than the liveness budget, or after six. The candidates are alive and
+/// answer, slowly, as a loaded machine's are. Expect every `fsync` to succeed, and one to have taken more than the
+/// liveness budget (or the shape did not slow them enough to tell). Before, a held `fsync` gave up at one wall-clock
+/// deadline of the liveness budget from its hold, however its candidates were answering: red 3 of 3 here on adacachy2,
+/// each first `fsync` `EIO` after 1.0013–1.0037 s with its head's placement still in flight (its bytes held by a
+/// candidate in two of them), as under load. After, 6 of 6 succeeded in 1.50–1.59 s.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the slow-candidates FUSE fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  if !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("skipping the slow-candidates FUSE fsync flow: no /dev/fuse on this host");
+    return;
+  }
+  let fleet = start_fleet("live-slow");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let pids: Vec<i32> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .map(|index| i32::try_from(fleet.daemons[index].child.id()).unwrap())
+    .collect();
+  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let mut rounds = Vec::new();
+  for round in 0..SLOW_ROUNDS {
+    let (synced, took) = slow_round(&fleet, &owner, &pids, round);
+    let past = took > budget;
+    rounds.push((synced, took));
+    if past {
+      break;
+    }
+  }
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("slow fsync: {rounds:?}; owner's live counters {counters:?}");
+  assert!(
+    rounds.iter().all(|(synced, _)| synced.is_ok()),
+    "every fsync its slow but answering candidates hold succeeds: {rounds:?}"
+  );
+  assert!(
+    rounds.iter().any(|(_, took)| *took > budget),
+    "the slow candidates kept an fsync past the liveness budget, or the test shows nothing: {rounds:?}"
+  );
+}
+
 /// The survivor among `hosts` (each member id with its instance) that takes `volume` over, as [`successor_of`] ranks it.
 fn successor_among(hosts: &[(slates_db::register::HostId, String)], volume: &str) -> String {
   let mut bytes = [0u8; 16];
