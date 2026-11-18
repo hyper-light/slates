@@ -2994,12 +2994,35 @@ pub struct ActionCount {
 /// A landing manifest's summary (§4.15 step 2).
 #[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
 pub struct LandingSummary {
-  /// Entries per action name.
+  /// Entries per action name, for people (a consumer reads [`LandingSummary::actions`]).
   pub by_action: Vec<ActionCount>,
   /// Bytes the landing writes.
   pub bytes: u64,
   /// Entries the filter left out.
   pub filtered_out: u64,
+  /// Entries per action, typed (A-299, 2026-11-18: until then a consumer read `by_action`'s names). Appended.
+  pub actions: ActionTally,
+}
+
+/// A landing manifest's entries per action (§4.15 "Plan"), each [`PlannedAction`]'s count. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ActionTally {
+  /// Files the disk did not have, written.
+  pub create: u64,
+  /// Files the disk had, replaced.
+  pub replace: u64,
+  /// Files the disk had, removed.
+  pub delete: u64,
+  /// Directories moved whole from their origins.
+  pub rename: u64,
+  /// Directories made.
+  pub mkdir: u64,
+  /// Directories removed with everything beneath them.
+  pub rmdir: u64,
+  /// Symlinks made or replaced.
+  pub symlink: u64,
+  /// Directories emptied and kept.
+  pub clear: u64,
 }
 
 /// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
@@ -3117,6 +3140,34 @@ pub struct LandingOutcome {
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
+  /// The terminal state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
+  pub stage: LandingStage,
+}
+
+/// A landing's stage (§4.15 "State machines"): the four terminal states a finished landing reports and the stages
+/// before them. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingStage {
+  /// Its manifest is being planned.
+  Planning,
+  /// Presented, awaiting an approval.
+  AwaitingGrant,
+  /// Its entries are being validated against the disk.
+  Validating,
+  /// Its entries are being written.
+  Writing,
+  /// Its written entries are being made durable.
+  Syncing,
+  /// The volume is advancing past what landed.
+  Advancing,
+  /// Every entry landed.
+  Done,
+  /// Some entries were undone; the rest landed.
+  Partial,
+  /// Validation refused it; nothing was written.
+  Refused,
+  /// Cancelled or crashed; a resume continues it.
+  Aborted,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3215,8 +3266,23 @@ pub struct GrantSummary {
   pub manifest: [u8; 32],
   /// The scope.
   pub scope: GrantScope,
-  /// The state name (`issued`, `consumed`, `expired`, `revoked`).
+  /// The state name (`issued`, `consumed`, `expired`, `revoked`), for people.
   pub state: String,
+  /// The state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
+  pub grant_state: GrantState,
+}
+
+/// Where a grant stands (§4.15 "State machines"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantState {
+  /// Issued and not yet used up.
+  Issued,
+  /// A single-use grant's landing finished.
+  Consumed,
+  /// Its term passed, or its session ended.
+  Expired,
+  /// Revoked.
+  Revoked,
 }
 
 /// An audit record on the wire (§4.15).
@@ -3234,8 +3300,31 @@ pub struct AuditEntry {
   pub landing: Option<u64>,
   /// The manifest, when bound.
   pub manifest: Option<[u8; 32]>,
-  /// The terminal state, for a finished landing.
+  /// The terminal state, for a finished landing, for people.
   pub outcome: Option<String>,
+  /// The record's kind, typed (A-299, 2026-11-18: until then a consumer read `kind`'s name). Appended.
+  pub audit_kind: AuditKind,
+  /// The terminal state, typed, for a finished landing. Appended with `audit_kind`.
+  pub stage: Option<LandingStage>,
+}
+
+/// What an audit record records (§4.15). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditKind {
+  /// A grant was issued (by the launcher's approval, or by a bypass policy).
+  GrantIssued,
+  /// A grant was revoked.
+  GrantRevoked,
+  /// A landing was presented.
+  LandingPlanned,
+  /// A landing's entries were validated against the disk.
+  LandingValidated,
+  /// An entry was written.
+  EntryWritten,
+  /// An entry was refused.
+  EntryRefused,
+  /// A landing finished.
+  LandingFinished,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
