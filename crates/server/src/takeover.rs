@@ -1208,7 +1208,9 @@ fn record_adoption(
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
       // and held inputs on the shard its id routes to (AUD-14).
       Ok(merge) => {
-        state.pending_green_materializations.insert(object, merge);
+        state
+          .pending_green_materializations
+          .insert(object, crate::state::PendingGreen { merge, attempts: 0 });
       }
       // A merge record of another format: adopted as bytes, never materialized from, and counted.
       Err(refused) => {

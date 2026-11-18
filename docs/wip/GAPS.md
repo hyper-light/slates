@@ -1991,6 +1991,32 @@
 > - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
 > - Convergence: every candidate at the owner's head, durable, nothing owed.
 >
+> - **Built, first runs owed (g229, 2026-11-17): loss, a running node cut off, and ReadSafety and Continuity across
+>   real processes.** SIGSTOP stops a whole process and drops nothing, so until now no flow here injected loss, kept an
+>   isolated owner running (its lease lapsing, its peers judged dead from its side), or cut one direction only; only
+>   KIND's netem injected loss (`cargo xtask kind live`, which no lane runs).
+>   - A node may bind elsewhere than it advertises (A-277, the manifest's `bind`), so the fault relay
+>     (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to their bind blocks, with
+>     no privilege. Each datagram meets its path's rule: a one-way cut, a loss rate, a hold of `delay ± jitter` (so
+>     datagrams reorder) and a duplication rate, every draw from one printed seed (`SLATES_CHAOS_SEED` replays it). A
+>     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
+>     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
+>     forwarding it could carry a cut-off node's traffic across.
+>   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
+>     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
+>     while it runs; and an owner that still speaks to its peers but hears none.
+>   - Two invariants are judged from outside in them. ReadSafety: a latest-state read sent through the partitioned
+>     owner after its successor acknowledged a write answers that write or a refusal, never other bytes and never
+>     missing. Continuity: the successor's first head is past every position an owner reported durable under an
+>     earlier epoch, since its log goes on from the head it adopted (`slates_db::live::Shipper::new`).
+>   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln run r71, Adas-MacBook-Pro-3,
+>     2026-11-17): forwarding and the answer's way back, a one-way cut, loss, delay and duplication, attribution by
+>     process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
+>     Linux's census has run nowhere yet.
+>   - Owed: ReadSafety and Continuity in the SIGSTOP and SIGKILL takeover flows, so every flow ends with every register
+>     invariant.
+>
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
 >   - With both candidates stopped, a live volume's destroy was answered done; the owner was SIGKILLed, and a survivor
@@ -15397,6 +15423,22 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   product non-convergence if that is not the cause.
 - **Instrumented:** on failure the test now prints each survivor's `merge.takeover*` and `fleet.takeover*` counters and
   its holder state of the green, which name the branch the next failure is stuck in.
+- **Bounded (2026-11-09, the supervisor's order), cause still open.** Every branch of `materialize_pending_greens`
+  retried each period with nothing that could clear it: `waits_catalog`, `incomplete`, a refused materialization, and a
+  missing placement or partition shard, which was not even counted. Each pending green now counts its attempts, one a
+  period, and past the failover SLO's worth (`failover_slo_ns / HEARTBEAT_NS`, 100 at the default 10 s; counted in
+  attempts so a loaded node's late periods take none of them) it is given up on: its owner shard records it unrecovered,
+  every verb on it answers `NotRecovered { cause: TakeoverIncomplete { waited_on } }` naming the branch (`catalog`,
+  `chain`, `placement`, `refused`), the node claims it to lookups, and `merge.takeover_given_up` counts it with a log
+  line. A green whose partition has no shard here is dropped at the bound, counted and logged. Red first
+  (`a_taken_over_green_whose_catalog_never_comes_is_refused_by_name`, `a_taken_over_green_whose_chain_is_short_is_refused_by_name`,
+  a one-node fleet at a 1 s SLO): without the bound each planted green retried 99 times in 100 periods and its status
+  answered `NotFound` throughout; with it, `NotRecovered` naming its branch after 10 attempts. The next stuck run of the
+  green-share test therefore fails with the branch named, not by its 4,000-period wait. Landed on main 2026-11-18,
+  ported from bug-sweep's 98c5a166 onto 48c64720 (the cause kind now reads `RecoveryCause::kind`, which main moved into
+  the protocol, and names it `TakeoverIncomplete`).
+- **Sibling, open:** a taken-over **volume**'s materialization (`fleet::materialize`, the `fleet.materialize.waits.*`
+  counters: content, placement, catalog, catalog placement, shard) waits each period the same way, with no bound.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

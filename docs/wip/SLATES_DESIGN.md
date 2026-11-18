@@ -5688,8 +5688,12 @@ registry (D-14). A node's advertised port and the next are its two serve sockets
 first, records on the second — each shared by every peer through the session plane's connection-id
 demultiplexer (§4.10a §8; a peer's re-dial after a lost session replaces the old session), and every
 peer dials it there, so both ends of every session are computed from the same file and can never
-disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, a base at the end
-of the port range, or an identity the TLS stack cannot use, is refused by name at boot. The two serve
+disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
+the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
+and the base of the same block, A-277); it serves there while every peer still dials its advertised
+ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
+the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -6383,6 +6387,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   does.
 > - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
 >   retained tail, is resent without end (GAPS "Chaos from outside the processes").
+> - **Loss, and an owner partitioned while it runs (built 2026-11-17, goal g229; first runs owed).** A fault relay in
+>   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
+>   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
+>   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
+>   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
+>   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
+>   head is past every position durable under an earlier epoch) from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7910,7 +7921,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > late holder's catch-up is built (AUD-13, below). Still owed: mounted work and green volumes, the extent-backed green
 > chain, pipelined and hedged merge records.
 
-> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
 >
 > **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 
@@ -20657,3 +20668,30 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
+
+Applied in the same change to:
+- §4.8 "Deployment": the `bind` sentence, and a bound base past the port range refused as an advertised one is.
+- `crates/server/src/deploy.rs`: `FleetNodeEntry::bind`; `bind_address` binds the block a node names, else its
+  advertised address as before; `validate` and the plan refuse a bind block past the port range
+  (`PortBlockOverflows`, naming the bind's base). The tests: `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`
+  and the bind case of `a_bad_manifest_is_refused_by_name`.
+- `crates/cli/src/fleet.rs`: the manifest's optional `bind` per node, an IPv4 literal with a nonzero port; a name,
+  a missing port, port 0 or a non-string refused naming `nodes[i].bind` (`a_declared_bind_parses_and_a_bad_one_is_named`).
+- `docs/cli.md`: the manifest's `bind` field. GAPS: "Chaos from outside the processes", the relay owed.
+- **What was there.** A node bound exactly the address it advertised (an IP literal), or every interface on the
+  advertised port (a name). Whatever a peer dialed had to be the node's own socket. A node behind a port mapping
+  whose outer ports differ from its inner ones (a container runtime's published ports, a NAT's port forward) could
+  not join a fleet: it bound the outer port, which is not its to bind. And nothing could stand between two real
+  daemons on one machine, since discovery's announcement of a node's own address wins over the manifest's at every
+  dial (`fleet::resolve_peer_address`), so every peer reached the node's socket directly.
+- **The rule.** `bind` names the IPv4 literal and base port the node's two serve sockets bind; the advertised
+  address still names where every peer dials it, and the node still announces only that. The block is the same two
+  ports. With no `bind`, nothing changes. The anchor binds and hands over the plan's sockets, so it binds the block
+  too, and the daemon's check of an inherited socket compares it with the bind block.
+- **Why.** Goal g229 (Ada's chaos directive of 2026-11-04: knock replicas offline, inject latency and loss) owed loss
+  across real processes on a developer's machine, where netem needs privileges this project never takes. A relay in
+  the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
+  reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
+  injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
