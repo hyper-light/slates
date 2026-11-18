@@ -333,8 +333,13 @@ pub const WINDOW_CEILING_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
 /// its shards keep `W`. Both of a shard's judgments follow it: wedged or starved after this window without a step, and
 /// spinning after this window of CPU held to the build ([`spin_window_ns`]). Pure, so the rule is tested on every host;
 /// the shard publishes its own window by the same rule as the health signal `shard.watch_window_ns`.
+#[allow(
+  clippy::manual_clamp,
+  reason = "`clamp` panics if its lower bound passes its upper; `min` then `max` cannot panic whatever the two constants \
+            become, which the no-panic rule asks of every path"
+)]
 pub fn watch_window_ns(overrun_ns: u64) -> u64 {
-  overrun_ns.clamp(LIVENESS_BUDGET_NS, WINDOW_CEILING_NS)
+  overrun_ns.min(WINDOW_CEILING_NS).max(LIVENESS_BUDGET_NS)
 }
 
 /// The build's measured cost in the banner's words.
