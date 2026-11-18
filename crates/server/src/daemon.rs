@@ -4182,6 +4182,8 @@ async fn init_shard(
     // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).
     tracer: slates_wire::observe::Tracer::new(host.0, partition),
     current_span: None,
+    forward_hold_ns: 0,
+    loop_run: 0,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),

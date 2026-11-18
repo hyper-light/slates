@@ -121,6 +121,61 @@ pub const fn loaded_wake_ratio() -> Derived<u64> {
   )
 }
 
+/// Format: R9 holds a create's p99 (AC-2.1), so one request in this many may fall in the tail: the share of a closed
+/// loop's requests a held window may leave to find their shard parked ([`loop_revisit_cycles`]).
+pub const PROVISION_TAIL: u64 = 100;
+/// Format: the floors one cycle of a closed loop takes at most: its request, within F at R9's percentile, and its think
+/// time, within F by the loop's definition (its next request within F of its last reply; A-223's window rule).
+const CLOSED_LOOP_CYCLE_FLOORS: u64 = 2;
+/// The longest cycle of a closed loop that meets R9, nanoseconds: [`CLOSED_LOOP_CYCLE_FLOORS`] × F (A-326).
+pub const CLOSED_LOOP_CYCLE_NS: u64 = PROVISION_FLOOR_NS.saturating_mul(CLOSED_LOOP_CYCLE_FLOORS);
+/// Format: one whole, in the fixed point the revisit walk keeps its probability in ([`loop_revisit_cycles`]): 64
+/// fractional bits, so a step's product with the shard count (at most 16 bits) fits 128 bits.
+const REVISIT_ONE: u128 = 1 << 64;
+
+/// How many cycles a closed loop over `shards` shards may go without returning to one of them, at R9's percentile: the
+/// least `k` with `((S − 1) / S)^k ≤ 1 / PROVISION_TAIL` (A-326). A create goes to the partition its name hashes to
+/// and every later verb to its volume's owner (`verbs::owner_of_name`, `verbs::owner_of`), so a request of the loop
+/// lands on a given shard with probability `1/S`, the cycles until it does are geometric, and more than `k` of them
+/// pass with probability `((S − 1) / S)^k`. One shard is revisited every cycle. Integer arithmetic: the probability is
+/// kept in fixed point and rounded up at each step, so `k` is never short of the bound; the walk ends within
+/// `S × PROVISION_TAIL` steps, since `((S − 1) / S)^(S × 100) < e^−100`.
+pub fn loop_revisit_cycles(shards: u16) -> u64 {
+  let shards = u128::from(shards.max(1));
+  let stay = shards.saturating_sub(1);
+  let tail = REVISIT_ONE
+    .checked_div(u128::from(PROVISION_TAIL))
+    .unwrap_or(0);
+  let most = u64::try_from(shards)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(PROVISION_TAIL);
+  let mut missed = REVISIT_ONE;
+  for cycles in 1..=most {
+    missed = missed.saturating_mul(stay).div_ceil(shards);
+    if missed <= tail {
+      return cycles;
+    }
+  }
+  most
+}
+
+/// The idle window a forward holds its shards open for when it is made for a client in R9's closed loop (§4.7; A-326):
+/// `CLOSED_LOOP_CYCLE_FLOORS × F × loop_revisit_cycles(S)`. A loop that meets R9 sends its next request within F of
+/// its last reply, which F covers on the client's own shard (A-223's window rule), but over `S` shards its next request
+/// for a given shard comes only after the loop has gone round the others, as many cycles of at most `2F` as
+/// [`loop_revisit_cycles`] allows at R9's percentile. Measured (step 6 of the A-223 plan, 2026-11-12): at R9's floor
+/// alone a quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against main's 27.1, its shards
+/// parking 144 to 331 times per 1,000 creates; at `F × S`, 36.8 µs and 3 to 7 parks; at `2F × S`, 29.5 µs. Its inputs
+/// are R9's floor and percentile and the shard count, so no load moves it. A forward holds no longer than its loop had
+/// run, and a paced client, whose next request comes later than F, starts no loop (`verbs::loop_hold`).
+pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
+  derived!(
+    CLOSED_LOOP_CYCLE_NS.saturating_mul(loop_revisit_cycles(shards)),
+    "2 × provision_floor_ns × the least k with ((shards − 1) / shards)^k ≤ 1 / PROVISION_TAIL",
+    ["provision_floor_ns", "shards", "PROVISION_TAIL (R9's p99)"]
+  )
+}
+
 /// The idle window for a shard whose wake estimate is `wake_ns`: `max(F, wake × loaded_wake_ratio())` (§4.3, §4.7;
 /// A-223). R9's floor keeps a closed-loop client's shards awake; the platform's multiple covers a loaded wake where
 /// parking costs more than spinning saves. Where the multiple is zero (Linux, macOS) no estimate moves the window, so a
@@ -333,6 +388,9 @@ pub struct DaemonConfig {
   pub instance: String,
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
   pub failover_slo_ns: u64,
+  /// Derived: the idle window a forward holds its shards open for when it is made for a client in R9's closed loop
+  /// ([`closed_loop_hold`], §4.7; A-326).
+  pub closed_loop_hold_ns: u64,
   /// The operator's stated per-node **re-replication bandwidth** in bytes/second, the anchor `B` of the
   /// scatter-width derivation (§4.8 "Placement", D-14): how fast this node restores a lost host's copies.
   /// `0` — the default — leaves the scatter width at the candidate floor (one copyset); a deployment states
@@ -915,6 +973,10 @@ impl DaemonConfig {
       tracking.idle_ratio = loaded_wake_ratio().get();
       tracking.idle_floor_ns = PROVISION_FLOOR_NS;
     }
+    // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
+    // the loop's revisit at R9's percentile (§4.7; A-326).
+    let loop_hold = closed_loop_hold(runtime.shards);
+    derivations.push(note("closed_loop_hold_ns", &loop_hold));
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
     let inode_reserve = inode_reserve(&mut derivations);
@@ -944,6 +1006,7 @@ impl DaemonConfig {
       discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
+      closed_loop_hold_ns: loop_hold.get(),
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
@@ -1585,6 +1648,43 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-326, §4.7. Do: derive the closed-loop hold for every shard count from one to [`MOST_SHARDS_TESTED`]. Expect: the
+  /// hold is whole cycles of 2F (R9's floor for a request and for the think time before the next); its cycles cover a
+  /// loop's return to one shard at R9's percentile, more of them passing without a return with probability
+  /// `((S − 1) / S)^k` of at most one in a hundred, while one cycle fewer would leave more than that; one shard, which
+  /// the loop returns to every cycle, holds one cycle; the hold never shrinks as shards are added; and at three shards it
+  /// is at least `2F × S`, the shortest window step 6 measured within main's spread there (29.5 µs, diag-liveness-44).
+  #[test]
+  fn a_closed_loops_hold_covers_its_return_to_a_shard_at_r9s_percentile() {
+    /// Shape: the shard counts derived, past the 23 of the widest machine measured (fedora-2, 32 CPUs).
+    const MOST_SHARDS_TESTED: u16 = 128;
+    /// Shape: the three shards of ubuntu-24.04-arm, where R9's floor alone failed (step 6, diag-liveness-42).
+    const STEP_SIX_SHARDS: u16 = 3;
+    let tail = 1.0 / f64::from(u32::try_from(PROVISION_TAIL).unwrap());
+    let mut last = 0;
+    for shards in 1..=MOST_SHARDS_TESTED {
+      let hold = closed_loop_hold(shards).get();
+      assert_eq!(hold % CLOSED_LOOP_CYCLE_NS, 0, "{shards} shards: {hold} ns");
+      let cycles = i32::try_from(hold / CLOSED_LOOP_CYCLE_NS).unwrap();
+      let stay = f64::from(shards - 1) / f64::from(shards);
+      assert!(
+        stay.powi(cycles) <= tail,
+        "{shards} shards: {cycles} cycles leave {} of returns uncovered",
+        stay.powi(cycles)
+      );
+      assert!(
+        cycles == 1 || stay.powi(cycles - 1) > tail,
+        "{shards} shards: {cycles} cycles, one more than R9's percentile needs"
+      );
+      assert!(hold >= last, "{shards} shards: {hold} ns after {last} ns");
+      last = hold;
+    }
+    assert_eq!(closed_loop_hold(1).get(), CLOSED_LOOP_CYCLE_NS);
+    assert!(
+      closed_loop_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
+    );
+  }
 
   /// A-223, §4.3, §4.7. Do: run a table of wake estimates through the idle window's rule: zero, one under F, the
   /// unqueued 6 µs Linux's probe reads quiet, the 346 µs a loaded boot's probe read (above F), a queued 2 ms, and a

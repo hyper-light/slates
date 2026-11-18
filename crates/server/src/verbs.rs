@@ -2832,6 +2832,27 @@ fn record_completion_routed(
 
 /// Forwards a volume-bound request to its owner shard: a task there runs the verb on the
 /// owner's state and hands the reply back to this shard's queue (sharing by move both ways).
+/// Judges a ring request read at `now` (§4.7; A-326) and returns the idle window a forward made for it holds its owner
+/// open for. The request continues this shard's closed loop when it came within F of the shard's last work: its client
+/// sent it within F of its last reply, R9's closed loop (A-223's window rule). Its hold is the loop's revisit bound at
+/// R9's percentile (`DaemonConfig::closed_loop_hold_ns`), but never more cycles of 2F than the loop had already run
+/// before this request, so the spin a loop's end leaves on the shards it went round is at most what the loop itself
+/// took (the ski-rental bound, counted in the loop's own cycles). A request after a longer pause ends the loop and holds
+/// nothing, and neither does the first request after it: a paced client's create and its destroy hold no shard. The gap
+/// is read against the shard's last work, one clock read a round, so a shard busy with several clients counts their
+/// requests as one loop.
+pub(crate) fn loop_hold(state: &mut ShardState, now: u64) -> u64 {
+  if now.saturating_sub(state.last_work_ns) > crate::config::PROVISION_FLOOR_NS {
+    state.loop_run = 0;
+    return 0;
+  }
+  let ran = state.loop_run;
+  state.loop_run = ran.saturating_add(1);
+  ran
+    .saturating_mul(crate::config::CLOSED_LOOP_CYCLE_NS)
+    .min(state.config.closed_loop_hold_ns)
+}
+
 fn forward(
   state: &mut ShardState,
   client_index: u32,
@@ -2844,6 +2865,8 @@ fn forward(
   // The `ring.request` span context of this slot read rides to the owner, so the verb's `shard.op` there
   // opens within it: one trace across the shard boundary, the cause named (§4.14).
   let cause = state.current_span;
+  // The idle window the owner holds open for the closed loop this request continues, 0 for none (A-326).
+  let hold_ns = state.forward_hold_ns;
   match send_forward(
     state.shard,
     client_index,
@@ -2852,7 +2875,7 @@ fn forward(
     &principal,
     &body,
     owner,
-    cause,
+    (cause, hold_ns),
   ) {
     Ok(()) => Served::Forwarded,
     Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -2873,6 +2896,7 @@ fn forward(
         body,
         owner,
         cause,
+        hold_ns,
       });
       Served::Forwarded
     }
@@ -2881,7 +2905,8 @@ fn forward(
 }
 
 /// Spawns the owner's task for one forward; the reply comes back as a task on `origin`. `cause` is the
-/// origin's `ring.request` span context, the cause of the verb's `shard.op` on the owner (§4.14).
+/// origin's `ring.request` span context, the cause of the verb's `shard.op` on the owner (§4.14); `hold_ns` the idle
+/// window the owner holds open for the client's closed loop, 0 for none (`ShardState::forward_hold_ns`; A-326).
 #[allow(clippy::too_many_arguments)] // a forward's whole identity: where from, who, what, where to, and its cause
 fn send_forward(
   origin: u16,
@@ -2891,7 +2916,7 @@ fn send_forward(
   principal: &Principal,
   body: &RequestBody,
   owner: u16,
-  cause: Option<SpanContext>,
+  (cause, hold_ns): (Option<SpanContext>, u64),
 ) -> Result<(), slates_rt::RtError> {
   let principal = principal.clone();
   let body = body.clone();
@@ -2905,6 +2930,11 @@ fn send_forward(
   let task = SpawnRequest::new(
     Box::pin(async move {
       unstarted.started();
+      // The closed loop this forward was made for comes back to this shard only after going round the others: the
+      // owner holds its window for it (A-326).
+      if hold_ns > 0 {
+        slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold_ns));
+      }
       let id = RequestId::from_word(request);
       let mut elsewhere = None;
       let mut carried = None;
@@ -3094,7 +3124,7 @@ fn retry_forwards(state: &mut ShardState) -> bool {
       &pending.principal,
       &pending.body,
       pending.owner,
-      pending.cause,
+      (pending.cause, pending.hold_ns),
     ) {
       Ok(()) => any = true,
       Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -12049,8 +12079,10 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       now,
     );
     state.current_span = Some(ring.context());
+    state.forward_hold_ns = loop_hold(state, now);
     let served = serve(state, handle, &request);
     state.current_span = None;
+    state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
         if send_reply(state, index, request.request, &mut reply) {

@@ -104,6 +104,9 @@ pub struct Counters {
   /// The idle spin window now, nanoseconds: how long the shard spins after client activity before it parks
   /// (§4.7), as its wake tracking derives it; its configured spin while it tracks no estimate.
   pub idle_window_ns: u64,
+  /// Activities that held the idle window open past the shard's own ([`ShardContext::hold_idle_window`]): the daemon's
+  /// forwards for a client in R9's closed loop (A-326), a non-vacuity count.
+  pub idle_holds: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -314,6 +317,11 @@ pub struct ShardContext {
   /// When the server last served a client's work on this shard (its clock), opening the idle window the
   /// shard spins in before it parks ([`ShardContext::note_activity`]); `None` until the first.
   activity_ns: Cell<Option<u64>>,
+  /// The end of the longest hold an activity asked for ([`ShardContext::hold_idle_window`]), shard clock: the idle
+  /// window stays open at least until it, whatever its own length. 0 before the first hold.
+  held_until_ns: Cell<u64>,
+  /// Holds asked for ([`Counters::idle_holds`]).
+  idle_holds: Cell<u64>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
   /// The shard's readiness registrations, by descriptor and direction: which task waits on each, and whether
@@ -506,6 +514,8 @@ impl ShardContext {
       current_task: Cell::new(None),
       exited: Cell::new(false),
       activity_ns: Cell::new(None),
+      held_until_ns: Cell::new(0),
+      idle_holds: Cell::new(0),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
       interests: RefCell::new(Interests::default()),
@@ -629,6 +639,20 @@ impl ShardContext {
     self.activity_ns.set(Some(self.now_ns()));
   }
 
+  /// Notes client work as [`note_activity`](Self::note_activity) does, and holds the idle window open until at least
+  /// `window_ns` from now, however long the shard's own window is (§4.7; A-326): the daemon's hold for a client in R9's
+  /// closed loop, whose next request may reach this shard only after the loop has gone round the others. The latest end
+  /// asked for stands; a later, shorter hold or a plain activity never cuts it short. Called on the shard's own thread.
+  pub fn hold_idle_window(&self, window_ns: u64) {
+    let now = self.now_ns();
+    self.activity_ns.set(Some(now));
+    let until = now.saturating_add(window_ns);
+    if until > self.held_until_ns.get() {
+      self.held_until_ns.set(until);
+    }
+    self.idle_holds.set(self.idle_holds.get().saturating_add(1));
+  }
+
   /// Whether any inbound ring holds a word (a check without a syscall).
   pub fn has_inbound(&self) -> bool {
     if self
@@ -674,6 +698,7 @@ impl ShardContext {
       .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
     c.idle_window_ns = self.idle_window_ns();
+    c.idle_holds = self.idle_holds.get();
     c
   }
 
