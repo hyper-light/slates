@@ -860,6 +860,10 @@ plan schedules.
   distinguishes workloads within it. A channel label supplied by a caller cannot establish
   human authority. A trusted confirmation surface binds its approval to the exact manifest;
   transport checks supplement that authority check (§4.13).
+- A-285 (Ada, 2026-11-18): the human's authority is a signature by a key only the human holds (an ssh-agent key that
+  asks for confirmation on every use, or a FIDO key that needs a touch), over the exact landing and a nonce the daemon
+  issued; the anchor's own terminal is the fallback where no key is registered. No secret a process of the user can
+  read is authority any more.
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -1491,6 +1495,27 @@ cluster.
 >   `Overloaded` past it);
 > - the fleet's tasks are added to every shard though they run on the control shard alone.
 
+> **Status (2026-11-17, A-279: a full control channel tells the senders waiting for its room).** A sender refused
+> `ControlFull` keeps its message and sends it again once the channel has room. Until now nothing said when: the serve
+> loop, while it kept a forward, woke once per idle window to try again (0.3 to 21 ms on this Mac under 36 spinners;
+> the window is the wake estimate × 100, with no cap).
+> - The sender asks to be told (`ShardContext::want_room`, `futures::want_room`): its shard's mark in the target's
+>   `room_wanted`, a `SeqCst` fence, and one more try.
+> - The target, after each drain that took a message, fences `SeqCst` and tells every shard marked
+>   (`registry::give_room`). The tell marks the target in the asker's `room_given`, fences `SeqCst` (against the fence
+>   of a drain that re-armed its flag with a plain store), and publishes the asker's control flag, which wakes its
+>   tasks waiting on that target at its next drain.
+> - Either the second try finds the room or the drain finds the mark; an exiting shard tells every asker.
+>
+> The serve loop asks for its first kept forward's owner and then idles with no timer
+> (`verbs::ask_room_for_kept_forwards`). Proven by loom models of each half (`crates/rt/src/room.rs`; the tell's fence
+> rests on C++20's fence rules, since its model passes without it too), a runtime test whose sender has no timer at
+> all (`crates/rt/tests/room.rs`), and `forward_retry.rs`, whose answer is now owed within the
+> liveness budget of the owner's last progress through the flood queued ahead of it. Its budget from the hold's end
+> had counted the drain of 41,125 queued tasks, 64 ms to 4.33 s under load (8 of 30 failed at load ~35). Record:
+> `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`. Owed: the scatter's
+> parts and a result carried home still poll a full channel every `REPLY_PACE_NS` (`xshard::given_room_within`).
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
@@ -1824,7 +1849,8 @@ struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, 
                body: Body, identity: Option<Blake3>, born: Epoch, flags,
                windows: WindowsAttributes /* A-262: HIDDEN, SYSTEM, ARCHIVE, OFFLINE, NOT_CONTENT_INDEXED, and a
                                              directory's READONLY (a file's is its mode), at Windows' values, in the
-                                             two bytes of tail padding, so no inode grows */ }
+                                             two bytes of tail padding, so no inode grows; A-275: a symlink's
+                                             DIRECTORY, which makes it a Windows directory link */ }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
             Base { witness: Option<Handle<Witness>>, pinned: ExtentList, fd: Option<BaseFd>, lost: bool } }
 struct Extent { off: u64, len: u64, src: ExtentSrc } enum ExtentSrc { Chunk{chunk: ChunkHandle, off: u32}, Zero, Base{fd: BaseFd} }
@@ -3053,9 +3079,10 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> list with one of the stated differences (security descriptors, generic reparse data, named streams, a link's own data;
 > a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
-> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
+> 18 cases off, leaving 355; symbolic links in A-275, which lets 105 cases behind three script-level entries run, 78
+> passing and 30 listed case by case, leaving 382). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
@@ -6851,8 +6878,10 @@ command and every host start, mount and grant through one implementation.
   the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
-  rewitness; serving as a host mount (§4.6, every platform's own mechanism) or as a descriptor a VMM
-  takes (the Shards stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
+  rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
+  without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
+  go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
+  stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
   `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
   the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
   whole typed client for the rest (the merge verbs of §4.16, the file verbs).
@@ -6873,7 +6902,8 @@ command and every host start, mount and grant through one implementation.
 > and (piece 2) the anchor and daemon roles moved from the CLI (`role`), served by a host's own
 > executable through `role::main`, with `Instance::start`, `StartSpec::anchor_command`,
 > `Instance::wait_for` and `Anchor::stop`; and (A-287, g266) a landing plan's per-path entries,
-> paged, `Instance::landing_entries(&plan)`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
+> paged, `Instance::landing_entries(&plan)`; and (piece 3) `mount::available` and
+> `mount::unmount_lazy`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
 > `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call it. Proven by use over an
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
@@ -7039,6 +7069,13 @@ server, not inferred from command names.
 > engine's transition, so only a finished single-use landing consumes its grant. Before, a restart lost
 > every grant and a session grant was recorded spent at its first landing. Record:
 > `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
+
+> **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
+> signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
+> assertion over the same statement; the anchor's own terminal where no key is registered. The statement, the SSH
+> verifier, the presentation's nonce and the signed `Grant` are built (`crates/server/src/grant_signature.rs`,
+> `landing::verify_signed_grant`); key registration and the CLI are owed, and the issuer secret still proves grants
+> until they land. Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -9537,8 +9574,9 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > Linux FUSE mount inside containers (`oci-linux`), and the live virtio-fs guest. Every leg sets one shared
 > environment (`slates_conformance::workload::ENVIRONMENT`), and a host determinism gate runs each of the four twice in
 > two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
-> that exits nonzero on both sides is a failed workload, never an identical one. Owed: the Windows WinFsp roster, and
-> a Linux FUSE leg outside a container.
+> that exits nonzero on both sides is a failed workload, never an identical one. Since A-293 the Linux lane runs the
+> roster over the daemon's own FUSE mount (`slates mount`, unprivileged), the route an agent's tools take, rather than
+> through the root NFS adapter. Owed: the Windows WinFsp roster.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -14600,7 +14638,15 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
-    (`ERROR_INVALID_FUNCTION`).
+    (`ERROR_INVALID_FUNCTION`). **Amended by A-275 (2026-11-09):** a volume symlink is the Windows symbolic link, so
+    the reason stands for generic reparse data (REPARSE) and no longer for symbolic links, with three differences a
+    POSIX link brings, each stated in A-275: a link holds no data stream of its own (SYMLINK-DATA); a link POSIX made is
+    a file link, whatever its target; and a link relative to the drive's root (`\x\y`) is kept relative to its own
+    directory, so moved, it reaches what that path names from its new directory, where NTFS keeps it naming `\x\y`.
+    And who may make one is NTFS's rule judged by the drive, with one deviation: under Developer Mode it allows a
+    program without the privilege that writes a link's reparse buffer itself without
+    `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, since that flag never reaches a file system (`CreateSymbolicLinkW`
+    refuses such a caller itself, so its callers get NTFS's answers).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
 - **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
@@ -16467,6 +16513,150 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-275 — A volume symlink is a Windows symbolic link: the WinFsp drive serves reparse points (accepted 2026-11-09, the supervisor's pick)
+Applied in the same change to: A-209 (amended: REPARSE and SYMLINK), §4.5 (the inode's kept Windows bits), §4.6 (the
+Windows conformance status), §4.8 (image version 26, delta version 9: 27 and 10 when built on 2026-11-09, which left
+26 and 9 to A-270; A-275 landed first, on 2026-11-17, so it took them), GAPS, `docs/wip/conformance.md`, the winfstest
+list (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 355 to 382 entries) and its record,
+`crates/vfs` (`inode::WindowsAttributes::LINK_DIRECTORY`, `kept`, `from_image`; `IMAGE_VERSION`, `DELTA_VERSION`),
+and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`'s walk and `file_info`'s tag in
+`host.rs`; the slots and exports in `ffi.rs`).
+- **What was missing.** The drive served no reparse point, so every `CreateSymbolicLinkW` answered
+  `ERROR_INVALID_FUNCTION`, a link made on Linux showed on Windows as a reparse point Windows could not follow, and
+  winfstest's `t/reparse/02.t`, `03.t` and `t/streams/04.t` stopped at their first link. Git for Windows
+  (`core.symlinks`) and npm make links this way.
+- **The rule.** A volume symlink is the Windows symbolic link; there is no second kind of link. The drive sets WinFsp's
+  `ReparsePoints` (bit 4 of `VolumeParams`, `fsctl.h` v2.1) and fills its four reparse slots. Windows follows a link
+  through WinFsp's own resolver (`FspFileSystemResolveReparsePoints`, and `FspFileSystemFindReparsePoint` when a path's
+  walk fails, as memfs's `GetSecurityByName` does), which asks the shard for each component's link by name without
+  following it. `FSCTL_GET_REPARSE_POINT` is answered with an `IO_REPARSE_TAG_SYMLINK` buffer made from the volume's
+  target. `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer, on the empty file or directory `CreateSymbolicLinkW`
+  has just made, replaces it with a volume link at its name, keeping its attribute bits; `FSCTL_DELETE_REPARSE_POINT`
+  turns a link back into an empty file or directory. Generic reparse data (every other tag) is its own change, owed
+  after named streams; it still answers `STATUS_INVALID_DEVICE_REQUEST`, as every reparse request did before.
+- **1. A link's type.** A Windows link is typed: a directory link carries `FILE_ATTRIBUTE_DIRECTORY` and is removed by
+  `RemoveDirectory`, a file link by `DeleteFile`. A volume symlink is untyped.
+  - A link Windows made keeps the type it was created with: the empty object `CreateSymbolicLinkW` made is a directory
+    for `SYMBOLIC_LINK_FLAG_DIRECTORY`, and the link that replaces it keeps `FILE_ATTRIBUTE_DIRECTORY` in A-262's
+    `Inode::windows`, whose kept set admits that bit for a symlink alone (`WindowsAttributes::LINK_DIRECTORY`). It
+    reports `DIRECTORY | REPARSE_POINT` (0x410), a file link `ARCHIVE | REPARSE_POINT` (0x420), as `t/reparse/03.t` and
+    `02.t` expect.
+  - A link POSIX made has no type and is presented as a file link, whatever its target is, and stays one when its target
+    changes type. This is how Samba presents a link opened as itself (`fdos_mode` reports `FILE_ATTRIBUTE_REPARSE_POINT`
+    for `S_IFLNK`, never `DIRECTORY`; samba master 9ae24f2f, `source3/smbd/dosmode.c` 729-746). WSL types a link by its
+    target only when it makes the NT link itself, and only for a target that exists (release notes, build 17046;
+    microsoft/WSL 2183822c, `test/windows/wsl/DrvFsTests.cpp` 160-191); Git for Windows makes a typeless link a file link
+    and recreates it as a directory link once its target exists as one (`compat/mingw.c`, `create_phantom_symlink`,
+    `process_phantom_symlink`), which on this drive sets the bit as any directory link does. The type decides only how
+    the link is removed and listed: WinFsp follows a file link into a directory, "contrary to NTFS" (its traverse check
+    in `src/dll/security.c`, and its resolver, which reads no link's type), so nothing a POSIX link names fails to
+    resolve on the drive. Deriving the type from the target at each lookup was rejected: it costs a resolution per link
+    in every listing, and Windows keeps a name's information until told (`FileInfoTimeout` infinite), so a target's
+    change of type would leave the link's reported type stale with no notification to correct it. Promoting a link the
+    drive finds pointing at a directory, as Git for Windows promotes its own, was rejected too: the drive would write the
+    volume on a lookup, which a read-only attachment refuses and which a publication would then carry; Git for Windows
+    promotes by recreating the link with `SYMBOLIC_LINK_FLAG_DIRECTORY`, which the drive keeps. When a target later
+    changes type, no link's type follows it: a POSIX link stays a file link, and a Windows link keeps the type it was made
+    with, as on NTFS.
+- **2. Separators (R8: one volume, one meaning).** A relative target is stored with `/` and presented to Windows with
+  `\`, as Git for Windows writes a link (`mingw_create_symlink`) and reads one (`normalize_ntpath`), and as WSL's DrvFs
+  does both ways (`drvfs.c` 3524-3570). A Windows link relative to the drive's root (`\x\y`) is stored as the path to the
+  same object from the link's own directory (`../../x/y` for a link at `\a\b\link`), which resolves to that object on
+  every platform; Windows reads it back in that form. This is a stated difference: POSIX has no form relative to a
+  volume's root, so a moved link of this form reaches what its path names from its new directory, where NTFS keeps it
+  naming `\x\y` (`a_link_relative_to_the_drives_root_follows_its_directory_when_moved`: moved one directory deeper, the
+  link reaches `\a\x\y`). `CreateSymbolicLinkW` never makes this form (it makes a rooted target absolute); only a
+  program that writes the reparse buffer itself does. Every other target is presented as given and resolves only where
+  it means something: a POSIX-absolute one (`/usr/bin`) is shown to Windows unchanged with flags 0 and resolves to
+  nothing on the drive; a Windows-absolute one keeps the Win32 path of its `\??\` substitute (`C:\x`, or `\\srv\share\x`
+  for `\??\UNC\srv\share\x`), which Linux and macOS read unchanged and do not resolve. Any other absolute NT form
+  (`\??\Volume{…}\`, `\Device\…`) has no Win32 path and is refused `STATUS_IO_REPARSE_DATA_INVALID`. The lossy case: a
+  POSIX name holding `\`, which Windows takes for a separator, so `a\b` reads on Windows as two components and `C:\x` as
+  a drive path; neither reaches what Linux meant, and Windows cannot name such a file in any case. Samba sends a
+  relative target's `/` unchanged (`read_symlink_reparse`, `source3/smbd/files.c` 859-922); slates converts, since its
+  drive is followed by WinFsp's resolver, which splits at `\` alone.
+- **3. Privilege: NTFS's rule.** Making or removing a symbolic link asks for `SeCreateSymbolicLinkPrivilege`, unless
+  Developer Mode is on (Microsoft Learn, CreateSymbolicLinkW, `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Git
+  for Windows passes, `adjust_symlink_flags`). WinFsp's own check (`ReparsePointsAccessCheck`, `SeSinglePrivilegeCheck`
+  in `src/sys/fsctl.c` 231-240, v2.1) was measured refusing Developer Mode's unprivileged create: a token with no
+  privilege, the flag passed and Developer Mode on (`AllowDevelopmentWithoutDevLicense` 1), answered
+  `ERROR_PRIVILEGE_NOT_HELD` (diagnostics run 42712321599). memfs, airfs and WinFsp's FUSE layer leave the check off, which
+  would make the drive looser than NTFS. So the drive judges it:
+  - WinFsp passes the caller's token only on a Create or Open (`Req.Create.AccessToken`; no FSCTL carries one). Only for
+    one that could become a link does the receiver read it: from user mode, opening a reparse point itself
+    (`FILE_OPEN_REPARSE_POINT`, as `CreateSymbolicLinkW` opens the object it makes a link) and asking an access a link's
+    set needs (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_ATTRIBUTES`, or a generic or maximum right granting
+    one; `Request::could_become_a_link`). Every other open costs no token query. The receiver reads the token's
+    privileges while WinFsp keeps it live, and keeps the open as one that may make a link if the token holds the
+    privilege enabled, as NTFS's check asks (`crate::dispatcher::may_link`). That table is bounded by the drive's open table, since each entry is one
+    of its live opens, and an entry is dropped at its Close; an open a successor restored after a takeover has none, and
+    is judged unprivileged unless Developer Mode is on.
+  - A symbolic link's set or delete is allowed if its open was kept so, or if Developer Mode is on, read from the registry
+    at the set. Otherwise it answers `STATUS_PRIVILEGE_NOT_HELD`, which Windows reports as `ERROR_PRIVILEGE_NOT_HELD`,
+    NTFS's answer.
+  - Stated deviations from NTFS. (a) WinFsp never passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file
+    system, so under Developer Mode the drive allows a program without the privilege that sets a link's buffer itself
+    (`FSCTL_SET_REPARSE_POINT`) without that flag, where NTFS may refuse it. A `CreateSymbolicLinkW` caller never meets
+    this: `CreateSymbolicLinkW` itself refuses a caller without the privilege that did not pass the flag, before any file
+    system is asked, so on its path the drive answers as NTFS in every case measured (a token with no privilege, the
+    flag and Developer Mode each off and on: `ERROR_PRIVILEGE_NOT_HELD` three times and the link made once, on the
+    drive and on the runner's NTFS alike, diagnostics run 42715955734). (b) The privilege
+    must be enabled in the token at the open, where NTFS asks it enabled at the set. `CreateSymbolicLinkW` enables it
+    around its whole operation, before its create, so on that path the two agree; a program that never enables it is
+    refused, as on NTFS. Only a program that enables it after its open and before its `FSCTL_SET_REPARSE_POINT` is
+    refused where NTFS allows it: stricter, and safe (`a_raw_link_set_needs_the_privilege_enabled_at_its_open`).
+    (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT` or a write access, or through one a
+    successor restored after a takeover (which kept no token), is judged as one without the privilege: allowed under
+    Developer Mode alone.
+  - Measured on the runner by `a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused` (`ERROR_PRIVILEGE_NOT_HELD`,
+    no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
+    `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag` and
+    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`, on the final build (diagnostics run 42720006662), with
+    Developer Mode on and then off: `CreateSymbolicLinkW` without the privilege and without the flag, 1314 and 1314;
+    with the flag, made and 1314; with the privilege, made; a raw set with the privilege held but disabled, made (the
+    deviation (a)) and 1314; enabled before its open, made and made. The NTFS control (the same token and
+    flags on the runner's own disk, Developer Mode off and on) gave the same four answers as the drive. The daemon holds no privilege (R10).
+- **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
+  its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
+  relative link (prefixed with the volume's name) and an absolute one alike (`src/sys/create.c` 893-996, v2.1), so the
+  I/O manager reopens the new name under the caller's token and is never handed an `IO_REPARSE_TAG_SYMLINK` to evaluate.
+  The drive is a local disk file system (`FILE_DEVICE_DISK_FILE_SYSTEM` without `FILE_REMOTE_DEVICE`,
+  `src/sys/volume.c`); Windows reports it a "Fixed Drive" (`fsutil fsinfo drivetype`). Measured on the runner (diagnostics
+  run 42712321599): the evaluation classes are L2L and L2R enabled, R2L and R2R disabled; a drive link to
+  `\\localhost\C$\Windows\win.ini` is followed. With `fsutil behavior set SymlinkEvaluation L2R:0` (which `fsutil behavior
+  query` then reports DISABLED) the drive link was still followed, but so was the same link on the runner's NTFS, so the
+  setting did not take effect on the running system and the run cannot tell the drive from NTFS there; the reason the
+  drive would not apply it either is WinFsp's rewrite, read in its source above.
+- **The stored form's cost, and the format bump.** The directory bit lives in the inode's existing `u16`: no inode,
+  wire, archive or layout change. But an earlier reader would drop the bit without a word and show a directory link as
+  a file link, so the image (version 26) and the delta (version 9) are bumped, and a reader of another version refuses
+  them typed rather than read them as its own (the version-refusal tests in `crates/vfs/tests/checkpoint_log.rs`). FUSE,
+  NFS and FSKit read and make links as before and never see the bit.
+- **Crash behaviour.** A set or delete is one shard request that removes the object and makes its replacement, then
+  publishes once (§4.8, D-18): no publication shows the name missing or holding both, so a crash leaves the old object or
+  the link, never neither.
+- **Limits, each answered by its status.** The print name is derived, not kept. A file with bytes cannot become a link
+  (`STATUS_DIRECTORY_NOT_EMPTY`). A link holds no bytes of its own: a write or read through a handle opened on the link
+  itself is refused (`ERROR_INVALID_PARAMETER`; NTFS and memfs keep a data stream beside a reparse point;
+  `t/reparse/02.t` cases 15 and 16, listed SYMLINK-DATA). The open that set the link keeps the object it opened, now
+  unlinked, as a POSIX open of an unlinked file does; WinFsp drops what Windows cached of the name after the set
+  (`FspFsvolFileSystemControlReparsePointComplete` invalidates the node's information), so the next open finds the link.
+- **What winfstest says** (diagnostics run 42695804063, windows-latest, 733 cases): the links let 105 cases run that
+  never ran. With the 3 listed cases they unlocked (02.t:1, 03.t:1, streams/04.t:9), 78 pass and 30 are listed, none a
+  defect: 02.t 39 of 41 (15 and 16, SYMLINK-DATA), 03.t 26 of 26, streams/04.t 13 of its cases 9 to 49 (28 listed
+  STREAMS, each through a `name:stream` path). The list goes from 355 to 382, recorded from diagnostics run 42720006662 on the final build (733 cases, 382
+  expected, 0 unexpected, 0 listed-now-passing).
+- **Proven** by `symbolic_links_made_through_the_drive_are_followed_and_read_back` and
+  the three privilege tests and `a_link_relative_to_the_drives_root_follows_its_directory_when_moved`
+  (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows
+  runner; the first red on main, `ERROR_INVALID_FUNCTION` at the first `CreateSymbolicLinkW`, and red with the four
+  reparse callbacks removed, `Incorrect function.` at the first `CreateSymbolicLinkW`, diagnostics run 42712321599), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
+  (`crates/bridge-core/tests/volume_bridge.rs`; on main the reply read 2 where 18 was set),
+  `windows_attributes_survive_an_image_and_a_rebuild` (`crates/vfs/tests/recover.rs`; with the old image mask the
+  rebuilt volume read 2, not 18), the version-refusal tests, the buffer's ten tests in `crates/bridge-winfsp/src/symlink.rs`
+  (its layout built field by field from MS-FSCC 2.1.2.4; hostile buffers refused; the separator rule and its lossy case),
+  and winfstest judged against the 382-entry list.
 
 ### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
@@ -20692,6 +20882,13 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+- **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
+  mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
+  `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
+  missing piece refused by its own reason, the macOS mount's own check now the same function; and
+  `mount::unmount_lazy(path)`, `fusermount3 -u -z` on Linux, refused `Unsupported` elsewhere. Applied to
+  `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
+  (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
   conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
@@ -20807,3 +21004,107 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+
+### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
+
+Applied in the same change to:
+- §4.3: the status of 2026-11-17 (the room wake).
+- `crates/rt/src/room.rs` (new): `ShardSet`, the protocol and its three loom models. `crates/rt/src/registry.rs`:
+  each entry's `room_wanted` and `room_given`; `give_room`; `note_exited` tells every asker.
+  `crates/rt/src/shard.rs`: `want_room`; `drain_control` wakes the tasks a tell names and, after a drain that took a
+  message, fences and tells; the counters `room_waits` and `room_wakes`. `crates/rt/src/futures.rs`: `want_room`.
+  The tests: `crates/rt/tests/room.rs` and `room_gone.rs`.
+- `crates/server/src/daemon.rs` (`serve_loop`) and `crates/server/src/verbs.rs` (`ask_room_for_kept_forwards`,
+  `refuse_unsent_forward`): the timed idle while a forward is kept is gone. `Daemon::flood_control_channel_counting`
+  and `crates/server/tests/forward_retry.rs`.
+- GAPS: the load test's "A kept forward waited for another request". The bug record:
+  `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`.
+- **What was there.** A shard's control channel is bounded at its admission limit, and a spawn it refuses is kept by
+  its sender (§4.3: "backpressure, never a drop"). No message, flag or kick told the sender when the channel had room
+  again. The serve loop, while it kept a forward, idled at most one idle window and then tried again (2026-11-07), so
+  it armed a timer every window and the forward reached its owner up to a window after the room. The window is the
+  shard's measured wake × 100 and has no cap of its own.
+- **The rule.** A sender refused `ControlFull` may ask the target to tell it when the channel has room. It marks its
+  shard in the target's set, fences `SeqCst`, and tries once more, and it waits only if that try is refused too. The
+  target, after every drain that took a message, fences `SeqCst` and tells each shard its set names. A tell marks the
+  target in the asker's set, fences `SeqCst`, and publishes the asker's control flag, so a parked asker is kicked as a
+  message would kick it. That fence answers the one a drain makes after re-arming its flag with a plain store, which
+  ends a publication's release sequence; a message needs none, since the channel claims its slot with a `SeqCst`
+  operation. An exiting target tells every asker, and an ask after its exit is refused `ShardGone`. The serve loop asks before it idles with a
+  forward kept and then idles with no timer. Asks and the tasks they woke are counted per shard.
+- **Why.** Goal g239: the supervisor's runs of main failed `forward_retry.rs` 8 of 30 at load ~35, named a lost wake.
+  The test's timeline on this Mac (30 runs beside 36 spinners) found the resend within 21 ms of the room in every run;
+  the answer waited for the owner's drain of the 41,125 tasks the test had queued ahead of the forward, which took up
+  to 4.33 s. So the test now owes the answer within the liveness budget of the owner's last progress through that
+  queue. The exact wake was the 2026-11-07 record's owed sibling. With it, nothing but the owner's word moves a kept
+  forward while its shard idles, which the test now proves, and the timer a window is gone.
+- **Cost.** The sender pays only on a refusal: a map insert on its own shard, two read-modify-writes and a fence. The
+  target pays one `SeqCst` fence and one load for each drain that took a message, nothing when none came, and a fence
+  for each tell.
+
+### A-293 — The Linux lane runs the workload roster over the daemon's own FUSE mount (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, Linux FUSE among them)
+Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip/conformance.md` (§4's Linux row),
+`crates/conformance/src/capability.rs` (the cell; `LINUX_NFS_ADAPTER` public), `xtask/src/conformance/slates.rs`
+(`Reach`, the FUSE mount), `mod.rs` (`Run::reach`), `bench.rs` and `live_fleet.rs` (their reach named), and the
+`conformance` job's comment in CI.
+- **The decision.** The native Linux transport is FUSE, and an agent's git, Mercurial and Subversion reach a volume
+  on Linux through `slates mount`, the daemon's own FUSE mount. The roster ran there only inside containers
+  (`oci-linux`); the native Linux lane ran it through a root `mount -t nfs` of the loopback export, an adapter
+  recorded LIMITED. The roster needs no root, and a user's processes reach the user's own FUSE mount without
+  `allow_other`, so its cell (`native-linux-fuse` × workloads) now names neither root nor an adapter: tools
+  `fusermount3` and `sh`, recorded RAN. The other suites keep the adapter (pjdfstest's root cases need `allow_other`,
+  the hermeticity tracer strips `fusermount3`'s setuid unless it runs as root), and over the FUSE mount they run in
+  the container lane.
+- **How a cell reaches its volume is the table's.** `Reach::of(transport, suite)` reads the cell's adapter from the
+  capability table, and `mount_volume` mounts by it: the transport's own mount, or the Linux NFS adapter. A run that
+  measures a mount of its own names its reach outright: the NFS bench measures NFSv3 beside NFSv4.2 (it asks for root
+  itself rather than borrow the workloads cell, whose reach is now FUSE), and the A-200 live-ship test keeps the soft
+  NFS mount it is about. `the_linux_nfs_adapter_is_the_only_adapter` holds every adapter the table names to the one
+  the harness can mount.
+- **Evidence.** `the_workloads_cell_reaches_linux_fuse_through_the_daemons_own_mount` opens the cell's session as
+  `conformance run --suite workloads` does, as a user with no root, and holds the kernel's mount table to a FUSE
+  mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
+  runs over the mount are the supervisor's (CLAUDE.md §8).
+
+### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
+Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
+`crates/server/src/grant_signature.rs`.
+Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested); piece 2 built (the presentation's
+nonce, the signed `Grant` on the wire, the nonce spent once). Owed, in order: durable key registration (the first key only
+through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
+sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
+GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.
+- Why: before, the anchor held the grant-issuer secret. On Linux it sat in a descriptor only the anchor's children
+  inherit, so no `slates grant` could be issued and a Linux server's landing stopped at its presentation (GAPS, A-201);
+  on macOS and Windows the anchor printed `export` variables, and any process of the user that held them could grant,
+  agents included. fs-server's options (2026-11-05):
+  - A. The anchor asks on its own controlling terminal, naming the exact manifest. Small and on every OS, but R10 rests
+    on who owns that terminal: an agent that started the anchor in its own shell can answer.
+  - B. A same-user socket to the anchor checked by `SO_PEERCRED`. Any process of the user, agents included, can
+    grant; it breaks D-22. Rejected.
+  - C. A separate operator account owns issuance (the peer's uid is checked). Strong and unprivileged, but a setup per
+    machine and the human switching accounts for each grant.
+  - **D. A grant signed by a key only the human holds**: an ssh-agent key added with `ssh-add -c` (the agent asks the
+    human through askpass on every use) or a FIDO key (`sk-ssh-ed25519`, a touch per signature). An agent with a shell
+    cannot make the signature unseen.
+  - E. Standing grants in a file the human writes. It weakens R10 to a policy, and agents must not be able to write
+    the file.
+
+  Ada chose D, with A only where no key is registered, the same on macOS, Windows and Linux (2026-11-18).
+- The proof: an SSH signature (OpenSSH `PROTOCOL.sshsig`) under the namespace `slates-grant`, over a plain-text
+  statement, one field a line: the landing, the manifest hash, the target (prefixed by its byte length), the scope and
+  term, a nonce the daemon issues with the presentation, and an expiry in Unix seconds. It covers all that the old
+  keyed proof bound. The nonce makes a signature usable once and only after the presentation. Keys: `ssh-ed25519` and
+  `sk-ssh-ed25519@openssh.com`, whose signature must carry the authenticator's user-presence flag; hashes `sha512` or
+  `sha256`; Ed25519 and SHA-2 from AWS-LC (A-66). A second form is accepted over the same bytes: a WebAuthn assertion
+  whose challenge is the statement's SHA-256, made in kiln's person session (a passkey or a security-key touch).
+- Registration is itself a grant-class act. A standalone anchor accepts its first key only through A's terminal
+  prompt. A kiln-managed anchor has no terminal; it registers and confirms through kiln's person session, a WebAuthn
+  ceremony whose public key reaches the anchor over kiln's authenticated person path, which agents cannot use (kiln
+  already refuses an agent a manifest-bearing land). This last route is the supervisor's direction, put to Ada as a
+  recommendation (2026-11-18). Each later key must be signed by a registered key. No agent channel can add a key.
+- Proven (piece 1): a real `ssh-keygen -Y sign` signature (OpenSSH 10.0p2) verifies; every single-bit flip of it is
+  refused; an unregistered key, a changed manifest or any other changed field, another namespace, a statement past its
+  expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
+  panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
+  the exact encoding, since the first vector was signed before the target gained its length prefix.

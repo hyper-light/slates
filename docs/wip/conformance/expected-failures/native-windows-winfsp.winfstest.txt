@@ -4,8 +4,11 @@
 # verdicts were the same case for case: 628 cases, 253 passed, 375 failed; t/base/05.t case 12 has passed since the
 # truncation fix (diagnostics run 42046112993), leaving 374 listed. t/base/06.t case 5 passes since the drive keeps
 # SetFileTime's creation time (A-259), leaving 373. The 18 ATTRIBUTES cases pass since the drive keeps the Windows
-# attribute bits beside the mode and a file's READONLY is its mode's write bits (A-262), leaving 355.
-# Each reason names A-209's stated difference the case meets (SECURITY, REPARSE, SYMLINK, STREAMS) or an
+# attribute bits beside the mode and a file's READONLY is its mode's write bits (A-262), leaving 355. Since A-275 a
+# volume symlink is a Windows symbolic link (diagnostics run 42695804063): t/reparse/02.t, 03.t and t/streams/04.t run to
+# their ends, 733 cases in all; 02.t:1, 03.t:1 and streams/04.t:9 pass, and 30 of the 105 cases newly run are listed
+# (02.t:15-16, a link's own data stream; 28 of streams/04.t's, each through a name:stream path), leaving 382.
+# Each reason names A-209's stated difference the case meets (SECURITY, REPARSE, STREAMS), A-275's (SYMLINK-DATA), or an
 # open bug with its record and failing test. A case that fails only because an earlier unsupported call
 # failed in the same script carries that call's reason.
 # One case per line. Unlisted failures, listed passes and absent listed cases fail the gate; the list only shrinks.
@@ -61,8 +64,8 @@ t/reparse/01.t:29  A-209 REPARSE: the drive serves no reparse points (WinFsp's G
 t/reparse/01.t:30  A-209 REPARSE: the drive serves no reparse points (WinFsp's Get/Set/DeleteReparsePoint are not provided), so FSCTL_SET/GET/DELETE_REPARSE_POINT answer ERROR_INVALID_FUNCTION and every later check of the point fails.
 t/reparse/01.t:31  A-209 REPARSE: the drive serves no reparse points (WinFsp's Get/Set/DeleteReparsePoint are not provided), so FSCTL_SET/GET/DELETE_REPARSE_POINT answer ERROR_INVALID_FUNCTION and every later check of the point fails.
 t/reparse/01.t:35  A-209 REPARSE: the drive serves no reparse points (WinFsp's Get/Set/DeleteReparsePoint are not provided), so FSCTL_SET/GET/DELETE_REPARSE_POINT answer ERROR_INVALID_FUNCTION and every later check of the point fails.
-t/reparse/02.t:1  A-209 SYMLINK: Windows symbolic links are reparse points, which the drive does not serve, so CreateSymbolicLink answers ERROR_INVALID_FUNCTION; the script skips its remaining cases.
-t/reparse/03.t:1  A-209 SYMLINK: Windows symbolic links are reparse points, which the drive does not serve, so CreateSymbolicLink answers ERROR_INVALID_FUNCTION; the script skips its remaining cases.
+t/reparse/02.t:15  A-275 SYMLINK-DATA: a volume symlink is a POSIX link, whose only content is its target, so a write and a read through a handle opened on the link itself (FILE_FLAG_OPEN_REPARSE_POINT) are refused (ERROR_INVALID_PARAMETER); NTFS, and WinFsp's memfs, keep a data stream beside a link's reparse point.
+t/reparse/02.t:16  A-275 SYMLINK-DATA: a volume symlink is a POSIX link, whose only content is its target, so a write and a read through a handle opened on the link itself (FILE_FLAG_OPEN_REPARSE_POINT) are refused (ERROR_INVALID_PARAMETER); NTFS, and WinFsp's memfs, keep a data stream beside a link's reparse point.
 t/streams/00.t:1  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
 t/streams/00.t:2  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
 t/streams/00.t:3  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
@@ -367,4 +370,31 @@ t/streams/04.t:5  A-209 STREAMS: the drive serves no named streams (WinFsp's Nam
 t/streams/04.t:6  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
 t/streams/04.t:7  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
 t/streams/04.t:8  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
-t/streams/04.t:9  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:10  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:11  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:12  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:13  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:14  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:15  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:16  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:17  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:19  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:20  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:21  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:22  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:23  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:24  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:25  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:26  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:29  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:30  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:31  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:32  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:33  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:38  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:39  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:40  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:41  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:45  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:46  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
+t/streams/04.t:47  A-209 STREAMS: the drive serves no named streams (WinFsp's NamedStreams is off), so a name:stream path answers ERROR_INVALID_NAME, FindStreams is refused, and every check that follows from a stream fails.
