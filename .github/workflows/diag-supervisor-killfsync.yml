@@ -1,0 +1,39 @@
+# DIAG (not for main): goal 84's acceptance run (A-358) through Apple's NFS kernel client on GitHub's macos-latest
+# instead of the offline Studio-2: a runner that panics costs nobody (Ada 2026-11-18: run it where a crash disrupts
+# least). docs/wip/bench/kill_fsync_macos.sh, 8 rounds x 15 kills x 30 s, every log line streamed to the job log.
+name: diag-supervisor-killfsync
+on:
+  push:
+    branches: ['diag-supervisor-killfsync-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  killfsync:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build slates (release)
+        run: cargo build --locked --release -p slates-cli --bin slates
+      - name: Panic reports before the run
+        run: ls -la /Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i panic || echo "no panic reports"
+      - name: kill_fsync_macos, 8 rounds of 15 kills
+        shell: bash
+        run: |
+          SLATES=$PWD/target/release/slates ROUNDS=8 KILLS=15 DURATION=30 WORK=$HOME/.cache/kfm bash docs/wip/bench/kill_fsync_macos.sh
+      - name: The verdict lines
+        if: always()
+        shell: bash
+        run: |
+          grep -E "checked [0-9]+: intact|BAD|empty [1-9]|corrupt [1-9]|panic|stuck" $HOME/.cache/kfm/run.log | head -60 || true
+          ls -la /Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i panic || echo "no panic reports"
+      - name: Upload the run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: killfsync-macos
+          path: ~/.cache/kfm/
