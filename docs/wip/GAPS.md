@@ -2740,9 +2740,12 @@
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.
->     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
->       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
->       verdict, a rebase and a read of the green each queue on the owner's one thread.
+>     - **Closed: a work's hop from its client's shard (A-400, 2026-11-18).** A work lived on the shard its name hashes
+>       to, so every verb of it crossed from its client's shard and back; it now lives on its client's shard, its name
+>       held by an alias where the name hashes. Priced first by naming works onto their clients' shards: an edit's p99
+>       about halved and its p50 40% lower at 1,000 clients.
+>     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
+>       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,

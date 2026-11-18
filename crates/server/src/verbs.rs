@@ -7225,17 +7225,20 @@ fn create_work_here(
     taken_over: None,
   };
   let now = state.clock.monotonic_ns();
+  // A green elsewhere recorded the work's floor when it admitted the work; a green here records it below. The id may be
+  // minted here as well (a name held by an alias elsewhere, A-400), so where the floor is recorded follows the green.
+  let admitted_elsewhere = owner_of(green) != state.partition;
   if let Err(e) = state
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
-    if minted.is_some() {
+    if admitted_elsewhere {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(refusal_of_db(&e));
   }
-  // The green keeps this base while the work holds it (A-247); a green elsewhere recorded it when it admitted the work.
-  if minted.is_none()
+  // The green keeps this base while the work holds it (A-247).
+  if !admitted_elsewhere
     && let Err(e) = state.db.mutate(
       &mut state.segment,
       &Op::WorkFloorSet {
