@@ -2120,6 +2120,8 @@ pub(crate) fn holder_reached(holder: HostId) {
 /// 1,395 entries old when last built, while an install's own transit added 0 or 1, so it landed past the retained tail
 /// and took a second whole install (`live_chaos`'s rolling partition, diag-live-durability-54).
 fn send_to_reached(state: &mut ShardState, holder: HostId) {
+  // Red check only: main's one-turn walk counted as one turn.
+  state.count("fleet.live.reached_slices", 1);
   let volumes: Vec<[u8; 16]> = state
     .live
     .shipping
