@@ -5493,23 +5493,16 @@ fn past_tolerance_of(
 
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
-/// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
-/// the head move there by value; on success the object is no longer pending, on a refusal (or a shard
-/// that does not answer this period) it is counted and stays pending.
+/// where every verb for it will run (`verbs::owner_of`), so that is where it must live. Made by a task of that
+/// shard in turns of its clock ([`make_taken`], g251), live log or placed seal alike: an attempt that finds one
+/// running joins it, one that finds one ended reads its end, and only one that finds neither gathers what the volume is
+/// made from (the live log's fetch, or the held archive copied a slice a turn, an envelope opened in turns) and begins
+/// one. On success the object is no longer pending; on a refusal (or a shard that does not answer this period) it is
+/// counted and stays pending.
 async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(), VolumeWait> {
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
   let taken = state::with_state(|s| {
-    // A contentless volume (never sealed) has no manifest and no archive: it materializes from its adopted
-    // head and catalog registers alone. A volume with content waits until this node holds that content.
-    let archive = match &head.manifest {
-      Some(manifest) => Some(
-        s.held_content
-          .archive_of(s.store.content.arena(), object, manifest)
-          .ok_or(VolumeWait::Content)?,
-      ),
-      None => None,
-    };
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
     let placed = s
@@ -5536,16 +5529,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       .get(usize::from(partition))
       .copied()
       .ok_or(VolumeWait::Shard)?;
-    Ok::<_, VolumeWait>((
-      archive,
-      placed,
-      catalog_sequence,
-      catalog,
-      catalog_placed,
-      target,
-    ))
+    Ok::<_, VolumeWait>((placed, catalog_sequence, catalog, catalog_placed, target))
   });
-  let (archive, placed, catalog_sequence, catalog, catalog_placed, target) = match taken {
+  let (placed, catalog_sequence, catalog, catalog_placed, target) = match taken {
     Some(Ok(taken)) => taken,
     Some(Err(waits)) => {
       // Each period's wait is counted by what it waits for, so a successor that adopted a head and never serves
@@ -5557,19 +5543,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     // The control shard's state out of reach (its shutdown): nothing is attempted, nothing is counted.
     None => return Ok(()),
   };
-  // A live volume's materialization runs in turns on its owner shard, by a task of that shard ([`make_live`], g251): an
+  // A volume's materialization runs in turns on its owner shard, by a task of that shard ([`make_taken`], g251): an
   // attempt that finds one running joins it, one that finds one ended reads its end, and only one that finds neither
-  // fetches the log and begins one. Before, every attempt fetched the whole log and rebuilt it inside one owner-shard
-  // turn, which ran past the watchdog's spin window (the nemesis's successors, 0.3 to 2.8 s), and an attempt that turn
-  // outlasted (its call's deadline a period, 100 ms) counted as unanswered, so the next period fetched and rebuilt the
-  // whole log again.
-  if catalog.live_shipped && catalog.live_holders.is_some() {
-    match making_of(origin, target, object).await {
-      Some(Joined::None) => {}
-      Some(Joined::Running(turns)) => return making_runs(object, turns),
-      Some(Joined::Ended(ended)) => return live_ended(object, ended),
-      None => return materialize_unanswered(),
-    }
+  // gathers the volume's content and begins one. Before, every attempt gathered it again and made the volume inside one
+  // owner-shard turn, which ran past the watchdog's spin window (a live log's successors, 0.3 to 2.8 s; a plain
+  // volume's restore of the 1.99 GB kernel base, seconds), and an attempt that turn outlasted (its call's deadline a
+  // period, 100 ms) counted as unanswered, so the next period gathered it and began again.
+  match making_of(origin, target, object).await {
+    Some(Joined::None) => {}
+    Some(Joined::Running(turns)) => return making_runs(object, turns),
+    Some(Joined::Ended(ended)) => return taken_ended(object, ended),
+    None => return materialize_unanswered(),
   }
   // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
   // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
@@ -5593,14 +5577,51 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     None
   };
   let region = head.content_holders.clone();
+  // Whether the round adopted the head, or phase one the log, past tolerance (A-309), for the loss report (A-332).
+  let registers_short = state::with_state(|s| {
+    s.pending_materializations
+      .get(&object)
+      .and_then(|pending| pending.registers_short)
+  })
+  .flatten();
+  let past_tolerance = past_tolerance_of(
+    registers_short,
+    live.as_ref().and_then(|fetched| fetched.past_tolerance),
+  );
+  if let Some(fetched) = live {
+    let making = MakeTaken {
+      object,
+      id,
+      head,
+      catalog,
+      catalog_sequence,
+      placed,
+      catalog_placed,
+      region,
+      past_tolerance,
+    };
+    return begin_materializing(origin, target, making, Source::Live(fetched)).await;
+  }
+  // A volume with content waits until this node holds that content whole, copied out of the held store a slice a turn
+  // ([`held_archive_in_turns`]); a contentless volume (never sealed) has no manifest and no archive: it materializes
+  // from its adopted head and catalog registers alone.
+  let archive = match head.manifest {
+    Some(manifest) => match held_archive_in_turns(object, manifest).await {
+      Some(archive) => Some(archive),
+      None => {
+        count_refusal(VolumeWait::Content.counter());
+        return Err(VolumeWait::Content);
+      }
+    },
+    None => None,
+  };
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
   // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
   // reached it) is handed the key by a fellow candidate of the head, as a live log's successor is (A-295).
-  let envelope = live.is_none()
-    && archive
-      .as_ref()
-      .is_some_and(slates_cluster::envelope::is_envelope);
+  let envelope = archive
+    .as_ref()
+    .is_some_and(slates_cluster::envelope::is_envelope);
   let successor_lineage =
     successor_lineage_of(object, &head, &placed.placement.candidates, envelope).await;
   let naming = head
@@ -5608,9 +5629,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     .as_ref()
     .and_then(|sealing| sealing.naming.clone());
   // A sealed envelope is opened before the volume is made, in turns of its owner shard's clock, its lineage key adopted
-  // first (A-347); the turn that makes the volume then finds a plain archive. Opened in that turn, a GiB volume's open
+  // first (A-347); the task that makes the volume then finds a plain archive. Opened in one turn, a GiB volume's open
   // ran about a second, the watchdog's window.
-  let (archive, successor_lineage) = if envelope {
+  let (archive, lineage) = if envelope {
     let owner = catalog.owner.clone();
     match open_in_turns(
       origin,
@@ -5627,115 +5648,73 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   } else {
     (archive, successor_lineage)
   };
-  // Whether the round adopted the head, or phase one the log, past tolerance (A-309), for the loss report (A-332).
-  let registers_short = state::with_state(|s| {
-    s.pending_materializations
-      .get(&object)
-      .and_then(|pending| pending.registers_short)
-  })
-  .flatten();
-  let past_tolerance = past_tolerance_of(
-    registers_short,
-    live.as_ref().and_then(|fetched| fetched.past_tolerance),
-  );
-  if let Some(fetched) = live {
-    let making = MakeLive {
-      object,
-      id,
-      head,
-      catalog,
-      catalog_sequence,
-      placed,
-      catalog_placed,
-      region,
-      past_tolerance,
-    };
-    return begin_live(origin, target, making, fetched).await;
-  }
-  let served = call_within(
-    origin,
-    target,
-    move |s| {
-      let sequence = placed.sequence;
-      // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
-      let taken = verbs::TakenOver {
-        head: &head,
-        catalog: &catalog,
-        catalog_sequence,
-        sequence,
-        takeover: slates_db::catalog::TakeoverRecord {
-          epoch: placed.epoch.0,
-          head_sequence: sequence,
-          from_live_log: false,
-          past_tolerance,
-        },
-      };
-      // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c); an
-      // envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node (it
-      // acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
-      if let Some(lineage) = successor_lineage
-        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
-      {
-        s.count(LINEAGE_UNADOPTED, 1);
-      }
-      // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
-      // An envelope is opened before this turn ([`open_in_turns`]), so what arrives here is a plain archive.
-      let opened = match archive {
-        Some(archive) => match opened_archive(archive) {
-          Some(opened) => Some(opened),
-          None => {
-            s.count(ENVELOPE_UNOPENED, 1);
-            return Err(ENVELOPE_UNOPENED);
-          }
-        },
-        None => None,
-      };
-      past_the_pressure_hold(s, |s| {
-        verbs::materialize_taken_over(s, id, &taken, region, opened.as_ref())
-      })
-      .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-      // The owner shard now owns the head's and the catalog's placements — its record plane writes the
-      // object's next records at the promotion epoch and ships only to holders still missing these.
-      s.placed_heads.insert(object, placed);
-      s.placed_heads.insert(object.catalog(), catalog_placed);
-      published_before_served(s)?;
-      Ok(())
-    },
-    HEARTBEAT_NS,
-  )
-  .await;
-  let outcome = state::with_state(|s| match served {
-    Some(Ok(())) => {
-      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
-      if let Some(pending) = s.pending_materializations.remove(&object) {
-        s.failover
-          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
-      }
-      s.pending_catalogs.remove(&object);
-      Ok(())
-    }
-    // Counted on this (control) shard with the refusal's kind, where status and the fleet tests read: the owner
-    // shard's typed refusal was discarded before 2026-10-07, and a successor refused every period for a whole
-    // test wait (298 times) said only `fleet.materialize`.
-    Some(Err(refusal)) => {
-      s.count(MATERIALIZE_REFUSED, 1);
-      s.count(refusal, 1);
-      Err(VolumeWait::Refused)
-    }
-    None => {
-      s.count(MATERIALIZE_REFUSED, 1);
-      s.count(MATERIALIZE_UNANSWERED, 1);
-      Err(VolumeWait::Refused)
-    }
-  });
-  // The control shard's state out of reach (its shutdown): nothing more is attempted.
-  outcome.unwrap_or(Ok(()))
+  let making = MakeTaken {
+    object,
+    id,
+    head,
+    catalog,
+    catalog_sequence,
+    placed,
+    catalog_placed,
+    region,
+    past_tolerance,
+  };
+  let source = Source::Archive {
+    archive,
+    lineage,
+    naming,
+  };
+  begin_materializing(origin, target, making, source).await
 }
 
-/// A live volume's materialization as its owner shard holds it, read by an attempt of the control shard ([`making_of`]).
+/// The archive this (control) shard holds whole for `object`'s manifest `identity`, copied out of the held store a
+/// slice of chunks a turn (g251): its manifest, then each chunk it names, until a copy slice's bytes are copied
+/// (`DaemonConfig::copy_slice_bytes`, a chunk at least), the shard given back between slices. `None` when the
+/// manifest or any chunk it names is not held for the object. Copied in one call (`ContentHold::archive_of`), the
+/// 1.99 GB kernel base volume was one copy of all its chunks in a turn of the coordinator, every period's attempt.
+async fn held_archive_in_turns(object: ObjectId, identity: [u8; 32]) -> Option<Archive> {
+  let manifest = state::with_state(|s| {
+    s.held_content
+      .held_manifest(s.store.content.arena(), object, &identity)
+  })
+  .flatten()?;
+  let referenced = manifest.referenced_chunks();
+  let mut chunks = Vec::with_capacity(referenced.len());
+  let mut next = referenced.into_iter().peekable();
+  while next.peek().is_some() {
+    let copied = state::with_state(|s| {
+      let slice_bytes = s.config.copy_slice_bytes();
+      let mut copied_bytes = 0u64;
+      s.count(MATERIALIZE_ARCHIVE_SLICES, 1);
+      while let Some(chunk) = next.next() {
+        let held = s
+          .held_content
+          .held_chunk(s.store.content.arena(), object, &identity, &chunk)?;
+        copied_bytes = copied_bytes.saturating_add(held.stored_len);
+        chunks.push(held);
+        if copied_bytes >= slice_bytes {
+          break;
+        }
+      }
+      Some(())
+    })
+    .flatten();
+    copied?;
+    futures::yield_now().await;
+  }
+  Some(Archive { chunks, ..manifest })
+}
+
+/// Counter: one turn's slice of a taken-over volume's held archive copied out of the held store on the control shard
+/// ([`held_archive_in_turns`], g251).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_ARCHIVE_SLICES: &str = "fleet.materialize.archive_slices";
+
+/// A taken-over volume's materialization as its owner shard holds it, read by an attempt of the control shard
+/// ([`making_of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Joined {
-  /// None runs or ended there: the attempt fetches the log and begins one.
+  /// None runs or ended there: the attempt gathers the volume's content and begins one.
   None,
   /// One runs: the turns it has taken.
   Running(u64),
@@ -5743,7 +5722,7 @@ enum Joined {
   Ended(Result<(), &'static str>),
 }
 
-/// Where `object`'s live materialization stands on its owner shard `target` ([`make_live`]), an ended one forgotten
+/// Where `object`'s materialization stands on its owner shard `target` ([`make_taken`]), an ended one forgotten
 /// there once read; `None` when the shard did not answer in its own time.
 async fn making_of(origin: u16, target: u16, object: ObjectId) -> Option<Joined> {
   crate::xshard::call_in_shard_time(
@@ -5782,10 +5761,11 @@ fn making_runs(object: ObjectId, turns: u64) -> Result<(), VolumeWait> {
   }
 }
 
-/// The end of a live volume's materialization where the control shard learns it: made, the takeover's pending entries
-/// are done with; refused, counted as an owner shard's refusals are, and a refusal of the log remembered at the head it
-/// was fetched at ([`crate::live_ship::note_rebuild`]), so the log is not fetched again at a head it cannot rebuild.
-fn live_ended(object: ObjectId, ended: Result<(), &'static str>) -> Result<(), VolumeWait> {
+/// The end of a taken-over volume's materialization where the control shard learns it: made, the takeover's pending
+/// entries are done with; refused, counted as an owner shard's refusals are, and a live log's refusal remembered at the
+/// head it was fetched at ([`crate::live_ship::note_rebuild`]), so the log is not fetched again at a head it cannot
+/// rebuild.
+fn taken_ended(object: ObjectId, ended: Result<(), &'static str>) -> Result<(), VolumeWait> {
   let adopted = state::with_state(|s| {
     s.pending_materializations
       .get(&object)
@@ -5797,8 +5777,7 @@ fn live_ended(object: ObjectId, ended: Result<(), &'static str>) -> Result<(), V
   }
   let outcome = state::with_state(|s| match ended {
     Ok(()) => {
-      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363), as a one-turn
-      // materialization's is.
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
       if let Some(pending) = s.pending_materializations.remove(&object) {
         s.failover
           .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
@@ -5829,9 +5808,9 @@ fn materialize_unanswered() -> Result<(), VolumeWait> {
   }
 }
 
-/// What a live volume's materialization takes to its owner shard besides the log: the takeover's adopted registers and
-/// their placements, the content holders the head recorded and the shortfall it was adopted past (A-332).
-struct MakeLive {
+/// What a taken-over volume's materialization takes to its owner shard besides its content: the takeover's adopted
+/// registers and their placements, the content holders the head recorded and the shortfall it was adopted past (A-332).
+struct MakeTaken {
   object: ObjectId,
   id: DbVolumeId,
   head: HeadValue,
@@ -5843,29 +5822,45 @@ struct MakeLive {
   past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
 }
 
-/// Begins a live volume's materialization on its owner shard `target` as a task of that shard ([`make_live`]) and waits
-/// a period for its end: an end within that is read at once; one still running is joined by the next attempt
-/// ([`making_of`], which asks in the shard's own time), its log never fetched or rebuilt again meanwhile, so the wait
+/// What a taken-over volume is made from on its owner shard.
+enum Source {
+  /// Its live log, fetched (A-200, A-386): rebuilt a payload a slice, then laid out as an archive.
+  Live(crate::live_ship::Fetched),
+  /// Its placed seal's archive (an envelope already opened in turns, A-347; none for a contentless volume), the
+  /// successor's lineage key to adopt (A-92 pieces 3b and 4c) and the head's naming key.
+  Archive {
+    archive: Option<Archive>,
+    lineage: Option<([u8; 16], Vec<u8>)>,
+    naming: Option<crate::head::HeadNaming>,
+  },
+}
+
+/// Begins a taken-over volume's materialization on its owner shard `target` as a task of that shard ([`make_taken`])
+/// and waits a period for its end: an end within that is read at once; one still running is joined by the next attempt
+/// ([`making_of`], which asks in the shard's own time), its content never gathered or made again meanwhile, so the wait
 /// needs no longer than the period it holds the control shard's coordinator for. Waited for in the owner shard's own
 /// time instead, the coordinator was held for the whole materialization (1.2 s of a test's paused turns), its council
-/// and its heads with it. The head and sealing the log was fetched at are kept with the pending volume, for its end's
+/// and its heads with it. A live log's head and sealing are kept with the pending volume, for its end's
 /// [`crate::live_ship::note_rebuild`].
-async fn begin_live(
+async fn begin_materializing(
   origin: u16,
   target: u16,
-  making: MakeLive,
-  fetched: crate::live_ship::Fetched,
+  making: MakeTaken,
+  source: Source,
 ) -> Result<(), VolumeWait> {
   let object = making.object;
-  let _ = state::with_state_counted(|s| {
-    if let Some(pending) = s.pending_materializations.get_mut(&object) {
-      pending.live_adopted = Some((fetched.head, fetched.sealing.clone()));
-    }
-  });
+  if let Source::Live(fetched) = &source {
+    let adopted = (fetched.head, fetched.sealing.clone());
+    let _ = state::with_state_counted(|s| {
+      if let Some(pending) = s.pending_materializations.get_mut(&object) {
+        pending.live_adopted = Some(adopted);
+      }
+    });
+  }
   let ended = crate::xshard::task_within(
     origin,
     target,
-    move || make_live(making, fetched),
+    move || make_taken(making, source),
     HEARTBEAT_NS,
   )
   .await;
@@ -5880,21 +5875,18 @@ async fn begin_live(
           s.making_taken_over.remove(&object);
         }
       });
-      live_ended(object, ended)
+      taken_ended(object, ended)
     }
     // Still running on the owner shard, or not begun there: the next attempt reads which.
     None => making_runs(object, 0),
   }
 }
 
-/// A live volume's materialization, a task of its owner shard (g251, CLAUDE.md "Bounded work everywhere"): it claims the
-/// volume's record (`ShardState::making_taken_over`), makes the volume in turns of the shard's clock
-/// ([`make_live_in_turns`]), and leaves its end in the record for the control shard to read. Refused
-/// [`MAKING_ALREADY`] when a materialization of the volume already runs there, which the control shard joins instead.
-async fn make_live(
-  making: MakeLive,
-  fetched: crate::live_ship::Fetched,
-) -> Result<(), &'static str> {
+/// A taken-over volume's materialization, a task of its owner shard (g251, CLAUDE.md "Bounded work everywhere"): it
+/// claims the volume's record (`ShardState::making_taken_over`), makes the volume in turns of the shard's clock
+/// ([`make_in_turns`]), and leaves its end in the record for the control shard to read. Refused [`MAKING_ALREADY`]
+/// when a materialization of the volume already runs there, which the control shard joins instead.
+async fn make_taken(making: MakeTaken, source: Source) -> Result<(), &'static str> {
   let object = making.object;
   let claimed = state::with_state(|s| {
     if s.making_taken_over.contains_key(&object) {
@@ -5902,6 +5894,7 @@ async fn make_live(
     }
     s.making_taken_over
       .insert(object, Making::Running { turns: 0 });
+    s.count(MATERIALIZE_BEGUN, 1);
     true
   });
   match claimed {
@@ -5909,10 +5902,13 @@ async fn make_live(
     Some(false) => return Err(MAKING_ALREADY),
     None => return Err(MATERIALIZE_UNANSWERED),
   }
-  let ended = make_live_in_turns(making, fetched).await;
+  let id = making.id;
+  let ended = make_in_turns(making, source).await;
   // Recorded only while the record is still this task's: a takeover the control shard gave up on meanwhile forgot it
-  // ([`give_up_taken_over`]), and nothing would read an end left then.
+  // ([`give_up_taken_over`]), and nothing would read an end left then. A volume still being made is discarded with
+  // its credits given back on any end but its making (`verbs::discard_making` finds none once it is made).
   let recorded = state::with_state(|s| {
+    verbs::discard_making(s, id);
     if let Some(record) = s.making_taken_over.get_mut(&object) {
       *record = match ended {
         Ok(()) => Making::Made,
@@ -5933,19 +5929,57 @@ fn turned(state: &mut ShardState, object: ObjectId) {
   }
 }
 
-/// The turns of a live volume's materialization on its owner shard: the log's payloads opened and applied a slice a
-/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a payload at least:
-/// [`crate::live_ship::Rebuilding`]), counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a
-/// turn; then the archive restored, a turn (`verbs::restore_taken_over`); then the volume made from the restore and
-/// published before it is served (A-343), its shipper made from the head the takeover adopted (A-329), a turn, so no
-/// client meets it unpublished. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68 to
-/// 1.08 s to rebuild 152 to 306 MB of log, 0.24 to 0.32 s to restore and populate the volume and up to 0.48 s to publish,
-/// past the watchdog's spin window, which ended the successor's process.
-async fn make_live_in_turns(
-  making: MakeLive,
-  fetched: crate::live_ship::Fetched,
-) -> Result<(), &'static str> {
-  let MakeLive {
+/// One turn of `object`'s materialization on this owner shard: `turn` run and counted for the control shard's progress
+/// ([`turned`]); refused [`MAKING_FORGOTTEN`] without running it once the control shard gave the takeover up and forgot
+/// its record ([`give_up_taken_over`]), so a materialization nothing waits for stops.
+fn making_turn<T>(
+  object: ObjectId,
+  turn: impl FnOnce(&mut ShardState) -> T,
+) -> Result<T, &'static str> {
+  state::with_state(|s| {
+    if !matches!(
+      s.making_taken_over.get(&object),
+      Some(Making::Running { .. })
+    ) {
+      return Err(MAKING_FORGOTTEN);
+    }
+    turned(s, object);
+    Ok(turn(s))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)?
+}
+
+/// The span a materialization's turn may run on this shard: the seal turns' share of the shard's quantum
+/// (`config::wrap_slice_ns` of [`seal_quantum_ns`], a piece at least), as a live rebuild's.
+fn making_slice_ns(state: &ShardState) -> u64 {
+  crate::config::wrap_slice_ns(seal_quantum_ns(state))
+}
+
+/// A test's wait between a materialization's turns (`Daemon::inject_live_turn_pause`); nothing in production.
+async fn injected_turn_pause() {
+  if let Some(pause_ns) = state::with_state(|s| s.live_turn_pause_ns).flatten()
+    && futures::sleep(pause_ns).await.is_err()
+  {
+    count_refusal(LIVE_TURN_PAUSE_UNTIMED);
+  }
+}
+
+/// The turns of a taken-over volume's materialization on its owner shard, each a turn of its own:
+/// - from a live log, its payloads opened and applied a slice a turn ([`crate::live_ship::Rebuilding`], counted
+///   [`LIVE_REBUILD_SLICES`]), then laid out as an archive; from a placed seal, the successor's lineage key adopted and
+///   the archive taken as opened;
+/// - unless the volume is made here already (a retry after its publication was refused), the archive restored a slice a
+///   turn (`slates_archive::Planning`, then `Restoring` once [`verbs::restore_admitted`] admits it; counted
+///   [`MATERIALIZE_RESTORE_SLICES`]), the volume begun ([`verbs::begin_making`]) and its tree laid in a slice a turn
+///   ([`verbs::populate_making`], writes of at most a copy slice; counted [`MATERIALIZE_POPULATE_SLICES`]);
+/// - then the volume recorded and sealed ([`verbs::finish_making`]) and published before it is served (A-343), a live
+///   log's shipper made from the head the takeover adopted (A-329), so no client meets it unpublished.
+///
+/// Before, a live volume's restore and making were each one turn (0.14 to 0.32 s at 300 MB on a Mac Studio), and a
+/// plain volume's restore and making were one turn behind a call whose deadline was a period (the 1.99 GB kernel base
+/// volume, seconds of one poll, past the watchdog's spin window).
+async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static str> {
+  let MakeTaken {
     object,
     id,
     head,
@@ -5956,6 +5990,113 @@ async fn make_live_in_turns(
     region,
     past_tolerance,
   } = making;
+  let (archive, adopted) = match source {
+    Source::Live(fetched) => {
+      let (archive, adopted) = rebuild_in_turns(object, id, &catalog, fetched).await?;
+      (Some(archive), Some(adopted))
+    }
+    Source::Archive {
+      archive,
+      lineage,
+      naming,
+    } => {
+      futures::yield_now().await;
+      let opened = making_turn(object, |s| {
+        // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c);
+        // an envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node
+        // (it acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
+        if let Some(lineage) = lineage
+          && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
+        {
+          s.count(LINEAGE_UNADOPTED, 1);
+        }
+        // A sealed archive is opened before this task begins ([`open_in_turns`]); what arrives here is a plain one, or
+        // none for a contentless volume.
+        match archive {
+          Some(archive) => opened_archive(archive).map(Some).ok_or_else(|| {
+            s.count(ENVELOPE_UNOPENED, 1);
+            ENVELOPE_UNOPENED
+          }),
+          None => Ok(None),
+        }
+      })??;
+      (opened, None)
+    }
+  };
+  let from_live_log = adopted.is_some();
+  futures::yield_now().await;
+  // A volume made here already (a retry after its publication was refused) restores and lays nothing.
+  let made = making_turn(object, |s| {
+    past_the_pressure_hold(s, |s| verbs::made_already(s, id, &catalog))
+      .map_err(|refusal| materialize_refusal_counter(&refusal))
+  })??;
+  // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
+  let (epoch, sequence) = (placed.epoch.0, placed.sequence);
+  let taken_over = || verbs::TakenOver {
+    head: &head,
+    catalog: &catalog,
+    catalog_sequence,
+    sequence,
+    takeover: slates_db::catalog::TakeoverRecord {
+      epoch,
+      head_sequence: sequence,
+      from_live_log,
+      past_tolerance,
+    },
+  };
+  if !made {
+    let restored = match archive.as_ref() {
+      Some(archive) => Some(restore_in_turns(object, &catalog, archive).await?),
+      None => None,
+    };
+    drop(archive);
+    futures::yield_now().await;
+    making_turn(object, |s| {
+      let taken = taken_over();
+      past_the_pressure_hold(s, |s| verbs::begin_making(s, id, &taken))
+        .map_err(|refusal| materialize_refusal_counter(&refusal))
+    })??;
+    if let Some(restored) = restored.as_ref() {
+      populate_in_turns(object, id, restored).await?;
+    }
+  }
+  futures::yield_now().await;
+  making_turn(object, |s| {
+    if !made {
+      let taken = taken_over();
+      past_the_pressure_hold(s, |s| verbs::finish_making(s, id, &taken, region))
+        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+    }
+    // A live log's successor goes on from the head it adopted (A-329), past every position durable before it.
+    if let Some(adopted) = adopted {
+      crate::live_ship::adopt_head(s, id, adopted);
+    }
+    // The owner shard now owns the head's and the catalog's placements: its record plane writes the object's next
+    // records at the promotion epoch and ships only to holders still missing these.
+    s.placed_heads.insert(object, placed);
+    s.placed_heads.insert(object.catalog(), catalog_placed);
+    // Published before it is served (A-343): its image is what a restart rebuilds it from, and a live log's shipper is
+    // made from the adopted head at once. A live volume is counted taken over only then, in this turn: a test that
+    // restarts the successor once the count rises found a volume made and published.
+    published_before_served(s)?;
+    if from_live_log {
+      crate::live_ship::taken_over(s);
+    }
+    Ok(())
+  })?
+}
+
+/// A live log's rebuild on its owner shard, its payloads opened and applied a slice a turn, each held to the turn's
+/// share of the seal quantum (`config::wrap_slice_ns`, a payload at least: [`crate::live_ship::Rebuilding`]), counted
+/// [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn. The archive, and the head the
+/// takeover adopted. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68
+/// to 1.08 s to rebuild 152 to 306 MB of log, past the watchdog's spin window, which ended the successor's process.
+async fn rebuild_in_turns(
+  object: ObjectId,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(Archive, Head), &'static str> {
   let crate::live_ship::Fetched {
     head: adopted,
     log,
@@ -5971,89 +6112,130 @@ async fn make_live_in_turns(
   let mut rebuilding = begun?;
   let _ = state::with_state_counted(|s| s.count(LIVE_REBUILDS_BEGUN, 1));
   loop {
-    let slice_ns = state::with_state(|s| crate::config::wrap_slice_ns(seal_quantum_ns(s)))
-      .ok_or(MATERIALIZE_UNANSWERED)?;
+    let slice_ns = state::with_state(|s| making_slice_ns(s)).ok_or(MATERIALIZE_UNANSWERED)?;
     let began = futures::now_ns();
     let before = rebuilding.applied();
     let advanced = rebuilding.advance(|| futures::now_ns().saturating_sub(began) >= slice_ns);
     let applied = rebuilding.applied().saturating_sub(before);
-    let done = state::with_state(|s| {
+    let done = making_turn(object, |s| {
       s.count(LIVE_REBUILD_SLICES, 1);
       s.count(
         LIVE_REBUILD_PAYLOADS,
         u64::try_from(applied).unwrap_or(u64::MAX),
       );
-      turned(s, object);
       advanced.map_err(|why| crate::live_ship::rebuild_refused(s, why))
-    })
-    .ok_or(MATERIALIZE_UNANSWERED)??;
+    })??;
     if done {
       break;
     }
     futures::yield_now().await;
-    // A test's wait between the turns (`Daemon::inject_live_turn_pause`); nothing in production.
-    if let Some(pause_ns) = state::with_state(|s| s.live_turn_pause_ns).flatten()
-      && futures::sleep(pause_ns).await.is_err()
-    {
-      count_refusal(LIVE_TURN_PAUSE_UNTIMED);
-    }
+    injected_turn_pause().await;
   }
   futures::yield_now().await;
   let archive = rebuilding.archive();
-  let archive = state::with_state(|s| {
-    turned(s, object);
+  let archive = making_turn(object, |s| {
     archive.map_err(|why| crate::live_ship::rebuild_refused(s, why))
-  })
-  .ok_or(MATERIALIZE_UNANSWERED)??;
-  futures::yield_now().await;
-  // The archive restored in a turn of its own: a volume made here already (a retry after its publication was refused)
-  // restores nothing.
-  let restored = state::with_state(|s| {
-    turned(s, object);
-    past_the_pressure_hold(s, |s| match verbs::made_already(s, id, &catalog)? {
-      true => Ok(None),
-      false => verbs::restore_taken_over(s, &catalog, Some(&archive)),
-    })
-    .map_err(|refusal| materialize_refusal_counter(&refusal))
-  })
-  .ok_or(MATERIALIZE_UNANSWERED)??;
-  drop(archive);
-  futures::yield_now().await;
-  state::with_state(|s| {
-    turned(s, object);
-    let sequence = placed.sequence;
-    // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
-    let taken = verbs::TakenOver {
-      head: &head,
-      catalog: &catalog,
-      catalog_sequence,
-      sequence,
-      takeover: slates_db::catalog::TakeoverRecord {
-        epoch: placed.epoch.0,
-        head_sequence: sequence,
-        from_live_log: true,
-        past_tolerance,
-      },
-    };
-    past_the_pressure_hold(s, |s| {
-      verbs::materialize_taken_over_restored(s, id, &taken, region, restored.as_ref())
-    })
-    .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-    // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
-    crate::live_ship::adopt_head(s, id, adopted);
-    s.placed_heads.insert(object, placed);
-    s.placed_heads.insert(object.catalog(), catalog_placed);
-    // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
-    // from the adopted head at once. Counted taken over only then, in this turn, as the one-turn materialization counted
-    // it: a test that restarts the successor once the count rises found a volume made and published.
-    published_before_served(s)?;
-    crate::live_ship::taken_over(s);
-    Ok(())
-  })
-  .ok_or(MATERIALIZE_UNANSWERED)?
+  })??;
+  Ok((archive, adopted))
 }
 
-/// Counter: one owner-shard turn's slice of a live volume's rebuild from its log ([`make_live_in_turns`], g251).
+/// A taken-over volume's archive restored on its owner shard a slice a turn (A-391): its tree planned
+/// (`slates_archive::Planning`), the restore admitted against what the volume may hold and the shard can admit once its
+/// need is known ([`verbs::restore_admitted`]), then restored (`slates_archive::Restoring`), each turn held to the
+/// turn's share of the seal quantum ([`making_slice_ns`], a piece at least) and counted
+/// [`MATERIALIZE_RESTORE_SLICES`]. A restore over its budget is refused `BudgetExceeded` naming the shard's room, a
+/// malformed archive `BadRequest` ([`verbs::restore_refused`]).
+async fn restore_in_turns(
+  object: ObjectId,
+  catalog: &crate::catalog::CatalogValue,
+  archive: &Archive,
+) -> Result<slates_archive::Restored, &'static str> {
+  let mut planning = slates_archive::Planning::new(archive);
+  let planned = loop {
+    let slice_ns = state::with_state(|s| making_slice_ns(s)).ok_or(MATERIALIZE_UNANSWERED)?;
+    let began = futures::now_ns();
+    let stepped = planning.step(|| futures::now_ns().saturating_sub(began) >= slice_ns);
+    let planned = making_turn(object, |s| {
+      s.count(MATERIALIZE_RESTORE_SLICES, 1);
+      stepped.map_err(|e| materialize_refusal_counter(&verbs::restore_refused(e, 0)))
+    })??;
+    if let Some(planned) = planned {
+      break planned;
+    }
+    futures::yield_now().await;
+  };
+  futures::yield_now().await;
+  let mut restoring = making_turn(object, |s| {
+    let (budget, room) =
+      past_the_pressure_hold(s, |s| verbs::restore_admitted(s, catalog, planned.needed()));
+    planned
+      .restoring(budget)
+      .map_err(|e| materialize_refusal_counter(&verbs::restore_refused(e, room)))
+  })??;
+  loop {
+    futures::yield_now().await;
+    let slice_ns = state::with_state(|s| making_slice_ns(s)).ok_or(MATERIALIZE_UNANSWERED)?;
+    let began = futures::now_ns();
+    let stepped = restoring.step(|| futures::now_ns().saturating_sub(began) >= slice_ns);
+    let restored = making_turn(object, |s| {
+      s.count(MATERIALIZE_RESTORE_SLICES, 1);
+      stepped.map_err(|e| materialize_refusal_counter(&verbs::restore_refused(e, 0)))
+    })??;
+    if let Some(restored) = restored {
+      return Ok(restored);
+    }
+  }
+}
+
+/// A taken-over volume's restored tree laid into the volume being made on its owner shard a slice a turn
+/// ([`verbs::populate_making`]): each turn held to the turn's share of the seal quantum ([`making_slice_ns`], a piece at
+/// least), each write to a copy slice of the same quantum (`DaemonConfig::copy_slice_bytes_within`, a page at least),
+/// counted [`MATERIALIZE_POPULATE_SLICES`].
+async fn populate_in_turns(
+  object: ObjectId,
+  id: DbVolumeId,
+  restored: &slates_archive::Restored,
+) -> Result<(), &'static str> {
+  let mut populating = verbs::Populating::new();
+  loop {
+    futures::yield_now().await;
+    let laid = making_turn(object, |s| {
+      let quantum_ns = seal_quantum_ns(s);
+      let slice_ns = crate::config::wrap_slice_ns(quantum_ns);
+      let slice_bytes = usize::try_from(s.config.copy_slice_bytes_within(quantum_ns))
+        .unwrap_or(usize::MAX)
+        .max(s.config.page);
+      s.count(MATERIALIZE_POPULATE_SLICES, 1);
+      let began = futures::now_ns();
+      past_the_pressure_hold(s, |s| {
+        verbs::populate_making(s, id, &mut populating, restored, slice_bytes, || {
+          futures::now_ns().saturating_sub(began) >= slice_ns
+        })
+      })
+      .map_err(|refusal| materialize_refusal_counter(&refusal))
+    })??;
+    if laid {
+      return Ok(());
+    }
+  }
+}
+
+/// Counter: a taken-over volume's materialization begun on its owner shard (g251): once a takeover, however many attempts
+/// its control shard makes while it runs.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_BEGUN: &str = "fleet.materialize.begun";
+/// Counter: one owner-shard turn's slice of a taken-over volume's restore, planned or restored (A-391, g251).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_RESTORE_SLICES: &str = "fleet.materialize.restore_slices";
+/// Counter: one owner-shard turn's slice of a taken-over volume's tree laid into it (g251).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_POPULATE_SLICES: &str = "fleet.materialize.populate_slices";
+/// Refusal: a materialization's turn found its record forgotten: the control shard gave the takeover up
+/// ([`give_up_taken_over`]), so the volume being made is discarded and the task stops.
+/// Format: a counter name in the daemon's status report.
+const MAKING_FORGOTTEN: &str = "fleet.materialize.forgotten";
+
+/// Counter: one owner-shard turn's slice of a live volume's rebuild from its log ([`rebuild_in_turns`], g251).
 /// Format: a counter name in the daemon's status report.
 const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
 /// Counter: the payloads a live volume's rebuild applied, in all its turns (g251): with [`LIVE_REBUILD_SLICES`], how
@@ -6092,7 +6274,7 @@ enum VolumeWait {
   Live,
   /// The owner shard refused the materialization, or did not answer within the period.
   Refused,
-  /// Its live materialization runs in turns on the owner shard ([`make_live`], g251).
+  /// Its materialization runs in turns on the owner shard ([`make_taken`], g251).
   Making,
 }
 
