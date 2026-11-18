@@ -4,16 +4,11 @@
 //! scratch volume.
 
 use slates_mem::Handle;
-use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
-use slates_vfs::clock::StepClock;
 use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::ids::SnapshotId;
-use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
-use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
   Audit, Beginning, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingState,
@@ -22,14 +17,9 @@ use crate::engine::{
 use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
 use crate::manifest::{Action, Filter, Judged};
 use crate::source::Source;
+use crate::test_store::{config, store};
 use crate::verdict::{ConflictClass, Verdict};
 
-/// Shape: the test store's page.
-const PAGE: usize = 4096;
-/// Shape: pages of content the test store maps (4 MiB).
-const REGION_PAGES: usize = 1024;
-/// Shape: slots per slab in the test store.
-const CAP: usize = 1 << 14;
 /// Shape: a file's mode.
 const FILE_MODE: u32 = 0o100_644;
 /// Shape: a directory's mode.
@@ -44,36 +34,6 @@ const EXECUTABLE_MODE: u32 = 0o100_755;
 const PRIVATE_MODE: u32 = 0o100_600;
 /// Format: a mode's permission bits.
 const PERMISSIONS: u32 = 0o7777;
-
-fn store() -> Store {
-  let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
-    .unwrap();
-  Store::new(
-    &StoreConfig {
-      page: PAGE,
-      cache_line: 64,
-      max_dirs: CAP,
-      max_inodes: CAP,
-      max_chunks: CAP,
-      max_dir_blocks: CAP,
-      dir_cutover: 4,
-    },
-    arena,
-    0,
-  )
-}
-
-fn config(prefix: u16) -> VolumeConfig {
-  VolumeConfig {
-    prefix,
-    names: NameEquivalence::Exact,
-    quota: Quota::Bounded { limit: 1 << 24 },
-    journal_bytes: 1 << 16,
-    clock: Box::new(StepClock::new(1_000, 1)),
-  }
-}
 
 fn dir(vol: &Volume, store: &Store, path: &str) -> Handle<DirNode> {
   match vol.resolve(store, path).unwrap().child {
@@ -238,6 +198,16 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     &mut store,
     (&origin, captured, &mut clone),
   );
+  planned_the_change_since_the_capture(&presented);
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  landed_the_change_and_kept_the_rest(&host);
+  assert!(!clone.is_overlay(), "the clone took a base from the target");
+}
+
+/// The judge of [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]'s presentation: judged
+/// by content, the change since the capture in landing order (removals deepest first), every entry to apply.
+fn planned_the_change_since_the_capture(presented: &crate::engine::Presented) {
   assert_eq!(presented.manifest.basis, Judged::Content);
   let planned: Vec<(&str, &Action)> = presented
     .manifest
@@ -264,17 +234,22 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     "{:?}",
     presented.preliminary
   );
-  let report = result.unwrap();
-  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+}
+
+/// The judge of [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]'s disk: the rewritten
+/// and the made file hold the agent's bytes, the removed file and directory are gone, and the outsider's file and the
+/// untouched one are as they were.
+fn landed_the_change_and_kept_the_rest(host: &SimHost) {
+  let bytes = |path: &str| host.bytes(path);
   assert_eq!(
-    host.bytes("/target/src/edit.rs").as_deref(),
+    bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
   );
   assert_eq!(
-    host.bytes("/target/src/made.rs").as_deref(),
+    bytes("/target/src/made.rs").as_deref(),
     Some(&b"made by the agent"[..])
   );
-  assert_eq!(host.bytes("/target/gone.rs"), None);
+  assert_eq!(bytes("/target/gone.rs"), None);
   assert!(
     !host
       .paths()
@@ -284,14 +259,13 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     host.paths()
   );
   assert_eq!(
-    host.bytes("/target/src/outsider.rs").as_deref(),
+    bytes("/target/src/outsider.rs").as_deref(),
     Some(&b"an outsider's edit"[..])
   );
   assert_eq!(
-    host.bytes("/target/src/keep.rs").as_deref(),
+    bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
-  assert!(!clone.is_overlay(), "the clone took a base from the target");
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes
@@ -411,6 +385,10 @@ fn a_captured_clones_mode_change_alone_lands() {
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
+  assert!(
+    !host.holds_unsynced_metadata("/target/src/keep.rs"),
+    "synced by its batch's barrier (A-472)"
+  );
 }
 
 /// The mode the target's file holds, its permission bits alone.
@@ -519,5 +497,9 @@ fn a_captured_clones_replacement_already_on_the_disk_still_lands_its_mode() {
   assert_eq!(
     host.bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
+  );
+  assert!(
+    !host.holds_unsynced_metadata("/target/src/edit.rs"),
+    "synced by its batch's barrier (A-472)"
   );
 }
