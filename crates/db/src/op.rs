@@ -520,6 +520,14 @@ pub enum Op {
     /// The public keys, in SSH wire form, in the order set.
     keys: Vec<Vec<u8>>,
   },
+  /// A volume this partition lost to a takeover is taken over here again (A-362): its stale record goes, with its
+  /// snapshots and lineage, so the state the takeover adopted is recorded in its place by the `VolumeCreated` that
+  /// follows. Unlike `VolumeDestroyed` it leaves no tombstone (the volume lives on, its registers adopted here) and erases
+  /// no key (the adopted lineage is the volume's own). Its attachments are ended before it. Appended (2026-11-18).
+  VolumeRelinquished {
+    /// The volume.
+    id: VolumeId,
+  },
 }
 
 impl Op {
@@ -600,6 +608,7 @@ impl Op {
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
       Op::VolumeSignersSet { .. } => "volume_signers_set",
+      Op::VolumeRelinquished { .. } => "volume_relinquished",
     }
   }
 }

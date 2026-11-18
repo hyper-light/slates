@@ -84,6 +84,8 @@ mod member_task;
 mod merge_origin;
 pub mod merge_service;
 mod mirror;
+// A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
+mod readmission;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards

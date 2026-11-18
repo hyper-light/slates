@@ -418,6 +418,12 @@ impl Audit {
     }
   }
 
+  /// The sequence the next record takes, one past the last record's: a reader that notes it before a run knows the
+  /// run's records as those from it on (the server mirrors a granted run's records once, §4.15 "Audit").
+  pub fn next_seq(&self) -> u64 {
+    self.next_seq
+  }
+
   /// The records, oldest first.
   pub fn records(&self) -> Vec<&AuditRecord> {
     let (later, earlier) = self.records.split_at(self.head);

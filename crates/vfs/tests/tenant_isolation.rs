@@ -108,7 +108,8 @@ proptest! {
   /// attacker has a tiny quota and storms large writes that, after the first few fit, every one refuses
   /// `NoSpace` — running the quota-admission and the retention-settle/reopen paths repeatedly — while the victim
   /// (ample quota) churns small creates, overwrites and removals over the same shared arena. Each attacker write
-  /// is either a clean success or a clean `NoSpace`, never any other error (a corrupt failure would show here);
+  /// is either a clean success or a clean `NoSpace` (or `RetentionExceeded`, should its retention path refuse), never
+  /// any other error (a corrupt failure would show here);
   /// and after every step the victim reads back exactly its own history: the attacker's refusals, and the shard
   /// arena pressure they create, reached nothing of the victim's bytes.
   #[test]
@@ -143,8 +144,8 @@ proptest! {
       // error (a corrupt or crossed failure) fails the test here.
       let at = if attacker_reopens_window_zero { 0 } else { frontier };
       match attacker.write(&mut store, storm, at, &big) {
-        Ok(_) | Err(VfsError::NoSpace) => {}
-        other => prop_assert!(false, "attacker write at {} was neither Ok nor NoSpace: {:?}", at, other),
+        Ok(_) | Err(VfsError::NoSpace | VfsError::RetentionExceeded) => {}
+        other => prop_assert!(false, "attacker write at {} was neither Ok nor a clean refusal: {:?}", at, other),
       }
       if !attacker_reopens_window_zero {
         frontier = frontier.saturating_add(u64::try_from(big.len()).unwrap_or(u64::MAX));

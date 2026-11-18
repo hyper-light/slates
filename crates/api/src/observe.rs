@@ -1,12 +1,13 @@
 //! Observing the daemon's grants and its audit log, typed (§4.12 "The consumer contract", A-299; §4.13 "Grants",
-//! §4.14, §4.15 "Audit"). The wire names a grant's state, an audit record's kind and a landing's state in words from
-//! closed tables the daemon keeps (`crates/server/src/landing.rs`: `grant_state_name`, `audit_kind_name`,
-//! `landing_state_name`); this module reads each word into its enum in one place, and a word the table does not hold is
-//! a protocol fault — a client and a daemon of different builds — never a guess.
+//! §4.14, §4.15 "Audit"). The wire carries a grant's state, an audit record's kind and a landing's stage typed
+//! (`GrantSummary::grant_state`, `AuditEntry::audit_kind` and `stage`, appended 2026-11-18); this module reads those,
+//! never the words beside them, which are for people. Until then it read the words, and a word it did not know was a
+//! protocol fault. A record of a landing as a whole carries how the landing's signature was judged (A-321), typed as
+//! the wire carries it.
 
-use slates_ipc::protocol::{AuditEntry, GrantScope, GrantSummary, VolumeId};
+use slates_ipc::protocol::{self as wire, AuditEntry, GrantScope, GrantSummary, VolumeId};
 
-use crate::error::{Error, ProtocolFault};
+use crate::signed::Verification;
 
 /// A grant as the daemon lists it (§4.13).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +56,10 @@ pub struct AuditRecord {
   pub manifest: Option<[u8; 32]>,
   /// The landing's state when the record was made, for a finished landing.
   pub outcome: Option<LandingStage>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole — its
+  /// presentation's and a granted run's [`AuditKind::LandingPlanned`], its [`AuditKind::LandingFinished`]
+  /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record.
+  pub verification: Option<Verification>,
 }
 
 /// What an audit record records.
@@ -103,156 +108,138 @@ pub enum LandingStage {
 }
 
 /// The daemon's grant listing, typed.
-pub(crate) fn grant_of(grant: GrantSummary) -> Result<GrantRecord, Error> {
-  let state = match grant.state.as_str() {
-    "issued" => GrantState::Issued,
-    "consumed" => GrantState::Consumed,
-    "expired" => GrantState::Expired,
-    "revoked" => GrantState::Revoked,
-    _ => return Err(unknown("grant state")),
-  };
-  Ok(GrantRecord {
+pub(crate) fn grant_of(grant: GrantSummary) -> GrantRecord {
+  GrantRecord {
     id: grant.id,
     volume: grant.volume,
     target: grant.target,
     manifest: grant.manifest,
     scope: grant.scope,
-    state,
-  })
+    state: match grant.grant_state {
+      wire::GrantState::Issued => GrantState::Issued,
+      wire::GrantState::Consumed => GrantState::Consumed,
+      wire::GrantState::Expired => GrantState::Expired,
+      wire::GrantState::Revoked => GrantState::Revoked,
+    },
+  }
 }
 
 /// One audit record, typed.
-pub(crate) fn audit_of(entry: AuditEntry) -> Result<AuditRecord, Error> {
-  let kind = match entry.kind.as_str() {
-    "grant_issued" => AuditKind::GrantIssued,
-    "grant_revoked" => AuditKind::GrantRevoked,
-    "landing_planned" => AuditKind::LandingPlanned,
-    "landing_validated" => AuditKind::LandingValidated,
-    "entry_written" => AuditKind::EntryWritten,
-    "entry_refused" => AuditKind::EntryRefused,
-    "landing_finished" => AuditKind::LandingFinished,
-    _ => return Err(unknown("audit kind")),
-  };
-  let outcome = entry.outcome.as_deref().map(stage_of).transpose()?;
-  Ok(AuditRecord {
+pub(crate) fn audit_of(entry: AuditEntry) -> AuditRecord {
+  AuditRecord {
     seq: entry.seq,
     at_ns: entry.at_ns,
-    kind,
+    kind: match entry.audit_kind {
+      wire::AuditKind::GrantIssued => AuditKind::GrantIssued,
+      wire::AuditKind::GrantRevoked => AuditKind::GrantRevoked,
+      wire::AuditKind::LandingPlanned => AuditKind::LandingPlanned,
+      wire::AuditKind::LandingValidated => AuditKind::LandingValidated,
+      wire::AuditKind::EntryWritten => AuditKind::EntryWritten,
+      wire::AuditKind::EntryRefused => AuditKind::EntryRefused,
+      wire::AuditKind::LandingFinished => AuditKind::LandingFinished,
+    },
     grant: entry.grant,
     landing: entry.landing,
     manifest: entry.manifest,
-    outcome,
-  })
+    outcome: entry.stage.map(stage_of),
+    verification: entry.verification.map(Verification::of_wire),
+  }
 }
 
-/// A landing's stage by the name the daemon writes.
-fn stage_of(name: &str) -> Result<LandingStage, Error> {
-  Ok(match name {
-    "planning" => LandingStage::Planning,
-    "awaiting_grant" => LandingStage::AwaitingGrant,
-    "validating" => LandingStage::Validating,
-    "writing" => LandingStage::Writing,
-    "syncing" => LandingStage::Syncing,
-    "advancing" => LandingStage::Advancing,
-    "done" => LandingStage::Done,
-    "partial" => LandingStage::Partial,
-    "refused" => LandingStage::Refused,
-    "aborted" => LandingStage::Aborted,
-    _ => return Err(unknown("landing state")),
-  })
-}
-
-/// A word the daemon's tables do not hold.
-fn unknown(field: &'static str) -> Error {
-  Error::Protocol(ProtocolFault::UnknownName { field })
+/// A landing's stage, typed.
+fn stage_of(stage: wire::LandingStage) -> LandingStage {
+  match stage {
+    wire::LandingStage::Planning => LandingStage::Planning,
+    wire::LandingStage::AwaitingGrant => LandingStage::AwaitingGrant,
+    wire::LandingStage::Validating => LandingStage::Validating,
+    wire::LandingStage::Writing => LandingStage::Writing,
+    wire::LandingStage::Syncing => LandingStage::Syncing,
+    wire::LandingStage::Advancing => LandingStage::Advancing,
+    wire::LandingStage::Done => LandingStage::Done,
+    wire::LandingStage::Partial => LandingStage::Partial,
+    wire::LandingStage::Refused => LandingStage::Refused,
+    wire::LandingStage::Aborted => LandingStage::Aborted,
+  }
 }
 
 #[cfg(test)]
 mod tests {
-  use slates_ipc::protocol::{AuditEntry, GrantScope, GrantSummary, VolumeId};
+  use slates_ipc::protocol::{self as wire, AuditEntry, GrantScope, GrantSummary, VolumeId};
 
   use super::{AuditKind, GrantState, LandingStage, audit_of, grant_of};
-  use crate::error::{Error, ProtocolFault};
 
-  /// A-299: do type a grant listing's every state word and one the daemon never writes; expect each state, and the
-  /// stranger a protocol fault, never a guess.
+  /// A-299: do type a grant listing of each typed state, its word for people set to a stranger; expect each state from
+  /// the typed field, the word never read (2026-11-18: until then a stranger word was a protocol fault).
   #[test]
-  fn each_grant_state_word_is_typed_and_a_stranger_refused() {
-    let grant = |state: &str| GrantSummary {
+  fn each_grant_state_is_read_from_its_typed_field() {
+    let grant = |state: wire::GrantState| GrantSummary {
       id: 1,
       volume: VolumeId { bytes: [1; 16] },
       target: "/t".to_owned(),
       manifest: [2; 32],
       scope: GrantScope::Once,
-      state: state.to_owned(),
+      state: "a word for people".to_owned(),
+      grant_state: state,
     };
-    for (word, state) in [
-      ("issued", GrantState::Issued),
-      ("consumed", GrantState::Consumed),
-      ("expired", GrantState::Expired),
-      ("revoked", GrantState::Revoked),
+    for (typed, state) in [
+      (wire::GrantState::Issued, GrantState::Issued),
+      (wire::GrantState::Consumed, GrantState::Consumed),
+      (wire::GrantState::Expired, GrantState::Expired),
+      (wire::GrantState::Revoked, GrantState::Revoked),
     ] {
-      assert_eq!(grant_of(grant(word)).map(|record| record.state), Ok(state));
+      assert_eq!(grant_of(grant(typed)).state, state);
     }
-    assert_eq!(
-      grant_of(grant("spent")),
-      Err(Error::Protocol(ProtocolFault::UnknownName {
-        field: "grant state"
-      }))
-    );
   }
 
-  /// A-299: do type audit records of each kind with and without an outcome, and one whose outcome names no stage;
-  /// expect each kind and stage, and the stranger a protocol fault.
+  /// A-299: do type audit records of each typed kind with and without a stage, their words for people set to
+  /// strangers; expect each kind and stage from the typed fields.
   #[test]
-  fn each_audit_word_is_typed_and_a_stranger_refused() {
-    let entry = |kind: &str, outcome: Option<&str>| AuditEntry {
+  fn each_audit_kind_and_stage_is_read_from_its_typed_field() {
+    let entry = |kind: wire::AuditKind, stage: Option<wire::LandingStage>| AuditEntry {
       seq: 3,
       at_ns: 4,
-      kind: kind.to_owned(),
+      kind: "a word for people".to_owned(),
       grant: None,
       landing: Some(5),
       manifest: None,
-      outcome: outcome.map(str::to_owned),
+      outcome: stage.map(|_| "a word for people".to_owned()),
+      audit_kind: kind,
+      stage,
+      verification: None,
     };
-    for (word, kind) in [
-      ("grant_issued", AuditKind::GrantIssued),
-      ("grant_revoked", AuditKind::GrantRevoked),
-      ("landing_planned", AuditKind::LandingPlanned),
-      ("landing_validated", AuditKind::LandingValidated),
-      ("entry_written", AuditKind::EntryWritten),
-      ("entry_refused", AuditKind::EntryRefused),
-      ("landing_finished", AuditKind::LandingFinished),
+    for (typed, kind) in [
+      (wire::AuditKind::GrantIssued, AuditKind::GrantIssued),
+      (wire::AuditKind::GrantRevoked, AuditKind::GrantRevoked),
+      (wire::AuditKind::LandingPlanned, AuditKind::LandingPlanned),
+      (
+        wire::AuditKind::LandingValidated,
+        AuditKind::LandingValidated,
+      ),
+      (wire::AuditKind::EntryWritten, AuditKind::EntryWritten),
+      (wire::AuditKind::EntryRefused, AuditKind::EntryRefused),
+      (wire::AuditKind::LandingFinished, AuditKind::LandingFinished),
+    ] {
+      assert_eq!(audit_of(entry(typed, None)).kind, kind);
+    }
+    for (typed, stage) in [
+      (wire::LandingStage::Planning, LandingStage::Planning),
+      (
+        wire::LandingStage::AwaitingGrant,
+        LandingStage::AwaitingGrant,
+      ),
+      (wire::LandingStage::Validating, LandingStage::Validating),
+      (wire::LandingStage::Writing, LandingStage::Writing),
+      (wire::LandingStage::Syncing, LandingStage::Syncing),
+      (wire::LandingStage::Advancing, LandingStage::Advancing),
+      (wire::LandingStage::Done, LandingStage::Done),
+      (wire::LandingStage::Partial, LandingStage::Partial),
+      (wire::LandingStage::Refused, LandingStage::Refused),
+      (wire::LandingStage::Aborted, LandingStage::Aborted),
     ] {
       assert_eq!(
-        audit_of(entry(word, None)).map(|record| record.kind),
-        Ok(kind)
+        audit_of(entry(wire::AuditKind::LandingFinished, Some(typed))).outcome,
+        Some(stage)
       );
     }
-    for (word, stage) in [
-      ("planning", LandingStage::Planning),
-      ("awaiting_grant", LandingStage::AwaitingGrant),
-      ("validating", LandingStage::Validating),
-      ("writing", LandingStage::Writing),
-      ("syncing", LandingStage::Syncing),
-      ("advancing", LandingStage::Advancing),
-      ("done", LandingStage::Done),
-      ("partial", LandingStage::Partial),
-      ("refused", LandingStage::Refused),
-      ("aborted", LandingStage::Aborted),
-    ] {
-      assert_eq!(
-        audit_of(entry("landing_finished", Some(word))).map(|record| record.outcome),
-        Ok(Some(stage))
-      );
-    }
-    assert!(matches!(
-      audit_of(entry("landing_finished", Some("landed"))),
-      Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
-    ));
-    assert!(matches!(
-      audit_of(entry("grant_minted", None)),
-      Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
-    ));
   }
 }

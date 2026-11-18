@@ -50,12 +50,21 @@ pub(crate) async fn pace(ns: u64) {
 /// A perpetual loop's sleep refused ([`pace`]): a tripwire, never an expected count.
 const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 
-/// Shape: the heartbeat cadence the control shard beats the anchor's word at (§4.14
-/// `daemon.alive`): a tenth of the anchor's liveness budget, so nine beats fit inside it.
-pub const HEARTBEAT_NS: u64 = 100_000_000;
-/// Shape: the anchor's liveness budget for `daemon.alive` (a second; the supervisor's
-/// input until the CLI takes the operator's value).
-pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
+/// Derived: the heartbeat, the fleet's coordinator period and the cadence the watchdog looks at its shards in (§4.14
+/// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
+/// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
+/// beats fit inside a window. 100 ms.
+pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+/// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
+/// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
+/// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
+/// waiting less risks paying `T` for a stall shorter than `T`, and waiting as long as the recovery costs is the
+/// deterministic online choice within twice the best (rent or buy [A: Karlin, Manasse, Rudolph & Sleator, "Competitive
+/// snoopy caching", Algorithmica 1988], the rule the wake probe's spin-then-park already follows). A second. Not
+/// derived from the failover SLO: the fleet's detection and confirmation timers are multiples of this window's
+/// heartbeat, so a failover SLO derived from them (Ada's rule, 2026-11-18) cannot also set it. The machine's measured
+/// scheduling delay is its floor, checked and logged at boot (`config::liveness_window`).
+pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
 /// How long an out-of-band observation ([`Daemon::observation`]) has, from its submission through its
 /// admission to its answer, before it ends with a deadline naming the stage it reached
 /// ([`crate::observe::ObserveError::Deadline`]). A live shard answers within a few coordinator periods
@@ -2816,9 +2825,10 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
-  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
-  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// Test support: the quantum a seal's turns are cut by on every shard (the record period's seal walk and envelope wrap,
+  /// `fleet::seal_walk_slice`, and a takeover's envelope open, `fleet::open_slice`), in place of the shard's own step
+  /// quantum; `None` gives the shard its own back. Zero ends each turn after one volume or one chunk, so a test sees the
+  /// slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
   /// once installed, else the typed refusal.
   pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -3226,7 +3236,7 @@ impl Daemon {
       // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
       // too, and their recovery would read as this one's.
       s.dead_session_dropped_at.clear();
-      s.dead_session_recovered_ns = None;
+      s.dead_session_recovered = None;
     })
   }
 
@@ -3240,6 +3250,16 @@ impl Daemon {
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       s.injected_forward_silence = volume;
+    })
+  }
+
+  /// Test support: while `withheld` is set, this node sends no confirmation of a takeover share it has finished
+  /// (counted `fleet.takeover.confirmation_withheld_by_fault`), as a confirmation late to commit leaves its share owed
+  /// while the other survivors confirm theirs, each confirmation a new configuration (A-353). Lifting it lets the next
+  /// period confirm. Delivered like [`Self::inject_takeover_silence`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_confirmation_withheld(&self, withheld: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_confirmation_withheld = withheld;
     })
   }
 
@@ -3528,6 +3548,19 @@ impl Daemon {
       .watchdog
       .as_ref()
       .map(|watchdog| watchdog.turns().read())
+  }
+
+  /// Test support: puts a memory-pressure level in place of the host's reading the watchdog takes at its looks (A-336,
+  /// [`crate::watchdog::MemoryStallSource`]): `Some(true)` the host reports a memory stall, `Some(false)` none, `None`
+  /// the host's own reading again. In production the watchdog reads the host (`slates_machine::memory_stall`); this
+  /// drives that very reading, as [`Daemon::inject_pressure_hold`] drives admission's, so a test proves the rule without
+  /// a host short of memory. `false` once the daemon has stopped its watchdog.
+  pub fn inject_memory_stall(&self, pressed: Option<bool>) -> bool {
+    self
+      .watchdog
+      .as_ref()
+      .map(|watchdog| watchdog.memory_stall().inject(pressed))
+      .is_some()
   }
 
   /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
@@ -4233,6 +4266,8 @@ async fn init_shard(
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
     unrecovered: std::collections::BTreeMap::new(),
+    yielded: std::collections::BTreeSet::new(),
+    relinquished: Vec::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
@@ -4342,10 +4377,11 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
+    injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
-    dead_session_recovered_ns: None,
+    dead_session_recovered: None,
     injected_pair_withhold: false,
     injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),
@@ -8400,6 +8436,205 @@ mod tests {
     assert!(!held, "the stale copy is gone");
   }
 
+  /// The content hazard's fixture (A-335; docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-
+  /// fetched.md): in a seven-member `f = 1` region whose every neighbourhood is the whole region, the audit node the
+  /// council's sole voter, the audit node holds a second member's volume head naming the member and itself as the
+  /// content's holders (`f + 1` of them, as a seal places it), and that content whole; the volume's successor in the
+  /// member's takeover is a third member that places it away from the audit node and holds none of the content. Returns
+  /// the member, the volume and the content's manifest identity.
+  fn hold_a_head_naming_this_holder(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    slates_db::register::HostId,
+    slates_db::register::ObjectId,
+    [u8; 32],
+  ) {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record};
+    let local = state.fleet.host();
+    let departed = HostId(local.0 ^ 1);
+    let mut members = vec![local, departed];
+    members.extend((2..7).map(|key| HostId(local.0 ^ key)));
+    // Shape: a neighbourhood of every member, so the audit node survives the departed one and is asked in its round.
+    let scatter = 7;
+    state.council = RegionalCouncil::new(
+      local,
+      members,
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    install_council(state);
+    let mut retired = state.council.configuration().clone();
+    retired.take_over(departed, scatter).unwrap();
+    let volume = (0..1024u64)
+      .map(|index| ObjectId::new(departed, index))
+      .find(|object| {
+        retired
+          .successor(departed, *object)
+          .is_some_and(|successor| {
+            successor != local
+              && retired
+                .configuration_for(successor)
+                .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+          })
+      })
+      .expect(
+        "some volume of the departed member is placed by its successor away from this holder",
+      );
+    let archive =
+      crate::merge_service::MergeShardState::inputs_archive(b"the volume's sealed bytes", 0, 4096);
+    let manifest = archive.manifest_identity();
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: vec![departed.0, local.0],
+      sealing: None,
+    };
+    let generation = state.fleet.configuration().version;
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: departed,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: departed,
+        object: volume,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: head.to_record_bytes(),
+      })
+      .unwrap();
+    state.holder_records.insert(volume, acceptor);
+    state.fleet.track_object_owner(volume, departed);
+    state
+      .held_content
+      .hold(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        volume,
+        slates_cluster::content::Placed { sequence: 0 },
+        archive,
+      )
+      .expect("the audit shard holds the volume's content");
+    (departed, volume, manifest)
+  }
+
+  /// A-335, red before it (the bug record named in [`hold_a_head_naming_this_holder`]): a holder outside the
+  /// successor's placement keeps the copy whose content its head names it for, when the successor confirms and when the
+  /// takeover completes. Do: hold such a head and its content (the fixture); take the departed member over and install;
+  /// have the volume's successor alone confirm its share and install; then every other survivor, so the takeover
+  /// completes, and install again. Expect the head and the content held after both installs, each counted
+  /// `fleet.takeover.kept_holding_content`, and nothing reclaimed. A successor confirms once it adopted the head
+  /// register, before its materialization has fetched the content, and it fetches from the head's holders alone
+  /// (`fleet::fetch_into_hold`): before, this holder let the head and the content go at the confirmation, so with the
+  /// dead owner the head's only other holder the successor could fetch from nobody, and one failure lost the volume.
+  #[test]
+  fn a_holder_outside_the_successors_placement_keeps_the_content_its_head_names() {
+    let (after_one, after_all, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state
+        .council
+        .configuration()
+        .successor(departed, volume)
+        .expect("the volume ranks a survivor");
+      assert_eq!(
+        state.fleet.object_owner(volume),
+        Some(successor),
+        "the copy moves to its successor at the takeover"
+      );
+      let holds = |state: &crate::state::ShardState| {
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest)
+      };
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_one = holds(state);
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        after_one,
+        holds(state),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(
+      after_one,
+      "the successor's confirmation leaves the content its head names, which the successor may still fetch"
+    );
+    assert!(after_all, "and so does the completed takeover");
+    assert_eq!(kept, 2, "each install counts the copy kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
+  /// A-335, red before it: a holder that installs a takeover only once it completed keeps the copy whose content its head
+  /// names it for. Do: hold such a head and its content (the fixture of
+  /// [`a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`]); take the departed member over and
+  /// have every survivor confirm before the audit node installs anything, then install. Expect the head and the content
+  /// held, counted `fleet.takeover.kept_holding_content`. The copy's line ends at the takeover's completion record, which
+  /// names the audit node among the survivors that confirmed; before, that let the copy go whole, the content the
+  /// adopted head names with it.
+  #[test]
+  fn a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes() {
+    let (held, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state.council.configuration().settled_for(departed, local),
+        "the takeover completed with the audit node among those that confirmed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(held, "the copy and the content its head names stay");
+    assert_eq!(kept, 1, "counted kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
   /// A-309: a holder the takeover never asked keeps its copy when the successor confirms, however the confirmation is
   /// read. Do: make the audit node hold a copy of a member's object although it is in none of that member's
   /// neighbourhoods (a copy an earlier neighbourhood of the member left there), in a six-member `f = 1` region whose
@@ -8417,22 +8652,27 @@ mod tests {
         Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
       };
       let local = state.fleet.host();
-      let others: Vec<HostId> = (100..104).map(|key| HostId(local.0 ^ key)).collect();
       // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
       let scatter = 3;
       let quorum = Quorum { f: 1 };
-      let members_with = |departed: HostId| {
+      // Shape: each candidate region's ids, the departed member's and its four others', apart from the next one's.
+      let stride = 8;
+      let members_with = |departed: HostId, others: &[HostId]| {
         let mut members = vec![local, departed];
         members.extend(others.iter().copied());
         members
       };
       // A member whose neighbourhood leaves the audit node out, and an object of it whose successor places it
-      // elsewhere too: rendezvous decides both, so search a few ids.
-      let (departed, object) = (1..64u64)
-        .map(|key| HostId(local.0 ^ key))
-        .find_map(|departed| {
+      // elsewhere too: rendezvous decides both, so search a few regions. Each candidate region has members of its own:
+      // with the other four fixed, whether a successor's neighbourhood holds the audit node is fixed by the audit
+      // node's random id alone, and about one id in ten was in all four (4 of 40 runs failed here, 2026-11-18).
+      let (departed, others, object) = (0..64u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let departed = HostId(local.0 ^ (base + 1));
+          let others: Vec<HostId> = (2..6).map(|key| HostId(local.0 ^ (base + key))).collect();
           let formed = RegionalConfiguration::formed(
-            members_with(departed),
+            members_with(departed, &others),
             quorum,
             std::collections::BTreeMap::new(),
             scatter,
@@ -8454,12 +8694,12 @@ mod tests {
                     .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
                 })
             })
-            .map(|object| (departed, object))
+            .map(|object| (departed, others.clone(), object))
         })
         .expect("a member whose neighbourhood and successor both leave the audit node out");
       state.council = RegionalCouncil::new(
         local,
-        members_with(departed),
+        members_with(departed, &others),
         vec![local],
         quorum,
         std::collections::BTreeMap::new(),

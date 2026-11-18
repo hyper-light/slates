@@ -119,6 +119,11 @@ pub struct LearnedMember {
   pub boot_nonce: u64,
   /// The member id at that boot_nonce — what membership, ownership and records name the peer by.
   pub host: slates_db::HostId,
+  /// The member id this anchor had before its last restart, `None` before any: an id this node saw end, whose RAM copies
+  /// (a live log's among them) are gone with its process. A live takeover past tolerance counts on it (A-345,
+  /// `live_ship::fetch`): a retired holder not seen restarted may return with its copy. One a anchor, bounded by the
+  /// roster as the map is.
+  pub previous: Option<slates_db::HostId>,
 }
 
 /// One peer's record session as the control shard keeps it (§4.8): the session itself, `None` while it is
@@ -218,6 +223,37 @@ pub struct RecordDial {
   pub stall: Option<slates_transport::endpoint::HandshakeStall>,
   /// Handshake calls made for this peer since boot: a dial that keeps calling is one that keeps failing.
   pub calls: u64,
+}
+
+/// An instant or a span on two clocks: the wall, and the control shard's coordinator periods
+/// ([`crate::merge_service::MergeShardState::coordinator_period`], one a period). The periods are the daemon's own
+/// time: a daemon kept off its CPUs runs fewer of them a wall second, so a span bounded in them is judged as A-228 judges
+/// a starved daemon, by what it did, never by a wall it was kept from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WallAndPeriods {
+  /// Nanoseconds on the runtime's clock.
+  pub ns: u64,
+  /// Coordinator periods.
+  pub periods: u64,
+}
+
+impl WallAndPeriods {
+  /// Now, on `state`'s shard: the runtime's clock, and the coordinator periods its state has counted (the control
+  /// shard's; another shard's holds the period of the record plane's latest pass over it).
+  pub(crate) fn now(state: &ShardState) -> WallAndPeriods {
+    WallAndPeriods {
+      ns: slates_rt::futures::now_ns(),
+      periods: state.merge.coordinator_period,
+    }
+  }
+
+  /// The span from `earlier` to this instant on each clock, never below zero.
+  pub(crate) fn since(self, earlier: WallAndPeriods) -> WallAndPeriods {
+    WallAndPeriods {
+      ns: self.ns.saturating_sub(earlier.ns),
+      periods: self.periods.saturating_sub(earlier.periods),
+    }
+  }
 }
 
 /// A mount capability's place in the shard's attachment registry (GAP-A9-4).
@@ -449,6 +485,18 @@ pub struct ShardState {
   /// one entry per catalog volume at most, made once at the shard's start.
   pub(crate) unrecovered:
     BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
+  /// The volumes this shard catalogued when its node's host epoch last advanced at a configuration it installed: the
+  /// host was retired while away and admitted again under its id, so each was taken over and its successor serves it
+  /// (A-334; §4.8 "Authority scope": the bumped epoch fences every object the host owned). A client's verb on one is
+  /// forwarded to the successor (`verbs::owned_by_another_host`), and its latest state is never served here
+  /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
+  /// yield (`crate::readmission`).
+  pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
+  /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
+  /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the reaper (`verbs::step_destroys`)
+  /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
+  /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
+  pub(crate) relinquished: Vec<VolumeSlot>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
@@ -795,8 +843,9 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
-  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum the record period's seal
-  /// walk turns are cut by in place of the shard's step quantum (`fleet::seal_walk_slice`).
+  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum a seal's turns are cut by in
+  /// place of the shard's step quantum: the record period's seal walk and envelope wrap (`fleet::seal_walk_slice`), and a
+  /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
@@ -889,6 +938,10 @@ pub struct ShardState {
   /// holder leaves unanswered while set, as a holder cut off from one successor alone is to it: the council never
   /// retires it, since every other member hears it (`Daemon::inject_takeover_silence`). Empty in production.
   pub injected_takeover_silence: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support (never reachable from the wire): while set, this node, as a successor, sends no confirmation of a
+  /// takeover share it has finished, as a confirmation late to commit leaves the share owed while other members confirm
+  /// theirs (`Daemon::inject_confirmation_withheld`, A-353). `false` in production.
+  pub injected_confirmation_withheld: bool,
   /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
   /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
   pub injected_deaf_session: Option<slates_db::HostId>,
@@ -896,12 +949,13 @@ pub struct ShardState {
   /// hold the one rescue that does not depend on a borrower (`Daemon::inject_discovery_hold`). `None` in production.
   pub injected_discovery_hold: Option<slates_db::HostId>,
   /// When each peer's record session was last dropped as failed or silent (a peer's reset, the transport's silence rule,
-  /// a discovery page that failed), until the forward lane's first reply on its replacement logs and counts the gap. One
-  /// entry a peer, so bounded by the roster.
-  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, u64>,
-  /// How long after the last silent session's drop the forward lane's first reply on its replacement came (logged too):
-  /// what a test or an operator reads to see the lane back on a live session. `None` until it has happened.
-  pub dead_session_recovered_ns: Option<u64>,
+  /// a discovery page that failed), on the wall and in coordinator periods, until the forward lane's first reply on its
+  /// replacement logs and counts the gap. One entry a peer, so bounded by the roster.
+  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, WallAndPeriods>,
+  /// How long after the last silent session's drop the forward lane's first reply on its replacement came, on the wall
+  /// and in the control shard's own periods (logged too): what a test or an operator reads to see the lane back on a live
+  /// session. `None` until it has happened.
+  pub dead_session_recovered: Option<WallAndPeriods>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
@@ -1488,6 +1542,10 @@ pub struct PendingVolume {
   /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
   /// adopted (a mirror's promotion).
   pub cohort_hosts: Vec<slates_db::register::HostId>,
+  /// Set when its head register was adopted past tolerance (A-309, A-332): the first cohort short of its recovery quorum,
+  /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
+  /// `None` within tolerance and for a volume no round adopted.
+  pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
 }
 
 impl PendingVolume {
@@ -1505,6 +1563,7 @@ impl PendingVolume {
       most_staged: None,
       round_seen: None,
       cohort_hosts,
+      registers_short: None,
     }
   }
 
