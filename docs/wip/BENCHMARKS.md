@@ -12924,3 +12924,50 @@ ended (its own process, so no end-of-run rows).
   reply a client waiting for good (A-232).
 - The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
   build: the carrier's cost does not show at this resolution.
+
+## A many-shard start under load, and where the starting thread's time goes at 407 shards (A-311, A-312; goal 254; 2026-11-18)
+
+**What it is.** Goal 254's owed runs: `a_start_whose_shards_sum_past_a_window_comes_up` (`crates/cli/tests/cli.rs`) under
+load on main before A-311 and A-312 (`f5b85d27b`) and after them (`7d760c4ea`), and the starting thread's CPU by phase
+at 407 shards, which the goal's notes held to be `connect_pairs` by arithmetic alone.
+
+**The test under load.** Release `cli` test binaries of each commit, each in its own target directory,
+`SLATES_TEST_CLI=1 <cli> a_start_whose_shards_sum_past_a_window_comes_up --exact --nocapture`, the arms run A B B A A B.
+The test measures one shard's share of a start and asks enough shards to sum past three liveness windows, so the shard
+count is the machine's:
+
+| where (2026-11-18 UTC) | load | shards asked | before `f5b85d27b` | after `7d760c4ea` |
+|---|---|---|---|---|
+| GitHub `ubuntu-latest`, 4 vCPU, two spinning loops a CPU (diag run 44279195223, 10:02) | 2.8-4.4 | 64-73 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `ubuntu-24.04-arm`, 4 vCPU, the same (09:58) | 2.4-13.6 | 48-140 | 3 of 3 pass | 3 of 3 pass |
+| Mac Studio adas-mac-studio.local-2, 32 cores, the box's own load (10:40) | 12.1-12.6 | 30-35 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `macos-latest`, 3 vCPU (10:39) | 6.3-13.1 | 756-1,959 | 0 of 3 (1,346-1,959 shards) | 1 of 3 (756 passed; 1,308 and 1,356 failed) |
+
+A shard's share of a start was 42 to 63 ms of CPU on the Linux runners, 86 to 101 ms on the Studio and 1.5 to 4.0 ms on
+`macos-latest`. Every `macos-latest` failure is the runtime's own limit, not a start kill: "start: runtime: too many
+shards: at most 1024 per process", the daemon's exit 4 and the anchor's crash loop, then "served false, the anchor's
+start kills []". The test does not cap the count it derives at the runtime's 1,024 shards a process.
+
+**The starting thread at 407 shards.** `slates daemon --quick --shards 407` of `7d760c4ea`, five starts on the Studio at
+load 17 to 47, with an uncommitted diagnostic that read the starting thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`)
+and the wall at slates-rt's phase boundaries. Milliseconds of that thread's CPU:
+
+| phase | starts 1 / 2 / 3 / 4 / 5 |
+|---|---|
+| registrations | 1.37 / 1.83 / 1.34 / 1.65 / 1.24 |
+| `connect_pairs` (407 × 406 rings) | 43.9 / 119.2 / 73.9 / 120.9 / 29.0 |
+| spawn | 4.6 / 6.5 / 5.5 / 4.7 / 4.2 |
+| readiness | 0.06 / 0.10 / 0.06 / 0.04 / 0.05 |
+
+Wall followed CPU within 2% in each phase. The start beat 166,873 times (S² + 3S + 3) before the watchdog took the beat
+over. Each start served 2.25 to 2.75 s after launch, by when the process had run 31.5 to 55.6 s of CPU, the 407 shard
+threads' own starts.
+
+**What it means.**
+- **`connect_pairs` is the starting thread's long unit:** 80 to 94% of its start, 29 to 121 ms here, inside the 1 s
+  window by an order of magnitude on this Mac.
+- **No run here reproduced the red these changes fixed** (B10's start kills at 367 to 407 shards on a 32-thread Linux
+  box at load 70): the machines that ran asked 30 to 140 shards, or more than the runtime allows. That run is still owed
+  on a 32-thread Linux box under load.
+- **The test is unrunnable where a shard starts cheaply:** past 1,024 shards it fails on the runtime's limit, both
+  before and after the change (reported to goal 254).
