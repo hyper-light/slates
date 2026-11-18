@@ -899,6 +899,22 @@
 >     to 0.92 s). The 2,410 to 2,456 `BudgetExceeded` per run were W2's.
 >   - Owed: the stall's diagnosis (which shard, which ring, which wake), raised to the supervisor.
 >
+> **The oracle at 100,000 clients (2026-11-17, g232).** The harness's oracle counted both of a conflict's bounds by
+> scanning every accepted submit, for every conflict: at the 10,000-client rung's 111,708 conflicts and 26,598 accepts
+> that is 5.9 × 10⁹ comparisons, and at 100,000 clients about 6 × 10¹¹ (an extrapolation at ten times of each), hours
+> of the harness's own CPU after its clients are done. It also tried every head between the bounds, and held three
+> whole copies of every touched file (before the level, the head and the replay: about 5 GB over the whole kernel's
+> 1.67 GB). The oracle is now its own file (`crates/client/examples/support/load_oracle.rs`): the bounds are two binary
+> searches over the accepted instants sorted once, a slot's writes are found by binary search, only the heads where one
+> of the submit's slots was written are tried (the expected set cannot change between them), the replay runs in place
+> over the bytes before the level, and each head file is read, compared and dropped in turn. Its test
+> (`crates/client/tests/load_oracle.rs`) keeps the serial oracle it replaced as the reference: over 512 generated levels
+> a serial green judged (some submits made wrong after), the two name the same failures in the same words and order;
+> handwritten cases hold each failure kind and a conflict that fits only past its lowest head. Red-checked: trying only
+> the lowest head failed both that case and the property; counting a reply at the send's own instant as before it
+> failed the property. The harness prints the oracle's own time (`oracle_ns\t<n>\tsubmits\t…\theads\t…`). Owed: the
+> time measured at a 10,000-client rung before and after.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
