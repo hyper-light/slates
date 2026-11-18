@@ -1,6 +1,7 @@
-//! The daemon's end of the anchor's hold (A-61, A-113, A-197): the channel over which it hands the supervising anchor a
-//! duplicate of each FUSE device it mounts, each NFS loopback connection it accepts and each writable direct map's copy
-//! it hands a client, and what the anchor handed back at this daemon's start. With it a daemon's death leaves its
+//! The daemon's end of the anchor's hold (A-61, A-113, A-197, A-365): the channel over which it hands the supervising
+//! anchor a duplicate of each FUSE device it mounts, each NFS loopback connection it accepts, each writable direct map's
+//! copy it hands a client and each Shards stream's DAX object it hands a device, and what the anchor handed back at this
+//! daemon's start. With it a daemon's death leaves its
 //! mounts, its kernel clients' connections and its clients' writable copies alive; the next daemon takes them back
 //! (`crate::fuse::adopt_held`, `crate::nfs::adopt_held`, `crate::direct_map::adopt_inherited`).
 //!
@@ -16,9 +17,7 @@
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 
-#[cfg(target_os = "linux")]
-use slates_anchor::held::ENV_COPIES;
-use slates_anchor::held::{self, ENV_CONNECTIONS, ENV_DEVICES, HoldRefusal, Outgoing};
+use slates_anchor::held::{self, ENV_CONNECTIONS, ENV_COPIES, ENV_DEVICES, HoldRefusal, Outgoing};
 
 /// The channel to the anchor, adopted once at start; unset without a supervising anchor.
 static CHANNEL: OnceLock<OwnedFd> = OnceLock::new();
@@ -43,9 +42,9 @@ pub(crate) struct HandedConnection {
   pub(crate) socket: OwnedFd,
 }
 
-/// A writable copy the anchor handed back (A-197): its id, the map id its client holds; the object; and its record, the
-/// daemon's own bytes (`crate::held_copy::CopyRecord`). Linux alone sends the anchor one.
-#[cfg(target_os = "linux")]
+/// A copy the anchor handed back: a writable direct map's (A-197, Linux), its id the map id its client holds; or a Shards
+/// stream's DAX object (A-365), its id its backing's handle. The object, and its record, the daemon's own bytes, which
+/// say which (`crate::held_copy::CopyRecord`, `crate::shards::DaxRecord`).
 #[derive(Debug)]
 pub(crate) struct HandedCopy {
   /// The copy's id.
@@ -63,8 +62,7 @@ pub(crate) struct Handed {
   pub(crate) devices: Vec<HandedDevice>,
   /// The held NFS connections.
   pub(crate) connections: Vec<HandedConnection>,
-  /// The held writable copies.
-  #[cfg(target_os = "linux")]
+  /// The held copies: writable direct maps' (Linux) and Shards streams' DAX objects.
   pub(crate) copies: Vec<HandedCopy>,
 }
 
@@ -126,14 +124,12 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
       );
     }
   }
-  #[cfg(target_os = "linux")]
   adopt_copies(&mut handed, taken);
   handed
 }
 
-/// Adopts the writable copies the anchor handed back in [`ENV_COPIES`] (A-197), none of whose descriptor numbers may be
+/// Adopts the copies the anchor handed back in [`ENV_COPIES`] (A-197, A-365), none of whose descriptor numbers may be
 /// one the devices' or connections' handoffs named (`taken`).
-#[cfg(target_os = "linux")]
 fn adopt_copies(handed: &mut Handed, mut taken: Vec<RawFd>) {
   taken.extend(handed.connections.iter().map(|connection| {
     use std::os::fd::AsRawFd;
@@ -199,8 +195,8 @@ pub(crate) fn release_connection(connection: u64) -> Option<Result<(), HoldRefus
   send(&Outgoing::ReleaseConnection { connection })
 }
 
-/// Asks the anchor to hold `object`, a writable direct map's copy, as `copy` with `record` (A-197).
-#[cfg(target_os = "linux")]
+/// Asks the anchor to hold `object`, a writable direct map's copy (A-197) or a Shards stream's DAX object (A-365), as
+/// `copy` with `record`.
 pub(crate) fn hold_copy(
   copy: u64,
   record: &[u8],
@@ -213,8 +209,7 @@ pub(crate) fn hold_copy(
   })
 }
 
-/// Tells the anchor `copy` was let go, so it closes its copy of it (A-197).
-#[cfg(target_os = "linux")]
+/// Tells the anchor `copy` was let go, so it closes its copy of it (A-197, A-365).
 pub(crate) fn release_copy(copy: u64) -> Option<Result<(), HoldRefusal>> {
   send(&Outgoing::ReleaseCopy { copy })
 }
