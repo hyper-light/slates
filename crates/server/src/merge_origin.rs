@@ -2542,4 +2542,85 @@ mod tests {
       "built from the checkpoint once, one version recomputed after it"
     );
   }
+
+  /// §4.16 "Apply on holders" (A-404): a holder that keeps a new checkpoint lets go of what it stands for. Do: give a
+  /// holder of a scratch green versions 0 and 1 (`f` created, its increment held) and a replica at version 1; serve it
+  /// version 2 naming version 1 committed, then version 3 naming version 2 committed; drop its replica, as a restart
+  /// does, and rebuild it. Expect both versions acknowledged; positions 0, 2 and 3 kept and 1 dropped; version 1's
+  /// inputs released and counted, version 2's and 3's held; and the replica rebuilt to version 3 at its identity from
+  /// the checkpoint, version 1's increment gone. Red without the compaction: position 1 and its inputs stay.
+  #[test]
+  fn a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for() {
+    use slates_db::register::Ack;
+    let one = creating("f", b"one", 1, 0);
+    let two = overwriting("f", b"two", 2, 1);
+    let three = creating("g", b"three", 3, 2);
+    let object = ObjectId([46; 16]);
+    let zero = identity_after(&[]);
+    let (after_two, after_three) = (
+      identity_after(&[&one, &two]),
+      identity_after(&[&one, &two, &three]),
+    );
+    let manifest = |increment: &Increment| {
+      InputsBuilder::whole(&increment.encode())
+        .finish(0, 4096)
+        .manifest_identity()
+    };
+    let manifests = [manifest(&one), manifest(&two), manifest(&three)];
+    let (acked, positions, held, released, rebuilt) = crate::daemon::audit_on_shard(move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &one);
+      let serve = |state: &mut ShardState, record: &Record, increment: &Increment| {
+        let reply = crate::fleet::serve_merge_shipment(
+          state,
+          host.0,
+          host.0,
+          &shipment_of(record, increment),
+        );
+        Ack::decode(&reply).is_ok_and(|ack| ack.sequence == record.sequence)
+      };
+      let second = with_committed(
+        merge_record(host, object, (2, 1), (Some(manifests[1]), after_two)),
+        1,
+      );
+      let third = with_committed(
+        merge_record(host, object, (3, 1), (Some(manifests[2]), after_three)),
+        2,
+      );
+      let acked = [serve(state, &second, &two), serve(state, &third, &three)];
+      let positions: Vec<u64> = state
+        .holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, ..)| sequence)
+            .collect()
+        })
+        .unwrap_or_default();
+      let held = manifests.map(|manifest| state.held_content.holds_manifest(object, &manifest));
+      let released = count_of(state, crate::merge_service::REPLICA_COMPACTED_INPUTS);
+      state.merge.replicas.remove(&object);
+      let mut seed = ReplicaSeed::rebuild(object, None, zero, 3);
+      let _ = seed_to_end(state, &mut seed);
+      (acked, positions, held, released, replica_at(state, object))
+    });
+    assert_eq!(acked, [true, true], "both versions acknowledged");
+    assert_eq!(
+      positions,
+      vec![0, 2, 3],
+      "version 0 and the checkpoint's own position on are kept, version 1 dropped"
+    );
+    assert_eq!(
+      held,
+      [false, true, true],
+      "version 1's inputs released, version 2's and 3's held"
+    );
+    assert_eq!(released, 1, "one held input released");
+    assert_eq!(
+      rebuilt,
+      Some((3, after_three)),
+      "the replica rebuilt to version 3 from the checkpoint"
+    );
+  }
 }
