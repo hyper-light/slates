@@ -22,11 +22,14 @@
 //! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are; each ask has a deadline
 //! (the lease bound), past which the verb answers `Overloaded`, unrecorded, and its retry runs it again.
 //!
-//! **Asks are batched.** A shard keeps one batch of asks out to each owner at a time ([`Outbox`]), carrying what gathered
-//! while the last was answered, at most a client region's credit, and a batch waits for room on the owner's channel
-//! rather than failing. One message per ask flooded the owner's and the clients' channels at 3,000 clients on one node:
-//! about half the asks were refused at once, their retries refused in turn, and replies to resumed verbs were dropped
-//! (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with nothing refused or dropped.
+//! **Asks are batched.** A shard keeps at most two batches of asks out to each owner at a time ([`Outbox`],
+//! [`BATCHES_OUT`]), each carrying what gathered while the others were out, at most a client region's credit, and a batch
+//! waits for room on the owner's channel rather than failing. One message per ask flooded the owner's and the clients'
+//! channels at 3,000 clients on one node: about half the asks were refused at once, their retries refused in turn, and
+//! replies to resumed verbs were dropped (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with
+//! nothing refused or dropped. One batch out at a time made an ask wait for the batch before it to come back before it
+//! left, about half of its way to the owner at 1,000 clients; with two, one waits at the owner while the other is served
+//! (A-388).
 //!
 //! **A submit's route first (A-298).** A version's merge record carries its submit's completion, and A-255 ships it only
 //! once the submitting work's catalog register, which names the green, is committed: after a takeover that register is
@@ -899,14 +902,27 @@ struct AskItem {
   back: ReplyRoute,
 }
 
-/// A shard's asks to one owner shard: those waiting, and whether a batch is out. One batch is out at a time, so a burst
-/// of asks rides a few messages, each carrying what gathered while the last was answered, and an owner's channel holds
-/// one message from each asking shard at most.
+/// A shard's asks to one owner shard: those waiting, and the batches out. At most [`BATCHES_OUT`] are out at a time, so a
+/// burst of asks rides a few messages, each carrying what gathered while the others were out, and an owner's channel
+/// holds at most that many messages from each asking shard (A-388).
 #[derive(Default)]
 pub(crate) struct Outbox {
   waiting: VecDeque<AskItem>,
-  sending: bool,
+  /// The batches out to the owner now, one a sender task ([`send_batches`]).
+  out: usize,
 }
+
+/// Shape: the batches a shard keeps out to one owner at once (A-388): two, so one waits at the owner while the one
+/// before it is served, and the owner never waits for an asking shard's round trip to have its next batch (double
+/// buffering). With one out, an ask made while a batch was out waited for that batch's whole round trip before it left:
+/// at 1,000 clients on a Mac Studio that wait was about half of an ask's way to the owner, at the median and in the
+/// slowest 1% (the g083 trace, BENCHMARKS 2026-11-18). The owner's channel holds at most two messages from each asking
+/// shard, the bound one batch at a time gave it doubled, never unbounded.
+const BATCHES_OUT: usize = 2;
+
+/// Format: the status counter of the most batch senders this shard has had out to one owner at once (A-388), the
+/// non-vacuity count of [`BATCHES_OUT`]: a shard that never had two out never tested the second.
+pub(crate) const BATCHES_OUT_PEAK: &str = "merge.work.batches_out_peak";
 
 /// The most asks one batch carries: one client region's request credit (`slots`), what one client may hold in flight,
 /// so the owner's step for a batch is about as long as the step it gives one client's requests.
@@ -916,8 +932,8 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
-/// Queues `need`'s ask to the green's owner, sending a batch if none is out. Returns whether it was queued; its answer
-/// resumes the queue.
+/// Queues `need`'s ask to the green's owner, sending a batch at once if fewer than [`BATCHES_OUT`] are out (A-388).
+/// Returns whether it was queued; its answer resumes the queue.
 fn start_ask(
   state: &mut ShardState,
   queue: DbVolumeId,
@@ -974,17 +990,36 @@ fn start_ask(
     principal: principal.clone(),
     back,
   });
-  let already = std::mem::replace(&mut outbox.sending, true);
+  // A batch out takes what waits when its answer is back; past the bound this ask waits for one.
+  let full = outbox.out >= BATCHES_OUT;
+  if !full {
+    outbox.out = outbox.out.saturating_add(1);
+  }
+  let out = outbox.out;
   state.count(ASKED_THE_OWNER, 1);
-  if already {
+  if full {
     return true;
   }
+  let peak = state.refusals.entry(BATCHES_OUT_PEAK).or_insert(0);
+  *peak = (*peak).max(u64::try_from(out).unwrap_or(u64::MAX));
   match slates_rt::futures::spawn(send_batches(here, owner)) {
     Ok(task) => {
       let _ = slates_rt::futures::detach(task);
       true
     }
     Err(_) => {
+      // This sender was not started: another out takes what waits when its answer is back.
+      let others = state
+        .work_home
+        .outboxes
+        .get_mut(&owner)
+        .map_or(0, |outbox| {
+          outbox.out = outbox.out.saturating_sub(1);
+          outbox.out
+        });
+      if others > 0 {
+        return true;
+      }
       // Nothing will send what waits: every ask in this outbox is answered unanswered now.
       let left = state
         .work_home
@@ -1009,7 +1044,8 @@ enum Outcome {
   Deferred,
 }
 
-/// Sends `here`'s outbox to `owner` a batch at a time until it is empty.
+/// Sends `here`'s outbox to `owner` a batch at a time until it is empty: one of the at most [`BATCHES_OUT`] senders out
+/// to `owner`, each awaiting its own batch's answers (A-388).
 async fn send_batches(here: u16, owner: u16) {
   loop {
     let batch = state::with_state(|s| take_batch(s, owner)).unwrap_or_default();
@@ -1056,7 +1092,8 @@ fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
   let take = outbox.waiting.len().min(bound);
   let items: Vec<AskItem> = outbox.waiting.drain(..take).collect();
   if items.is_empty() {
-    outbox.sending = false;
+    // This sender ends: its batch is no longer out.
+    outbox.out = outbox.out.saturating_sub(1);
     return items;
   }
   let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
