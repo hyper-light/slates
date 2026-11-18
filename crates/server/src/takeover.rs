@@ -462,8 +462,9 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
   }
 }
 
-/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), run on
-/// the control shard at each install, before the held acceptors' authority is reconciled to their owners:
+/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), before the held
+/// acceptors' authority is reconciled to their owners; an install's walk does it a copy a turn ([`resolve_held_object`],
+/// `fleet::install_on_copy`, A-398), and this whole pass is that walk's oracle in the daemon's unit tests:
 ///
 /// - an object whose owner a kept retirement names is moved to the successor its lineage ranks, and remembers
 ///   the retired host whose takeover it is recovered in (`departed_owners`, the lease gate's record);
@@ -474,6 +475,7 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
 ///   kept retirement shows the object's settled cohorts within tolerance, when it goes the same way (A-341);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
+#[cfg(test)]
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();

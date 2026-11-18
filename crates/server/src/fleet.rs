@@ -1910,6 +1910,7 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
 /// authority only advances. An install walks the copies a slice a turn instead ([`install_on_copy`], A-398); this whole
 /// pass is the walk's oracle in the daemon's unit tests.
+#[cfg(test)]
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
   let retired = retired_hosts(state);
@@ -1920,6 +1921,7 @@ pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
 }
 
 /// The hosts the council's configuration keeps a retirement of.
+#[cfg(test)]
 fn retired_hosts(state: &ShardState) -> std::collections::BTreeSet<HostId> {
   state
     .council

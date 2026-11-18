@@ -376,11 +376,17 @@
 > the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
 > `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
 > supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
-> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
-> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
-> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
-> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
-> well as by the walk (a design change to §4.8's install, with its model).
+> **Closed (the seal walk's other sibling, 2026-11-18, A-398):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raised every held record's fence and moved every held object of a retired owner
+> in one turn. It now installs the version in that turn and walks the copies a step quantum a turn
+> (`fleet::InstallWalk`; `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`). The worry written here,
+> that a record a stale owner sends to a copy not yet reached must still meet the new fence, was put to the model first
+> (`docs/wip/models/InstallInTurns.tla`, the model table): a copy not yet reached refuses a record of the new
+> generation by its own generation check, the node refuses one of any other generation at the door, and phase one's
+> page fences and re-authorizes each copy it lists itself; any one or two of those three may go and no stale record
+> commits, and only with all three gone does one. So no reconcile on access is needed for safety; the walk alone
+> decides when a copy follows. **Owed (measurement, the supervisor's):** the control shard's longest step at an install
+> with 10^4 and 10^5 held copies, before and after.
 
 > **A takeover round started over one epoch above its own adoptions, and the successor's writes were refused for good:
 > fixed for a newer configuration (2026-11-18, A-353, §4.8 "Promotion and takeover"; g230, caught live by g229).** Each
@@ -7990,6 +7996,11 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_eager.cfg` (A-398): 3 holders (symmetric), 3 versions (two takeovers), 1 record an owner, every copy moved at its node's install | no error (TypeOK, TotalOrder, Continuity, StaleNeverCommits, ReadSafety; 16 s) | 117,782 distinct | 32 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy.cfg` (A-398): the same, each copy reconciled at any later step (the walk in turns) | no error (34 s) | 192,633 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a

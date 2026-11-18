@@ -5908,6 +5908,22 @@ commit quorum. It drops its role on `StaleEpoch`. The historical `FencedRegister
 its modeled TotalOrder, Continuity, StaleNeverCommits and ReadSafety transitions; A-9 requires
 refinement and revalidation before those results can be applied to the corrected implementation.
 
+> **Status (2026-11-18, A-398: a holder takes an installed configuration a copy a turn).** "Every holder raises its
+> fence for that host to the new epoch" was done at the install, in the turn that installed the version, over every copy
+> the holder keeps: each fence raised to its owner's committed epoch, each object a kept retirement names moved to its
+> successor or let go as stale, each authority moved to the owner its route names. The install now takes the version in
+> that turn (the node's placement, so a record of another generation is refused at the door), and the copies follow by a
+> walk in key order, a step quantum of the control shard a turn (`fleet::InstallWalk`, `install_slice`, counted
+> `fleet.config.install_slices`, `installs_walked`), each turn a poll of its own; a newer install begins the walk again.
+> Model-checked first, `docs/wip/models/InstallInTurns.tla` (three holders, two takeovers, every interleaving of
+> installs, copy reconciles, promotions, writes and accepts): a copy reconciled any time after its node installed the
+> version keeps TotalOrder, Continuity, StaleNeverCommits and ReadSafety, and so it does with any one or two of its
+> three protections removed (its own generation check, the fence raises, phase one's demand that its authority name the
+> successor); with all three removed StaleNeverCommits fails at depth 12 (GAPS' model table). So a copy the walk has not
+> reached refuses, and nothing the walk delays can let a stale owner's record commit: a takeover round's page promises
+> and fences each copy it lists itself. Held by `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`
+> (`crates/server/tests/fleet.rs`).
+
 > **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
 > The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
 > It replaces a per-object round that a successor ran only for objects it already held, which stalled for
@@ -28362,3 +28378,31 @@ alone cannot see it, since one call is the same steps).
 Applied in the same change to: D-17 (its amendment line), GAPS (A-347's one-turn walks: the restore's steps exist; the
 server still restores in one turn until the population and the plain takeover path follow),
 `crates/archive/src/{restore,lib}.rs`, `crates/archive/tests/restore.rs`.
+
+### A-398 — A holder takes an installed configuration a copy a turn: the install walks the held register copies in turns, model-checked first (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere"; A-324's sibling)
+Applied in the same change to: §4.8 "Promotion and takeover" (its status), GAPS (A-324's entry: the install's item
+closed; the model table: nine `InstallInTurns` runs), `docs/wip/models/InstallInTurns.tla` and its nine configurations
+(new), and the code below.
+- **What was there.** At every newly committed configuration the control shard's install moved every register copy it
+  held, in one turn: each fence raised to its owner's committed epoch, then each object a kept retirement names moved to
+  the successor its lineage ranks or let go as stale (`takeover::resolve_held_objects`), then each authority moved to
+  the owner its route names (`fleet::reconcile_held_authority`). One turn over every held copy, whatever their number.
+- **The question first.** GAPS held that the loop could not simply be cut: a record a stale owner sends to a copy not
+  yet reached must still meet the new fence. `docs/wip/models/InstallInTurns.tla` asks it: three holders, two
+  takeovers, owners that learn their own retirement and write on, and each copy reconciled at any later step than its
+  node's install. TotalOrder, Continuity, StaleNeverCommits and ReadSafety hold with the copies reconciled late; they
+  hold with any one or any two of the three protections removed (a copy's own generation check, the fence raises other
+  than an accepted record's, phase one's demand that the copy's authority name the successor); with all three removed
+  a stale owner's record commits at depth 12. A copy not yet reached refuses a record of the new generation, the node
+  refuses one of any other generation, and a takeover round's page fences and re-authorizes each copy it lists itself.
+- **The rule.** The install takes the version in its turn (the node's placement) and the copies follow by a walk in key
+  order (`fleet::InstallWalk`): a task of the control shard reaches them a step quantum a turn (`install_slice`), each
+  turn a poll of its own (`xshard::Turns`), each copy brought to the version as the install once did all of them
+  (`install_on_copy`: fence, then `takeover::resolve_held_object`, then `reconcile_held_copy`). A newer install begins
+  the walk again; a walk whose council has committed past it ends, and the next install begins its own; a task that
+  could not be spawned, or a turn not answered within a heartbeat, is begun again where the walk stands at the next
+  period. Counted `fleet.config.install_walks`, `install_slices`, `installs_walked`, `install_unwalked`.
+- **Tests.** `a_holders_copies_take_an_install_in_turns_and_every_copy_follows` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`; four volumes on a, held by b and c; b's and c's walks cut to one copy a turn; a cut off on the probe
+  plane until every head is placed on its successor): RESULTS. The whole-map passes stay as the daemon's unit-test
+  oracle of the per-copy steps.
