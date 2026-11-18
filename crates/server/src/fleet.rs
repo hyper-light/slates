@@ -5670,9 +5670,12 @@ struct MakeLive {
 }
 
 /// Begins a live volume's materialization on its owner shard `target` as a task of that shard ([`make_live`]) and waits
-/// for its end in the shard's own time, up to a period of its CPU: an end within that is read at once; one still running
-/// is joined by the next attempt ([`making_of`]), its log never fetched or rebuilt again meanwhile. The head and sealing
-/// the log was fetched at are kept with the pending volume, for its end's [`crate::live_ship::note_rebuild`].
+/// a period for its end: an end within that is read at once; one still running is joined by the next attempt
+/// ([`making_of`], which asks in the shard's own time), its log never fetched or rebuilt again meanwhile, so the wait
+/// needs no longer than the period it holds the control shard's coordinator for. Waited for in the owner shard's own
+/// time instead, the coordinator was held for the whole materialization (1.2 s of a test's paused turns), its council
+/// and its heads with it. The head and sealing the log was fetched at are kept with the pending volume, for its end's
+/// [`crate::live_ship::note_rebuild`].
 async fn begin_live(
   origin: u16,
   target: u16,
@@ -5685,7 +5688,7 @@ async fn begin_live(
       pending.live_adopted = Some((fetched.head, fetched.sealing.clone()));
     }
   });
-  let ended = crate::xshard::task_in_shard_time(
+  let ended = crate::xshard::task_within(
     origin,
     target,
     move || make_live(making, fetched),
@@ -5758,9 +5761,10 @@ fn turned(state: &mut ShardState, object: ObjectId) {
 
 /// The turns of a live volume's materialization on its owner shard: the log's payloads opened and applied a slice a
 /// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a payload at least:
-/// [`crate::live_ship::Rebuilding`]), counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive;
-/// then the volume made from it, published before it is served (A-343), its shipper made from the head the takeover
-/// adopted (A-329). Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68 to
+/// [`crate::live_ship::Rebuilding`]), counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a
+/// turn; then the archive restored, a turn (`verbs::restore_taken_over`); then the volume made from the restore and
+/// published before it is served (A-343), its shipper made from the head the takeover adopted (A-329), a turn, so no
+/// client meets it unpublished. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68 to
 /// 1.08 s to rebuild 152 to 306 MB of log, 0.24 to 0.32 s to restore and populate the volume and up to 0.48 s to publish,
 /// past the watchdog's spin window, which ended the successor's process.
 async fn make_live_in_turns(
@@ -5829,6 +5833,19 @@ async fn make_live_in_turns(
   })
   .ok_or(MATERIALIZE_UNANSWERED)??;
   futures::yield_now().await;
+  // The archive restored in a turn of its own: a volume made here already (a retry after its publication was refused)
+  // restores nothing.
+  let restored = state::with_state(|s| {
+    turned(s, object);
+    past_the_pressure_hold(s, |s| match verbs::made_already(s, id, &catalog)? {
+      true => Ok(None),
+      false => verbs::restore_taken_over(s, &catalog, Some(&archive)),
+    })
+    .map_err(|refusal| materialize_refusal_counter(&refusal))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)??;
+  drop(archive);
+  futures::yield_now().await;
   state::with_state(|s| {
     turned(s, object);
     let sequence = placed.sequence;
@@ -5846,7 +5863,7 @@ async fn make_live_in_turns(
       },
     };
     past_the_pressure_hold(s, |s| {
-      verbs::materialize_taken_over(s, id, &taken, region, Some(&archive))
+      verbs::materialize_taken_over_restored(s, id, &taken, region, restored.as_ref())
     })
     .map_err(|refusal| materialize_refusal_counter(&refusal))?;
     // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
