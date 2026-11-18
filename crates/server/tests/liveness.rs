@@ -830,12 +830,13 @@ fn a_spinning_shard_stops_the_beat_role() {
 }
 
 /// Shape: the CPU the slow poll of [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs,
-/// in budgets: two, past the one budget of CPU a poll had before A-318, and a whole budget short of the least spin window
-/// the test judges ([`LEAST_SPIN_BUDGETS`]), so the look cadence and the clocks' grain cannot carry it over.
-const SLOW_POLL_BUDGETS: u32 = 2;
-/// Shape: the least spin window, in budgets, under which the slow-poll test runs; a build measured nearer machine code's
-/// speed would rightly call its poll spinning, and the test says so and skips.
-const LEAST_SPIN_BUDGETS: u32 = 3;
+/// in half budgets: three, half a budget past the one budget of CPU a poll had before A-318, and a whole budget short of
+/// the least spin window the test judges ([`LEAST_SPIN_HALF_BUDGETS`]), so the look cadence and the clocks' grain cannot
+/// carry it over. An unoptimized build measured 3.5 budgets on a Mac Studio (2026-11-18).
+const SLOW_POLL_HALF_BUDGETS: u32 = 3;
+/// Shape: the least spin window, in half budgets, under which the slow-poll test runs; a build measured nearer machine
+/// code's speed would rightly call its poll spinning, and the test says so and skips.
+const LEAST_SPIN_HALF_BUDGETS: u32 = 5;
 
 /// The calling thread's CPU time, read from its own clock (every platform the watchdog judges by it).
 fn own_cpu_spent() -> Duration {
@@ -844,10 +845,10 @@ fn own_cpu_spent() -> Duration {
   )
 }
 
-/// A-318, §4.14. Do: on the shard that is not the control shard, run one poll on the CPU for two budgets of its own CPU,
-/// then end it; watch the beat until a window after it ends. Expect, where this build's spin window (the budget held to
-/// the build, the daemon's own) is at least three budgets, as an unoptimized build's is: the beat never gaps a window and
-/// no look withholds it, since a poll this build runs slower is no spin. Before A-318 a window of CPU was the budget
+/// A-318, §4.14. Do: on the shard that is not the control shard, run one poll on the CPU for a budget and a half of its
+/// own CPU, then end it; watch the beat until a window after it ends. Expect, where this build's spin window (the budget
+/// held to the build, the daemon's own) is at least two and a half budgets, as an unoptimized build's is: the beat never
+/// gaps a window and no look withholds it, since a poll this build runs slower is no spin. Before A-318 a window of CPU was the budget
 /// alone, and the beat stopped one budget into the poll, as ThreadSanitizer's 1,054 ms poll ended a test binary on CI.
 /// A build measured nearer machine code skips, loudly.
 #[test]
@@ -871,16 +872,16 @@ fn a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_ro
   };
   let _serving = beating(&daemon);
   let spin_window = Duration::from_nanos(daemon.spin_window_ns().unwrap());
-  if spin_window < WINDOW * LEAST_SPIN_BUDGETS {
+  let least = WINDOW * LEAST_SPIN_HALF_BUDGETS / 2;
+  let poll_cpu = WINDOW * SLOW_POLL_HALF_BUDGETS / 2;
+  if spin_window < least {
     println!(
-      "SKIP: this build's spin window is {spin_window:?}, under {LEAST_SPIN_BUDGETS} budgets of {WINDOW:?}: it runs \
-       compiled code near machine code's speed, so a poll of {SLOW_POLL_BUDGETS} budgets of CPU would rightly be \
-       judged spinning"
+      "SKIP: this build's spin window is {spin_window:?}, under {least:?}: it runs compiled code near machine code's \
+       speed, so a poll of {poll_cpu:?} of CPU would rightly be judged spinning"
     );
     daemon.stop();
     return;
   }
-  let poll_cpu = WINDOW * SLOW_POLL_BUDGETS;
   let ended = &*Box::leak(Box::new(AtomicBool::new(false)));
   let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;
   let before = daemon.watchdog_turns().unwrap();
