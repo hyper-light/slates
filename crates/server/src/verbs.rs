@@ -2189,8 +2189,8 @@ fn serve_on_channel(
   if let RequestBody::Revoke { consumer, proof } = body {
     return Break(revoke_on_channel(
       state,
-      client.index(),
-      request.request,
+      (client.index(), request.request),
+      principal,
       consumer,
       proof,
     ));
@@ -4694,7 +4694,7 @@ fn dispatch_inner(
       term_ns,
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
-    RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::Enroll { account, proof } => enroll(state, principal, account, proof),
     RequestBody::SetPolicy {
       subject,
       policy,
@@ -4722,8 +4722,20 @@ fn dispatch_inner(
 /// verifies, a consumer id and a secret capability are minted, the hash of the capability is recorded
 /// durably (never the capability), and the capability is returned once for the human to deliver to the
 /// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
-/// not verify: an agent cannot enroll itself.
-fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
+/// not verify: an agent cannot enroll itself. Refused `Forbidden` — counted `enroll_by_consumer` — on a channel bound
+/// to a consumer, before anything else and whatever its proof (A-285): the launcher's authority is the instance's
+/// issuer, which an agent's consumer channel never holds, so a leaked proof cannot mint the agent a second consumer
+/// outside its own write policy.
+fn enroll(
+  state: &mut ShardState,
+  principal: &Principal,
+  account: u32,
+  proof: Capability,
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("enroll_by_consumer", 1);
+    return forbidden("enroll");
+  }
   if !crate::landing::proven_by_launcher(
     state,
     |secret| crate::landing::enroll_proof(secret, account),
@@ -5001,14 +5013,20 @@ fn consumer_policy_on_channel(
 /// overtake (measured: the very next `Status` after `Revoked` was served), so the acknowledgement waits for
 /// every mark. A shard that does not answer within the liveness budget makes the revocation refuse
 /// `NotFound` rather than acknowledge a revocation not yet in force everywhere; the durable record stands,
-/// so the human retries and the retry is a no-op mark.
+/// so the human retries and the retry is a no-op mark. Refused `Forbidden` — counted `revoke_by_consumer` — on a channel
+/// bound to a consumer, before anything else and whatever its proof (A-285): revocation is the launcher's, so an agent
+/// holding a leaked proof cannot revoke another agent's consumer.
 fn revoke_on_channel(
   state: &mut ShardState,
-  client_index: u32,
-  request: u64,
+  (client_index, request): (u32, u64),
+  principal: &Principal,
   consumer: u64,
   proof: Capability,
 ) -> Served {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("revoke_by_consumer", 1);
+    return Served::Reply(forbidden("revoke"));
+  }
   if !crate::landing::proven_by_launcher(
     state,
     |secret| crate::landing::revoke_proof(secret, consumer),
