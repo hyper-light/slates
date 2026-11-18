@@ -7006,6 +7006,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
 > (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
 >
+> **The held replies' bound is met before a verb runs (2026-11-18).** A shard holds at most `awaiting_bound` such
+> replies (its client seats times ring slots). A recorded verb that could be held (one that changes a live-shipped
+> volume, or a destroy while `f > 0`) meets that bound before it runs (`live_ship::refuse_over_bound`, from
+> `verbs::run_recorded`): refused `Overloaded`, it changed nothing, and its resend under the same id runs it once, as on
+> a plain volume. Before, the bound was met in `defer`, after the verb's effects had committed with no completion
+> record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
+> twice (g232's finding). Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
+> in `defer`, after its commit (GAPS, OPEN).
+>
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
 > its log (`live_ship::fetch`): every candidate of the head's placement raises its fence to the head's placed epoch,
@@ -27051,6 +27062,8 @@ Applied in the same change to:
   loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
   refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
   loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+  Each guard red-checked (diagnostics run 44353311142): without the step-out the launcher ran unasked under the loaded
+  profile; without the exec-time drop the command ran under the profile's label and held the grant.
 - **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
   whole binary (§4.6, "The launcher on a restricted host", says why).
 - **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
