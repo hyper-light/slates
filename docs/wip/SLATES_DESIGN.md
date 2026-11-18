@@ -152,7 +152,8 @@ the two equal):
 | `slates-bridge-nfs` | the mount point and loopback socket (§4.6) |
 | `slates-bridge-fskit` | the mount (§4.6) |
 | `slates-bridge-winfsp` | the volume (§4.6) |
-| `slates-cli` | the launcher's namespace setup and mount install (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
+| `slates-cli` | the launcher's namespace setup (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
+| `slates-api` | the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write |
 <!-- host-path-sites:end -->
 
 ### 0.3 Evidence tiers and how citations are written
@@ -542,6 +543,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 
 - **Rust client library**: the reference implementation of the ring protocol; used by the CLI,
   the launcher, and both SDKs.
+- **Rust library for embedding hosts** (`slates-api`, A-278): what a host such as kiln vendors and
+  drives slates through, never the `slates` command — attach to an instance, volumes, a host mount
+  or a descriptor a VMM takes, drift, landing plans and landing under a grant the host's own
+  confirmation surface issues, and observation. The CLI mounts and grants through it.
 - **Python SDK** (`slates` on PyPI): PyO3 extension; `async` methods on any event loop through
   file-descriptor readiness; a sync facade.
 - **TypeScript SDK** (`@hyper-light/slates` on npm, with `@hyper-light/slates-<platform>` binary
@@ -6819,6 +6824,43 @@ registry and are structurally excluded from SDK/MCP exports.
 
 **Rust client.** The ring protocol, rendezvous per OS, completion fd, request ids, typed errors.
 
+**Embedding (A-278).** A host product that embeds slates — kiln first, then Hex — vendors it and
+drives it through one Rust crate, `slates-api`, never through the `slates` command and never by
+parsing its output. The crate is the client plus what was the CLI's alone: the host mount, the
+issuer authority, the grant's term. The CLI calls it for these, so the command and every host
+mount and grant through one implementation.
+- *What a host holds.* An `Instance`: one held client of one running instance. A landing's
+  presentation lives as long as the client that made it (A-46), so a plan a person is shown is
+  granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
+  the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
+- *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
+  host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
+  rewitness; serving as a host mount (§4.6, every platform's own mechanism) or as a descriptor a VMM
+  takes (the Shards stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
+  `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
+  the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
+  whole typed client for the rest (the merge verbs of §4.16, the file verbs).
+- *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
+  the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
+  `PathFault`). None is prose alone.
+- *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
+  no grant verb reaches them (the structural exclusion this section asks of the registry); the
+  daemon still refuses a grant kind on their channels whatever they claim.
+- *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
+  grow append-only (D-15), so a host matches their enums with a wildcard arm.
+
+> **Status (2026-11-18, A-278, piece 1).** Built: the crate with attach, the group, the volume
+> lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
+> `unsafe` block), the Shards stream and vhost-user serving, landing plans, `land_approved`, the
+> issuer (from the environment, as `slates grant` has it, or from a handoff's pairs), observation;
+> the CLI's `mount`, `unmount`, `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call
+> it. Proven by use over an in-process daemon (`crates/api/tests/api.rs`). Owed, in order:
+> starting an instance from the host's own executable, with the issuer handed to its starter, so a
+> host runs no `slates` binary (the anchor and daemon roles move into the crate); an async form over
+> a host's reactor (R6: a readiness wait and a timer over the client's driver); a seam trait with a
+> simulator and a conformance suite for hosts whose rules ask for one; a landing plan's per-path
+> entries, paged, for a person to review.
+
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
 to=None)` moves the base to the head (or a named version) or raises with windows;
@@ -8976,6 +9018,7 @@ workflow dry run.
 | AC-5.9 | T-5.11 | CLI/MCP/SDK adapters conform to one operation descriptor and are navigable. | Execute the same create/clone/base/attach/status/resize flows through each adapter, using ids and scoped names; expect equivalent results/refusals, useful help, stable JSON, bounded cursors and cancellation. |
 | AC-5.10 | T-5.12 | Human grants are authenticated and bound to the exact proposed landing. | Preview a plan, change its filter/target/content, replay or forge approval from an agent channel; expect refusal. Approve the unchanged manifest through the enrolled human surface and expect only its granted effects and audit records. |
 | AC-5.11 | T-5.13 | Users can discover attachment support and complete supported flows without hidden setup. | Start from an enrolled instance on each host, follow CLI help through a live overlay and an immutable-base/guest flow; expect endpoint/root discovery, actual path/tag readiness, clear coverage/reservation/durability output and actionable capability errors. |
+| AC-5.12 | T-5.14 | An embedding host drives every flow through the library alone (A-278): no `slates` command, no parsed output. | Through `slates-api` over a live daemon: attach (no daemon: `Unavailable`), make the group, create, snapshot, clone and destroy; lay an overlay over a folder, change it, read its drift; plan its landing, grant and land exactly the approved manifest (another manifest returns the new plan and writes nothing); serve it to a VMM as a Shards stream and speak FUSE through the end; observe the daemon. Expect every answer typed and the folder to change only at the granted landing. |
 
 ### Phase 6 — Merge engine: green volumes, increments, canonical rebase, the verdict (single node)
 
@@ -9859,6 +9902,8 @@ slates/
     cluster/                 membership, the configuration group, neighbourhoods, the register and
                              content puts with hedging, takeover, migration, mirroring
     mcp/                     MCP server and skills projection
+    api/                     `slates-api`: the library an embedding host drives slates through (A-278):
+                             instances, volumes, the host mount, landing under a grant, observation
     cli/                     `slates` binary: daemon, exec launcher, admin
     sdk-py/                  PyO3 extension (async via fd readiness)
     sdk-node/                napi-rs addon (async via uv_poll)
@@ -20552,3 +20597,45 @@ Applied in the same change to:
   the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
   reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
   injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
+
+### A-278 — An embedding host drives slates through one library, `slates-api`; the host mount and the issuer move into it from the CLI (accepted and built in part 2026-11-18, Ada's goal "slates has a library API for embedding hosts")
+
+Applied in the same change to:
+- §2.4 (the surfaces list), §4.12 ("Embedding", its status, and AC-5.12 / T-5.14 in Phase 5's table), Appendix B.6
+  (the layout); `docs/library.md` (the user's guide) and the README's documentation table.
+- `crates/api` (new): `lib.rs` (the crate doc, `deadlines`, `overlay`, `scratch`), `instance.rs` (`Instance`,
+  `LandingPlan`, `Planned`, `Approved`, `LandingRequest`), `issuer.rs` (`Issuer`, `GRANT_TERM_NS`), `mount.rs` (the
+  host mount, moved), `error.rs` (`Error`, `MountFault`, `IssuerFault`, `PathFault`), `tests/api.rs`.
+- `crates/cli`: `src/mount.rs` deleted; `verbs.rs` mounts, unmounts, exports, grants, enrolls, revokes, runs and
+  recovers through the crate; `args.rs` takes the grant's term from it.
+- `unsafe-budget.toml` (the macOS `mount(2)` block counted in `slates-api`, `slates-cli` 7 → 6), `xtask/src/main.rs`
+  (`slates-api` may name host paths: the mount point's real path, a read), GAPS (the inventory row).
+
+- **Why.** Ada (2026-11-18): kiln invoking slates only through its CLI is wrong; kiln must vendor slates and use a
+  library API, as it vendors Shards, Hex and Mantle. Until now kiln ran the `slates` binary for every verb
+  (`crates/kiln/src/workspace/slates.rs` at kiln 28b6c8ca): one process per verb, its JSON parsed back, the anchor
+  found by a binary on the `PATH`, a landing plan held only while the command that made it ran (so kiln re-planned
+  before every grant), one `--exclude` per landing, and a grant possible only by passing on the variables the anchor
+  had printed to its log, never on Linux.
+- **The rule.** A host product reaches slates through `slates-api` alone. Its name follows the convention of the
+  products kiln vendors (`hex-api`, `shards-api`, `quiver-api`): the crate other products reach the product through.
+  What a front end needs past the client (a mount, the issuer, the grant's term) lives in this crate once, and every
+  front end calls it, the CLI included; no front end keeps a copy (CLAUDE.md §2 item 7).
+- **The issuer stays the human's.** The crate's `Issuer` is the same authority `slates grant` holds — the anchor
+  segment's handoff, which the anchor's tree inherits and, on macOS and Windows, its user exports — attached for one
+  proof at a time and never kept as a secret, so a daemon restart between two grants meets each with its own secret.
+  The SDKs and the MCP server do not depend on the crate, so no grant verb reaches them; an embedding host is a
+  confirmation surface in §4.13's sense, and `Instance::land_approved` binds its grant to exactly the manifest its
+  person approved.
+- **Owed, in order.** (1) Starting an instance from the host's own executable: the anchor and daemon roles move into
+  the crate, a host's `main` serves them, and the anchor hands its starter the issuer on an inherited channel (the
+  segment's descriptor on Linux), so a host runs no `slates` binary and grants on Linux too. (2) An async form over a
+  host's reactor (R6). (3) A seam trait with a simulator and a conformance suite, for hosts whose rules ask for one
+  (Hex's §9, kiln's `kiln-seams`). (4) A landing plan's per-path entries, paged.
+- **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
+  the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
+  an overlay's landing with `/.git` left out lands exactly the approved manifest, an approval of another manifest
+  writes nothing and returns the plan, and the folder is untouched until then; a file changed on disk after the volume
+  changed it is drift and a planned conflict, and a grant id nobody issued lands nothing; the daemon's status and a
+  shard's telemetry; and a Shards stream from the crate answers FUSE `INIT` and finds the volume's file (Linux and
+  macOS). The CLI's harness verb test runs its enrollment through the crate's issuer.
