@@ -1,7 +1,8 @@
 //! A green's works are served where they live; only the verdict is the green's (§4.16, A-247). One history is run on a
-//! daemon with one shard, where a work and its green share a partition, and on a daemon with many, where a green's
-//! works are spread over the shards by their names. Every reply and every file must be the same, and the counter of
-//! verbs a work's shard asked the green's owner for proves the many-shard run really went there.
+//! daemon with one shard, where a work and its green share a partition, and on a daemon with many, where a work lives on
+//! the shard of the client that made it (A-400) and its green on another, its maker's ([`green_off`]). Every reply and
+//! every file must be the same, and the counter of verbs a work's shard asked the green's owner for proves the many-shard
+//! run really went there.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -94,9 +95,9 @@ fn file(client: &mut Client, volume: VolumeId, path: &str) -> String {
 /// The history: seeded base files; works that edit their own slots, a shared slot, a length change followed by an edit
 /// past it, a file of their own and a file they only read; their submits in order; a conflict, its rebase and its
 /// resolution; every reply and file written down.
-fn history(client: &mut Client) -> Vec<String> {
+fn history(client: &mut Client, (instance, shards): (&str, u16)) -> Vec<String> {
   let mut said = Vec::new();
-  let green = client.create_green("spread-green", false).unwrap();
+  let green = green_off(client, instance, shards, "spread-green");
   let (seed, base) = client.create_work(green, "spread-seed").unwrap();
   said.push(format!("seed based at {base}"));
   for name in ["shared", "shifted", "untouched"] {
@@ -171,7 +172,7 @@ fn a_greens_works_spread_over_shards_answer_as_they_do_on_one() {
   let run = |shards: u16, tag: &str| {
     let (daemon, instance) = daemon(shards, tag);
     let mut client = connect(&instance);
-    let said = history(&mut client);
+    let said = history(&mut client, (&instance, shards));
     let counts = daemon.refusals_on_every_shard().unwrap();
     let asked = counts.get(ASKED_THE_OWNER).copied().unwrap_or(0);
     let composed = (
@@ -208,12 +209,29 @@ const VERSION_BYTES: usize = 8 << 10;
 /// Shape: the versions the floor test goes on to once released: several times what the cap holds.
 const VERSIONS: u64 = 120;
 
-/// A name of `prefix` that hashes to a partition other than `green`'s, so a work of that name is off its owner.
+/// A name of `prefix` that hashes to a partition other than `green`'s: a work of that name made on another shard holds
+/// it there by an alias (A-400).
 fn off_owner_name(green: VolumeId, prefix: &str) -> String {
   (0u32..)
     .map(|suffix| format!("{prefix}-{suffix}"))
     .find(|name| owner_of_name(name, usize::from(MANY_SHARDS)) != owner_of(green))
     .unwrap()
+}
+
+/// A green made by a client of another shard than `client`'s, on a daemon of `shards` shards (A-400: a work lives on
+/// the shard of the client that makes it, and a green on its maker's), so every work `client` makes is off its green's
+/// shard. On one shard there is no other, and the green is `client`'s own.
+fn green_off(client: &mut Client, instance: &str, shards: u16, name: &str) -> VolumeId {
+  if shards < 2 {
+    return client.create_green(name, false).unwrap();
+  }
+  let here = client.client_id() % u32::from(shards);
+  loop {
+    let mut maker = connect(instance);
+    if maker.client_id() % u32::from(shards) != here {
+      return maker.create_green(name, false).unwrap();
+    }
+  }
 }
 
 /// The bytes version `n` writes over the file: distinct per version.
@@ -286,7 +304,7 @@ fn a_checkpoint_never_folds_past_a_work_on_another_shard() {
   .unwrap();
   daemon.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-  let green = client.create_green("floor-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "floor-green");
   let (seed, _) = client.create_work(green, "floor-seed").unwrap();
   let first = version_bytes(1);
   client.edit(seed, "file", 0, 0, &first).unwrap();
@@ -351,7 +369,7 @@ fn a_work_off_its_greens_shard_keeps_its_edits_and_its_base_across_a_restart() {
   let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
   first.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-  let green = client.create_green("restart-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "restart-green");
   let (seed, _) = client.create_work(green, "restart-seed").unwrap();
   client
     .edit(seed, "shared", 0, 0, &[b'.'; FILE_BYTES])
@@ -494,7 +512,7 @@ fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
 fn verbs_pipelined_on_a_work_off_its_greens_shard_keep_their_order() {
   let (daemon, instance) = daemon(MANY_SHARDS, "order");
   let mut client = connect(&instance);
-  let green = client.create_green("order-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "order-green");
   let (seed, _) = client.create_work(green, "order-seed").unwrap();
   client.edit(seed, "first", 0, 0, b"aaaa").unwrap();
   client.edit(seed, "second", 0, 0, b"bbbb").unwrap();
@@ -523,8 +541,8 @@ fn await_overloaded(client: &mut Client, id: RequestId) {
 }
 
 /// A green at version 1 and a work off its shard with one edit waiting.
-fn green_and_edited_work(client: &mut Client, tag: &str) -> (VolumeId, VolumeId) {
-  let green = client.create_green(&format!("{tag}-green"), false).unwrap();
+fn green_and_edited_work(client: &mut Client, instance: &str, tag: &str) -> (VolumeId, VolumeId) {
+  let green = green_off(client, instance, MANY_SHARDS, &format!("{tag}-green"));
   let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
   client.edit(seed, "f", 0, 0, b"....").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
@@ -569,7 +587,7 @@ const ACCEPTED_AT_TWO: ReplyBody = ReplyBody::Submitted {
 fn a_submit_whose_answer_was_lost_is_answered_by_the_owners_record_once() {
   let (daemon, instance) = daemon(MANY_SHARDS, "lost");
   let mut client = connect(&instance);
-  let (green, work) = green_and_edited_work(&mut client, "lost");
+  let (green, work) = green_and_edited_work(&mut client, &instance, "lost");
   let (id, request) = submit_with_the_answer_lost(&daemon, &mut client, green, work);
   assert_eq!(client.retry(id, &request).unwrap(), ACCEPTED_AT_TWO);
   assert_eq!(client.versions(green).unwrap(), 2, "one version");
@@ -591,7 +609,7 @@ fn a_submit_whose_answer_was_lost_is_answered_by_the_owners_record_once() {
 fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
   let (daemon, instance) = daemon(MANY_SHARDS, "lost-conflict");
   let mut client = connect(&instance);
-  let green = client.create_green("lost-conflict-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "lost-conflict-green");
   let (other, _) = client.create_work(green, "lost-conflict-other").unwrap();
   client.edit(other, "f", 0, 0, &[b'.'; 64]).unwrap();
   assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(1));
@@ -637,7 +655,7 @@ fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
 fn an_edit_after_a_lost_answer_is_kept_when_the_submit_is_retried() {
   let (daemon, instance) = daemon(MANY_SHARDS, "lost-then-edit");
   let mut client = connect(&instance);
-  let (green, work) = green_and_edited_work(&mut client, "lost-then-edit");
+  let (green, work) = green_and_edited_work(&mut client, &instance, "lost-then-edit");
   let (id, request) = submit_with_the_answer_lost(&daemon, &mut client, green, work);
   client.edit(work, "later", 0, 0, b"kept").unwrap();
   assert_eq!(client.retry(id, &request).unwrap(), ACCEPTED_AT_TWO);
@@ -665,7 +683,7 @@ fn a_submit_whose_answer_was_lost_is_answered_once_across_a_restart() {
   let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
   first.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-  let (green, work) = green_and_edited_work(&mut client, "lost-restart");
+  let (green, work) = green_and_edited_work(&mut client, &instance, "lost-restart");
   let (id, request) = submit_with_the_answer_lost(&first, &mut client, green, work);
   first.stop();
   let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
@@ -694,7 +712,7 @@ fn a_floor_whose_work_was_never_made_is_released_at_the_next_start() {
   let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
   first.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-  let green = client.create_green("orphan-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "orphan-green");
   let (seed, _) = client.create_work(green, "orphan-seed").unwrap();
   client.edit(seed, "file", 0, 0, &version_bytes(1)).unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
@@ -741,7 +759,7 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
   static HELD: AtomicBool = AtomicBool::new(false);
   let (daemon, instance) = daemon(MANY_SHARDS, "behind");
   let mut client = connect(&instance);
-  let green = client.create_green("behind-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "behind-green");
   let (seed, _) = client.create_work(green, "behind-seed").unwrap();
   client.edit(seed, "f", 0, 0, b"....").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
@@ -829,7 +847,7 @@ fn a_shards_second_ask_leaves_while_its_first_batch_is_still_out() {
   static HELD: AtomicBool = AtomicBool::new(false);
   let (daemon, instance) = daemon(MANY_SHARDS, "two-out");
   let mut client = connect(&instance);
-  let green = client.create_green("two-out-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "two-out-green");
   let (seed, _) = client.create_work(green, "two-out-seed").unwrap();
   client.edit(seed, "first", 0, 0, b"....").unwrap();
   client.edit(seed, "second", 0, 0, b"....").unwrap();
@@ -906,7 +924,7 @@ const AT_ONCE: usize = 24;
 fn works_created_at_once_off_their_greens_shard_get_their_own_ids() {
   let (daemon, instance) = daemon(MANY_SHARDS, "at-once");
   let mut client = connect(&instance);
-  let green = client.create_green("at-once-green", false).unwrap();
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "at-once-green");
   let (seed, _) = client.create_work(green, "at-once-seed").unwrap();
   client.edit(seed, "f", 0, 0, b"....").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
@@ -1062,13 +1080,16 @@ fn generated_step() -> impl Strategy<Value = Step> {
 /// One daemon's side of the differential.
 struct Side {
   client: Client,
+  /// The daemon's instance and shards, for a green made off the client's shard (A-400).
+  daemon: (String, u16),
   green: VolumeId,
   works: Vec<VolumeId>,
 }
 
 impl Side {
   fn begin(&mut self, name: &str) {
-    self.green = self.client.create_green(name, false).unwrap();
+    let (instance, shards) = self.daemon.clone();
+    self.green = green_off(&mut self.client, &instance, shards, name);
     let (seed, _) = self
       .client
       .create_work(self.green, &format!("{name}-seed"))
@@ -1180,11 +1201,13 @@ fn generated_histories_answer_the_same_on_one_shard_and_on_many() {
   let sides = RefCell::new((
     Side {
       client: connect(&one_instance),
+      daemon: (one_instance.clone(), ONE_SHARD),
       green: VolumeId::default(),
       works: Vec::new(),
     },
     Side {
       client: connect(&many_instance),
+      daemon: (many_instance.clone(), MANY_SHARDS),
       green: VolumeId::default(),
       works: Vec::new(),
     },
@@ -1255,9 +1278,13 @@ fn a_rename_rebased_then_submitted_off_the_owner_merges_as_on_it() {
     Step::Submit { slot: 1 },
   ];
   let mut said = Vec::new();
-  for (instance, tag) in [(&one_instance, "one"), (&many_instance, "many")] {
+  for (instance, tag, shards) in [
+    (&one_instance, "one", ONE_SHARD),
+    (&many_instance, "many", MANY_SHARDS),
+  ] {
     let mut side = Side {
       client: connect(instance),
+      daemon: (instance.clone(), shards),
       green: VolumeId::default(),
       works: Vec::new(),
     };
@@ -1310,9 +1337,9 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   let mut client = connect(&instance);
   let asked_before = asked_of_the_owner(&daemon);
 
-  expect_the_greens_forbid_refused(&mut client, &secret);
+  expect_the_greens_forbid_refused(&mut client, &instance, &secret);
 
-  let (green, work) = green_and_edited_work(&mut client, "policy-ask");
+  let (green, work) = green_and_edited_work(&mut client, &instance, "policy-ask");
   merging(
     &mut client,
     &secret,
@@ -1373,7 +1400,7 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     PolicySubject::Consumer { consumer },
     WriteMode::Ask,
   );
-  expect_the_sessions_ask_to_hold_its_agents_merge(&mut agent);
+  expect_the_sessions_ask_to_hold_its_agents_merge(&mut agent, &instance);
   assert!(
     asked_of_the_owner(&daemon) > asked_before,
     "the verdicts were asked of the green's owner"
@@ -1385,8 +1412,8 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
 
 /// The green's forbid in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`. Do: forbid a green's merges
 /// with `secret`'s authority and submit a work of it. Expect `PolicyForbids` naming the green, and nothing merged.
-fn expect_the_greens_forbid_refused(client: &mut Client, secret: &[u8; 32]) {
-  let (green, work) = green_and_edited_work(client, "policy-forbid");
+fn expect_the_greens_forbid_refused(client: &mut Client, instance: &str, secret: &[u8; 32]) {
+  let (green, work) = green_and_edited_work(client, instance, "policy-forbid");
   merging(
     client,
     secret,
@@ -1482,8 +1509,8 @@ fn expect_the_greens_ask_to_hold_an_edit_and_submit(client: &mut Client, secret:
 /// as `agent`, whose consumer's own policy asks, make a green and a work named off the green's shard, edit the work and
 /// submit it. Expect the merge held for approval with its one path, and nothing merged, though both volumes would merge
 /// at once.
-fn expect_the_sessions_ask_to_hold_its_agents_merge(agent: &mut Client) {
-  let green = agent.create_green("policy-session-green", false).unwrap();
+fn expect_the_sessions_ask_to_hold_its_agents_merge(agent: &mut Client, instance: &str) {
+  let green = green_off(agent, instance, MANY_SHARDS, "policy-session-green");
   let (work, _) = agent
     .create_work(green, &off_owner_name(green, "policy-session"))
     .unwrap();
