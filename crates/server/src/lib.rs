@@ -69,6 +69,8 @@ mod fuse_hold;
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
+// A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
+mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;

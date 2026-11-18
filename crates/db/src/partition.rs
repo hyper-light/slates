@@ -148,9 +148,27 @@ pub struct PartitionSnapshot {
   pub pending_submits: Vec<crate::catalog::PendingSubmitRecord>,
   /// Each work's creation awaiting its admission (A-247; appended).
   pub pending_creations: Vec<crate::catalog::PendingCreationRecord>,
+  /// Each green this node took over and adopted from its own holder ledger of it (A-333; 2026-11-18; appended).
+  pub green_adoptions: Vec<GreenAdoption>,
   /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
   /// (volume, snapshot) order.
   pub captured_bases: Vec<CapturedBase>,
+}
+
+/// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
+/// A-333): versions 0 to `version` are the merge records this node accepted as one of the green's holders and the inputs
+/// it holds for them, kept while the green lives here; the green's chain holds the versions after `version`. A few dozen
+/// bytes a green, where a re-recorded origin was the whole tree's bytes.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenAdoption {
+  /// The green.
+  pub green: VolumeId,
+  /// The adopted version: the green's head when this node took it over.
+  pub version: u64,
+  /// The green's head identity at `version`.
+  pub identity: [u8; 32],
+  /// Version 0's inputs manifest identity as the ledger names it; `None` for a green with no origin.
+  pub origin: Option<[u8; 32]>,
 }
 
 /// A snapshot captured as a complete immutable base (§4.15 `capture_base`, A-291): every name, byte and attribute of its
@@ -263,6 +281,9 @@ pub struct Partition {
   /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
   /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
   green_origin_refs: BTreeMap<VolumeId, OriginRef>,
+  /// Each green adopted from this node's own holder ledger by its takeover (A-333): the versions up to the adoption are
+  /// the ledger's, the chain holds the ones after it. A few dozen bytes a green. Removed with the green.
+  green_adoptions: BTreeMap<VolumeId, GreenAdoption>,
   /// The NFSv4 file state and clients (§4.6 A-37), each bounded before any operation is issued: the
   /// owner's file state bounds its opens and locks, the listener's session table its clients, and a
   /// replay reproduces only what they admitted.
@@ -363,6 +384,7 @@ impl Partition {
       green_chain_bytes: 0,
       work_logs: BTreeMap::new(),
       green_origin_refs: BTreeMap::new(),
+      green_adoptions: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
       captured_bases: std::collections::BTreeSet::new(),
       tombstones: BTreeMap::new(),
@@ -375,11 +397,9 @@ impl Partition {
   /// volume does not exist or the sequence is spent.
   pub fn tombstone_sequence(&self, id: VolumeId) -> Option<u64> {
     let record = self.volume(id)?;
-    let newest_version = self
-      .green_chains
-      .get(&id)
-      .map_or(0, |chain| u64::try_from(chain.len()).unwrap_or(u64::MAX));
-    record.epoch.max(newest_version).checked_add(1)
+    // The green's head, not its chain's length: the chain holds only the versions after a checkpoint (A-238) or an
+    // adoption (A-333), and a tombstone at or below a version its holders accepted would not be newer than it.
+    record.epoch.max(self.green_head(id)).checked_add(1)
   }
 
   /// The tombstone this owner still owes for the destroyed volume `id`, if any.
@@ -425,24 +445,42 @@ impl Partition {
       .map(|(version, bytes)| (*version, bytes.as_slice()))
   }
 
-  /// A green's head as its durable records hold it: its checkpoint's version and the increments after it.
+  /// A green's head as its durable records hold it: its floor ([`Partition::green_floor`]) and the increments after it.
   pub fn green_head(&self, green: VolumeId) -> u64 {
-    let held = self
-      .green_checkpoints
-      .get(&green)
-      .map_or(0, |(version, _)| *version);
     let chained = u64::try_from(self.green_chain(green).len()).unwrap_or(u64::MAX);
-    held.saturating_add(chained)
+    self.green_floor(green).saturating_add(chained)
+  }
+
+  /// The version a green's chain begins after: its checkpoint's version (W3) once it holds one, else the version it was
+  /// adopted at by its takeover (A-333), else 0. The chain's entry `n` is version `floor + n + 1`. A checkpoint of an
+  /// adopted green is always past its adoption ([`Partition::green_checkpoint`]'s check), so the newer of the two is the
+  /// checkpoint's whenever both stand.
+  pub fn green_floor(&self, green: VolumeId) -> u64 {
+    match (
+      self.green_checkpoints.get(&green),
+      self.green_adoptions.get(&green),
+    ) {
+      (Some((version, _)), _) => *version,
+      (None, Some(adoption)) => adoption.version,
+      (None, None) => 0,
+    }
+  }
+
+  /// A green's adoption by its takeover successor (A-333), if it was adopted here from this node's holder ledger.
+  pub fn green_adoption(&self, green: VolumeId) -> Option<&GreenAdoption> {
+    self.green_adoptions.get(&green)
   }
 
   /// What a checkpoint at `version` folds of `green`'s records: the increments it drops and the bytes it releases (the
   /// increments and the checkpoint it replaces), or the refusal when `version` is not past the checkpoint held or is
   /// past the head (W3).
   fn checkpoint_folds(&self, green: VolumeId, version: u64) -> Result<(usize, usize), DbError> {
-    let (held, held_bytes) = self
+    // An adopted green's chain begins after its adoption (A-333), which no checkpoint may fold below.
+    let held = self.green_floor(green);
+    let held_bytes = self
       .green_checkpoints
       .get(&green)
-      .map_or((0, 0), |(held, bytes)| (*held, bytes.len()));
+      .map_or(0, |(_, bytes)| bytes.len());
     let chain = self.green_chain(green);
     let out_of_range = DbError::CheckpointOutOfRange {
       version,
@@ -1128,33 +1166,7 @@ impl Partition {
   /// The guard the live path runs before appending: refuses what the log must never record.
   pub fn check(&self, op: &Op, now_ns: u64) -> Result<(), DbError> {
     match op {
-      Op::VolumeCreated { record } => {
-        if let Some(existing) = self.volume(record.id) {
-          return Err(DbError::AlreadyExists {
-            existing: existing.id.bytes,
-          });
-        }
-        if let Some(existing) = self.volume_by_name(&record.name) {
-          return Err(DbError::AlreadyExists {
-            existing: existing.id.bytes,
-          });
-        }
-        // A name this partition holds for another partition's volume is that volume's (A-236), confirmed or not.
-        if let Some(alias) = self.name_alias(&record.name) {
-          return Err(DbError::AlreadyExists {
-            existing: alias.volume.bytes,
-          });
-        }
-        if self.tombstones.contains_key(&record.id) {
-          return Err(DbError::AlreadyExists {
-            existing: record.id.bytes,
-          });
-        }
-        if self.volume_slots_used() >= self.caps.volumes {
-          return Err(DbError::Capacity { table: "volumes" });
-        }
-        Ok(())
-      }
+      Op::VolumeCreated { record } => self.check_volume_created(record),
       Op::VolumeDestroyed { id } => {
         self.volume(*id).ok_or(DbError::NotFound)?;
         self
@@ -1401,16 +1413,7 @@ impl Partition {
         self
           .snapshot(origin.volume, origin.snapshot)
           .ok_or(DbError::NotFound)?;
-        // Version 0, recorded once and only before any increment, whatever form the origin takes.
-        if self.green_origins.contains_key(green)
-          || self.green_origin_refs.contains_key(green)
-          || self.green_head(*green) > 0
-        {
-          return Err(DbError::AlreadyExists {
-            existing: green.bytes,
-          });
-        }
-        Ok(())
+        self.check_version_zero_unrecorded(*green)
       }
       Op::WorkRestated { work, entry } => {
         self.volume(*work).ok_or(DbError::NotFound)?;
@@ -1423,13 +1426,7 @@ impl Partition {
       } => self.check_green_checkpoint(*green, *version, checkpoint.len()),
       Op::GreenOriginated { green, origin } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
-        // An origin is version 0: recorded once, and only before any increment — a chain that has
-        // advanced was based on whatever origin it had, so a later origin would rewrite history.
-        if self.green_origins.contains_key(green) || self.green_head(*green) > 0 {
-          return Err(DbError::AlreadyExists {
-            existing: green.bytes,
-          });
-        }
+        self.check_version_zero_unrecorded(*green)?;
         if self.green_chain_bytes.saturating_add(origin.len()) > self.caps.green_chain_bytes {
           return Err(DbError::Capacity {
             table: "green_chains",
@@ -1437,7 +1434,57 @@ impl Partition {
         }
         Ok(())
       }
+      // A green adopted by its successor is recorded by its adoption (A-333): a new volume, checked as a creation is.
+      Op::GreenAdopted { record, .. } => self.check_volume_created(record),
     }
+  }
+
+  /// The check of a volume's creation, and of a green's by its adoption (A-333): the id and the name free here (a name
+  /// this partition holds for another partition's volume is that volume's, A-236, confirmed or not), no tombstone owed
+  /// under the id, and room in the volumes table.
+  fn check_volume_created(&self, record: &crate::catalog::VolumeRecord) -> Result<(), DbError> {
+    if let Some(existing) = self.volume(record.id) {
+      return Err(DbError::AlreadyExists {
+        existing: existing.id.bytes,
+      });
+    }
+    if let Some(existing) = self.volume_by_name(&record.name) {
+      return Err(DbError::AlreadyExists {
+        existing: existing.id.bytes,
+      });
+    }
+    if let Some(alias) = self.name_alias(&record.name) {
+      return Err(DbError::AlreadyExists {
+        existing: alias.volume.bytes,
+      });
+    }
+    if self.tombstones.contains_key(&record.id) {
+      return Err(DbError::AlreadyExists {
+        existing: record.id.bytes,
+      });
+    }
+    if self.volume_slots_used() >= self.caps.volumes {
+      return Err(DbError::Capacity { table: "volumes" });
+    }
+    Ok(())
+  }
+
+  /// Version 0 of a green is recorded once and only before anything after it, whatever form it takes — the origin's
+  /// bytes, a reference to its base snapshot (A-217) or an adoption from this node's holder ledger (A-333, which records
+  /// the green itself, so nothing precedes it): a chain that has advanced was based on whatever origin it had, so a later
+  /// one would rewrite history. `AlreadyExists` otherwise.
+  fn check_version_zero_unrecorded(&self, green: VolumeId) -> Result<(), DbError> {
+    if self.green_origins.contains_key(&green)
+      || self.green_origin_refs.contains_key(&green)
+      || self.green_adoptions.contains_key(&green)
+      || self.green_checkpoints.contains_key(&green)
+      || !self.green_chain(green).is_empty()
+    {
+      return Err(DbError::AlreadyExists {
+        existing: green.bytes,
+      });
+    }
+    Ok(())
   }
 
   /// A lease is taken by a new holder only after the current one expired or was released,
@@ -1882,6 +1929,24 @@ impl Partition {
         self.green_origin_refs.insert(*green, *origin);
         Ok(())
       }
+      Op::GreenAdopted {
+        record,
+        version,
+        identity,
+        origin,
+      } => {
+        self.insert_volume(record.clone())?;
+        self.green_adoptions.insert(
+          record.id,
+          GreenAdoption {
+            green: record.id,
+            version: *version,
+            identity: *identity,
+            origin: *origin,
+          },
+        );
+        Ok(())
+      }
       Op::WorkLogged { work, entry } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
         self.work_logs.entry(*work).or_default().push(entry.clone());
@@ -2002,6 +2067,7 @@ impl Partition {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(origin.len());
     }
     self.green_origin_refs.remove(&id);
+    self.green_adoptions.remove(&id);
     if let Some((_, checkpoint)) = self.green_checkpoints.remove(&id) {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(checkpoint.len());
     }
@@ -2152,6 +2218,7 @@ impl Partition {
           bytes: bytes.clone(),
         })
         .collect(),
+      green_adoptions: self.green_adoptions.values().copied().collect(),
       captured_bases: self.captured_bases.iter().copied().collect(),
       work_logs: self
         .work_logs
@@ -2379,6 +2446,9 @@ impl Partition {
     }
     for held in &snapshot.green_origin_refs {
       self.green_origin_refs.insert(held.green, held.origin);
+    }
+    for adoption in &snapshot.green_adoptions {
+      self.green_adoptions.insert(adoption.green, *adoption);
     }
     for checkpoint in &snapshot.green_checkpoints {
       self.green_chain_bytes = self
