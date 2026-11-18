@@ -4376,7 +4376,13 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
 > p999 under 1 ms at load 30. Since 2026-11-18 the round is counted hop by hop on the owner (§4.10 status "The round,
 > counted hop by hop": `fleet.live.hop.*`, the hops adding up to the round exactly); its breakdown under the contract
-> command is owed. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
+> command is owed. A-396 (2026-11-18): the round's cost was parked threads, not the hop; each shard on a write's path
+> asks to hold its idle window across its wait, the windows learned from the traffic, each hold kept only while the
+> shard's measured idle turn is shorter than its wake (A-387's predicate: a macOS shard declines). First A/B at load
+> 78–93 (adacachy): added 86–115 µs against main's 186–295, but the live p999 not better (4.2–27.7 ms against 2.6–15.1)
+> and the plain write's p99 worse (293–1,024 against 132–785 µs): suspected the unit's CPU quota spent by the spinning
+> shards; landed before its A/B (Ada's rule of 2026-11-18), the supervisor's A/B with `nr_throttled` is owed and
+> decides whether the holds stay. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
 > to holders of its catalog, and a lane waits for its requests before it ends (§4.10 status "One lane a holder"): a
 > write no longer waits for a stopped candidate (main: 406–1,064 ms for the first write after a stop, now 3–99 ms), and
 > no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
