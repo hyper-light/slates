@@ -12172,6 +12172,106 @@ fn a_takeovers_envelope_is_opened_in_turns_and_served() {
   );
 }
 
+/// Format: a node's count of the owner-shard turns of its taken-over volumes' restores, planned or restored
+/// (`fleet::restore_in_turns`).
+const MATERIALIZE_RESTORE_SLICES: &str = "fleet.materialize.restore_slices";
+/// Format: a node's count of the owner-shard turns its taken-over volumes' trees were laid in (`fleet::populate_in_turns`).
+const MATERIALIZE_POPULATE_SLICES: &str = "fleet.materialize.populate_slices";
+/// Format: a node's count of the takeover materializations begun on its owner shards (`fleet::make_taken`).
+const MATERIALIZE_BEGUN: &str = "fleet.materialize.begun";
+/// Format: a node's control shard's count of the turns it copied a held archive out in (`fleet::held_archive_in_turns`).
+const MATERIALIZE_ARCHIVE_SLICES: &str = "fleet.materialize.archive_slices";
+
+/// g251 (CLAUDE.md "Bounded work everywhere"; g232's 1.99 GB kernel base volume restored and laid in one poll), §4.8
+/// "Promotion and takeover": a placed seal's takeover is copied out of the held store, restored and laid into its volume
+/// in turns, by a task of the successor's owner shard that the control shard's later attempts join. Do: three nodes at
+/// `f = 1`, one shard a node; on a, one volume of 24 files of distinct bytes, shared with the fleet, sealed and held by
+/// both other nodes; cut the survivors' seal turns to one unit (`Daemon::inject_seal_walk_quantum(Some(0))`: a piece a
+/// turn, a page a write); stop a; once the survivor the volume ranks first serves it, read every file through it. Expect
+/// the volume served and every file read back; the held archive copied out in turns (non-vacuous); its restore in more
+/// turns than it has files, and its tree laid in more turns than it has files; one materialization begun and none begun
+/// while one ran; and both survivors' longest steps under the watchdog's window. Before, the restore and the laying of the
+/// tree ran inside the one owner-shard turn that made the volume, behind a call whose deadline was a period, so a large
+/// volume held its shard for seconds and every period's attempt that the turn outlasted began again.
+#[test]
+fn a_placed_seals_takeover_is_restored_and_laid_in_turns() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = match sealed_many_and_held(&daemons, "laid") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  for daemon in &daemons[1..] {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+  }
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..OPENED_CHUNKS)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/opened-{file}"));
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == opened_body(file))
+    })
+    .collect();
+  drop(reader);
+  let counters = summed_counters(&daemons[index]);
+  let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
+  let (archive_slices, restore_slices, populate_slices, begun, twice) = (
+    counted(MATERIALIZE_ARCHIVE_SLICES),
+    counted(MATERIALIZE_RESTORE_SLICES),
+    counted(MATERIALIZE_POPULATE_SLICES),
+    counted(MATERIALIZE_BEGUN),
+    counted(MAKING_ALREADY),
+  );
+  let longest_steps_ns: Vec<u64> = daemons.iter().map(control_longest_poll_ns).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a placed seal's takeover in turns: served {served}, read {read:?}, {archive_slices} archive turns, \
+     {restore_slices} restore turns and {populate_slices} laying turns for {OPENED_CHUNKS} files, {begun} begun, \
+     {twice} begun twice, the survivors' longest steps {longest_steps_ns:?} ns"
+  );
+  assert!(served, "the successor serves the volume");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+  let files = u64::try_from(OPENED_CHUNKS).unwrap();
+  assert!(
+    archive_slices >= 1,
+    "non-vacuity: the held archive was copied out in turns ({archive_slices})"
+  );
+  assert!(
+    restore_slices > files,
+    "the archive was restored a piece a turn: {restore_slices} turns for {files} files"
+  );
+  assert!(
+    populate_slices > files,
+    "the tree was laid a piece a turn: {populate_slices} turns for {files} files"
+  );
+  assert_eq!(begun, 1, "the volume was made once");
+  assert_eq!(
+    twice, 0,
+    "no materialization of the volume was begun while one ran"
+  );
+  assert!(
+    longest_steps_ns
+      .iter()
+      .all(|longest| *longest < LIVENESS_BUDGET_NS),
+    "the survivors' longest steps {longest_steps_ns:?} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// Shape: the distinct files of the wrapped volume, each its own chunk, so its envelope seals that many chunks.
 const WRAPPED_CHUNKS: usize = 24;
 /// Format: the owner's count of the owner-shard turns its envelope wraps took (`fleet::wrap_slice`).
@@ -14346,6 +14446,106 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   assert!(
     all_taken,
     "each holder took every entry of the burst: {taken_before:?} -> {taken_after:?}"
+  );
+}
+
+/// Shape: the writes of [`a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it`]'s closed loop.
+const HOP_LOOP_WRITES: usize = 16;
+/// Format: the owner's hops of a live write's round, each a counter of writes timed and one of their nanoseconds
+/// (`live_ship::HOP_*`): the build, the hop to the control shard, the lane, the exchange and the hop back.
+const LIVE_HOPS: [(&str, &str); 5] = [
+  ("fleet.live.hop.build", "fleet.live.hop.build_ns"),
+  ("fleet.live.hop.to_control", "fleet.live.hop.to_control_ns"),
+  ("fleet.live.hop.lane", "fleet.live.hop.lane_ns"),
+  ("fleet.live.hop.exchange", "fleet.live.hop.exchange_ns"),
+  ("fleet.live.hop.to_owner", "fleet.live.hop.to_owner_ns"),
+];
+/// Format: the owner's count of rounds timed and their nanoseconds, end to end.
+const LIVE_ROUND: (&str, &str) = ("fleet.live.hop.round", "fleet.live.hop.round_ns");
+/// Format: a holder's count of entries served and their nanoseconds, arrival to answer.
+const LIVE_HOLDER_HOP: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holder_ns");
+
+/// §4.10 "Live shipping" (A-200's owed breakdown, A-396): do write a live-shipped volume over and over from one client,
+/// each write sent once the last was answered. Expect every write answered at durability, its round timed on the owner hop
+/// by hop (the build, the hop to the control shard, the lane, the exchange, the hop back), each hop counted once a timed
+/// round, and the hops' nanoseconds adding up to the rounds' exactly: each is the difference of consecutive stamps on the
+/// host's one monotonic clock, so a hop measured across shards is as sound as one within a shard. And a holder's serve
+/// timed too. These are the counters a run of the contract command reads the round's hops apart by.
+#[test]
+fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "hops".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BURST_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the timed volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let replies: Vec<ReplyBody> = (0..HOP_LOOP_WRITES)
+    .map(|write| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: "/timed".to_owned(),
+        bytes: vec![u8::try_from(write % 251).unwrap(); BURST_WRITE_BYTES],
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let count = |daemon: &Daemon, kind: &str| refusal_count(daemon, kind).unwrap();
+  let hops: Vec<(u64, u64)> = LIVE_HOPS
+    .iter()
+    .map(|(timed, ns)| (count(&daemons[0], timed), count(&daemons[0], ns)))
+    .collect();
+  let round = (
+    count(&daemons[0], LIVE_ROUND.0),
+    count(&daemons[0], LIVE_ROUND.1),
+  );
+  let holders: Vec<u64> = [&daemons[1], &daemons[2]]
+    .iter()
+    .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("hops: (timed, ns) {hops:?}; round {round:?}; holders' serves {holders:?}");
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write of the loop is answered at durability: {replies:?}"
+  );
+  assert!(round.0 > 0, "rounds were timed: {round:?}");
+  for (index, (timed, _)) in hops.iter().enumerate() {
+    assert_eq!(
+      *timed, round.0,
+      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
+    );
+  }
+  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
+  assert_eq!(
+    summed, round.1,
+    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  );
+  assert!(
+    holders.iter().any(|served| *served > 0),
+    "a holder's serves were timed: {holders:?}"
   );
 }
 

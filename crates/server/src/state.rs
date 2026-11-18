@@ -886,7 +886,7 @@ pub struct ShardState {
   /// the held copies is cut by in place of the shard's step quantum (`fleet::install_slice`).
   pub(crate) install_walk_quantum_ns: Option<u64>,
   /// Test support (`Daemon::inject_live_turn_pause`, never set in production): a wait between the turns of a live
-  /// takeover's rebuild on this owner shard (`fleet::make_live_in_turns`, g251), so a test's materialization outlasts
+  /// takeover's rebuild on this owner shard (`fleet::rebuild_in_turns`, g251), so a test's materialization outlasts
   /// the control shard's periods and its later attempts meet it running.
   pub(crate) live_turn_pause_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
@@ -1180,11 +1180,17 @@ pub struct ShardState {
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
   /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
   pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
-  /// On a taken-over volume's owner shard, its materialization from a live log made in turns of this shard's clock by a
-  /// task of its own (g251, `fleet::make_live`): running, with the turns it has taken, or ended, until the control
-  /// shard's next attempt reads the end and forgets it. A later attempt joins a running one and never rebuilds the log
-  /// again. At most one a volume this shard is making, which the takeover's pending materializations bound.
+  /// On a taken-over volume's owner shard, its materialization made in turns of this shard's clock by a task of its own
+  /// (g251, `fleet::make_taken`; a live log's or a placed seal's): running, with the turns it has taken, or ended, until
+  /// the control shard's next attempt reads the end and forgets it. A later attempt joins a running one and never
+  /// gathers or makes the volume again. At most one a volume this shard is making, which the takeover's pending
+  /// materializations bound.
   pub making_taken_over: BTreeMap<ObjectId, Making>,
+  /// On a taken-over volume's owner shard, the volume its materialization is making (g251, `verbs::MakingVolume`):
+  /// created and admitted, its restored tree laid in a piece a turn, until it is recorded and published or discarded
+  /// with its credits given back. Held here between turns, not by the task alone, so a refusal or a give-up leaves
+  /// nothing behind. At most one a volume in `making_taken_over`.
+  pub making_volumes: BTreeMap<slates_db::catalog::VolumeId, crate::verbs::MakingVolume>,
   /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
   /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
   /// record continues the register from that sequence. Bounded by the objects this node owns.
