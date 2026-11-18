@@ -7080,7 +7080,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > answered only once durable, fenced or destroyed: every transport judges its own held reply by the rule above, and
 > this, its own holder, by none. So a log that could never be held kept its writer waiting as long as its daemon lived:
 > A-353's successor, whose holders' catalog was refused for good, held a write 21 minutes (g229's capture, 2026-11-18).
-> Each held reply now keeps when it was held and is refused at the rule's total bound, the failover SLO from its hold:
+> Each held reply now keeps when it was held and is refused at the rule's total bound, the failover SLO from its hold
+> (read from the rule's own spans, `live_ship::durable_spans`, so it is the transports' bound and follows the failover
+> estimate wherever it is published, never a number of its own):
 > judged at the period's visit to its volume (`live_ship::judge_held`), a destroy's once a period on its shard
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
