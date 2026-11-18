@@ -137,8 +137,16 @@ pub struct LandingApproval {
   pub manifest: [u8; 32],
   /// What would be written.
   pub summary: Summary,
-  /// How the landing's signature was judged.
+  /// How the landing's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
   pub verification: Verification,
+  /// The landing's statement (A-321): the exact bytes a signature over this landing signs, as the daemon states them —
+  /// the volume, the target as the request names it and this manifest, one field a line. Sign it under the namespace
+  /// `slates-work` (`ssh-keygen -Y sign -n slates-work -f KEY FILE`); the signature verifies for this manifest alone.
+  pub statement: Vec<u8>,
+  /// The signature the landing carried, carried again by its approval (A-321): [`crate::Instance::approve_landing`]
+  /// presents and lands with it, so the landing is recorded with its verdict. An approver may set one made over
+  /// [`LandingApproval::statement`] before approving; a signature permits nothing either way.
+  pub signature: Option<WorkSignature>,
 }
 
 impl LandingApproval {
@@ -248,7 +256,8 @@ pub struct LandingReport {
   pub degraded_elided: u32,
   /// The batch barriers taken (A-130).
   pub barriers: u64,
-  /// The landing's signature, as judged.
+  /// How the landing's signature was judged against the manifest it wrote (A-321), as its finished audit record keeps
+  /// it ([`crate::Instance::audit`]): `Unsigned` when it carried none.
   pub verification: Verification,
 }
 
@@ -266,25 +275,29 @@ pub enum LandingState {
 }
 
 impl LandingState {
-  /// The state the daemon names in a landing's outcome (`done`, `partial`, `refused`, `aborted`).
-  fn of_name(name: &str) -> Option<LandingState> {
-    match name {
-      "done" => Some(Self::Done),
-      "partial" => Some(Self::Partial),
-      "refused" => Some(Self::Refused),
-      "aborted" => Some(Self::Aborted),
-      _ => None,
+  /// A finished landing's state from its outcome's typed stage (A-299, 2026-11-18: until then read from its name); a
+  /// stage short of the end is no finished landing's.
+  fn of_stage(stage: slates_ipc::protocol::LandingStage) -> Option<LandingState> {
+    use slates_ipc::protocol::LandingStage as Stage;
+    match stage {
+      Stage::Done => Some(Self::Done),
+      Stage::Partial => Some(Self::Partial),
+      Stage::Refused => Some(Self::Refused),
+      Stage::Aborted => Some(Self::Aborted),
+      Stage::Planning
+      | Stage::AwaitingGrant
+      | Stage::Validating
+      | Stage::Writing
+      | Stage::Syncing
+      | Stage::Advancing => None,
     }
   }
 }
 
-/// The daemon's landing outcome as the contract types it.
-pub(crate) fn report_of(
-  outcome: LandingOutcome,
-  verification: Verification,
-) -> Result<LandingReport, Error> {
+/// The daemon's landing outcome as the contract types it, with how its signature was judged (A-321).
+pub(crate) fn report_of(outcome: LandingOutcome) -> Result<LandingReport, Error> {
   let state =
-    LandingState::of_name(&outcome.state).ok_or(Error::Protocol(ProtocolFault::UnknownName {
+    LandingState::of_stage(outcome.stage).ok_or(Error::Protocol(ProtocolFault::UnknownName {
       field: "landing state",
     }))?;
   Ok(LandingReport {
@@ -300,36 +313,28 @@ pub(crate) fn report_of(
     degraded: outcome.degraded,
     degraded_elided: outcome.degraded_elided,
     barriers: outcome.barriers,
-    verification,
+    verification: Verification::of_wire(outcome.verification),
   })
 }
 
-/// The daemon's landing summary as the contract types it: each action the manifest names counted under its own field.
-pub(crate) fn summary_of(summary: &LandingSummary) -> Result<Summary, Error> {
-  let mut actions = ActionTally::default();
-  for counted in &summary.by_action {
-    let field = match counted.action.as_str() {
-      "create" => &mut actions.create,
-      "replace" => &mut actions.replace,
-      "delete" => &mut actions.delete,
-      "rename" => &mut actions.rename,
-      "mkdir" => &mut actions.mkdir,
-      "rmdir" => &mut actions.rmdir,
-      "symlink" => &mut actions.symlink,
-      "clear" => &mut actions.clear,
-      _ => {
-        return Err(Error::Protocol(ProtocolFault::UnknownName {
-          field: "landing action",
-        }));
-      }
-    };
-    *field = field.saturating_add(counted.count);
-  }
-  Ok(Summary {
-    actions,
+/// The daemon's landing summary as the contract types it: each action the manifest names counted under its own field,
+/// read from the typed tally (A-299; the names are for people).
+pub(crate) fn summary_of(summary: &LandingSummary) -> Summary {
+  let typed = summary.actions;
+  Summary {
+    actions: ActionTally {
+      create: typed.create,
+      replace: typed.replace,
+      delete: typed.delete,
+      rename: typed.rename,
+      mkdir: typed.mkdir,
+      rmdir: typed.rmdir,
+      symlink: typed.symlink,
+      clear: typed.clear,
+    },
     bytes: summary.bytes,
     filtered_out: summary.filtered_out,
-  })
+  }
 }
 
 /// A merge window's class from its wire discriminant (`MergeWindow::class`, `MergeConflictClass as u8`), read against
@@ -358,32 +363,32 @@ pub(crate) fn merge_class_of(discriminant: u8) -> Result<MergeConflictClass, Err
 
 #[cfg(test)]
 mod tests {
-  use slates_ipc::protocol::{ActionCount, LandingSummary};
+  use slates_ipc::protocol::LandingSummary;
 
   use super::{MergeConflictClass, merge_class_of, summary_of};
   use crate::error::{Error, ProtocolFault};
 
-  /// A-299: do type a summary naming every action the manifest has, and one naming an action it has not; expect each
-  /// count under its own field and the total their sum, and the unknown name refused as a protocol fault, never counted
-  /// under another.
+  /// A-299: do type a summary whose typed tally counts every action the manifest has, its names for people left
+  /// empty; expect each count under its own field and the total their sum. The names are never read (2026-11-18: until
+  /// then the summary was read from them, and a name the contract did not know was a protocol fault).
   #[test]
-  fn a_summary_counts_each_action_under_its_own_name() {
-    let names = [
-      "create", "replace", "delete", "rename", "mkdir", "rmdir", "symlink", "clear",
-    ];
+  fn a_summary_counts_each_action_under_its_own_field() {
     let summary = LandingSummary {
-      by_action: names
-        .iter()
-        .zip(1u64..)
-        .map(|(name, count)| ActionCount {
-          action: (*name).to_owned(),
-          count,
-        })
-        .collect(),
+      by_action: Vec::new(),
       bytes: 7,
       filtered_out: 2,
+      actions: slates_ipc::protocol::ActionTally {
+        create: 1,
+        replace: 2,
+        delete: 3,
+        rename: 4,
+        mkdir: 5,
+        rmdir: 6,
+        symlink: 7,
+        clear: 8,
+      },
     };
-    let typed = summary_of(&summary).unwrap();
+    let typed = summary_of(&summary);
     let actions = typed.actions;
     assert_eq!(
       [
@@ -400,19 +405,6 @@ mod tests {
     );
     assert_eq!(actions.total(), 36);
     assert_eq!((typed.bytes, typed.filtered_out), (7, 2));
-    let unknown = LandingSummary {
-      by_action: vec![ActionCount {
-        action: "chmod".to_owned(),
-        count: 1,
-      }],
-      ..LandingSummary::default()
-    };
-    assert_eq!(
-      summary_of(&unknown),
-      Err(Error::Protocol(ProtocolFault::UnknownName {
-        field: "landing action"
-      }))
-    );
   }
 
   /// A-299, D-27: do read every merge window class back from the discriminant the daemon sends (`class as u8`), and one

@@ -2652,13 +2652,20 @@ pub(crate) async fn run_merge_period(
         .await
       }
       MergeWork::ShipWorkCatalog(catalog) => {
-        let dispatch =
+        let shipped =
           crate::fleet::ship_owed_catalog(origin, owner_acceptor, local, &catalog, budget).await;
-        // The catalog's placement is recorded on its owner shard ahead of the next pass's question there, which
-        // this wakes, so the version that waited for it ships at once. A refused borrow loses this wake and is
-        // counted; the coordinator's next period still ships the version.
-        let _ = crate::state::with_state_counted(nudge_record_plane);
-        dispatch
+        // A placement that came back is recorded on the catalog's owner shard ahead of the next pass's question there,
+        // which this wakes, so the version that waited for it ships at once. Only that nudges, as only an event that
+        // makes new work does ([`nudge_record_plane`]): a ship that found no session, or that the runtime refused, sent
+        // nothing, and a pass run at once would only ship it again, with nothing awaited between, for good. Before, every
+        // ship nudged: on windows-11-arm a work made while its catalog's candidates had no session held the control
+        // shard inside its record plane's poll until the watchdog ended the process (g251, diag-g251-spin-3), and the
+        // sessions, whose tasks run on that shard, could never come. Such a ship waits for the coordinator's next
+        // period. A refused borrow loses this wake and is counted; the coordinator's next period still ships the version.
+        if shipped.recorded {
+          let _ = crate::state::with_state_counted(nudge_record_plane);
+        }
+        shipped.dispatch
       }
     };
     if let Some(dispatch) = dispatch {

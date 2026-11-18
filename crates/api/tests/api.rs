@@ -2,8 +2,8 @@
 //! embedding host's whole flow over a daemon in this process — attach, the consensus group, volumes provisioned from
 //! each source, snapshotted, cloned and destroyed, an overlay written, its drift read typed, a landing presented for
 //! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, a signed
-//! merge judged and its record read back (a signed landing refused until the daemon verifies a landing's signature), a
-//! Shards stream that serves the volume, and the daemon observed — each
+//! merge and a signed landing judged and their records read back, a Shards stream that serves the volume, and the
+//! daemon observed — each
 //! outcome and each refusal asserted as its typed variant. Every test drives the crate's own verbs and judges only what
 //! a host could observe: the daemon's answers and the bytes on the disk.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -32,7 +32,7 @@ use slates_api::{
 #[cfg(unix)]
 use slates_api::{
   AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, LandOutcome, LandingApproval,
-  LandingConflict, LandingStage, LandingState, Unsupported,
+  LandingConflict, LandingStage, LandingState,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -227,15 +227,6 @@ fn issuer_of(daemon: &Daemon) -> slates_api::Issuer {
   slates_api::Issuer::from_handoff(&daemon.segment().handoff_env().unwrap()).unwrap()
 }
 
-/// A signature in `ssh-keygen -Y sign`'s armour, for the refusals that come before any verifier reads it.
-#[cfg(unix)]
-fn a_signature() -> WorkSignature {
-  WorkSignature::from_armoured(
-    "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----",
-  )
-  .unwrap()
-}
-
 /// T-5.1's library form (A-278, §4.7; A-299): do attach to an instance no daemon serves; expect the typed
 /// `Unavailable`, retryable once an instance runs, never a hang or a panic, naming the instance asked.
 #[test]
@@ -364,7 +355,7 @@ fn the_launchers_authority_needs_the_anchors_handoff() {
 /// landing answered `ApprovalRequired` with a typed summary (one create, one replace, `.git` filtered out), unsigned,
 /// listing exactly the two files as they read; the stale approval writing nothing and answering the fresh
 /// presentation; the shown one `Written`, `Done`, two entries, and the folder then holding exactly the volume's two
-/// files with `.git/HEAD` as it was; a signed landing refused `Unsupported(SignedWork)` before anything is sent.
+/// files with `.git/HEAD` as it was.
 #[cfg(unix)]
 #[test]
 fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
@@ -412,24 +403,27 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   daemon.stop();
 }
 
-/// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request` signed, then unsigned.
-/// Expect the signed landing refused `Unsupported(SignedWork)` before anything is sent, and the unsigned one answered
-/// `ApprovalRequired`, unsigned, for `request`, with a typed summary of one create and one replace, `.git` filtered out.
-/// Returns the approval.
+/// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request`, unsigned. Expect it
+/// answered `ApprovalRequired`, unsigned and carrying no signature, for `request`, with the landing's statement and a
+/// typed summary of one create and one replace, `.git` filtered out. Returns the approval.
 #[cfg(unix)]
 fn expect_an_approval_asked(
   instance: &mut Instance,
   request: &slates_api::LandingRequest,
 ) -> LandingApproval {
-  assert_eq!(
-    instance.land(request, Some(&a_signature())),
-    Err(Error::Unsupported(Unsupported::SignedWork))
-  );
   let LandOutcome::ApprovalRequired(approval) = instance.land(request, None).unwrap() else {
     panic!("a landing with changes asks under today's mode");
   };
   assert_eq!(approval.request, *request);
-  assert_eq!(approval.verification, Verification::Unsigned);
+  assert_eq!(
+    (approval.verification, approval.signature.as_ref()),
+    (Verification::Unsigned, None)
+  );
+  assert!(
+    approval.statement.starts_with(b"slates landing v1\n"),
+    "{:?}",
+    String::from_utf8_lossy(&approval.statement)
+  );
   assert_eq!(
     (
       approval.summary.actions.create,
@@ -591,7 +585,7 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
 /// merges. Expect: an unset volume's policy reads back as none; the bypass volume read back as set and landed in the one
 /// call, `Written` and `Done`, its file on the disk; its plan presented and nothing written (the daemon's present-only
 /// verb); the forbid volume's landing answered `Refused` by its own policy and nothing written; and the signed-merge
-/// requirement refused `Unsupported(SignedWork)` before anything is sent, since the daemon does not keep it yet.
+/// requirement set and read back on the volume, a consumer's refused (A-321).
 #[cfg(unix)]
 #[test]
 fn a_landing_follows_its_volumes_write_mode() {
@@ -877,6 +871,95 @@ fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
     Err(Error::NotFound(Missing::Version { green, version: 9 }))
   );
   daemon.stop();
+}
+
+/// AC-5.10 / AC-5.12 (A-321; §4.15, §4.12 "The consumer contract") on the landing a host drives (Unix: the daemon lands
+/// on Unix): do trust a key on an overlay with the launcher's authority; plan its landing; sign the statement the plan
+/// states with the trusted key and land with the signature under the ask an unset volume has; approve the approval it
+/// answers; read the audit. Expect the plan unsigned, stating the landing for a signer; the signed landing asked again
+/// over the same manifest, verified naming the key and carrying the signature, nothing written; the approval `Written`
+/// and verified, the file on the disk; and the landing's planned and finished audit records verified.
+#[cfg(unix)]
+#[test]
+fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
+  let (daemon, mut instance) = grouped("signed-landing");
+  let launcher = issuer_of(&daemon);
+  let folder = Folder::new();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("signed-landing", &folder.path, ROOM),
+  );
+  write_file(&mut instance, volume, "/s.txt", b"signed\n");
+  let key = signer::TestSigner::fresh();
+  let trusted = TrustedSigner::from_wire(key.public()).unwrap();
+  instance
+    .set_signers(volume, std::slice::from_ref(&trusted), &launcher)
+    .unwrap();
+  let request = landing_into(volume, &folder);
+  let LandOutcome::ApprovalRequired(plan) = instance.plan_landing(&request).unwrap() else {
+    panic!("a plan presents");
+  };
+  assert_eq!(plan.verification, Verification::Unsigned);
+  let signature = WorkSignature::from_blob(key.sign(&plan.statement));
+  let verified = Verification::Verified {
+    signer: trusted.signer(),
+  };
+  let LandOutcome::ApprovalRequired(asked) = instance.land(&request, Some(&signature)).unwrap()
+  else {
+    panic!("an unset volume asks, signed or not");
+  };
+  assert_eq!(
+    (asked.manifest, asked.verification, asked.signature.as_ref()),
+    (plan.manifest, verified, Some(&signature))
+  );
+  assert_eq!(
+    folder.read("s.txt"),
+    None,
+    "nothing written before the approval"
+  );
+  let LandOutcome::Written(report) = instance.approve_landing(&asked, &launcher).unwrap() else {
+    panic!("the approved manifest lands");
+  };
+  assert_eq!(report.verification, verified);
+  assert_eq!(folder.read("s.txt").unwrap(), b"signed\n");
+  expect_the_signed_landing_audited(&mut instance, report.landing, verified);
+  daemon.stop();
+}
+
+/// The audit of `a_signed_landing_is_judged_and_read_back_through_the_contract`. Expect every record of `landing` that
+/// judges its signature `verified`, a planned and a finished one among them, and no other kind of record judging one.
+#[cfg(unix)]
+fn expect_the_signed_landing_audited(
+  instance: &mut Instance,
+  landing: u64,
+  verified: Verification,
+) {
+  let audit = instance.audit(0).unwrap();
+  let judged: Vec<(AuditKind, Verification)> = audit
+    .iter()
+    .filter(|record| record.landing == Some(landing))
+    .filter_map(|record| Some((record.kind, record.verification?)))
+    .collect();
+  assert!(
+    judged.iter().all(|(_, verdict)| *verdict == verified),
+    "{audit:?}"
+  );
+  for kind in [AuditKind::LandingPlanned, AuditKind::LandingFinished] {
+    assert!(
+      judged.iter().any(|(judged, _)| *judged == kind),
+      "{audit:?}"
+    );
+  }
+  assert!(
+    audit
+      .iter()
+      .filter(|record| record.verification.is_some())
+      .all(|record| matches!(
+        record.kind,
+        AuditKind::LandingPlanned | AuditKind::LandingFinished
+      )),
+    "{audit:?}"
+  );
 }
 
 /// AC-5.12 (A-299, A-285; §4.16): do set a green's merge mode to ask with the launcher's authority, merge a work into

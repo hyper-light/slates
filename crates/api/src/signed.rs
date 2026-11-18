@@ -1,9 +1,10 @@
 //! Signed work (§4.12 "The consumer contract", A-299; A-321; Ada, 2026-11-18: "we can (and should) support signed work
-//! (signed merges, etc.)"). A merge may carry a signature by its author's key over the merge's statement, and its
-//! outcome says how the daemon judged it: verified (by which key), unsigned, or invalid (why). A volume's policy may
+//! (signed merges, etc.)"). A merge or a landing may carry a signature by its author's key over the act's statement, and
+//! its outcome says how the daemon judged it: verified (by which key), unsigned, or invalid (why). A volume's policy may
 //! require signed merges ([`crate::WritePolicy::require_signed_merges`]), and its trusted signers are set by the launcher
-//! ([`crate::Instance::set_signers`]). The verdict is recorded with the version, so a consumer reads it back
-//! ([`crate::Instance::merge_record`]).
+//! ([`crate::Instance::set_signers`]). The verdict is recorded as the act's provenance, so a consumer reads it back: a
+//! merge's with the version ([`crate::Instance::merge_record`]), a landing's on its audit records
+//! ([`crate::Instance::audit`]).
 //!
 //! **Signatures never gate permission.** Whether a merge or a landing may write is the caller's write mode
 //! ([`crate::WriteMode`]), set by the launcher or the harness; a signature only says who made the work. A volume that
@@ -16,9 +17,13 @@
 //! [`crate::Instance::merge_statement`]), which names the work, its green, its base and the increment's identity, so a
 //! signature verifies for exactly the increment it was made over and never once the work changes.
 //!
-//! **Landings.** A landing's statement and its verification are the daemon's next piece (A-321, GAPS); until they land,
-//! a landing that carries a signature is refused `Unsupported(SignedWork)` before anything is sent, and every landing's
-//! outcome reports [`Verification::Unsigned`], which is the truth.
+//! **Landings.** A landing's statement names the volume, the target as the request names it (its length first, so no
+//! path forges a later line) and the manifest hash (§4.15 step 2), which binds every entry written; every presentation
+//! states it ([`crate::LandingApproval::statement`]). The daemon judges a landing's signature under the volume's trusted
+//! signers against the manifest it presents and again against the one it writes, so the approval shows the verdict an
+//! approver weighs and the report the verdict of what reached the disk ([`crate::LandingReport::verification`]). An
+//! approval carries the signature on to the landing it approves ([`crate::LandingApproval::signature`]). Nothing
+//! requires a signed landing: whether it writes is the mode's alone.
 
 use std::fmt;
 

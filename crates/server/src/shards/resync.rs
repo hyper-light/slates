@@ -2,15 +2,26 @@
 //! stream, so that a successor daemon can hand the device a fresh stream for the same attachment after this daemon dies
 //! (`slates_bridge_fuse::shards_resync` holds the wire, the conditions Shards' coordinator set, and their evidence).
 //!
-//! **At the attach** ([`establish`]): a message pair (`slates_ipc::stream::message_pair`); the attachment's resync
-//! token, 128 bits from the daemon's secure random, never its NFS mount capability; the `Attached` message written on
-//! the daemon's end before the device has its own, so it is the first thing the device reads. The daemon's end then
-//! goes to the anchor as a held descriptor, keyed by the attachment, with the token and the stream's owner view as its
-//! session bytes ([`session_bytes`]), before the attachment's record commits, so a committed record never names a
-//! channel the anchor was not given; and the daemon closes its own copy. The anchor needs nothing of its own for it: its
-//! hold is the one it keeps for a FUSE device (`slates_anchor::held`), and the next daemon tells the two apart by the
-//! form of the attachment's record. A daemon with no anchor, or one whose hold is refused, closes its end at once: the
-//! device reads `Attached` and then the channel's end, and knows its share ends with this daemon (Shards' option (a)).
+//! **At the attach** ([`establish`]): a message pair (`slates_ipc::stream::message_pair`: sequenced packets on Linux,
+//! a stream of fixed-length messages on macOS, A-339); the attachment's resync token, 128 bits from the daemon's secure
+//! random, never its NFS mount capability; the `Attached` message written on the daemon's end before the device has its
+//! own, so it is the first thing the device reads. The daemon's end then goes to the anchor as a held descriptor, keyed
+//! by the attachment, with the token and the stream's owner view as its session bytes ([`session_bytes`]), before the
+//! attachment's record commits, so a committed record never names a channel the anchor was not given. The anchor needs
+//! nothing of its own for it: its hold is the one it keeps for a FUSE device (`slates_anchor::held`), and the next
+//! daemon tells the two apart by the form of the attachment's record. A daemon with no anchor, or one whose hold is
+//! refused, closes its end at once: the device reads `Attached` and then the channel's end, and knows its share ends
+//! with this daemon (Shards' option (a)).
+//!
+//! **The daemon keeps its own copy of its end while the anchor holds one** ([`Resync::end`], A-339). XNU flushes a Unix
+//! socket whose every reference rides a message in flight whenever its collector of such descriptors runs (`unp_gc`,
+//! which any Unix socket's close in the system can start): its collector walks only descriptors that are themselves in
+//! flight, so a socket waiting in the receive buffer of one never sent (the anchor's end of its channel) is never found
+//! reachable. Flushed, the end would read its own end of file for good, and its owner could never again tell the device's
+//! close from it. An end sent to the anchor and closed at once is all in flight until the anchor's receive, so the
+//! daemon keeps its copy until the attachment's end or [`give_up`], and closes it then with the anchor's: the device
+//! reads the channel's end only when both are gone. Linux's collector takes only unreachable cycles (measured not to
+//! flush a handed end, A-161's record); the copy is kept there too, so the two platforms run one rule.
 //!
 //! **While the stream lives**: the owner view the guest's root names (A-281) is told to the anchor as the hold's new
 //! session ([`tell_owners`]); a stream whose guest maps a file with DAX gives its resync up ([`give_up`]), since the
@@ -23,8 +34,8 @@
 //! successor serves it on a fresh stream as the same attachment (its owner view from the hold's session, no `INIT`, no
 //! restore), then hands the device the fresh stream's end over the held channel in a `Resync` naming the same token.
 //! A request the dead daemon published with its effect and never answered is answered from that reply when the device
-//! resends it (A-61's rule, `crate::shards`'s replay). Not here yet: the macOS hand-off of the end (and the write log
-//! a resync there needs), DAX objects held across the death, and Windows (GAPS).
+//! resends it (A-61's rule, `crate::shards`'s replay). Not here yet: the successor's half on macOS (A-339 hands the
+//! device its end there, on the socket route), DAX objects held across the death, and Windows (GAPS).
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -38,12 +49,20 @@ use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage, TOKEN_BYTES};
 pub(super) const SESSION_BYTES: usize = TOKEN_BYTES + 4 * size_of::<u32>();
 
 /// A stream's resync channel as its daemon keeps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct Resync {
   /// The attachment's resync token, which only the anchor's hold and the device know besides.
   pub(super) token: [u8; TOKEN_BYTES],
+  /// The daemon's own copy of its end, kept exactly while the anchor holds one, so no message ever carries the end's
+  /// only reference (see the module's notes): none once given up, or when the anchor never held it.
+  pub(super) end: Option<OwnedFd>,
+}
+
+impl Resync {
   /// Whether the anchor holds the daemon's end: only then can a successor resync the stream.
-  pub(super) held: bool,
+  pub(super) fn held(&self) -> bool {
+    self.end.is_some()
+  }
 }
 
 /// What [`establish`] made: the device's end, to hand out with the stream's, and the channel as the daemon keeps it.
@@ -80,11 +99,13 @@ pub(super) fn establish(attachment: u64, owners: OwnerView) -> Result<Establishe
     _ => return Err(Unmade::Refused),
   }
   let held = hold(attachment, &daemon, &session_bytes(&token, owners));
-  // The anchor holds its own copy now, or none does: either way this daemon keeps none (see the module's notes).
-  drop(daemon);
+  // Kept while the anchor holds a copy, closed at once when none does (see the module's notes).
   Ok(Established {
     end: device,
-    resync: Resync { token, held },
+    resync: Resync {
+      token,
+      end: held.then_some(daemon),
+    },
   })
 }
 
@@ -113,7 +134,7 @@ fn hold(attachment: u64, daemon: &OwnedFd, session: &[u8; SESSION_BYTES]) -> boo
 /// refused update gives the resync up ([`give_up`]): a successor must never show the guest another owner. Whether the
 /// anchor still holds the end.
 pub(super) fn tell_owners(attachment: u64, resync: &mut Resync, owners: OwnerView) -> bool {
-  if !resync.held {
+  if !resync.held() {
     return false;
   }
   let session = session_bytes(&resync.token, owners);
@@ -126,7 +147,7 @@ pub(super) fn tell_owners(attachment: u64, resync: &mut Resync, owners: OwnerVie
     // releases an end it cannot adopt; the caller counts the stream given up.
     let _released = give_up(attachment, resync);
   }
-  resync.held
+  resync.held()
 }
 
 /// Sends the device, over `held` (the attachment's resync end the anchor held across the last daemon's death), a
@@ -163,13 +184,15 @@ pub(super) enum GivenUp {
   Refused,
 }
 
-/// Gives `attachment`'s resync up: the anchor closes its end, so the device reads the channel's end and knows its share
-/// ends with this daemon.
+/// Gives `attachment`'s resync up: the anchor closes its end and the daemon its own, so the device reads the channel's
+/// end and knows its share ends with this daemon.
 pub(super) fn give_up(attachment: u64, resync: &mut Resync) -> GivenUp {
-  if !std::mem::replace(&mut resync.held, false) {
+  let Some(own) = resync.end.take() else {
     return GivenUp::Nothing;
-  }
-  match crate::anchor_hold::send(&Outgoing::Release { attachment }) {
+  };
+  let released = crate::anchor_hold::send(&Outgoing::Release { attachment });
+  drop(own);
+  match released {
     Some(Ok(())) => GivenUp::Released,
     _ => GivenUp::Refused,
   }

@@ -51,7 +51,7 @@ A-267's first part bounded a status's drift; these four ride in the reply of a v
 - `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`, `crates/sdk-python/src/lib.rs`, `crates/sdk-node/src/lib.rs`: each
   shows the count (text lines say how many more; JSON and the SDKs' objects carry it).
 - `crates/api/src`: `Instance::rewitness` answers `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`,
-  and a presentation is clean only when it carries and counts no conflict; `CONTRACT` = 21.
+  and a presentation is clean only when it carries and counts no conflict; `CONTRACT` = 23.
 
 ## Siblings
 

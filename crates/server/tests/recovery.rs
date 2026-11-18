@@ -1984,6 +1984,7 @@ fn present_landing(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   }) {
     Ok(ReplyBody::GrantRequired { landing, .. }) => landing,
     other => panic!("the landing was not presented: {other:?}"),

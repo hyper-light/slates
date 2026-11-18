@@ -85,9 +85,9 @@ again when the work changed. Both work from any `Instance`.
 
 ### Signed work
 
-A merge may carry a signature by its author's key, and its outcome carries how the daemon judged
-it: `Verification::{Verified { signer }, Unsigned, Invalid { reason }}`. Signatures never gate
-permission; the write mode does.
+A merge or a landing may carry a signature by its author's key, and its outcome carries how the
+daemon judged it: `Verification::{Verified { signer }, Unsigned, Invalid { reason }}`. Signatures
+never gate permission; the write mode does.
 
 1. The launcher trusts keys on a volume: `set_signers(volume, &[TrustedSigner::from_openssh(line)?],
    &issuer)` (an `ssh-ed25519` or FIDO `sk-ssh-ed25519@openssh.com` public key line); `signers(volume)`
@@ -98,11 +98,20 @@ permission; the write mode does.
    `merge(&work, &evidence, Some(&WorkSignature::from_armoured(&text)?))` before the work changes.
 3. The verdict is recorded with the version: `merge_record(green, version)` reads it back.
 
+A landing is signed the same way. Every presentation states the landing's statement (the volume,
+the target and the manifest hash, as plain text): `plan_landing(&request)` answers it in
+`LandingApproval::statement`, as does a `land` an ask mode holds. Sign it with the same command and
+land with `land(&request, Some(&signature))`. The verdict comes back in the approval
+(`LandingApproval::verification`) and in what was written (`LandingReport::verification`), and the
+landing's planned and finished audit records keep it: `audit(since)` reads it back as
+`AuditRecord::verification`. An approval carries the landing's signature on to
+`approve_landing(&approval, &issuer)` (`LandingApproval::signature`, which an approver may also set).
+Nothing requires a signed landing.
+
 A volume's policy may require signed merges (`WritePolicy::require_signed_merges`, on a green for
 every merge into it, on a work for every merge from it): an unsigned or invalid merge is then
 answered `MergeOutcome::Refused` with `PolicyReason::SignatureRequired`, at once in bypass and at its
-approval in ask. A landing's signature is owed: a signed `land` is refused
-`Error::Unsupported(Unsupported::SignedWork)` before anything is sent.
+approval in ask.
 
 ### Errors
 
@@ -160,7 +169,7 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_lazy(path)`
   lets go of a mount that a leftover process still uses (Linux, `fusermount3 -u -z`).
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
-  without writing, for a reviewer; `approval_entries(&approval)` lists what an approval writes, path
+  without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
   it): a reviewer with no mount of the volume builds the change from it, checking each file it reads
   at the head against its entry, and presents the landing again on a mismatch; `approve_landing(&approval,
@@ -233,7 +242,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 ## What is owed
 
 1. The starter handed the launcher's authority on every platform.
-2. A landing's signature (signed merges are built).
-3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-4. An async form over the host's own reactor.
-5. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.
+2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
+3. An async form over the host's own reactor.
+4. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

@@ -1514,6 +1514,11 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
   })
 }
 
+/// One part of a takeover past tolerance as JSON (A-332): the hosts its recovery needed and how many of them remained.
+fn shortfall_json(shortfall: &slates_ipc::protocol::Shortfall) -> Value {
+  json!({ "needed": shortfall.needed, "remaining": shortfall.remaining })
+}
+
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
 /// surface (§4.12 schema parity — one definition, two surfaces).
 pub fn status_json(r: &StatusReport) -> Value {
@@ -1539,6 +1544,10 @@ pub fn status_json(r: &StatusReport) -> Value {
         "epoch": taken.epoch,
         "head_sequence": taken.head_sequence,
         "from_live_log": taken.from_live_log,
+        "past_tolerance": taken.past_tolerance.as_ref().map(|past| json!({
+          "registers": past.registers.as_ref().map(shortfall_json),
+          "live_log": past.live_log.as_ref().map(shortfall_json),
+        })),
       })),
     },
     "head": r.head.value,

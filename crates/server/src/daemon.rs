@@ -50,12 +50,21 @@ pub(crate) async fn pace(ns: u64) {
 /// A perpetual loop's sleep refused ([`pace`]): a tripwire, never an expected count.
 const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 
-/// Shape: the heartbeat cadence the control shard beats the anchor's word at (§4.14
-/// `daemon.alive`): a tenth of the anchor's liveness budget, so nine beats fit inside it.
-pub const HEARTBEAT_NS: u64 = 100_000_000;
-/// Shape: the anchor's liveness budget for `daemon.alive` (a second; the supervisor's
-/// input until the CLI takes the operator's value).
-pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
+/// Derived: the heartbeat, the fleet's coordinator period and the cadence the watchdog looks at its shards in (§4.14
+/// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
+/// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
+/// beats fit inside a window. 100 ms.
+pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+/// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
+/// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
+/// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
+/// waiting less risks paying `T` for a stall shorter than `T`, and waiting as long as the recovery costs is the
+/// deterministic online choice within twice the best (rent or buy [A: Karlin, Manasse, Rudolph & Sleator, "Competitive
+/// snoopy caching", Algorithmica 1988], the rule the wake probe's spin-then-park already follows). A second. Not
+/// derived from the failover SLO: the fleet's detection and confirmation timers are multiples of this window's
+/// heartbeat, so a failover SLO derived from them (Ada's rule, 2026-11-18) cannot also set it. The machine's measured
+/// scheduling delay is its floor, checked and logged at boot (`config::liveness_window`).
+pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
 /// How long an out-of-band observation ([`Daemon::observation`]) has, from its submission through its
 /// admission to its answer, before it ends with a deadline naming the stage it reached
 /// ([`crate::observe::ObserveError::Deadline`]). A live shard answers within a few coordinator periods
@@ -2815,9 +2824,10 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
-  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
-  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// Test support: the quantum a seal's turns are cut by on every shard (the record period's seal walk and envelope wrap,
+  /// `fleet::seal_walk_slice`, and a takeover's envelope open, `fleet::open_slice`), in place of the shard's own step
+  /// quantum; `None` gives the shard its own back. Zero ends each turn after one volume or one chunk, so a test sees the
+  /// slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
   /// once installed, else the typed refusal.
   pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -3225,7 +3235,7 @@ impl Daemon {
       // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
       // too, and their recovery would read as this one's.
       s.dead_session_dropped_at.clear();
-      s.dead_session_recovered_ns = None;
+      s.dead_session_recovered = None;
     })
   }
 
@@ -4238,6 +4248,7 @@ async fn init_shard(
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
     unrecovered: std::collections::BTreeMap::new(),
+    yielded: std::collections::BTreeSet::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
@@ -4350,7 +4361,7 @@ async fn init_shard(
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
-    dead_session_recovered_ns: None,
+    dead_session_recovered: None,
     injected_pair_withhold: false,
     injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),

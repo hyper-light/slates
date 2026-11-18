@@ -449,9 +449,6 @@ pub enum Unsupported {
     /// The form.
     feature: &'static str,
   },
-  /// A landing that carries a signature: the daemon verifies signed merges (A-321) and not yet a landing's signature
-  /// ([`crate::signed`]). Nothing was sent.
-  SignedWork,
   /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
   SecureRandom,
 }

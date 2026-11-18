@@ -2359,8 +2359,24 @@ fn loss_text(report: &StatusReport) -> String {
       "taken_over: epoch {} head {} from_live_log {}\n",
       taken.epoch, taken.head_sequence, taken.from_live_log
     ));
+    if let Some(past) = &taken.past_tolerance {
+      out.push_str(&format!(
+        "taken_over_past_tolerance: registers {} live_log {}\n",
+        shortfall_text(past.registers.as_ref()),
+        shortfall_text(past.live_log.as_ref())
+      ));
+    }
   }
   out
+}
+
+/// One part of a takeover past tolerance in `status` (A-332): `<remaining>/<needed>` of the hosts its recovery counted
+/// on, or `within` when that part was recovered within tolerance.
+fn shortfall_text(shortfall: Option<&slates_ipc::protocol::Shortfall>) -> String {
+  shortfall.map_or_else(
+    || "within".to_owned(),
+    |short| format!("{}/{}", short.remaining, short.needed),
+  )
 }
 
 /// The volume's journal (§4.5): its budget and retention, and what its consuming rounds found waiting (the budget's

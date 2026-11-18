@@ -471,6 +471,41 @@ pub struct DaemonConfig {
 /// operator gives `slates anchor` a value.
 pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
+/// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivenessWindow {
+  /// The derived window `W` (`crate::daemon::LIVENESS_BUDGET_NS`).
+  pub window_ns: u64,
+  /// The machine's floor, measured at boot: the wake probe's p99, how long a parked thread waits to run again once
+  /// woken (`slates_machine::wake::WakeLatency::p99_ns`).
+  pub floor_ns: u64,
+  /// The window this machine needs: the longer of the two.
+  pub needed_ns: u64,
+  /// Whether the floor passes the window: a live shard can then be kept off its CPU longer than a window, so on this
+  /// machine the daemon cannot meet its window, and its boot log says so.
+  pub floor_past_window: bool,
+}
+
+/// Derived: the liveness window this daemon runs on and the floor its machine measured at boot (A-359): `W` is the
+/// recovery budget `T` (`crate::daemon::LIVENESS_BUDGET_NS`, rent or buy); its floor is `floor_ns`, the wake probe's
+/// p99. Where the floor passes the window the daemon cannot meet its window on this machine: the window it needs is
+/// the floor, and the boot log names both (`DaemonConfig::derivations`). A-228 already judges a shard starved, not
+/// stuck, while it is kept off its CPU, so the window's verdicts stay safe there; what the floor bounds is how soon.
+pub fn liveness_window(floor_ns: u64) -> Derived<LivenessWindow> {
+  let window_ns = crate::daemon::LIVENESS_BUDGET_NS;
+  derived!(
+    LivenessWindow {
+      window_ns,
+      floor_ns,
+      needed_ns: window_ns.max(floor_ns),
+      floor_past_window: floor_ns > window_ns,
+    },
+    "W = T, the recovery budget (rent or buy: a verdict waits as long as the recovery it starts costs); floor = the \
+     wake probe's p99; past W the daemon cannot meet its window on this machine and needs the floor",
+    ["RECOVERY_BUDGET_NS", "wake.p99_ns"]
+  )
+}
+
 /// Where each part of a shard's slice of the content object lies, relative to the slice's start, as
 /// `(start, end)` or `(start, len)` ranges ([`DaemonConfig::shard_content_layout`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +640,10 @@ impl DaemonConfig {
   /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.
   pub fn derive(profile: &MachineProfile, instance: &str, shards: Option<u16>) -> DaemonConfig {
     let mut derivations = Vec::new();
+    derivations.push(note(
+      "liveness_budget_ns",
+      &liveness_window(profile.wake.p99_ns),
+    ));
     let d = profile.derived();
     let admission = admission_limit(ASSUMED_REQUESTS_PER_SECOND, ASSUMED_SERVICE_P99_NS);
     derivations.push(note("requests_in_flight_per_shard", &admission));
@@ -1671,6 +1710,24 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-359: do derive the liveness window over a quiet machine's floor (a wake p99 of 400 µs) and over one kept so busy
+  /// at boot that a woken thread waits longer than a window. Expect the quiet one within its window and needing no
+  /// more; the busy one reported past it, needing its floor.
+  #[test]
+  fn a_machine_whose_scheduling_delay_passes_the_window_is_reported_needing_its_floor() {
+    let quiet = liveness_window(400_000).get();
+    assert!(!quiet.floor_past_window, "{quiet:?}");
+    assert_eq!(quiet.needed_ns, quiet.window_ns);
+    let busy_floor = crate::daemon::LIVENESS_BUDGET_NS + crate::daemon::HEARTBEAT_NS;
+    let busy = liveness_window(busy_floor).get();
+    assert!(busy.floor_past_window, "{busy:?}");
+    assert_eq!(busy.needed_ns, busy_floor);
+    assert_eq!(
+      busy.window_ns, quiet.window_ns,
+      "the derived window is the machine's, not the load's"
+    );
+  }
 
   /// A-326, §4.7. Do: derive the closed-loop hold for every shard count from one to [`MOST_SHARDS_TESTED`]. Expect: the
   /// hold is whole cycles of 2F (R9's floor for a request and for the think time before the next); its cycles cover a
