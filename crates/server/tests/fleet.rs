@@ -2080,8 +2080,28 @@ fn fleet_config(
   peers: &[FleetPeer],
   domains: &std::collections::BTreeMap<HostId, DomainId>,
 ) -> DaemonConfig {
+  fleet_config_with_quorum(
+    profile,
+    instance,
+    (anchor, host),
+    peers,
+    domains,
+    Quorum { f: 1 },
+  )
+}
+
+/// [`fleet_config`] at `quorum`: a node of a fleet that tolerates `quorum.f` failures (`2f + 1` nodes form one
+/// neighbourhood, each a candidate of every volume), its stable anchor and generation-0 seed given together.
+fn fleet_config_with_quorum(
+  profile: &MachineProfile,
+  instance: &str,
+  (anchor, host): (HostId, HostId),
+  peers: &[FleetPeer],
+  domains: &std::collections::BTreeMap<HostId, DomainId>,
+  quorum: Quorum,
+) -> DaemonConfig {
   DaemonConfig::derive(profile, instance, Some(1)).with_fleet(FleetMembership {
-    quorum: Quorum { f: 1 },
+    quorum,
     peers: peers.iter().map(|peer| peer.host).collect(),
     host,
     origin_anchor: anchor,
@@ -14004,6 +14024,626 @@ fn a_node_replaced_with_fresh_ram_at_its_anchor_exchanges_pair_keys_with_its_sur
   assert!(
     exchanged,
     "each survivor delivered its pairs to the replacement again: served {served_on_replacement:?}"
+  );
+}
+
+/// Writes [`CONTENT`] as `hello.txt` into `volume` through `client`, under a write attachment it lets go of after: a test
+/// that writes many volumes keeps no attachment for each, which a mount would, against the partition's cap on
+/// attachments.
+fn write_hello_through(client: &mut Client, volume: VolumeId) {
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("{volume:?} took a write attachment");
+  };
+  let written = client.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: "/hello.txt".to_owned(),
+    bytes: CONTENT.to_vec(),
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "hello.txt was written into {volume:?}: {written:?}"
+  );
+  assert_eq!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached,
+    "the write attachment of {volume:?} ended"
+  );
+}
+
+/// `hello.txt` of `volume` at its head, read through `client` (no attachment), or the reply that was not its bytes, as
+/// bytes of its own description.
+fn read_hello_through(client: &mut Client, volume: VolumeId) -> Vec<u8> {
+  match client.call(&RequestBody::Read {
+    volume,
+    path: "/hello.txt".to_owned(),
+    at: ReadAt::Head,
+  }) {
+    ReplyBody::ReadBytes { bytes } => bytes,
+    other => format!("{other:?}").into_bytes(),
+  }
+}
+
+/// A fellow candidate's counts of the lineage keys it was asked for (A-295): handed, and refused by why.
+fn lineage_counters(daemon: &Daemon) -> Result<Vec<(&'static str, u64)>, ObserveError> {
+  daemon.fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(name, _)| name.starts_with("fleet.seal.lineage"))
+      .collect()
+  })
+}
+
+/// Shape: the survivors among whom a dead owner's successor is ranked in the window test: the five-node fleet less the
+/// owner, the replacement among them.
+const WINDOW_SURVIVORS: usize = 4;
+
+/// Shape: the live volumes the window test writes on its owner. Rendezvous makes the replacement the successor of about
+/// one in [`WINDOW_SURVIVORS`] of them, so `n` volumes leave it none with probability `(3/4)^n`; 39 is the least `n` that
+/// brings that to one run in 65,536 or fewer (`(3/4)^39 = 2^-16.2`), which the test names rather than passing.
+const WINDOW_VOLUMES: usize = 39;
+
+/// A-295, A-271's window (GAPS, 2026-11-17): a live volume whose successor is a node replaced at its own anchor, which
+/// never received the owner's pair, is served there, the key handed to it by a fellow candidate. Do: form five nodes
+/// at `f = 2` (two failures within `f`: the replaced node's store and then the owner) and let their owner shards
+/// exchange pair keys; on the owner (a node that leads neither group) create [`WINDOW_VOLUMES`] volumes shared with
+/// the fleet, turn each live-shipped and write `hello.txt` into it, until every other node holds every volume's log;
+/// make the owner's pair delivery to one of them fail from then on (`Daemon::inject_pair_withhold_to`, as a delivery
+/// whose recipient answer never comes back fails each period); replace that node with a fresh daemon at its own anchor
+/// (its RAM, and every key it was delivered, gone) and wait until the fleet has recovered from the loss (every node a
+/// voter in the same committed set, the replacement among them, no retirement kept, and the owner's neighbourhood
+/// settled with the replacement in it); stop the owner. Expect: each volume whose successor is the replacement is
+/// served by it, `hello.txt` byte for byte, through a handed key (`fleet.live.takeover_key_handed`). Before: only the
+/// owner's shard held the pair the replacement needed, so it waited for a key that could never come, and the volume
+/// was refused `no_key` until its wait ran out. At `f = 1` the same window leaves the live volume no takeover at all:
+/// the owner records the replacement as a holder only once it is covered, so its recorded holders lack the replacement
+/// and phase one cannot reach `f + 1` (GAPS).
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let quorum = Quorum { f: 2 };
+  let profiles: Vec<MachineProfile> = ["window-a", "window-b", "window-c", "window-d", "window-e"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<HostId> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<HostId> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<Vec<Identity>> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node: usize| -> Vec<FleetPeer> {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config_with_quorum(
+        profile,
+        &format!("window-{node}-{pid}"),
+        (anchors[node], seeds[node]),
+        &peers(node),
+        &Default::default(),
+        quorum,
+      )
+    })
+    .collect();
+  let daemons: Vec<Daemon> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        SegmentSource::Create {
+          name: common::fixture_object("window", &node.to_string()),
+        },
+      )
+    })
+    .collect();
+  daemons[0]
+    .bootstrap(true)
+    .expect("the operator explicitly creates this test's new fleet");
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), quorum);
+  let others = u64::try_from(daemons.len() - 1).unwrap();
+  let exchanged =
+    audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+      all_hold(daemons.iter().map(|daemon| {
+        refusal_count(daemon, "fleet.seal.pair_served").map(|served| served >= others)
+      }))
+    });
+  // The owner and the replaced node lead neither group where the fleet allows it, so neither loss is a leader's.
+  let leads =
+    |daemon: &Daemon| daemon.root_leads() == Ok(true) || daemon.council_leads() == Ok(true);
+  let replaced = (0..daemons.len())
+    .find(|node| !leads(&daemons[*node]))
+    .unwrap_or(0);
+  let owner = (0..daemons.len())
+    .find(|node| *node != replaced && !leads(&daemons[*node]))
+    .or_else(|| (0..daemons.len()).find(|node| *node != replaced))
+    .unwrap();
+  let mut client = Client::connect(daemons[owner].instance());
+  let mut volumes: Vec<(String, VolumeId)> = Vec::new();
+  for index in 0..WINDOW_VOLUMES {
+    let name = format!("window-{index}");
+    let ReplyBody::Created { id } = client.call(&scratch(&name)) else {
+      panic!("volume {name} was created on the owner");
+    };
+    share_with_fleet(&mut client, id, &daemons);
+    let set = client.call(&RequestBody::LiveShip {
+      volume: id,
+      live_shipped: true,
+    });
+    assert!(
+      matches!(set, ReplyBody::LiveShippingSet { live_shipped: true }),
+      "volume {name} was turned live-shipped: {set:?}"
+    );
+    write_hello_through(&mut client, id);
+    volumes.push((name, id));
+  }
+  let holders: Vec<usize> = (0..daemons.len()).filter(|node| *node != owner).collect();
+  let held_before = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    all_hold(volumes.iter().flat_map(|(_, id)| {
+      holders.iter().map(|node| {
+        daemons[*node]
+          .fleet_live_held(ObjectId(id.bytes))
+          .map(|held| held.is_some())
+      })
+    }))
+  });
+  let withheld = daemons[owner].inject_pair_withhold_to(Some(anchors[replaced].0));
+  let mut slots: Vec<Option<Daemon>> = daemons.into_iter().map(Some).collect();
+  let lost = slots[replaced].take().unwrap();
+  let old = lost.member_identity().unwrap();
+  lost.stop();
+  let replacement = start_fleet_node(
+    &profiles[replaced],
+    configs[replaced].clone(),
+    identities[replaced].pop().unwrap(),
+    ports[replaced],
+    peers(replaced),
+    SegmentSource::Create {
+      name: common::fixture_object("window", "replacement"),
+    },
+  );
+  let fresh = replacement.member_identity().unwrap();
+  let owner_daemon = slots[owner].take().unwrap();
+  let owner_member = owner_daemon.member_identity().unwrap();
+  let fellows: Vec<Daemon> = slots.into_iter().flatten().collect();
+  let fleet: Vec<&Daemon> = fellows
+    .iter()
+    .chain([&owner_daemon, &replacement])
+    .collect();
+  let mut statuses: Vec<Client> = fleet
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
+  let recovered = audit_wait(&fleet, || {
+    let mut all = true;
+    for (daemon, status) in fleet.iter().zip(statuses.iter_mut()) {
+      let me = daemon.member_identity()?;
+      let seated = daemon.council_voters()?.is_some_and(|voters| {
+        voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
+      });
+      let kept = match status.call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
+        _ => usize::MAX,
+      };
+      // The owner's neighbourhood settled with the replacement in it: its heads placed on the new cohort, which is the
+      // cohort its volumes are recovered through once it is gone (`Retirement::settled`).
+      let settled = settled_now(daemon, owner_member)?;
+      all &= seated && kept == 0 && settled;
+    }
+    Ok(all)
+  });
+  // Pairs delivered to the replacement before the owner was lost: its fellows', never the owner's.
+  let pairs_received = refusal_count(&replacement, "fleet.seal.pair_served").unwrap_or(0);
+  // The volumes whose successor, once the owner is lost, is the replacement: the one rendezvous ranks first among the
+  // survivors, every one of them a candidate of every volume in a fleet of `2f + 1`.
+  let survivors: Vec<HostId> = fellows
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .chain([fresh])
+    .collect();
+  assert_eq!(survivors.len(), WINDOW_SURVIVORS);
+  let to_replacement: Vec<&(String, VolumeId)> = volumes
+    .iter()
+    .filter(|(_, id)| rendezvous_first(&survivors, ObjectId(id.bytes)) == Some(fresh))
+    .collect();
+  owner_daemon.stop();
+  let stopped = Instant::now();
+  let survivors_running: Vec<&Daemon> = fellows.iter().chain([&replacement]).collect();
+  // Every volume the replacement succeeds to answers its status there, within one serve deadline for them all.
+  let mut successor_client = Client::connect(replacement.instance());
+  let mut last = Vec::new();
+  let all_served = poll_until(&survivors_running, SERVE_DEADLINE, || {
+    last = to_replacement
+      .iter()
+      .map(|(_, id)| successor_client.call(&RequestBody::Status { volume: *id }))
+      .filter(|reply| !matches!(reply, ReplyBody::Status { .. }))
+      .map(|reply| format!("{reply:?}"))
+      .collect();
+    Ok(last.is_empty())
+  });
+  let read: Vec<(String, Vec<u8>)> = if all_served {
+    to_replacement
+      .iter()
+      .map(|(name, id)| (name.clone(), read_hello_through(&mut successor_client, *id)))
+      .collect()
+  } else {
+    Vec::new()
+  };
+  let counters = replacement
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  let handed_by_replacement = refusal_count(&replacement, "fleet.live.takeover_key_handed");
+  let handed: Vec<_> = fellows.iter().map(lineage_counters).collect();
+  eprintln!(
+    "window (live, f = 2): {} of {WINDOW_VOLUMES} volumes to the replacement, served {:?} after the owner stopped: {}; \
+     keys handed to it {handed_by_replacement:?}; each fellow's lineage counts {handed:?}",
+    to_replacement.len(),
+    stopped.elapsed(),
+    all_served
+  );
+  for daemon in fellows {
+    daemon.stop();
+  }
+  replacement.stop();
+  assert!(exchanged, "the pairs were exchanged before the owner wrote");
+  assert!(
+    held_before,
+    "every other node held every volume's log before the owner's delivery to one anchor failed"
+  );
+  assert!(
+    withheld.is_ok(),
+    "the delivery failure was installed: {withheld:?}"
+  );
+  assert!(
+    recovered,
+    "the fleet recovered from the replaced node's loss before the owner was lost"
+  );
+  assert!(
+    !to_replacement.is_empty(),
+    "rendezvous gave the replacement none of the {WINDOW_VOLUMES} volumes (once in 65,536 runs): the window was not \
+     exercised"
+  );
+  assert!(
+    all_served && read.iter().all(|(_, bytes)| bytes.as_slice() == CONTENT),
+    "each volume whose successor is the replacement ({} of {WINDOW_VOLUMES}) is served there, hello.txt byte for \
+     byte: the replies that were not a status {last:?}; read {:?}; the replacement's counters {counters:?}; pairs \
+     delivered to it before the owner was lost {pairs_received}; keys handed to it {handed_by_replacement:?}; each \
+     fellow's lineage counts {handed:?}",
+    to_replacement.len(),
+    read
+      .iter()
+      .map(|(name, bytes)| (name, bytes.len()))
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    handed_by_replacement
+      .as_ref()
+      .is_ok_and(|handed| *handed > 0),
+    "the replacement served what it succeeded to through a handed key: {handed_by_replacement:?}"
+  );
+}
+
+/// Shape: the sealed volumes the sealed-head window test writes on its owner. At `f = 1` rendezvous makes the
+/// replacement the successor of about one in two of them (two survivors), so sixteen leave it none once in 65,536 runs
+/// when every volume's content survives, which the test names rather than passing.
+const SEALED_WINDOW_VOLUMES: usize = 16;
+
+/// A-295, A-271's window for a volume served from a sealed head's envelope rather than a live log: its successor, a
+/// node replaced at its own anchor that never received the owner's pair, opens the envelope with the key a fellow
+/// candidate hands it. Do: form three nodes at `f = 1`; on the owner (a node that leads neither group) create
+/// [`SEALED_WINDOW_VOLUMES`] volumes shared with the fleet, write `hello.txt` into each and seal it by a snapshot, until
+/// every snapshot is placed and both other nodes hold every head; choose the other node that holds the least of the
+/// content (`f + 1` copies: the owner's and one other's) and make the owner's pair delivery to it fail from then on
+/// (`Daemon::inject_pair_withhold_to`); replace that node with a fresh daemon at its own anchor and wait until the
+/// fleet has recovered from the loss (every node a voter in the same committed set, the replacement among them, no
+/// retirement kept, and the owner's neighbourhood settled with the replacement in it, so every head and its content are
+/// placed on the new cohort, a survivor among their holders); stop the owner. Expect: each volume whose successor is
+/// the replacement is served by it, `hello.txt` byte for byte, through a handed key (`fleet.seal.envelope_key_handed`).
+/// Before: the head's entry for the replacement's anchor opened only under the owner's pair, so the envelope stayed
+/// unopened (`fleet.seal.envelope_unopened` every period). Unlike a live log's, a head's takeover counts the members
+/// that exist now, so once the content is on a survivor the window is the key's alone at `f = 1` too. Without the
+/// settlement the content can rest on the owner and the destroyed node alone, two failures at `f = 1` (two red runs:
+/// every fetch found no recorded holder, `fleet.fetch.no_holder_session`).
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_succeeds_to() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<MachineProfile> = ["sealed-window-a", "sealed-window-b", "sealed-window-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<HostId> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<HostId> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<Vec<Identity>> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node: usize| -> Vec<FleetPeer> {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("sealed-window-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let daemons: Vec<Daemon> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        SegmentSource::Create {
+          name: common::fixture_object("sealed-window", &node.to_string()),
+        },
+      )
+    })
+    .collect();
+  daemons[0]
+    .bootstrap(true)
+    .expect("the operator explicitly creates this test's new fleet");
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let exchanged = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
+    all_hold(
+      daemons
+        .iter()
+        .map(|daemon| refusal_count(daemon, "fleet.seal.pair_served").map(|served| served >= 2)),
+    )
+  });
+  // The owner leads neither group where the fleet allows it, so its loss is not a leader's.
+  let leads =
+    |daemon: &Daemon| daemon.root_leads() == Ok(true) || daemon.council_leads() == Ok(true);
+  let owner = (0..daemons.len())
+    .find(|node| !leads(&daemons[*node]))
+    .unwrap_or(0);
+  let mut client = Client::connect(daemons[owner].instance());
+  let mut volumes: Vec<(String, VolumeId, SnapshotId)> = Vec::new();
+  for index in 0..SEALED_WINDOW_VOLUMES {
+    let name = format!("sealed-window-{index}");
+    let ReplyBody::Created { id } = client.call(&scratch(&name)) else {
+      panic!("volume {name} was created on the owner");
+    };
+    share_with_fleet(&mut client, id, &daemons);
+    write_hello_through(&mut client, id);
+    let ReplyBody::Snapshotted { id: snapshot, .. } =
+      client.call(&RequestBody::Snapshot { volume: id })
+    else {
+      panic!("volume {name} was sealed by a snapshot");
+    };
+    volumes.push((name, id, snapshot));
+  }
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = volumes
+    .iter()
+    .all(|(_, id, snapshot)| poll_snapshot_placed(&observed, &mut client, *id, *snapshot));
+  let others: Vec<&Daemon> = (0..daemons.len())
+    .filter(|node| *node != owner)
+    .map(|node| &daemons[node])
+    .collect();
+  let held_before = volumes
+    .iter()
+    .all(|(_, id, _)| poll_all_hold(&others, ObjectId(id.bytes)));
+  drop((observed, others));
+  // Each volume's content's recorded holders, as the other nodes hold its newest head: the owner and the other it
+  // placed the content on (`f + 1`). The node replaced is the other that holds the least of it, so the content of the
+  // volumes it can succeed to rests on the survivor: on the owner and the destroyed node alone, the owner's death is a
+  // second failure for the content at `f = 1`, whatever the key (two red runs, every fetch without a recorded holder,
+  // `fleet.fetch.no_holder_session`).
+  let content_holders: Vec<Vec<HostId>> = volumes
+    .iter()
+    .map(|(_, id, _)| {
+      let mut holders: Vec<HostId> = (0..daemons.len())
+        .filter(|node| *node != owner)
+        .filter_map(|node| {
+          daemons[node]
+            .fleet_holder_head(ObjectId(id.bytes))
+            .ok()
+            .flatten()
+        })
+        .filter_map(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+        .flat_map(|head| head.holders())
+        .collect();
+      holders.sort_unstable();
+      holders.dedup();
+      holders
+    })
+    .collect();
+  let replaced = (0..daemons.len())
+    .filter(|node| *node != owner)
+    .min_by_key(|node| {
+      let member = daemons[*node].member_identity().unwrap();
+      content_holders
+        .iter()
+        .filter(|holders| holders.contains(&member))
+        .count()
+    })
+    .unwrap();
+  let survivor_member = (0..daemons.len())
+    .find(|node| *node != owner && *node != replaced)
+    .map(|node| daemons[node].member_identity().unwrap())
+    .unwrap();
+  let withheld = daemons[owner].inject_pair_withhold_to(Some(anchors[replaced].0));
+  let mut slots: Vec<Option<Daemon>> = daemons.into_iter().map(Some).collect();
+  let lost = slots[replaced].take().unwrap();
+  let old = lost.member_identity().unwrap();
+  lost.stop();
+  let replacement = start_fleet_node(
+    &profiles[replaced],
+    configs[replaced].clone(),
+    identities[replaced].pop().unwrap(),
+    ports[replaced],
+    peers(replaced),
+    SegmentSource::Create {
+      name: common::fixture_object("sealed-window", "replacement"),
+    },
+  );
+  let fresh = replacement.member_identity().unwrap();
+  let owner_daemon = slots[owner].take().unwrap();
+  let owner_member = owner_daemon.member_identity().unwrap();
+  let fellows: Vec<Daemon> = slots.into_iter().flatten().collect();
+  let fleet: Vec<&Daemon> = fellows
+    .iter()
+    .chain([&owner_daemon, &replacement])
+    .collect();
+  let mut statuses: Vec<Client> = fleet
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
+  let recovered = audit_wait(&fleet, || {
+    let mut all = true;
+    for (daemon, status) in fleet.iter().zip(statuses.iter_mut()) {
+      let me = daemon.member_identity()?;
+      let seated = daemon.council_voters()?.is_some_and(|voters| {
+        voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
+      });
+      let kept = match status.call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
+        _ => usize::MAX,
+      };
+      // The owner's neighbourhood settled with the replacement in it: its heads placed on the new cohort, which is the
+      // cohort its volumes are recovered through once it is gone (`Retirement::settled`).
+      let settled = settled_now(daemon, owner_member)?;
+      all &= seated && kept == 0 && settled;
+    }
+    Ok(all)
+  });
+  // The volumes whose successor, once the owner is lost, is the replacement.
+  let survivors: Vec<HostId> = fellows
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .chain([fresh])
+    .collect();
+  // Judged only where the content survives: on the survivor among its recorded holders.
+  let to_replacement: Vec<&(String, VolumeId, SnapshotId)> = volumes
+    .iter()
+    .zip(&content_holders)
+    .filter(|((_, id, _), holders)| {
+      rendezvous_first(&survivors, ObjectId(id.bytes)) == Some(fresh)
+        && holders.contains(&survivor_member)
+    })
+    .map(|(volume, _)| volume)
+    .collect();
+  owner_daemon.stop();
+  let stopped = Instant::now();
+  let survivors_running: Vec<&Daemon> = fellows.iter().chain([&replacement]).collect();
+  // Every volume the replacement succeeds to answers its status there, within one serve deadline for them all.
+  let mut successor_client = Client::connect(replacement.instance());
+  let mut last = Vec::new();
+  let all_served = poll_until(&survivors_running, SERVE_DEADLINE, || {
+    last = to_replacement
+      .iter()
+      .map(|(_, id, _)| successor_client.call(&RequestBody::Status { volume: *id }))
+      .filter(|reply| !matches!(reply, ReplyBody::Status { .. }))
+      .map(|reply| format!("{reply:?}"))
+      .collect();
+    Ok(last.is_empty())
+  });
+  let read: Vec<(String, Vec<u8>)> = if all_served {
+    to_replacement
+      .iter()
+      .map(|(name, id, _)| (name.clone(), read_hello_through(&mut successor_client, *id)))
+      .collect()
+  } else {
+    Vec::new()
+  };
+  let counters = replacement
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  let handed_to_replacement = refusal_count(&replacement, "fleet.seal.envelope_key_handed");
+  let handed: Vec<_> = fellows.iter().map(lineage_counters).collect();
+  eprintln!(
+    "window (sealed head, f = 1): {} of {SEALED_WINDOW_VOLUMES} volumes to the replacement, served {:?} after the \
+     owner stopped: {}; envelope keys handed to it {handed_to_replacement:?}; each fellow's lineage counts {handed:?}",
+    to_replacement.len(),
+    stopped.elapsed(),
+    all_served
+  );
+  for daemon in fellows {
+    daemon.stop();
+  }
+  replacement.stop();
+  assert!(exchanged, "the pairs were exchanged before the owner wrote");
+  assert!(
+    placed,
+    "every snapshot placed before the owner's delivery to one anchor failed"
+  );
+  assert!(
+    held_before,
+    "both other nodes held every head before the owner's delivery to one anchor failed"
+  );
+  assert!(
+    withheld.is_ok(),
+    "the delivery failure was installed: {withheld:?}"
+  );
+  assert!(
+    recovered,
+    "the fleet recovered from the replaced node's loss before the owner was lost"
+  );
+  assert!(
+    !to_replacement.is_empty(),
+    "rendezvous gave the replacement none of the {SEALED_WINDOW_VOLUMES} volumes whose content survives (once in 65,536 \
+     runs when the owner placed every volume's content on one node, as it has in every run): the window was not \
+     exercised; the content's recorded holders {content_holders:?}"
+  );
+  assert!(
+    all_served && read.iter().all(|(_, bytes)| bytes.as_slice() == CONTENT),
+    "each sealed volume whose successor is the replacement ({} of {SEALED_WINDOW_VOLUMES}) is served there, hello.txt \
+     byte for byte: the replies that were not a status {last:?}; read {:?}; the replacement's counters {counters:?}; \
+     envelope keys handed to it {handed_to_replacement:?}; each fellow's lineage counts {handed:?}",
+    to_replacement.len(),
+    read
+      .iter()
+      .map(|(name, bytes)| (name, bytes.len()))
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    handed_to_replacement
+      .as_ref()
+      .is_ok_and(|handed| *handed > 0),
+    "the replacement opened what it succeeded to through a handed key: {handed_to_replacement:?}"
   );
 }
 

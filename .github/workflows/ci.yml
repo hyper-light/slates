@@ -199,9 +199,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      # SLATES_TEST_CONTAINER turns on fs_server's container lane (fs-server plan step 2): on Linux the server node runs
+      # in its own Docker container and lands the client node's merge into a volume attached to it; the lane is compiled
+      # on Linux only (Docker Desktop's containers are not reachable by address from a macOS host).
       - name: The slates CLI flow (anchor + daemon)
         env:
           SLATES_TEST_CLI: "1"
+          SLATES_TEST_CONTAINER: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
       # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
