@@ -91,6 +91,31 @@
 >   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
 >   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
 
+> **"Initial membership did not commit": the bootstrapper's record dial to one peer sat in its first handshake call for
+> 10.8 to 15.8 s, so its council or root could not stage that peer (open, 2026-11-18, §4.8; goal g225).** Three
+> formations failed this way, each at `settle_initial_consensus` (`crates/server/tests/fleet.rs`): the Mac Studio (macOS
+> arm64, `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region` under background QoS, 1 of 688 runs,
+> kiln r156), and GitHub's diag-g225-forming-fleet-reaches-3 (run 44346317178, one CPU beside two busy loops, 2 of about
+> 8,000 runs: `a_root_learner_fetches_the_committed_region_membership_over_the_transport` on ubuntu-latest,
+> `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` on ubuntu-24.04-arm). In each, the bootstrapper (the
+> council or root leader) reported for one peer `RecordDialReport { dialing_for_ns: Some(t), call_for_ns: Some(t),
+> budgets_spent: 0, stall: None, calls: 1 }` with t 15.8, 12.9 and 10.8 s, and no `fleet.dial.*` count, while that peer
+> held a record session to the bootstrapper. That peer's demultiplexer had opened one session fewer than every other
+> node's and replaced one fewer (a healthy node's shows two opens and one replacement for each peer, read here as the
+> seed dial and the dial under the learned id): no second session from the bootstrapper was ever opened. The leader's
+> staging of that member never caught up with no session to replicate over (`RaftNode::catch_up`), so its voter change
+> never began, and the formation wait gave up after 10.8 to 14.2 s. A dialer keeps its socket for two handshake budgets
+> of 33 probe timeouts each (`ESTABLISH_BUDGETS_BEFORE_REDIAL`, `handshake_deadline`, about 44 s) before it dials from a
+> new port, longer than a formation. Not yet known: whether the second call resends on the seed dial's socket into a
+> session the peer no longer answers, sends nowhere, or is never woken. The instrumented branch
+> `agents/g225-diag-formation-4` logs every record dial's addresses and end, every session a demultiplexer opens, every
+> handshake datagram that reaches an established session, and a dialer's silent retransmits; it did not fail in 2,417
+> runs on the Mac Studio (kiln r208), and its run is filed for main (`~/.cache/slates-scratch/fanout/run-requests.md`,
+> 2026-11-18T19:20Z g225). The other two shapes of this failure are distinct: a leader whose follower holds a joint
+> entry the leader lacks (the integrator's diag-green-44269355181 arm64 run 7: leader at last log 6, follower at 7, same
+> term 1, no stuck dial), and the Windows two-region root whose new voters reported no committed root voter set (run
+> 44298844583, no stuck dial).
+
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
 > fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five
