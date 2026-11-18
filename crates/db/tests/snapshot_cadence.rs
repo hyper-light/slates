@@ -115,6 +115,7 @@ fn green() -> VolumeRecord {
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },

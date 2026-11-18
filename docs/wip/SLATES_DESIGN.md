@@ -21091,10 +21091,14 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
 ### A-285 — Write permission follows the mode the user gave the agent; signed work is provenance, never the permission gate (accepted 2026-11-18, Ada's decisions; revised the same day)
 Applied in the same change to: R10 (CLAUDE.md §1 and Part 1's rule table), D-22 (A-285 line), §4.13 "Grants" (status),
 GAPS (2026-11-18 entry), `crates/server/src/grant_signature.rs` (module docs).
-Status: the rule is recorded; the daemon side is owed, in order: the write policy and its wire (`WriteMode`,
-`SetPolicy`, `PolicyForbids`), landing under it (bypass lands at once, Linux included; ask answers an approval
-request; forbid refuses), merges under it, the MCP and SDK land verb gated by it, then signed work. The SSH-signature
-verifier built first (below) stays, for signed work.
+Status: a volume's write policy and landing under it are built (2026-11-18): the wire (`WriteAct`, `WriteMode`,
+`WritePolicy`, `PolicySubject`, `SetPolicy`, `Policy`, `Refusal::PolicyForbids`), the policy an appended field of the
+volume's record (`PolicyRecord.write`, op `VolumeWritePolicySet`), set only under the issuer and never from a
+consumer-bound channel; a landing under it, on every Unix host: forbid refuses before any host access, ask answers the
+approval request a launcher's grant approves, bypass grants the planned presentation itself (`GrantSurface::Policy`)
+and lands it in the same request (`landing::land_under_policy`). Owed, in order: a consumer's own policy (the stricter
+of consumer and volume), merges under the policy, the MCP and SDK land verb gated by it, then signed work. The
+SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
   prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
