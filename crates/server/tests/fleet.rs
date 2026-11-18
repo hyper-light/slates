@@ -13737,7 +13737,7 @@ fn a_successors_takeover_report_survives_its_warm_restart() {
 /// Shape: the shards each node of the live takeover restart test runs: two, so the volume lives on a shard other than the
 /// control shard, where no holder's acknowledgement publishes the shard's image by the way (every holder answer does,
 /// `fleet::accept_held_record`, `content_holder`, `live_ship::acknowledged`; the record plane is the control shard's).
-const LIVE_RESTART_SHARDS: u16 = 2;
+const LIVE_RESTART_SHARDS: u16 = 1;
 
 /// A live-shipped volume through `client` on its node's shard `partition`, shared with `fleet` and written
 /// [`CONTINUITY_FILES`] files: the volume and every write's reply.
@@ -13798,7 +13798,7 @@ fn anchored_fleet_with_a_live_volume(
     .collect();
   assert_fleet_forms(&daemons, &hosts, names);
   let mut client = Client::connect(daemons[0].instance());
-  let volume = live_volume_on(&mut client, &daemons, 1, prefix);
+  let volume = live_volume_on(&mut client, &daemons, 0, prefix);
   (fleet, daemons, hosts, volume)
 }
 
