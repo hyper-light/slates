@@ -3701,8 +3701,8 @@ fn read(
   }) {
     ReplyBody::ReadPage { bytes, total, .. } => {
       assert_eq!(
-        u64::try_from(bytes.len()).unwrap(),
-        total,
+        usize::try_from(total).ok(),
+        Some(bytes.len()),
         "{path} fits one page"
       );
       Ok(bytes)
