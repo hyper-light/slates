@@ -5792,6 +5792,17 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > `an_owner_is_answered_by_its_holder_within_the_lease_bound_while_far_members_stretch_the_round` (simulated: 9,886 ms
 > unanswered before, the 100 ms interval after, 10 of 10 runs); on the two Docker networks the lease's unconfirmed
 > verdicts went from every forwarded read to none.
+>
+> **Status (2026-11-18, A-334, an owner admitted again).** The lease is the host's, so it confirms again once a host
+> the council retired while away (a false death) refutes and is admitted again under its id. That host's objects all
+> belong to successors by then, but its shards still catalogued their copies and served them: the SIGSTOP owner flow of
+> `live_chaos.rs` read five of a successor's acknowledged files through the resumed owner as `NotFound`, the volume
+> still catalogued at its epoch-1 shipper while the host stood at epoch 2. Now a shard that installs a configuration
+> carrying a newer epoch for its own host yields every volume it catalogues (`crate::readmission`): a client's verb on
+> one is forwarded to its successor through the location round, and its latest state is refused here whatever the lease
+> says (`LeaseVerdict::Yielded`). Regression
+> `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
+> (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the
@@ -24113,3 +24124,32 @@ outside the processes"), and the code below.
   one record-plane datagram per acknowledged write (`judge_relayed`, over the relay's per-path record count): a stream
   sends its next write only once the last is answered, so each acknowledgement is a distinct answer from a candidate.
 - Record: `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`.
+
+### A-334 — A host admitted again under its own id yields the volumes it catalogued (2026-11-18, goal g229, the SIGSTOP owner flow's ReadSafety finding; realizes §4.8 "Authority scope" for a re-admission)
+Applied in the same change to: §4.8 "Leases and reads" (its status), GAPS ("Chaos from outside the processes"), and the
+code below.
+- **What was there.** A host the council retired while it was away (a stopped process resumed, a partition healed)
+  refutes its death and is admitted again under its id, at a newer host epoch, once the takeover of its objects is done.
+  `FleetNode::install_configuration` then forgets the host's own routing entries, so that "later lookups forward to the
+  successors rather than serving a stale copy". The shards were never told: their catalogs kept the copies, a verb on a
+  volume this node created or catalogues ran here (`verbs::owned_by_another_host`), and the owner lease, which is the
+  host's and not the object's, confirmed again once the holders answered the re-admitted host.
+- **What it broke.** ReadSafety. Read the moment it resumed, the old owner of the SIGSTOP owner flow parked the read for
+  its lease, then served it from its epoch-1 copy and answered five of its successor's acknowledged files `NotFound`.
+  Writes stayed safe: the copy's shipper was fenced and refused them `StaleEpoch`.
+- **The rule.** A shard that installs, at run time, a configuration carrying a newer epoch for its own host yields every
+  volume it catalogues (`ShardState::yielded`; `crate::readmission::install_placement` at both run-time installs). A
+  client's verb on a yielded volume is forwarded to its successor through the location round (the creator shortcut of
+  `owner_location::Query::known_owner` never names this node), and its latest state is refused here whatever the lease
+  says (`LeaseVerdict::Yielded`, counted `lease.refused.yielded`), for a mount's live tree and a peer's forward too. A
+  host's first epoch is `FIRST_EPOCH` and a restarted daemon is a new member at it, so no boot yields.
+- **The failing test.** `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
+  (`crates/server/tests/fleet.rs`): both survivors judge a live volume's owner dead though it lives; a survivor takes
+  the volume over and writes a second file; the owner refutes and is admitted again; every read of the second file
+  through it answers the bytes or a refusal, one answers the bytes, and the owner counted the volume yielded.
+- **Owed.** A later takeover naming this node a yielded volume's successor again keeps the copy
+  (`verbs::materialize_taken_over` returns early for an id it has), so the volume stays yielded until a rebuild over the
+  adopted head replaces it; the copy's memory is released only by the ledger transfer GAP-A9-7 owes; and two siblings of
+  the creator rule on the client's shard (`remote_attach::elsewhere`, the remote-attach reap) still take a yielded
+  volume for this node's own.
+- Record: `docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`.

@@ -3029,15 +3029,22 @@
 >       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
 >       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
 >       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
->     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>     - **Fixed (A-334): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
 >       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
->       ms after their acknowledgements), where it must refuse or answer them. The flow now notes the reader's state when
->       a read answers missing (`note_missing`), and its first run with it (Mac Studio, 2026-11-18) showed the cause: the
->       old owner was retired and re-admitted under its own id (`fleet_host_epoch` 2), its catalog still held the volume
->       with its epoch-1 shipper, and its lease confirmed again (`lease.refused.superseded` 1, `lease.wait.parked` 1,
->       `lease.wait.served` 1), so it served its stale copy. A re-admission yields an owner's objects only in its
->       routing table (`FleetNode::install_configuration`), and `verbs::owned_by_another_host` serves every volume its
->       node created or still catalogues.
+>       ms after their acknowledgements). The flow's new note (`note_missing`) showed why on its first run (Mac Studio,
+>       2026-11-18): the old owner had been retired and admitted again under its own id (`fleet_host_epoch` 2), its
+>       catalog still held the volume at its epoch-1 shipper, and its lease confirmed again (`lease.wait.parked` 1,
+>       `lease.wait.served` 1), so it served its stale copy. A re-admission yielded the host's objects only in its routing
+>       table. Now each shard yields its catalogued volumes when its own host's epoch advances (`crate::readmission`): a
+>       verb on one is forwarded to the successor, its latest state refused here (`LeaseVerdict::Yielded`). Red first:
+>       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
+>       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). **Owed:** a later
+>       takeover naming the host a yielded volume's successor again keeps the copy (`verbs::materialize_taken_over`
+>       returns early for an id it has), so the volume stays yielded there until a rebuild replaces it; releasing a
+>       yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the client's shard,
+>       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
+>       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
+>       term).
 >     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
 >       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
 >       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read

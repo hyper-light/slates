@@ -282,6 +282,11 @@ pub enum LeaseVerdict {
     /// The confirmations it needs ([`confirmations_needed`]).
     needed: usize,
   },
+  /// The object was catalogued here when this host's epoch last advanced: the host was retired while away and admitted
+  /// again under its id, so the object was taken over and its successor serves it (A-334; §4.8 "Authority scope").
+  /// However this node's lease stands, it never serves the object's latest state from its copy, which its successor's
+  /// writes have passed.
+  Yielded,
 }
 
 impl LeaseVerdict {
@@ -296,9 +301,15 @@ impl LeaseVerdict {
       LeaseVerdict::Holds => None,
       LeaseVerdict::Superseded { .. } => Some(LEASE_SUPERSEDED),
       LeaseVerdict::Unconfirmed { .. } => Some(LEASE_UNCONFIRMED),
+      LeaseVerdict::Yielded => Some(LEASE_YIELDED),
     }
   }
 }
+
+/// The status count under which a node records a latest-state request it refused for an object it yielded at its
+/// re-admission ([`LeaseVerdict::Yielded`]).
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+pub const LEASE_YIELDED: &str = "lease.refused.yielded";
 
 /// The status count under which an owner records a latest-state request it refused while superseded
 /// ([`LeaseVerdict::Superseded`]).

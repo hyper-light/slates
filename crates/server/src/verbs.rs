@@ -803,6 +803,11 @@ fn takeovers_pending(state: &ShardState) -> u64 {
 /// bounded startup allowance, and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate
 /// ([`dispatch`]), the mount bridge (`crate::nfs`, which is Unix's) and the daemon's test observation.
 pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
+  // An object this shard yielded at its host's re-admission is its successor's: its copy here is never served as the
+  // latest state, however this host's lease stands (A-334, `crate::readmission`).
+  if state.yielded.contains(&DbVolumeId { bytes: object.0 }) {
+    return crate::lease::LeaseVerdict::Yielded;
+  }
   let config = state.fleet.configuration();
   // The cohorts a successor's promotion quorum can be drawn from: the settled one, and — while this owner's
   // neighbourhood change is in flight and moved the object's cohort — the current one the council may settle
@@ -2018,7 +2023,11 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   }
   let host = state.fleet.host();
   let creator = ObjectId(volume.bytes).creator();
-  if creator == host || state.db.partition().volume(to_db_volume(volume)).is_some() {
+  // A volume this shard yielded when its host was admitted again under its id is its successor's, whoever created it
+  // and whatever this catalog still holds of it (A-334, `crate::readmission`): served here it answered from a copy the
+  // successor's writes had passed.
+  let yielded = state.yielded.contains(&to_db_volume(volume));
+  if !yielded && (creator == host || state.db.partition().volume(to_db_volume(volume)).is_some()) {
     return None;
   }
   // Only another member can own it. A node alone (a laptop: the fleet of one) answers the verb here, `NotFound` for an
