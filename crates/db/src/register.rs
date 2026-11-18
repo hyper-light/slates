@@ -1972,12 +1972,29 @@ impl Acceptor {
   /// Drops every accepted position of `object` below `sequence` (AUD-29-43). For a **single-value** register
   /// — a volume's head, its catalog, a tombstone — phase one reports only the highest accepted position
   /// ([`prepare`](Acceptor::prepare)), so once `sequence` is accepted the older positions can never be adopted
-  /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) must
-  /// not be compacted: a successor replays every version. The owner of the value class decides which it is.
+  /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) is not compacted
+  /// this way: a successor rebuilds from its positions, and only those below a durable checkpoint of what they hold can
+  /// go ([`Acceptor::compact_ledger_between`]). The owner of the value class decides which it is.
   pub fn compact_below(&mut self, object: ObjectId, sequence: u64) {
     let changes = &mut self.changes;
     self.accepted.retain(|&(held, position), _| {
       let kept = held != object || position >= sequence;
+      if !kept && let Some(changes) = changes.as_mut() {
+        changes.note_dropped((held, position));
+      }
+      kept
+    });
+  }
+
+  /// Drops the accepted positions of a **ledger** `object` from `from` up to, not including, `below` (A-404): what a
+  /// holder whose durable checkpoint stands for the versions below `below` keeps no more, every one of them committed
+  /// at `f + 1`. Phase one ranks only the highest position, so nothing a takeover adopts is dropped; the positions kept
+  /// below `from` (a green's version 0, whose record names its origin) and from `below` on (the checkpoint's own
+  /// version, whose record its rebuild checks) stay. Noted as dropped where the acceptor tracks its changes.
+  pub fn compact_ledger_between(&mut self, object: ObjectId, from: u64, below: u64) {
+    let changes = &mut self.changes;
+    self.accepted.retain(|&(held, position), _| {
+      let kept = held != object || position < from || position >= below;
       if !kept && let Some(changes) = changes.as_mut() {
         changes.note_dropped((held, position));
       }
@@ -4045,6 +4062,68 @@ mod tests {
     acceptor.forget_object(second);
     assert!(positions(&acceptor, second).is_empty());
     assert_eq!(acceptor.prepare(&prepare(second)).unwrap().highest, None);
+  }
+
+  /// A-404: a ledger compacted below a durable checkpoint keeps what its rebuild reads. Do: accept positions 0 to 5 of a
+  /// ledger and 1 of another object, clear the changes, and compact the ledger between 1 and 4. Expect positions 0, 4
+  /// and 5 kept, 1 to 3 dropped and noted dropped, the other object untouched, and the highest position still 5.
+  #[test]
+  fn a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own() {
+    let config = Configuration::solo(HostId(1));
+    let authority = Authority {
+      generation: config.version,
+      owner: config.owner,
+    };
+    let mut acceptor = Acceptor::new(config.owner, authority).tracking_changes();
+    let accept = |acceptor: &mut Acceptor, object: u64, sequence: u64| {
+      acceptor
+        .accept(&record_under(
+          &config,
+          object,
+          sequence,
+          HostEpoch(1),
+          &sequence.to_le_bytes(),
+        ))
+        .unwrap();
+    };
+    for sequence in 0..=5 {
+      accept(&mut acceptor, 7, sequence);
+    }
+    accept(&mut acceptor, 8, 1);
+    acceptor.clear_changes();
+    let (ledger, other) = (
+      ObjectId::new(config.owner, 7),
+      ObjectId::new(config.owner, 8),
+    );
+    acceptor.compact_ledger_between(ledger, 1, 4);
+    let kept: Vec<u64> = acceptor
+      .positions()
+      .filter(|(held, ..)| *held == ledger)
+      .map(|(_, sequence, ..)| sequence)
+      .collect();
+    let dropped: Vec<(ObjectId, u64)> = acceptor
+      .changes()
+      .map(|changes| changes.dropped.iter().copied().collect())
+      .unwrap_or_default();
+    assert_eq!(
+      kept,
+      vec![0, 4, 5],
+      "version 0 and the checkpoint's own position on stay"
+    );
+    assert_eq!(
+      dropped,
+      vec![(ledger, 1), (ledger, 2), (ledger, 3)],
+      "the positions between are dropped and noted"
+    );
+    assert!(
+      acceptor.value_at(other, 1).is_some(),
+      "another object's position is untouched"
+    );
+    assert_eq!(
+      acceptor.highest(ledger).map(|(sequence, _)| sequence),
+      Some(5),
+      "phase one's highest position stays"
+    );
   }
 
   /// §4.8 "persistence before reply", A-367: a holder's acceptor that tracks its changes names exactly the positions a
