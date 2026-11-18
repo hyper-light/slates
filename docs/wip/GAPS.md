@@ -817,10 +817,12 @@
 >   it serves (`held_rendezvous.rs`, `nfs_held.rs`, `merge_kill.rs`, `live_fleet.rs`, `winfsp.rs`, `guest_vhost.rs`), and
 >   `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). They are to
 >   pace their kills on a recovered verdict the anchor publishes.
-> - **A long start beats per unit of work.** The backoff paces a loop of killed starts; it does not let the 407-shard
->   start come up. That start's one thread runs past a window of CPU before the daemon's first beat. A hypothesis from
->   the code, not yet measured: the daemon's main thread making every ordered pair of shards' rings
->   (`slates_rt::runtime::connect_pairs`, N(N-1) rings, 165,242 at 407 shards) before the watchdog thread exists.
+> - ~~**A long start beats per unit of work.**~~ **Built 2026-11-17 (A-312):** the starting thread beats after each unit
+>   of its work (each shard's registration, spawn and acknowledged build, each pair ring) until the watchdog takes the
+>   beat over, so the backoff is no longer all that stands between a long start and the anchor. Owed: the supervisor's
+>   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
+>   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
+>   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
 
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was

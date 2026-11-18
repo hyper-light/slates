@@ -639,8 +639,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > failed starts in a window of a second, so a start that a busy machine stretched past the window and that then failed
 > was never a crash loop and was restarted at once for good (a 407-shard start, every second for 27 minutes on B10's
 > Linux gate at load 70). Now the first failed start is restarted at once and the second in a row is a crash loop,
-> backed off at least the failed start's own life and doubling to the operator's failover SLO. Owed (GAPS): the
-> serve-then-crash loop, and a long start that beats per unit of work. Record:
+> backed off at least the failed start's own life and doubling to the operator's failover SLO. And a start beats as it
+> goes (A-312): the starting thread writes the heartbeat after each unit of its work until the watchdog takes the beat
+> over, so a start that grows with its shards (a ring for every ordered pair) is never one thread's window of CPU
+> without a beat. Owed (GAPS): the serve-then-crash loop. Record:
 > `docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`.
 
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
@@ -21778,5 +21780,45 @@ Applied in the same change to:
   MacBook at load 15, 2026-11-17).
 - **Owed** (GAPS, the entry of 2026-11-11): the serve-then-crash loop, a daemon that dies before it has served as long as
   its start took (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`, ignored), once the end-to-end tests that kill
-  a serving daemon again soon after it serves pace their kills on a recovered verdict the anchor publishes; and a long
-  start that beats per unit of work, so the 407-shard start is not killed in the first place.
+  a serving daemon again soon after it serves pace their kills on a recovered verdict the anchor publishes. A long start
+  that beats per unit of work, so the 407-shard start is not killed in the first place, is A-312.
+
+### A-312 — A daemon's start beats its supervisor at every unit of its work until the watchdog takes the beat over (2026-11-17, built for goal g254: "a long start beats per unit of work")
+
+Applied in the same change to:
+- `crates/rt/src/runtime.rs`: `Runtime::start_sized` and `start_with_sized` take a progress hook, called after each
+  shard's registration, each pair ring (`connect_pairs`), each worker's spawn and each acknowledged build
+  (`await_readiness`); `Runtime::start`, `start_with` and the simulation report to no one.
+- `crates/server/src/daemon.rs`: `StartBeat`, the supervision block's heartbeat written by the starting thread from the
+  segment's attach, through the runtime's start and each shard's spawn, until the watchdog thread starts;
+  `Daemon::start_beats`; a boot line saying how often the start beat.
+- Tests: `crates/rt/tests/lifecycle.rs` (`a_start_reports_every_unit_of_its_work_as_it_goes`) and
+  `crates/server/tests/daemon.rs` (`a_daemons_start_beats_at_every_unit_of_its_work`). The end-to-end proof is
+  `crates/cli/tests/cli.rs` `a_start_whose_shards_sum_past_a_window_comes_up` (gated on `SLATES_TEST_CLI=1`), whose
+  watch fails at the anchor's first start kill since A-311.
+- §2.6's status and GAPS.
+
+- **What was there.** The anchor judges a start in its own CPU time until its first beat, and kills one whose busiest
+  thread runs a liveness window of CPU without beating (§4.14, A-228's rule for a start). Nothing in a daemon beat
+  until its watchdog thread ran, at the end of `Daemon::start_with_fleet`, and the work before it grows with the
+  shards: a driver and a registration for each, a ring for every ordered pair, N(N-1) of them, and a thread for each.
+  At 407 shards on B10's Linux gate (load 67-73) the start's busiest thread ran 1,009-1,037 ms of CPU without a beat,
+  and the anchor killed it every time; A-311 backs that loop off, but the start never came up.
+- **The rule.** A start beats as it goes. The starting thread writes the heartbeat at the segment's attach, before the
+  runtime starts, after each unit of the runtime's work, after each shard's spawn, and once more just before the
+  watchdog thread starts, which is the beat's only writer from then on. Each unit is microseconds, so a start that
+  keeps progressing keeps beating, however many shards it starts. A start stuck in a unit stops beating: the anchor
+  finds the beat lapsed with no watchdog look and judges the process by its CPU from there (A-232's rule for a silent
+  watchdog), so a stuck start is still killed, a window later than the start judgment would have killed it. A start's
+  beat is the same signal as the watchdog's: the daemon is making progress.
+- **Why not start the watchdog first.** It judges shards, and before the runtime there are none, so it would beat
+  while the starting thread spun: the case the start judgment exists to catch.
+- **Why not only make the rings cheaper.** Each shard could make its own outbound rings on its own thread, spreading
+  the quadratic work. That shortens a start but bounds no unit of it: a start is long for other reasons too (a page
+  fault cost 128 µs at load 62, `page_fault_ns` in the liveness agent's kill-loop log of 2026-11-11), and a beat at each
+  unit holds whatever the start's length.
+- **Evidence.** The runtime's hook is called once per unit, `S·(S-1) + 3·S` times for a start of S = 3 shards. A
+  daemon's start beats at least once a unit (`Daemon::start_beats`). The attribution of the 407-shard start's long
+  thread to the pair rings is the code's arithmetic (165,242 rings), not yet measured.
+- **Owed** (GAPS): the supervisor's run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the
+  starting thread's CPU by phase at 407 shards.
