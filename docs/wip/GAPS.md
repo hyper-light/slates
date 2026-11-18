@@ -298,7 +298,10 @@
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
 > privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
-> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> Administrator, so only as a choice the person makes when elevated; (b') the same with WinFsp's machine-wide setting
+> `MountUseMountmgrFromFSD=1`, which an Administrator sets once (as WinFsp itself is installed once) and which then lets
+> an unprivileged mount use the Mount Manager from WinFsp's kernel driver, its drives global to the machine (WinFsp's
+> registry-settings page: "not recommended for general use"); (c) mount as a WinFsp network file system, whose
 > final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
 > cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
 > first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
