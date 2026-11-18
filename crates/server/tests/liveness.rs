@@ -737,10 +737,10 @@ fn spinner_nice_shown() -> i32 {
 /// bound; a sixtieth leaves six times that.
 const LEAST_CPU_SHARE_WINDOWS: u32 = 60;
 
-/// A-228, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding. Wait on the
-/// shard's own CPU clock, the quantity the rule reads, until the spin has run a window of it; then watch the beat for a
-/// window of wall from its last beat. Expect: the beat stops, as the rule says once a shard has run a window of CPU without
-/// a step. How long the CPU takes is the machine's: a window of wall on a free core, ten at load 185 on the 18-CPU Mac,
+/// A-228, A-318, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding. Wait
+/// on the shard's own CPU clock, the quantity the rule reads, until the spin has run the spin window of it (the budget
+/// held to this build, the daemon's own); then watch the beat for a window of wall from its last beat. Expect: the beat
+/// stops, as the rule says once a shard has run the spin window of CPU without a step. How long the CPU takes is the machine's: a window of wall on a free core, ten at load 185 on the 18-CPU Mac,
 /// where the old test's ten windows of wall were about one window of the shard's CPU and failed. Before A-228 nothing
 /// saw a spinning shard.
 #[test]
@@ -760,7 +760,11 @@ fn a_spinning_shard_stops_the_beat_role() {
     return;
   };
   let _serving = beating(&daemon);
-  let backstop = WINDOW * LEAST_CPU_SHARE_WINDOWS;
+  // The CPU a poll may run before the rule calls it spinning: the budget held to this build (A-318), several budgets in
+  // an unoptimized build, one in an optimized one.
+  let spin_window_ns = daemon.spin_window_ns().unwrap();
+  let spin_window = Duration::from_nanos(spin_window_ns);
+  let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
   let spinning = &*Box::leak(Box::new(AtomicBool::new(false)));
   let worker = on_shard(&daemon, other, move || {
@@ -778,9 +782,8 @@ fn a_spinning_shard_stops_the_beat_role() {
   }
   let at_spin = spent();
   let started = Instant::now();
-  let window_ns = u64::try_from(WINDOW.as_nanos()).unwrap();
-  // Phase one: the spin runs a window of the shard's CPU, the rule's own measure.
-  while spent().saturating_sub(at_spin) < window_ns && started.elapsed() < backstop {
+  // Phase one: the spin runs the spin window of the shard's CPU, the rule's own measure.
+  while spent().saturating_sub(at_spin) < spin_window_ns && started.elapsed() < backstop {
     wait(SAMPLE);
   }
   let cpu_at_window = Duration::from_nanos(spent().saturating_sub(at_spin));
@@ -808,19 +811,125 @@ fn a_spinning_shard_stops_the_beat_role() {
   running.store(false, Ordering::Relaxed);
   worker.join().unwrap();
   println!(
-    "spinning shard: a window of its CPU ({cpu_at_window:?}) took {wall_to_window:?} of wall; {beats_after} beat(s) \
-     after; the beat stopped {stopped}; its CPU by the end {cpu_at_end:?}"
+    "spinning shard: the spin window of its CPU ({spin_window:?} held to this build; {cpu_at_window:?} read) took \
+     {wall_to_window:?} of wall; {beats_after} beat(s) after; the beat stopped {stopped}; its CPU by the end \
+     {cpu_at_end:?}"
   );
   assert!(
-    cpu_at_window >= WINDOW,
-    "the spinning shard's CPU clock reached {cpu_at_window:?} in {wall_to_window:?}, under a window: it got less than a \
-     {LEAST_CPU_SHARE_WINDOWS}th of a CPU, which this test does not judge"
+    cpu_at_window >= spin_window,
+    "the spinning shard's CPU clock reached {cpu_at_window:?} in {wall_to_window:?}, under the spin window \
+     {spin_window:?}: it got less than a {LEAST_CPU_SHARE_WINDOWS}th of a CPU, which this test does not judge"
   );
   assert!(
     stopped,
     "a shard that ran {cpu_at_end:?} of CPU without a step never stopped the beat ({beats_after} beat(s) after its \
      window of CPU, in {:?})",
     watching.elapsed()
+  );
+  daemon.stop();
+}
+
+/// Shape: the CPU the slow poll of [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs,
+/// in half budgets: three, half a budget past the one budget of CPU a poll had before A-318, and a whole budget short of
+/// the least spin window the test judges ([`LEAST_SPIN_HALF_BUDGETS`]), so the look cadence and the clocks' grain cannot
+/// carry it over. An unoptimized build measured 3.5 budgets on a Mac Studio (2026-11-18).
+const SLOW_POLL_HALF_BUDGETS: u32 = 3;
+/// Shape: the least spin window, in half budgets, under which the slow-poll test runs; a build measured nearer machine
+/// code's speed would rightly call its poll spinning, and the test says so and skips.
+const LEAST_SPIN_HALF_BUDGETS: u32 = 5;
+
+/// The calling thread's CPU time, read from its own clock (every platform the watchdog judges by it).
+fn own_cpu_spent() -> Duration {
+  Duration::from_nanos(
+    slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+  )
+}
+
+/// A-318, §4.14. Do: on the shard that is not the control shard, run one poll on the CPU for a budget and a half of its
+/// own CPU, then end it; watch the beat until a window after it ends. Expect, where this build's spin window (the budget
+/// held to the build, the daemon's own) is at least two and a half budgets, as an unoptimized build's is: the beat never
+/// gaps a window and no look withholds it, since a poll this build runs slower is no spin. Before A-318 a window of CPU was the budget
+/// alone, and the beat stopped one budget into the poll, as ThreadSanitizer's 1,054 ms poll ended a test binary on CI.
+/// A build measured nearer machine code skips, loudly.
+#[test]
+fn a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat() {
+  common::supervised::run(
+    "a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role",
+    "liveness-slow-poll",
+    2,
+  );
+}
+
+/// The role [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs as a supervised
+/// daemon's process: anchored, so a spinning verdict withholds the beat rather than ending the process.
+#[test]
+#[ignore = "a role: run by a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat as a supervised child"]
+fn a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role() {
+  let Some((daemon, _, other)) =
+    supervised("a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role")
+  else {
+    return;
+  };
+  let _serving = beating(&daemon);
+  let spin_window = Duration::from_nanos(daemon.spin_window_ns().unwrap());
+  let least = WINDOW * LEAST_SPIN_HALF_BUDGETS / 2;
+  let poll_cpu = WINDOW * SLOW_POLL_HALF_BUDGETS / 2;
+  if spin_window < least {
+    println!(
+      "SKIP: this build's spin window is {spin_window:?}, under {least:?}: it runs compiled code near machine code's \
+       speed, so a poll of {poll_cpu:?} of CPU would rightly be judged spinning"
+    );
+    daemon.stop();
+    return;
+  }
+  let ended = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;
+  let before = daemon.watchdog_turns().unwrap();
+  let worker = on_shard(&daemon, other, move || {
+    let started = own_cpu_spent();
+    let wall = Instant::now();
+    while own_cpu_spent().saturating_sub(started) < poll_cpu && wall.elapsed() < backstop {
+      std::hint::spin_loop();
+    }
+    ended.store(true, Ordering::Release);
+  });
+  let watching = Instant::now();
+  let mut last = beat(&daemon);
+  let mut last_seen = Instant::now();
+  let mut largest = Duration::ZERO;
+  let mut ended_at = None;
+  while watching.elapsed() < backstop {
+    wait(SAMPLE);
+    let now = beat(&daemon);
+    if now != last {
+      largest = largest.max(last_seen.elapsed());
+      last = now;
+      last_seen = Instant::now();
+    }
+    if ended.load(Ordering::Acquire) {
+      let at = *ended_at.get_or_insert_with(Instant::now);
+      if at.elapsed() >= WINDOW {
+        break;
+      }
+    }
+  }
+  largest = largest.max(last_seen.elapsed());
+  let after = daemon.watchdog_turns().unwrap();
+  worker.join().unwrap();
+  let (looks, withheld) = (after.0 - before.0, after.1 - before.1);
+  println!(
+    "a poll of {poll_cpu:?} of CPU under a spin window of {spin_window:?}: ended {}; the watchdog looked {looks} times \
+     and withheld the beat at {withheld}; largest beat gap {largest:?}",
+    ended_at.is_some()
+  );
+  assert!(
+    ended_at.is_some(),
+    "the slow poll ended within {backstop:?}"
+  );
+  assert!(
+    looks > 0 && withheld == 0 && largest < WINDOW,
+    "a poll of {poll_cpu:?} of CPU, within this build's spin window of {spin_window:?}, was judged stuck: the beat \
+     withheld at {withheld} of {looks} looks, the largest gap {largest:?}"
   );
   daemon.stop();
 }

@@ -11060,41 +11060,9 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
 fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
-  let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::Created { id } = client.call(&scratch("unpromised")) else {
-    panic!("create on the owner")
-  };
-  share_with_fleet(&mut client, id, &daemons);
-  let ReplyBody::Snapshotted { id: snapshot, .. } =
-    client.call(&RequestBody::Snapshot { volume: id })
-  else {
-    panic!("snapshot on the owner")
-  };
+  let id = held_by_both_survivors(&daemons, "unpromised");
   let object = ObjectId(id.bytes);
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  assert!(
-    poll_snapshot_placed(&observed, &mut client, id, snapshot),
-    "the volume's head placed"
-  );
-  // Both survivors hold the head, so the successor learns the object from its own copy whichever it is.
-  assert!(
-    poll_until(&observed, PLACEMENT_DEADLINE, || {
-      Ok(
-        daemons[1].fleet_holder_head(object)?.is_some()
-          && daemons[2].fleet_holder_head(object)?.is_some(),
-      )
-    }),
-    "both survivors hold the volume's head"
-  );
-  drop(client);
-  let silenced = [
-    daemons[1].inject_takeover_silence(&[hosts[2]]),
-    daemons[2].inject_takeover_silence(&[hosts[1]]),
-  ];
-  assert!(
-    silenced.iter().all(Result::is_ok),
-    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
-  );
+  silence_each_other(&daemons, &hosts);
   let successor = rendezvous_first(&[hosts[1], hosts[2]], object).unwrap();
   daemons.remove(0).stop();
   let (at, other) = if successor == hosts[1] {
@@ -11102,23 +11070,7 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   } else {
     (1, 0)
   };
-  let survivors: Vec<&Daemon> = daemons.iter().collect();
-  let mut client = Client::connect(daemons[at].instance());
-  let mut last = None;
-  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
-    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
-    let named = matches!(
-      &reply,
-      ReplyBody::Refused {
-        refusal: Refusal::NotRecovered {
-          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on },
-        },
-      } if waited_on == "promises"
-    );
-    last = Some(reply);
-    Ok(named)
-  });
-  drop(client);
+  let (given_up, last) = given_up_naming(&daemons, at, id, "promises");
   let counted = daemons[at]
     .fleet_refusals()
     .map(|counters| takeover_counters(&counters));
@@ -11137,20 +11089,94 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
     "the successor gives the volume up naming the promises it waited for, within {SERVE_DEADLINE:?}; its last reply \
      {last:?}; its counters {counted:?}"
   );
-  expect_the_wait_past_its_bound_and_the_give_up_counted(&counted.unwrap_or_default());
+  assert_counted(
+    &counted.unwrap_or_default(),
+    &[
+      "fleet.takeover.unpromised.past_bound",
+      "fleet.takeover.given_up",
+    ],
+  );
 }
 
-/// The successor's counts in `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name`: expect `counted` (its
-/// takeover counters) to hold the wait for promises past its bound and the give-up, each at least once.
-fn expect_the_wait_past_its_bound_and_the_give_up_counted(counted: &[(&'static str, u64)]) {
-  for name in [
-    "fleet.takeover.unpromised.past_bound",
-    "fleet.takeover.given_up",
-  ] {
+/// On `daemons[0]`, a scratch volume named `name`, shared with the fleet and snapshotted, once its head is placed and
+/// both survivors-to-be (`daemons[1]` and `daemons[2]`) hold it, so a successor learns it from its own copy whichever
+/// it is. The volume.
+fn held_by_both_survivors(daemons: &[Daemon], name: &str) -> VolumeId {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create on the owner")
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot on the owner")
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  assert!(
+    poll_snapshot_placed(&observed, &mut client, id, snapshot),
+    "the volume's head placed"
+  );
+  assert!(
+    poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(
+        daemons[1].fleet_holder_head(object)?.is_some()
+          && daemons[2].fleet_holder_head(object)?.is_some(),
+      )
+    }),
+    "both survivors hold the volume's head"
+  );
+  id
+}
+
+/// `daemons[1]` and `daemons[2]` (of `hosts`) each leave the other's takeover pages and questions unanswered: a holder
+/// cut off from one successor alone, which the council never retires since every other member hears it.
+fn silence_each_other(daemons: &[Daemon], hosts: &[HostId]) {
+  let silenced = [
+    daemons[1].inject_takeover_silence(&[hosts[2]]),
+    daemons[2].inject_takeover_silence(&[hosts[1]]),
+  ];
+  assert!(
+    silenced.iter().all(Result::is_ok),
+    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
+  );
+}
+
+/// Asks `daemons[at]` for `id`'s status until it is refused `NotRecovered { TakeoverIncomplete { waited_on } }`, within
+/// the serve deadline: whether it was, and the last reply.
+fn given_up_naming(
+  daemons: &[Daemon],
+  at: usize,
+  id: VolumeId,
+  waited_on: &str,
+) -> (bool, Option<ReplyBody>) {
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[at].instance());
+  let mut last = None;
+  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
+    let named = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotRecovered {
+          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on: named },
+        },
+      } if named == waited_on
+    );
+    last = Some(reply);
+    Ok(named)
+  });
+  (given_up, last)
+}
+
+/// Asserts each counter of `names` moved in `counted`.
+fn assert_counted(counted: &[(&str, u64)], names: &[&str]) {
+  for name in names {
     assert!(
       counted
         .iter()
-        .any(|(counter, count)| *counter == name && *count > 0),
+        .any(|(counter, count)| counter == name && *count > 0),
       "the successor counted {name}: {counted:?}"
     );
   }
