@@ -17,7 +17,9 @@
 //! its client was on another node (A-255: its merge record carries both, so a green's successor answers the submit's
 //! resend after a takeover and keeps the work's route only while it holds such a completion, A-288; and a restarted owner
 //! rebuilds that record byte for byte from this entry), the green's head identity at this version where one was
-//! computed, and a digest of everything before it.
+//! computed, how the submit's signature was judged where it carried one (signed work, A-321: the version's provenance,
+//! which replay hands the green's accepted record, [`crate::engine::Green::record_signature`], so a checkpoint keeps it
+//! once the entry is folded), and a digest of everything before it.
 //!
 //! **The encoding** follows the origin's and the checkpoint's: magic and version, little-endian, every count checked
 //! against the bytes that remain before anything is allocated, any malformation refused typed ([`DocDecodeError`]).
@@ -31,8 +33,8 @@ use crate::special::SpecialNode;
 /// an earlier layout) are refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
 /// Format: the chain entry encoding's version; a decoder refuses any other. 2 since A-255 added the completion key, 3
-/// since A-288 added the submitting work beside it.
-const VERSION: u32 = 3;
+/// since A-288 added the submitting work beside it, 4 since A-321 added the signature's verdict.
+const VERSION: u32 = 4;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;
 /// Format: the byte that marks a head identity, a completion key or a submitting work present.
@@ -46,10 +48,12 @@ const WORK_BYTES: usize = 16;
 /// Format: a completion key and its work: the origin host, the client, the sequence, and the submitting work's marker
 /// and id.
 const COMPLETION_BYTES: usize = 8 + 4 + 4 + 1 + WORK_BYTES;
+/// Format: a signature's verdict at its largest: its marker, the verdict's kind and detail, and the signer's fingerprint.
+const SIGNATURE_BYTES: usize = 1 + 1 + 1 + HASH_BYTES;
 /// Format: the fixed bytes of an entry around its parts: magic, version, the increment's length, the effect count, the
-/// completion's marker and key, the identity's marker and hash, and the digest.
+/// completion's marker and key, the identity's marker and hash, the signature's section, and the digest.
 const ENTRY_OVERHEAD_BYTES: usize =
-  4 + 4 + 4 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + HASH_BYTES;
+  4 + 4 + 4 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + SIGNATURE_BYTES + HASH_BYTES;
 /// Format: an effect's largest fixed part: its tag and three length prefixes or counts.
 const EFFECT_OVERHEAD_BYTES: usize = 1 + 3 * 4;
 /// Format: the smallest an effect can encode to: its tag and one length prefix.
@@ -111,6 +115,21 @@ pub struct ChainEntry {
   pub completion: Option<Completion>,
   /// The green's head identity at this version, where one was computed.
   pub identity: Option<[u8; 32]>,
+  /// How the submit's signature was judged, where it carried one (module docs).
+  pub signature: Option<Signature>,
+}
+
+/// How the signature of the submit that made a version was judged (signed work, A-321): the version's provenance.
+/// Opaque here: the merge plane keeps what the server's verifier decided (`slates_server::signed_work`), so a restarted
+/// owner answers it as it was judged, never judging again under signers set since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signature {
+  /// The verdict's kind (verified or invalid), as the server numbers it.
+  pub kind: u8,
+  /// The verdict's detail (the signer's key type, or why it did not verify), as the server numbers it.
+  pub detail: u8,
+  /// The signer's key fingerprint (zero for a signature that did not verify).
+  pub fingerprint: [u8; 32],
 }
 
 /// A submit's completion key (§4.9 RIFL): the host its client is on, the client and the request's sequence, with the
@@ -203,6 +222,7 @@ pub fn encode(
   applied: &[Applied],
   completion: Option<Completion>,
   identity: Option<[u8; 32]>,
+  signature: Option<Signature>,
 ) -> Vec<u8> {
   let mut out = Vec::with_capacity(increment_bytes.len().saturating_add(ENTRY_OVERHEAD_BYTES));
   out.extend_from_slice(&MAGIC.to_le_bytes());
@@ -235,9 +255,42 @@ pub fn encode(
     }
     None => out.push(ABSENT),
   }
+  put_signature(&mut out, signature);
   let digest = *blake3::hash(&out).as_bytes();
   out.extend_from_slice(&digest);
   out
+}
+
+/// Appends a signature's verdict (module docs): a present marker and the verdict, or an absent marker alone.
+pub(crate) fn put_signature(out: &mut Vec<u8>, signature: Option<Signature>) {
+  match signature {
+    Some(verdict) => {
+      out.push(PRESENT);
+      out.push(verdict.kind);
+      out.push(verdict.detail);
+      out.extend_from_slice(&verdict.fingerprint);
+    }
+    None => out.push(ABSENT),
+  }
+}
+
+/// Reads what [`put_signature`] wrote.
+pub(crate) fn take_signature(reader: &mut Reader<'_>) -> Result<Option<Signature>, DocDecodeError> {
+  match reader.u8()? {
+    PRESENT => {
+      let kind = reader.u8()?;
+      let detail = reader.u8()?;
+      let fingerprint = <[u8; HASH_BYTES]>::try_from(reader.bytes(HASH_BYTES)?)
+        .map_err(|_| DocDecodeError::Truncated)?;
+      Ok(Some(Signature {
+        kind,
+        detail,
+        fingerprint,
+      }))
+    }
+    ABSENT => Ok(None),
+    _ => Err(DocDecodeError::BadKind),
+  }
 }
 
 /// The increment's own encoding within an entry, checking the entry's digest: what a merge record's inputs are.
@@ -291,6 +344,7 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
     ABSENT => None,
     _ => return Err(DocDecodeError::BadKind),
   };
+  let signature = take_signature(&mut reader)?;
   if !reader.is_empty() {
     return Err(DocDecodeError::TrailingBytes);
   }
@@ -299,6 +353,7 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
     applied,
     completion,
     identity,
+    signature,
   })
 }
 

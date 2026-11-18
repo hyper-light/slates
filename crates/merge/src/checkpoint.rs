@@ -6,7 +6,9 @@
 //! reference to its base snapshot, A-217): for every key of every dimension whose value in effect at `F` was set by a
 //! version after 0, that version and that value (absent when the key was removed). With it, the identities of every
 //! increment accepted up to `F` and their versions, the idempotency record a retried submit is answered from. A key
-//! untouched since the origin is not in it. So a checkpoint costs what the green's versions changed, once each, and an
+//! untouched since the origin is not in it. With the accepted identities, how each signed version's submit was judged
+//! (signed work, A-321): the provenance its chain entry carried until the checkpoint folded it, kept as long as the
+//! version's idempotency record is. So a checkpoint costs what the green's versions changed, once each, and an
 //! increment folded into it is never read again: the green restored from the origin and the checkpoint
 //! ([`crate::engine::Green::restore`]) answers exactly as the green did for every version from `F` on, and a base below
 //! `F` is refused as unknown rather than judged against deltas that are gone.
@@ -28,8 +30,11 @@ use crate::special::SpecialNode;
 /// Format: the checkpoint encoding's magic, "GCKP" little-endian, so a chain entry of another kind (an increment, an
 /// origin) is refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GCKP");
-/// Format: the checkpoint encoding's version; a decoder refuses any other.
-const VERSION: u32 = 2;
+/// Format: the checkpoint encoding's version; a decoder refuses any other. 3 since A-321 added the signed versions'
+/// verdicts beside the accepted identities.
+const VERSION: u32 = 3;
+/// Format: a signature verdict's fingerprint, a SHA-256 hash (`crate::chain_entry::Signature::fingerprint`).
+const FINGERPRINT_BYTES: usize = 32;
 /// Format: an accepted increment's identity, a BLAKE3 hash.
 const IDENTITY_BYTES: usize = 32;
 /// Format: the byte that marks a value present (a key whose value at the checkpoint is set).
@@ -55,6 +60,8 @@ pub struct Checkpoint {
   pub version: u64,
   /// Every increment accepted at or before `version`, by identity, with the version it committed.
   pub accepted: Vec<([u8; 32], u64)>,
+  /// How the signature of each version at or before `version` whose submit carried one was judged (A-321), by version.
+  pub signatures: Vec<(u64, crate::chain_entry::Signature)>,
   /// Regular files changed since the origin.
   pub files: Vec<Changed<String, Vec<u8>>>,
   /// Directories created or removed since the origin (present: `Some(())`).
@@ -78,6 +85,7 @@ impl Checkpoint {
   /// Sorts every table by its key, so the encoding is one sequence whatever order the engine walked its histories in.
   pub fn canonicalize(&mut self) {
     self.accepted.sort();
+    self.signatures.sort_by_key(|(version, _)| *version);
     self.files.sort_by(|a, b| a.key.cmp(&b.key));
     self.dirs.sort_by(|a, b| a.key.cmp(&b.key));
     self.modes.sort_by(|a, b| a.key.cmp(&b.key));
@@ -99,6 +107,13 @@ impl Checkpoint {
     for (identity, version) in &canonical.accepted {
       out.extend_from_slice(identity);
       out.extend_from_slice(&version.to_le_bytes());
+    }
+    put_count(&mut out, canonical.signatures.len());
+    for (version, signature) in &canonical.signatures {
+      out.extend_from_slice(&version.to_le_bytes());
+      out.push(signature.kind);
+      out.push(signature.detail);
+      out.extend_from_slice(&signature.fingerprint);
     }
     put_table(
       &mut out,
@@ -184,6 +199,21 @@ impl Checkpoint {
       let mut identity = [0u8; IDENTITY_BYTES];
       identity.copy_from_slice(reader.bytes(IDENTITY_BYTES)?);
       checkpoint.accepted.push((identity, reader.u64()?));
+    }
+    for _ in 0..take_count(&mut reader)? {
+      let version = reader.u64()?;
+      let kind = reader.u8()?;
+      let detail = reader.u8()?;
+      let mut fingerprint = [0u8; FINGERPRINT_BYTES];
+      fingerprint.copy_from_slice(reader.bytes(FINGERPRINT_BYTES)?);
+      checkpoint.signatures.push((
+        version,
+        crate::chain_entry::Signature {
+          kind,
+          detail,
+          fingerprint,
+        },
+      ));
     }
     checkpoint.files = take_table(&mut reader, take_str, |r| Ok(reader_bytes(r)?.to_vec()))?;
     checkpoint.dirs = take_table(&mut reader, take_str, |_| Ok(()))?;
