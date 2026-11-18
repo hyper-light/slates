@@ -12997,7 +12997,7 @@ const FILL_ATTEMPTS: usize = 3;
 /// Fills `daemon`'s shard (one shard a node in these meshes) with one bounded volume of everything it admits now: a
 /// create past any shard's room is refused `BudgetExceeded` naming what the shard could admit, and a create of that size
 /// takes it. The volume made, or the last reply.
-fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
+fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, Box<ReplyBody>> {
   let mut client = Client::connect(daemon.instance());
   let mut limit = u64::MAX / 2;
   let mut last = None;
@@ -13020,9 +13020,9 @@ fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
       }
     }
   }
-  Err(last.unwrap_or(ReplyBody::Refused {
+  Err(Box::new(last.unwrap_or(ReplyBody::Refused {
     refusal: Refusal::BudgetExceeded { available: limit },
-  }))
+  })))
 }
 
 /// §4.2 ("a remote holder makes the same admission against its own machine before acknowledging placement"; g229, the
@@ -13740,6 +13740,9 @@ fn takeover_outcomes(daemons: &[Daemon]) -> Vec<(u64, u64)> {
     .collect()
 }
 
+/// Each node's counted (live takeovers, given-up objects), before a deaf spell and after it ([`takeover_outcomes`]).
+type OutcomePairs = (Vec<(u64, u64)>, Vec<(u64, u64)>);
+
 /// What one deaf spell of [`deaf_until_its_takeover_resolves`] did: whether the node was made deaf and healed, whether
 /// the others retired it and its takeover resolved meanwhile, each node's live takeovers and given-up objects before
 /// and after, and every node's configuration at the retirement and at the heal.
@@ -13748,7 +13751,7 @@ struct DeafSpell {
   retired: bool,
   resolved: bool,
   healed: bool,
-  outcomes: (Vec<(u64, u64)>, Vec<(u64, u64)>),
+  outcomes: OutcomePairs,
   at_retirement: Vec<String>,
   at_heal: Vec<String>,
 }
@@ -15343,7 +15346,7 @@ fn hex_of_volume(volume: VolumeId) -> String {
 fn volume_of_hex(text: &str) -> VolumeId {
   let mut bytes = [0u8; 16];
   for (index, byte) in bytes.iter_mut().enumerate() {
-    *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).unwrap();
+    *byte = u8::from_str_radix(text.get(2 * index..2 * index + 2).unwrap(), 16).unwrap();
   }
   VolumeId { bytes }
 }
@@ -15413,7 +15416,11 @@ fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
       .expect("the holder printed its attachment")
       .unwrap();
     if let Some(at) = line.find(YIELDED_HOLDER_TAG) {
-      break line[at + YIELDED_HOLDER_TAG.len()..].trim().to_owned();
+      break line
+        .get(at + YIELDED_HOLDER_TAG.len()..)
+        .unwrap()
+        .trim()
+        .to_owned();
     }
   };
   let observed: Vec<&Daemon> = daemons.iter().collect();
@@ -23628,7 +23635,10 @@ fn submit_version_on(node: &Daemon, green: VolumeId, version: u64) -> ReplyBody 
 
 /// A work over `green` made on `node`, with one edit of a file `kept` declared and not submitted: the work, or the
 /// refusal of the step that failed.
-fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<VolumeId, ReplyBody> {
+fn work_with_an_unsubmitted_edit(
+  node: &Daemon,
+  green: VolumeId,
+) -> Result<VolumeId, Box<ReplyBody>> {
   let mut client = Client::connect(node.instance());
   let created = client
     .try_call(
@@ -23640,7 +23650,7 @@ fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<Volum
     )
     .unwrap_or_else(|e| refused_placeholder(&e));
   let ReplyBody::WorkCreated { id: work, .. } = created else {
-    return Err(created);
+    return Err(Box::new(created));
   };
   let edited = client.call(&RequestBody::Edit {
     work,
@@ -23651,7 +23661,7 @@ fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<Volum
   });
   match edited {
     ReplyBody::Edited => Ok(work),
-    other => Err(other),
+    other => Err(Box::new(other)),
   }
 }
 

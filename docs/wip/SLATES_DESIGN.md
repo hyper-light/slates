@@ -29871,7 +29871,7 @@ module's channel and message paragraphs).
   record kept, a fresh pipe, its client end duplicated into the holder and named in this message, the replies kept for
   a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
   message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
-  a restore runs and its holder changes). And Shards' device half.
+  a restore runs and its holder changes): built by A-423. And Shards' device half.
 
 ### A-420 — A commit times the decode a replay of its record does, and recovery replays a record at a time (2026-11-18, goal 83, g251; A-243's open line)
 
@@ -30000,6 +30000,71 @@ Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the
 `docs/cli.md`, `crates/server/src/{verbs,landing,daemon,remote_attach}.rs`, `crates/db/src/catalog.rs` (the consumers'
 lease docs), `crates/client/tests/reap.rs`, `crates/server/tests/landing_fairness.rs`, `crates/cli/tests/fs_server.rs`
 (a bound's comment).
+
+### A-421 — The load test's workers park between replies and sends, as the clients they stand for do (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; the harness's half of A-297's measurement)
+Applied in the same change to: GAPS (the load test's entry), `crates/client/examples/load_bench.rs` (`drive`,
+`Worker::sweep`, `park_until`, `arm_in_flight`, `count_park`, `park_margin_ns`, `next_due`, `park` paired for Unix and
+Windows, `park_timeout_ns`, `Parked`, `Connection::completion`, the `harness` row's park columns, the module's "Workers
+wait"), and the example's tests below.
+- **What was measured.** Every worker spun for its whole level, so the harness took a core a worker from the daemon it
+  measured: eight on the Mac Studio's 32. On that box under load its sweeps took 25 to 127 ms and held 6.9 clients on
+  average, due to send and not yet sent, against 2.2 in flight, at 1,000 clients (g083's trace, 2026-11-18).
+- **The rule.** A worker whose sweep took no reply and sent nothing sweeps on for the daemon's published spin window
+  (the measured mean cost of a wake), as an async client spins before it parks. Then it arms the completion of every
+  connection with a request in flight, drains those once more, which closes the race with a reply that landed before
+  its arm, and parks on every connection's completion until a reply makes one readable or its next deadline comes:
+  the earliest due send, overdue check or progress report. It wakes early by the spin window and by the mean lateness
+  of its timed-out parks, and spins the rest of the way, so a due client is sent on time. Every arm is cleared after
+  the park, so a reply taken while the worker sweeps costs the daemon no wake. A worker does not park while a
+  connection reconnects or resends: those keep their own pacing. A reply that comes while its worker is parked costs
+  the daemon a wake and the worker its wakeup, inside that reply's latency, as it does for an agent's async client.
+- **Per platform.** Linux polls the rendezvous's eventfd and macOS each connection's completion bridge pipe, both with
+  `poll(2)` (on macOS under a launchd job's timer policy it comes back about 2 ms late where `nanosleep` and `select`
+  come back about 76 ms late, 2026-10-26). Windows polls each completion bridge's socket with `WSAPoll`, which waits on
+  at least one socket, so every connection's completion is in the set. A connection whose completion is not armed is
+  never made readable.
+- **Counted.** The `harness` row now ends with the parks, those a reply ended, the worker-nanoseconds parked and the
+  mean lateness of the parks that met their deadline.
+- **Tests** (`cargo test -p slates-client --example load_bench`): `a_parked_worker_is_woken_by_its_reply` (the daemon's
+  one shard held until the worker has armed its connection and found its ring empty; the reply ends the park long
+  before its 5 s deadline and is there to be taken; then, with nothing in flight, a park meets its 20 ms deadline less
+  its margin and its lateness is kept) and `a_park_wakes_its_margin_before_its_deadline`. The stamp tests now stand in
+  for the host's preemption with a yielding wait rather than a blocking sleep (D-9). The A/B is main's: main's harness,
+  spinning, against this one at the same daemon, `held`, `max_sweep_ns` and every kind's `latency` and `floor` p99.
+
+### A-423 — The Windows anchor holds a Shards stream's resync end, and a daemon replaces a held entry's record as the stream's session moves (2026-11-18, goal 90, item b, piece two; A-418's owed anchor formats)
+Applied in the same change to: A-418's owed list; GAPS, A-281's entry (its Windows item);
+`crates/anchor/src/handles.rs` (`WHAT_SHARDS_RESYNC`, `SHARDS_RESYNC_HANDLES`, `admits`, `HandleMessage::Record`, its
+encoding and its decoding, the module's notes); `crates/anchor/src/held_windows.rs` (`Held::apply` takes a record's
+replacement; `Held::hold` admits each kind at its handle counts); `crates/anchor/src/supervise_windows.rs` (the drain
+bound's derivation).
+
+- **What was there.** The Windows hold (A-198) held one kind of entry, a WinFsp mount's handles, and kept each entry's
+  record as its hold set it: any other kind was refused `Malformed`, and nothing could change a record once held. A
+  Shards stream's resync end needs both: its hold is one handle, the daemon's end of the stream's message-mode resync
+  pipe, and its record is the stream's session, which moves while the stream lives (the guest names its owner, its
+  kernel's `INIT` is answered, a restore takes a saved guest's tables, a holder is named for the stream), as the Unix
+  hold's session does (`crate::held`'s `Session` message, A-281, A-378).
+- **The kinds.** `admits(what, count)`: a WinFsp mount one to `MAX_HANDLES` handles, as A-198 left it (its daemon names
+  two since A-369; the room stays for a daemon built apart across an upgrade); a Shards stream's resync end
+  (`WHAT_SHARDS_RESYNC`, 2) exactly one; any other kind nothing. A record is opaque to the anchor, within `RECORD_CAP`.
+- **The record's replacement.** `Record { id, record }` (kind 6), laid out as a hold whose kind, count and handle slots
+  are zero, which decoding requires, so the message has one encoding and names no handle; nothing is duplicated for
+  it. Answered `Held { id }` once the anchor keeps the new record, the entry's handles as they were held, and refused
+  `Malformed` and counted, with nothing changed, for an entry the anchor does not hold or a record past the cap. Its
+  answer is a hold's: a daemon runs one exchange at a time, sends a record's replacement only for an entry the anchor
+  answered held, and gives the stream's resync up rather than send another after one whose answer did not come, so
+  no answer can be taken for another of the same entry. An anchor built before this refuses the kind and the message,
+  so a newer daemon's stream is served without a resync there (Shards' option (a)), as when the anchor refuses a hold.
+- **Evidence.** The formats' unit tests, on every host (`crates/anchor`, `handles`): the record's golden vector, a
+  resync hold and two records round-tripping, a record naming a kind, a count or a handle and one past the cap refused
+  with every changed bit, a long record refused at encoding, and `admits` for every count of every kind. Red first: on
+  main the tests did not build (no `Record`, `WHAT_SHARDS_RESYNC` or `admits`). The hold's own test
+  (`held_windows.rs`, Windows): a resync end held alone and a two-handle one refused, its record replaced and handed to
+  the next process under its kind, and a replacement for an entry not held or past the cap refused and counted, with
+  nothing changed; compiled clean for Windows (`cargo xwin check`), its run filed for main.
+- **Owed.** The daemon's half: its hold of a resync end and its record's replacements over `crate::anchor_hold`'s
+  exchange, and a successor adopting a handed resync entry (A-418's attach and successor halves).
 
 ### A-425 — The NFSv4 lease is derived from the clients it serves, and every wait on a recalled delegation reads it: one number for the lease advertised, the recall's revocation, the quiet period, the NFSv3 gate and a landing (2026-11-18, built for goal g255; A-414's owed list; RFC 8881 §8.3, §10.4, §10.4.5; §4.6 A-35, A-78, A-79)
 - **What was there.** The listener granted and advertised (`FATTR4_LEASE_TIME`) the operator's failover SLO, the 10 s

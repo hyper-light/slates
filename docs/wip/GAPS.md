@@ -775,9 +775,11 @@
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
 >   its guest's maps. **Owed:** Windows on Shards' handle path; its wire is built (A-418, 2026-11-18): a Windows
 >   `Resync` names the fresh end's handle in the stream's holder's process, where a successor duplicates it (A-175's
->   route), since no descriptor rides a message there; owed after it, the attach's half (the message-mode resync pipe,
->   the anchor holding its end with the session and the holder) and the successor's half (adopting the held end, the
->   duplicate into the holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
+>   route), since no descriptor rides a message there; and the Windows anchor's hold formats for it (A-423, the same
+>   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
+>   stream's session moves; owed after them, the attach's half (the message-mode resync pipe, the anchor holding its
+>   end with the session and the holder) and the successor's half (adopting the held end, the duplicate into the
+>   holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -980,6 +982,35 @@
 >   (`a_client_turning_its_async_completion_on_and_off_keeps_no_memory`;
 >   `docs/bugs/2026-11-18-the-completion-bridge-kept-two-blocks-a-start.md`);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
+>
+> **The library goal audited clause by clause (2026-11-18, goal 88's library part, g262; main at 3f4700745).** Each
+> clause of the goal's text, the tests on main that hold it by use, and where they run. `api.rs` and `start.rs` are
+> `crates/api/tests/`; "Unix" means the test is `cfg(unix)`; a gated test runs only where its variable is set. Rows
+> marked **missing** are owed, each a piece of its own.
+>
+> | Clause | Held by (on main) | Where it runs |
+> |---|---|---|
+> | Instance start | `start.rs`: `an_instance_starts_from_the_hosts_own_executable_serves_and_stops`, `a_second_start_of_a_running_instance_is_refused_already_running`, `a_program_that_cannot_run_is_refused_spawn`, `an_anchor_whose_host_refuses_the_role_is_refused_anchor_exited`, `an_instance_started_with_a_launcher_secret_takes_it_and_serves`, `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret`, `an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves` | the start binary (the test binary is the host, `harness = false`); the wrapper test Unix |
+> | Instance attach | `api.rs`: `attaching_where_no_daemon_serves_is_refused_unavailable`; `start.rs`: `a_wait_for_an_instance_nobody_starts_ends_unavailable_at_its_deadline`; every `api.rs` test attaches, and the first `start.rs` test attaches again after its stop | every platform |
+> | Volume create | `api.rs`: `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (empty; `AlreadyExists` naming the holder; a relative overlay folder `Invalid(Path)`), `a_group_is_made_once_and_made_again_harmlessly_before_any_volume` (`Unusable(NoGroup)`), `a_merge_is_accepted_or_conflicted_typed` (green, work), `kilns_workspaces_are_provisioned_side_by_side` (kiln's overlay spec, Unix), `an_instance_answers_the_seams_conformance_suite` | every platform; the overlay tests Unix |
+> | Clone | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (the clone reads the snapshot's bytes), `a_captured_bases_clone_reads_the_capture_with_no_base_directory` (Unix), the seam suite | every platform |
+> | Snapshot | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed`; the seam suite (a pinned snapshot's destroy `Busy(Volume(Pinned))`, an unpinned one's done); `a_snapshots_retention_refused_is_not_the_quota` (Unix) | every platform |
+> | Destroy | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (gone from the list, then `NotFound` naming it); the seam suite | every platform |
+> | Serving: a mount on bare metal | `api.rs`: `a_busy_mount_is_let_go_of_the_oss_way` (mounts through the library; a plain unmount refused busy; `unmount_busy` answers `Detached` or `Forced`); the CLI mounts through `Instance::mount`: `slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it`, `slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it` (`crates/cli/tests/cli.rs`), the WinFsp drive (`crates/cli/tests/winfsp.rs`); `mount.rs`'s nine unit tests (what a mount needs on each OS, the mount's arguments) | kernel mounts only where asked: `SLATES_TEST_MOUNT=1` (Unix), `SLATES_TEST_CLI=1`, CI's Windows lanes |
+> | Serving: a virtio-fs/DAX descriptor to a VMM | `api.rs`: `a_shards_stream_end_serves_the_volume_it_was_made_for` (FUSE through the end the library hands; `INIT` keeps a `dax=inode` guest's DAX flags; a file of a DAX range or more marked `FUSE_ATTR_DAX`); the seam suite (a served stream's peer reads its end at the detach); the CLI's `slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it` (gated); the map's data path, below the library over the same stream: `the_stream_offers_per_inode_dax_for_files_of_a_range_or_more`, `a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart` (`crates/server/tests/shards.rs`). **Missing:** the Windows stream through the library (the `api.rs` test is Linux and macOS only; the route is held below it by `crates/client/tests/shards.rs`); and `Instance::serve_vhost_user` (Linux), which no `slates-api` test drives (the route is held by the server's vhost-user tests and `crates/cli/tests/guest_vhost.rs`, a real VM, gated) | Linux, macOS |
+> | Changes | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (`approval_entries`: exactly the two files, each read back and hashed against its entry), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (kiln's review: a snapshot presented, its entries listed, each read at the head), `a_greens_changes_are_read_a_page_at_a_time_and_whole` (a green's `changed_since`) | Unix |
+> | Drift | `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict`, `an_overlays_drift_past_one_reply_is_read_whole`; unit: `a_base_report_is_typed_entry_by_entry`, `a_drift_page_is_typed_as_a_status_is` | Unix; the units everywhere |
+> | Landing plans | `a_landing_follows_its_volumes_write_mode` (a plan presents and writes nothing), `a_signed_landing_is_judged_and_read_back_through_the_contract` (a plan states what a signer signs), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (a snapshot's plan) | Unix |
+> | Grant-bound landing | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (ask: nothing written until approved; another manifest's approval writes nothing and answers the fresh presentation; the shown one writes exactly its manifest; the grant consumed, the landing audited), `a_landing_follows_its_volumes_write_mode` (bypass `Written` in one call; forbid `Refused`, nothing written), `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict` (`Conflicted`, nothing written), `the_launchers_authority_needs_the_anchors_handoff`; `start.rs`: `the_launchers_secret_proves_its_policy_across_a_daemon_restart` | Unix |
+> | Changes, drift, plans and landing on Windows | **Missing:** the daemon lands on Windows since A-185, and the overlay's drift is read there (`crates/base/src/windows.rs`), but every `api.rs` test of changes, drift, plans and landing is `cfg(unix)`, as are the paged audit's and the async form's | none |
+> | Observation | `the_daemon_is_observed_through_the_library` (the daemon's status, a shard's telemetry), `a_listing_is_read_a_page_at_a_time_and_whole`, `the_audit_is_read_a_page_at_a_time_and_whole` (Unix), `a_signed_landings_audit_reads_back_on_every_shard_kiln_starts` (Unix), the landing test's audit and grant reads; unit: `each_grant_state_is_read_from_its_typed_field`, `each_audit_kind_and_stage_is_read_from_its_typed_field` | every platform; the audit's Unix |
+> | Typed refusals | `crates/api/src/error.rs`'s eleven unit tests (every wire refusal through one exhaustive table, `each_refusal_is_typed_into_the_class_a_consumer_acts_on` first); by use: `Unavailable` (attach, a wait), `Unusable(NoGroup)`, `NotFound` and `AlreadyExists` naming their subject, `Invalid(Path)`, `Busy(Volume(Pinned))`, `Exhausted::Volume(RetentionExceeded)`, `Stale` (a version past the head), `Invalid::MoveTarget` (`a_lone_instance_names_itself_and_refuses_a_move_typed`), `Denied(NoAuthority)`, and the start's `AlreadyRunning`, `Spawn`, `AnchorExited`, `NeverServed` | every platform; some Unix |
+> | By-use tests | `api.rs` over an in-process daemon; `start.rs`, the test binary as the embedding host; the seam suite over an instance and over the simulator (`an_instance_answers_the_seams_conformance_suite`, `the_simulator_answers_the_seams_conformance_suite`) | every platform |
+> | Documented | `docs/library.md`, §4.12 "Embedding" and "The consumer contract", every module's doc; `role::main`'s example compiles as a doctest. **Missing:** the guide's workspace-flow example (`docs/library.md`) is compiled by no test, so it can drift from the API unseen | the doctest everywhere |
+> | Versioned | `VERSION` and `CONTRACT`; `the_contract_history_names_every_version_in_order` (unit); the wire's tags, `crates/ipc/tests/wire_order.rs` and `crates/db/tests/wire_order.rs` | every platform |
+>
+> Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
+> a page at a time, and a merge's versions typed on the wire.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
 > goal of 2026-11-18).** The Windows lanes (`windows-lint`, `windows-arm64`) now run the roster's four version-control
@@ -3066,6 +3097,16 @@
 >     round, as many edits and merges as its conflicts make, stays in the `latency` row (191 ms at its p99 with every
 >     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
 >     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
+>
+>     **The harness's workers park instead of spinning (2026-11-18, g083, A-421).** Each worker spun for its whole
+>     level, a core each taken from the daemon it measured; on the loaded Mac Studio its sweeps took 25 to 127 ms and
+>     held 6.9 clients on average against 2.2 in flight. A worker now sweeps on for the daemon's published spin window
+>     after its last reply or send, then arms every connection with a request in flight and parks on their completions
+>     until a reply or its next deadline, waking early by the spin window and its parks' measured lateness. The
+>     `harness` row counts the parks. Unit tests: a worker parked with its request in flight is woken by the reply, and
+>     with nothing in flight meets its deadline. **Owed, measurement (the supervisor's):** the A/B of main's spinning
+>     harness against the parking one at the same daemon (`held`, `max_sweep_ns`, every kind's `latency` and `floor`
+>     p99).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,

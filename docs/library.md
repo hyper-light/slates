@@ -294,6 +294,13 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 ## What is owed
 
+The gap ledger's consumer-contract entry audits this library clause by clause, naming the tests
+that hold each one and where they run. What it found owed, with the rest:
+
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
+3. Tests through the library on Windows for changes, drift, landing plans and grant-bound
+   landing (the daemon lands there, and these tests run on Unix only), and for the Shards stream.
+4. A test of `serve_vhost_user` through the library (Linux).
+5. The example above compiled by a test, so it cannot drift from the API.
