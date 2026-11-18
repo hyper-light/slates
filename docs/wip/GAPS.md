@@ -1252,6 +1252,7 @@
 >   deafness, its test thread blocked in it). The other 4 runs with that probe answered in 118 to 198 ms, and 6 runs
 >   without it in 60 to 205 ms. Not reproduced; a recurrence in a gate run is the data point to chase.
 
+
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
 > child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe

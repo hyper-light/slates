@@ -12414,31 +12414,3 @@ whole image is about 140 µs above both, and its p99 is about twice theirs.
 65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
 pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
 answers.
-
-## The forward lane's stall budget in its own shard's time: what a deaf session's first answer costs (A-232 C+D; 2026-11-09, loadtest-scale)
-
-`6da9670d` counts a forward batch's quiet on the lane's poll clock instead of the wall
-(`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). Its driving turns last a poll pace
-(10 ms) at most, where a turn before held the session up to the batch's whole stall budget, so the session is returned
-and taken back every turn. That costs the dead-session test's first answer on the replacement session about 60 ms at
-the median. The fix is kept for what it buys: a starved origin gave up 2 to 1,208 batches to a live owner on main in 6
-of 6 runs, and none with the fix in 3 of 3 (`a_starved_origin_keeps_its_forward_to_a_live_owner`).
-
-`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`: 256 clients burst through b, b's session to a made
-deaf, and the first answer on the replacement timed from the drop; the bound is 1.1 s. adacachy2 (32 CPUs), load 40 to
-41, debug builds, the two binaries alternated, the test without any probe:
-
-| Pair | Before (`6da9670d~1`'s lane) | The fix |
-| --- | --- | --- |
-| 1 | 118.1 ms | 173.3 ms |
-| 2 | 75.7 ms | 151.3 ms |
-| 3 | 119.9 ms | 59.5 ms |
-| 4 | 91.9 ms | 67.8 ms |
-| 5 | 39.0 ms | 205.4 ms |
-| 6 | 71.5 ms | 132.7 ms |
-| Median | 83.8 ms | 142.0 ms |
-
-The fix was slower in 4 of the 6 pairs, and every run of both passed. The fleet suite's own run of the test at
-`2577aa61` answered 439 ms after the drop. A version of the fix that credited a pace a turn whatever the shard ran took
-1.06 to 2.21 s on adacachy2 (43 to 136 ms before, alternated at load 52 to 81) and 22.4 s on the 18-CPU Mac: it read a
-busy shard as starved (the bug record's Fix).
