@@ -8432,9 +8432,9 @@ the format floor.
 > reads the file a page at a time (`read`) and keeps it where it keeps bytes (Mantle, kiln's object store, CP-T10.4).
 > The archive carries every file's bytes and every entry's metadata, each chunk and the whole verified by identity on
 > the way back in; its manifest identity, which the reply names, is the tree's. A snapshot whose entries still read an
-> overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed: the volume made from an
-> archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
-> archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
+> overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed then, both built since:
+> the volume made from an archive (A-453, below) and a streamed encoder (A-459, below); until A-459 the archive was
+> held whole while it was encoded, one unit of its size, then written into the file a chunk a unit.
 
 > **Status (2026-11-18, A-453: a volume made from an archive through the library).** `ArchiveImport`
 > (`Instance::import_archive`, contract 40) is the export's way back. A consumer writes the archive bytes it kept into
@@ -8460,6 +8460,26 @@ the format floor.
 > them, as a takeover's restore brings them back; a host mount the daemon makes honours no set-id bit and opens no
 > device node (`nosuid,nodev`, A-94). Owed: a streamed decoder, since the file is held whole while it is decoded, as
 > the export's encoding is; and the manifest's decode and identity in pieces (one piece today: the whole tree's).
+
+> **Status (2026-11-18, A-459: the export's archive is written as a stream).** An export no longer holds the snapshot's
+> content or its archive whole. It walks the snapshot twice, as the streamed checkpoint counts before it encodes
+> (`encode_image_into`):
+> - the first walk hands each new chunk to a `slates_archive::Measure`, which keeps its identity and lengths and drops
+>   its bytes (`SnapshotArchiver::advance_into`, a unit's chunks at a time). From it and the walk's manifest, a
+>   `Layout` knows the header, every record's offset and the whole length before a byte is written, so the archive
+>   volume is admitted exactly, as A-441 admitted it;
+> - the second walk hands the same chunks, each checked against its first-walk record, to a `StreamWriter`, which
+>   stages each record behind the header, then the manifest, the seek table and the trailer, folding the
+>   whole-archive BLAKE3 over every byte as it is staged;
+> - the stage is emptied into the archive file once it holds a copy slice (`DaemonConfig::copy_slice_bytes`: emptying
+>   it is a copy into the file), a slice a turn on the owner shard, so it holds at most that and the largest item
+>   staged whole after it, a record of the archive's largest chunk (`StreamWriter::bound`). Its emptyings are counted
+>   (`image.archive_stage_flushes`), and a stage past its bound would be (`image.archive_stage_past_bound`, zero).
+>
+> The bytes are the whole-buffer encoder's (`Archive::encode`), byte for byte; that encoder is the streamed one's oracle
+> in the tests and stays the encoder of a holder that keeps an archive whole (the fleet's replication). The cost is the
+> second walk: the chunks' identities and compression are computed twice. Owed: the manifest's encoding is held whole
+> while it is written (the tree's metadata, never its content), and the import's decoder still holds its file whole.
 
 ### 4.12 Agent surfaces (D-19)
 
@@ -31526,3 +31546,63 @@ handoff's length built, the Unix sibling found); and:
   three-daemon tests A-291 names; no library change was needed. The live move between two Mac runners is filed for main.
 
 Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
+
+### A-459 — The export's archive is written as a stream: two walks, an exact admission and a bounded stage (2026-11-18, goal g268; A-441's gap; §4.11 "Archive", D-17; D-11; the streamed checkpoint's discipline, `encode_image_into`)
+Applied in the same change to: `crates/archive` (the module `stream`: `ChunkSink`, `Measure`, `Layout`,
+`StreamWriter`, `Next`, with the tests `a_streamed_archive_is_the_whole_buffer_encoders_byte_for_byte`,
+`a_stream_larger_than_its_threshold_never_stages_past_its_bound` and
+`a_second_pass_chunk_that_differs_from_the_first_is_refused`); `crates/vfs/src/export.rs`
+(`SnapshotArchiver::advance_into`, with the tests `a_streamed_export_of_a_generated_tree_is_the_whole_buffer_encoders`
+and `a_snapshot_larger_than_the_stage_exports_with_the_stage_within_its_bound`); `crates/server/src/image.rs`
+(`ArchiveJob`: two walks, the layout, the exact admission, the staged writing as the writer asks; the counters
+`image.archive_stage_flushes` and `image.archive_stage_past_bound`); §4.11's status; GAPS (A-441's entry, its gap
+closed).
+
+- **Why.** A-441's export held the snapshot's whole content twice: the walk kept every chunk's bytes in its archive,
+  then the archive was encoded into one buffer of its size, and only then written into the file. A shard exporting a
+  snapshot near its memory held it twice for that time, outside every budget.
+- **The shape.** The streamed checkpoint's discipline (`slates_vfs::recover::StreamedImage`, `encode_image_into`):
+  count first, then encode in order into a stage emptied between items, the checksum folded as the bytes go and written
+  last. An archive's header names its chunk count, its raw and stored totals and its manifest's identity, and its
+  trailer holds the whole-archive BLAKE3 over everything before it, header first. So the first walk measures: each new
+  chunk's identity and lengths kept and its bytes dropped (`Measure`, behind `SnapshotArchiver::advance_into`, which
+  hands a unit's chunks on as the unit ends). From that and the walk's manifest, `Layout` knows the header, every
+  record's offset and the archive's whole length before a byte is written, so the archive volume is admitted exactly,
+  as before. The second walk hands the same chunks again to `StreamWriter`. Each is checked against its first-walk
+  record at its place (the walk of a pinned snapshot is deterministic, and the two walks share one codec policy), then
+  staged as its record behind the header. The tail follows a piece a call, and the hash is folded over every byte as
+  it is staged.
+- **The stage's bound (D-11).** The stage is emptied into the archive file once it holds a copy slice
+  (`DaemonConfig::copy_slice_bytes`: half the live step quantum at the measured memcpy rate, since emptying the stage is
+  a copy into the file). The writer decides what comes next (`StreamWriter::next`): write the stage once it holds that
+  threshold or the archive's last bytes, else let the walk cut its next unit, else stage the tail's next piece within
+  the threshold's room. The daemon's job and the tests follow that one decision. One unit stages at most one item whole
+  past the threshold, so the stage never holds more than the threshold and the larger of the header and one record of
+  the archive's largest chunk (`StreamWriter::bound`). The job counts each emptying and a stage past its bound.
+- **The oracle.** The whole-buffer encoder (`Archive::encode`) is unchanged and shares no code with the stream (the
+  header is written field by field in both, on purpose). The tests hold the stream to it byte for byte on generated
+  archives and on the export of generated trees under measured codec points. It stays the encoder of a holder that
+  keeps an archive whole anyway (the fleet's replication).
+- **Rejected.** One walk, with the header and the manifest's length patched at the end and the hash computed by
+  reading the file back. That saves the second walk's hashing and compression, but the archive's length is then
+  unknown at the admission: the volume would have to grow a bounded reservation, and a locked volume its locked
+  credit, write by write, and shrink at the end. Two walks keep A-441's exact admission and a pure append. The price
+  is the chunks' identities and compression computed twice; an A/B of the two is owed.
+- **Owed.** The manifest's encoding is held whole while it is written (the tree's metadata, never its content; the
+  walk holds the tree itself anyway). The import's decoder (A-453) still holds its file whole.
+- **Evidence (Mac Studio, 2026-11-18, debug, kiln r349 and r355).**
+  - The archive crate's lib tests, 7 of 7 in 0.62 s. Among them: generated archives (raw and LZ4 chunks, zero to
+    eleven of them, generated thresholds and tail rooms) are streamed both as the writer asks and with the tail filled
+    by hand, and every stream equals `Archive::encode`'s bytes and decodes. Sixteen 4 KiB chunks no codec shrinks,
+    streamed at a two-chunk threshold, never stage past the bound and are emptied more often than the archive holds
+    bounds. A second-walk chunk that differs is refused at its place before a byte of it is staged.
+  - The export's lib tests, 8 of 8 in 0.90 s. Among them: 48 generated trees (up to four files of repeated, text-like
+    and noisy bytes up to a chunk and a half, in nested directories, some with an attribute, and a symlink), exported
+    under measured codec points at generated thresholds, equal the whole-buffer encoder's bytes and decode. A snapshot
+    whose archive is more than twice the stage's bound (`populate` and `decorate`'s tree at a one-chunk threshold)
+    exports with the stage within its bound, emptied more often than the archive holds bounds.
+  - Through the daemon, `a_snapshot_exported_as_its_archive_carries_every_file_and_entry`, the import round trip
+    (which exports twice more) and the hostile archives, 3 of 3 in 1.11 s.
+  - Red once each (r355): with the header staged outside the hash, both oracle tests failed (the streams' bytes
+    differed from the encoder's); with the stage written only once the archive was staged whole, both bound tests
+    failed.

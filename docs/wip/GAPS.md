@@ -11369,14 +11369,22 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
 >   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453); the archive streamed (A-459)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
->   from an archive is built: A-453, the entry above.)
+> - **Closed (A-459, 2026-11-18): the streamed encoder.** The export walks the snapshot twice. The first walk measures
+>   each chunk and drops its bytes, and the archive is laid out and its volume admitted exactly. The second walk writes
+>   it through a stage emptied into the file at a copy slice, never past the threshold and one record of the largest
+>   chunk. The whole-buffer encoder is its oracle, byte for byte. Proven (Mac Studio, debug, kiln r349, r355):
+>   generated archives and 48 generated trees under measured codec points stream to the encoder's bytes; an archive
+>   more than twice the stage's bound streams within it, the stage emptied more often than the archive holds bounds;
+>   the export, import and hostile api tests pass through the daemon; red once each (the header outside the hash; the
+>   stage written only at the end).
+>   Owed: the manifest's encoding is held whole while it is written (metadata); an A/B of the second walk's cost.
+>   (The volume made from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 
