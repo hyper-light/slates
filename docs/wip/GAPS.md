@@ -3878,19 +3878,59 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
 >   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
 >   replaced by ask (the one land writes nothing).
-> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3; macOS legs
->   done, Linux legs owed).** Two kiln runners, one manifest over the LAN (Wi-Fi: 90-150 ms average round trips, spikes
->   to about 470 ms), no person in the run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`,
->   `approve`) are the per-machine steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the
->   client, `node` starts each node (the server under its launcher's secret, made on the server, mode 0600, read on
->   standard input), the client pushes two increments over four files into two greens (accepted 1 and 2; the late push
->   refused with `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1
->   create, 3 replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one
->   `slates land` writes 4 entries (92 bytes); the server's disk holds every merged byte. Server Adas-Mac-Studio, client
->   Adas-Mac-Studio-2: passed in 83 s (kiln node runs r1052, r1054); the reverse: passed in 69 s (r1118, r1119). The
->   kiln program that drives both machines is the supervisor's (`~/.cache/slates-scratch/fanout/fs-two-machines.js`).
->   **Owed:** the Linux x86_64 legs (server on Linux, then client on Linux). adacachy2 was held for hours by kiln's own
->   CI labs, during which kiln freezes every agent run there; adacachy did not answer.
+> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3): done in both
+>   directions between macOS arm64 and Linux x86_64.** Two kiln runners, one manifest over the LAN, no person in the
+>   run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`, `approve`) are the per-machine
+>   steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the client, `node` starts each
+>   node (the server under its launcher's secret, made on the server, mode 0600, read on standard input), the client
+>   pushes two increments over four files into two greens (accepted 1 and 2; the late push refused with
+>   `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1 create, 3
+>   replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one `slates land`
+>   writes 4 entries (92 bytes); the server's disk then holds exactly the 4 merged files. The recorded command is the
+>   kiln program `docs/wip/bench/fs-two-machines/run.js`, pasted as `code_run`'s program. Its input names the two
+>   runners, each machine's `slates` and `fs_server` binaries (from `build.sh` beside it), each node's UDP port block
+>   and the runners whose house rules cap every command. It checks each node's port block free before it starts, reads
+>   every regular file under each project after the landing, so "exactly the 4 merged files" is measured, and ends by
+>   reporting what each machine has left: no process, unit or folder after any run below.
+>   - macOS to macOS, earlier the same day (the supervisor's first program): server Adas-Mac-Studio, client
+>     Adas-Mac-Studio-2, passed in 83 s (kiln node runs r1052, r1054); the reverse in 69 s (r1118, r1119). Wi-Fi: 90-150
+>     ms average round trips, spikes to about 470 ms.
+>   - Linux and macOS, 14:50-15:28 UTC: adacachy (AMD Ryzen 9 9950X3D2, 16 cores and 32 threads, 122 GiB, CachyOS
+>     kernel 7.2.9, wired; every command in its own `systemd-run --user` unit at CPU weight 1, nice 19, 8 GiB and its
+>     disk's IO caps, as its house rules require) and Adas-Mac-Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4,
+>     Wi-Fi), both machines' binaries at 1e8f4a49e (branch `supervisor/fs-two-1e8f4a49e`; `fs_server.rs`'s roles are
+>     unchanged on main since). adacachy's firewall admits LAN UDP only on kiln's ports and KDE Connect's 1714-1764, so
+>     its node takes 1740-1741 or 1750-1751 there (`ss -uln`: only 1716 bound in the range); the Mac's node 17202-17203
+>     or 17212-17213. 10 of 11 runs passed: server on adacachy 7 of 8 (47, 166, 58, 60, 173, 152 and 220 s), server on
+>     the Mac 3 of 3 (45, 209 and 190 s). The last three, with the committed program as it stands, passed in a row:
+>     g066j (server on the Mac, 209 s, adacachy at load 100.6), g066k (server on adacachy, 220 s, load 69.8) and g066l
+>     (server on the Mac, 190 s, adacachy at load 122.6). Their phases, in seconds, in that order: port check 6.5,
+>     13.6, 5.5; identities, manifest and secret 10.8, 18.1, 3.7; nodes up 7.2, 28.2, 6.4; root group formed 10.5,
+>     10.2, 2.1; the client's first read of the first green 46.3, 30.3, 4.6; its two pushes, the late refusal and the
+>     server's checkout 55.3, 64.7, 59.0; the same for the second green 33.4, 18.5, 23.7 and 30.3, 10.5, 66.5; ask
+>     (presented, approved, written) 2.1, 10.3, 10.1; bypass's one land 1.5, 9.4, 2.5; cleanup 3.5, 4.2, 3.5. Every
+>     step is its own kiln command with 1-2 s of dispatch, so on a quiet pair most of a phase is kiln's: g066b and
+>     g066c took 47 and 45 s in all. The record sessions' smoothed round trip ran from 17 ms (adacachy at load 34) to
+>     724 ms (at load 122.6), with probe timeouts up to 3.3 s.
+>   - **Open: one forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on
+>     adacachy at 1750).** The client's `work` was refused about 125 s after the root group formed, after the client's
+>     first read of the same green had answered. At the refusal the client node held configuration version 0 with no
+>     members while the server held version 1 with both, each node had replaced its record session after a loss 15
+>     (client) and 17 (server) times, and both had a probe session. Its identities phase took 27.7 s (2.8 to 20.6 s in
+>     the other runs), so a machine or the path was slow then. It did not recur in the 8 runs after it, 5 of them in
+>     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
+>     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
+>     refusal a consumer retries; and a learner fetches the configuration only over a record session
+>     (`fleet::drive_learner_fetch`). The cause is a hypothesis, since the run kept no node logs: the server node, held
+>     to CPU weight 1 on adacachy under a load near 100 (in g066e, at load 112.9, its control shard ran 627, 923 and
+>     1,104 ms late against its 1,000 ms watchdog window), answered its record sessions late for longer than the SLO.
+>     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
+>     reproduce it on one box with the server node held to a CPU quota (`systemd-run --user -p CPUQuota=`) and tell
+>     from its log whether the refusal is the SLO doing its job, the configuration arriving once the starvation ends,
+>     or a session or learner defect, which then gets its failing test first.
+>   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
+>     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
+>     path while the flow itself passed; the program passes every `$` as `$$`.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
