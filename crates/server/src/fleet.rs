@@ -5782,6 +5782,16 @@ pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String 
 enum DirectContact {
   /// The fleet's consensus groups are not both initialized yet: everyone is contacted.
   Forming,
+  /// This node is not a member of the council configuration it holds (A-331): a fresh member whose first fetch was
+  /// answered before the council admitted it, or a member retired while it was away. It is no peer's neighbour and
+  /// holds nothing under that configuration, and the voters it knows are its join donor's, which may be the member it
+  /// replaced alone. Judged by the member rule a fresh member kept no peer at all: every record link idled, its learner
+  /// fetched over no session, and it never learned the configuration that admits it (live_chaos's fresh-member flow, 2
+  /// of 48 runs at one CPU; diag-raft-chaos-ab-68b-2: council at version 8, in contact with none of its four live
+  /// members, `fleet.learner.no_session` 113 in 48 s); a retired member kept only the old neighbours of the placement it
+  /// last installed. Every member it holds alive is contacted, as while forming, until it holds a configuration that
+  /// names it.
+  Unadmitted,
   /// Believed dead, but only as a manifest **seed** this node has not yet replaced by a learned id: the seed
   /// was never a live incarnation, so its death (folded where a neighbour learned the peer's real id, and
   /// gossiped here) says only that the peer has a real incarnation this node has not reached. Contact is
@@ -5856,8 +5866,8 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
     dead_contact(state, peer)
-  } else if !state.council.initialized() || !state.root.initialized() {
-    DirectContact::Forming
+  } else if let Some(joining) = joining_contact(state) {
+    joining
   } else if !state.council.configuration().members.contains(&peer) {
     DirectContact::NotInCouncilConfiguration
   } else if state.fleet.configuration().neighbours(peer) {
@@ -5876,6 +5886,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::AsVoter
   } else {
     DirectContact::OutsideNeighbourhood
+  }
+}
+
+/// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever
+/// the peer's role: [`DirectContact::Forming`] before both groups are initialized, [`DirectContact::Unadmitted`] while
+/// the council configuration it holds does not name it (A-331). `None` once it is a member, where the role rule applies.
+/// Both are judged of this node alone, so the member rule below them never meets a node with no neighbourhood.
+fn joining_contact(state: &ShardState) -> Option<DirectContact> {
+  if !state.council.initialized() || !state.root.initialized() {
+    Some(DirectContact::Forming)
+  } else if !state
+    .council
+    .configuration()
+    .members
+    .contains(&state.fleet.host())
+  {
+    Some(DirectContact::Unadmitted)
+  } else {
+    None
   }
 }
 
@@ -9542,6 +9571,7 @@ pub(crate) async fn forward_over_leader_session(
     peer,
     &[request],
     deadline_ns,
+    crate::forward_lane::failover_bound_from(slates_rt::futures::now_ns()),
     &mut crate::forward_lane::Place::default(),
   )
   .await
@@ -9558,17 +9588,20 @@ pub(crate) async fn forward_over_leader_session(
 /// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
 /// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
-/// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
-/// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
-/// budget. The batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
+/// keeps delivering is never cut off for its size. A stretch with no progress is given up once the lane's shard has
+/// read what came, or at once past `bound_ns`, the failover bound on the wall from the forward's first send
+/// ([`crate::forward_lane`]'s stall, A-315). Returns the replies in order (`None` for one not answered) with how they
+/// streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the budget. The
+/// batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
 /// ([`crate::forward_lane::Place`]).
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  bound_ns: u64,
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns, place).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound_ns, place).await
 }
 
 #[cfg(test)]

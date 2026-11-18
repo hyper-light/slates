@@ -24,7 +24,7 @@ pub use slates_merge::verdict::MergeConflictClass;
 use crate::error::{Error, ProtocolFault};
 use crate::instance::LandingRequest;
 use crate::policy::PolicyRefusal;
-use crate::signed::Verification;
+use crate::signed::{Verification, WorkSignature};
 
 /// What a landing came to, under the caller's write mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,8 +54,20 @@ pub enum MergeOutcome {
   /// The increment met intervening changes: each conflict window, typed. Nothing was merged; rebase, resolve and merge
   /// again.
   Conflicted(MergeConflicts),
-  /// A policy refused the merge: its mode forbids it, or the volume requires signed merges. Nothing was merged.
+  /// A policy refused the merge: its mode forbids it, or the work or the green requires signed merges and the merge's
+  /// signature was absent or did not verify. Nothing was merged.
   Refused(PolicyRefusal),
+}
+
+/// A green version's merge record as a consumer reads it back (§4.16, A-321; [`crate::Instance::merge_record`]): how the
+/// signature of the merge that made the version was judged when it merged, its provenance, kept for as long as the green
+/// keeps the version's accepted record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeRecord {
+  /// The version.
+  pub version: u64,
+  /// How the merge's signature was judged (`Unsigned` for version 0, the origin, and for a merge that carried none).
+  pub verification: Verification,
 }
 
 /// What a rebase came to (§4.16 "Rebase, the only corrective path"): the green is unchanged either way.
@@ -153,6 +165,9 @@ pub struct MergeApproval {
   pub paths: u64,
   /// How the merge's signature was judged.
   pub verification: Verification,
+  /// The signature the merge carried, carried again by its approval (A-321): the held merge kept nothing, and the
+  /// approved one is recorded with it.
+  pub signature: Option<WorkSignature>,
 }
 
 /// What a landing would write (§4.15 step 2): entries per action, bytes, and what the filter left out.

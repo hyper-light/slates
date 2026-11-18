@@ -12930,3 +12930,64 @@ the thread's CPU clock).** 3,000 clients, 3 runs, oracle 0: a verdict 21.4–21.
 51–53% of the owner's wall (`merge-util`), the engine 68% of that. A rung verdict costs the engine 13 µs where the bench's
 one-path verdict costs under 2.5 µs, and 82% of the rung's verdicts are conflicts: what in a rung increment costs the
 engine the difference is the next measurement (a line-table build, `sample`'s call sites resolved by `atos`).
+
+## The 1,000-client bound on main: met at no offered load on a shared Mac Studio (goal 231; A-297; 2026-11-18)
+
+**What it is.** Goal 231's measurement of the bound Ada stated on 2026-11-18 (A-297): every kind's p99 under 1 ms while
+1,000 clients offer at least 10³ verdicts a second, with no oracle failure and no client given up or starved. One run is
+one level of `load_bench`, whose `bound` row is the verdict. Main `7d760c4ea` carries W1 (A-247 step one), A-298,
+A-307, the `bound` row (A-297) and the reply carrier (A-296).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, Darwin 25.4.0),
+release (LTO) binaries of main `7d760c4ea` built there with Rust 1.98.1. Not quiet: other agents' test suites and
+builds ran throughout, the one-minute load average at each run's start was 11.5 to 57.2, and the run itself took about
+10 to 16 cores (the daemon, by its CPU time over the wall) and 8 more (the harness's workers). Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files, 16.3 MB.
+
+**Command.** A fresh single-node anchored daemon per run (`slates --instance <i> anchor --quick`, then `slates
+--instance <i> bootstrap root`; it derived 23 shards), then `load_bench --instance <i> --tree <linux-v7.4-rc1>/kernel
+--clients 1000 --hot-files 800 --rounds 20 --reply-patience 60 --per-connection 32 --think-us Z` for Z = 200, 100, 50
+and 20 ms, and Z = 200 ms with `--per-connection 1`. Three rounds, the five points interleaved in each, 2026-11-18
+09:10 to 09:40 UTC; loadtest-scale's `rung.sh` with every bench.log kept whole. All 15 runs:
+
+| Z (ms), round | load at start | verdicts/s | held | p99 ms: Edit / Accepted / Conflict / ReadHead / Rebase | Cycle p99 ms | Round p99 ms | gave up | harness max sweep ms | oracle failures |
+|---|---|---|---|---|---|---|---|---|---|
+| 200, 1 | 11.5 | 280 | 2.0 | 28.4 / 30.6 / 35.2 / 24.9 / 35.9 | 173 | 888 | 19 | 113 | 0 |
+| 100, 1 | 24.7 | 556 | 3.1 | 20.7 / 26.8 / 26.5 / 19.0 / 27.8 | 130 | 587 | 16 | 79 | 0 |
+| 50, 1 | 34.5 | 1,105 | 5.9 | 25.2 / 29.2 / 32.8 / 23.0 / 34.5 | 160 | 670 | 16 | 156 | 0 |
+| 20, 1 | 35.5 | 2,409 | 16.9 | 44.5 / 76.4 / 72.7 / 28.1 / 58.5 | 540 | 2,593 | 20 | 263 | 0 |
+| 200 pc 1, 1 | 36.5 | 268 | 10.6 | 94.9 / 109.8 / 116.6 / 80.8 / 121.7 | 574 | 2,984 | 21 | 211 | 0 |
+| 200, 2 | 42.1 | 281 | 7.5 | 40.1 / 44.3 / 47.9 / 34.1 / 50.1 | 195 | 1,623 | 29 | 133 | 0 |
+| 100, 2 | 32.5 | 562 | 0.0 | **0.59 / 0.94 / 0.88 / 0.48 / 0.88** | 5.4 | 58.8 | 17 | 9.0 | 0 |
+| 50, 2 | 32.6 | 1,106 | 0.5 | 3.67 / 4.55 / 6.40 / 4.32 / 7.79 | 41 | 174 | 24 | 31 | 0 |
+| 20, 2 | 34.7 | 2,732 | 0.5 | 3.83 / 4.84 / 4.96 / 3.35 / 5.19 | 21 | 148 | 24 | 9.4 | 0 |
+| 200 pc 1, 2 | 34.0 | 269 | 11.8 | 62.5 / 76.5 / 72.9 / 54.2 / 74.1 | 272 | 2,562 | 29 | 167 | 0 |
+| 200, 3 | 37.9 | 283 | 0.8 | 10.1 / 12.4 / 13.0 / 9.4 / 13.2 | 62 | 295 | 22 | 77 | 0 |
+| 100, 3 | 28.3 | 486 | 26.4 | 100.9 / 126.6 / 114.8 / 80.5 / 118.7 | 740 | 3,473 | 28 | 305 | **1** |
+| 50, 3 | 47.0 | 1,053 | 6.8 | 19.8 / 51.1 / 42.2 / 18.7 / 27.7 | 298 | 1,356 | 25 | 300 | 0 |
+| 20, 3 | 55.7 | 2,019 | 69.5 | 94.2 / 111.1 / 119.9 / 76.6 / 120.0 | 616 | 3,683 | 29 | 213 | **1** |
+| 200 pc 1, 3 | 57.2 | 272 | 11.0 | 95.1 / 107.6 / 128.2 / 81.1 / 133.6 | 691 | 3,523 | 25 | 250 | 0 |
+
+The p50 of every request kind was 0.07 to 2.13 ms at every point. The daemon's peak RSS was 2.17 to 2.51 GiB. Every
+`lost` counter read 0 at all 15 points (`xshard.reply_dropped` among them) and so did every room wait; the works
+composed 133,017 to 138,446 submissions on their own shards and none on the owner. The `per-connection 1` runs' harness
+went up to 2.71 s between two drains of a ring.
+
+**What it means.**
+- **Not met, and not meetable at this shape.** No run read `met yes`; `worst` named the Round's p99 at all 15. Every
+  level also had 16 to 29 clients give up: twenty rounds over 800 hot picks runs some clients past the harness's 64
+  resolutions a round, and the bound admits none. So the shape decides `met no` before the latency does (goal 231's
+  open decision 2, whether the Round is judged, comes after it).
+- **The offered load is lower than the think time suggests.** A round is about 13 requests with a pause after each, so
+  Z = 200 ms offers 268 to 283 verdicts a second, not 10³. The floor is reached from Z = 50 ms (1,053 to 1,106 a
+  second); Z = 20 ms offers 2,019 to 2,732.
+- **The tails follow the box, not the offered load.** Each request kind's p99 was under 1 ms in one run only, Z = 100 ms
+  round 2 (562 verdicts a second, nobody held, the harness sweeping within 9.0 ms). The three best runs swept within
+  9 to 31 ms; the three worst took 213 to 305 ms a sweep with 26 to 70 clients held. On this box the tail is shared
+  CPU until shown otherwise: the run on a quiet host is owed.
+- **No reply was lost** in 15 runs at 1,000 clients (A-296's counters, all zero).
+- **Two oracle failures, at the two most loaded runs** (Z = 100 ms and 20 ms of round 3). Each is a conflict naming a
+  window touched by the version one past the head window the oracle allowed it: v3803 against 3800..=3802, v8171
+  against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
+  `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
+  submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.
