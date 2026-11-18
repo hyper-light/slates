@@ -847,8 +847,12 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
       break;
     }
+    // The test's bound is the anchor's own verdict: it expects no start killed, so the first kill ends the watch and fails
+    // it with the anchor's line. Before 2026-11-11 the watch read on, and with no back-off for starts that each fail past
+    // the window it read for good: B10's Linux gate restarted the start every second for 27 minutes.
     if line.contains(START_KILL_LINE) {
       kills.push(line.trim_end().to_owned());
+      break;
     }
   }
   let served = line.contains(&serving_line);
@@ -3737,6 +3741,28 @@ fn formation_counter_allowed(line: &str) -> bool {
     // superseded link work — exactly what this assertion permits — and it is counted during formation
     // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
     "fleet.link.invalid.member_changed",
+    // Events and readings of formation's normal work that the counter map has carried since 2026-11-17, which the
+    // three-process flows met the first time CI's ubuntu lane reached this step again (run 44298844583, 2026-11-18;
+    // every earlier run had stopped at a red `Test` step): the serve sockets' sessions opened and their pool's
+    // high-water mark (`fleet::SERVE_OPENED`, `SERVE_HIGH_WATER`), the record links' dials, readings at the report
+    // and the calls made (`fleet::DIAL_RECORD_*`, 96eda8992), the period's seal and mirror walks and their turns
+    // (`fleet::SEAL_WALKS`, `MIRROR_WALKS` and their slices, 8636d8510), and the record period's live work and a
+    // returned holder's walk in turns (`live_ship::LIVE_PERIODS`, `LIVE_PERIOD_SLICES`, bdd767167;
+    // `LIVE_REACHED_SLICES`, A-324). The serve sockets' refusals (`fleet.serve.setup_refused`,
+    // `peer_sessions_refused`, `peers_refused`) are not among them, and still fail here.
+    "fleet.serve.opened",
+    "fleet.serve.high_water",
+    "fleet.dial.record.dialing",
+    "fleet.dial.record.longest_call_ms",
+    "fleet.dial.record.longest_enroll_ms",
+    "fleet.dial.record.calls",
+    "fleet.seal.walks",
+    "fleet.seal.walk_slices",
+    "fleet.mirror.walks",
+    "fleet.mirror.walk_slices",
+    "fleet.live.periods",
+    "fleet.live.period_slices",
+    "fleet.live.reached_slices",
   ]
   .contains(&counter)
 }
@@ -4005,10 +4031,11 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   }
 }
 
-/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind
-/// (`AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`), never served from a copy that node holds: the mount
-/// would hand the client something of this host's for another host's volume. Where `mount_nfs` exists; elsewhere it
-/// skips loudly.
+/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind (the wire's
+/// `AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`, which the command renders through the consumer contract
+/// as `not offered here: Attachment { transport: NfsLoopback, reason: OwnedByAnotherHost }`), never served from a copy
+/// that node holds: the mount would hand the client something of this host's for another host's volume. Where
+/// `mount_nfs` exists; elsewhere it skips loudly.
 fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
   if !mountable {
     eprintln!("mount_nfs is not on this host: skipping the bystander's refused mount");
@@ -4019,7 +4046,10 @@ fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
   };
   let (code, _, err) = run(instance, &["mount", id, &mount_point.path]);
   assert!(
-    code != 0 && err.contains("AttachmentUnsupported") && err.contains("OwnedByAnotherHost"),
+    code != 0
+      && err.contains("Attachment {")
+      && err.contains("NfsLoopback")
+      && err.contains("OwnedByAnotherHost"),
     "a node that does not own the volume refuses its mount by kind: exit {code}: {err}"
   );
   assert!(
@@ -12093,10 +12123,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
     .unwrap();
   let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
-  let policy = RestartPolicy::derive(
-    slates_db::replay::RECOVERY_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  );
+  let policy = RestartPolicy::derive(config.failover_slo_ns);
   let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
   anchor
     .0

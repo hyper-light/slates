@@ -522,6 +522,11 @@ pub enum RequestBody {
     filter: Filter,
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
+    /// A signature over the landing's statement (signed work, A-321; `slates_server::signed_work::landing_statement`,
+    /// signed under the namespace `slates-work`): judged under the volume's trusted signers against the manifest the
+    /// landing writes (or presents), recorded with the landing's audit records and answered. It permits nothing: the
+    /// landing follows its write mode.
+    signature: Option<Vec<u8>>,
   },
   /// The caller's grants (a read; creating a grant is off-ring).
   Grants,
@@ -942,6 +947,9 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+    /// A signature over the presented landing's statement, judged as `Land`'s is (A-321): what a held landing of an
+    /// asking session carries to its approval request.
+    signature: Option<Vec<u8>>,
   },
   /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
   /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
@@ -1995,6 +2003,11 @@ pub struct DaemonReport {
   /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
   /// accounts must name it. Stable across the node's restarts. Appended.
   pub anchor: u64,
+  /// The anchor has judged this daemon recovered (A-311): it has served as long as its start took, so its exit from
+  /// here on is no failed start and is restarted at once, where an exit before would count toward a crash loop. Whoever
+  /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
+  /// nothing. Appended.
+  pub recovered: bool,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2330,6 +2343,9 @@ pub struct StatusReport {
   /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
   /// one, a green, a work volume). Appended.
   pub base: Option<BaseReport>,
+  /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost (§4.10
+  /// "Auto-seal", AC-8.3, D-18). Appended.
+  pub loss: LossReport,
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
@@ -2379,6 +2395,40 @@ pub enum WatcherState {
   Overflowed,
   /// None on this host or folder: fingerprints alone.
   Unavailable,
+}
+
+/// A volume's loss window (§4.10 "Auto-seal", AC-8.3, D-18): what of it lives on its owner alone, and what the takeover
+/// that made this node its owner lost. Every time is this host's own clock's, so no two hosts' clocks are compared; a
+/// seal is named by its head sequence, which the owner and every successor share.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LossReport {
+  /// The window an owner loss would lose now, nanoseconds (the design's `last_placed_snapshot_age`, made exact): zero
+  /// when every change is on another host too (the head sealed and placed with nothing changed since, or a live-shipped
+  /// log in a fleet, whose acknowledged writes are durable on its holders); otherwise the age of the newest seal placed
+  /// on `f + 1` hosts, or of the volume itself when none is (on a laptop, `f = 0`, nothing is on another host). `None`
+  /// when the time is unknown (taken under another boot of this host's clock) or not measured: never reported as zero.
+  pub at_risk_ns: Option<u64>,
+  /// The head sequence of the newest seal placed on `f + 1` hosts: the one a takeover would serve from now, so the
+  /// edits after it are the window. `None` while no seal is placed on another host.
+  pub placed_sequence: Option<u64>,
+  /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
+  /// at durability.
+  pub live_shipped: bool,
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
+  /// this node's memory: a restart of this node forgets it.
+  pub taken_over: Option<VolumeTakeover>,
+}
+
+/// The takeover that made this node a volume's owner (AC-8.3): the loss window an owner loss left.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct VolumeTakeover {
+  /// The epoch the volume has been served under since.
+  pub epoch: u64,
+  /// Served from the volume's live log: every write the lost owner acknowledged at durability survived.
+  pub from_live_log: bool,
+  /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
+  /// seal it names (its `placed_sequence` when it was lost) are the loss window.
+  pub head_sequence: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3046,6 +3096,9 @@ pub struct LandingOutcome {
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
+  /// How the landing's signature was judged against the manifest it wrote (signed work, A-321), as its finished
+  /// record keeps it: `Unsigned` when the landing carried none.
+  pub verification: Verification,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3165,6 +3218,10 @@ pub struct AuditEntry {
   pub manifest: Option<[u8; 32]>,
   /// The terminal state, for a finished landing.
   pub outcome: Option<String>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole: its
+  /// presentation's and a granted run's `landing_planned`, and its `landing_finished` (`Unsigned` when it carried
+  /// none). `None` on every other record.
+  pub verification: Option<Verification>,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
@@ -3531,6 +3588,69 @@ pub enum Refusal {
     /// How the merge's signature was judged.
     verification: Verification,
   },
+  /// The volume core refused the verb for a reason the variants before this one do not name (A-299): until
+  /// 2026-11-18 each reached a client as `BadRequest` carrying the reason's name, which a consumer could only read as
+  /// words. Appended.
+  Volume {
+    /// Why, typed.
+    refusal: VolumeRefusal,
+  },
+}
+
+/// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
+/// class of a volume-core error (`slates_vfs::VfsError`) by the same name. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeRefusal {
+  /// `ENOTDIR`: not a directory where one was needed.
+  NotDirectory,
+  /// `EISDIR`: a directory where a file was needed.
+  IsDirectory,
+  /// `ENOTEMPTY`: a directory that must be empty is not.
+  NotEmpty,
+  /// `EINVAL`: an argument the operation does not take.
+  Invalid,
+  /// `ENODATA`: no such extended attribute.
+  NoAttribute,
+  /// `EPERM`: the volume's rules forbid the operation.
+  NotPermitted,
+  /// A link protected against the operation (a sticky directory's, a hard link's).
+  LinkProtected,
+  /// An operation a special file (a FIFO, a socket name) does not support.
+  SpecialFileOperation,
+  /// `EMLINK`: a file at its link bound.
+  TooManyLinks,
+  /// `EFBIG`: past a file's largest size.
+  FileTooLarge,
+  /// `EXDEV`: a move across volumes.
+  CrossVolumeMove,
+  /// A handle or number that no longer names anything (a freed inode, a destroyed snapshot).
+  StaleHandle,
+  /// The snapshot is pinned by a live clone, or the volume is a green's origin: destroy the clone first.
+  Pinned,
+  /// A guest maps the file in a way the change cannot keep its map equal to, so the change waits for the map's end.
+  DaxMapped,
+  /// A witnessed base entry changed on the disk beneath an unpinned range: the read refuses rather than mix states.
+  BaseDrift,
+  /// The verb names an overlay's base, and the volume has none.
+  NotOverlay,
+  /// The digest cache is at its bound.
+  DigestCacheFull,
+  /// A memory refusal the variants before [`Refusal::Volume`] do not name.
+  Memory,
+  /// A journal reader asked for records retention has dropped.
+  JournalIncomplete {
+    /// The record it needed.
+    needed: u64,
+    /// The oldest record retained.
+    oldest: u64,
+  },
+  /// A recovery image of another format version.
+  RecoveryVersion {
+    /// The version found.
+    found: u16,
+    /// The version this build reads.
+    expected: u16,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3570,15 +3690,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
-  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
-  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
-  /// rather than waiting without end. Appended.
+  /// A volume or green this node took over from a departed owner (§4.8, §4.16 owner-loss recovery) could not be adopted
+  /// or materialized within the takeover's bound: the failover SLO's worth of the fleet's periods without progress, each
+  /// one attempt. Every verb on it answers this rather than waiting without end. Appended.
   TakeoverIncomplete {
-    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
-    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
-    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
-    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
-    /// owner shard refused the rebuilt green).
+    /// What the last attempt waited on: `promises` (a recovery cohort never gave its quorum of promises in the takeover
+    /// round, A-304), `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
+    /// `content` (a volume's content not held here, and not served whole by a recorded holder), `live` (a live-shipped
+    /// volume's log), `shard` (no shard here for its partition), `chain` (a version's record not known here: the adopted
+    /// version beyond this node's accepted records), `inputs` (an input its ledger names not held here, and not served
+    /// whole by the survivors that reported the adopted version), `placement` (no placement of the adopted record, or no
+    /// shard for its partition), or `refused` (the owner shard refused the rebuilt volume or green).
     waited_on: String,
   },
 }
@@ -3786,6 +3908,12 @@ pub enum ReplyBody {
     summary: LandingSummary,
     /// Conflicts found before any write (empty when the landing is clean).
     conflicts: Vec<String>,
+    /// The exact statement a signature over this landing signs (signed work, A-321;
+    /// `slates_server::signed_work::landing_statement`: the volume, the target as the request named it and this
+    /// manifest, one field a line): sign it under the namespace `slates-work` and land with the signature.
+    statement: Vec<u8>,
+    /// How the request's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
+    verification: Verification,
   },
   /// A landing finished (or partially).
   Landed {

@@ -66,6 +66,19 @@ pub struct MergeStatement {
   pub statement: Vec<u8>,
 }
 
+/// A landing's answer as signed work sees it (A-321; [`Client::land_with_signature`]): the landing's outcome, how its
+/// signature was judged (`Unsigned` when it carried none), and for a presentation the statement a signature over it signs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedLanding {
+  /// The outcome: landed, or presented for a grant.
+  pub landing: Landing,
+  /// How the landing's signature was judged.
+  pub verification: Verification,
+  /// The landing's statement, for a presentation: the volume, the target as the request named it and the presented
+  /// manifest, which a signer signs under the namespace `slates-work`.
+  pub statement: Option<Vec<u8>>,
+}
+
 /// A green version's merge record as a consumer reads it back (A-321, [`Client::merge_record`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeRecord {
@@ -167,6 +180,10 @@ pub struct ShardsStream {
   /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
   /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
   pub stream: StreamEnd,
+  /// The device's end of the stream's resync channel (A-316; `slates_bridge_fuse::shards_resync`), close-on-exec, to
+  /// hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor daemon hands the
+  /// device a fresh stream after this one's daemon dies. None where the daemon hands none (macOS and Windows yet).
+  pub resync: Option<StreamEnd>,
 }
 
 /// What `attach_vhost_user` returns (§4.6; goal G-vhost): the attachment, and the socket end to hand the VMM as its
@@ -959,18 +976,34 @@ fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
 /// Extracts a landing's outcome from its reply — landed, or a grant required — or a typed mismatch.
 /// The same rule the sync [`Client::land`] applies.
 fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
+  extract_signed_landing(body).map(|signed| signed.landing)
+}
+
+/// Extracts a landing's outcome with its signed-work parts (A-321): a finished landing's verdict from its outcome, a
+/// presentation's from its reply, with the statement a signature over it signs.
+fn extract_signed_landing(body: ReplyBody) -> Result<SignedLanding, ClientError> {
   match body {
-    ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
+    ReplyBody::Landed { outcome } => Ok(SignedLanding {
+      verification: outcome.verification,
+      statement: None,
+      landing: Landing::Landed(outcome),
+    }),
     ReplyBody::GrantRequired {
       landing,
       manifest,
       summary,
       conflicts,
-    } => Ok(Landing::GrantRequired {
-      landing,
-      manifest,
-      summary,
-      conflicts,
+      statement,
+      verification,
+    } => Ok(SignedLanding {
+      landing: Landing::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      },
+      verification,
+      statement: Some(statement),
     }),
     _ => Err(ClientError::UnexpectedReply { verb: "land" }),
   }
@@ -1247,6 +1280,12 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// The sync wait's wake estimate now, nanoseconds, and the parked wakes that taught it: what the client spins
+  /// for before it parks, seeded with the daemon's published window (`ClientEnd::wake_estimate_ns`).
+  pub fn wake_estimate(&self) -> (u64, u64) {
+    (self.end.wake_estimate_ns(), self.end.wake_samples())
+  }
+
   /// The client's ring slots: the requests it may hold in flight, and half the completion records the daemon keeps
   /// for it unacknowledged (§4.9; the server's `completion_bound` is twice this).
   pub fn ring_slots(&self) -> usize {
@@ -1315,7 +1354,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_read" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1443,7 +1484,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedWrite::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_write" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_write" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1570,18 +1613,22 @@ impl Client {
         established,
         capability,
         token,
-      } => Ok(ShardsStream {
-        stream: self.delivered_stream(attachment)?,
-        attachment: Attachment {
-          attachment,
-          lease_epoch,
-          path,
-          version,
-          established,
-          capability,
-          token,
-        },
-      }),
+      } => {
+        let (stream, resync) = self.delivered_stream_and_resync(attachment)?;
+        Ok(ShardsStream {
+          stream,
+          resync,
+          attachment: Attachment {
+            attachment,
+            lease_epoch,
+            path,
+            version,
+            established,
+            capability,
+            token,
+          },
+        })
+      }
       ReplyBody::ShardsHanded {
         attachment,
         lease_epoch,
@@ -1589,6 +1636,7 @@ impl Client {
         handle,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1606,6 +1654,7 @@ impl Client {
         secret,
       } => Ok(ShardsStream {
         stream: self.claim_offer(attachment, &secret)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1678,21 +1727,54 @@ impl Client {
   /// (Linux: a Shards stream, A-161; a vhost-user device's socket, G-vhost).
   #[cfg(unix)]
   fn delivered_stream(&self, attachment: u64) -> Result<StreamEnd, ClientError> {
-    let delivered = self.recv_delivery(|delivery| {
+    self
+      .delivered_stream_and_resync(attachment)
+      .map(|(stream, _resync)| stream)
+  }
+
+  /// [`Self::delivered_stream`], and the stream's resync end when the stream's delivery says one follows it (A-316),
+  /// which the daemon sends next, before the reply.
+  #[cfg(unix)]
+  fn delivered_stream_and_resync(
+    &self,
+    attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
+    let unexpected = || ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    };
+    let ControlDelivery::Stream(delivered) = self.recv_delivery(|delivery| {
       matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
-    })?;
-    match delivered {
-      ControlDelivery::Stream(delivered) => Ok(delivered.stream),
-      ControlDelivery::Mapping(_) => Err(ClientError::UnexpectedReply {
-        verb: "attach_shards",
-      }),
+    })?
+    else {
+      return Err(unexpected());
+    };
+    if !delivered.resync_follows {
+      return Ok((delivered.stream, None));
     }
+    let ControlDelivery::Resync(resync) = self.recv_delivery(|delivery| {
+      matches!(delivery, ControlDelivery::Resync(resync) if resync.attachment == attachment)
+    })?
+    else {
+      return Err(unexpected());
+    };
+    Ok((delivered.stream, Some(resync.end)))
   }
 
   /// No control socket carries a handle here: a Windows daemon answers the Shards form `ShardsHanded`, naming the handle
   /// in the reply, so `Attached` is not one of its answers to it.
   #[cfg(not(unix))]
   fn delivered_stream(&self, _attachment: u64) -> Result<StreamEnd, ClientError> {
+    Err(ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    })
+  }
+
+  /// See [`Self::delivered_stream`]: no control socket carries a handle here.
+  #[cfg(not(unix))]
+  fn delivered_stream_and_resync(
+    &self,
+    _attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })
@@ -2925,6 +3007,7 @@ impl Client {
       target: target.to_owned(),
       filter,
       grant,
+      signature: None,
     })
   }
 
@@ -4069,27 +4152,31 @@ impl Client {
     filter: Filter,
     grant: Option<u64>,
   ) -> Result<Landing, ClientError> {
-    match self.call(&RequestBody::Land {
+    self
+      .land_with_signature((volume, snapshot), target, filter, grant, None)
+      .map(|signed| signed.landing)
+  }
+
+  /// [`Client::land`] as signed work when `signature` is given (A-321): an SSH signature blob over the landing's
+  /// statement (a presentation's answer carries it), made under the namespace `slates-work`. The daemon judges it
+  /// against the manifest the landing writes, or presents, under the volume's trusted signers, records the verdict with
+  /// the landing's audit records, and answers it beside the landing's outcome. It permits nothing: the write mode does.
+  pub fn land_with_signature(
+    &mut self,
+    (volume, snapshot): (VolumeId, Option<SnapshotId>),
+    target: &str,
+    filter: Filter,
+    grant: Option<u64>,
+    signature: Option<&[u8]>,
+  ) -> Result<SignedLanding, ClientError> {
+    extract_signed_landing(self.call(&RequestBody::Land {
       volume,
       snapshot,
       target: target.to_owned(),
       filter,
       grant,
-    })? {
-      ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
-      ReplyBody::GrantRequired {
-        landing,
-        manifest,
-        summary,
-        conflicts,
-      } => Ok(Landing::GrantRequired {
-        landing,
-        manifest,
-        summary,
-        conflicts,
-      }),
-      _ => Err(ClientError::UnexpectedReply { verb: "land" }),
-    }
+      signature: signature.map(<[u8]>::to_vec),
+    })?)
   }
 
   /// Presents a landing and never lands it, whatever the volume's write policy (A-285): `Landing::GrantRequired` with
@@ -4102,11 +4189,26 @@ impl Client {
     target: &str,
     filter: Filter,
   ) -> Result<Landing, ClientError> {
-    extract_landed(self.call(&RequestBody::Present {
+    self
+      .present_with_signature((volume, snapshot), target, filter, None)
+      .map(|signed| signed.landing)
+  }
+
+  /// [`Client::present`] carrying a signature (A-321): the presentation's answer says how it was judged against the
+  /// presented manifest, and carries the statement a signature over the landing signs.
+  pub fn present_with_signature(
+    &mut self,
+    (volume, snapshot): (VolumeId, Option<SnapshotId>),
+    target: &str,
+    filter: Filter,
+    signature: Option<&[u8]>,
+  ) -> Result<SignedLanding, ClientError> {
+    extract_signed_landing(self.call(&RequestBody::Present {
       volume,
       snapshot,
       target: target.to_owned(),
       filter,
+      signature: signature.map(<[u8]>::to_vec),
     })?)
   }
 

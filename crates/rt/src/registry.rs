@@ -146,6 +146,9 @@ pub struct Pulse {
   /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
   /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
   wake_cost_ns: AtomicU64,
+  /// The shard's idle spin window (`ShardContext::counters`' `idle_window_ns`), mirrored beside the wake estimate
+  /// it may be priced on, so a reader on another thread can tell whether the window follows the estimate (A-223).
+  idle_window_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -170,6 +173,17 @@ impl Pulse {
   /// [`Pulse::record_wake_cost`]).
   pub fn wake_cost_ns(&self) -> u64 {
     self.wake_cost_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors its idle spin window after folding a wake into its estimate.
+  pub fn record_idle_window(&self, idle_window_ns: u64) {
+    self.idle_window_ns.store(idle_window_ns, Ordering::Relaxed);
+  }
+
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake; 0 until its first (see
+  /// [`Pulse::record_idle_window`]).
+  pub fn idle_window_ns(&self) -> u64 {
+    self.idle_window_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.
@@ -306,6 +320,22 @@ impl Registration {
   /// The registered shard id.
   pub fn shard(&self) -> u16 {
     self.shard
+  }
+
+  /// Tells every shard that asked this slot for room ([`crate::shard::ShardContext::want_room`]) that its control
+  /// channel has room now, as a shard's drain that took a message tells them ([`crate::room`]): for a holder that takes
+  /// messages off the slot's control channel itself (a test's stand-in for a shard), called after each take. The fence
+  /// orders the take before the look at who asked, as the drain's does, so either an asker's second try finds the room
+  /// or this finds its mark.
+  pub fn tell_room(&self) {
+    let _ = with_entry(self.shard, |entry| {
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| give_room(origin, self.shard));
+      }
+    });
   }
 }
 

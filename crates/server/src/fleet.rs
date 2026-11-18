@@ -42,7 +42,8 @@
 //! durable holds ([`crate::takeover::serve_host_prepare`]).
 //!
 //! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
-//! newest snapshot is archived in bounded slices ([`advance_seals`], the vfs `SnapshotArchiver`), its
+//! newest snapshot is archived in bounded slices ([`advance_home_seal`], the vfs `SnapshotArchiver`), the shard's
+//! volumes visited in turns of about a step quantum each ([`seal_walk_slice`]), its
 //! archive put to the content candidates by missing set until `f + 1` hold it verified
 //! ([`put_seal_content`], the first round to `f + 1`, later rounds hedged to the rest), and only then the
 //! head naming the manifest and the acknowledging holders shipped ([`head_value_of`]) and the snapshot
@@ -183,8 +184,14 @@ pub struct FleetPeer {
 pub struct FleetTransport<Serve = ServeSockets> {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
-  /// The address this node publishes to authenticated peers.
+  /// The probe-plane address this node publishes to authenticated peers: where they dial its probes, its advertised
+  /// address and base port.
   pub advertise: NodeAddress,
+  /// The record-plane address this node publishes to authenticated peers: where they dial its record links (the
+  /// advertised base port's next in a manifest's layout). Never the port its record socket is bound to, which differs
+  /// behind a port mapping (A-277): a peer told the bound port redials around the mapping, or to a port the mapping does
+  /// not forward (A-330).
+  pub advertise_record: NodeAddress,
   /// Operator trust anchors for certificates of nodes absent from the seed manifest.
   pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
@@ -439,6 +446,7 @@ impl FleetTransport<ServeAddresses> {
     let FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve,
@@ -448,6 +456,7 @@ impl FleetTransport<ServeAddresses> {
     Ok(FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve: serve.bind()?,
@@ -1048,6 +1057,7 @@ fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     advertise,
+    advertise_record,
     enrollment_roots,
     identity,
     name,
@@ -1064,12 +1074,6 @@ pub async fn run_membership(transport: FleetTransport) {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
-  // The record port discovery publishes is the one the record socket is bound to; a socket that cannot
-  // say (the OS refusing `getsockname`) cannot be published, counted like a socket that would not bind.
-  let Ok(record_port) = record_socket.local_addr().map(|address| address.port()) else {
-    count_refusal(BIND_REFUSED);
-    return;
-  };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task names it by its `Kept` handle, reaching it only inside a closure while this shard runs
@@ -1097,14 +1101,16 @@ pub async fn run_membership(transport: FleetTransport) {
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  // Discovery announces both planes where this node advertises them, never where it binds (A-277, A-330): a peer
+  // prefers the announcement at every dial (`resolve_peer_address`), and behind a port mapping the bound record port is
+  // reached around the mapping or not at all.
   let initialized = state::with_state(|state| {
     state.discovery = Some(crate::discovery::Discovery::new(
       state,
       name.clone(),
       enrollment_roots.clone(),
       certificate,
-      advertise,
-      record_port,
+      (advertise, advertise_record),
       &peers,
     )?);
     crate::discovery::restore(state)
@@ -2482,11 +2488,29 @@ pub(crate) fn retire_done_tombstones(state: &mut ShardState, local: HostId) -> V
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const TOMBSTONE_RETIRE_REFUSED: &str = "fleet.tombstone.retire_refused";
 
+/// The promotion epoch `object`'s volume was taken over at, as the volume's record keeps it (A-325's
+/// `VolumeRecord::taken_over`; `object` its head register or its catalog's): what this owner writes the volume's records
+/// and ships its live log under once a warm restart has forgotten `placed_heads` (A-344). Before, a successor restarted
+/// warm wrote them at its own host's epoch, below the fence its takeover had raised at every holder, so none placed and
+/// its live log never shipped: its write was not answered within the client's 30 s deadline (a Mac Studio, 2026-11-18).
+/// `None` for a volume this node did not take over.
+pub(crate) fn promotion_epoch(state: &ShardState, object: ObjectId) -> Option<HostEpoch> {
+  let volume = DbVolumeId {
+    bytes: object.placement_key().0,
+  };
+  state
+    .db
+    .partition()
+    .volume(volume)?
+    .taken_over
+    .map(|takeover| HostEpoch(takeover.epoch))
+}
+
 /// The record of `object` at `sequence` with `value`, as this owner still owes it to some remote candidate —
 /// its full candidate set, the candidates that already hold it and the quorum — or `None` once every remote
-/// candidate holds it. The record is written at the greater of the host's epoch and the epoch the object was
-/// last written or adopted under: a taken-over object's holders fenced it at its promotion epoch (see
-/// `PlacedHead`).
+/// candidate holds it. The record is written at the greater of the host's epoch, the epoch the object was
+/// last written or adopted under, and the promotion epoch its volume's record keeps: a taken-over object's holders
+/// fenced it at its promotion epoch (see `PlacedHead`), and a restart forgets `placed_heads` ([`promotion_epoch`]).
 fn owed_record(
   state: &ShardState,
   config: &slates_db::register::Configuration,
@@ -2502,7 +2526,8 @@ fn owed_record(
     .unwrap_or_default();
   let epoch = recorded
     .map_or(config.host_epoch, |head| head.epoch)
-    .max(config.host_epoch);
+    .max(config.host_epoch)
+    .max(promotion_epoch(state, object).unwrap_or(config.host_epoch));
   // Every remote candidate that has not acked still needs the record; when none remain it is done.
   let outstanding = placement
     .candidates
@@ -2741,69 +2766,67 @@ fn mirror_neighbourhood_of(state: &ShardState, local: HostId) -> Vec<HostId> {
   slates_db::mirror::mirror_neighbourhood(local, &members, state.fleet.configuration().quorum)
 }
 
-/// One period of this node's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece M2):
-/// for each owned volume whose head snapshot is recorded placed at home and not yet in the mirror, a mirror job is
-/// started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
-/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
-/// holds, or that is being destroyed, keeps no job. Nothing runs with no mirror declared.
-fn advance_mirror_seals(
-  state: &mut ShardState,
-  local: HostId,
-  slice_bytes: u64,
-  created_unix: u64,
-  round: CommitBudget,
-) -> Vec<ContentWork> {
+/// The opening of a period's mirror walk ([`seal_walk_slice`]): this node's mirror neighbourhood, settled once for the
+/// period. Whether there is one to ship to; with none, every mirror job is dropped and the walk visits nothing.
+fn open_mirror_walk(state: &mut ShardState, local: HostId) -> bool {
   state.mirror_neighbourhood = mirror_neighbourhood_of(state, local);
-  if state.mirror_neighbourhood.is_empty() {
-    // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is
-    // the one way a declared mirror ships nothing without a refusal anywhere.
-    let own = state
-      .node_regions
-      .get(&local)
-      .copied()
-      .unwrap_or(RegionId(0));
-    if state
-      .region_mirrors
-      .get(&own)
-      .is_some_and(|mirror| *mirror != own)
-    {
-      state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+  if !state.mirror_neighbourhood.is_empty() {
+    return true;
+  }
+  // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is the
+  // one way a declared mirror ships nothing without a refusal anywhere.
+  let own = state
+    .node_regions
+    .get(&local)
+    .copied()
+    .unwrap_or(RegionId(0));
+  if state
+    .region_mirrors
+    .get(&own)
+    .is_some_and(|mirror| *mirror != own)
+  {
+    state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+  }
+  state.mirror_seals.clear();
+  false
+}
+
+/// One volume's step of a period's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece
+/// M2; [`seal_walk_slice`]): when its head snapshot is recorded placed at home and not yet in the mirror, a mirror job
+/// is started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
+/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
+/// holds, or that is being destroyed, keeps no job.
+fn advance_mirror_seal(
+  state: &mut ShardState,
+  (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
+  slicing: SealSlicing,
+  round: CommitBudget,
+) -> Option<ContentWork> {
+  let object = ObjectId(id.bytes);
+  let Some(head) = mirror_due(state, id) else {
+    state.mirror_seals.remove(&object);
+    return None;
+  };
+  if state
+    .mirror_seals
+    .get(&object)
+    .is_some_and(|job| job.snapshot != head.0)
+  {
+    state.mirror_seals.remove(&object);
+  }
+  if !state.mirror_seals.contains_key(&object) {
+    if !start_mirror_seal(state, object, handle, head, slicing.created_unix) {
+      return None;
     }
-    state.mirror_seals.clear();
-    return Vec::new();
+    state.count(MIRROR_JOB_STARTED, 1);
+  }
+  if !advance_seal(state, Track::Mirror, object, handle, slicing) {
+    return None;
   }
   let quorum = state.fleet.configuration().quorum;
-  let mut work = Vec::new();
-  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
-    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
-  for (id, handle) in volumes {
-    let object = ObjectId(id.bytes);
-    let Some(head) = mirror_due(state, id) else {
-      state.mirror_seals.remove(&object);
-      continue;
-    };
-    if state
-      .mirror_seals
-      .get(&object)
-      .is_some_and(|job| job.snapshot != head.0)
-    {
-      state.mirror_seals.remove(&object);
-    }
-    if !state.mirror_seals.contains_key(&object) {
-      if !start_mirror_seal(state, object, handle, head, created_unix) {
-        continue;
-      }
-      state.count(MIRROR_JOB_STARTED, 1);
-    }
-    if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
-      continue;
-    }
-    if let Some(item) = content_work(state, Track::Mirror, object, quorum, round) {
-      state.count(MIRROR_CONTENT_ROUNDS, 1);
-      work.push(item);
-    }
-  }
-  work
+  let item = content_work(state, Track::Mirror, object, quorum, round)?;
+  state.count(MIRROR_CONTENT_ROUNDS, 1);
+  Some(item)
 }
 
 /// The head snapshot of `id` and its sequence when it is placed at home and its mirror placement is not yet recorded:
@@ -2852,6 +2875,7 @@ fn start_mirror_seal(
       sequence,
       put_sequence: sequence,
       archiver: Some(archiver),
+      wrapping: None,
       archive: None,
       manifest: None,
       content: Placement {
@@ -2922,7 +2946,7 @@ fn record_mirrored_seals(state: &mut ShardState) {
 }
 
 /// Counter: periods in which this node's region declares a mirror but no live, authenticated member of the mirror
-/// region was found to ship to (`advance_mirror_seals`).
+/// region was found to ship to (`open_mirror_walk`).
 const MIRROR_NO_NEIGHBOURHOOD: &str = "fleet.mirror.no_neighbourhood";
 
 /// Counter: home content rounds that found no free session to any of their targets (`put_seal_content`).
@@ -2952,64 +2976,129 @@ const MIRROR_CONTENT_ROUNDS: &str = "fleet.mirror.content_rounds";
 /// Format: a refusal name in the daemon's status report.
 const MIRROR_RECORD_REFUSED: &str = "fleet.mirror.record_refused";
 
-/// One period of this node's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices): for each
-/// owned volume whose newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
-/// snapshot superseded the one being sealed), its archive walk is advanced one slice of `slice_bytes`, and —
-/// once the archive is complete and its content not yet placed — the content put to run this period is
-/// returned, its archive moved out for the dispatch and put back after ([`put_seal_content`]). A seal whose
-/// snapshot the database already records placed is dropped (a restart resumes nothing it need not).
-fn advance_seals(
+/// One volume's step of a period's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices;
+/// [`seal_walk_slice`]): when its newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
+/// snapshot superseded the one being sealed), its archive walk is advanced one slice of `slice_bytes`, and — once the
+/// archive is complete and its content not yet placed — the content put to run this period is returned, its archive
+/// moved out for the dispatch and put back after ([`put_seal_content`]). A seal whose snapshot the database already
+/// records placed is dropped (a restart resumes nothing it need not).
+fn advance_home_seal(
   state: &mut ShardState,
   local: HostId,
-  slice_bytes: u64,
-  created_unix: u64,
+  (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
+  slicing: SealSlicing,
   round: CommitBudget,
-) -> Vec<ContentWork> {
-  let quorum = state.fleet.configuration().quorum;
-  let mut work = Vec::new();
-  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
-    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
-  for (id, handle) in volumes {
-    let object = ObjectId(id.bytes);
-    let Some((head, sequence)) = sealable_head(state, id, object) else {
-      continue;
-    };
-    // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the
-    // head naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
-    if !state.seals.contains_key(&object)
-      && state.seal_root.is_some()
-      && let Some(owner) = state
-        .db
-        .partition()
-        .volume(id)
-        .map(|volume| volume.owner.clone())
-      && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
-    {
-      state.count(LINEAGE_UNMADE, 1);
-    }
-    if !state.seals.contains_key(&object)
-      && !start_seal(
-        state,
-        local,
-        object,
-        handle,
-        head,
-        sequence,
-        created_unix,
-        None,
-      )
-    {
-      continue;
-    }
-    if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
-      continue;
-    }
-    if let Some(item) = content_work(state, Track::Home, object, quorum, round) {
-      work.push(item);
-    }
+) -> Option<ContentWork> {
+  let object = ObjectId(id.bytes);
+  let (head, sequence) = sealable_head(state, id, object)?;
+  // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the head
+  // naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
+  if !state.seals.contains_key(&object)
+    && state.seal_root.is_some()
+    && let Some(owner) = state
+      .db
+      .partition()
+      .volume(id)
+      .map(|volume| volume.owner.clone())
+    && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
+  {
+    state.count(LINEAGE_UNMADE, 1);
   }
-  heal_one_placed_snapshot(state, local, created_unix);
-  work
+  if !state.seals.contains_key(&object)
+    && !start_seal(
+      state,
+      local,
+      object,
+      handle,
+      head,
+      sequence,
+      slicing.created_unix,
+      None,
+    )
+  {
+    return None;
+  }
+  if !advance_seal(state, Track::Home, object, handle, slicing) {
+    return None;
+  }
+  let quorum = state.fleet.configuration().quorum;
+  content_work(state, Track::Home, object, quorum, round)
+}
+
+/// Counter: a period's home seal walk over one owner shard's volumes ([`seal_walk_slice`]), however many turns it took.
+const SEAL_WALKS: &str = "fleet.seal.walks";
+/// Counter: one owner-shard turn of the home seal walk.
+const SEAL_WALK_SLICES: &str = "fleet.seal.walk_slices";
+/// Counter: a period's mirror walk over one owner shard's volumes, however many turns it took.
+const MIRROR_WALKS: &str = "fleet.mirror.walks";
+/// Counter: one owner-shard turn of the mirror walk.
+const MIRROR_WALK_SLICES: &str = "fleet.mirror.walk_slices";
+
+/// One owner-shard turn of a period's seal walk for `track` (§4.10 "Content replication"; CLAUDE.md "Bounded work
+/// everywhere"): the shard's volumes after `after` in id order, each visited ([`advance_home_seal`],
+/// [`advance_mirror_seal`]) until the shard's step quantum is spent (`futures::step_budget_ns`, what a destroy's or an
+/// archive's slice is sized by): the content puts made ready, and the last volume visited when any remain after it
+/// (`None` once the walk is done). The first volume is always visited, so a turn always moves the walk on. `opening`
+/// marks the walk's first turn this period, which settles what a period decides once (the mirror neighbourhood); the
+/// home walk's last turn takes the healer's step. Until 2026-11-17 one turn visited every volume and advanced every
+/// seal job a slice each: a shard sealing `n` volumes at once was held for `n` archive slices, each sized to a step
+/// quantum, while its clients waited, as the live record period was (`live_ship::period_slice`).
+fn seal_walk_slice(
+  state: &mut ShardState,
+  local: HostId,
+  (track, opening): (Track, bool),
+  after: Option<DbVolumeId>,
+  round: CommitBudget,
+) -> (Vec<ContentWork>, Option<DbVolumeId>) {
+  let (walks, slices) = match track {
+    Track::Home => (SEAL_WALKS, SEAL_WALK_SLICES),
+    Track::Mirror => (MIRROR_WALKS, MIRROR_WALK_SLICES),
+  };
+  if opening {
+    state.count(walks, 1);
+  }
+  state.count(slices, 1);
+  if opening && track == Track::Mirror && !open_mirror_walk(state, local) {
+    return (Vec::new(), None);
+  }
+  let quantum = state
+    .seal_walk_quantum_ns
+    .or_else(futures::step_budget_ns)
+    .unwrap_or(state.config.runtime.step_budget_ns);
+  let slicing = SealSlicing {
+    archive_bytes: state.config.archive_slice_bytes(),
+    wrap_ns: crate::config::wrap_slice_ns(quantum),
+    created_unix: u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND,
+  };
+  let began = futures::now_ns();
+  let mut cursor = after;
+  let mut work = Vec::new();
+  let remaining = loop {
+    let next = match cursor {
+      Some(last) => state
+        .by_id
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next(),
+      None => state.by_id.iter().next(),
+    }
+    .map(|(id, handle)| (*id, *handle));
+    let Some(volume) = next else {
+      break None;
+    };
+    let item = match track {
+      Track::Home => advance_home_seal(state, local, volume, slicing, round),
+      Track::Mirror => advance_mirror_seal(state, volume, slicing, round),
+    };
+    work.extend(item);
+    cursor = Some(volume.0);
+    if futures::now_ns().saturating_sub(began) >= quantum {
+      break cursor;
+    }
+  };
+  if remaining.is_none() && track == Track::Home {
+    heal_one_placed_snapshot(state, local, slicing.created_unix);
+  }
+  (work, remaining)
 }
 
 /// The healer's step (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only
@@ -3362,6 +3451,7 @@ fn start_seal(
       sequence,
       put_sequence,
       archiver: Some(archiver),
+      wrapping: None,
       archive: None,
       manifest: None,
       content,
@@ -3397,15 +3487,30 @@ fn restoring(job: &SealJob) -> bool {
   job.healing && !job.republish
 }
 
-/// Advances `object`'s seal one slice of `slice_bytes`; `true` once its archive is complete (this slice or
-/// an earlier one). A snapshot that cannot be archived whole (an overlay's base bytes are not in RAM) stays
-/// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
+/// How one turn of the seal walk slices each volume's seal ([`seal_walk_slice`]): the bytes its archive walk may hash,
+/// the time its envelope's wrap may take (A-323), and the creation time a new archive carries.
+#[derive(Clone, Copy, Debug)]
+struct SealSlicing {
+  /// The bytes one archive-walk slice may hash (`DaemonConfig::archive_slice_bytes`).
+  archive_bytes: u64,
+  /// How long one wrap slice may seal chunks for (`config::wrap_slice_ns` of the turn's quantum); a chunk at least.
+  wrap_ns: u64,
+  /// The informational creation time a new archive carries, Unix seconds.
+  created_unix: u64,
+}
+
+/// Advances `object`'s seal one slice: its archive walk one slice of `slicing.archive_bytes`, then, once the archive is
+/// complete on a node that seals, its envelope one slice of `slicing.wrap_ns` ([`wrap_slice`]); `true` once the archive
+/// the content puts carry is complete (this turn or an earlier one). A snapshot that cannot be archived whole (an
+/// overlay's base bytes are not in RAM) stays `Local`, counted so an operator sees why it never places (§4.4 coverage is
+/// never upgraded). An archive whose envelope is refused drops the job, so the next period starts the seal again
+/// (A-322).
 fn advance_seal(
   state: &mut ShardState,
   track: Track,
   object: ObjectId,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
-  slice_bytes: u64,
+  slicing: SealSlicing,
 ) -> bool {
   // The track's map is picked field by field, so the job is borrowed beside the volumes and the store.
   let jobs = match track {
@@ -3415,47 +3520,59 @@ fn advance_seal(
   let Some(job) = jobs.get_mut(&object) else {
     return false;
   };
-  let Some(archiver) = job.archiver.as_mut() else {
-    return true;
-  };
-  let Ok(slot) = state.volumes.get(handle) else {
-    return false;
-  };
-  let archive = match archiver.advance(&slot.volume, &state.store, slice_bytes) {
-    Ok(Progress::More) => return false,
-    Ok(Progress::Done(archive)) => {
-      job.archiver = None;
-      archive
-    }
-    Err(_) => {
-      job.archiver = None;
-      state.count(SEAL_REFUSED, 1);
+  if let Some(archiver) = job.archiver.as_mut() {
+    let Ok(slot) = state.volumes.get(handle) else {
       return false;
+    };
+    match archiver.advance(&slot.volume, &state.store, slicing.archive_bytes) {
+      Ok(Progress::More) => return false,
+      Ok(Progress::Done(archive)) => {
+        job.archiver = None;
+        // Where this node cannot seal at all (its key region or root unavailable, reported in status) the archive is
+        // placed as it is; where it can, the archive is wrapped first, from this turn on.
+        if state.seal_root.is_none() {
+          job.manifest = Some(archive.manifest_identity());
+          job.archive = Some(archive);
+          return true;
+        }
+        let segment = archive.base_page_size;
+        job.wrapping = Some(slates_cluster::envelope::Wrapping::new(archive, segment));
+      }
+      Err(_) => {
+        job.archiver = None;
+        state.count(SEAL_REFUSED, 1);
+        return false;
+      }
     }
-  };
-  let Some(archive) = envelope_of(state, object, archive) else {
-    return false;
-  };
-  let Some(job) = seal_jobs(state, track).get_mut(&object) else {
-    return false;
-  };
-  job.manifest = Some(archive.manifest_identity());
-  job.archive = Some(archive);
-  true
+  }
+  if job.wrapping.is_none() {
+    return true;
+  }
+  wrap_slice(state, track, object, slicing.wrap_ns)
 }
 
-/// The archive a seal places (A-92 piece 3b): `archive` wrapped in an envelope under the volume's lineage and naming
-/// keys (`slates_cluster::envelope`), so holders keep ciphertext and hold no key, in segments of the volume's base page
-/// (seal.md §4: the smallest unit slates reads and seals at). Where this node cannot seal at all (its key region or
-/// root unavailable, reported in status) the archive is placed as it is. Where it can but a key or the seal refuses,
-/// `None`: the seal is refused and counted, and the next period starts it again; content is never placed in the clear
-/// by a node that seals.
-fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Option<Archive> {
-  if state.seal_root.is_none() {
-    return Some(archive);
-  }
+/// What one turn's slice of an envelope's wrap came to ([`wrap_slice`]).
+enum Wrapped {
+  /// The envelope is complete: the archive the content puts carry.
+  Envelope(Archive),
+  /// Chunks remain for a later turn.
+  More,
+  /// A key or the seal refused.
+  Refused,
+}
+
+/// One turn's slice of `object`'s envelope (A-92 piece 3b, A-323): the archive the seal places wrapped under the
+/// volume's lineage and naming keys (`slates_cluster::envelope`), so holders keep ciphertext and hold no key, in segments
+/// of the volume's base page (seal.md §4: the smallest unit slates reads and seals at). Chunks are sealed until `wrap_ns`
+/// has passed on the shard's clock, one at least, so no turn seals the whole archive (64 MiB took 98 ms in one turn,
+/// 2026-10-05, and about a GiB ran past the watchdog's window). The keys are found again each turn, which costs a few
+/// key unwraps: a volume's lineage and naming keys are made once and never replaced (`crate::seal_keys`), so every turn
+/// seals under the keys the first did. `true` once the envelope is complete. Where a key or the seal refuses, the seal
+/// is dropped and counted (A-322), and the next period starts it again; content is never placed in the clear by a node
+/// that seals.
+fn wrap_slice(state: &mut ShardState, track: Track, object: ObjectId, wrap_ns: u64) -> bool {
   let id = DbVolumeId { bytes: object.0 };
-  let sealed = state
+  let keys = state
     .db
     .partition()
     .volume(id)
@@ -3463,13 +3580,68 @@ fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Op
     .and_then(|account| {
       let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
       let namer = crate::seal_keys::namer(state, id, account).ok()?;
-      slates_cluster::envelope::wrap(&archive, &lineage, &namer, archive.base_page_size).ok()
+      Some((lineage, namer))
     });
-  if sealed.is_none() {
-    state.count(SEAL_ENVELOPE_REFUSED, 1);
+  let began = futures::now_ns();
+  let wrapped = match (&keys, seal_jobs(state, track).get_mut(&object)) {
+    (Some((lineage, namer)), Some(job)) => match job.wrapping.as_mut() {
+      Some(wrapping) => wrap_until(wrapping, (lineage, namer), began, wrap_ns),
+      None => return true,
+    },
+    (None, Some(_)) => Wrapped::Refused,
+    (_, None) => return false,
+  };
+  let slices = match track {
+    Track::Home => SEAL_WRAP_SLICES,
+    Track::Mirror => MIRROR_WRAP_SLICES,
+  };
+  state.count(slices, 1);
+  match wrapped {
+    Wrapped::Envelope(envelope) => {
+      let Some(job) = seal_jobs(state, track).get_mut(&object) else {
+        return false;
+      };
+      job.wrapping = None;
+      job.manifest = Some(envelope.manifest_identity());
+      job.archive = Some(envelope);
+      true
+    }
+    Wrapped::More => false,
+    Wrapped::Refused => {
+      // A refused envelope drops the seal, so the next period starts it again (A-322). Until 2026-11-18 the job was
+      // kept with its walk spent and no archive: every later period found it complete and nothing to put, so its head
+      // never placed, whatever the keys did next; a heal kept that way shut the healer out of the volume as well.
+      seal_jobs(state, track).remove(&object);
+      state.count(SEAL_ENVELOPE_REFUSED, 1);
+      false
+    }
   }
-  sealed
 }
+
+/// Seals `wrapping`'s chunks one at a time under `keys` until `wrap_ns` has passed since `began` on the shard's clock,
+/// one chunk at least ([`wrap_slice`]).
+fn wrap_until(
+  wrapping: &mut slates_cluster::envelope::Wrapping,
+  (lineage, namer): (&hyper_seal::keys::WrappingKey, &hyper_seal::name::Namer),
+  began: u64,
+  wrap_ns: u64,
+) -> Wrapped {
+  loop {
+    // A budget of one byte seals exactly one chunk (or, with none left, the manifest), so the clock is read between
+    // chunks.
+    match wrapping.advance(lineage, namer, 1) {
+      Ok(Some(envelope)) => return Wrapped::Envelope(envelope),
+      Ok(None) if futures::now_ns().saturating_sub(began) < wrap_ns => {}
+      Ok(None) => return Wrapped::More,
+      Err(_) => return Wrapped::Refused,
+    }
+  }
+}
+
+/// Counter: one owner-shard turn's slice of a home seal's envelope wrap ([`wrap_slice`], A-323).
+const SEAL_WRAP_SLICES: &str = "fleet.seal.wrap_slices";
+/// Counter: one owner-shard turn's slice of a mirror shipment's envelope wrap.
+const MIRROR_WRAP_SLICES: &str = "fleet.mirror.wrap_slices";
 
 /// Derived: how many put-latency readings the owner shard keeps for the content class's p95 — the
 /// acknowledgements of one recovery budget of seals. A seal is put to at most `2f` remote candidates, one
@@ -4438,6 +4610,11 @@ async fn adopt_pending_tombstones(origin: u16) {
             if recorded && let Some(placed) = placed {
               s.placed_heads.insert(object, placed);
             }
+            if recorded {
+              // A round that gave the object up waiting for its cohorts' promises, then adopted it under a later
+              // configuration, left its record here (`takeover::give_up_unpromised`); its tombstone answers now.
+              s.unrecovered.remove(&tombstone.volume);
+            }
             recorded
           },
           HEARTBEAT_NS,
@@ -4603,8 +4780,9 @@ impl GreenWait {
 /// Derived: the materialization attempts without progress a taken-over volume or green gets before it is given up on:
 /// the failover SLO's worth of the fleet's periods (`failover_slo_ns / HEARTBEAT_NS`, at least one), each one attempt.
 /// Counted in attempts, not wall time, so a loaded node whose periods run late is given its attempts all the same; the
-/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8).
-fn takeover_attempts(failover_slo_ns: u64) -> u32 {
+/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8). The same bound counts a
+/// learned object's wait for its recovery cohorts' promises in the takeover round itself (`takeover::PromiseWait`).
+pub(crate) fn takeover_attempts(failover_slo_ns: u64) -> u32 {
   u32::try_from((failover_slo_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
 }
 
@@ -4938,6 +5116,62 @@ const GREEN_TAKEOVER_GIVEN_UP: &str = "merge.takeover_given_up";
 /// Format: a counter name in the daemon's status report.
 const GREEN_TAKEOVER_INPUTS_FETCHED: &str = "merge.takeover_inputs_fetched";
 
+/// The hosts a live takeover's phase one asks for `object` (A-240, A-309), and where the retired owner placed it: the
+/// takeover's `placed` candidates, then every candidate of the current placement not among them; and the retired
+/// owner's cohort hosts for the volume as the round that adopted it recorded them (`PendingVolume::cohort_hosts`),
+/// asked and waited for when the recorded holders are past tolerance (`live_ship::fetch`). With this shard's state out of
+/// reach (its shutdown) only the `placed` candidates, and no cohort hosts.
+fn live_candidates(object: ObjectId, placed: &[HostId]) -> (Vec<HostId>, Vec<HostId>) {
+  let mut candidates = placed.to_vec();
+  let (current, cohort_hosts) = state::with_state(|s| {
+    (
+      s.fleet.configuration().place(object).candidates,
+      s.pending_materializations
+        .get(&object)
+        .map(|pending| pending.cohort_hosts.clone())
+        .unwrap_or_default(),
+    )
+  })
+  .unwrap_or_default();
+  for host in current {
+    if !candidates.contains(&host) {
+      candidates.push(host);
+    }
+  }
+  (candidates, cohort_hosts)
+}
+
+/// The lineage key a taken-over volume's successor opens and seals its `head` with (A-92 piece 4c), wrapped under this
+/// node's root: its own copy where the head carried an entry for it; else, for an `envelope` it must open, the key a
+/// fellow candidate of the head (`candidates`, this node left out) hands it (A-295), counted; else none.
+async fn successor_lineage_of(
+  object: ObjectId,
+  head: &HeadValue,
+  candidates: &[HostId],
+  envelope: bool,
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = head.sealing.as_ref()?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  if !envelope {
+    return None;
+  }
+  let local = state::with_state(|s| s.fleet.configuration().owner);
+  let fellows: Vec<HostId> = candidates
+    .iter()
+    .copied()
+    .filter(|host| Some(*host) != local)
+    .collect();
+  let handed = ask_handed_lineage(object, sealing, &fellows).await;
+  if handed.is_some() {
+    count_refusal(ENVELOPE_KEY_HANDED);
+  }
+  handed
+}
+
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
 /// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
@@ -5014,15 +5248,8 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     .filter(|_| catalog.live_shipped)
   {
     let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
-    let mut candidates = placed.placement.candidates.clone();
-    let current =
-      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
-    for host in current {
-      if !candidates.contains(&host) {
-        candidates.push(host);
-      }
-    }
-    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+    let (candidates, cohort_hosts) = live_candidates(object, &placed.placement.candidates);
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders, cohort_hosts).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
@@ -5041,32 +5268,12 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
   // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
   // reached it) is handed the key by a fellow candidate of the head, as a live log's successor is (A-295).
-  let own_lineage = head.sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
   let envelope = live.is_none()
     && archive
       .as_ref()
       .is_some_and(slates_cluster::envelope::is_envelope);
-  let successor_lineage = match (own_lineage, head.sealing.as_ref()) {
-    (Some(own), _) => Some(own),
-    (None, Some(sealing)) if envelope => {
-      let local = state::with_state(|s| s.fleet.configuration().owner);
-      let fellows: Vec<HostId> = placed
-        .placement
-        .candidates
-        .iter()
-        .copied()
-        .filter(|host| Some(*host) != local)
-        .collect();
-      let handed = ask_handed_lineage(object, sealing, &fellows).await;
-      if handed.is_some() {
-        count_refusal(ENVELOPE_KEY_HANDED);
-      }
-      handed
-    }
-    _ => None,
-  };
+  let successor_lineage =
+    successor_lineage_of(object, &head, &placed.placement.candidates, envelope).await;
   let naming = head
     .sealing
     .as_ref()
@@ -5076,11 +5283,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     target,
     move |s| {
       let sequence = placed.sequence;
+      // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
       let taken = verbs::TakenOver {
         head: &head,
         catalog: &catalog,
         catalog_sequence,
         sequence,
+        takeover: slates_db::catalog::TakeoverRecord {
+          epoch: placed.epoch.0,
+          head_sequence: sequence,
+          from_live_log: live.is_some(),
+        },
       };
       // The volume's lineage key, so this node opens what the dead owner sealed and seals under the same key (A-92
       // pieces 3b and 4c). A head that carried no entry for this node (it acknowledged before its pair arrived) leaves
@@ -5100,8 +5313,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
         })
         .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
+        crate::live_ship::adopt_head(s, id, fetched.head);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
+        // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
+        // from the adopted head at once.
+        published_before_served(s)?;
         return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
@@ -5123,6 +5341,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);
       s.placed_heads.insert(object.catalog(), catalog_placed);
+      published_before_served(s)?;
       Ok(())
     },
     HEARTBEAT_NS,
@@ -5236,6 +5455,23 @@ fn materialize_refusal_counter(refusal: &slates_ipc::protocol::ReplyBody) -> &'s
 /// Counter: the owner shard did not answer a taken-over volume's materialization within the period.
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_UNANSWERED: &str = "fleet.materialize.unanswered";
+/// Counter: a taken-over volume materialized whose shard image could not be published (`published_before_served`):
+/// the materialization is tried again next period, which keeps the volume and publishes again.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_UNPUBLISHED: &str = "fleet.materialize.unpublished";
+
+/// Publishes the owner shard's image once a taken-over volume is materialized there, before it is served (§4.8
+/// "persistence before reply"; A-325, A-343): the image in the anchor is what a restart of this node rebuilds the volume
+/// from. Until 2026-11-18 nothing published it until the volume's first write, and a successor restarted before then
+/// found no image for it (`NoImage`) and never served it again, though its records named it the owner. A live volume's
+/// publication also makes its shipper, from the head its takeover adopted (A-329), so the successor ships its log from
+/// the takeover on. A refused publication is [`MATERIALIZE_UNPUBLISHED`]: the materialization stays pending, and its next
+/// attempt finds the volume made (`verbs::materialize_taken_over` keeps it) and publishes again.
+fn published_before_served(s: &mut crate::state::ShardState) -> Result<(), &'static str> {
+  crate::verbs::publish_shard(s)
+    .map(|_| ())
+    .map_err(|_| MATERIALIZE_UNPUBLISHED)
+}
 
 /// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
 /// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a
@@ -5657,6 +5893,16 @@ pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String 
 enum DirectContact {
   /// The fleet's consensus groups are not both initialized yet: everyone is contacted.
   Forming,
+  /// This node is not a member of the council configuration it holds (A-331): a fresh member whose first fetch was
+  /// answered before the council admitted it, or a member retired while it was away. It is no peer's neighbour and
+  /// holds nothing under that configuration, and the voters it knows are its join donor's, which may be the member it
+  /// replaced alone. Judged by the member rule a fresh member kept no peer at all: every record link idled, its learner
+  /// fetched over no session, and it never learned the configuration that admits it (live_chaos's fresh-member flow, 2
+  /// of 48 runs at one CPU; diag-raft-chaos-ab-68b-2: council at version 8, in contact with none of its four live
+  /// members, `fleet.learner.no_session` 113 in 48 s); a retired member kept only the old neighbours of the placement it
+  /// last installed. Every member it holds alive is contacted, as while forming, until it holds a configuration that
+  /// names it.
+  Unadmitted,
   /// Believed dead, but only as a manifest **seed** this node has not yet replaced by a learned id: the seed
   /// was never a live incarnation, so its death (folded where a neighbour learned the peer's real id, and
   /// gossiped here) says only that the peer has a real incarnation this node has not reached. Contact is
@@ -5731,8 +5977,8 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
     dead_contact(state, peer)
-  } else if !state.council.initialized() || !state.root.initialized() {
-    DirectContact::Forming
+  } else if let Some(joining) = joining_contact(state) {
+    joining
   } else if !state.council.configuration().members.contains(&peer) {
     DirectContact::NotInCouncilConfiguration
   } else if state.fleet.configuration().neighbours(peer) {
@@ -5751,6 +5997,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::AsVoter
   } else {
     DirectContact::OutsideNeighbourhood
+  }
+}
+
+/// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever
+/// the peer's role: [`DirectContact::Forming`] before both groups are initialized, [`DirectContact::Unadmitted`] while
+/// the council configuration it holds does not name it (A-331). `None` once it is a member, where the role rule applies.
+/// Both are judged of this node alone, so the member rule below them never meets a node with no neighbourhood.
+fn joining_contact(state: &ShardState) -> Option<DirectContact> {
+  if !state.council.initialized() || !state.root.initialized() {
+    Some(DirectContact::Forming)
+  } else if !state
+    .council
+    .configuration()
+    .members
+    .contains(&state.fleet.host())
+  {
+    Some(DirectContact::Unadmitted)
+  } else {
+    None
   }
 }
 
@@ -6632,12 +6897,11 @@ const PAIR_KEY_STREAM: u64 = 19;
 const PAIR_ACCEPTED: u8 = 1;
 /// The stream a volume's successor asks a fellow candidate for the volume's lineage key on (A-295): the object, the key's
 /// id and the asker's recipient public key ([`lineage_request`]), answered with the key wrapped to that recipient, or
-/// empty when refused (counted where it was refused).
-/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable. After the work routes' (25,
-/// `work_route::STREAM`) and the live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as
-/// that stream, so its request reaches no lineage handler at all (the first run of the window test, every ask
-/// unanswered while the work-route arm took kind 25). Held distinct by `every_request_kind_the_record_session_
-/// dispatches_is_its_own`.
+/// empty when refused (counted where it was refused). After the work routes' kind (25, `work_route::STREAM`) and the
+/// live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as that stream, so its request
+/// reaches no lineage handler at all (the first run of the window test, every ask unanswered while the work-route arm
+/// took kind 25). Held distinct by `every_request_kind_the_record_session_dispatches_is_its_own`.
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
 const LINEAGE_STREAM: u64 = 27;
 
 /// Format: the refusal name counting council requests left unanswered because their sender is held dead
@@ -8526,9 +8790,10 @@ async fn follow_configuration(
   }
 }
 
-/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds
-/// of those whose archive is complete, keeping each round's dispatch for its stragglers. Whether the shard holds any
-/// job of the track.
+/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds of
+/// those whose archive is complete, keeping each round's dispatch for its stragglers. The walk over the shard's volumes
+/// runs in turns of about a step quantum each ([`seal_walk_slice`]), each turn's puts dispatched before the next turn,
+/// so the shard serves its clients between them. Whether the shard holds any job of the track at the walk's end.
 async fn put_track_content(
   origin: u16,
   shard: u16,
@@ -8537,29 +8802,31 @@ async fn put_track_content(
   track: Track,
   in_flight: &mut Vec<Dispatch>,
 ) -> bool {
-  let (work, jobs) = call_within(
-    origin,
-    shard,
-    move |s| {
-      let slice_bytes = s.config.archive_slice_bytes();
-      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      let work = match track {
-        Track::Home => advance_seals(s, local, slice_bytes, created_unix, budget),
-        Track::Mirror => advance_mirror_seals(s, local, slice_bytes, created_unix, budget),
-      };
-      let jobs = !seal_jobs(s, track).is_empty();
-      (work, jobs)
-    },
-    HEARTBEAT_NS,
-  )
-  .await
-  .unwrap_or_default();
-  for item in work {
-    if let Some(dispatch) = put_seal_content(origin, local, item).await {
-      in_flight.push(dispatch);
+  let mut after = None;
+  let mut opening = true;
+  loop {
+    let first = std::mem::take(&mut opening);
+    let (work, jobs, next) = call_within(
+      origin,
+      shard,
+      move |s| {
+        let (work, next) = seal_walk_slice(s, local, (track, first), after, budget);
+        (work, !seal_jobs(s, track).is_empty(), next)
+      },
+      HEARTBEAT_NS,
+    )
+    .await
+    .unwrap_or_default();
+    for item in work {
+      if let Some(dispatch) = put_seal_content(origin, local, item).await {
+        in_flight.push(dispatch);
+      }
+    }
+    match next {
+      Some(last) => after = Some(last),
+      None => return jobs,
     }
   }
-  jobs
 }
 
 /// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
@@ -9415,6 +9682,7 @@ pub(crate) async fn forward_over_leader_session(
     peer,
     &[request],
     deadline_ns,
+    crate::forward_lane::failover_bound_from(slates_rt::futures::now_ns()),
     &mut crate::forward_lane::Place::default(),
   )
   .await
@@ -9431,17 +9699,20 @@ pub(crate) async fn forward_over_leader_session(
 /// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
 /// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
-/// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
-/// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
-/// budget. The batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
+/// keeps delivering is never cut off for its size. A stretch with no progress is given up once the lane's shard has
+/// read what came, or at once past `bound_ns`, the failover bound on the wall from the forward's first send
+/// ([`crate::forward_lane`]'s stall, A-315). Returns the replies in order (`None` for one not answered) with how they
+/// streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the budget. The
+/// batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
 /// ([`crate::forward_lane::Place`]).
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  bound_ns: u64,
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns, place).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound_ns, place).await
 }
 
 #[cfg(test)]

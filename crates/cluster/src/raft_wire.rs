@@ -12,8 +12,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Adoption, DomainId, HostEpoch, HostId, Moved, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum,
-  RegionId, RegionalConfiguration, Retirement, RootConfiguration, Settled,
+  Adoption, CompletedTakeover, DomainId, HostEpoch, HostId, Moved, Neighbourhood, OBJECT_BYTES,
+  ObjectId, Quorum, RegionId, RegionalConfiguration, Retirement, RootConfiguration, Settled,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -715,12 +715,15 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 1, the first versioned layout (with A-272's
-/// `dropped_unconfirmed` and the moved-object exceptions, `moved`, last). A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read
-/// another layout's fields by position: before it, a field appended to the layout was refused only by the accident of
-/// a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have been read
-/// with a field defaulted (GAPS, live-durability 2026-11-09).
-const REGIONAL_LAYOUT: u32 = 1;
+/// Format: the regional configuration's layout version: 2 since A-309, which put the completion records (`completed`)
+/// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
+/// byte, then its settled form, after its unconfirmed hosts); the moved-object exceptions, `moved`, stay last. Layout 1
+/// was the first versioned layout. A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than
+/// read another layout's fields by position: before the version, a field appended to the layout was refused only by the
+/// accident of a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have
+/// been read with a field defaulted (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was
+/// dropped and no retirement is kept, which only the version tells apart.
+const REGIONAL_LAYOUT: u32 = 2;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -790,6 +793,14 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     encode_hosts(&mut out, &retirement.survivors);
     encode_hosts(&mut out, &retirement.confirmed);
     encode_hosts(&mut out, &retirement.unconfirmed);
+    // The current neighbourhood a change in flight reached (A-309): a presence byte, then its settled form.
+    match &retirement.current {
+      Some(current) => {
+        out.push(u8::from(true));
+        encode_settled(&mut out, current);
+      }
+      None => out.push(u8::from(false)),
+    }
   }
   put_u32(
     &mut out,
@@ -801,7 +812,15 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.head);
     put_bytes(&mut out, &adoption.catalog);
   }
-  encode_hosts(&mut out, &config.dropped_unconfirmed);
+  put_u32(
+    &mut out,
+    u32::try_from(config.completed.len()).unwrap_or(u32::MAX),
+  );
+  for (host, record) in &config.completed {
+    put_u64(&mut out, host.0);
+    put_u64(&mut out, record.version);
+    encode_hosts(&mut out, &record.confirmed);
+  }
   put_u32(
     &mut out,
     u32::try_from(config.moved.len()).unwrap_or(u32::MAX),
@@ -834,6 +853,22 @@ fn decode_moved(
     rest = tail;
   }
   Ok((moved, rest))
+}
+
+/// Decodes the completion records (count, then each `(host, version, confirmed hosts)`), bounding every count (A-309).
+fn decode_completed(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, CompletedTakeover>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut completed = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (host, tail) = take_u64(rest)?;
+    let (version, tail) = take_u64(tail)?;
+    let (confirmed, tail) = decode_hosts(tail)?;
+    completed.insert(HostId(host), CompletedTakeover { version, confirmed });
+    rest = tail;
+  }
+  Ok((completed, rest))
 }
 
 /// Decodes the adoptions map (count, then each `(object, successor, head, catalog)`), bounding the count.
@@ -906,8 +941,8 @@ fn decode_settled_map(
   Ok((settled, rest))
 }
 
-/// Decodes the retirements map (count, then each `(host, version, settled, survivors, confirmed, unconfirmed)`),
-/// bounding every count.
+/// Decodes the retirements map (count, then each `(host, version, settled, survivors, confirmed, unconfirmed,
+/// current)`, the current neighbourhood a presence byte and then its settled form), bounding every count.
 fn decode_retired(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<HostId, Retirement>, &[u8]), RaftWireError> {
@@ -920,11 +955,19 @@ fn decode_retired(
     let (survivors, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
     let (unconfirmed, tail) = decode_hosts(tail)?;
+    let (present, tail) = take_bool(tail)?;
+    let (current, tail) = if present {
+      let (current, tail) = decode_settled(tail)?;
+      (Some(current), tail)
+    } else {
+      (None, tail)
+    };
     retired.insert(
       HostId(host),
       Retirement {
         version,
         settled,
+        current,
         survivors,
         confirmed,
         unconfirmed,
@@ -952,7 +995,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (settled, rest) = decode_settled_map(rest)?;
   let (retired, rest) = decode_retired(rest)?;
   let (adoptions, rest) = decode_adoptions(rest)?;
-  let (dropped_unconfirmed, rest) = decode_hosts(rest)?;
+  let (completed, rest) = decode_completed(rest)?;
   let (moved, rest) = decode_moved(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
@@ -966,7 +1009,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     settled,
     retired,
     adoptions,
-    dropped_unconfirmed,
+    completed,
     moved,
   })
 }
@@ -1851,6 +1894,49 @@ mod tests {
     assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3)));
     assert_eq!(config.moved.len(), 1);
     expect_round_trip(&config, "round-trip is identity with a moved object");
+    // A completed takeover's record (A-309) survives it too: every survivor of every kept retirement confirms.
+    complete_every_retirement(&mut config);
+    assert!(!config.completed.is_empty());
+    expect_round_trip(&config, "round-trip is identity with completion records");
+  }
+
+  /// Confirms every survivor's share of every retirement `config` keeps, so each completes into a record (A-309).
+  fn complete_every_retirement(config: &mut slates_db::register::RegionalConfiguration) {
+    let departed: Vec<HostId> = config.retired.keys().copied().collect();
+    for retired in departed {
+      for survivor in config.survivors_of(retired) {
+        config.confirm(retired, survivor);
+      }
+    }
+  }
+
+  /// A-309: a retirement taken while a change was in flight keeps the current neighbourhood its joint writes reached,
+  /// and the encoding carries it. Do: form a member beside one other, admit a third, and take the member over before it
+  /// reports the new neighbourhood; encode and decode. Expect the retirement's current neighbourhood kept and the
+  /// configuration back unchanged.
+  #[test]
+  fn a_retirements_current_neighbourhood_round_trips() {
+    use slates_db::register::RegionalConfiguration;
+    let mut joint = RegionalConfiguration::formed(
+      vec![A, B],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    assert!(joint.admit(HostId(3), None, 3));
+    joint.take_over(A, 3);
+    assert!(
+      joint
+        .retired
+        .get(&A)
+        .is_some_and(|retirement| retirement.current.is_some()),
+      "the change in flight is kept"
+    );
+    expect_round_trip(
+      &joint,
+      "round-trip is identity with a retirement's current neighbourhood",
+    );
   }
 
   /// Do: encode `config` and decode its bytes. Expect the configuration back unchanged; `case` names the state it was
@@ -1862,6 +1948,47 @@ mod tests {
       Ok(config),
       "{case}"
     );
+  }
+
+  /// A-309: a completion record whose confirmed-host count lies — more ids than the bytes back — is refused before
+  /// allocating, and a configuration cut short inside its completion records is refused.
+  #[test]
+  fn a_lying_completion_record_count_is_refused() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    for survivor in config.survivors_of(A) {
+      config.confirm(A, survivor);
+    }
+    let confirmed = config
+      .completed
+      .get(&A)
+      .map(|record| record.confirmed.len())
+      .unwrap();
+    assert!(config.moved.is_empty());
+    let bytes = encode_regional_configuration(&config);
+    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count.
+    let tail = confirmed * size_of::<u64>() + size_of::<u32>();
+    let count_at = bytes.len() - tail - size_of::<u32>();
+    let mut lying = bytes.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&lying),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+    for cut in 1..=tail + size_of::<u32>() + 2 * size_of::<u64>() {
+      assert!(
+        decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
+        "a configuration cut {cut} bytes short is refused"
+      );
+    }
   }
 
   /// A configuration whose moved-object count lies — more exceptions than the bytes back — is refused before
@@ -1910,11 +2037,12 @@ mod tests {
     );
     config.take_over(A, 3);
     let bytes = encode_regional_configuration(&config);
-    // The last retirement ends with its confirmed ids (a count, none here) and its unconfirmed ids (a count,
-    // none here): make the confirmed count claim every id there is.
-    // The adoptions' count, the unconfirmed drops' count and the moved objects' count (none of each here) follow the
-    // last retirement, in that order.
-    let confirmed_count_at = bytes.len() - 5 * size_of::<u32>();
+    // The last retirement ends with its confirmed ids (a count, none here), its unconfirmed ids (a count, none here)
+    // and its current neighbourhood's presence byte (none here, A-309): make the confirmed count claim every id there
+    // is. The adoptions' count, the completion records' count and the moved objects' count (none of each here) follow
+    // the last retirement, in that order.
+    let tail = 5 * size_of::<u32>() + 1;
+    let confirmed_count_at = bytes.len() - tail;
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
       .copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1923,7 +2051,7 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=5 * size_of::<u32>() {
+    for cut in 1..=tail {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"
@@ -2003,32 +2131,14 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x01\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x02\x00\x00\x00".as_slice()),
         Some(b"RTCF\x01\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version 1, little-endian"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 2 since A-309"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
-    let layout_at = size_of::<u32>();
-    let mut raised = regional_bytes.clone();
-    raised[layout_at..layout_at + size_of::<u32>()]
-      .copy_from_slice(&(REGIONAL_LAYOUT + 1).to_le_bytes());
-    assert_eq!(
-      decode_regional_configuration(&raised),
-      Err(RaftWireError::LayoutVersion {
-        layout: REGIONAL_LAYOUT + 1
-      })
-    );
-    let mut raised = root_bytes.clone();
-    raised[layout_at..layout_at + size_of::<u32>()]
-      .copy_from_slice(&(ROOT_LAYOUT + 1).to_le_bytes());
-    assert_eq!(
-      decode_root_configuration(&raised),
-      Err(RaftWireError::LayoutVersion {
-        layout: ROOT_LAYOUT + 1
-      })
-    );
+    expect_a_raised_layout_refused(&regional_bytes, &root_bytes);
     assert_eq!(
       decode_regional_configuration(&root_bytes),
       Err(RaftWireError::ForeignLayout { magic: ROOT_MAGIC }),
@@ -2051,5 +2161,30 @@ mod tests {
       decode_root_configuration(unversioned),
       Err(RaftWireError::ForeignLayout { .. })
     ));
+  }
+
+  /// The raised layouts of `a_configuration_of_another_layout_is_refused_by_name`: expect a regional and a root
+  /// configuration's encodings (`regional`, `root`), each with its layout version raised by one, refused
+  /// `LayoutVersion` naming the raised version.
+  fn expect_a_raised_layout_refused(regional: &[u8], root: &[u8]) {
+    let layout_at = size_of::<u32>();
+    let mut raised = regional.to_vec();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(REGIONAL_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: REGIONAL_LAYOUT + 1
+      })
+    );
+    let mut raised = root.to_vec();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(ROOT_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_root_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: ROOT_LAYOUT + 1
+      })
+    );
   }
 }

@@ -378,6 +378,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: vec![],
     created_ns: 0,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 
@@ -805,6 +806,12 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           landing: None,
           manifest: None,
           outcome: None,
+          // Every other record carries a verdict, so recovery is held to keep it (A-321).
+          signature: k.is_multiple_of(2).then_some(slates_db::catalog::SignatureVerdict {
+            kind: 1,
+            detail: *k,
+            fingerprint: [*k; 32],
+          }),
         },
       }
     }

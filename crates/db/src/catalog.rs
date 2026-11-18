@@ -428,6 +428,23 @@ pub struct VolumeRecord {
   /// the access list, the base — so the owner ships each change as a newer record and a takeover adopts the
   /// newest (AUD-29-17). Raised in `apply`, so replay reproduces it.
   pub catalog_version: u64,
+  /// The takeover that made this node the volume's owner (AC-8.3, A-325), recorded with the volume when the successor
+  /// materializes it, so its loss report survives the successor's restart over its anchor; `None` for a volume made
+  /// here. Appended.
+  pub taken_over: Option<TakeoverRecord>,
+}
+
+/// The takeover that made a node a volume's owner (AC-8.3, A-325; the loss report in `slates status`): the epoch the head
+/// was placed under, the head sequence the volume was served from, and whether it was rebuilt from the volume's live log
+/// (no acknowledged write lost) or from the seal the head names (the lost owner's edits after it are the loss window).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeoverRecord {
+  /// The epoch the adopted head was placed under.
+  pub epoch: u64,
+  /// The head sequence the volume was served from.
+  pub head_sequence: u64,
+  /// Whether the volume was rebuilt from its live log rather than from the seal the head names.
+  pub from_live_log: bool,
 }
 
 /// Where a snapshot's records and content are held (§4.8).
@@ -902,6 +919,22 @@ pub struct AuditRecord {
   pub manifest: Option<[u8; 32]>,
   /// The terminal state, for `LandingFinished`.
   pub outcome: Option<LandingState>,
+  /// How the landing's signature was judged (signed work, A-321), on a `LandingPlanned` and a `LandingFinished`
+  /// record: the landing's provenance. `None` on every other record, and on a landing that carried no signature.
+  /// Appended.
+  pub signature: Option<SignatureVerdict>,
+}
+
+/// How an act's signature was judged (signed work, A-321), as a record keeps it: the server's verdict
+/// (`slates_server::signed_work`), opaque here, so a record read back reports it as it was judged.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignatureVerdict {
+  /// The verdict's kind (verified or invalid), as the server numbers it.
+  pub kind: u8,
+  /// The verdict's detail (the signer's key type, or why it did not verify), as the server numbers it.
+  pub detail: u8,
+  /// The signer's key fingerprint (zero for a signature that did not verify).
+  pub fingerprint: [u8; 32],
 }
 
 /// An NFSv4 open held at its file's owner partition (§4.6 A-37): what `slates_bridge_nfs::v4::files`

@@ -1408,6 +1408,188 @@ fn detector_lines(instance: &str) -> String {
 /// (1 s each, `LIVENESS_BUDGET_NS`), so the owner's departure look (one a budget) runs at least twice meanwhile.
 const LIVE_HOLD: Duration = Duration::from_millis(2_500);
 
+/// Format: the environment variable that turns this test binary, re-invoked, into one of its roles, for the lanes that
+/// put a node or its launcher where the test process is not (the container lane; the two-machine lane, driven through
+/// kiln): `mint`, `unpack`, `node`, `ask`, `bypass` or `approve` ([`role`]). The other `ROLE_*` variables say what the
+/// role works on; a launcher's secret comes on standard input, never in an argument or the environment.
+const ROLE: &str = "SLATES_FS_ROLE";
+/// Format: the role's instance.
+const ROLE_INSTANCE: &str = "SLATES_FS_ROLE_INSTANCE";
+/// Format: the role's volume (32 hexadecimal characters).
+const ROLE_VOLUME: &str = "SLATES_FS_ROLE_VOLUME";
+/// Format: the role's landing target, as its server names it.
+const ROLE_TARGET: &str = "SLATES_FS_ROLE_TARGET";
+/// Format: the role's directory: `mint` writes the fleet's identities there, `unpack` what it is handed.
+const ROLE_DIR: &str = "SLATES_FS_ROLE_DIR";
+/// Format: the `node` role's fleet manifest.
+const ROLE_MANIFEST: &str = "SLATES_FS_ROLE_MANIFEST";
+/// Format: the `node` role's node, by its name in the manifest.
+const ROLE_NODE: &str = "SLATES_FS_ROLE_NODE";
+/// Format: the `node` role's `slates` binary.
+const ROLE_SLATES: &str = "SLATES_FS_ROLE_SLATES";
+/// Format: the tag of each line a role reports on, found anywhere in a line (libtest's own `test role ... ` comes first
+/// on the same line).
+const ROLE_TAG: &str = "FS-ROLE:";
+
+/// A role's required variable.
+fn role_var(name: &str) -> String {
+  std::env::var(name).unwrap_or_else(|_| panic!("the role needs {name}"))
+}
+
+/// `bytes` as lowercase hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+  bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The bytes of a hexadecimal text.
+fn unhex(text: &str) -> Vec<u8> {
+  text
+    .as_bytes()
+    .chunks(2)
+    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+    .collect()
+}
+
+/// The launcher's secret a role reads on its standard input (64 hexadecimal characters), or `None` when given none.
+fn role_secret() -> Option<slates_api::LauncherSecret> {
+  use std::io::Read;
+  let mut text = String::new();
+  std::io::stdin().read_to_string(&mut text).unwrap();
+  let text = text.trim();
+  if text.is_empty() {
+    return None;
+  }
+  let bytes: [u8; slates_api::launcher::LAUNCHER_SECRET_BYTES] = unhex(text)
+    .try_into()
+    .unwrap_or_else(|_| panic!("a launcher's secret is 32 bytes"));
+  Some(slates_api::LauncherSecret::from_bytes(bytes).unwrap())
+}
+
+/// Not a test of its own: a role of this binary, run when [`ROLE`] names it (a lane re-invokes the binary where the
+/// role must run); otherwise it returns at once.
+#[test]
+fn role() {
+  let Ok(role) = std::env::var(ROLE) else {
+    return;
+  };
+  match role.as_str() {
+    "mint" => role_mint(),
+    "unpack" => role_unpack(),
+    "node" => role_node(),
+    "ask" => role_sets_land_mode("ask", slates_api::WriteMode::Ask),
+    "bypass" => role_sets_land_mode("bypass", slates_api::WriteMode::Bypass),
+    "approve" => role_approve(),
+    other => panic!("no role {other:?}"),
+  }
+}
+
+/// `mint`: the fleet's identities for [`NODES`] in [`ROLE_DIR`], each file reported as `file NAME HEX`, so a lane hands
+/// the same identities to every machine.
+#[allow(clippy::disallowed_methods)]
+fn role_mint() {
+  let dir = role_var(ROLE_DIR);
+  for node in NODES {
+    mint_identity(&dir, node);
+    for name in [format!("{node}.crt.der"), format!("{node}.key.der")] {
+      let bytes = std::fs::read(format!("{dir}/{name}")).unwrap();
+      println!("{ROLE_TAG} file {name} {}", hex(&bytes));
+    }
+  }
+}
+
+/// `unpack`: writes into [`ROLE_DIR`] each `NAME HEX` line of its standard input (bare file names only).
+#[allow(clippy::disallowed_methods)]
+fn role_unpack() {
+  use std::io::Read;
+  let dir = role_var(ROLE_DIR);
+  let mut input = String::new();
+  std::io::stdin().read_to_string(&mut input).unwrap();
+  let mut count = 0usize;
+  for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    let (name, text) = line.split_once(' ').unwrap();
+    assert!(
+      !name.contains('/') && !name.starts_with('.'),
+      "a bare file name: {name}"
+    );
+    std::fs::write(format!("{dir}/{name}"), unhex(text)).unwrap();
+    count += 1;
+  }
+  println!("{ROLE_TAG} unpacked {count}");
+}
+
+/// `node`: starts the node [`ROLE_NODE`] of [`ROLE_MANIFEST`] as `slates anchor` at [`ROLE_INSTANCE`] (the command
+/// `slates-api` builds for a host), under the launcher's secret when one comes on standard input, and stays until the
+/// anchor ends (a lane stops it with `SIGTERM`).
+fn role_node() {
+  let mut spec = slates_api::StartSpec::new(
+    &role_var(ROLE_INSTANCE),
+    std::path::PathBuf::from(role_var(ROLE_SLATES)),
+    &[],
+  );
+  spec.quick = true;
+  spec.shards = Some(SHARDS.parse().unwrap());
+  spec.fleet = Some(slates_api::role::FleetSelection {
+    manifest: role_var(ROLE_MANIFEST),
+    node: role_var(ROLE_NODE),
+  });
+  let spec = match role_secret() {
+    Some(secret) => spec.with_launcher(secret),
+    None => spec,
+  };
+  let mut anchor = spec
+    .anchor_command()
+    .unwrap()
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  println!("{ROLE_TAG} started {}", anchor.id());
+  let status = anchor.wait().unwrap();
+  println!("{ROLE_TAG} ended {status}");
+}
+
+/// `ask` and `bypass`: the launcher sets [`ROLE_VOLUME`]'s land mode at [`ROLE_INSTANCE`].
+fn role_sets_land_mode(name: &str, land: slates_api::WriteMode) {
+  let secret =
+    role_secret().unwrap_or_else(|| panic!("the {name} role needs the launcher's secret"));
+  let launcher = slates_api::Issuer::from_launcher_secret(&secret);
+  launcher_sets_land_mode(
+    &role_var(ROLE_INSTANCE),
+    &launcher,
+    &role_var(ROLE_VOLUME),
+    land,
+  );
+  println!("{ROLE_TAG} {name} set");
+}
+
+/// `approve`: the launcher approves exactly the landing of [`ROLE_VOLUME`] into [`ROLE_TARGET`] it is presented, as
+/// kiln approves what a harness's person said yes to; reports `written=N failed=M`.
+fn role_approve() {
+  let secret =
+    role_secret().unwrap_or_else(|| panic!("the approve role needs the launcher's secret"));
+  let launcher = slates_api::Issuer::from_launcher_secret(&secret);
+  let mut approver = slates_api::Instance::attach(&role_var(ROLE_INSTANCE)).unwrap();
+  let request = slates_api::LandingRequest {
+    volume: volume_id(&role_var(ROLE_VOLUME)),
+    snapshot: None,
+    target: role_var(ROLE_TARGET),
+    filter: slates_api::Filter::default(),
+  };
+  let approval = match approver.plan_landing(&request).unwrap() {
+    slates_api::LandOutcome::ApprovalRequired(approval) => approval,
+    other => panic!("an ask landing is an approval request: {other:?}"),
+  };
+  match approver.approve_landing(&approval, &launcher).unwrap() {
+    slates_api::LandOutcome::Written(report) => {
+      println!(
+        "{ROLE_TAG} written={} failed={}",
+        report.written, report.failed
+      );
+    }
+    other => panic!("the approved landing is written: {other:?}"),
+  }
+}
+
 /// The server in its own container (fs-server plan step 2; R8, A-285, A-299): the server node is `slates anchor` in a
 /// Linux container on a Docker network of its own, started with its launcher's secret on standard input, its projects a
 /// volume attached to the container; the client node runs on the host and reaches it over the network's bridge. The
@@ -1421,23 +1603,11 @@ const LIVE_HOLD: Duration = Duration::from_millis(2_500);
 #[cfg(target_os = "linux")]
 mod in_a_container {
   use super::*;
-  use std::io::{Read, Write};
+  use std::io::Write;
 
   /// Format: the image the server node runs in: the release GitHub's `ubuntu-latest` runs, so the binaries built
   /// beside it (this test binary and `slates`) run in it unchanged, with no library of their own.
   const SERVER_IMAGE: &str = "ubuntu:24.04";
-  /// Format: the environment variable that turns the re-invoked test binary into the launcher's role, with its value
-  /// the role (`ask`, `bypass`, `approve`). The other `ROLE_*` variables give its instance, volume and target.
-  const ROLE: &str = "SLATES_FS_CONTAINER_ROLE";
-  /// Format: the role's instance (its name inside the container).
-  const ROLE_INSTANCE: &str = "SLATES_FS_CONTAINER_ROLE_INSTANCE";
-  /// Format: the role's volume (32 hexadecimal characters).
-  const ROLE_VOLUME: &str = "SLATES_FS_CONTAINER_ROLE_VOLUME";
-  /// Format: the role's landing target, as the server names it.
-  const ROLE_TARGET: &str = "SLATES_FS_CONTAINER_ROLE_TARGET";
-  /// Format: the tag of the one line the role reports on, found anywhere in a line (libtest's own `test NAME ... `
-  /// comes first on the same line).
-  const ROLE_TAG: &str = "FS-CONTAINER-ROLE:";
   /// Shape: the projects' directory as the server names it inside its container.
   const PROJECTS_IN_CONTAINER: &str = "/projects";
   /// Shape: the server node's probe port inside its container (records on the next); its network namespace is its
@@ -1679,7 +1849,7 @@ mod in_a_container {
       container,
       "/usr/local/bin/fs-server-role",
       "--exact",
-      "in_a_container::launcher_role_in_the_servers_container",
+      "role",
       "--nocapture",
       "--test-threads",
       "1",
@@ -1716,59 +1886,6 @@ mod in_a_container {
           .map(|(_, said)| said.trim().to_owned())
       })
       .unwrap_or_else(|| panic!("the launcher's {role} role reported nothing: {out}{err}"))
-  }
-
-  /// Not a test of its own: the launcher's role inside the server's container, run when [`ROLE`] names it (the
-  /// container lane re-invokes this binary there); otherwise it returns at once.
-  #[test]
-  fn launcher_role_in_the_servers_container() {
-    let Ok(role) = std::env::var(ROLE) else {
-      return;
-    };
-    let instance = std::env::var(ROLE_INSTANCE).unwrap();
-    let volume = std::env::var(ROLE_VOLUME).unwrap();
-    let target = std::env::var(ROLE_TARGET).unwrap();
-    let mut hex = String::new();
-    std::io::stdin().read_to_string(&mut hex).unwrap();
-    let mut bytes = [0u8; slates_api::launcher::LAUNCHER_SECRET_BYTES];
-    for (byte, pair) in bytes.iter_mut().zip(hex.trim().as_bytes().chunks(2)) {
-      *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
-    }
-    let secret = slates_api::LauncherSecret::from_bytes(bytes).unwrap();
-    let launcher = slates_api::Issuer::from_launcher_secret(&secret);
-    match role.as_str() {
-      "ask" => {
-        launcher_sets_land_mode(&instance, &launcher, &volume, slates_api::WriteMode::Ask);
-        println!("{ROLE_TAG} ask set");
-      }
-      "bypass" => {
-        launcher_sets_land_mode(&instance, &launcher, &volume, slates_api::WriteMode::Bypass);
-        println!("{ROLE_TAG} bypass set");
-      }
-      "approve" => {
-        let mut approver = slates_api::Instance::attach(&instance).unwrap();
-        let request = slates_api::LandingRequest {
-          volume: volume_id(&volume),
-          snapshot: None,
-          target,
-          filter: slates_api::Filter::default(),
-        };
-        let approval = match approver.plan_landing(&request).unwrap() {
-          slates_api::LandOutcome::ApprovalRequired(approval) => approval,
-          other => panic!("an ask landing is an approval request: {other:?}"),
-        };
-        match approver.approve_landing(&approval, &launcher).unwrap() {
-          slates_api::LandOutcome::Written(report) => {
-            println!(
-              "{ROLE_TAG} written={} failed={}",
-              report.written, report.failed
-            );
-          }
-          other => panic!("the approved landing is written: {other:?}"),
-        }
-      }
-      other => panic!("no launcher role {other:?}"),
-    }
   }
 
   /// The two nodes up: the server in its container on its own network, the client on the host at the network's

@@ -421,6 +421,15 @@ impl VersionBudget {
     self.ledger.take(slots).map(|slots| VersionCredit { slots })
   }
 
+  /// Grows a dynamic volume's version hold by `slots` (§4.2 "Dynamic volumes"; A-342), whole or refused with nothing
+  /// changed: taken from the *unpromised* capacity only — the slab less every bounded claim's reserved allowance, every
+  /// hold and retention already taken, and the copy-up headroom — so a dynamic volume's inodes never spend a bounded
+  /// claim's slots, as its bytes never spend a bounded claim's bytes. A hold never shrinks while its volume lives; its
+  /// owner returns it whole at teardown through [`release`](Self::release).
+  pub fn grow(&mut self, slots: u64) -> Result<VersionCredit, MemError> {
+    self.ledger.take(slots).map(|slots| VersionCredit { slots })
+  }
+
   /// Returns a credit's slots to the version slab.
   pub fn release(&mut self, credit: VersionCredit) {
     self.ledger.give(credit.slots);
@@ -802,6 +811,36 @@ mod tests {
     assert_eq!(v.committed(), 60, "a refused reservation changes nothing");
     v.release(a);
     assert_eq!(v.admittable(), 99, "release returns the credit's slots");
+  }
+
+  /// A-342: a dynamic volume's version hold grows only into unpromised slots — never a bounded claim's reserved
+  /// allowance, never the copy-up headroom — is refused whole with nothing changed at the boundary, and comes back whole
+  /// when its owner releases it at teardown.
+  #[test]
+  fn a_dynamic_hold_grows_into_unpromised_slots_only_and_returns_whole() {
+    let mut v = VersionBudget::new(100, 1);
+    let claim = v.reserve(60).unwrap(); // a bounded claim's whole allowance
+    let mut held = 0;
+    for _ in 0..39 {
+      held += v.grow(1).unwrap().slots; // an inode at a time, as a dynamic volume issues them
+    }
+    assert_eq!(held, 39, "every unpromised slot, and no more");
+    match v.grow(1) {
+      Err(MemError::BudgetExceeded {
+        requested: 1,
+        available: 0,
+      }) => {}
+      other => panic!("the claim's slots and the headroom are not a hold's to take: {other:?}"),
+    }
+    assert_eq!(v.committed(), 99, "a refused growth changes nothing");
+    v.release(VersionCredit { slots: held });
+    assert_eq!(
+      v.committed(),
+      60,
+      "the hold comes back whole; the claim stays"
+    );
+    v.release(claim);
+    assert_eq!(v.admittable(), 99);
   }
 
   /// The byte dimension's retention charge draws only from unpromised capacity — never from a

@@ -832,6 +832,53 @@ pub fn adopt(
     .max_by_key(|(_, head)| head.rank())
 }
 
+/// Whether a live takeover's phase one is past tolerance (A-309): fewer than `f + 1` of the recorded `holders` are still
+/// members (`is_member`), so [`adopt`]'s count can never be met. More of the log's holders failed than the region
+/// tolerates; A-240's count waited for good (g240's finding: at `f = 1` a set recorded as {survivor, destroyed node}).
+pub fn past_tolerance(
+  holders: &[HostId],
+  is_member: impl Fn(HostId) -> bool,
+  quorum: Quorum,
+) -> bool {
+  let Some(needed) = usize::try_from(quorum.f)
+    .ok()
+    .and_then(|f| f.checked_add(1))
+  else {
+    return false;
+  };
+  holders.iter().filter(|host| is_member(**host)).count() < needed
+}
+
+/// Phase one's choice past tolerance ([`adopt_past_tolerance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastTolerance {
+  /// A surviving host that may hold the log has not reported yet.
+  Waiting,
+  /// Every surviving host that may hold the log has reported: the holder of the greatest head and that head, `None`
+  /// when none holds any of the log.
+  Adopt(Option<(HostId, Head)>),
+}
+
+/// Phase one's choice past tolerance (A-309): once every host of `wait` has reported, the greatest head among `reports`.
+/// `wait` is every surviving member that may hold the log: the recorded holders still members and the members of the
+/// retired owner's cohorts for the volume, settled and current (where a joint transition shipped). No count of
+/// recorded holders can meet every durable entry past tolerance; waiting for every surviving holder means the newest
+/// head any of them keeps is never passed over, the replacement that caught up on the log among them.
+pub fn adopt_past_tolerance(reports: &[(HostId, Option<Head>)], wait: &[HostId]) -> PastTolerance {
+  if !wait
+    .iter()
+    .all(|host| reports.iter().any(|(reporter, _)| reporter == host))
+  {
+    return PastTolerance::Waiting;
+  }
+  PastTolerance::Adopt(
+    reports
+      .iter()
+      .filter_map(|(holder, head)| head.map(|head| (*holder, head)))
+      .max_by_key(|(_, head)| head.rank()),
+  )
+}
+
 /// What the owner keeps of its log beyond its own state, in bytes of entries at their wire size
 /// ([`Entry::wire_bytes`]; AC-8.9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -892,6 +939,9 @@ pub struct Shipper {
   unsettled_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
+  /// The position its first entry takes when it has no `start`: 0 for a new log, and for an owner restarted over its
+  /// own log one past every position it may have shipped before ([`Shipper::resumed`], A-344).
+  first: u64,
   /// The owner's head: its last entry, or `start` before its first.
   head: Option<Head>,
   /// The retained entries, oldest first, dense in position.
@@ -939,6 +989,7 @@ impl Shipper {
       unsettled: VecDeque::new(),
       unsettled_bytes: 0,
       start,
+      first: 0,
       head: start,
       retained: VecDeque::new(),
       held: BTreeMap::new(),
@@ -949,6 +1000,41 @@ impl Shipper {
     };
     shipper.refresh_durable();
     shipper
+  }
+
+  /// The owner's side after its own restart over its log (A-344; §4.10): the log it shipped before is gone with its
+  /// memory, and `past` is the greatest position it may have shipped under `epoch` (`None`: none), which its recovery
+  /// image kept. Its first entry takes position `past + 1` under the same epoch, so no position it may already have
+  /// shipped is used again: a holder holds the old chain or nothing, and each is installed from the new chain's first
+  /// entry, which ranks above every entry of the old. Nothing before that entry is settled or durable here: no holder
+  /// has acknowledged anything of this chain. Before A-344 a restarted owner began again at position 0 under the same
+  /// epoch, and the old chain and the new were two values at the same positions (Agreement; a takeover adopted the
+  /// old chain's greater head and lost what the new one had made durable). Refused [`LiveError::Malformed`] at the
+  /// last position.
+  pub fn resumed(
+    (owner, object, epoch): (HostId, ObjectId, HostEpoch),
+    quorum: Quorum,
+    holders: &[HostId],
+    past: Option<u64>,
+    bounds: Bounds,
+  ) -> Result<Shipper, LiveError> {
+    let first = match past {
+      Some(past) => past.checked_add(1).ok_or(LiveError::Malformed)?,
+      None => 0,
+    };
+    let mut shipper = Shipper::new((owner, object, epoch), quorum, holders, None, bounds);
+    shipper.first = first;
+    shipper.refresh_durable();
+    Ok(shipper)
+  }
+
+  /// The position the next entry takes ([`Shipper::append`]): what an owner's recovery image keeps, so a restart
+  /// resumes past it (A-344). `None` past the last position.
+  pub fn next_position(&self) -> Option<u64> {
+    match self.head {
+      Some(head) => head.position.checked_add(1),
+      None => Some(self.first),
+    }
   }
 
   /// The owner it ships as.
@@ -1043,7 +1129,10 @@ impl Shipper {
     // has not counted yet: the target holds them too before the record may name it. Without this a successor moved to
     // a set disjoint from the old at once, and the next takeover adopted nothing (the model, f = 2, 2026-11-07).
     let start = self.start.map(|start| start.position);
-    let Some(floor) = self.durable.max(start) else {
+    // A restarted owner's first entry carries every durable entry of the chain before it (A-344): the target holds
+    // them once it holds that entry.
+    let resumed = (self.first > 0).then_some(self.first);
+    let Some(floor) = self.durable.max(start).max(resumed) else {
       return true;
     };
     self
@@ -1106,15 +1195,18 @@ impl Shipper {
     }
   }
 
-  /// The last position nothing appended here waits on: the durable position, or the head it started from when that is
-  /// higher (`None`: neither yet).
+  /// The last position nothing appended here waits on: the durable position, the head it started from, or the last
+  /// position before a restarted owner's first (A-344), whichever is highest (`None`: none of them).
   fn settled_through(&self) -> Option<u64> {
-    match (self.durable, self.start) {
-      (Some(durable), Some(start)) => Some(durable.max(start.position)),
-      (Some(durable), None) => Some(durable),
-      (None, Some(start)) => Some(start.position),
-      (None, None) => None,
-    }
+    let before_first = self.first.checked_sub(1);
+    [
+      self.durable,
+      self.start.map(|start| start.position),
+      before_first,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
   }
 
   /// The wire bytes of the entries appended here that are not yet durable: what [`Bounds::credit`] holds.
@@ -1167,7 +1259,7 @@ impl Shipper {
         head.position.checked_add(1).ok_or(LiveError::Malformed)?,
         head.identity,
       ),
-      None => (0, GENESIS),
+      None => (self.first, GENESIS),
     };
     let entry = Entry {
       owner: self.owner,
