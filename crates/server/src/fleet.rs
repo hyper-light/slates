@@ -6157,6 +6157,14 @@ async fn injected_turn_pause() {
   }
 }
 
+/// A placed seal's archive (none for a contentless volume), the successor's lineage key to adopt and the head's
+/// naming key ([`Source::Archive`]).
+type ArchiveSource = (
+  Option<Archive>,
+  Option<([u8; 16], Vec<u8>)>,
+  Option<crate::head::HeadNaming>,
+);
+
 /// A taken-over volume's placed archive, opened in a turn of its owner shard: a copy this node froze for a move it made
 /// (A-291) let go before the volume's keys are adopted ([`let_frozen_go`]; an envelope's open let it go in its first
 /// turn); the volume's lineage key adopted, so this node seals under the key the dead owner did (A-92 pieces 3b and 4c;
@@ -6168,11 +6176,7 @@ async fn archive_opened(
   object: ObjectId,
   id: DbVolumeId,
   catalog: &crate::catalog::CatalogValue,
-  (archive, lineage, naming): (
-    Option<Archive>,
-    Option<([u8; 16], Vec<u8>)>,
-    Option<crate::head::HeadNaming>,
-  ),
+  (archive, lineage, naming): ArchiveSource,
 ) -> Result<Option<Archive>, &'static str> {
   futures::yield_now().await;
   making_turn(object, |s| {
