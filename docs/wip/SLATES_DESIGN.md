@@ -6598,7 +6598,8 @@ reconstruction budget are derived, never fixed (D-O6).
 > track). Held by `a_shards_seals_are_walked_in_turns_and_every_one_places` (`crates/server/tests/fleet.rs`: 12 volumes
 > sealed at once with the turn cut to one volume, every snapshot placed). Owed (measurement): the owner shard's longest
 > step while hundreds of volumes seal at once, before and after. The envelope wrap at a seal's end, one turn of the
-> whole archive until 2026-11-18, is in turns too (A-323, below).
+> whole archive until 2026-11-18, is in turns too (A-323, below). Until A-347 the walk's turns over the control shard's
+> own volumes ran in one poll (an inline call; `xshard::Turns`, below).
 
 > **Status (2026-11-18, A-322 and A-323, g230: a seal's envelope in turns, and a refused one started again).** On a
 > node that seals, a seal's archive is wrapped in its envelope (A-92 piece 3b) before its content is put. The wrap ran
@@ -6617,7 +6618,35 @@ reconstruction budget are derived, never fixed (D-O6).
 > `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
 > (`crates/cluster/tests/envelope.rs`). Owed (measurement): the owner shard's longest step while a GiB volume seals,
 > before and after. Owed: a seal's archive walk and its wrap each advance one slice a record period, so a large volume
-> takes many periods to place (GAPS); and a takeover's open of the envelope still runs in one turn of the successor.
+> takes many periods to place (GAPS). A takeover's open of the envelope runs in turns too since A-347 (the next status).
+>
+> **Status (2026-11-18, A-347, g230: a takeover's open of a sealed envelope in turns).** A successor opened a sealed
+> volume's envelope inside the one owner-shard turn that made the volume (`fleet::opened_archive`'s `envelope::open`): a
+> seal's open and a BLAKE3 pass a byte, about a second a GiB, the watchdog's window, on the path a takeover must finish.
+> It now opens it before that turn, in turns of the successor's owner shard (`fleet::open_in_turns`): its lineage key
+> adopted first, then the sealed manifest opened (the real archive's tree, never its content) into a
+> `slates_cluster::envelope::Opening`, then its chunks a slice a turn, one at least, until the seal turns' share of the
+> quantum has passed (`config::wrap_slice_ns`, as the wrap's); the turn that makes the volume then finds a plain archive.
+> The archive is the very one a whole open makes. Counted `fleet.seal.open_slices`; an open that is refused or cut short
+> starts again from the envelope at the materialization's next attempt. Held by
+> `a_takeovers_envelope_is_opened_in_turns_and_served` (`crates/server/tests/fleet.rs`) and by
+> `an_envelope_opened_in_slices_is_the_whole_opens_archive` and `an_open_ends_at_its_archive_or_its_refusal`
+> (`crates/cluster/tests/envelope.rs`). Owed: the restore that follows (`slates_archive::restore` in
+> `verbs::materialize_taken_over`) still lays the whole archive out in that one turn, and the sealed manifest is opened
+> in one turn (its cost grows with the volume's entries, not its bytes) (GAPS).
+>
+> The same change gives every sliced walk its turns on the shard that drives it (`xshard::Turns`). A walk is driven by a
+> task of the control shard, one `xshard::call_within` a slice; a call to another shard is a task there, a turn of its
+> own, but a call to the caller's own shard runs inline, so a walk that called again at once ran every slice in the one
+> poll of its task. Four walks were that shape: the live record period (`live_ship::period`, 2026-11-17), a returned
+> holder's walk (`live_ship::reached_walk`, A-324), the seal walk (`fleet::put_track_content`, 2026-11-17) and this open.
+> On the control shard's own volumes, and on every shard of a one-shard daemon (every fleet test's), each ran as one
+> turn however many slices it counted, and each test counted slices, not polls. Measured on the Mac Studio on
+> 2026-11-18 (the measurer's harness, one shard): the owner's longest step over a holder's return grew with the live
+> volumes, at most 12.0 ms over 1,000 and at most 42.0 ms over 4,000, the one-poll shape (an inference from the scaling,
+> not traced). A walk's call to its own shard now yields first, and two slices of one walk that still run in one poll
+> are counted `xshard.turns_shared`, which the four walks' tests hold at zero; with the yield removed each of them
+> counts shared turns.
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -7098,7 +7127,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > visited; the first volume of a slice is always visited, so the period always ends. Held by
 > `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved` (`crates/server/tests/fleet.rs`: 24
 > live volumes, the quantum cut to one volume a slice, every log durable at its head after three periods). Owed
-> (measurement): the owner shard's longest step with thousands of live volumes, before and after.
+> (measurement): the owner shard's longest step with thousands of live volumes, before and after. Until A-347 the
+> slices over the control shard's own volumes ran in one poll (an inline call; `xshard::Turns`, §4.10's A-347 status).
 >
 > **A holder's return in turns (2026-11-18, A-324, g230).** When a holder's record session is established again, every
 > shard sends it what its live volumes owe it at once (`live_ship::holder_reached`). That ran in one turn of each shard:
@@ -7110,6 +7140,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
 > written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
 > (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+> Until A-347 the turns over the control shard's own volumes ran in one poll (an inline call; `xshard::Turns`, §4.10's
+> A-347 status): the measurer's longest steps of at most 12.0 and 42.0 ms over 1,000 and 4,000 volumes grew with the
+> volumes as one poll would (an inference from the scaling, not traced).
 >
 > **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
 > a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
@@ -25191,3 +25224,31 @@ Applied in the same change to:
   mounts as a node that does not hold it: an NFS request `NFS3ERR_STALE` and no root at a mount, as the router answers a
   handle of a volume outside the node's set; a FUSE mount fenced as a revoked one is, its kernel's cache dropped, its
   requests refused `ENOTCONN`, and the mount ended. The client mounts the volume through its successor's node.
+
+### A-347 — A takeover opens a sealed volume's envelope in turns of the successor's owner shard (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", §4.10 "Content replication"; CLAUDE.md "Bounded work everywhere"; A-323's sibling)
+Applied in the same change to:
+- §4.10 "Content replication": the status of A-322 and A-323 (its owed open closed), the seal walk's status and A-347's
+  own status; §4.10 "Live shipping": the period's and A-324's statuses (their turns on the control shard).
+- `crates/cluster/src/envelope.rs`: `Opening` (new, advance, chunks_left); `open` is one whole advance.
+  `crates/server/src/fleet.rs`: `open_in_turns`, `open_slice`, `recorded_keys`, `seal_quantum_ns`,
+  `materialize_refused`; `materialize` opens an envelope before the turn that makes the volume. The seal quantum's test
+  hook covers the open (`Daemon::inject_seal_walk_quantum`).
+- `crates/server/src/xshard.rs`: `Turns` (a sliced walk's calls, a turn of the shard each, the caller's own shard
+  yielded to first) and the counter `xshard.turns_shared`; driven through it: `fleet::open_in_turns`,
+  `fleet::put_track_content` (the seal walk), `live_ship::period` and `live_ship::reached_walk` (A-324).
+- Tests: `a_takeovers_envelope_is_opened_in_turns_and_served` (`crates/server/tests/fleet.rs`);
+  `an_envelope_opened_in_slices_is_the_whole_opens_archive`, `an_open_ends_at_its_archive_or_its_refusal`
+  (`crates/cluster/tests/envelope.rs`); the seal walk's, the period's and A-324's fleet tests each hold
+  `xshard.turns_shared` at zero.
+- GAPS: A-323's entry (its owed open closed; the restore and the manifest's open owed).
+- **What was there.** A successor made a taken-over volume in one owner-shard turn: its lineage key adopted, its
+  envelope opened whole, its archive restored, its record made and published. The open is a seal's open and a BLAKE3
+  pass a byte of the volume, so a GiB volume's takeover ran about a second in one turn, the watchdog's window, on the
+  path that must finish for the volume to be served again.
+- **The rule.** A sealed envelope is opened before the volume is made, a slice a turn on the volume's owner shard, each
+  slice at least one chunk and held to the shard's clock as a seal's wrap is (`config::wrap_slice_ns`). The opened
+  archive is the very one a whole open makes; an open refused or cut short starts again from the envelope at the next
+  attempt. And every walk cut into slices is driven through `xshard::Turns`, so each slice is a turn of its shard of its
+  own wherever the shards fall: a call to the driving shard itself runs inline (§4.3's one code path for one shard and
+  many), so the four sliced walks, this open among them, ran every slice in one poll on the control shard and on every
+  shard of a one-shard daemon, and their tests, counting slices, could not see it.

@@ -2815,9 +2815,10 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
-  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
-  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// Test support: the quantum a seal's turns are cut by on every shard (the record period's seal walk and envelope wrap,
+  /// `fleet::seal_walk_slice`, and a takeover's envelope open, `fleet::open_slice`), in place of the shard's own step
+  /// quantum; `None` gives the shard its own back. Zero ends each turn after one volume or one chunk, so a test sees the
+  /// slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
   /// once installed, else the typed refusal.
   pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {

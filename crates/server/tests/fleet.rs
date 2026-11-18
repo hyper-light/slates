@@ -5455,6 +5455,18 @@ fn control_longest_poll_ns(daemon: &Daemon) -> u64 {
     .map_or(0, |pulse| pulse.longest_step_ns)
 }
 
+/// Format: a node's count of the slices of its sliced walks that ran in one poll of their shard with the slice before
+/// them (`xshard::Turns`): a turn not given back, zero by construction.
+const TURNS_SHARED: &str = "xshard.turns_shared";
+
+/// `daemon`'s [`TURNS_SHARED`], summed over its shards: how many of its walks' slices shared a poll with the one before.
+fn turns_shared(daemon: &Daemon) -> u64 {
+  summed_counters(daemon)
+    .get(TURNS_SHARED)
+    .copied()
+    .unwrap_or(0)
+}
+
 /// The tasks `daemon`'s control shard has refused at admission so far (`tasks_refused` in `slates status`).
 fn control_tasks_refused(daemon: &Daemon) -> u64 {
   daemon
@@ -10484,8 +10496,10 @@ fn owned_live_line(
 /// step quantum at a time (`live_ship::period_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 24
 /// live-shipped volumes, each written once, answered at durability and detached; cut the owner's slices after one volume
 /// each (`Daemon::inject_live_period_quantum(Some(0))`) and let three record periods pass. Expect at least 24 slices for each
-/// period that passed whole (one volume each, and one that finds none left), and every volume's log durable at its head
-/// with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard owned.
+/// period that passed whole (one volume each, and one that finds none left), each slice a poll of the shard of its own
+/// (`xshard.turns_shared` zero; until A-347 the control shard's own slices ran in one poll), and every volume's log
+/// durable at its head with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard
+/// owned.
 #[test]
 fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved() {
   let _serial = serialize_fleet_tests();
@@ -10504,6 +10518,7 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
     refusal_count(&daemons[0], LIVE_PERIODS).map(|periods| periods >= before[0] + 3)
   });
   let after = counts(&daemons[0]);
+  let shared = turns_shared(&daemons[0]);
   daemons[0].inject_live_period_quantum(None).unwrap();
   let lines: Vec<_> = volumes
     .iter()
@@ -10513,7 +10528,9 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("period slicing: periods, slices before {before:?} after {after:?}; lines {lines:?}");
+  eprintln!(
+    "period slicing: periods, slices before {before:?} after {after:?}; {shared} slices shared a poll; lines {lines:?}"
+  );
   assert!(passed, "three record periods passed");
   let (periods, slices) = (
     after[0].saturating_sub(before[0]),
@@ -10523,6 +10540,10 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
   assert!(
     slices >= periods.saturating_sub(1) * volumes_per_period,
     "each whole period took a slice a volume ({periods} periods, {slices} slices)"
+  );
+  assert_eq!(
+    shared, 0,
+    "each slice was a turn of the owner shard of its own: {shared} shared a poll with the slice before"
   );
   for (index, line) in lines.iter().enumerate() {
     assert!(
@@ -10543,44 +10564,49 @@ const SEAL_WALKS: &str = "fleet.seal.walks";
 /// Format: the owner's count of the owner-shard turns those walks took.
 const SEAL_WALK_SLICES: &str = "fleet.seal.walk_slices";
 
+/// A volume `walked-<index>` on `client`'s node, written once ([`WALKED_FILE_BYTES`] of bytes distinct to `index`) and its
+/// attachment let go: a partition's attachments are capped at the node's derived admission limit
+/// (`PartitionCaps::attachments`), and a seal needs none held.
+fn walked_volume_written_once(client: &mut Client, index: usize) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(&format!("walked-{index}"))) else {
+    panic!("volume {index} was created");
+  };
+  let attachment = write_attachment(client, id);
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/walked".to_owned(),
+    bytes: vec![u8::try_from(index % 251).unwrap(); WALKED_FILE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "volume {index}'s write: {written:?}"
+  );
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "volume {index}'s attachment was let go: {detached:?}"
+  );
+  id
+}
+
 /// CLAUDE.md "Bounded work everywhere", §4.10 "Content replication": a shard's seal walk visits its volumes in turns of
 /// about a step quantum each (`fleet::seal_walk_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 12
 /// volumes each written once and detached; cut the owner's walk turns after one volume each
 /// (`Daemon::inject_seal_walk_quantum(Some(0))`); snapshot every volume, then wait for every snapshot to place. Expect
-/// every snapshot placed (the slicing starved no seal), and at least 12 turns for each walk that passed whole (one
-/// volume each). Before, one turn visited every volume and advanced every seal job a slice each, so a shard sealing `n`
-/// volumes at once was held for `n` archive slices while its clients waited.
+/// every snapshot placed (the slicing starved no seal), at least 12 turns for each walk that passed whole (one volume
+/// each), and each turn a poll of the shard of its own (`xshard.turns_shared` zero; until A-347 the control shard's own
+/// turns ran in one poll). Before, one turn visited every volume and advanced every seal job a slice each, so a shard
+/// sealing `n` volumes at once was held for `n` archive slices while its clients waited.
 #[test]
 fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
   let mut client = Client::connect(daemons[0].instance());
-  let mut volumes = Vec::new();
-  for index in 0..WALKED_SEAL_VOLUMES {
-    let ReplyBody::Created { id } = client.call(&scratch(&format!("walked-{index}"))) else {
-      panic!("volume {index} was created");
-    };
-    let attachment = write_attachment(&mut client, id);
-    let written = client.call(&RequestBody::FsWrite {
-      volume: id,
-      attachment,
-      path: "/walked".to_owned(),
-      bytes: vec![u8::try_from(index % 251).unwrap(); WALKED_FILE_BYTES],
-      mode: 0o644,
-    });
-    assert!(
-      matches!(written, ReplyBody::FsDone { .. }),
-      "volume {index}'s write: {written:?}"
-    );
-    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`); a seal
-    // needs none held.
-    let detached = client.call(&RequestBody::Detach { attachment });
-    assert!(
-      matches!(detached, ReplyBody::Detached),
-      "volume {index}'s attachment was let go: {detached:?}"
-    );
-    volumes.push(id);
-  }
+  let volumes: Vec<VolumeId> = (0..WALKED_SEAL_VOLUMES)
+    .map(|index| walked_volume_written_once(&mut client, index))
+    .collect();
   daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
   let before = [SEAL_WALKS, SEAL_WALK_SLICES].map(|kind| refusal_count(&daemons[0], kind).unwrap());
   let snapshots: Vec<_> = volumes
@@ -10602,12 +10628,15 @@ fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
     })
     .collect();
   let after = [SEAL_WALKS, SEAL_WALK_SLICES].map(|kind| refusal_count(&daemons[0], kind).unwrap());
+  let shared = turns_shared(&daemons[0]);
   daemons[0].inject_seal_walk_quantum(None).unwrap();
   drop(observed);
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("seal walk: walks, turns before {before:?} after {after:?}; placed {placed:?}");
+  eprintln!(
+    "seal walk: walks, turns before {before:?} after {after:?}; {shared} turns shared a poll; placed {placed:?}"
+  );
   assert!(
     snapshots.iter().all(Option::is_some),
     "every volume was snapshotted: {snapshots:?}"
@@ -10624,6 +10653,10 @@ fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
   assert!(
     walks >= 2 && turns >= walks.saturating_sub(1) * volumes_per_walk,
     "each whole walk took a turn a volume ({walks} walks, {turns} turns)"
+  );
+  assert_eq!(
+    shared, 0,
+    "each walk turn was a turn of the owner shard of its own: {shared} shared a poll with the turn before"
   );
 }
 
@@ -10763,6 +10796,129 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
   );
 }
 
+/// Shape: the distinct files of the taken-over sealed volume, each its own chunk, so its envelope's open opens that many.
+const OPENED_CHUNKS: usize = 24;
+/// Format: the successor's count of the owner-shard turns its envelope opens took (`fleet::open_slice`).
+const ENVELOPE_OPEN_SLICES: &str = "fleet.seal.open_slices";
+
+/// The bytes of opened file `index`: distinct for each file, so each is its own chunk.
+fn opened_body(index: usize) -> Vec<u8> {
+  vec![u8::try_from(index).unwrap(); WALKED_FILE_BYTES]
+}
+
+/// A volume of [`OPENED_CHUNKS`] distinct files on `daemons[0]`, shared with the fleet, sealed, its snapshot placed and
+/// its head held by both other nodes: the volume, or what did not hold.
+fn sealed_many_and_held(daemons: &[Daemon], name: &str) -> Result<VolumeId, String> {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("create on the owner".to_owned());
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let attachment = write_attachment(&mut client, id);
+  let written = (0..OPENED_CHUNKS).all(|index| {
+    matches!(
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/opened-{index}"),
+        bytes: opened_body(index),
+        mode: 0o644,
+      }),
+      ReplyBody::FsDone { .. }
+    )
+  });
+  let detached = client.call(&RequestBody::Detach { attachment });
+  let snapshot = snapshot_taken(&mut client, id).ok_or("snapshot on the owner")?;
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&observed, &mut client, id, snapshot);
+  let held = poll_all_hold(&[&daemons[1], &daemons[2]], ObjectId(id.bytes));
+  if written && matches!(detached, ReplyBody::Detached) && placed && held {
+    Ok(id)
+  } else {
+    Err(format!(
+      "written {written}, detached {detached:?}, placed {placed}, held by both others {held}"
+    ))
+  }
+}
+
+/// A-347 (§4.8 "Promotion and takeover", §4.10, CLAUDE.md "Bounded work everywhere"): a takeover opens a sealed volume's
+/// envelope in turns of the successor's owner shard, a chunk at least a turn, never the whole archive in one turn. Do:
+/// three nodes at `f = 1`; on a, one volume of 24 files of distinct bytes (24 distinct chunks), shared with the fleet,
+/// sealed and held by both other nodes; cut the survivors' seal turns to one unit
+/// (`Daemon::inject_seal_walk_quantum(Some(0))`); stop a for good; once the survivor the volume ranks first serves it,
+/// read every file through it and read its shard's longest step. Expect the volume served, every file read back, at
+/// least 24 turns of the open on the successor (a chunk a turn), each a poll of its own (`xshard.turns_shared` zero: one
+/// shard a node, so the control shard drives a walk over its own state, which an inline call ran in one poll), and its
+/// longest step under the watchdog's window (`LIVENESS_BUDGET_NS`). Before, the open ran inside the turn that made the
+/// volume: one turn whatever the volume, about a second a GiB.
+#[test]
+fn a_takeovers_envelope_is_opened_in_turns_and_served() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = match sealed_many_and_held(&daemons, "opened") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  for daemon in &daemons[1..] {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+  }
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = summed_counters(&daemons[index + 1])
+    .get(ENVELOPE_OPEN_SLICES)
+    .copied()
+    .unwrap_or(0);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..OPENED_CHUNKS)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/opened-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == opened_body(file))
+    })
+    .collect();
+  drop(reader);
+  let turns = summed_counters(&daemons[index])
+    .get(ENVELOPE_OPEN_SLICES)
+    .copied()
+    .unwrap_or(0)
+    .saturating_sub(before);
+  let longest_step_ns = control_longest_poll_ns(&daemons[index]);
+  let shared = turns_shared(&daemons[index]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "open in turns: served {served}, {turns} open turns for {OPENED_CHUNKS} chunks, {shared} turns shared a poll, \
+     read {read:?}, the successor's longest step {longest_step_ns} ns"
+  );
+  assert!(served, "the successor serves the volume");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+  assert!(
+    turns >= u64::try_from(OPENED_CHUNKS).unwrap(),
+    "the envelope was opened a chunk a turn: {turns} turns for {OPENED_CHUNKS} chunks"
+  );
+  assert_eq!(
+    shared, 0,
+    "each turn of the open was a turn of the successor's owner shard of its own (one shard a node: the control shard \
+     calls itself): {shared} shared a poll with the turn before"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the successor's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// Shape: the distinct files of the wrapped volume, each its own chunk, so its envelope seals that many chunks.
 const WRAPPED_CHUNKS: usize = 24;
 /// Format: the owner's count of the owner-shard turns its envelope wraps took (`fleet::wrap_slice`).
@@ -10855,8 +11011,9 @@ const LIVE_REACHED_SLICES: &str = "fleet.live.reached_slices";
 /// (`Daemon::inject_live_period_quantum(Some(0))`); hold b off its control shard for two liveness budgets while a writes
 /// each volume again (durable on c), so a's lanes to b go unanswered and a drops b's link and dials it afresh; then wait
 /// for b to hold every volume's log at a's head. Expect every write answered, at least 12 turns of a's walks for b's
-/// return (a volume a turn), and b at a's head on every volume. Before, one turn of a's shard visited every live volume it
-/// owns for b's return and built every message b lacked, an install a copy of the whole volume each.
+/// return (a volume a turn), each a poll of a's shard of its own (`xshard.turns_shared` zero; until A-347 the control
+/// shard's own turns ran in one poll), and b at a's head on every volume. Before, one turn of a's shard visited every
+/// live volume it owns for b's return and built every message b lacked, an install a copy of the whole volume each.
 #[test]
 fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
   let _serial = serialize_fleet_tests();
@@ -10882,14 +11039,15 @@ fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
   let turns = refusal_count(&daemons[0], LIVE_REACHED_SLICES)
     .unwrap()
     .saturating_sub(before);
+  let shared = turns_shared(&daemons[0]);
   daemons[0].inject_live_period_quantum(None).unwrap();
   drop(observed);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "reached walk: b held {held_ns:?} ns, {turns} turns of a's walks for {REACHED_LIVE_VOLUMES} volumes, caught up \
-     {caught_up}"
+    "reached walk: b held {held_ns:?} ns, {turns} turns of a's walks for {REACHED_LIVE_VOLUMES} volumes, {shared} \
+     turns shared a poll, caught up {caught_up}"
   );
   assert!(
     written
@@ -10901,6 +11059,10 @@ fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
   assert!(
     turns >= u64::try_from(REACHED_LIVE_VOLUMES).unwrap(),
     "b's return was walked a volume a turn: {turns} turns for {REACHED_LIVE_VOLUMES} volumes"
+  );
+  assert_eq!(
+    shared, 0,
+    "each turn of a's walks was a turn of its shard of its own: {shared} shared a poll with the turn before"
   );
   assert!(caught_up, "b holds every volume's log at a's head");
 }
