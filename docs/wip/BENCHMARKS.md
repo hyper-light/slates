@@ -12831,3 +12831,96 @@ went up to 2.71 s between two drains of a ring.
   against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
   `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
   submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.
+
+## Many writers on one large live volume: the byte credit keeps the owner up in 5 of 8 runs, and two whole records still ship (AC-8.9; A-200; goal 230; 2026-11-18)
+
+**What it is.** Goal 230's piece 1 replaced the live credit of two entries by the bytes of the volume's whole state
+(85e54bd12), so that a burst of stable writes ships changes, not the volume. The measurement the goal owed: many writers
+on one live volume of 100 MB or more, before and after, with `fleet.live.whole`, `fleet.live.refused.no_credit` and the
+write's p50, p99 and p999.
+
+**Environment.** GitHub runners, diagnostics run 44281929450 (branch `diag-measurer-7`, never merged), 2026-11-18
+10:14 to 10:23 UTC: `ubuntu-latest` (x86_64, 4 vCPUs) and `ubuntu-24.04-arm` (arm64, 4 vCPUs), each running both arms;
+load average 1.4 to 2.0 at each run's start. Before is `3c0af9399`, main just before the stack landed (the second parent
+of its landing); after is `8c81d2655`, the landing. Each arm's `live_fleet` test binary built release, each in its own
+target directory.
+
+**Command.** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 SLATES_MEASURE_WRITERS=32 SLATES_MEASURE_PREFILL_MIB=128
+SLATES_MEASURE_WRITES=200 <live_fleet> measure_many_writers_on_one_large_live_volume --exact --nocapture`, with the
+measurer's harness appended to `crates/cli/tests/live_fleet.rs` in both arms and never committed (it is in the
+branch's `.github/measurer/g230_harness.rs`): `start_fleet` (three daemons, `f = 1`, no anchor), one live-shipped volume
+on the owner bounded at 512 MiB, one file filled to 128 MiB by 64 KiB `FILE_SYNC` writes, then 32 writers, each its own
+NFS connection with its own `MOUNT` and `LOOKUP`, each sending 200 4 KiB `FILE_SYNC` writes to pages drawn across the
+file; a retry-later answer is sent again as a client does, for at most 10 s. Round 0 starts the writers together,
+rounds 1 to 3 start them 50 ms apart; the arms ran A B, A B, B A, A B on each runner.
+
+| runner, round | before `3c0af9399` | after `8c81d2655`: write p50 / p99 / p999 / max | after: writes a second |
+|---|---|---|---|
+| x86_64, 0 | daemon ended, 32 of 32 writers failed | daemon ended, 32 of 32 writers failed | |
+| x86_64, 1 | daemon ended (21 writers first answered `NFS3ERR_JUKEBOX` past 10 s) | daemon ended, 32 of 32 failed | |
+| x86_64, 2 | daemon ended, 32 of 32 failed | 58.3 ms / 1.94 s / 3.28 s / 3.70 s | 77 |
+| x86_64, 3 | daemon ended, 32 of 32 failed | 223.2 ms / 2.04 s / 3.72 s / 4.03 s | 65 |
+| arm64, 0 | daemon ended, 32 of 32 failed | 67.5 ms / 406 ms / 1.93 s / 1.94 s | 353 |
+| arm64, 1 | daemon ended, 32 of 32 failed | daemon ended, 32 of 32 failed | |
+| arm64, 2 | daemon ended, 32 of 32 failed | 67.1 ms / 294 ms / 1.94 s / 1.94 s | 351 |
+| arm64, 3 | daemon ended, 32 of 32 failed | 149.9 ms / 1.05 s / 2.02 s / 2.05 s | 120 |
+
+"Daemon ended" is the watchdog of a daemon run with no anchor ending its process (exit 4) on "shard 0 is spinning,
+1000 ms of CPU without a step" (1,000 to 1,099 ms); the writers' connections were then reset or refused. Across the
+writers in every completed run the owner's counters went `whole` 1 to 3 (`whole_bytes` 837 to 271,093,469: two whole
+records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carrying 20 to 304 entries, `durable_late`
+1 in one run; `refused.no_credit` never appeared.
+
+**What it means.**
+- **The byte credit helps:** before it, every run lost the owner to one step of a second of CPU; after it, 5 of 8 runs
+  wrote all 6,400 writes.
+- **It does not yet do what it promised under 32 writers:** two whole records of the 128 MiB volume still shipped in
+  every completed run, against "no whole records after the log's first", and a write's p99 was 0.29 to 2.04 s, its
+  p999 1.93 to 3.72 s.
+- **A step of a second of CPU still ends the daemon in 3 of 8 runs.** Which step was not measured; the whole record's
+  build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
+  whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
+  which is still an outage of every writer's connection.
+
+## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
+
+**What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
+never dropped): the many-client rung on main just before the carrier landed (`8c9f05404`) against its landing
+(`d0e737b8d`). Both carry W1, so a green's works are served on the shards their names hash to.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), release (LTO)
+`load_bench` of each commit built there with Rust 1.98.1, 2026-11-18 10:11 to 10:34 UTC. Shared with other agents' work:
+the one-minute load average at each run's start is in the table. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients N --hot-files 0.8N --per-connection 32 --rounds 3
+--reply-patience 60` (think time 0, the in-process daemon, which derived 23 shards), under `/usr/bin/time -l`. The
+`lost` rows are the daemon's counters read at the end of the run; `room` is the carrier's waits for room. Every run:
+
+| clients | build, round | load at start | wall s | verdicts/s | `xshard.reply_dropped` | room waits begun / ended (peak) | p99 ms: Edit / Accepted / Conflict / Rebase |
+|---|---|---|---|---|---|---|---|
+| 3,000 | before, 1 | 12.9 | 10 | 7,832 | 0 | (none in this build) | 91.3 / 106.7 / 114.6 / 110.8 |
+| 3,000 | after, 1 | 15.2 | 9 | 11,447 | 0 | 0 / 0 | 46.8 / 62.8 / 64.2 / 64.2 |
+| 3,000 | after, 2 | 18.0 | 6 | 13,427 | 0 | 0 / 0 | 41.8 / 49.5 / 63.3 / 53.2 |
+| 3,000 | before, 2 | 17.7 | 5 | 13,702 | 0 | | 49.8 / 61.8 / 71.8 / 59.9 |
+| 3,000 | before, 3 | 18.8 | 5 | 12,591 | 0 | | 44.0 / 48.6 / 64.9 / 51.3 |
+| 3,000 | after, 3 | 20.8 | 5 | 13,729 | 0 | 0 / 0 | 49.0 / 63.4 / 69.7 / 63.2 |
+| 10,000 | before, 1 | 15.9 | 31 | 12,213 | 0 | | 170.5 / 175.1 / 197.0 / 187.8 |
+| 10,000 | after, 1 | 25.2 | 62 | 5,440 | 0 | 6,576 / 6,576 (106) | 443.8 / 440.8 / 495.4 / 491.9 |
+| 10,000 | after, 2 | 41.0 | 32 | 11,446 | 0 | 6,358 / 6,358 (41) | 208.7 / 213.6 / 247.0 / 232.0 |
+| 10,000 | before, 2 | 37.6 | hung | | **57** (read live) | | |
+
+Every other `lost` counter read 0 in every completed run, and the oracle found nothing in any. The 10,000-client runs
+had 1,737 to 1,908 clients starved past the harness's resolutions (10,000 clients over 8,000 hot picks). The hung run
+progressed as its sibling did until about 40 s; from then to 545 s seven of its eight harness workers sat 2 to 6 agents
+short of done with their requests unanswered (one worker stopped reporting at 35 s), and the live daemon's
+`slates status`, read with `8c9f05404`'s own CLI built for it, counted `xshard.reply_dropped` 57. The harness was then
+ended (its own process, so no end-of-run rows).
+
+**What it means.**
+- **After the carrier, no reply was lost in 5 runs** at 3,000 and 10,000 clients; at 10,000 the carrier waited for room
+  6,358 and 6,576 times a run and ended every wait.
+- **Before it, the 3,000-client rung no longer drops** once W1 is in (0 in three runs), so the "about 4,200 a run" of
+  main `db9c514e` is not reproduced at this rung; at 10,000 clients one run of two lost 57 replies and hung, each lost
+  reply a client waiting for good (A-232).
+- The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
+  build: the carrier's cost does not show at this resolution.
