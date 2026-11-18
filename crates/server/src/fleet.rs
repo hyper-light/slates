@@ -1531,8 +1531,9 @@ async fn serve_peer_records(
   let mut enrolled = false;
   let mut forwards = crate::forward_lane::ServedForwards::new();
   loop {
-    if !enrolled {
-      enrolled = state::with_state(|state| {
+    // Enrolled once the discovery recognizes the peer's certificate, and asked again only until then.
+    enrolled = enrolled
+      || state::with_state(|state| {
         state
           .discovery
           .as_ref()
@@ -1540,7 +1541,6 @@ async fn serve_peer_records(
       })
       .flatten()
       .is_some();
-    }
     // A forwarded verb runs on its own task (`crate::forward_lane::ServedForwards`), so one waiting on its owner shard
     // holds no other request of this peer; every other request is served here, one at a time, as before.
     let next =
@@ -4213,7 +4213,7 @@ async fn materialize_green(
   let gather = |s: &mut ShardState| {
     crate::merge_service::recover_green_inputs(s, object, adopted, (catalog_sequence, &catalog))
   };
-  let recovery = match state::with_state(&gather).flatten() {
+  let recovery = match state::with_state(gather).flatten() {
     Some(recovery) => recovery,
     None => {
       // The chain is short here. A version commits at `f + 1`, so a successor one version behind the quorum knows the
@@ -4221,7 +4221,7 @@ async fn materialize_green(
       // shipped and the survivors that accepted the version hold (GAPS 2026-11-09). Fetch what it lacks by identity
       // from them, then gather again.
       fetch_green_inputs(object, pending, budget).await?;
-      state::with_state(&gather)
+      state::with_state(gather)
         .flatten()
         .ok_or(GreenWait::Inputs)?
     }

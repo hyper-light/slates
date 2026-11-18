@@ -1770,12 +1770,7 @@ mod tests {
     domains.insert(A, 7);
     let mut config =
       RegionalConfiguration::formed(vec![A, B, HostId(3)], Quorum { f: 1 }, domains, 3, true);
-    let bytes = encode_regional_configuration(&config);
-    assert_eq!(
-      decode_regional_configuration(&bytes),
-      Ok(config.clone()),
-      "round-trip is identity"
-    );
+    expect_round_trip(&config, "round-trip is identity");
     // A change in flight (an admission moved the neighbourhoods) and a retirement with a confirmation and an
     // unconfirmed lineage: every settled neighbourhood, domain and retirement field survives the round trip.
     assert!(config.admit(HostId(4), Some(9), 3));
@@ -1788,11 +1783,9 @@ mod tests {
     assert!(config.confirm(A, survivor));
     config.take_over(HostId(4), 3);
     assert!(!config.retired.is_empty());
-    let bytes = encode_regional_configuration(&config);
-    assert_eq!(
-      decode_regional_configuration(&bytes),
-      Ok(config.clone()),
-      "round-trip is identity with retirements and a change in flight"
+    expect_round_trip(
+      &config,
+      "round-trip is identity with retirements and a change in flight",
     );
     // A promoted object's adoption in flight (docs/wip/mirroring.md decision 4) survives it too.
     assert!(config.assign_adoption(
@@ -1803,20 +1796,21 @@ mod tests {
         catalog: vec![4],
       },
     ));
-    let bytes = encode_regional_configuration(&config);
-    assert_eq!(
-      decode_regional_configuration(&bytes),
-      Ok(config.clone()),
-      "round-trip is identity with an adoption in flight"
-    );
+    expect_round_trip(&config, "round-trip is identity with an adoption in flight");
     // A moved object's exception (§4.8 "Authority scope") survives it too.
     assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3)));
     assert_eq!(config.moved.len(), 1);
-    let bytes = encode_regional_configuration(&config);
+    expect_round_trip(&config, "round-trip is identity with a moved object");
+  }
+
+  /// Do: encode `config` and decode its bytes. Expect the configuration back unchanged; `case` names the state it was
+  /// in when a round trip changed it.
+  fn expect_round_trip(config: &slates_db::register::RegionalConfiguration, case: &str) {
+    let bytes = encode_regional_configuration(config);
     assert_eq!(
-      decode_regional_configuration(&bytes),
+      decode_regional_configuration(&bytes).as_ref(),
       Ok(config),
-      "round-trip is identity with a moved object"
+      "{case}"
     );
   }
 

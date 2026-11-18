@@ -6909,6 +6909,61 @@ fn merge_mode(
   }
 }
 
+/// The refusals a submit into `green_id` meets before its seal, so nothing is composed for a submit that cannot be
+/// accepted: a forbidding write policy (A-285), `mode` the one `by` set; then a green that requires evidence, for an
+/// increment without any (§4.16 `EvidenceRequired`).
+fn refused_before_the_seal(
+  state: &mut ShardState,
+  (mode, by): (slates_db::catalog::WriteMode, DbVolumeId),
+  green_id: DbVolumeId,
+  evidence: &[[u8; 32]],
+) -> Option<ReplyBody> {
+  if mode == slates_db::catalog::WriteMode::Forbid {
+    state.count("policy_forbids.merge", 1);
+    return Some(refused(Refusal::PolicyForbids {
+      act: slates_ipc::protocol::WriteAct::Merge,
+      by: slates_ipc::protocol::PolicySubject::Volume {
+        volume: to_wire_volume(by),
+      },
+    }));
+  }
+  if evidence.is_empty()
+    && matches!(
+      crate::merge_service::merge_role(state, green_id),
+      Some(crate::merge_service::MergeRole::Green {
+        require_evidence: true
+      })
+    )
+  {
+    return Some(refused(Refusal::EvidenceRequired));
+  }
+  None
+}
+
+/// What a submit's write policy answers once the increment `inc` of `work` is built (A-285). An asking `mode` merges
+/// only the increment an approval names: with none yet (`approved`) it answers what to approve, and an approval of
+/// another increment (the work changed since) is refused. Any other mode, or an approval of this increment, answers
+/// nothing and the merge goes on. Building the increment changed nothing, so an answer leaves nothing to undo.
+fn approval_answer(
+  mode: slates_db::catalog::WriteMode,
+  approved: Option<[u8; 32]>,
+  work: VolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Option<ReplyBody> {
+  if mode != slates_db::catalog::WriteMode::Ask {
+    return None;
+  }
+  match approved {
+    None => Some(ReplyBody::MergeApprovalRequired {
+      work,
+      identity: inc.id,
+      paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
+    }),
+    Some(identity) if identity != inc.id => Some(refused(Refusal::GrantMismatch)),
+    Some(_) => None,
+  }
+}
+
 fn submit(
   state: &mut ShardState,
   principal: &Principal,
@@ -6924,26 +6979,8 @@ fn submit(
   // The write policy (A-285): a forbidding mode refuses before the seal; an asking one is answered below, once the
   // increment it would approve is known.
   let (mode, by) = merge_mode(state, work_id, green_id);
-  if mode == slates_db::catalog::WriteMode::Forbid {
-    state.count("policy_forbids.merge", 1);
-    return refused(Refusal::PolicyForbids {
-      act: slates_ipc::protocol::WriteAct::Merge,
-      by: slates_ipc::protocol::PolicySubject::Volume {
-        volume: to_wire_volume(by),
-      },
-    });
-  }
-  // A green that requires evidence refuses an increment without any (§4.16 `EvidenceRequired`),
-  // before the seal: nothing is composed for a submit that cannot be accepted.
-  if evidence.is_empty()
-    && matches!(
-      crate::merge_service::merge_role(state, green_id),
-      Some(crate::merge_service::MergeRole::Green {
-        require_evidence: true
-      })
-    )
-  {
-    return refused(Refusal::EvidenceRequired);
+  if let Some(refusal) = refused_before_the_seal(state, (mode, by), green_id, &evidence) {
+    return refusal;
   }
   // The submission barrier (§4.16 "Submission": "seal the work volume"): the seal is taken here, in
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
@@ -6953,20 +6990,8 @@ fn submit(
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
-  // An asking policy merges only the increment an approval names: none yet is answered with what to approve, and an
-  // approval of another (the work changed since) is refused. Building the increment changed nothing.
-  if mode == slates_db::catalog::WriteMode::Ask {
-    match approved {
-      None => {
-        return ReplyBody::MergeApprovalRequired {
-          work,
-          identity: inc.id,
-          paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
-        };
-      }
-      Some(identity) if identity != inc.id => return refused(Refusal::GrantMismatch),
-      Some(_) => {}
-    }
+  if let Some(answer) = approval_answer(mode, approved, work, &inc) {
+    return answer;
   }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
@@ -9929,7 +9954,8 @@ fn record_taken_over_completions(
   completions: &[Option<crate::merge_service::SubmitCompletion>],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
-  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64, Option<DbVolumeId>)>> =
+  // Each client's submits: a request's sequence, the version it was answered and the work it came from.
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<_>> =
     std::collections::BTreeMap::new();
   for (index, key) in completions.iter().enumerate() {
     let Some(key) = key else {
