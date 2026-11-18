@@ -116,6 +116,17 @@ No enum of the contract is `#[non_exhaustive]`. Pin the contract: `slates_api::C
 with every change to a type or a verb, so assert the one you wrote against, and match exhaustively
 where you must decide; a moved contract then fails your build at the place to update.
 
+### The seam and its simulator
+
+A host whose rules reach other products only through a trait with a simulator (Hex's) holds
+`slates_api::Volumes`: provision, snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM,
+mount, unmount and detach, each with the `Instance` verb's own signature. `Instance` implements it,
+and so does `SimVolumes::new(most)`, an in-memory stand-in for tests with no daemon: it answers the
+same outcomes and typed errors (names unique, clones pinning snapshots, works only over greens), holds
+at most `most` volumes and `most` attachments, serves no bytes (a stream it hands out is a real end
+nothing answers until detached) and mounts nothing (a mount is a record). The conformance suite in
+`crates/api/tests/api.rs` (`the_seam_conforms`) runs over both.
+
 ## What is built (2026-11-18)
 
 - `Instance::attach(name)`: a client of a running instance. With no daemon it is refused
@@ -210,4 +221,4 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
    policy and hand out the statement a signer signs.
 3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
 4. An async form over the host's own reactor.
-5. A seam trait with a simulator and a conformance suite.
+5. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

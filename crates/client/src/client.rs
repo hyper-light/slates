@@ -216,11 +216,14 @@ pub struct Page<T, C> {
   pub next: Option<C>,
 }
 
-/// One page of an overlay volume's drifted entries ([`Client::drifted_page`]; §4.4 `status`, A-267).
+/// One page of an overlay volume's drifted entries ([`Client::drifted_page`]; §4.4 `status`, A-267), typed as a status's
+/// `base` types them (A-299).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriftedPage {
-  /// This page's entries, each its path and the kind of drift, in path order, as a status names them.
-  pub entries: Vec<String>,
+  /// This page's entries the disk changed after the volume witnessed them, in path order.
+  pub drifted: Vec<slates_ipc::protocol::DriftEntry>,
+  /// This page's entries whose re-check the host refused now, by path, in path order.
+  pub unverified: Vec<String>,
   /// The position the next page is read from, or `None` when this page ends the list.
   pub next: Option<u64>,
   /// Entries in this page's range too long for any reply alone (a host path near the platform's maximum), passed over
@@ -4459,31 +4462,38 @@ impl Client {
     }
   }
 
-  /// An overlay volume's drifted entries, each its path and the kind of drift, in path order (§4.4 `status`, A-267):
-  /// walked a page at a time from the volume's owner ([`Client::drifted_page`]), since a status carries only the first
-  /// that fit. Also the number of entries too long for any reply, which no page carries.
-  pub fn drifted(&mut self, volume: VolumeId) -> Result<(Vec<String>, u64), ClientError> {
-    let mut entries = Vec::new();
-    let mut oversized = 0u64;
+  /// An overlay volume's drift (§4.4 `status`, A-267): every entry the disk changed after the volume witnessed it and
+  /// every one whose re-check the host refused, each list in path order, walked a page at a time from the volume's owner
+  /// ([`Client::drifted_page`]), since a status carries only the first that fit. Also the number of entries too long for
+  /// any reply, which no page carries.
+  pub fn drifted(&mut self, volume: VolumeId) -> Result<DriftedPage, ClientError> {
+    let mut whole = DriftedPage {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      next: None,
+      oversized: 0,
+    };
     let mut from = 0u64;
     loop {
       let page = self.drifted_page(volume, from)?;
-      entries.extend(page.entries);
-      oversized = oversized.saturating_add(u64::from(page.oversized));
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.oversized = whole.oversized.saturating_add(page.oversized);
       match page.next {
-        None => return Ok((entries, oversized)),
+        None => return Ok(whole),
         Some(next) => from = next,
       }
     }
   }
 
-  /// One page of an overlay volume's drifted entries (§4.4 `status`, A-267) from position `from` (0 begins): each its
-  /// path and the kind of drift, in path order, as many as one reply holds; where the next page is read from; and the
-  /// entries in this page's range too long for any reply alone, passed over and counted. A page whose position does
-  /// not move past `from` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  /// One page of an overlay volume's drift (§4.4 `status`, A-267) from position `from` (0 begins), typed as a status's
+  /// `base` types it, as many entries as one reply holds; where the next page is read from; and the entries in this
+  /// page's range too long for any reply alone, passed over and counted. A page whose position does not move past
+  /// `from` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
   pub fn drifted_page(&mut self, volume: VolumeId, from: u64) -> Result<DriftedPage, ClientError> {
     let ReplyBody::Drifted {
-      entries,
+      drifted,
+      unverified,
       next,
       oversized,
     } = self.call(&RequestBody::Drifted { volume, from })?
@@ -4492,7 +4502,8 @@ impl Client {
     };
     forward(next, Some(from), "drifted")?;
     Ok(DriftedPage {
-      entries,
+      drifted,
+      unverified,
       next,
       oversized,
     })

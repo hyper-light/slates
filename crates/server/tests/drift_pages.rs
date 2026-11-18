@@ -104,24 +104,27 @@ fn a_volume_with_more_drift_than_one_reply_holds_still_answers_its_status() {
   daemon.stop();
 }
 
-/// The paged drift read of `volume` holds every drifted file once, and `carried` (the status's entries) is its start.
+/// The paged drift read of `volume` holds every drifted file once, typed, and `carried` (the status's text entries) names
+/// its first entries.
 fn the_paged_read_holds_every_entry(
   client: &mut slates_client::Client,
   volume: slates_client::VolumeId,
   carried: &[String],
 ) {
-  let (entries, oversized) = client.drifted(volume).expect("every drifted entry");
-  assert_eq!(oversized, 0, "no entry here is too long for a page");
+  let whole = client.drifted(volume).expect("every drifted entry");
+  assert_eq!(whole.oversized, 0, "no entry here is too long for a page");
+  assert!(whole.unverified.is_empty(), "every re-check answered");
   assert_eq!(
-    entries.len(),
+    whole.drifted.len(),
     DRIFTED,
     "the paged read holds every drifted entry"
   );
   for n in 0..DRIFTED {
     assert_eq!(
-      entries
+      whole
+        .drifted
         .iter()
-        .filter(|entry| entry.contains(&file(n)))
+        .filter(|entry| entry.path.contains(&file(n)))
         .count(),
       1,
       "{} once",
@@ -131,8 +134,8 @@ fn the_paged_read_holds_every_entry(
   assert!(
     carried
       .iter()
-      .zip(&entries)
-      .all(|(carried, read)| carried == read),
+      .zip(&whole.drifted)
+      .all(|(carried, read)| *carried == format!("{} ({:?})", read.path, read.kind)),
     "the status carries the first entries of the full list"
   );
 }

@@ -2229,9 +2229,62 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
-  /// Drifted entries the report did not carry (A-267; appended): `drifted` holds the first that fit beside the
-  /// report's other fields, and `Drifted` reads every one.
+  /// An overlay's base as this status read it, typed (§4.15 "Drift"; A-299): the facts `drifted` and `watcher` carry as
+  /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
+  /// one, a green, a work volume). Appended.
+  pub base: Option<BaseReport>,
+  /// Drifted or unverified entries the report did not carry (A-267; appended): `drifted` and `base`'s lists hold the
+  /// first that fit beside the report's other fields, the same entries in both, and `Drifted` reads every one.
   pub drifted_elided: u32,
+}
+
+/// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum BaseReport {
+  /// The base was read.
+  Read {
+    /// Each entry the disk changed after the volume witnessed it: landing it would conflict.
+    drifted: Vec<DriftEntry>,
+    /// Each entry whose re-check the host refused now, by path: not known to match its witness.
+    unverified: Vec<String>,
+    /// The base's watcher.
+    watcher: WatcherState,
+  },
+  /// The base could not be read now: its drift is unknown.
+  Unreadable,
+}
+
+/// One drifted entry of an overlay (§4.15 "Drift").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DriftEntry {
+  /// The entry, from the volume's root.
+  pub path: String,
+  /// What the disk did to it.
+  pub kind: DriftKind,
+}
+
+/// What changed on the disk beneath a witnessed entry (§4.15 "Drift"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftKind {
+  /// The same file, with other bytes or attributes.
+  Modified,
+  /// The entry is gone.
+  Deleted,
+  /// Another file sits at the path.
+  Replaced,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+}
+
+/// An overlay's watcher (§4.15): hints that make drift reports prompt, never the truth. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherState {
+  /// Delivering hints.
+  Live,
+  /// It lost events; a full re-check is done or scheduled.
+  Overflowed,
+  /// None on this host or folder: fingerprints alone.
+  Unavailable,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3909,10 +3962,12 @@ pub enum ReplyBody {
     /// The paths the increment changes.
     paths: u64,
   },
-  /// One page of a volume's drifted entries (`Drifted`), each its path and the kind of drift. Appended.
+  /// One page of a volume's drifted entries (`Drifted`), typed as a status's `base` types them. Appended.
   Drifted {
-    /// The drifted entries of this page.
-    entries: Vec<String>,
+    /// This page's entries the disk changed after the volume witnessed them, in path order.
+    drifted: Vec<DriftEntry>,
+    /// This page's entries whose re-check the host refused now, by path, in path order.
+    unverified: Vec<String>,
     /// The position the next page reads from, or `None` when this page ends the list.
     next: Option<u64>,
     /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over

@@ -105,6 +105,6 @@ impl Instance {
       .client
       .drifted_page(volume, from)
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
-    drift_page_of(page)
+    Ok(drift_page_of(page))
   }
 }

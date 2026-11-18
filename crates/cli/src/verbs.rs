@@ -751,7 +751,9 @@ fn emit_status(
     slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
     let (entries, oversized) = if report.drifted_elided > 0 {
-      client.drifted(volume)?
+      let whole = client.drifted(volume)?;
+      let oversized = whole.oversized;
+      (drift_lines(whole), oversized)
     } else {
       (report.drifted, 0)
     };
@@ -767,6 +769,25 @@ fn emit_status(
     slates_machine::out_text!("{}", status_text(&report));
   }
   Ok(())
+}
+
+/// A drift walked a page at a time, as text in path order: `PATH (KIND)` for an entry the disk changed, as a status
+/// names it, and `PATH (unverified)` for one whose re-check the host refused (a page carries no refusal's words).
+fn drift_lines(whole: slates_client::DriftedPage) -> Vec<String> {
+  let mut lines: Vec<(String, String)> = whole
+    .drifted
+    .into_iter()
+    .map(|entry| {
+      let line = format!("{} ({:?})", entry.path, entry.kind);
+      (entry.path, line)
+    })
+    .chain(whole.unverified.into_iter().map(|path| {
+      let line = format!("{path} (unverified)");
+      (path, line)
+    }))
+    .collect();
+  lines.sort();
+  lines.into_iter().map(|(_, line)| line).collect()
 }
 
 /// `volume create`: the new volume's id, as text (the id and its bridge path) or a JSON `{ "id" }`.

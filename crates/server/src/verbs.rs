@@ -1722,8 +1722,11 @@ pub(crate) async fn resolve_and_forward(
       },
     },
   };
+  // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
+  // never go ahead of it however often it is sent again.
+  let mut place = crate::forward_lane::Place::default();
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests).await;
+    let (decoded, later) = forward_once(owner, &requests, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1765,11 +1768,13 @@ pub(crate) async fn resolve_and_forward(
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
 /// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it: the decoded reply to the first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the
-/// decoded replies to the rest that came back, in order, up to the first that did not.
+/// it, queued at `place` in the owner's lane (the first send's, for a resend): the decoded reply to the first (`None`
+/// when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that came back, in
+/// order, up to the first that did not.
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
+  place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
     return (None, Vec::new());
@@ -1788,6 +1793,7 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
+    place,
   )
   .await;
   if forwarded.is_none() {
@@ -5955,20 +5961,31 @@ fn open_base(
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
 /// object the write boundary keeps equal to the head, never the shared content a snapshot freezes (A-168, A-195).
 fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  match take_snapshot(state, principal, volume) {
+    Ok((id, coverage)) => ReplyBody::Snapshotted { id, coverage },
+    Err(refusal) => *refusal,
+  }
+}
+
+/// Takes the snapshot [`snapshot`] answers with, for `principal`, who must be allowed to write `volume`: its id and its
+/// coverage, or the refusal the verb answers. A Shards stream's SAVE takes one at its cut the same way (A-303), for
+/// the stream's own principal, so a save can do nothing its principal could not ask itself.
+pub(crate) fn take_snapshot(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Result<(SnapshotId, slates_ipc::protocol::SnapshotCoverage), Box<ReplyBody>> {
   use crate::merge_service::{StoreVerb, find_store_backed};
-  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Snapshot) {
-    Ok(x) => x,
-    Err(r) => return *r,
-  };
+  let (handle, record) = find_store_backed(state, volume, StoreVerb::Snapshot)?;
   if !rights_of(&record, principal).write {
-    return forbidden("snapshot");
+    return Err(Box::new(forbidden("snapshot")));
   }
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
   let Some(next_epoch) = record.epoch.checked_add(1) else {
-    return refused(Refusal::Unsupported {
+    return Err(Box::new(refused(Refusal::Unsupported {
       feature: VOLUME_EPOCH_EXHAUSTED.to_owned(),
-    });
+    })));
   };
   // The barrier (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): every live attachment of the
   // volume in the shard's registry has its generation closed before the root is frozen, so every
@@ -5981,20 +5998,20 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
       attachment,
       generation,
     }) => {
-      return refused(Refusal::BarrierIncomplete {
+      return Err(Box::new(refused(Refusal::BarrierIncomplete {
         attachment: catalog_attachment_of(state, attachment),
         generation,
-      });
+      })));
     }
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let taken = match state.volumes.get_mut(handle) {
     Ok(slot) => slot.volume.snapshot(&mut state.store),
-    Err(_) => return refused(Refusal::NotFound),
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
   };
   let id = match taken {
     Ok(id) => wire_snapshot(id),
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let now = state.clock.monotonic_ns();
   let ops = [
@@ -6016,10 +6033,10 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(refusal_of_db(&e));
+      return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  ReplyBody::Snapshotted { id, coverage }
+  Ok((id, coverage))
 }
 
 /// What a closed barrier lets the snapshot claim (§4.6): the attachments closed, and the narrowest
@@ -6931,6 +6948,16 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     Ok((record, _)) => record.id,
     Err(refusal) => return refused(refusal),
   };
+  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
+  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
+  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
+  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
+    && slates_bridge_core::guest_only(name.as_bytes())
+  {
+    return refused(Refusal::Unsupported {
+      feature: format!("a guest's own attribute ({name}) from a host's channel"),
+    });
+  }
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };
@@ -9902,7 +9929,9 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drift, watcher) = drift_entries(slot, &mut state.store);
+  // An overlay's base, read once: text for people (`drifted`, `watcher`) and typed for consumers (`base`, A-299), the
+  // same entries in both, filled as far as one reply holds (A-267).
+  let read = drift_entries(slot, &mut state.store);
   let attachments = state.db.partition().attachments_of(record.id).len();
   let reply = ReplyBody::Status {
     report: Box::new(StatusReport {
@@ -9916,7 +9945,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
         value: record.head.value,
       },
       drifted: Vec::new(),
-      watcher,
+      watcher: read.watcher.clone(),
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
       placed: placed_state(state, &record),
       // The daemon's NFS port (§4.6), 0 until the listener binds; report it so a client can mount.
@@ -9928,77 +9957,176 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts_elided,
       journal,
       takeover_kept,
+      base: read.base.clone(),
       drifted_elided: 0,
     }),
   };
-  with_drift(reply, drift)
+  with_drift(reply, read)
 }
 
-/// A status reply's drift, filled in last (A-267): the status stays one reply, so it carries the first drifted entries
-/// that fit beside its other fields and counts the rest, which `Drifted` reads.
-fn with_drift(reply: ReplyBody, drift: Vec<String>) -> ReplyBody {
-  {
-    let ReplyBody::Status { mut report } = reply else {
-      return reply;
-    };
-    let total = drift.len();
-    report.drifted_elided = u32::try_from(total).unwrap_or(u32::MAX);
-    let framed = slates_ipc::protocol::framed_len(&ReplyBody::Status {
-      report: report.clone(),
-    });
-    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
-    let room = chunk.saturating_sub(framed);
-    let mut used = 0usize;
-    for entry in drift {
-      let bytes = encoded_len(&entry);
-      if used.saturating_add(bytes) > room {
-        break;
-      }
-      used = used.saturating_add(bytes);
-      report.drifted.push(entry);
+/// A status reply's drift, filled in last (A-267): the status stays one reply, so it carries the first entries that fit
+/// beside its other fields — the same entries as text for people (`drifted`) and typed for consumers (`base`, A-299) —
+/// and counts the rest, which `Drifted` reads typed. An unreadable base's one text entry says why.
+fn with_drift(reply: ReplyBody, read: DriftRead) -> ReplyBody {
+  let ReplyBody::Status { mut report } = reply else {
+    return reply;
+  };
+  let DriftRead { items, refused, .. } = read;
+  let texts: Vec<String> = match refused {
+    Some(refusal) => vec![format!("status refused: {refusal:?}")],
+    None => items.iter().map(DriftItem::text).collect(),
+  };
+  let total = texts.len();
+  let room = reply_room(&ReplyBody::Status {
+    report: report.clone(),
+  });
+  let mut used = 0usize;
+  for (index, text) in texts.into_iter().enumerate() {
+    let typed = items.get(index).map_or(0, DriftItem::typed_len);
+    let bytes = encoded_len(&text).saturating_add(typed);
+    if used.saturating_add(bytes) > room {
+      break;
     }
-    report.drifted_elided =
-      u32::try_from(total.saturating_sub(report.drifted.len())).unwrap_or(u32::MAX);
-    ReplyBody::Status { report }
+    used = used.saturating_add(bytes);
+    report.drifted.push(text);
+    if let Some(item) = items.get(index) {
+      item.push_into(&mut report.base);
+    }
   }
+  report.drifted_elided =
+    u32::try_from(total.saturating_sub(report.drifted.len())).unwrap_or(u32::MAX);
+  ReplyBody::Status { report }
 }
 
-/// An overlay volume's drifted entries in path order, each its path and the kind of drift (a witnessed entry whose
-/// disk no longer matches, or one whose re-check the host refused), and the watcher's state; none for a scratch volume.
-fn drift_entries(
-  slot: &mut VolumeSlot,
-  store: &mut slates_vfs::volume::Store,
-) -> (Vec<String>, String) {
-  match slot.host.as_mut() {
-    Some(host) => match slot.volume.with_host(host).status(store) {
-      Ok(s) => {
-        let mut entries: Vec<(String, String)> = s
-          .drift
-          .iter()
-          .map(|(p, k)| (p.clone(), format!("{p} ({k:?})")))
-          .chain(
-            s.unverified
-              .iter()
-              .map(|(p, refusal)| (p.clone(), format!("{p} (unverified: {refusal})"))),
-          )
-          .collect();
-        entries.sort();
-        (
-          entries.into_iter().map(|(_, entry)| entry).collect(),
-          format!("{:?}", s.watcher),
-        )
+/// One entry of an overlay's drift as a status reads it (§4.15 "Drift"): changed on the disk, or its re-check refused.
+enum DriftItem {
+  /// The disk changed it.
+  Drifted(slates_ipc::protocol::DriftEntry),
+  /// The host refused its re-check now; the refusal as people read it.
+  Unverified {
+    /// The entry.
+    path: String,
+    /// The host's refusal.
+    refusal: String,
+  },
+}
+
+impl DriftItem {
+  /// The entry's path.
+  fn path(&self) -> &str {
+    match self {
+      DriftItem::Drifted(entry) => &entry.path,
+      DriftItem::Unverified { path, .. } => path,
+    }
+  }
+
+  /// The entry as text for people: `PATH (KIND)`, or `PATH (unverified: REFUSAL)`.
+  fn text(&self) -> String {
+    match self {
+      DriftItem::Drifted(entry) => format!("{} ({:?})", entry.path, entry.kind),
+      DriftItem::Unverified { path, refusal } => format!("{path} (unverified: {refusal})"),
+    }
+  }
+
+  /// The bytes the entry takes in its typed list.
+  fn typed_len(&self) -> usize {
+    match self {
+      DriftItem::Drifted(entry) => encoded_len(entry),
+      DriftItem::Unverified { path, .. } => encoded_len(path),
+    }
+  }
+
+  /// Puts the entry in a read base's typed lists.
+  fn push_into(&self, base: &mut Option<slates_ipc::protocol::BaseReport>) {
+    if let Some(slates_ipc::protocol::BaseReport::Read {
+      drifted,
+      unverified,
+      ..
+    }) = base
+    {
+      match self {
+        DriftItem::Drifted(entry) => drifted.push(entry.clone()),
+        DriftItem::Unverified { path, .. } => unverified.push(path.clone()),
       }
-      Err(e) => (
-        vec![format!("status refused: {e:?}")],
-        "unavailable".to_owned(),
-      ),
-    },
-    None => (Vec::new(), "scratch".to_owned()),
+    }
   }
 }
 
-/// `Drifted`: one page of the volume's drifted entries from position `from` (A-267), as many as one reply chunk holds.
-/// An entry too long for any page alone is passed over and counted.
+/// An overlay's base as one status reads it: its drifted and unverified entries in path order, the watcher as text,
+/// and the typed report with its lists empty (filled as far as a reply holds); none for a volume with no base. An
+/// unreadable base keeps the volume core's refusal.
+struct DriftRead {
+  items: Vec<DriftItem>,
+  watcher: String,
+  base: Option<slates_ipc::protocol::BaseReport>,
+  refused: Option<slates_vfs::VfsError>,
+}
+
+/// Reads an overlay volume's base once, re-checking every witnessed entry ([`DriftRead`]).
+fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -> DriftRead {
+  use slates_ipc::protocol::{BaseReport, DriftEntry, DriftKind, WatcherState};
+  let Some(host) = slot.host.as_mut() else {
+    return DriftRead {
+      items: Vec::new(),
+      watcher: "scratch".to_owned(),
+      base: None,
+      refused: None,
+    };
+  };
+  match slot.volume.with_host(host).status(store) {
+    Ok(status) => {
+      let mut items: Vec<DriftItem> = status
+        .drift
+        .iter()
+        .map(|(path, kind)| {
+          DriftItem::Drifted(DriftEntry {
+            path: path.clone(),
+            kind: match kind {
+              slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
+              slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
+              slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
+              slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
+            },
+          })
+        })
+        .chain(
+          status
+            .unverified
+            .iter()
+            .map(|(path, refusal)| DriftItem::Unverified {
+              path: path.clone(),
+              refusal: format!("{refusal}"),
+            }),
+        )
+        .collect();
+      items.sort_by(|a, b| a.path().cmp(b.path()));
+      DriftRead {
+        items,
+        watcher: format!("{:?}", status.watcher),
+        base: Some(BaseReport::Read {
+          drifted: Vec::new(),
+          unverified: Vec::new(),
+          watcher: match status.watcher {
+            slates_vfs::host::WatchState::Live => WatcherState::Live,
+            slates_vfs::host::WatchState::Overflowed => WatcherState::Overflowed,
+            slates_vfs::host::WatchState::Unavailable => WatcherState::Unavailable,
+          },
+        }),
+        refused: None,
+      }
+    }
+    Err(refusal) => DriftRead {
+      items: Vec::new(),
+      watcher: "unavailable".to_owned(),
+      base: Some(BaseReport::Unreadable),
+      refused: Some(refusal),
+    },
+  }
+}
+
+/// `Drifted`: one page of the volume's drift from position `from` (A-267), typed as a status's `base` types it, as many
+/// entries as one reply chunk holds. An entry too long for any page alone is passed over and counted; a base that
+/// cannot be read now is refused as the volume core refused it.
 fn drifted(
   state: &mut ShardState,
   principal: &Principal,
@@ -10015,20 +10143,27 @@ fn drifted(
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
-  let (drift, _) = drift_entries(slot, &mut state.store);
-  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
-  let room = chunk.saturating_sub(slates_ipc::protocol::framed_len(&ReplyBody::Drifted {
-    entries: Vec::new(),
+  let read = drift_entries(slot, &mut state.store);
+  if let Some(refusal) = read.refused {
+    return refused(refusal_of_vfs(&refusal));
+  }
+  let room = reply_room(&ReplyBody::Drifted {
+    drifted: Vec::new(),
+    unverified: Vec::new(),
     next: Some(u64::MAX),
     oversized: u32::MAX,
-  }));
+  });
   let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let mut base = Some(slates_ipc::protocol::BaseReport::Read {
+    drifted: Vec::new(),
+    unverified: Vec::new(),
+    watcher: slates_ipc::protocol::WatcherState::Unavailable,
+  });
   let mut used = 0usize;
-  let mut entries = Vec::new();
   let mut oversized = 0u32;
   let mut position = start;
-  for entry in drift.iter().skip(start) {
-    let bytes = encoded_len(entry);
+  for item in read.items.iter().skip(start) {
+    let bytes = item.typed_len();
     if bytes > room {
       oversized = oversized.saturating_add(1);
       position = position.saturating_add(1);
@@ -10038,12 +10173,21 @@ fn drifted(
       break;
     }
     used = used.saturating_add(bytes);
-    entries.push(entry.clone());
+    item.push_into(&mut base);
     position = position.saturating_add(1);
   }
-  let next = (position < drift.len()).then(|| u64::try_from(position).unwrap_or(u64::MAX));
+  let next = (position < read.items.len()).then(|| u64::try_from(position).unwrap_or(u64::MAX));
+  let (drifted, unverified) = match base {
+    Some(slates_ipc::protocol::BaseReport::Read {
+      drifted,
+      unverified,
+      ..
+    }) => (drifted, unverified),
+    _ => (Vec::new(), Vec::new()),
+  };
   ReplyBody::Drifted {
-    entries,
+    drifted,
+    unverified,
     next,
     oversized,
   }

@@ -24,6 +24,7 @@
 //! - *Signed work* ([`signed`]): a merge or a landing may carry a signature, and its outcome says how it was judged
 //!   ([`Verification`]); a volume's policy may require signed merges. Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
+//! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
@@ -46,7 +47,13 @@
 //! **What is owed** (GAPS, the A-278 and A-299 rows): the starter handed the launcher's authority on every platform;
 //! the write modes, approvals of merges and signed work verified on the daemon's side (A-285); typed fields on the wire
 //! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
-//! listing; an async form over a host's reactor (R6); a seam trait with a simulator and a conformance suite.
+//! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
+//! answers untyped (`Invalid::Request`, A-310).
+//!
+//! **The seam (A-310).** A host whose rules reach other products only through a trait with a simulator and a
+//! conformance suite (Hex's `CLAUDE.md` §9) holds [`Volumes`]: the contract's volume verbs, implemented by [`Instance`]
+//! and by [`SimVolumes`], an in-memory stand-in that answers the same typed outcomes and errors. One conformance suite
+//! runs over both (`tests/seam.rs`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -64,7 +71,9 @@ pub mod outcome;
 pub mod page;
 pub mod policy;
 pub mod role;
+pub mod seam;
 pub mod signed;
+pub mod sim;
 pub mod start;
 pub mod volume;
 
@@ -86,7 +95,9 @@ pub use outcome::{
 };
 pub use page::Page;
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
+pub use seam::Volumes;
 pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
+pub use sim::SimVolumes;
 pub use start::{Anchor, StartSpec, Started};
 pub use volume::{
   BaseState, Drift, DriftKind, DriftPage, DriftReport, Provisioned, Source, VolumeSpec,
@@ -110,11 +121,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// launcher's own secret: `LauncherSecret`, `StartSpec::launcher` and `with_launcher`, `Issuer::from_launcher_secret`,
 /// `StartSpec::anchor_command` fallible (`StartFault::Launcher`), `IssuerFault::LauncherCannotRecover`,
 /// `Unsupported::SecureRandom`; and, from A-285's owner the same hour, `Stale::Policy`, a policy setting that raced
-/// another (`set_write_policy` names the version it read) (the same day). 8: lists a page
-/// at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page, changed_since,
-/// changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`; `Instance::drift` reads every
-/// entry (the same day).
-pub const CONTRACT: u32 = 8;
+/// another (`set_write_policy` names the version it read) (the same day). 8: an overlay's drift read from the status
+/// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
+/// read with no base (it failed as a protocol fault before) (the same day). 9: the [`Volumes`]
+/// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
+/// same day). 10: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
+/// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
+/// `Instance::drift` reads every entry (the same day).
+pub const CONTRACT: u32 = 10;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
