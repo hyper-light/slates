@@ -636,6 +636,40 @@ impl Liveness {
     self.inner.daemon_gone()
   }
 
+  /// Whether the daemon's process has ended (A-456): on Linux its control socket's peer end has closed, which the kernel
+  /// does as the process ends; on macOS and Windows the exit watch on the process that answered the claim (A-143) has
+  /// fired. It is the one question a reply wait asks. A daemon process that lives answers its client's ring, whichever
+  /// daemon holds the instance's bootstrap object now, so unlike [`Self::daemon_gone`] this reads nothing of that object.
+  pub fn departed(&self) -> bool {
+    self.inner.departed()
+  }
+
+  /// The daemon's process handle, to wait on beside the reply's Event (Windows, A-456), as a claim waits beside its
+  /// answer's (A-447); `None` when the process was already gone when the watch was taken.
+  #[cfg(windows)]
+  #[must_use]
+  pub fn exit_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+    self.inner.exit_handle()
+  }
+
+  /// A liveness check over `socket`, the client's end of a control socket a test made (Linux), its deliveries opened
+  /// under the stand-in seal.
+  #[cfg(all(test, target_os = "linux"))]
+  pub(crate) fn of_socket(socket: std::os::fd::OwnedFd) -> Result<Liveness, IpcError> {
+    Ok(Liveness {
+      inner: platform::Liveness::of_socket(socket)?,
+    })
+  }
+
+  /// A liveness check on process `pid` alone, under no instance (macOS, Windows): its exit is what a test's reply wait
+  /// asks ([`Self::departed`]); [`Self::daemon_gone`] reads it gone, as no bootstrap object names it.
+  #[cfg(all(test, any(target_os = "macos", windows)))]
+  pub(crate) fn of_process(pid: u32) -> Result<Liveness, IpcError> {
+    Ok(Liveness {
+      inner: platform::Liveness::of_process(pid)?,
+    })
+  }
+
   /// A descriptor that reports the daemon's departure when polled (Linux: the control socket, whose peer end closes
   /// with the daemon's process, so `POLLRDHUP` and `POLLHUP` arrive), for a process that must notice a takeover without
   /// a call in flight (`slates pmem`, A-197). The daemon's deliveries make it readable too, which `POLLRDHUP` alone does
@@ -1105,6 +1139,22 @@ pub mod platform {
         // Reset, or an unusable descriptor: the channel is gone either way.
         Err(_) => true,
       }
+    }
+
+    /// The daemon's process has ended ([`super::Liveness::departed`]): here that is the socket's peer end closed, the
+    /// one fact `daemon_gone` reads on this platform.
+    pub(super) fn departed(&self) -> bool {
+      self.daemon_gone()
+    }
+
+    /// A liveness check over a test's `socket`, its deliveries opened under the stand-in seal (A-187's test channel).
+    #[cfg(test)]
+    pub(super) fn of_socket(socket: OwnedFd) -> Result<Liveness, IpcError> {
+      let (_daemon_seal, client_seal) = crate::toy_seal::channel_pair()?;
+      Ok(Liveness {
+        socket,
+        seal: RefCell::new(client_seal),
+      })
     }
 
     /// Receives a delivery from the daemon over the control socket (§4.6: a content map, A-135; a stream end,
@@ -2951,6 +3001,28 @@ pub mod platform {
       self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
     }
 
+    /// The daemon's process has ended ([`super::Liveness::departed`]): its exit watch alone, one zero-timeout `kevent`
+    /// on macOS, one zero-timeout wait on Windows; the bootstrap object is not read.
+    pub(super) fn departed(&self) -> bool {
+      self.watch.exited()
+    }
+
+    /// The daemon's process handle (Windows; [`super::Liveness::exit_handle`]).
+    #[cfg(windows)]
+    pub(super) fn exit_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+      self.watch.handle()
+    }
+
+    /// A liveness check on process `pid` alone, under no instance ([`super::Liveness::of_process`]).
+    #[cfg(test)]
+    pub(super) fn of_process(pid: u32) -> Result<Liveness, IpcError> {
+      Ok(Liveness {
+        instance: String::new(),
+        generation: 0,
+        watch: crate::exit_watch::ExitWatch::on(pid)?,
+      })
+    }
+
     /// No control socket here yet (§4.6, A-135), so no descriptor is ever delivered over one: a same-kernel client on
     /// this platform reads by copy, and a stream end comes by the platform's own route (A-161).
     #[cfg(unix)]
@@ -4623,6 +4695,11 @@ pub mod platform {
 
   impl Liveness {
     pub(super) fn daemon_gone(&self) -> bool {
+      true
+    }
+
+    /// No daemon here, so none lives.
+    pub(super) fn departed(&self) -> bool {
       true
     }
   }

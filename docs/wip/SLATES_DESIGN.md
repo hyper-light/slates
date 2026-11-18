@@ -5022,12 +5022,16 @@ loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured
 refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two
 slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
-(futex / `os_sync_wait_on_address(SHARED)` / the Event). Daemon: after writing a reply and advancing
+(futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
+departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
+Windows waits on the Event and the daemon's process handle together, and macOS keeps the word, looking at the daemon's
+exit watch on a doubling schedule. Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
-cannot tell, so there the client confirms its own sleep by its switch count across the wait, and learns
-nothing where the OS refuses the count, A-223), and, for SDK event loops, signal
+cannot tell, and a Linux park on the eventfd is no futex sleeper, so there the client confirms its own sleep by its
+switch count across the wait, and learns nothing where the OS refuses the count, A-223, A-456), and, for SDK event
+loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
 return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
@@ -5139,6 +5143,26 @@ drops.
 > calls of 231; stuck, 40 of 40 inside their bounds. A-232's amendment and
 > `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md` hold the tests, the mutations and what stays
 > open.
+
+> **Status (2026-11-18, A-456): a synchronous call's wait for its reply ends at the reply or at its daemon's departure,
+> with no deadline.** A-232 kept the reply deadline (the liveness budget `W`, a second) as the cadence of its question:
+> each deadline that passed asked the daemon's liveness, so a call whose daemon died learned it up to `W` later, by a
+> clock, where the platform can wait on the death itself. Now `ClientEnd::wait_while_daemon_lives` parks on the reply
+> and the daemon's process together where the platform waits on both: on Linux one `poll` of the completion eventfd,
+> which the daemon writes for a parked client, beside the control socket, whose peer end the kernel closes as the
+> daemon's process ends; on Windows one `WaitForMultipleObjects` on the reply's Event and the daemon's process handle
+> (A-447's watch). macOS wakes a park through the wake word (`os_sync_wait_on_address`), which no wait takes beside a
+> descriptor or a process, so there the park looks at the daemon's exit watch on A-443's doubling: the first look once
+> the wait has lasted twice the longer of the time waited at its first park and the client's wake estimate (a look
+> costs a park's timeout and a wake), each later look at twice the time waited. The looks cost the logarithm of the
+> wait, and a departure is seen within the time waited. The departure is the process's end alone (the socket's close,
+> the exit watch), never the bootstrap object, which a live daemon need not hold to answer its ring. A Linux park on a
+> descriptor is never confirmed by the daemon's futex wake, so the client judges its own sleep by its voluntary
+> switches (`getrusage(RUSAGE_THREAD)`, `slates_machine::switches`), as Windows' parks do, and its wake estimate still
+> learns. While a Linux completion bridge runs (Node's adopted descriptor), the park waits on the bridge's pipe, the
+> eventfd's only reader then, and gives the pipe's level back as it ends. The synchronous round trip waits so; the
+> reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
+> on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
@@ -31084,3 +31108,52 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), 
 - **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
+
+### A-456 — A synchronous call's reply wait ends at the reply or at its daemon's departure: waited on together on Linux and Windows, looked at on A-443's doubling on macOS (2026-11-18, goal 85 via g251b; R3's class C, C-b's first part; §4.7 "Failure matrix", "Wake strategy"; A-223, A-232, A-443, A-447)
+
+- **What was there.** Since A-232 a call waits while its daemon lives, but the synchronous wait parked with the client's
+  reply deadline as its timeout (`Deadlines::reply_ns`, the anchor's liveness budget `W`, a second) and asked the
+  daemon's liveness each time it passed. So a call whose daemon died learned it up to a second later, by a clock, on
+  every platform, and a live daemon's slow call woke its client once a second for nothing.
+- **The rule.** `ClientEnd::wait_while_daemon_lives` has no deadline. It ends at the reply (`Waited::Reply`), or at the
+  daemon's process's end with no reply in the ring (`Waited::Departed`; a reply written before the end is taken
+  first). Linux: one `poll` of the wake's level beside the control socket (`POLLRDHUP`, `POLLHUP`), the level being
+  the completion eventfd the daemon writes for a parked client, or, while a completion bridge runs, the bridge's pipe
+  (the bridge is then the eventfd's only reader and writes its pipe after every read; the park gives the pipe's level
+  back as it ends, so the async loop still learns of replies the synchronous wait drained past it). Windows: one
+  `WaitForMultipleObjects` on the region's Event and the daemon's process handle (`Event::wait_or_exit` now reports
+  which ended the wait). macOS: the wake word's wait (`os_sync_wait_on_address`, which no wait takes beside a
+  descriptor or a process) until the next look at the daemon's exit watch; the first look once the wait has lasted
+  twice the longer of the time waited at its first park and the wake estimate (a look costs a park's timeout and a
+  wake), each later one at twice the time waited (`Looks`). The departure is the process's end alone
+  (`Liveness::departed`: the socket's close, the exit watch), not `daemon_gone`'s bootstrap stamp, since a live daemon
+  answers its ring whoever holds the instance's name. `Client::round_trip` waits with it and reconnects at `Departed`;
+  `ClientEnd::wait(deadline)` is unchanged.
+- **The wake estimate keeps learning.** The daemon's futex wake never finds a Linux park on a descriptor asleep, so its
+  stamp is never confirmed; a park now carries its own rule (`Parked::waker_confirms`) and a Linux departure park, like
+  every Windows park, is judged by the client's own switch count across the wait. `slates_machine::switches` gains
+  Linux's (`getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`, the voluntary switches, 130–134 ns a read; one unsafe block, budget
+  85 → 86). Without it the Linux client's estimate would have stayed at the daemon's published seed.
+- **Evidence (Mac Studio, macOS arm64, load 4–5, 2026-11-18, debug).** A daemon process killed 296 ms into a wait: the
+  wait ended `Departed` 146 ms after it, 442 ms after the ask, in 10 looks. A reply the daemon held 1.5 s: taken after
+  1.512 s, in 11 looks, where the old rule woke the client once at the second. Red once, the old cadence put into the
+  look schedule (the first look at a second, each later a second on): the daemon gone 304 ms into the wait was seen at
+  1.002 s, one look, and the departure test failed. The look schedule's oracle: the first
+  look at twice the longer of the first park and the wake, each later at twice the time waited, at most
+  `log2(t / first) + 2` across a wait `t`. The touched crates' focused unit tests green (`slates-ipc` `endpoint::`,
+  `rendezvous::`, `completion::`, `wake::`, `exit_watch::` 19 of 19; `slates-machine` `switches` 1; `slates-client`
+  lib 5). Linux's and Windows' paths are compile-checked here and run on main's lanes.
+- **Kept, and why.** `Deadlines::reply_ns` stays, its role narrowed to the waits that cannot see the departure yet,
+  each a later part of C-b: the async driver's tick (the SDK loops poll only the completion descriptor), the wait for a
+  slot on a full ring (a slot that frees wakes nothing), a delivery's read and the macOS route's claim steps; the CLI's
+  MCP edge borrows it for a deadline of its own. No field changes, so the library's contract does not change. macOS sees
+  a departure within the time waited, not at once: a thread per client waiting on the exit watch could wake the park
+  at the exit, and was not built for a rare event.
+- **Tests.** `endpoint::departure::a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives`,
+  `endpoint::departure::a_daemons_departure_ends_the_wait_before_the_old_reply_deadline` (a child process stands for
+  the daemon on macOS and Windows, a socket pair's end on Linux; both hold the descriptor gate) and
+  `endpoint::looks::looks_come_at_twice_the_time_waited_from_twice_the_longer_of_the_first_park_and_the_wake`.
+
+Applied in the same change to: §4.7 ("Wake strategy", the A-232 status's successor), GAPS (the `LIVENESS_BUDGET_NS`
+entry's class C), `crates/ipc/src/{endpoint,rendezvous,wake,region,completion,lib}.rs`, `crates/machine/src/switches.rs`,
+`crates/client/src/client.rs`, `crates/api/src/lib.rs` (the deadlines' doc), `unsafe-budget.toml`.
