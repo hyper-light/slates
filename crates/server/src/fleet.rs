@@ -5512,8 +5512,8 @@ fn materialize_refused(refusal: &'static str) -> Result<(), VolumeWait> {
 enum Sliced {
   /// Every chunk is open: the real archive.
   Opened(Archive),
-  /// Chunks remain: the open, to go on with at the next turn.
-  More(slates_cluster::envelope::Opening),
+  /// Chunks remain: the open, to go on with at the next turn (boxed: it carries the envelope and the real archive).
+  More(Box<slates_cluster::envelope::Opening>),
 }
 
 /// The successor's adoption of a taken-over volume's keys (A-92 pieces 3b and 4c): the volume's owner, its lineage key
@@ -5556,7 +5556,9 @@ async fn open_in_turns(
       let opening = adopted
         .then(|| {
           let (lineage, namer) = recorded_keys(s, id, &begun_owner)?;
-          slates_cluster::envelope::Opening::new(archive, &lineage, &namer).ok()
+          slates_cluster::envelope::Opening::new(archive, &lineage, &namer)
+            .ok()
+            .map(Box::new)
         })
         .flatten();
       if opening.is_none() {
@@ -5619,7 +5621,7 @@ fn open_slice(
   state: &mut ShardState,
   id: DbVolumeId,
   owner: &slates_db::catalog::Principal,
-  mut opening: slates_cluster::envelope::Opening,
+  mut opening: Box<slates_cluster::envelope::Opening>,
 ) -> Result<Sliced, &'static str> {
   state.count(ENVELOPE_OPEN_SLICES, 1);
   let Some((lineage, namer)) = recorded_keys(state, id, owner) else {
