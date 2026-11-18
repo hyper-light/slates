@@ -267,11 +267,21 @@ pub enum WorkloadStatus {
     /// The tool that was absent.
     tool: String,
   },
+  /// Identical under the reviewed exclusions but for output lines the route's stated differences name
+  /// (`crate::workload::stated_differences`, A-300), each with both sides. A stated difference is a property of the
+  /// route the design records (the WinFsp drive makes no hard link, so a local clone copies there where NTFS links),
+  /// never a defect, so it does not fail the suite; a stated line that no longer differs is a difference, so a route's
+  /// list only shrinks.
+  Stated {
+    /// Each stated line that differed: its number, the host's line and the mount's.
+    lines: Vec<String>,
+  },
 }
 
 impl WorkloadStatus {
   /// Whether this verdict fails the workload suite: a difference, or a script that failed on both sides. An absent
-  /// tool does not (its record names the tool); every leg that runs the roster judges its suite by this one rule.
+  /// tool does not (its record names the tool), nor does a route's stated difference (its record names each line);
+  /// every leg that runs the roster judges its suite by this one rule.
   pub fn fails_the_suite(&self) -> bool {
     matches!(
       self,
@@ -287,7 +297,25 @@ impl WorkloadStatus {
       WorkloadStatus::Failed { exit_code, detail } => Some(format!(
         "{workload}: the script exited {exit_code} on both sides; host output tail: {detail}"
       )),
-      WorkloadStatus::Identical | WorkloadStatus::Skipped { .. } => None,
+      WorkloadStatus::Identical
+      | WorkloadStatus::Skipped { .. }
+      | WorkloadStatus::Stated { .. } => None,
+    }
+  }
+
+  /// The note a suite's record carries for a verdict identical but for the route's stated differences: the workload's
+  /// name and each stated line with both sides; `None` for every other verdict.
+  pub fn stated_note(&self, workload: &str) -> Option<String> {
+    match self {
+      WorkloadStatus::Stated { lines } => Some(format!(
+        "{workload}: identical but for the route's stated difference{}: {}",
+        if lines.len() == 1 { "" } else { "s" },
+        lines.join("; ")
+      )),
+      WorkloadStatus::Identical
+      | WorkloadStatus::Differs { .. }
+      | WorkloadStatus::Failed { .. }
+      | WorkloadStatus::Skipped { .. } => None,
     }
   }
 }
@@ -597,6 +625,50 @@ mod tests {
     assert_eq!(Record::parse(json.as_bytes()).unwrap(), record);
     assert_eq!(record.file_name(), "native-macos-nfs.fsx.json");
     assert!(record.is_evidence());
+  }
+
+  /// A-300. Do: write a Windows workloads record whose git history run was identical but for the drive's stated link
+  /// count, beside an identical one, and read it back. Expect the same record, the stated verdict kept with its line,
+  /// passing the suite, and its note naming the line with both sides.
+  #[test]
+  fn a_stated_workload_verdict_round_trips_and_passes_the_suite() {
+    let stated = WorkloadStatus::Stated {
+      lines: vec![
+        "output line 1: host \"objects with two names after the clone: 5 of 5\", mount \"objects with two names \
+         after the clone: 0 of 5\""
+          .to_owned(),
+      ],
+    };
+    let mut record = run(
+      Suite::Workloads,
+      Outcome::Ran {
+        counts: Counts::Workloads {
+          tools: vec![
+            WorkloadResult {
+              name: "git".to_owned(),
+              status: WorkloadStatus::Identical,
+            },
+            WorkloadResult {
+              name: "git-history".to_owned(),
+              status: stated.clone(),
+            },
+          ],
+        },
+      },
+    );
+    record.transport = Transport::NativeWindowsWinfsp;
+    let json = record.to_json().unwrap();
+    assert!(json.contains("\"stated\""), "{json}");
+    assert_eq!(Record::parse(json.as_bytes()).unwrap(), record);
+    assert!(!stated.fails_the_suite() && stated.failure_note("git-history").is_none());
+    let note = stated.stated_note("git-history").unwrap();
+    assert!(
+      note.starts_with("git-history: identical but for the route's stated difference: ")
+        && note.contains("5 of 5")
+        && note.contains("0 of 5"),
+      "{note}"
+    );
+    assert!(WorkloadStatus::Identical.stated_note("git").is_none());
   }
 
   /// Hostile input: garbage, an oversized file and a foreign schema are typed refusals.
