@@ -18,13 +18,13 @@
 //! base, and submits again — at most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved,
 //! never hidden.
 //!
-//! **The oracle (offline, after the run).** Every submit is recorded with its base, its send and reply instants,
-//! its slots and its outcome. The accepted versions must be exactly `1..=V`, each once. An accepted submit at `v`
-//! must have no slot that an accepted version in `(base, v)` touched while the green's bytes at `v - 1` differ from
-//! the slot's (the verdict's rule). A conflict's windows must equal the rule's expected set at some head the verdict
-//! could have seen: between the newest version whose reply came back before the submit was sent and the newest
-//! version whose submit was sent before this reply came back. And the green's head bytes of every file the run
-//! touched must equal the version-ordered replay of the accepted submits over the files' version-0 bytes.
+//! **The oracle (offline, after the run; `support/load_oracle.rs` states it exactly).** Every submit is recorded with
+//! its base, its send and reply instants, its slots and its outcome. The accepted versions must be exactly `1..=V`,
+//! each once. An accepted submit at `v` must have no slot that an accepted version in `(base, v)` touched while the
+//! green's bytes at `v - 1` differ from the slot's (the verdict's rule). A conflict's windows must equal the rule's
+//! expected set at some head the verdict could have seen, bounded by the accepted submits whose replies came back
+//! before the submit was sent and those sent before its reply came back. And the green's head bytes of every file the
+//! run touched must equal the version-ordered replay of the accepted submits over the files' bytes before the level.
 //!
 //! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then `oracle\t<n>\t…` lines;
 //! a nonzero `oracle_failures` exits 1.
@@ -45,6 +45,12 @@ use slates_client::{
 use slates_ipc::protocol::{EntryKind, GreenBase, MergeWindow, Refusal, ReplyBody, RequestBody};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+// The oracle: the design's rule over the level's submits, in its own file so its test
+// (`crates/client/tests/load_oracle.rs`) names the same code.
+#[path = "support/load_oracle.rs"]
+mod load_oracle;
+use load_oracle::{Outcome, Slot, SubmitEvent};
 
 /// Shape: rounds of edit-and-submit each client runs, unless `--rounds` says otherwise.
 const ROUNDS: usize = 3;
@@ -74,14 +80,6 @@ const PERMILLE: u64 = 1000;
 /// Shape: the seed of the deterministic plan (splitmix64), so a run is reproducible.
 const SEED: u64 = 0x5eed_1a7e_57c0_ffee;
 
-/// One slot an edit overwrites.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Slot {
-  path: String,
-  at: u64,
-  bytes: Vec<u8>,
-}
-
 /// The kinds of operation timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -92,32 +90,6 @@ enum Kind {
   ReadHead,
   Rebase,
   Destroy,
-}
-
-/// What a submit came back with.
-#[derive(Clone, Debug)]
-enum Outcome {
-  Accepted(u64),
-  Conflict(Vec<(String, u64, u64)>),
-  /// The client gave up with the submit in flight (the daemon gone past its reconnect budget, a reply lost): the
-  /// green may or may not have taken it, which the oracle settles from the green itself ([`resolve_unknown`]).
-  Unknown,
-}
-
-/// The conflict classes a conflict reply named, kept beside the windows for the event dump.
-type Classes = Vec<u8>;
-
-/// One submit, as the oracle judges it.
-#[derive(Clone, Debug)]
-struct SubmitEvent {
-  base: u64,
-  sent_ns: u64,
-  replied_ns: u64,
-  slots: Vec<Slot>,
-  outcome: Outcome,
-  agent: usize,
-  round: usize,
-  classes: Classes,
 }
 
 /// What a client is doing.
@@ -1286,200 +1258,32 @@ fn report(n: usize, tally: &mut Tally) {
   );
 }
 
-/// Each slot's writes by the accepted versions, in version order: what the green held at a slot at any version is the
-/// last write at or before it, else the file's version-0 bytes. Built once, linear in the accepted slots, so judging a
-/// verdict at a head is a lookup per slot. (The oracle had replayed a whole copy of every touched file for every
-/// version: 1,600 versions × 677 files at 1,000 clients, minutes of the harness's own CPU after the clients were done,
-/// which read as a hung daemon.)
-type SlotWrites<'a> = BTreeMap<(&'a str, u64), Vec<(u64, &'a [u8])>>;
-
-fn slot_writes<'a>(accepted: &[&'a SubmitEvent]) -> SlotWrites<'a> {
-  let mut writes: SlotWrites<'a> = BTreeMap::new();
-  for (index, event) in accepted.iter().enumerate() {
-    let version = index as u64 + 1;
-    for slot in &event.slots {
-      writes
-        .entry((slot.path.as_str(), slot.at))
-        .or_default()
-        .push((version, slot.bytes.as_slice()));
-    }
-  }
-  writes
-}
-
-/// The green's bytes at slot `(path, at)` of `len` bytes as of `version`.
-fn slot_at<'a>(
-  writes: &SlotWrites<'a>,
-  base: &'a BTreeMap<String, Vec<u8>>,
-  (path, at, len): (&str, u64, usize),
-  version: u64,
-) -> &'a [u8] {
-  let written = writes.get(&(path, at)).and_then(|history| {
-    history
-      .iter()
-      .rev()
-      .find(|(written, _)| *written <= version)
-      .map(|(_, bytes)| *bytes)
-  });
-  written.unwrap_or_else(|| {
-    let start = usize::try_from(at).unwrap();
-    &base[path][start..start + len]
-  })
-}
-
-/// The green's bytes of every touched file after the last accepted version.
-fn replay(base: &BTreeMap<String, Vec<u8>>, writes: &SlotWrites<'_>) -> BTreeMap<String, Vec<u8>> {
-  let mut state = base.clone();
-  for ((path, at), history) in writes {
-    if let Some((_, bytes)) = history.last() {
-      let start = usize::try_from(*at).unwrap();
-      state.get_mut(*path).unwrap()[start..start + bytes.len()].copy_from_slice(bytes);
-    }
-  }
-  state
-}
-
-/// The windows the verdict's rule expects for `event` judged against head `head`: each slot that a version in
-/// `(base, head]` touched, where the green's bytes at `head` differ from the slot's.
-fn expected_windows(
-  event: &SubmitEvent,
-  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
-  head: u64,
-) -> BTreeSet<(String, u64, u64)> {
-  event
-    .slots
-    .iter()
-    .filter(|slot| {
-      writes
-        .get(&(slot.path.as_str(), slot.at))
-        .is_some_and(|history| history.iter().any(|(v, _)| *v > event.base && *v <= head))
-    })
-    .filter(|slot| {
-      slot_at(writes, base, (&slot.path, slot.at, slot.bytes.len()), head) != slot.bytes.as_slice()
-    })
-    .map(|slot| (slot.path.clone(), slot.at, SLOT_BYTES))
-    .collect()
-}
-
-/// Why the oracle did not expect a window at `(path, at)`: the versions that wrote it, and the head's bytes there
-/// against the submit's.
-fn explain(
-  event: &SubmitEvent,
-  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
-  (path, at): (&str, u64),
-  head: u64,
-) -> String {
-  let touched: Vec<u64> = writes
-    .get(&(path, at))
-    .map(|history| history.iter().map(|(v, _)| *v).collect())
-    .unwrap_or_default();
-  let mine = event
-    .slots
-    .iter()
-    .find(|slot| slot.path == path && slot.at == at);
-  let held = slot_at(writes, base, (path, at, 16), head);
-  format!(
-    "{path}@{at}: touched by versions {touched:?}; head {:?}; mine {:?}",
-    String::from_utf8_lossy(held),
-    mine.map(|slot| String::from_utf8_lossy(&slot.bytes[..16]).into_owned())
-  )
-}
-
-/// Judges every submit and the final bytes; returns the failures, each printed.
+/// Judges the level (the rule is `support/load_oracle.rs`'s): every submit over `base`, the touched files' bytes before
+/// the level, then the green's head of each file as `read_head` reads it, one file at a time. Prints the first
+/// failures, the summary row and the oracle's own time (`oracle_ns`: the submits' judgment, then the heads' with
+/// their reads), so a level's wall is told from the harness's own work after it; returns the failures.
 fn oracle(
   n: usize,
   submits: &[SubmitEvent],
-  base: &BTreeMap<String, Vec<u8>>,
-  head: &BTreeMap<String, Vec<u8>>,
+  base: BTreeMap<String, Vec<u8>>,
+  read_head: impl FnMut(&str) -> Vec<u8>,
 ) -> u64 {
-  let mut failures = 0u64;
-  let mut fail = |what: String| {
-    failures += 1;
-    if failures <= 20 {
-      println!("oracle_failure\t{n}\t{what}");
-    }
-  };
-  let mut accepted: Vec<&SubmitEvent> = submits
-    .iter()
-    .filter(|e| matches!(e.outcome, Outcome::Accepted(_)))
-    .collect();
-  accepted.sort_by_key(|e| match e.outcome {
-    Outcome::Accepted(v) => v,
-    Outcome::Conflict(_) | Outcome::Unknown => 0,
-  });
-  for (index, event) in accepted.iter().enumerate() {
-    if let Outcome::Accepted(v) = event.outcome
-      && v != index as u64 + 1
-    {
-      fail(format!(
-        "accepted versions are not 1..=V: position {index} holds {v}"
-      ));
-    }
-  }
-  let writes = slot_writes(&accepted);
-  let judged = (&writes, base);
-  for event in submits {
-    match &event.outcome {
-      Outcome::Accepted(v) => {
-        let expected = expected_windows(event, judged, v - 1);
-        if !expected.is_empty() {
-          fail(format!(
-            "version {v} (base {}) was accepted over conflicts {expected:?}",
-            event.base
-          ));
-        }
-      }
-      // An outcome still unknown after `resolve_unknown` was not taken by the green: it judges nothing.
-      Outcome::Unknown => {}
-      Outcome::Conflict(windows) => {
-        let reported: BTreeSet<(String, u64, u64)> = windows.iter().cloned().collect();
-        let low = accepted
-          .iter()
-          .filter(|e| e.replied_ns < event.sent_ns)
-          .count() as u64;
-        let high = accepted
-          .iter()
-          .filter(|e| e.sent_ns < event.replied_ns)
-          .count() as u64;
-        let fits =
-          (low.max(event.base)..=high).any(|h| expected_windows(event, judged, h) == reported);
-        if !fits {
-          let top = expected_windows(event, judged, high);
-          let why: Vec<String> = reported
-            .difference(&top)
-            .map(|(path, at, _)| explain(event, judged, (path, *at), high))
-            .collect();
-          fail(format!(
-            "conflict (agent {}, base {}) reported {reported:?}; no head in {low}..={high} expects that; at {high} \
-             expected {top:?}; unexpected: {why:?}",
-            event.agent, event.base
-          ));
-        }
-      }
-    }
-  }
-  let replayed = &replay(base, &writes);
-  for (path, bytes) in replayed {
-    if head.get(path) != Some(bytes) {
-      fail(format!(
-        "the green's head of {path} differs from the replay of the accepted submits"
-      ));
-    }
+  let judging = Instant::now();
+  let (judged, writes) = load_oracle::judge_submits(submits, &base);
+  let judge_ns = judging.elapsed().as_nanos();
+  let reading = Instant::now();
+  let mut failures = judged.failures;
+  let files_checked = load_oracle::judge_heads(base, &writes, read_head, &mut failures);
+  let heads_ns = reading.elapsed().as_nanos();
+  for what in &failures.named {
+    println!("oracle_failure\t{n}\t{what}");
   }
   println!(
-    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tunknown\t{}\tfiles_checked\t{}\toracle_failures\t{failures}",
-    accepted.len(),
-    submits
-      .iter()
-      .filter(|e| matches!(e.outcome, Outcome::Conflict(_)))
-      .count(),
-    submits
-      .iter()
-      .filter(|e| matches!(e.outcome, Outcome::Unknown))
-      .count(),
-    replayed.len()
+    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tunknown\t{}\tfiles_checked\t{files_checked}\toracle_failures\t{}",
+    judged.accepted, judged.conflicts, judged.unknown, failures.count
   );
-  failures
+  println!("oracle_ns\t{n}\tsubmits\t{judge_ns}\theads\t{heads_ns}");
+  failures.count
 }
 
 /// Settles the submits whose outcome their clients never learned, from the green itself: every version of this level
@@ -1776,7 +1580,6 @@ fn level(
   // has since restarted (its `versions` answered `DaemonGone` after the primary's kill, 2026-11-07).
   let mut reader = connect(first_instance(instance)).unwrap();
   let unexplained = resolve_unknown(&mut reader, green, head_before, &mut total.submits);
-  let head = read_files(&mut reader, green, &paths, ReadAt::Head);
   if std::env::args().any(|a| a == "--events") {
     for event in &total.submits {
       let slots: Vec<String> = event
@@ -1801,8 +1604,11 @@ fn level(
       "oracle_failure\t{n}\tversion {version} is on the green but no submit of this level, known or unknown, explains it"
     );
   }
+  let judged = oracle(n, &total.submits, base, |path| {
+    read_patiently(&mut reader, green, path, ReadAt::Head)
+  });
   u64::try_from(unexplained.len()).unwrap_or(u64::MAX)
-    + oracle(n, &total.submits, &base, &head)
+    + judged
     + own_files_oracle(n, &mut reader, green, &total.submits)
 }
 

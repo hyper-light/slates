@@ -16354,6 +16354,9 @@ Applied in the same change to:
 - **Open.**
   - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
   - The cross-region case is owed a test.
+  - The route has no end for a work whose owner died. Only a volume's owner writes its tombstone, and a work never
+    comes back, so its adopted catalog record is kept placed for as long as the fleet runs: a store with no bound,
+    which CLAUDE.md §2 bans. How it should end is reserved for Ada (GAPS, A-255's entry, 2026-11-17).
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),

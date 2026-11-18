@@ -78,7 +78,17 @@
 > Mac Studio, and 109 ms while the catalog waited for the period. Still open:
 > - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
 > - the cross-region case is not yet tested;
-> - the 0.35 ms could be overlapped by a pipelined dispatch.
+> - the 0.35 ms could be overlapped by a pipelined dispatch;
+> - **the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8).** Only a volume's
+>   owner writes its tombstone, and a work never comes back to have one, so nothing retires its catalog record. The
+>   adopter keeps it placed (`fleet::owed_adopted_work_catalogs`, which scans every adopted work catalog each record
+>   period), its holders keep it in `holder_records`, and `pending_catalogs` drops an entry only at a materialization or
+>   a tombstone, neither of which comes for a work. Every work alive when its owner dies is held so for as long as the
+>   fleet runs. Found by reading on 2026-11-17, in the sibling sweep after A-255 landed; no test shows it yet. How the
+>   route should end is a decision for Ada. One option: the adopter retires the record once the green's owner holds no
+>   completion of the work's submits, which needs the work's id in the merge record beside the request key. The other:
+>   a cap per adopter, derived from the fleet's outstanding-completion capacity, which retires the oldest record first,
+>   and a resend past it is refused `NotFound`.
 >
 > `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 
@@ -981,6 +991,22 @@
 >   - At 3,000 clients, W3 and main measure the same (three runs each, wall 72 to 105 s, `SubmitAccepted` p50 0.58
 >     to 0.92 s). The 2,410 to 2,456 `BudgetExceeded` per run were W2's.
 >   - Owed: the stall's diagnosis (which shard, which ring, which wake), raised to the supervisor.
+>
+> **The oracle at 100,000 clients (2026-11-17, g232).** The harness's oracle counted both of a conflict's bounds by
+> scanning every accepted submit, for every conflict: at the 10,000-client rung's 111,708 conflicts and 26,598 accepts
+> that is 5.9 × 10⁹ comparisons, and at 100,000 clients about 6 × 10¹¹ (an extrapolation at ten times of each), hours
+> of the harness's own CPU after its clients are done. It also tried every head between the bounds, and held three
+> whole copies of every touched file (before the level, the head and the replay: about 5 GB over the whole kernel's
+> 1.67 GB). The oracle is now its own file (`crates/client/examples/support/load_oracle.rs`): the bounds are two binary
+> searches over the accepted instants sorted once, a slot's writes are found by binary search, only the heads where one
+> of the submit's slots was written are tried (the expected set cannot change between them), the replay runs in place
+> over the bytes before the level, and each head file is read, compared and dropped in turn. Its test
+> (`crates/client/tests/load_oracle.rs`) keeps the serial oracle it replaced as the reference: over 512 generated levels
+> a serial green judged (some submits made wrong after), the two name the same failures in the same words and order;
+> handwritten cases hold each failure kind and a conflict that fits only past its lowest head. Red-checked: trying only
+> the lowest head failed both that case and the property; counting a reply at the send's own instant as before it
+> failed the property. The harness prints the oracle's own time (`oracle_ns\t<n>\tsubmits\t…\theads\t…`). Owed: the
+> time measured at a 10,000-client rung before and after.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
