@@ -1,0 +1,67 @@
+# A Windows build of `slates` starts in Nano Server (Appendix B.2; A-210, A-357). Nano Server is the smallest Windows
+# image: it has no Visual C++ runtime, and its system DLLs export less than Windows Server's. Windows refuses to start a
+# binary that imports a DLL or a function it cannot find, before any of the binary's code runs (0xC0000135 for a DLL,
+# 0xC0000139 for a function). So a binary that answers `slates version` here loads with Nano Server's own DLLs.
+#
+# Two callers. release.yml starts the release binary, its C runtime linked in, so the check also proves it needs no
+# Visual C++ runtime. CI's Windows lane starts the debug binary its tests built, whose C runtime is a DLL: with
+# `c-runtime-beside`, the runtime's DLLs are put beside it, so every other import must resolve from Nano Server's own.
+# That is the check that catches, on the push that adds it, an import Nano Server lacks: A-223's three thread-profiling
+# functions passed every push and showed first on the release's test tag (run 44326428333).
+#
+# Docker's engine is made to answer first. Its service is set to start automatically, yet on 1 of 11 windows-2025
+# runners sampled on 2026-11-18 it was stopped when the job began (diag run 44353300409); started, its engine answered
+# within 0.6 s. On the tag v0.1.0's run (44347535833) the missing engine was read as the binary's exit 1. A Docker
+# failure is now named as the runner's, apart from the binary's. Process isolation needs a host of the image's own build:
+# the callers run on windows-2025 (`windows-latest` is `windows-2025-vs2026`).
+name: The binary starts in Nano Server
+description: Starts a Windows slates binary in a process-isolated nanoserver:ltsc2025 container; it must answer `slates version`.
+inputs:
+  binary:
+    description: The binary to start, a path in the workspace.
+    required: true
+  c-runtime-beside:
+    description: Put the Visual C++ runtime's DLLs beside the binary, for a build whose C runtime is a DLL ("true" or "false").
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Start it in Nano Server
+      shell: pwsh
+      env:
+        BINARY: ${{ inputs.binary }}
+        C_RUNTIME_BESIDE: ${{ inputs.c-runtime-beside }}
+      run: |
+        $image = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+        $service = Get-Service docker -ErrorAction Stop
+        if ($service.Status -ne 'Running') {
+          Write-Output "Docker's service was $($service.Status); starting it"
+          Start-Service docker
+        }
+        # Shape: one look a second; the engine answered within 0.6 s of its service's start. The caller's
+        # `timeout-minutes` bounds the wait.
+        while ($true) {
+          docker version *> $null
+          if ($LASTEXITCODE -eq 0) { break }
+          Start-Sleep -Seconds 1
+        }
+        $dir = Join-Path $env:RUNNER_TEMP 'nano-server'
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        $name = Split-Path $env:BINARY -Leaf
+        Copy-Item $env:BINARY (Join-Path $dir $name)
+        if ($env:C_RUNTIME_BESIDE -eq 'true') {
+          foreach ($dll in 'vcruntime140.dll', 'vcruntime140_1.dll') {
+            $runtime = Join-Path $env:SystemRoot "System32\$dll"
+            if (Test-Path $runtime) { Copy-Item $runtime $dir }
+          }
+        }
+        docker pull --quiet $image
+        if ($LASTEXITCODE -ne 0) { throw "Docker could not pull $image (exit $LASTEXITCODE): the runner failed, not the binary" }
+        $answer = docker run --rm --isolation=process -v "${dir}:C:\nano:ro" $image "C:\nano\$name" version
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+          throw ("{0} version exited 0x{1:X8} in Nano Server (0xC0000139: a function it imports is missing there; 0xC0000135: a DLL)" -f $name, $code)
+        }
+        if (-not ("$answer" -like "slates *")) { throw "unexpected answer: $answer" }
+        Write-Output "Nano Server: $answer"

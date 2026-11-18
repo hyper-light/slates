@@ -68,9 +68,9 @@ use slates_bridge_core::{
 use slates_bridge_winfsp::held::{Record as HeldRecord, windows::Inherited};
 use slates_bridge_winfsp::host::Ready;
 use slates_bridge_winfsp::host::{
-  MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request, WinFspError,
+  MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request, Sibling, WinFspError,
 };
-use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
+use slates_bridge_winfsp::notify::{NotifyRound, OpenNames, spanning};
 use slates_bridge_winfsp::opens::{Ledger, Open};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
 use slates_bridge_winfsp::retry::{PurgeRetries, REQUEST_TIMEOUT_NS, Recorded};
@@ -172,6 +172,12 @@ pub(crate) struct WinFspMount {
   round_out: Option<Option<InvalidationCursor>>,
   /// A round is owed although the volume's generation has not moved since: the last one was put back.
   owed: bool,
+  /// Changes through one name of a file that has others (A-360), owed to its other open names at the next round: for
+  /// each file and the name the change came through, the bytes changed. At most one entry an open handle Windows holds
+  /// ([`owe_siblings`]); past that, [`WinFspMount::siblings_widened`] tells every open name instead.
+  siblings: BTreeMap<(u64, String), CachedBytes>,
+  /// The changes owed through [`WinFspMount::siblings`] outgrew its bound: the next round tells every open name.
+  siblings_widened: bool,
   /// The volume's change generation as of the mount's last delivered round (`Volume::change_generation`).
   seen: u64,
   /// The mount is to end at its task's next turn: its attachment ended (`end_if_mounted`).
@@ -656,6 +662,8 @@ fn keep(
       coherence: Coherence::new(),
       round_out: None,
       owed: takeover,
+      siblings: BTreeMap::new(),
+      siblings_widened: false,
       seen: 0,
       ending: false,
       waker,
@@ -1064,6 +1072,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
         round_out,
         purge_out,
         owed,
+        siblings,
+        siblings_widened,
         thread,
         told,
         volume,
@@ -1085,6 +1095,10 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
           round_out,
           purge_out: *purge_out,
           owed,
+          siblings: Siblings {
+            owed: siblings,
+            widened: siblings_widened,
+          },
           thread,
           told,
           takeover,
@@ -1092,6 +1106,12 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       );
       let served = request.map(|request| {
         let served = request.serve(&mut bridge, &cx, names, ledger);
+        if let Some(sibling) = served.sibling_change() {
+          // The file's other names have file nodes and caches of their own (A-360): the next round tells them. Telling
+          // them before this reply would make the receive worker wait on a notification whose purge may need it.
+          owe_siblings(siblings, siblings_widened, names, sibling);
+          *owed = true;
+        }
         coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
         served
       });
@@ -1288,9 +1308,37 @@ struct Rounds<'m> {
   /// A purge-only command is out, so no round is sent until its outcome is read.
   purge_out: bool,
   owed: &'m mut bool,
+  siblings: Siblings<'m>,
   thread: &'m MountThread,
   told: &'m mut u64,
   takeover: &'m mut bool,
+}
+
+/// A round's view of [`WinFspMount::siblings`] and [`WinFspMount::siblings_widened`] (A-360).
+struct Siblings<'m> {
+  owed: &'m mut BTreeMap<(u64, String), CachedBytes>,
+  widened: &'m mut bool,
+}
+
+/// Owes `sibling` to the next round (A-360), its bytes widened into an entry for the same file and name. A new entry past
+/// one an open handle widens the round to every open name instead, so the record never outgrows what Windows holds.
+fn owe_siblings(
+  owed: &mut BTreeMap<(u64, String), CachedBytes>,
+  widened: &mut bool,
+  names: &OpenNames,
+  sibling: &Sibling,
+) {
+  let key = (sibling.ino, sibling.through.clone());
+  if let Some(bytes) = owed.get_mut(&key) {
+    *bytes = spanning(*bytes, sibling.bytes);
+    return;
+  }
+  if owed.len() >= names.len().max(1) {
+    *widened = true;
+    owed.clear();
+    return;
+  }
+  owed.insert(key, sibling.bytes);
 }
 
 /// Delivers the owed round when none is out: every invalidation since the cursor, as records naming what Windows holds
@@ -1331,8 +1379,11 @@ fn deliver_owed(
   if delivered.gather_refused {
     return refused;
   }
-  if *mount.takeover {
+  if *mount.takeover || *mount.siblings.widened {
     round.add(&Invalidation::Everything, names);
+  }
+  for (ino, through) in mount.siblings.owed.keys() {
+    round.add_siblings(*ino, through, names);
   }
   *mount.owed = false;
   let too_long = round.too_long();
@@ -1341,10 +1392,16 @@ fn deliver_owed(
       bridge,
       cx,
       names,
-      (&changed, overruns > 0 || *mount.takeover),
+      (
+        &changed,
+        overruns > 0 || *mount.takeover || *mount.siblings.widened,
+      ),
+      mount.siblings.owed,
     );
     if mount.thread.notify(round.bytes().to_vec(), purges).is_ok() {
       *mount.round_out = Some(before);
+      mount.siblings.owed.clear();
+      *mount.siblings.widened = false;
       *mount.told = mount
         .told
         .saturating_add(u64::try_from(round.records()).unwrap_or(u64::MAX));
@@ -1354,6 +1411,11 @@ fn deliver_owed(
       *mount.owed = true;
       return refused;
     }
+  }
+  if round.is_empty() {
+    // No other name of a changed file is open: nothing caches what it changed.
+    mount.siblings.owed.clear();
+    *mount.siblings.widened = false;
   }
   Round {
     delivered,
@@ -1371,6 +1433,7 @@ fn purges_owed(
   cx: &slates_bridge_core::OpContext,
   names: &OpenNames,
   (changed, everything): (&[(u64, CachedBytes)], bool),
+  siblings: &BTreeMap<(u64, String), CachedBytes>,
 ) -> Vec<Purge> {
   let sector = slates_bridge_winfsp::host::sector_bytes();
   let owed: Vec<(u64, CachedBytes)> = if everything {
@@ -1411,6 +1474,27 @@ fn purges_owed(
         offset,
         len: end.saturating_sub(offset),
       });
+    }
+  }
+  // A change through one name of a file (A-360): its other names' pages, never the name it came through, whose own
+  // cache saw it; a purge opens the file through the drive with write access, which an open sharing only reads is
+  // refused while it lasts.
+  for ((ino, through), bytes) in siblings {
+    let Ok(attr) = bridge.getattr(ObjectId::new(*ino, 0), cx) else {
+      continue;
+    };
+    let Some((offset, len)) = purge_range(bytes, attr.size, sector) else {
+      continue;
+    };
+    for name in names.open_names(*ino) {
+      if name != through.as_str() {
+        purges.push(Purge {
+          object: ObjectId::new(*ino, 0),
+          path: name.to_owned(),
+          offset,
+          len,
+        });
+      }
     }
   }
   purges

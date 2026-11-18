@@ -68,3 +68,15 @@ Diagnostics branch `diag-g071-nano-1` (run 44332283768, 2026-11-18, `windows-202
 
 The red arm's job reported failure after printing the reproduction, since GitHub's `pwsh` wrapper ends a step with the
 last native command's exit code, here the reproduced 0xC0000139.
+
+## Follow-up: every push checks it
+
+The same day, CI's Windows lane (`windows-lint`) gained the check: after its CLI tests build `target/debug/slates.exe`,
+the action `.github/actions/nano-server-start` starts it in the same container, with the Visual C++ runtime's DLLs
+beside it, since that build's C runtime is a DLL. release.yml's step uses the same action. The action starts Docker's
+engine first. On the tag `v0.1.0`'s run (44347535833) a runner's Docker service was stopped, and the step reported it as
+`slates version exited 1`. Of 11 `windows-2025` runners sampled (diag runs 44352989836 and 44353300409), one had the
+service stopped though it is set to start automatically; started, its engine answered within 0.6 s. Proof
+(diag-g071-ci-1, run 44354728411, each job stopping Docker's service first): the debug binary of this change answered
+`slates 0.1.0` in 21 s, main 68148152d's was refused with `slates.exe version exited 0xC0000139`, and test 4's
+static binary answered through the release's call in 31 s.

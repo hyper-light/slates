@@ -1,7 +1,7 @@
 //! A volume's catalog register (§4.8 "volume heads, chain versions, landing leases and catalog entries are
 //! registers the owner writes under that epoch"; AUD-29-17). The catalog register holds what a successor needs
 //! to serve a taken-over volume *as it was*: its mount name, size class, name policy, owner, whether it must
-//! live in locked RAM, and the access list. Its object is the volume's id with the register-class bit set
+//! live in locked RAM, the access list, and its write policy and trusted signers (A-285, A-321). Its object is the volume's id with the register-class bit set
 //! (`ObjectId::catalog`), placed and taken over exactly as the volume is, and its sequence is the volume
 //! record's `catalog_version`, which every catalog-changing op raises — so each change ships as a newer record
 //! and a takeover adopts the newest.
@@ -72,6 +72,15 @@ pub struct CatalogValue {
   /// green's owner, which holds the submit's completion in the green's merge records. `None` for any other volume.
   /// Appended.
   pub work_of: Option<slates_db::catalog::VolumeId>,
+  /// The volume's write policy (A-285), its signed-merge requirement with it (A-321): a successor holds the volume's
+  /// merges and landings to the modes the launcher set. `None` while unset. Appended.
+  pub write: Option<slates_db::catalog::WritePolicy>,
+  /// How many times the write policy or the trusted signers were set (A-285, A-321): the version a launcher's proof
+  /// names, so a successor refuses a captured setting as the owner did. Appended.
+  pub write_version: u64,
+  /// The keys trusted to sign the volume's work (A-321), in SSH wire form, in the order the launcher set them: a
+  /// successor judges signed work under the same signers. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 impl CatalogValue {
@@ -90,6 +99,9 @@ impl CatalogValue {
         slates_db::catalog::Role::Work { green, .. } => Some(green),
         slates_db::catalog::Role::Plain | slates_db::catalog::Role::Green { .. } => None,
       },
+      write: record.policy.write,
+      write_version: record.policy.write_version,
+      signers: record.policy.signers.clone(),
     }
   }
 
@@ -135,6 +147,13 @@ mod tests {
       live_shipped: false,
       live_holders: None,
       work_of: Some(slates_db::catalog::VolumeId { bytes: [9; 16] }),
+      write: Some(slates_db::catalog::WritePolicy {
+        merge: slates_db::catalog::WriteMode::Bypass,
+        land: slates_db::catalog::WriteMode::Forbid,
+        require_signed_merges: true,
+      }),
+      write_version: 2,
+      signers: vec![vec![7; 51]],
     }
   }
 

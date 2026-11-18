@@ -45,7 +45,9 @@ use std::os::windows::io::{
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
-use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
+use slates_bridge_core::{
+  Bridge, CachedBytes, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -295,6 +297,14 @@ enum Op<T> {
     to: String,
     replace: bool,
   },
+  /// A hard link (A-360): `path` becomes another name of the file the open `object` names. Only a WinFsp driver with
+  /// `docs/wip/winfsp-patches` applied forwards one; the receive worker serves it before WinFsp's DLL, which has no case
+  /// for it. `replace` is ReplaceIfExists.
+  Link {
+    object: T,
+    path: String,
+    replace: bool,
+  },
   /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
   /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-209, `t/base/05.t`), and any other
   /// allocation changes nothing the volume keeps.
@@ -380,6 +390,7 @@ impl<T> Op<T> {
         | Op::SetTimes { .. }
         | Op::SetAllocation { .. }
         | Op::Rename { .. }
+        | Op::Link { .. }
         | Op::Flush { .. }
         | Op::FlushVolume
         | Op::Cleanup { .. }
@@ -459,6 +470,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -470,6 +482,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -499,11 +512,14 @@ impl Request {
     // retires nothing, so a replayed Cleanup's stale context stays a refusal.
     let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
+    let through =
+      context_of(&self.op).and_then(|context| names.name_of(context).map(str::to_owned));
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
+    let change = bound.as_ref().ok().and_then(|op| change_of(op, bridge, cx));
     let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
@@ -525,6 +541,7 @@ impl Request {
     };
     reply = record_open_reply(reply, opened, self.hint, bridge, cx, names, ledger);
     reply = finish_context_effects(reply, closed, names, ledger);
+    let sibling = change.and_then(|change| change.sibling(&reply, through));
     Served {
       reply,
       sender: self.reply,
@@ -532,8 +549,127 @@ impl Request {
       echo,
       restored_read,
       flush,
+      sibling,
     }
   }
+}
+
+/// A change through one name of a file that has, or had, another (A-360): what the file's other names Windows holds
+/// open must be told of. Each other name has a file node and caches of its own in WinFsp's driver, which only a
+/// notification reaches; the name the change came through saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sibling {
+  /// The file.
+  pub ino: u64,
+  /// The name the change came through, as Windows' file node is named.
+  pub through: String,
+  /// The bytes it changed, `CachedBytes::Kept` for its information alone (times, a link count).
+  pub bytes: CachedBytes,
+}
+
+/// What a request does to a file that may have other names (A-360), decided before it runs.
+#[derive(Clone, Copy)]
+struct Change {
+  ino: u64,
+  bytes: CachedBytes,
+  count: Count,
+}
+
+/// How a [`Change`] learns whether the file has another name.
+#[derive(Clone, Copy)]
+enum Count {
+  /// From its reply, which carries the file's information and its link count with it.
+  Reported,
+  /// A link: the file has another name once it succeeds.
+  Link,
+  /// The delete of one name of a file that had this many.
+  Delete { names: u32 },
+}
+
+impl Change {
+  /// The [`Sibling`] the served request leaves owed, if it succeeded and the file has, or had, another name. With the
+  /// name it came through unknown, every name is told.
+  fn sibling(self, reply: &Reply, through: Option<String>) -> Option<Sibling> {
+    let shared = match (self.count, reply) {
+      (_, Reply::Err(_)) => false,
+      (Count::Reported, Reply::Wrote { info, .. } | Reply::Object { info, .. }) => {
+        info.hard_links > 1
+      }
+      (Count::Reported, _) => false,
+      (Count::Link, _) => true,
+      (Count::Delete { names }, _) => names > 1,
+    };
+    shared.then(|| Sibling {
+      ino: self.ino,
+      through: through.unwrap_or_default(),
+      bytes: self.bytes,
+    })
+  }
+}
+
+/// The open context a request names, when it acts through one.
+fn context_of(op: &Op<u64>) -> Option<u64> {
+  match op {
+    Op::Write { object, .. }
+    | Op::SetSize { object, .. }
+    | Op::Truncate { object, .. }
+    | Op::SetAllocation { object, .. }
+    | Op::SetTimes { object, .. }
+    | Op::Link { object, .. }
+    | Op::Cleanup { object, .. } => Some(*object),
+    _ => None,
+  }
+}
+
+/// The [`Change`] `op` makes: a write's bytes (from where it lands, when it appends), a size's or an overwrite's whole
+/// file, a time's or a link's information alone; their replies carry the link count. A delete reads the file's link
+/// count first, since its reply carries none. A purge's own echo is no change.
+fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<Change> {
+  let (object, bytes, count) = match op {
+    Op::Write { object, .. } if object.purge => return None,
+    Op::Write {
+      object,
+      offset,
+      data,
+      append,
+      ..
+    } => {
+      let bytes = if *append {
+        CachedBytes::From { at: *offset }
+      } else {
+        CachedBytes::Range {
+          at: *offset,
+          len: u64::try_from(data.len()).unwrap_or(u64::MAX),
+        }
+      };
+      (object, bytes, Count::Reported)
+    }
+    Op::SetSize { object, .. } | Op::Truncate { object, .. } | Op::SetAllocation { object, .. } => {
+      (object, CachedBytes::ALL, Count::Reported)
+    }
+    Op::SetTimes { object, .. } => (object, CachedBytes::Kept, Count::Reported),
+    Op::Link { object, .. } => (object, CachedBytes::Kept, Count::Link),
+    Op::Cleanup {
+      object,
+      delete: Some(_),
+    } if !object.purge => {
+      let attr = bridge.getattr(object.object, cx).ok()?;
+      if attr.kind == Kind::Dir {
+        return None;
+      }
+      (
+        object,
+        CachedBytes::Kept,
+        Count::Delete { names: attr.nlink },
+      )
+    }
+    _ => return None,
+  };
+  Some(Change {
+    ino: object.object.inode,
+    bytes,
+    count,
+  })
 }
 
 fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
@@ -703,6 +839,15 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       replace,
     },
     Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => Op::Link {
+      object: ledger.get(object)?,
+      path,
+      replace,
+    },
     Op::CanDelete { object } => Op::CanDelete {
       object: ledger.get(object)?,
     },
@@ -768,6 +913,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
+  /// The request changed a file that has, or had, another name (A-360): see [`Served::sibling_change`].
+  sibling: Option<Sibling>,
   /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
   flush: bool,
 }
@@ -783,6 +930,13 @@ impl Served {
   /// host (`crate::purge`).
   pub fn is_purge_echo(&self) -> bool {
     self.echo
+  }
+
+  /// The change this request made to a file that has, or had, another name (A-360). The mount's own requests are its
+  /// kernel's doing for the name they came through, so their journal records are passed over; but each other name
+  /// Windows holds open has a file node and caches of its own, so the mount's next round tells those names.
+  pub fn sibling_change(&self) -> Option<&Sibling> {
+    self.sibling.as_ref()
   }
 
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.
@@ -828,7 +982,13 @@ fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
     index_number: attr.ino,
-    hard_links: 0,
+    // A file's names (A-360): a driver with `docs/wip/winfsp-patches` reports them as `NumberOfLinks`; a directory
+    // has one there, as on NTFS, whatever POSIX counts for it.
+    hard_links: if attr.kind == Kind::Dir {
+      0
+    } else {
+      attr.nlink
+    },
     ea_size: 0,
   })
 }
@@ -982,6 +1142,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       object_reply(&attr, 0)?
     }
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => op_link(bridge, cx, object.object, &path, replace)?,
     Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
     Op::SetAllocation { object, new_size } => {
       op_set_allocation(bridge, cx, object.object, new_size)?
@@ -1249,6 +1414,69 @@ fn op_rename(
     },
   )?;
   Ok(Reply::Ok)
+}
+
+/// A hard link (A-360; `FileLinkInformation`): `path` becomes another name of `object`, by Windows' rules (MS-FSA
+/// 2.1.5.15.7). A taken name is refused `STATUS_OBJECT_NAME_COLLISION` unless the caller asked to replace it; a name of
+/// the file itself is left as it is; a replaced name is never a directory's or a read-only file's (`STATUS_ACCESS_DENIED`,
+/// as a rename's, [`replaces_a_directory`], [`crate::refuses_replacement`]). A directory takes no second name
+/// (`STATUS_FILE_IS_A_DIRECTORY`; the driver refuses it first). A replace is made under a name of its own and renamed over
+/// the taken one, so a refusal at either step leaves the taken name as it was; one shard turn serves all of it, so no
+/// other request sees the name between.
+fn op_link(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  path: &str,
+  replace: bool,
+) -> Result<Reply, VfsError> {
+  if bridge.getattr(object, cx)?.kind == Kind::Dir {
+    return Err(VfsError::IsDirectory);
+  }
+  let (name, parent) = match split_parent(bridge, cx, path)? {
+    Ok(pair) => pair,
+    Err(status) => return Ok(Reply::Err(status)),
+  };
+  let taken = match bridge.lookup(parent, cx, name) {
+    Ok(attr) => attr,
+    Err(VfsError::NotFound) => {
+      bridge.link(object, parent, cx, name)?;
+      return Ok(Reply::Ok);
+    }
+    Err(error) => return Err(error),
+  };
+  if !replace {
+    return Err(VfsError::AlreadyExists);
+  }
+  if (taken.ino, taken.generation) == (object.inode, object.generation) {
+    return Ok(Reply::Ok);
+  }
+  if matches!(taken.kind, Kind::Dir) || crate::refuses_replacement(&taken) {
+    return Err(VfsError::NotPermitted);
+  }
+  let staging = staging_name(object);
+  match bridge.lookup(parent, cx, &staging) {
+    Err(VfsError::NotFound) => {}
+    Ok(_) => return Err(VfsError::AlreadyExists),
+    Err(error) => return Err(error),
+  }
+  bridge.link(object, parent, cx, &staging)?;
+  if let Err(error) = bridge.rename(parent, parent, cx, &staging, name, RenameFlags::default()) {
+    if let Err(undo) = bridge.unlink(parent, cx, &staging) {
+      slates_machine::log_line!(
+        "slates-winfsp: a refused link's staging name {staging} stays beside {name}: {undo:?}"
+      );
+    }
+    return Err(error);
+  }
+  Ok(Reply::Ok)
+}
+
+/// The name a replacing link is made under before it is renamed over the taken name: one per file, so two links of
+/// different files cannot meet, and a name no Windows program makes (`:` is refused in a component by Win32 and by
+/// WinFsp's driver). Never seen: the shard serves the link and the rename in one turn.
+fn staging_name(object: ObjectId) -> String {
+  format!(":slates-link:{:x}:{:x}", object.inode, object.generation)
 }
 
 /// Whether a rename asked to replace would replace a directory other than its own source: Windows never does
@@ -2285,6 +2513,29 @@ extern "C" fn rename(
   }
 }
 
+/// Serves a hard link the patched driver forwards (A-360) on the receive worker, which takes it before WinFsp's DLL: the
+/// DLL has no case for `FileLinkInformation` (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`). The drive's
+/// objects all carry one descriptor (A-350, `drive_security_descriptor`), so a caller that opened the file holds the
+/// same access over the new name's directory and the name it replaces, and none of the checks a rename's replace makes
+/// in the DLL (`FspFileSystemRenameCheck`) is made here.
+///
+/// # Safety
+///
+/// `fs` is this host's live file system, as every callback's is.
+pub(crate) unsafe fn link(fs: *mut FileSystem, link: &crate::inflight::Link) -> Ntstatus {
+  // SAFETY: the caller's contract: our live file system.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::Link {
+    object: link.context,
+    path: link.path.clone(),
+    replace: link.replace,
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
+}
+
 extern "C" fn read_directory(
   fs: *mut FileSystem,
   context: Pvoid,
@@ -2501,6 +2752,9 @@ impl Mounted {
       // daemon itself holds no privilege (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
+      // The volume makes hard links (A-360): a driver with `docs/wip/winfsp-patches` forwards `FileLinkInformation`; the
+      // released driver ignores the bit and refuses the link itself.
+      | ffi::VOLUME_FLAG_HARD_LINKS
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed
       // that first box twice (run 40251802164); a stable token would likewise name the wrong open.

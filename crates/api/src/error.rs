@@ -1381,6 +1381,9 @@ pub enum StartFault {
     /// The OS error number, when the OS gave one.
     errno: Option<i32>,
   },
+  /// The anchor, started [`crate::StartSpec::until_served`], stopped: its daemons crash-looped and none of them ever
+  /// served, so the instance never answered (A-366). Its log lines say each daemon's exit; a start again begins anew.
+  NeverServed,
 }
 
 impl fmt::Display for StartFault {
@@ -1405,6 +1408,10 @@ impl fmt::Display for StartFault {
         f,
         "handing the anchor the launcher's secret: {}",
         errno_text(*errno)
+      ),
+      Self::NeverServed => f.write_str(
+        "the instance never answered: its daemons failed their starts in a row and none served, so its anchor stopped; \
+         its log lines say each daemon's exit",
       ),
     }
   }

@@ -102,6 +102,12 @@ pub(crate) struct AdoptedGreen {
   pub(crate) access: Vec<slates_db::catalog::AccessEntry>,
   /// The adopted catalog register's sequence, which the green's record continues from.
   pub(crate) catalog_sequence: u64,
+  /// The green's write policy, from its adopted catalog register (A-285, A-321).
+  pub(crate) write: Option<slates_db::catalog::WritePolicy>,
+  /// The policy's version, from the same register.
+  pub(crate) write_version: u64,
+  /// The green's trusted signers, from the same register (A-321).
+  pub(crate) signers: Vec<Vec<u8>>,
   /// The adopted version.
   pub(crate) head: u64,
   /// The adopted record's identity: the green's head identity at `head`.
@@ -144,8 +150,9 @@ pub(crate) enum Engine {
   /// The replica is behind, and these versions' inputs, named by records this node accepted, are not held here: each
   /// version and manifest.
   Unheld(Vec<(u64, [u8; 32])>),
-  /// The ledger here lacks the record of this version: no engine can be built from it (the ledger-prefix transfer of
-  /// records is owed, GAP-A9-7).
+  /// The ledger here lacks the record of this version: no engine can be built from it until the records from it up to
+  /// the adopted version are adopted position by position (`fleet::adopt_missing_records`, A-364, GAP-A9-7's record
+  /// half).
   RecordsShort(u64),
   /// The green is refused on this node: its replica's identity at the adopted version is another, or a recomputation
   /// mismatched before (fatal-and-loud, counted).

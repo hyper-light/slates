@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_bridge_core::Invalidation;
+use slates_bridge_core::{CachedBytes, Invalidation};
 
 /// Format: `FILE_NOTIFY_CHANGE_FILE_NAME` (winnt.h): a name was added, removed or renamed.
 pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
@@ -130,6 +130,11 @@ impl OpenNames {
         beneath(path, from).is_none()
           || path.encode_utf16().count().saturating_add(grows) <= MAX_PATH_UNITS
       })
+  }
+
+  /// The name handle `handle` was opened by, as Windows' file node is named, while it is open.
+  pub fn name_of(&self, handle: u64) -> Option<&str> {
+    self.by_handle.get(&handle).map(|(_, path)| path.as_str())
   }
 
   /// How many handles Windows holds open.
@@ -262,6 +267,16 @@ impl NotifyRound {
     }
   }
 
+  /// Adds a change to inode `ino` made through its name `through` (A-360): one record for every other name it is open
+  /// under, whose file node caches what changed. The name it came through saw the change itself.
+  pub fn add_siblings(&mut self, ino: u64, through: &str, names: &OpenNames) {
+    for name in names.names_of(ino) {
+      if name != through {
+        self.record(name, INODE_FILTER);
+      }
+    }
+  }
+
   /// Appends one `FSP_FSCTL_NOTIFY_INFO` record naming `path`, at the next aligned offset.
   fn record(&mut self, path: &str, filter: u32) {
     let units: Vec<u16> = path.encode_utf16().collect();
@@ -312,6 +327,39 @@ impl NotifyRound {
 
 /// `offset` rounded up to the record alignment (`FSP_FSCTL_DEFAULT_ALIGN_UP`). Saturates at the top of the address
 /// space, where no round can reach.
+/// The bytes both `first` and `second` name, as one span (A-360: two changes through one name of a file owed to its
+/// other names before a round tells them): from the first byte either names to the last, or to the file's end where
+/// either runs to it; `CachedBytes::Kept` names none. Wider than either is never stale.
+pub fn spanning(first: CachedBytes, second: CachedBytes) -> CachedBytes {
+  match (first, second) {
+    (CachedBytes::Kept, other) | (other, CachedBytes::Kept) => other,
+    (CachedBytes::From { at: one }, CachedBytes::From { at: two }) => {
+      CachedBytes::From { at: one.min(two) }
+    }
+    (CachedBytes::From { at }, CachedBytes::Range { at: start, .. })
+    | (CachedBytes::Range { at: start, .. }, CachedBytes::From { at }) => {
+      CachedBytes::From { at: at.min(start) }
+    }
+    (
+      CachedBytes::Range {
+        at: one,
+        len: one_len,
+      },
+      CachedBytes::Range {
+        at: two,
+        len: two_len,
+      },
+    ) => {
+      let start = one.min(two);
+      let end = one.saturating_add(one_len).max(two.saturating_add(two_len));
+      CachedBytes::Range {
+        at: start,
+        len: end.saturating_sub(start),
+      }
+    }
+  }
+}
+
 fn aligned(offset: usize) -> usize {
   offset
     .checked_next_multiple_of(NOTIFY_INFO_ALIGNMENT)
@@ -321,7 +369,6 @@ fn aligned(offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use slates_bridge_core::CachedBytes;
 
   /// The records of a round as the kernel walks them (`FspVolumeNotifyWork`): each record's size, filter, action and
   /// name, the next at the aligned offset past its size.
@@ -346,6 +393,56 @@ mod tests {
       at = (at + size).next_multiple_of(NOTIFY_INFO_ALIGNMENT);
     }
     out
+  }
+
+  /// A-360. Do: span pairs of changed bytes: none with a range, two ranges apart and overlapping, a range with a run to
+  /// the end, two runs. Expect: the one that names bytes; the hull from the first byte to the last; a run from the earlier
+  /// start; the earlier run. Each names every byte either named.
+  #[test]
+  fn two_changes_owed_one_word_span_every_byte_either_changed() {
+    let range = |at, len| CachedBytes::Range { at, len };
+    assert_eq!(spanning(CachedBytes::Kept, range(4, 2)), range(4, 2));
+    assert_eq!(spanning(range(4, 2), CachedBytes::Kept), range(4, 2));
+    assert_eq!(spanning(range(0, 2), range(8, 4)), range(0, 12));
+    assert_eq!(spanning(range(3, 10), range(5, 2)), range(3, 10));
+    assert_eq!(
+      spanning(range(6, 4), CachedBytes::From { at: 8 }),
+      CachedBytes::From { at: 6 }
+    );
+    assert_eq!(
+      spanning(CachedBytes::From { at: 9 }, CachedBytes::From { at: 2 }),
+      CachedBytes::From { at: 2 }
+    );
+    assert_eq!(
+      spanning(CachedBytes::Kept, CachedBytes::Kept),
+      CachedBytes::Kept
+    );
+  }
+
+  /// A-360. Do: open one inode by three names (one of them twice) and another inode by a fourth, and add a change made
+  /// through the second name. Expect: one modified record each for the first and third names, none for the name the
+  /// change came through, none for the other inode.
+  #[test]
+  fn a_change_through_one_name_tells_only_the_files_other_names() {
+    let mut names = OpenNames::new();
+    names.opened(1, 7, "\\a\\file.bin");
+    names.opened(2, 7, "\\b\\link.bin");
+    names.opened(3, 7, "\\b\\link.bin");
+    names.opened(4, 7, "\\c.bin");
+    names.opened(5, 9, "\\other.txt");
+    assert_eq!(names.name_of(2), Some("\\b\\link.bin"));
+    assert_eq!(names.name_of(6), None);
+    let mut round = NotifyRound::new();
+    round.add_siblings(7, "\\b\\link.bin", &names);
+    let mut told: Vec<String> = walk(round.bytes())
+      .into_iter()
+      .map(|(filter, action, name)| {
+        assert_eq!((filter, action), (INODE_FILTER, FILE_ACTION_MODIFIED));
+        name
+      })
+      .collect();
+    told.sort();
+    assert_eq!(told, ["\\a\\file.bin", "\\c.bin"]);
   }
 
   /// §4.6 "Windows". Do: open a file by two names (two handles on one inode, as hard links would) and a third handle on

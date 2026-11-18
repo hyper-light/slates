@@ -885,9 +885,19 @@ impl Daemon {
     let handed = crate::anchor_hold::adopt(config.held_device_bound());
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
+    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
+    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
+    #[cfg(unix)]
+    let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
+    #[cfg(unix)]
+    let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
-    let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
+    let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    for copy in other_copies {
+      // No other kind of copy is held here: one is let go at once, its record no shard's.
+      let _released = crate::anchor_hold::release_copy(copy.copy);
+    }
     #[cfg(windows)]
     let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
     #[cfg(windows)]
@@ -910,6 +920,7 @@ impl Daemon {
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
       let windows_holds = (
@@ -2574,6 +2585,49 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-367): every position this node holds of `object` as a holder, as its sequence and the epoch it was
+  /// accepted at, in sequence order.
+  pub fn fleet_held_positions(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Vec<(u64, u64)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, epoch, _)| (sequence, epoch.0))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+  }
+
+  /// Test support: the record this node holds of `object` at ledger position `sequence`, with the epoch its fence has
+  /// seen; `None` when it holds none there. A test reads what a takeover adopted at a position whatever the successor
+  /// wrote after it.
+  pub fn fleet_held_record_at(
+    &self,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+  ) -> Result<Option<HeldRecordView>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let acceptor = s.holder_records.get(&object)?;
+      let (promised, accepted) = acceptor.persisted();
+      accepted
+        .into_iter()
+        .find(|(held, at, _, _)| *held == object && *at == sequence)
+        .map(|(_, sequence, epoch, value)| HeldRecordView {
+          sequence,
+          epoch: epoch.0,
+          value,
+          fence: promised.0,
+        })
+    })
+  }
+
   /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
   /// phase one would read from it.
   pub fn fleet_held_record(
@@ -3847,12 +3901,17 @@ fn content_slice(
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
+  Option<crate::dax_ranges::RangeTable>,
 ) {
   let images = image_range(config, partition, content.as_deref());
   let Some(object) = content.filter(|_| images.1 > images.0) else {
-    return ((0, 0), None, crate::write_log::Recovered::default());
+    return ((0, 0), None, crate::write_log::Recovered::default(), None);
   };
   let layout = config.shard_content_layout();
+  // The DAX range table (A-365), with what the previous daemon recorded in it.
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  let dax_ranges = crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes);
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
@@ -3871,8 +3930,13 @@ fn content_slice(
     },
   );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
-    Some((log, recovered)) => (images, Some(log), recovered),
-    None => (images, None, crate::write_log::Recovered::default()),
+    Some((log, recovered)) => (images, Some(log), recovered, dax_ranges),
+    None => (
+      images,
+      None,
+      crate::write_log::Recovered::default(),
+      dax_ranges,
+    ),
   }
 }
 
@@ -3911,6 +3975,8 @@ struct ShardHolds {
   /// The held writable copies.
   #[cfg(target_os = "linux")]
   copies: Vec<crate::held_copy::InheritedCopy>,
+  /// The held Shards streams' DAX objects (A-365).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
@@ -4196,7 +4262,7 @@ async fn init_shard(
     None => None,
   };
   #[cfg(unix)]
-  let (content_range, write_log, recovered_writes) =
+  let (content_range, write_log, recovered_writes, dax_ranges) =
     content_slice(config, partition, content.as_mut());
   #[cfg(windows)]
   let content_range = content_slice(config, partition, content.as_ref());
@@ -4253,6 +4319,12 @@ async fn init_shard(
     pending_replies: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    dax_ranges,
+    #[cfg(unix)]
+    inherited_dax: holds.dax,
+    #[cfg(unix)]
+    adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
@@ -4368,6 +4440,7 @@ async fn init_shard(
     death_reports: std::collections::BTreeMap::new(),
     death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
+    dialed_in: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
@@ -4426,6 +4499,7 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
+    failover: slates_cluster::failover::Failover::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -6768,6 +6842,98 @@ mod tests {
     );
   }
 
+  /// A-337 (§4.8 direct contact and the plane's keying; the formation flake of
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
+  /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
+  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
+  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
+  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
+  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
+  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  #[test]
+  fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::membership::{Liveness, MemberState};
+    use slates_cluster::root_group::RootGroup;
+    use slates_db::register::{HostId, Quorum, RegionId};
+    let (dropped, readings) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
+      let voter = others[0];
+      let mut all = vec![local];
+      all.extend_from_slice(&others);
+      state.council = RegionalCouncil::new(
+        voter,
+        all,
+        vec![voter],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      state.root = RootGroup::new(voter, vec![RegionId(0)], vec![voter]);
+      install_council(state);
+      let alive = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 0,
+      };
+      for peer in &others {
+        slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
+      }
+      let Some(peer) = others
+        .iter()
+        .copied()
+        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
+      else {
+        return (None, Vec::new());
+      };
+      let origin = state.origin_anchor;
+      let mut readings = Vec::new();
+      for anchor in [
+        HostId(origin.0.saturating_add(1)),
+        HostId(origin.0.saturating_sub(1)),
+      ] {
+        state.learned_members.clear();
+        state.learned_members.insert(
+          anchor,
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: peer,
+            previous: None,
+          },
+        );
+        for sessions in [0u32, 1] {
+          state.dialed_in.clear();
+          if sessions > 0 {
+            state.dialed_in.insert(anchor, sessions);
+          }
+          readings.push((
+            anchor > origin,
+            sessions,
+            crate::fleet::direct_contact_reason(state, peer),
+            crate::fleet::keeps_direct_contact_with(state, peer),
+          ));
+        }
+      }
+      (Some(peer), readings)
+    });
+    assert!(
+      dropped.is_some(),
+      "a member of seven at scatter three falls outside this node's role rule"
+    );
+    let expected: Vec<(bool, u32, String, bool)> = vec![
+      (true, 0, "OutsideNeighbourhood".to_owned(), false),
+      (true, 1, "Dialed".to_owned(), true),
+      (false, 0, "OutsideNeighbourhood".to_owned(), false),
+      (false, 1, "OutsideNeighbourhood".to_owned(), false),
+    ];
+    assert_eq!(
+      readings, expected,
+      "(the peer's anchor above this node's, sessions it dialed here, the reason, kept)"
+    );
+  }
+
   /// §4.8 Lookup, AC-8.14: a node whose placement has not yet installed its council's newest configuration
   /// still claims an object it owns — ownership moves only when the owner is retired, and the claim is judged
   /// against the council's own membership, so the lag cannot make a claim false. Do: commit a change on this
@@ -6987,6 +7153,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,
@@ -7025,6 +7192,74 @@ mod tests {
       .install_configuration(configuration, &regional.members);
   }
 
+  /// Shape: the content puts the content-delta test holds, one publication each: enough that a delta carrying the whole
+  /// hold's image would carry tens of times what one put is.
+  const CONTENT_PUTS: u64 = 64;
+
+  /// §4.8 "persistence before reply", A-376: a holder publishes before it acknowledges each content put, and what that
+  /// publication carries must be the content it put, never the hold it already carries. Do: on a shard, hold
+  /// [`CONTENT_PUTS`] inputs of one green, each placed for its own version and of one size, building after each the delta
+  /// a publication would carry and committing it. Expect every delta to carry the same bytes (the put's manifest and its
+  /// one new chunk), and the pieces every delta carried, folded in order, to be the hold's whole image. Before: the hold's
+  /// image was one piece, re-encoded at every publication and re-put whenever it changed, so the n-th put carried every
+  /// input held before it.
+  #[test]
+  fn a_holders_publication_carries_the_content_it_puts_not_the_whole_hold() {
+    let (carried, folded_whole) = audit_on_shard(|state| {
+      use slates_db::register::{HostId, ObjectId};
+      let green = ObjectId::new(HostId(9), 1);
+      state.published_held = crate::content_holder::PublishedHeld::default();
+      crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+      let mut folded: std::collections::BTreeMap<
+        [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+        Vec<u8>,
+      > = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      let mut carried = std::collections::BTreeSet::new();
+      for version in 1..=CONTENT_PUTS {
+        let archive =
+          crate::merge_origin::InputsBuilder::whole(&version.to_le_bytes()).finish(version, 4096);
+        state
+          .held_content
+          .hold(
+            &mut crate::content_holder::hold_space(&mut state.store),
+            green,
+            slates_cluster::content::Placed { sequence: version },
+            archive,
+          )
+          .unwrap();
+        let changes = crate::content_holder::held_changes(state);
+        carried.insert(
+          changes
+            .put
+            .iter()
+            .map(|piece| piece.bytes.len())
+            .sum::<usize>(),
+        );
+        for piece in &changes.put {
+          folded.insert(piece.key, piece.bytes.clone());
+        }
+        for key in &changes.removed {
+          folded.remove(key);
+        }
+        crate::content_holder::held_committed(state, changes.whole, false);
+      }
+      let whole: std::collections::BTreeMap<_, _> = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      (carried, folded == whole)
+    });
+    assert_eq!(
+      carried.len(),
+      1,
+      "every put's delta carries its manifest and its chunk, whatever the hold holds: {carried:?}"
+    );
+    assert!(folded_whole, "the folded deltas are the hold's whole image");
+  }
+
   /// One step of the held-pieces oracle's history (A-270): a change to what the shard holds, or a publication.
   #[derive(Clone, Copy, Debug)]
   enum HeldStep {
@@ -7034,22 +7269,73 @@ mod tests {
     Clear(u8),
     /// Live copy `copy` let go.
     Drop(u8),
-    /// A register record held for object `object`.
+    /// A register put in place for object `object`: a fresh acceptor that keeps no changes, holding one position.
     Hold(u8),
     /// Object `object`'s register dropped.
     Forget(u8),
+    /// The next position of object `object`'s register accepted, its acceptor made, keeping its changes, when none is
+    /// held (A-367: the ledger a holder of a green keeps).
+    Accept(u8),
+    /// Object `object`'s newest position accepted again at a newer epoch, as a takeover re-commits it (A-367).
+    Again(u8),
+    /// Object `object`'s register compacted below its newest position, as a single-value register is (A-367).
+    Compact(u8),
+    /// A fresh acceptor that keeps its changes put in place of object `object`'s, holding one position (A-367): its
+    /// changes do not account for the published positions it replaced.
+    Renew(u8),
+    /// Content held for object `object`, placed for the step's index (A-376).
+    Put(u8),
+    /// Everything held for object `object` released, as a tombstone releases it (A-376).
+    Release(u8),
     /// A delta published: what `held_changes` carries, folded over the model.
     Delta,
     /// A checkpoint published: everything held.
     Checkpoint,
   }
 
-  /// A-270, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
-  /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
-  /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
-  /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
-  /// by a copy made again, or a key both put and removed fails here as a difference, before it is a record a restart
-  /// lost.
+  /// Accepts into `acceptor` a record of `object` from the owner its authority names, under its generation: at
+  /// `again`, its value unchanged at an epoch one past its fence (a takeover's re-commit); else at the position after its
+  /// highest, at its fence's epoch, valued by `at`. Whether it was accepted.
+  fn held_accept(
+    acceptor: &mut slates_db::register::Acceptor,
+    object: slates_db::register::ObjectId,
+    at: usize,
+    again: Option<u64>,
+  ) -> bool {
+    use slates_db::register::{HostEpoch, Record};
+    let (promised, _) = acceptor.persisted();
+    let (sequence, epoch, value) = match again {
+      Some(sequence) => {
+        let Some(value) = acceptor.value_at(object, sequence).map(<[u8]>::to_vec) else {
+          return false;
+        };
+        (sequence, HostEpoch(promised.0.saturating_add(1)), value)
+      }
+      None => {
+        let next = acceptor
+          .highest(object)
+          .map_or(1, |(sequence, _)| sequence.saturating_add(1));
+        (next, promised, format!("value {at}").into_bytes())
+      }
+    };
+    acceptor
+      .accept(&Record {
+        owner: acceptor.owner(),
+        object,
+        sequence,
+        epoch,
+        generation: acceptor.generation(),
+        value,
+      })
+      .is_ok()
+  }
+
+  /// A-270, A-367, the oracle of the incremental held image: do run a generated history of live copies kept, cleared,
+  /// let go and made again, and registers held, dropped, grown a position at a time, accepted again at a newer epoch,
+  /// compacted and replaced, publishing deltas and checkpoints between them. Expect after every publication the pieces a
+  /// restart would fold (each checkpoint's, each delta's put and removed applied in order) to equal everything the shard
+  /// holds (`held_image`). A change the tracked maps or an acceptor's changes missed, a live slot reused by a copy made
+  /// again, or a key both put and removed fails here as a difference, before it is a record a restart lost.
   #[test]
   fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
     use proptest::strategy::Strategy;
@@ -7058,12 +7344,18 @@ mod tests {
       type Model =
         std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
       let local = state.fleet.host();
-      let step = (0u8..7, 0u8..3).prop_map(|(kind, which)| match kind {
+      let step = (0u8..14, 0u8..3).prop_map(|(kind, which)| match kind {
         0 | 1 => HeldStep::Push(which),
         2 => HeldStep::Clear(which),
         3 => HeldStep::Drop(which),
         4 => HeldStep::Hold(which),
         5 => HeldStep::Forget(which),
+        6 | 7 => HeldStep::Accept(which),
+        8 => HeldStep::Again(which),
+        9 => HeldStep::Compact(which),
+        10 => HeldStep::Renew(which),
+        12 => HeldStep::Put(which),
+        13 => HeldStep::Release(which),
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
@@ -7080,6 +7372,9 @@ mod tests {
         let state: &mut crate::state::ShardState = &mut borrowed;
         state.holder_records.clear();
         state.live.held.clear();
+        state
+          .held_content
+          .forget_all(&mut crate::content_holder::hold_space(&mut state.store));
         state.published_held = crate::content_holder::PublishedHeld::default();
         crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
         let mut model: Model = Model::new();
@@ -7104,19 +7399,77 @@ mod tests {
               state.live.held.remove(&object(which));
             }
             HeldStep::Hold(which) => {
-              state.holder_records.insert(
-                object(which),
-                Acceptor::new(
-                  local,
-                  Authority {
-                    generation: u64::try_from(at).unwrap(),
-                    owner: HostId(local.0 ^ 1),
-                  },
-                ),
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
               );
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Forget(which) => {
               state.holder_records.remove(&object(which));
+            }
+            HeldStep::Accept(which) => {
+              let acceptor = state
+                .holder_records
+                .entry(object(which))
+                .or_insert_with(|| {
+                  Acceptor::new(
+                    local,
+                    Authority {
+                      generation: 0,
+                      owner: HostId(local.0 ^ 1),
+                    },
+                  )
+                  .tracking_changes()
+                });
+              held_accept(acceptor, object(which), at, None);
+            }
+            HeldStep::Again(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                held_accept(acceptor, object(which), at, Some(sequence));
+              }
+            }
+            HeldStep::Compact(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                acceptor.compact_below(object(which), sequence);
+              }
+            }
+            HeldStep::Put(which) => {
+              let index = u64::try_from(at).unwrap();
+              let archive =
+                crate::merge_origin::InputsBuilder::whole(&index.to_le_bytes()).finish(index, 4096);
+              let _ = state.held_content.hold(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+                slates_cluster::content::Placed { sequence: index },
+                archive,
+              );
+            }
+            HeldStep::Release(which) => {
+              state.held_content.forget_object(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+              );
+            }
+            HeldStep::Renew(which) => {
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
+              )
+              .tracking_changes();
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
               let changes = crate::content_holder::held_changes(state);
@@ -8983,6 +9336,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,

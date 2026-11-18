@@ -43,6 +43,22 @@
 //! no `latency` row, and before an operation's first send in no `operation` row either: a level with clients held
 //! measures less than its clients wait, and says so here.
 //!
+//! **Each instant is read on the side of its event that keeps the oracle's bounds sound.** A send is stamped before
+//! its request is handed to the connection's ring, and read again once it is, so the request left between the two; a
+//! reply is stamped after the ring it was taken from was read, so it arrived before. Stamped the other way round (as
+//! until 2026-11-18), a worker the host preempted between handing a submit over and reading the clock recorded a send
+//! after the verdict that reflected it, and one preempted between reading the clock and reading the ring recorded a
+//! reply before it came: the measurer's three oracle failures under load, one of them a recorded round trip of 5 µs
+//! where the run's submits took 374 to 399 µs (BENCHMARKS, 2026-11-18). The clock is the host's common monotonic one
+//! (`slates_machine::clock::monotonic_ns`), the clock the daemon stamps its spans in.
+//!
+//! **What the harness itself may have added (the `floor` rows).** A reply not taken by a connection's drain was not
+//! there when that drain began, so it arrived after the later of that instant and its request's handing over: the
+//! attempt's `floor`, a lower bound on what the daemon and the ring took, whatever the harness's own sweep did. Each
+//! `latency` lies between its `floor` and itself, and the gap is the harness's resolution: the longest such window of
+//! the level is `max_drain_gap_ns` in the `harness` row. A tail in `latency` with none in `floor` may be the harness's;
+//! a tail in `floor` is not.
+//!
 //! **The bound (the `bound` row; Ada's decision of 2026-11-18, A-297).** "1,000 clients under 1 ms" is stated at up to
 //! 10³ verdicts a second, the floor of §1.4's fleet-session row ("Increments per green volume per second: thousands").
 //! A level meets it when every kind's p99, each attempt's (`latency`) and each operation's (`operation`), is under 1 ms
@@ -54,7 +70,8 @@
 //!
 //! Rows: `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
 //! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
-//! answer, refusals for now and resends included; then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
+//! answer, refusals for now and resends included; then `floor\t…` in the same columns, each attempt's floor (above);
+//! then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
 //! then `bound\t<n>\t…` (above). Last, from the daemon's own report: `lost\t<counter>\t<count>` for each of its
 //! counters of a lost reply, result, release or ask; `room\t<counter>\t<count>` for its waits for room (begun and
 //! ended, summed over the shards, and the most one shard held at once, goal 238); and `counter\t<counter>\t<count>` for
@@ -201,6 +218,9 @@ struct Agent {
   /// When the request in flight was sent, this attempt alone (a retry under its id keeps its first send in `inflight`
   /// for its latency): the start of the client's time in flight.
   attempt_sent_ns: u64,
+  /// When this attempt's request was in its ring: the clock read once the send returned, so the request left at or
+  /// before it. A reply's floor is measured from it ([`Worker::drain`]).
+  handed_ns: u64,
 }
 
 /// What a worker brings back.
@@ -213,6 +233,9 @@ struct Tally {
   /// (`AcknowledgementOwed`, `LeaseUnconfirmed`) and sent again as new, or retried under its id, is one operation whose
   /// wait includes the refusals, the pauses and the resends. `latencies` times each attempt alone.
   operations: BTreeMap<Kind, Vec<u64>>,
+  /// Each answered attempt's floor, by the kind its latency is filed under: how long after its request was in the ring
+  /// its reply was still not there, which no sweep of the harness can have added (the module's "floor").
+  floors: BTreeMap<Kind, Vec<u64>>,
   submits: Vec<SubmitEvent>,
   /// The clients that gave up, by why ([`Agent::give_up`]): a refusal the harness does not ride out, a lost connection,
   /// a retry past its patience.
@@ -232,8 +255,10 @@ struct Tally {
   /// Requests the daemon refused `AcknowledgementOwed` and the client sent again: the multiplexed connection's
   /// backpressure while an older request of the connection is still awaited (its acknowledgement cannot pass it).
   backpressure: u64,
-  /// The longest wait between two drains of one connection's completion ring: the resolution of every latency here,
-  /// since a reply's arrival is stamped when its ring is drained.
+  /// The longest window a reply's arrival could not be placed in: from the later of its request's handing over and the
+  /// start of the drain before the one that took it, to the stamp after the one that took it. The resolution of every
+  /// latency here (each lies within this of its floor). A connection with nothing in flight is not drained, and its
+  /// idle time is in no window (it was, before 2026-11-18, so a gap of seconds was a connection whose clients thought).
   max_drain_gap_ns: u64,
   /// Where the clients' time went, summed over clients in client-nanoseconds: in flight, thinking (the pauses drawn),
   /// pausing after a refusal for now, and held (due to send and not yet sent, [`Worker::send_ready`]). A request given
@@ -261,6 +286,9 @@ impl Tally {
         .entry(kind)
         .or_default()
         .append(&mut samples);
+    }
+    for (kind, mut samples) in std::mem::take(&mut tally.floors) {
+      self.floors.entry(kind).or_default().append(&mut samples);
     }
     self.submits.append(&mut tally.submits);
     for (why, count) in tally.refusals {
@@ -323,8 +351,30 @@ impl Rng {
   }
 }
 
-fn ns_since(epoch: Instant) -> u64 {
-  u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+/// The harness's clock: a reading of the host's common monotonic clock, in nanoseconds (the module's "Each instant").
+type ClockRead = Box<dyn FnMut() -> u64 + Send>;
+
+/// A worker's clock: nanoseconds since the level's start, read through `read`, which is the host's monotonic clock in a
+/// run and a test's own in a test (a host that preempts the worker between two of its steps, in particular).
+struct Clock {
+  read: ClockRead,
+  /// The level's start, on `read`'s scale.
+  epoch: u64,
+}
+
+impl Clock {
+  /// The host's common monotonic clock, counted from `epoch`, one of its own readings.
+  fn host(epoch: u64) -> Clock {
+    Clock {
+      read: Box::new(slates_machine::clock::monotonic_ns),
+      epoch,
+    }
+  }
+
+  /// Nanoseconds since the level's start.
+  fn now(&mut self) -> u64 {
+    (self.read)().saturating_sub(self.epoch)
+  }
 }
 
 fn deadlines() -> Deadlines {
@@ -904,25 +954,25 @@ struct Connection {
   /// Words in flight when the channel was lost, still to be resent once reconnected, and since when.
   resend: Vec<u64>,
   resend_since: u64,
-  /// When this connection's ring was last drained.
-  drained_ns: u64,
+  /// When this connection's last drain began, the clock read before its ring was read: a reply that drain did not take
+  /// arrived after it (the module's "floor").
+  read_began_ns: u64,
 }
 
 impl Connection {
-  fn new(client: Client, epoch: Instant) -> Connection {
+  fn new(client: Client, now: u64) -> Connection {
     Connection {
       client,
       inflight: BTreeMap::new(),
       reconnecting: None,
       resend: Vec::new(),
       resend_since: 0,
-      drained_ns: ns_since(epoch),
+      read_began_ns: now,
     }
   }
 
-  fn lost(&mut self, epoch: Instant) {
+  fn lost(&mut self, now: u64) {
     if self.reconnecting.is_none() {
-      let now = ns_since(epoch);
       self.reconnecting = Some(now);
       self.resend = self.inflight.keys().copied().collect();
       self.resend_since = now;
@@ -941,7 +991,7 @@ struct Worker {
   /// worker's own draws of it.
   think: Think,
   tally: Tally,
-  epoch: Instant,
+  clock: Clock,
 }
 
 /// The clients' pauses between requests: each drawn from the exponential distribution of the stated mean, and each
@@ -984,19 +1034,25 @@ impl Worker {
     if conn.reconnecting.is_some() {
       return false;
     }
+    // Read before the request is handed to its ring, so the send's stamp is never later than its departure, and once
+    // the send returns, so the departure is bracketed (the module's "Each instant").
+    let sent = self.clock.now();
     if let Some((word, first_sent_ns, retried_kind)) = agent.retry {
-      return match conn.client.begin_again(word, &body) {
+      let resent = conn.client.begin_again(word, &body);
+      let handed = self.clock.now();
+      return match resent {
         Ok(true) => {
           agent.retry = None;
           agent.inflight = Some((word, first_sent_ns, retried_kind));
-          agent.attempt_sent_ns = ns_since(self.epoch);
+          agent.attempt_sent_ns = sent;
+          agent.handed_ns = handed;
           conn.inflight.insert(word, a);
           self.tally.retried += 1;
           true
         }
         Ok(false) | Err(ClientError::TooManyOutstanding { .. } | ClientError::Rebinding) => false,
         Err(_) if conn.client.daemon_gone() => {
-          conn.lost(self.epoch);
+          conn.lost(handed);
           false
         }
         Err(e) => {
@@ -1006,12 +1062,14 @@ impl Worker {
         }
       };
     }
-    match conn.client.begin(&body) {
+    let begun = conn.client.begin(&body);
+    let handed = self.clock.now();
+    match begun {
       Ok(id) => {
-        let now = ns_since(self.epoch);
-        agent.op_since.get_or_insert(now);
-        agent.inflight = Some((id.word(), now, kind));
-        agent.attempt_sent_ns = now;
+        agent.op_since.get_or_insert(sent);
+        agent.inflight = Some((id.word(), sent, kind));
+        agent.attempt_sent_ns = sent;
+        agent.handed_ns = handed;
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -1022,7 +1080,7 @@ impl Worker {
         | ClientError::Rebinding,
       ) => false,
       Err(_) if conn.client.daemon_gone() => {
-        conn.lost(self.epoch);
+        conn.lost(handed);
         false
       }
       Err(e) => {
@@ -1036,7 +1094,7 @@ impl Worker {
   /// a client that cannot go is kept and the rest are tried). Each due client's wait past the instant it was due (or
   /// was last kept) is counted held: the harness's sweep or its connection's bound kept it back.
   fn send_ready(&mut self) {
-    let now = ns_since(self.epoch);
+    let now = self.clock.now();
     let mut kept = Vec::new();
     while let Some(std::cmp::Reverse((due, a))) = self.ready.peek().copied() {
       if due > now {
@@ -1054,20 +1112,20 @@ impl Worker {
     self.ready.extend(kept);
   }
 
-  /// Drains connection `c`'s ring, stamping each reply's arrival, and moves each reply's client on.
+  /// Drains connection `c`'s ring and moves each reply's client on. Each reply is stamped after the ring was read, so
+  /// it arrived before its stamp; and it was not there when the connection's drain before began, so it arrived after
+  /// that and after its request was handed over: its floor (the module's "floor").
   fn drain(&mut self, c: usize) {
-    let now = ns_since(self.epoch);
+    let began = self.clock.now();
     let conn = &mut self.conns[c];
-    self.tally.max_drain_gap_ns = self
-      .tally
-      .max_drain_gap_ns
-      .max(now.saturating_sub(conn.drained_ns));
-    conn.drained_ns = now;
-    let words = match conn.client.take_ready() {
+    let taken = conn.client.take_ready();
+    let now = self.clock.now();
+    let words = match taken {
       Ok(words) => words,
-      Err(_) if conn.client.daemon_gone() => return conn.lost(self.epoch),
+      Err(_) if conn.client.daemon_gone() => return conn.lost(now),
       Err(e) => return self.fail_connection(c, &format!("take_ready: {e}")),
     };
+    let not_before = std::mem::replace(&mut conn.read_began_ns, began);
     let mut answered = false;
     for word in words {
       let conn = &mut self.conns[c];
@@ -1085,7 +1143,12 @@ impl Worker {
       };
       answered = true;
       self.tally.answered += 1;
-      self.take_answer(a, word, reply, now);
+      let handed = self.agents[a].handed_ns;
+      self.tally.max_drain_gap_ns = self
+        .tally
+        .max_drain_gap_ns
+        .max(now.saturating_sub(not_before.max(handed)));
+      self.take_answer(a, word, reply, (now, not_before.saturating_sub(handed)));
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
     // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited, never past a request
@@ -1095,10 +1158,11 @@ impl Worker {
     }
   }
 
-  /// Moves client `a` on with `reply`, the answer to its request `word`, arrived at `now`: a retryable refusal is
-  /// resent under its id (or given up past the patience); any other answer advances the client and, once it is final,
-  /// records the logical operation from its first send.
-  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, now: u64) {
+  /// Moves client `a` on with `reply`, the answer to its request `word`, taken by `now` and absent `floor` past its
+  /// request's handing over: a retryable refusal is resent under its id (or given up past the patience); any other
+  /// answer advances the client and, once it is final, records the logical operation from its first send, and the
+  /// attempt's floor under the kind its latency is filed under.
+  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, (now, floor): (u64, u64)) {
     let agent = &mut self.agents[a];
     let Some((_, sent_ns, kind)) = agent.inflight.take() else {
       return;
@@ -1153,10 +1217,13 @@ impl Worker {
       first.unwrap_or(sent_ns),
       &mut self.tally,
     );
-    if !refused && let Some(first) = first {
-      self
-        .tally
-        .operation_took(outcome, now.saturating_sub(first));
+    if !refused {
+      self.tally.floors.entry(outcome).or_default().push(floor);
+      if let Some(first) = first {
+        self
+          .tally
+          .operation_took(outcome, now.saturating_sub(first));
+      }
     }
     if agent.step != Step::Done {
       let wait = if for_now {
@@ -1192,7 +1259,7 @@ impl Worker {
   /// connection's id, then each request in flight resent under its own id. Bounded by the client's own derived
   /// reconnect budget.
   fn recover(&mut self, c: usize) {
-    let now = ns_since(self.epoch);
+    let now = self.clock.now();
     let conn = &mut self.conns[c];
     let since = conn.reconnecting.unwrap_or(conn.resend_since);
     if now.saturating_sub(since) > conn.client.deadlines().reconnect_ns {
@@ -1228,7 +1295,7 @@ impl Worker {
         Err(_) if conn.client.daemon_gone() => {
           conn.resend = left;
           conn.reconnecting = None;
-          return conn.lost(self.epoch);
+          return conn.lost(now);
         }
         Err(e) => {
           let why = format!("resend: {e}");
@@ -1244,7 +1311,7 @@ impl Worker {
   /// is named by its stall dump ([`Self::stall_dump`]). Until 2026-11-13 a request the daemon would not defer
   /// (`Client::defers`, now gone) was counted lost past `reply_patience` deadlines while its daemon lived.
   fn overdue(&mut self) {
-    let now = ns_since(self.epoch);
+    let now = self.clock.now();
     for c in 0..self.conns.len() {
       let conn = &mut self.conns[c];
       if conn.reconnecting.is_some() || !conn.resend.is_empty() {
@@ -1257,7 +1324,7 @@ impl Worker {
           .is_some_and(|(_, sent_ns, _)| now.saturating_sub(sent_ns) > deadline)
       });
       if overdue && conn.client.daemon_gone() {
-        conn.lost(self.epoch);
+        conn.lost(now);
       }
     }
   }
@@ -1265,9 +1332,9 @@ impl Worker {
   /// Where every connection with a request in flight stands, printed once per stall, so a stalled level names its hop
   /// without a debugger (fixtures' f = 1 stalls of 2026-11-07, where ptrace was not allowed): `ring_unread` or `held`
   /// above zero is a reply that came and was not collected (the harness's side); both zero with requests awaited is a
-  /// reply that never came (the daemon's side, placed by its `fleet.forward.*` hop counters).
-  fn stall_dump(&self, worker: usize, quiet: Duration) {
-    let now = ns_since(self.epoch);
+  /// reply that never came (the daemon's side, placed by its `fleet.forward.*` hop counters). `now` is the worker's
+  /// clock.
+  fn stall_dump(&self, worker: usize, quiet: Duration, now: u64) {
     for (c, conn) in self.conns.iter().enumerate() {
       if conn.inflight.is_empty() {
         continue;
@@ -1300,7 +1367,8 @@ impl Worker {
     }
   }
 
-  fn progress(&self, worker: usize) {
+  /// Where the worker's clients stand at `now`, its clock.
+  fn progress(&self, worker: usize, now: u64) {
     let done = self
       .agents
       .iter()
@@ -1314,7 +1382,7 @@ impl Worker {
     {
       let age = agent
         .inflight
-        .map(|(_, sent, kind)| (kind, ns_since(self.epoch).saturating_sub(sent)));
+        .map(|(_, sent, kind)| (kind, now.saturating_sub(sent)));
       println!(
         "pending\t{worker}\tagent\t{}\tstep\t{:?}\tround\t{}\tinflight\t{age:?}\toutstanding\t{}",
         agent.id,
@@ -1325,7 +1393,7 @@ impl Worker {
     }
     println!(
       "progress\t{worker}\t{}\tdone\t{done}\tof\t{}\tsubmits\t{}",
-      self.epoch.elapsed().as_secs(),
+      Duration::from_nanos(now).as_secs(),
       self.agents.len(),
       self.tally.submits.len()
     );
@@ -1341,7 +1409,7 @@ impl Worker {
 fn drive(
   conns: Vec<Connection>,
   agents: Vec<Agent>,
-  epoch: Instant,
+  clock: Clock,
   worker: usize,
   mut think: Think,
 ) -> Tally {
@@ -1358,10 +1426,10 @@ fn drive(
     ready,
     think,
     tally,
-    epoch,
+    clock,
   };
   let mut reported = Instant::now();
-  let mut checked = ns_since(epoch);
+  let mut checked = state.clock.now();
   // The last time any reply moved a client on, and whether this stall was dumped.
   let mut moved = Instant::now();
   let mut answers = 0u64;
@@ -1380,13 +1448,14 @@ fn drive(
       .tally
       .max_sweep_ns
       .max(u64::try_from(sweep.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    if ns_since(epoch).saturating_sub(checked) >= check_every {
-      checked = ns_since(epoch);
+    let now = state.clock.now();
+    if now.saturating_sub(checked) >= check_every {
+      checked = now;
       state.overdue();
     }
     if reported.elapsed() >= PROGRESS_EVERY {
       reported = Instant::now();
-      state.progress(worker);
+      state.progress(worker, now);
     }
     let answered = state.tally.answered;
     if answered != answers {
@@ -1395,7 +1464,7 @@ fn drive(
       dumped = false;
     } else if !dumped && moved.elapsed() >= STALL_DUMP_AFTER {
       dumped = true;
-      state.stall_dump(worker, moved.elapsed());
+      state.stall_dump(worker, moved.elapsed(), now);
     }
   }
   state.tally
@@ -1481,33 +1550,27 @@ fn percentile(sorted: &[u64], permille: u64) -> u64 {
   sorted.get(index.min(last)).copied().unwrap_or(0)
 }
 
+/// Prints one row a kind of `samples`, sorted in place: `<row>\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>`.
+fn quantile_rows(row: &str, n: usize, samples: &mut BTreeMap<Kind, Vec<u64>>) {
+  for (kind, samples) in samples {
+    samples.sort_unstable();
+    let cuts: Vec<String> = PERCENTILES
+      .iter()
+      .map(|p| percentile(samples, *p).to_string())
+      .collect();
+    println!(
+      "{row}\t{n}\t{kind:?}\t{}\t{}\t{}",
+      samples.len(),
+      cuts.join("\t"),
+      samples.last().copied().unwrap_or(0)
+    );
+  }
+}
+
 fn report(n: usize, tally: &mut Tally) {
-  for (kind, samples) in &mut tally.latencies {
-    samples.sort_unstable();
-    let cuts: Vec<String> = PERCENTILES
-      .iter()
-      .map(|p| percentile(samples, *p).to_string())
-      .collect();
-    println!(
-      "latency\t{n}\t{kind:?}\t{}\t{}\t{}",
-      samples.len(),
-      cuts.join("\t"),
-      samples.last().copied().unwrap_or(0)
-    );
-  }
-  for (kind, samples) in &mut tally.operations {
-    samples.sort_unstable();
-    let cuts: Vec<String> = PERCENTILES
-      .iter()
-      .map(|p| percentile(samples, *p).to_string())
-      .collect();
-    println!(
-      "operation\t{n}\t{kind:?}\t{}\t{}\t{}",
-      samples.len(),
-      cuts.join("\t"),
-      samples.last().copied().unwrap_or(0)
-    );
-  }
+  quantile_rows("latency", n, &mut tally.latencies);
+  quantile_rows("operation", n, &mut tally.operations);
+  quantile_rows("floor", n, &mut tally.floors);
   for (why, count) in &tally.refusals {
     println!("refusal\t{n}\t{count}\t{why}");
   }
@@ -1814,6 +1877,7 @@ fn spread(
       op_since: None,
       pause_ns: 0,
       attempt_sent_ns: 0,
+      handed_ns: 0,
     });
   }
   groups
@@ -1890,22 +1954,25 @@ fn level(
     "--per-connection {per_connection} exceeds the connection's in-flight bound {limit}"
   );
   let think_mean = think_mean_ns();
-  let epoch = Instant::now();
+  // The level's start on the host's monotonic clock, which every worker counts from (the module's "Each instant").
+  let epoch = slates_machine::clock::monotonic_ns();
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
     let handles: Vec<_> = groups
       .into_iter()
       .enumerate()
       .map(|(worker, (clients, agents))| {
         scope.spawn(move || {
+          let mut clock = Clock::host(epoch);
+          let started = clock.now();
           let conns = clients
             .into_iter()
-            .map(|client| Connection::new(client, epoch))
+            .map(|client| Connection::new(client, started))
             .collect();
           let think = Think {
             mean_ns: think_mean,
             draws: Rng(THINK_SEED ^ (n as u64) ^ ((worker as u64) << HIGH_HALF)),
           };
-          drive(conns, agents, epoch, worker, think)
+          drive(conns, agents, clock, worker, think)
         })
       })
       .collect();
@@ -1914,7 +1981,7 @@ fn level(
       .map(|handle| handle.join().unwrap())
       .collect()
   });
-  let wall_ns = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  let wall_ns = slates_machine::clock::monotonic_ns().saturating_sub(epoch);
   let mut total = Tally::default();
   for tally in tallies {
     total.absorb(tally);
@@ -2273,6 +2340,7 @@ mod tests {
       op_since: None,
       pause_ns: 0,
       attempt_sent_ns: 0,
+      handed_ns: 0,
     }
   }
 
@@ -2505,5 +2573,240 @@ mod tests {
       "{empty:?}"
     );
     assert!(empty.ends_with("\tmet\tno"), "{empty:?}");
+  }
+
+  /// Shape: shards of the stamp tests' daemon: one, so a request is served on the shard that reads its slot, and holding
+  /// that shard holds the request.
+  const STAMP_SHARDS: u16 = 1;
+  /// Shape: each probe's wall budget for the stamp tests' machine profile (milliseconds).
+  const PROBE_MS: u64 = 5;
+  /// Shape: how long the stamp tests' client retries the rendezvous while its daemon starts.
+  const START_WAIT: Duration = Duration::from_secs(10);
+  /// Shape: how long the stamp tests' host keeps the worker off its CPU: far past what one quiet shard takes to answer a
+  /// work's creation (microseconds), so the daemon answers while the worker is away, and well inside the watchdog's
+  /// one-second window, which the hold before it spends no more than this of.
+  const PREEMPTION: Duration = Duration::from_millis(100);
+  /// Shape: the budget of the observation that holds the daemon's shard, the daemon's own liveness budget.
+  const HOLD_BUDGET_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS;
+
+  /// A daemon's one shard held from another thread, released by a test's clock.
+  struct Hold {
+    /// The holder is on the shard.
+    held: std::sync::atomic::AtomicBool,
+    /// The holder stays while this is set.
+    holding: std::sync::atomic::AtomicBool,
+  }
+
+  impl Hold {
+    const fn new() -> Hold {
+      Hold {
+        held: std::sync::atomic::AtomicBool::new(false),
+        holding: std::sync::atomic::AtomicBool::new(false),
+      }
+    }
+
+    fn release(&self) {
+      self
+        .holding
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  /// The send test's hold, apart from the reply test's, since the two run at once.
+  static SEND_HOLD: Hold = Hold::new();
+  /// The reply test's hold.
+  static REPLY_HOLD: Hold = Hold::new();
+
+  /// Holds `daemon`'s control shard, its only one, until `hold` is released: an observation spinning on the shard,
+  /// waited for on its own thread. Returns once the shard is held.
+  fn hold_the_shard(daemon: &Daemon, hold: &'static Hold) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    hold.holding.store(true, SeqCst);
+    let observation = daemon
+      .observation_on_control(
+        HOLD_BUDGET_NS,
+        move |_: &mut slates_server::state::ShardState| {
+          hold.held.store(true, SeqCst);
+          while hold.holding.load(SeqCst) {
+            std::hint::spin_loop();
+          }
+        },
+      )
+      .unwrap();
+    let holder = std::thread::spawn(move || observation.wait().unwrap());
+    while !hold.held.load(SeqCst) {
+      std::thread::yield_now();
+    }
+    holder
+  }
+
+  /// A one-shard daemon with a green whose file `f` holds a client's slots, an observer client, and the worker's client.
+  fn stamp_daemon(tag: &str) -> (Daemon, Client, Client, VolumeId) {
+    let profile = MachineProfile::measure_patiently(&ProfileOptions {
+      budget_per_probe: Duration::from_millis(PROBE_MS),
+      codecs: false,
+      core_matrix: false,
+    })
+    .unwrap();
+    let instance = format!("lb-{tag}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(STAMP_SHARDS));
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-lb-{tag}-{}", std::process::id()),
+      },
+    )
+    .unwrap();
+    daemon.bootstrap(true).unwrap();
+    let started = Instant::now();
+    let connect = || loop {
+      match Client::connect(&instance, deadlines()) {
+        Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+          if started.elapsed() < START_WAIT =>
+        {
+          std::thread::yield_now();
+        }
+        other => return other.unwrap(),
+      }
+    };
+    let mut observer = connect();
+    let green = observer.create_green("g", false).unwrap();
+    let (seed, _) = observer.create_work(green, "seed").unwrap();
+    let bytes = vec![b'.'; usize::try_from(SLOTS_PER_FILE * SLOT_STRIDE).unwrap()];
+    observer.edit(seed, "f", 0, 0, &bytes).unwrap();
+    observer.submit(seed).unwrap();
+    let worker_client = connect();
+    (daemon, observer, worker_client, green)
+  }
+
+  /// A worker of one client about to create its work over `green`, on `client`, reading `read` for its clock.
+  fn worker_creating_a_work(client: Client, green: VolumeId, read: ClockRead) -> Worker {
+    let mut agent = agent_at_its_first_edit();
+    agent.green = green;
+    agent.work = None;
+    agent.step = Step::CreateWork;
+    Worker {
+      conns: vec![Connection::new(client, 0)],
+      agents: vec![agent],
+      ready: std::collections::BinaryHeap::new(),
+      think: Think {
+        mean_ns: 0,
+        draws: Rng(THINK_SEED),
+      },
+      tally: Tally::default(),
+      // Epoch 0: the worker's instants are the host's monotonic clock itself, the daemon's spans' clock.
+      clock: Clock { read, epoch: 0 },
+    }
+  }
+
+  /// Every span the daemon's one shard holds, drained.
+  fn spans(observer: &mut Client) -> (Vec<String>, Vec<slates_ipc::protocol::SpanRecord>) {
+    let mut names = Vec::new();
+    let mut spans = Vec::new();
+    loop {
+      let report = observer.telemetry(0).unwrap();
+      names = report
+        .chokepoints
+        .iter()
+        .map(|point| point.name.clone())
+        .collect();
+      spans.extend(report.spans);
+      if report.remaining == 0 {
+        return (names, spans);
+      }
+    }
+  }
+
+  /// The daemon's `ring.request` span of the request `word`: its slot read to its reply written, on the shard's clock.
+  fn ring_request(observer: &mut Client, word: u64) -> slates_ipc::protocol::SpanRecord {
+    let id = slates_client::RequestId::from_word(word);
+    let (names, spans) = spans(observer);
+    let point = names
+      .iter()
+      .position(|name| name == "ring.request")
+      .unwrap();
+    spans
+      .into_iter()
+      .find(|span| {
+        usize::try_from(span.point).unwrap() == point
+          && span.request_client == id.client
+          && span.request_sequence == id.sequence
+      })
+      .unwrap()
+  }
+
+  /// AC-9.1 (the oracle's bounds rest on the harness's instants, `support/load_oracle.rs`): a worker the host keeps off
+  /// its CPU before every clock read, long enough for the daemon to answer what it handed its ring, still stamps that
+  /// request sent before the daemon wrote its reply. Stamped after the send returned, it recorded a send 100 ms after
+  /// the answer, as the measurer's run recorded a submit sent after the verdict that reflected it (2026-11-18).
+  #[test]
+  fn a_send_is_stamped_before_the_daemon_can_have_answered_it() {
+    let (daemon, mut observer, client, green) = stamp_daemon("send");
+    let _ = spans(&mut observer);
+    let holder = hold_the_shard(&daemon, &SEND_HOLD);
+    // The host takes the worker off its CPU before each of its clock reads, and the shard, let go at the first, answers
+    // whatever the worker handed its ring while the worker is away.
+    let mut first = true;
+    let read: ClockRead = Box::new(move || {
+      if std::mem::take(&mut first) {
+        SEND_HOLD.release();
+      }
+      std::thread::sleep(PREEMPTION);
+      slates_machine::clock::monotonic_ns()
+    });
+    let mut worker = worker_creating_a_work(client, green, read);
+    assert!(worker.send(0), "the creation went");
+    let (word, sent_ns, _) = worker.agents[0].inflight.unwrap();
+    holder.join().unwrap();
+    while worker.agents[0].inflight.is_some() {
+      worker.drain(0);
+    }
+    assert_eq!(worker.agents[0].step, Step::Edit(0), "the work was made");
+    let ring = ring_request(&mut observer, word);
+    assert!(
+      sent_ns < ring.end_ns,
+      "the send is stamped {} ns after the daemon wrote its reply",
+      sent_ns.saturating_sub(ring.end_ns)
+    );
+    daemon.stop();
+  }
+
+  /// AC-9.1: a worker the host keeps off its CPU while it drains a ring, long enough for the reply it waits for to come,
+  /// stamps that reply no earlier than the daemon's reading of its request. Stamped before the ring was read, the
+  /// reply it took then was recorded before its request was even read.
+  #[test]
+  fn a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read() {
+    let (daemon, mut observer, client, green) = stamp_daemon("reply");
+    let _ = spans(&mut observer);
+    let holder = hold_the_shard(&daemon, &REPLY_HOLD);
+    let mut worker =
+      worker_creating_a_work(client, green, Box::new(slates_machine::clock::monotonic_ns));
+    assert!(worker.send(0), "the creation went");
+    let (word, sent_ns, _) = worker.agents[0].inflight.unwrap();
+    // The host takes the worker off its CPU right after its next clock read, the drain's: the shard, let go now,
+    // answers while it is away.
+    let mut preempted = true;
+    worker.clock.read = Box::new(move || {
+      let now = slates_machine::clock::monotonic_ns();
+      if std::mem::take(&mut preempted) {
+        REPLY_HOLD.release();
+        std::thread::sleep(PREEMPTION);
+      }
+      now
+    });
+    while worker.agents[0].inflight.is_some() {
+      worker.drain(0);
+    }
+    holder.join().unwrap();
+    assert_eq!(worker.agents[0].step, Step::Edit(0), "the work was made");
+    let replied_ns = sent_ns + only(&worker.tally, Kind::CreateWork)[0];
+    let ring = ring_request(&mut observer, word);
+    assert!(
+      replied_ns > ring.start_ns,
+      "the reply is stamped {} ns before the daemon read its request",
+      ring.start_ns.saturating_sub(replied_ns)
+    );
+    daemon.stop();
   }
 }

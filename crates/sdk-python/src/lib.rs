@@ -1762,11 +1762,62 @@ fn decode_pending(
   })
 }
 
-/// The `slates` extension module: the [`Client`] and [`AsyncClient`] classes and the SDK version.
+/// Format: the executable [`exec_command`] runs unless its caller names another: the `slates` binary, found on the
+/// `PATH` as a shell finds it. slates' AppArmor profile attaches to the binary's real path (A-370).
+const SLATES_PROGRAM: &str = "slates";
+
+/// The command that runs slates' chosen-path launcher (`slates exec`, §4.6 "The launcher"; A-370): `volume` shown at
+/// the existing directory `at` for `command`, in a namespace of its own (Linux). It returns the argument list for
+/// `subprocess.run` or `asyncio.create_subprocess_exec`, so the program spawns and awaits it as it would any command;
+/// the launcher finds the volume under `SLATES_ROOT` in the environment it is given. `apparmor_profile` is the
+/// launcher's AppArmor option, off unless `True`: on a host whose AppArmor restricts unprivileged user namespaces
+/// (Ubuntu 24.04 and later), the launcher then makes its namespace under slates' AppArmor profile for `program`, which
+/// an administrator loads as root ([`apparmor_profile`]); off, it never uses that profile. The grammar is every
+/// surface's (`slates_client::exec::ExecSpec`), so the `slates` command reads back exactly this request.
+#[pyfunction]
+#[pyo3(signature = (volume, at, command, *, apparmor_profile = false, program = None))]
+fn exec_command(
+  volume: String,
+  at: String,
+  command: Vec<String>,
+  apparmor_profile: bool,
+  program: Option<String>,
+) -> PyResult<Vec<String>> {
+  if command.is_empty() {
+    return Err(SlatesError::new_err("exec needs a command"));
+  }
+  let spec = slates_client::exec::ExecSpec {
+    volume,
+    at,
+    command,
+    apparmor: if apparmor_profile {
+      slates_client::exec::AppArmor::Profile
+    } else {
+      slates_client::exec::AppArmor::Off
+    },
+  };
+  let mut argv = vec![program.unwrap_or_else(|| SLATES_PROGRAM.to_owned())];
+  argv.extend(spec.arguments());
+  Ok(argv)
+}
+
+/// slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+/// text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. It grants that
+/// executable `userns,` and nothing else. Raises [`SlatesError`] for a path the profile cannot name exactly.
+#[pyfunction]
+fn apparmor_profile(executable: &str) -> PyResult<String> {
+  slates_client::exec::profile(executable)
+    .map_err(|refusal| SlatesError::new_err(refusal.to_string()))
+}
+
+/// The `slates` extension module: the [`Client`] and [`AsyncClient`] classes, the launcher's command and AppArmor
+/// profile (A-370), and the SDK version.
 #[pymodule]
 fn slates(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<Client>()?;
   module.add_class::<AsyncClient>()?;
+  module.add_function(wrap_pyfunction!(exec_command, module)?)?;
+  module.add_function(wrap_pyfunction!(apparmor_profile, module)?)?;
   module.add("SlatesError", module.py().get_type_bound::<SlatesError>())?;
   module.add("__version__", env!("CARGO_PKG_VERSION"))?;
   Ok(())

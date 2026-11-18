@@ -1128,10 +1128,38 @@ fn owed_position(
   Some(target)
 }
 
+/// The refusal a verb about to run on this (its owner) shard meets before it runs, when its reply could be held here
+/// and the shard already holds its bound of such replies ([`awaiting_bound`]): `Overloaded`, counted. Judged before
+/// the verb, so a refused verb changed nothing and its resend under the same id runs it once, as on a plain volume. A
+/// verb could be held when it changes a live-shipped volume ([`defer`]), or destroys one while the fleet places
+/// tombstones (`f > 0`, [`defer_destroy`]). Until 2026-11-18 the bound was judged only in [`defer`], after the verb's
+/// effects had committed with no completion record: the resend ran the verb again over them, so a directory's resend
+/// was refused `AlreadyExists` and an append landed twice (g232's finding).
+pub(crate) fn refuse_over_bound(
+  state: &mut ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<slates_ipc::protocol::ReplyBody> {
+  if held_replies(state) < awaiting_bound(state) {
+    return None;
+  }
+  let volume = body.volume().map(crate::verbs::to_db_volume)?;
+  let destroy = matches!(body, slates_ipc::protocol::RequestBody::Destroy { .. })
+    && state.fleet.configuration().quorum.f > 0;
+  let live = body.mutates_shard_image() && is_live(state, volume);
+  if !(destroy || live) {
+    return None;
+  }
+  state.count(LIVE_OVER_BOUND, 1);
+  Some(slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
+  })
+}
+
 /// Holds a verb's reply until `volume`'s log is durable at `target` (A-200): its effects are committed, its completion
 /// is recorded and its reply delivered then ([`resolve`]): `None`. The reply to give now instead, `Overloaded`
 /// (counted, nothing recorded, so a retry runs the verb again), when the shard already holds its bound of such
-/// replies.
+/// replies: a recorded verb met the bound before it ran ([`refuse_over_bound`]), so only an asynchronous outcome
+/// (a mapped file's sync, an image build) meets it here.
 pub(crate) fn defer(
   state: &mut ShardState,
   (volume, target): (slates_db::catalog::VolumeId, u64),
@@ -1286,21 +1314,15 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
-/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]): `None`. `Overloaded` now
-/// instead (counted, nothing recorded, so a retry runs the verb again) at the shard's bound of held replies.
+/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]). The shard's bound of held
+/// replies was judged before the destroy ran ([`refuse_over_bound`]), so it is never refused here, after its effects.
 pub(crate) fn defer_destroy(
   state: &mut ShardState,
   (volume, sequence): (slates_db::catalog::VolumeId, u64),
   (origin, id): (u64, slates_wire::request::RequestId),
   route: Option<crate::merge_service::ReplyRoute>,
   reply: slates_ipc::protocol::ReplyBody,
-) -> Option<slates_ipc::protocol::ReplyBody> {
-  if held_replies(state) >= awaiting_bound(state) {
-    state.count(LIVE_OVER_BOUND, 1);
-    return Some(slates_ipc::protocol::ReplyBody::Refused {
-      refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
-    });
-  }
+) {
   let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   let (target, waiting) = state
     .live
@@ -1314,7 +1336,6 @@ pub(crate) fn defer_destroy(
     .destroys_by_request
     .insert((origin, id.client, id.sequence), volume.bytes);
   state.count(DESTROY_AWAITED, 1);
-  None
 }
 
 /// Answers the destroys waiting on `volume` once its tombstone is region-placed ([`defer_destroy`]).
@@ -1382,7 +1403,9 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
 fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
   let id = slates_db::catalog::VolumeId { bytes: volume };
   let now = slates_rt::futures::now_ns();
-  let bound_ns = state.config.failover_slo_ns;
+  // The rule's own total ([`durable_spans`]): the failover delay, so a held verb is bounded as the transports' held
+  // replies are and follows the failover estimate wherever it is published, never a number of its own.
+  let bound_ns = durable_spans(state).total_ns;
   let keys: Vec<([u8; 16], u64)> = state
     .live
     .awaiting
@@ -1418,7 +1441,8 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
 fn judge_held_destroys(state: &mut ShardState) {
   let now = slates_rt::futures::now_ns();
-  let bound_ns = state.config.failover_slo_ns;
+  // The rule's own total, as [`judge_held`] reads it.
+  let bound_ns = durable_spans(state).total_ns;
   let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
   for volume in volumes {
     let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
@@ -4962,6 +4986,9 @@ mod tests {
         live_shipped: true,
         live_holders: holders.map(|holders| slates_db::catalog::LiveHolders { epoch: 1, holders }),
         work_of: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
       }
       .to_record_bytes()
     };

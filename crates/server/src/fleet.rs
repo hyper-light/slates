@@ -1483,6 +1483,39 @@ pub(crate) fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
   *count = count.saturating_add(1);
 }
 
+/// A record session `anchor`'s node dialed to this one, counted in [`ShardState::dialed_in`] for as long as this node
+/// serves it ([`serve_peer_records`]), however the serve ends (A-337). Made and dropped on the control shard, where
+/// sessions are served.
+struct DialedIn {
+  anchor: HostId,
+}
+
+impl DialedIn {
+  /// Counts a session `anchor` dialed, for this guard's life.
+  fn counted(anchor: HostId) -> DialedIn {
+    let _ = state::with_state_counted(|s| {
+      let sessions = s.dialed_in.entry(anchor).or_insert(0);
+      *sessions = sessions.saturating_add(1);
+    });
+    DialedIn { anchor }
+  }
+}
+
+impl Drop for DialedIn {
+  fn drop(&mut self) {
+    let anchor = self.anchor;
+    let _ = state::with_state_counted(|s| {
+      let left = s.dialed_in.get_mut(&anchor).map(|sessions| {
+        *sessions = sessions.saturating_sub(1);
+        *sessions
+      });
+      if left == Some(0) {
+        s.dialed_in.remove(&anchor);
+      }
+    });
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1524,6 +1557,8 @@ async fn serve_peer_records(
       |peer| peer.anchor,
     );
   let seed = crate::deploy::member_id(peer_anchor, 0);
+  // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
+  let _dialed_in = DialedIn::counted(peer_anchor);
   // The membership plane's secret for this connection (A-67 H-2b), should the peer announce an epoch on it.
   let plane_secret = endpoint.export_secret(hyper_datagram::EXPORTER_LABEL).ok();
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
@@ -1709,6 +1744,14 @@ async fn serve_peer_records(
               .get(&peer_anchor)
               .map_or(seed, |learned| learned.host);
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          crate::takeover::TAKEOVER_LEDGER_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
           stream if is_content_stream(stream) => {
@@ -1936,13 +1979,16 @@ pub(crate) fn hold_checked_record(
       // in the window between the owner's install and the holder's never placed
       // (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`, sibling). With no acceptor left behind, the
       // owner's next re-ship after the install creates it at the current generation and is accepted.
+      // A holder's acceptor keeps what changes of its positions (A-367): its shard's recovery image carries each
+      // position as its own piece, so a publication carries the records accepted since the last one.
       let mut acceptor = Acceptor::new(
         local,
         Authority {
           generation,
           owner: peer_host,
         },
-      );
+      )
+      .tracking_changes();
       let result = acceptor.accept(record);
       if result.is_ok() {
         state.holder_records.insert(record.object, acceptor);
@@ -4550,16 +4596,21 @@ async fn adopt_and_serve(
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
-  materialize_adopted_objects(origin, local, budget).await;
+  materialize_adopted_objects(origin, local, budget, in_flight).await;
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
-async fn materialize_adopted_objects(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_adopted_objects(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, local, budget).await;
-  materialize_pending_greens(origin, local, budget).await;
+  materialize_pending_greens(origin, local, budget, in_flight).await;
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -4703,7 +4754,12 @@ const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 /// gathering still running is not counted: each is a finite task of this shard, which the attempt that started it was
 /// counted for. Before, every branch retried each period without end: the green-share takeover test once waited out its
 /// 4,000-period budget so (GAPS 2026-11-09).
-async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_pending_greens(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let pending: Vec<(ObjectId, crate::state::PendingGreen)> = state::with_state(|s| {
     s.pending_green_materializations
       .iter()
@@ -4713,7 +4769,8 @@ async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBu
   .unwrap_or_default();
   let paging = state::with_state(|s| crate::takeover::rounds_still_paging(s)).unwrap_or_default();
   for (object, pending) in pending {
-    let Err(waited) = materialize_green(origin, object, &pending, budget).await else {
+    let Err(waited) = materialize_green(origin, (object, local), &pending, budget, in_flight).await
+    else {
       continue;
     };
     count_refusal(waited.counter());
@@ -4842,9 +4899,10 @@ fn paging_round(
 /// owner shard (and is no longer pending), else what it waited on.
 async fn materialize_green(
   origin: u16,
-  object: ObjectId,
+  (object, local): (ObjectId, HostId),
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
 ) -> Result<(), GreenWait> {
   // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
   // record before its current catalog is committed): the green's access list. Until it and its
@@ -4868,7 +4926,7 @@ async fn materialize_green(
   }
   // This node's replica at the adopted version (A-333), or what it waits on: its chain and inputs, judged before the
   // adopted record's placement, as the chain was gathered before it.
-  ready_engine(object, pending, budget).await?;
+  ready_engine(object, pending, budget, (local, in_flight)).await?;
   // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
   // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
   // so the successor's record plane writes the green's next versions at the promotion epoch.
@@ -4947,18 +5005,35 @@ fn finish_green(object: ObjectId) {
 }
 
 /// Brings this node's replica of `object` to the version its takeover adopted (A-333), or says what it waits on: `Ok`
-/// once it is there with the adopted identity. Inputs of the versions the replica lacks that this node does not hold are
-/// fetched first ([`fetch_green_inputs`]).
+/// once it is there with the adopted identity. The records of versions below the adopted one this node does not know
+/// are adopted first, position by position ([`adopt_missing_records`], A-364), and the inputs of the versions the
+/// replica lacks that this node does not hold are fetched ([`fetch_green_inputs`]).
 async fn ready_engine(
   object: ObjectId,
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
+  (local, in_flight): (HostId, &mut Vec<Dispatch>),
 ) -> Result<(), GreenWait> {
   use crate::green_adopt::Engine;
   let adopted = &pending.merge;
   let at = (adopted.version, adopted.identity);
   let mut engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
     .ok_or(GreenWait::Building)?;
+  if let Engine::RecordsShort(first) = engine {
+    // A successor two or more versions behind the quorum lacks the records between its own and the adopted one, which
+    // phase one's pages never report (each holder's highest record alone): adopted position by position (A-364).
+    adopt_missing_records(
+      object,
+      pending,
+      (first, adopted.version),
+      local,
+      budget,
+      in_flight,
+    )
+    .await?;
+    engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
+      .ok_or(GreenWait::Building)?;
+  }
   if let Engine::Unheld(unheld) = engine {
     // A successor one or more versions behind the quorum holds the adopted record (its adoption committed it here) but
     // not those versions' inputs, which the survivors that reported the adopted version hold (GAPS 2026-11-09).
@@ -4974,6 +5049,30 @@ async fn ready_engine(
     Engine::RecordsShort(_) => Err(GreenWait::Chain),
     Engine::Refused => Err(GreenWait::Refused),
   }
+}
+
+/// Adopts the records of a taken-over green's versions `from..to` this node (`local`) does not know (A-364, GAP-A9-7's
+/// record half): `from` the first version whose record its ledger lacks (`green_adopt::Engine::RecordsShort`), `to` the
+/// version the takeover round of `pending.departed` adopted, position by position (`takeover::adopt_ledger_positions`),
+/// each committed again under this node. `Err(GreenWait::Chain)` while the range is not adopted whole (the attempt
+/// waits, toward its bound), and for a green no round adopted (a mirror's promotion, with no round to ask under). The
+/// dispatches go to the coordinator (`in_flight`) to recover their stragglers.
+async fn adopt_missing_records(
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  (from, to): (u64, u64),
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) -> Result<(), GreenWait> {
+  if from >= to {
+    return Err(GreenWait::Chain);
+  }
+  let departed = pending.departed.ok_or(GreenWait::Chain)?;
+  let (adopted, dispatches) =
+    crate::takeover::adopt_ledger_positions(departed, object, (from, to), local, budget).await;
+  in_flight.extend(dispatches);
+  adopted.map(|_| ()).map_err(|_| GreenWait::Chain)
 }
 
 /// The adoption of `object` this attempt hands its owner shard (A-333), once its replica is at the adopted version
@@ -5005,6 +5104,9 @@ fn handed_green(
     owner: adopted.owner.clone(),
     access: catalog.access.clone(),
     catalog_sequence,
+    write: catalog.write,
+    write_version: catalog.write_version,
+    signers: catalog.signers.clone(),
     head: adopted.version,
     identity: adopted.identity,
     origin,
@@ -5540,7 +5642,11 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   }
   let outcome = state::with_state(|s| match served {
     Some(Ok(())) => {
-      s.pending_materializations.remove(&object);
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
+      if let Some(pending) = s.pending_materializations.remove(&object) {
+        s.failover
+          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
+      }
       s.pending_catalogs.remove(&object);
       Ok(())
     }
@@ -6256,6 +6362,16 @@ enum DirectContact {
   /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
   /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
   Returned,
+  /// This node is the pair's canonical dialer (its anchor is the lower one) and serves a record session the peer dialed
+  /// to it, which the peer dials and keeps only while it keeps direct contact with this node (A-337): kept, so the pair's
+  /// plane is keyed whenever the peer's rule keeps it, whatever this node's own view says. Each role rule above is kept
+  /// from both sides only while both sides hold the same view: a learner told stale voters (a seat change moves no
+  /// configuration version, so no learner fetches on it, and a learner answered by another learner takes that one's
+  /// stale voters) dropped a voter as `OutsideNeighbourhood` while the voter kept it `AsVoter`, and where the learner was
+  /// the pair's lower anchor the pair was never keyed and its probe mesh never formed (fleet test
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18).
+  Dialed,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -6315,9 +6431,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::Staged
   } else if state.council.is_voter(state.fleet.host()) || state.root.is_voter(state.fleet.host()) {
     DirectContact::AsVoter
+  } else if dialed_by_a_higher_anchor(state, peer) {
+    DirectContact::Dialed
   } else {
     DirectContact::OutsideNeighbourhood
   }
+}
+
+/// Whether this node is the pair's canonical dialer with `peer` (its anchor below the peer's, the side that announces the
+/// pair's plane epoch) and serves a record session the peer dialed to it ([`ShardState::dialed_in`]): the peer keeps
+/// direct contact with this node (A-337). Only the canonical dialer follows a peer's session, so two nodes never keep each
+/// other by their sessions alone: the higher anchor's contact never rests on the lower's dial.
+fn dialed_by_a_higher_anchor(state: &ShardState, peer: HostId) -> bool {
+  crate::member_task::anchor_of(state, peer).is_some_and(|anchor| {
+    anchor > state.origin_anchor
+      && state
+        .dialed_in
+        .get(&anchor)
+        .is_some_and(|sessions| *sessions > 0)
+  })
 }
 
 /// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever
@@ -8934,6 +9066,21 @@ impl Fan {
   }
 }
 
+/// Refreshes this node's failover estimate for the period (§4.8 "Derived constants", A-363): the detection term from the
+/// member plane (SWIM's count of periods from a crashed peer's last answer to its condemnation, each at the detector's
+/// measured period's running tail, `MemberPlane::detection`), and the confirmation from the council's election timing
+/// this period derived, at the coordinator's measured period. The recovery term moves as takeovers and volumes complete
+/// (`takeover::drive_host_takeover`, `fleet::materialize`). Nothing sets the estimate: it is what this node measured.
+fn refresh_failover(state: &mut ShardState) {
+  let detection = state
+    .plane
+    .plane
+    .as_ref()
+    .and_then(slates_cluster::member_plane::MemberPlane::detection);
+  let timing = state.council_timing;
+  state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+}
+
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
 /// and takeover"): one task per node that, each period, ships every unplaced head to all its candidates in
 /// one commit and drives every owed takeover over all surviving holders, borrowing the holder sessions the
@@ -8982,6 +9129,9 @@ async fn run_record_plane(local: HostId) {
     // it (`merge_service::PLACED_WITHIN_PERIOD`).
     let _ = state::with_state(|s| {
       s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+      // The period's length is a sample of the coordinator's period, which the council's death watch counts in
+      // (A-363): a starved coordinator's periods stretch, and its failover estimate with them.
+      s.failover.period_began(slates_rt::futures::now_ns());
     });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
@@ -8992,6 +9142,9 @@ async fn run_record_plane(local: HostId) {
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.
     drive_config_council(local, budget, &mut council_timer, &mut in_flight).await;
+    // The failover estimate for this period, from the detector as it stands and the council's timing just derived
+    // (A-363): published in the daemon's status as it moves.
+    let _ = state::with_state_counted(refresh_failover);
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
     // root-voter sessions, sequential with the council's and the record ships, so it never contends.
     drive_root_group(local, budget, &mut root_timer, &mut in_flight).await;
@@ -10218,7 +10371,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 26] = [
+    let kinds: [(&str, u64); 27] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -10254,6 +10407,7 @@ mod request_kind_tests {
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
       ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
+      ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
     ];
     let mut shared = Vec::new();
     for (at, (name, kind)) in kinds.iter().enumerate() {
