@@ -6990,6 +6990,26 @@ reconstruction budget are derived, never fixed (D-O6).
 > archive's layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first
 > publication's live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
 >
+> **Status (2026-11-18, A-397, g251: a takeover's volume made in turns, live log or placed seal).** After the fetch, a
+> live volume's layout as an archive, its restore and its making were still a turn each (0.14 to 0.32 s at 300 MB),
+> and a placed seal's whole takeover (the held archive copied out on the control shard, the restore, the volume made
+> and its tree laid) ran in two turns, the second behind a call whose deadline was a period, so the 1.99 GB, 97,254-file
+> kernel base volume held its owner shard for seconds and the next period's attempt began again (g232). Now one task
+> of the owner shard makes either (`fleet::make_taken`, joined by later attempts as A-374's live one was): the control
+> shard copies a placed seal's held archive out a copy slice a turn (`fleet::held_archive_in_turns`, counted
+> `fleet.materialize.archive_slices`) and opens an envelope in turns (A-347); the task restores the archive a slice a
+> turn (`fleet::restore_in_turns` over A-391's `Planning` and `Restoring`, admitted by `verbs::restore_admitted` once
+> its need is known, counted `fleet.materialize.restore_slices`), begins the volume (`verbs::begin_making`: the
+> admission and the create), lays its tree a slice a turn with writes of a copy slice (`verbs::Populating`, the hard
+> links' bytes compared a slice at a time too; counted `fleet.materialize.populate_slices`), and finishes it
+> (`verbs::finish_making`) and publishes it before it is served, each a turn. The volume being made lives in
+> `ShardState::making_volumes` between turns; a refusal, a give-up (the control shard forgetting the record:
+> `fleet.materialize.forgotten`) or a task that ends any way but made discards it with its credits given back
+> (`verbs::discard_making`). Held by `a_placed_seals_takeover_is_restored_and_laid_in_turns`
+> (`crates/server/tests/fleet.rs`) and `a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once` (`crates/server/src/verbs.rs`).
+> Owed: a live volume's layout as an archive (`live_ship::archive_of`, a turn), the held manifest's decode and its chunk
+> list (a turn of the control shard, metadata-sized), and the first publication (g230's item).
+>
 > **Status (2026-11-18, A-386, g251: a takeover's fetch of a live log in turns).** The fetch the rebuild starts from was
 > still one turn on each end: the candidate the successor adopted cloned every entry it held and copied them all into
 > one answer grown as it went, in a turn of its control shard, and the successor copied every payload back out of the
@@ -28346,3 +28366,40 @@ alone cannot see it, since one call is the same steps).
 Applied in the same change to: D-17 (its amendment line), GAPS (A-347's one-turn walks: the restore's steps exist; the
 server still restores in one turn until the population and the plain takeover path follow),
 `crates/archive/src/{restore,lib}.rs`, `crates/archive/tests/restore.rs`.
+
+### A-397 — A taken-over volume is made by one owner-shard task in turns, from a live log or a placed seal
+
+*2026-11-18, g251 (the coordinator's order: archive, restore and population in turns; g232's handoff of the kernel base
+volume's takeover).* §4.8 "Promotion and takeover" and §4.10: A-374 made a live volume in turns of its owner shard but
+left its archive layout, restore and making a turn each, and a placed seal's takeover was made in one owner-shard turn
+behind `xshard::call_within` with a period's deadline, the held archive copied out whole on the control shard before it,
+every period's attempt again. The 1.99 GB, 97,254-file kernel base volume (g232) held its owner shard for seconds.
+**Now:** one task of the owner shard (`fleet::make_taken`, generalizing A-374's `make_live`) makes either source
+(`fleet::Source::Live` or `Source::Archive`), claiming the volume's record (`ShardState::making_taken_over`) so every
+later attempt joins it (`fleet::making_of` for both sources). Before the task, the control shard copies a placed seal's
+held archive out of the held store a copy slice of chunks a turn (`fleet::held_archive_in_turns`: `held_manifest`, then
+`held_chunk` for each chunk it names) and opens an envelope in turns (A-347). The task: a live log rebuilt in turns
+(A-374, `fleet::rebuild_in_turns`) and laid out as an archive, or a placed seal's lineage key adopted; then, unless the
+volume is made already, the archive restored a slice a turn (`fleet::restore_in_turns`: A-391's `Planning`, then
+`verbs::restore_admitted` at the known need under the pressure hold, then `Restoring`); the volume begun
+(`verbs::begin_making`: the admission and the create, which g229's candidate claim takes over next); its tree laid a
+slice a turn (`verbs::Populating`, `verbs::populate_making`: each file checked and each hard link's bytes compared a slice
+at a time before the volume is touched, the links counted, the directories made, each file made and its data written a
+copy slice of the quantum, a page at least, a write, then the attributes, owners and times, files then directories
+deepest first, then the root); then finished (`verbs::finish_making`: the versions hold, the record, the sealed head)
+and published before it is served, each a turn. Each turn is held to the seal turns' share of the quantum
+(`fleet::making_slice_ns`). The volume being made is held in `ShardState::making_volumes`, not by the task, and a
+refusal, a give-up (`fleet.materialize.forgotten`: a turn finds the record the control shard forgot) or any end but its
+making discards it with its credits (`verbs::discard_making`); a later `begin_making` discards one left over first.
+`verbs::materialize_taken_over`, `restore_taken_over` and `populate_restored` remain, test-only, as the pieces run to
+their ends in one call.
+
+Tests: `a_placed_seals_takeover_is_restored_and_laid_in_turns` (three nodes, a sealed volume of 24 distinct files, the
+survivors' turns cut to a piece; the held archive copied in turns, more restore turns and more laying turns than files,
+one materialization begun and none twice, both survivors' longest steps under the window, every file read back),
+`a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once` (a sparse file around a hole, hard links, a symlink, a FIFO,
+nested directories and an attribute laid a piece a step and a byte a write equal the tree laid in one call), the live
+takeover test and the envelope test unchanged.
+
+Applied in the same change to: §4.10's status (A-397), GAPS (A-347's one-turn walks: the takeover's restore and
+population, both sources), `crates/server/src/{fleet,verbs,state,daemon}.rs`, `crates/server/tests/fleet.rs`.
