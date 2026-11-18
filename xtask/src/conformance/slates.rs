@@ -637,7 +637,7 @@ impl Drop for Mount {
 /// Whether the drive answers: Windows keeps no mount table a user lists, and a WinFsp drive's root answers a look-up
 /// once it serves (`crates/cli/tests/winfsp.rs`, `wait_ready`).
 #[cfg(windows)]
-fn is_mounted(path: &Path) -> bool {
+pub(super) fn is_mounted(path: &Path) -> bool {
   std::fs::metadata(path).is_ok()
 }
 
@@ -651,7 +651,7 @@ fn free_drive() -> Result<String, Failure> {
 
 /// Whether the mount table lists `path`.
 #[cfg(unix)]
-fn is_mounted(path: &Path) -> bool {
+pub(super) fn is_mounted(path: &Path) -> bool {
   let listed = stdout_of("mount", &[]);
   listed
     .lines()

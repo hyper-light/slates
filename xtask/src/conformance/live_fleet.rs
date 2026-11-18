@@ -465,10 +465,22 @@ mod tests {
     eprintln!(
       "the size change answered after {answered:?} ({changed:?}); the owner's late stable replies: {late}"
     );
+    // The session goes with the file still open, as a suite killed mid-run leaves its files: its mount must go too.
+    // The macOS mount is hard (A-229), so one left behind with its daemon gone hangs whatever touches it (on CI, the
+    // cache's walk of `target/`); on 2026-11-18 this test left `slates:/livewait-vol` mounted, the plain unmount refused
+    // busy.
+    let mount_point = session.mount.path().to_path_buf();
     drop(session);
+    let left_mounted = super::super::slates::is_mounted(&mount_point);
+    drop(handle);
     assert!(
       changed.is_ok(),
       "a writer waiting for stopped candidates failed after {answered:?}: {changed:?} ({late} late stable replies)"
+    );
+    assert!(
+      !left_mounted,
+      "the session's mount {} outlived its session",
+      mount_point.display()
     );
   }
 }
