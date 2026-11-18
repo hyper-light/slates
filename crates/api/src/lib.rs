@@ -162,10 +162,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// day). 21: a takeover past the volume's tolerance shows in its loss report (`VolumeTakeover::past_tolerance`, a
 /// [`PastTolerance`] naming the [`Shortfall`] of its registers' cohort and of its live log's recorded holders): until
 /// then a consumer could not tell a takeover that may have lost writes acknowledged only to the lost hosts from one that
-/// kept every one (A-332; the same day).
+/// kept every one (A-332; the same day). 22: a reply held for durability past the failover SLO is a typed
+/// retry (`RetryCause::DurabilityPending`, the wire's appended `Refusal::DurabilityPending`): until then a write whose
+/// log or tombstone could not be held where its reply waits for it was never answered (A-354; the same day). 23: a
+/// start a host waits on needs no wall-clock deadline of its own: [`StartSpec::until_served`] asks the anchor to stop when its daemons crash-loop before any of them has served, and
+/// [`Instance::wait_for`] with that anchor's child then ends [`StartFault::NeverServed`]; until then an anchor looped on
+/// such an instance for good (A-119), so a host bounded its wait by a second it picked, and a slow start under load
+/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 21;
+pub const CONTRACT: u32 = 23;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
