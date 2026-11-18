@@ -5646,11 +5646,6 @@ fn live_ship(
   if !live_shipped || record.policy.live_shipped {
     return set_live_shipping(state, volume, live_shipped);
   }
-  let Some(request) = state.current_request else {
-    return refused(Refusal::Unsupported {
-      feature: "a live-ship outside a recorded request".to_owned(),
-    });
-  };
   let object = ObjectId(volume.bytes);
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
@@ -5660,6 +5655,17 @@ fn live_ship(
     .into_iter()
     .filter(|host| *host != local)
     .collect();
+  // With no candidate to ask (a laptop, `f = 0`), the verdict over no answers is decided here, by the same function the
+  // task's asks are judged by; nothing waits.
+  if candidates.is_empty() {
+    let verdict = crate::live_ship::admission_verdict(&candidates, &[]);
+    return crate::live_ship::ship_after(state, volume, verdict);
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a live-ship outside a recorded request".to_owned(),
+    });
+  };
   let admit = slates_db::live::Admit {
     object,
     size: record.policy.size,

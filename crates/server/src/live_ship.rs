@@ -5271,12 +5271,40 @@ const LIVE_SHIP_NO_ROOM: &str = "fleet.live.ship_refused.no_room";
 /// Format: a counter name in the daemon's status report.
 const LIVE_SHIP_UNANSWERED: &str = "fleet.live.ship_unanswered";
 
+/// What a `live-ship` that turns `volume`'s live shipping on answers once its candidates' admissions are judged (§4.2,
+/// A-401): the flag recorded when none refused, the candidates that gave no answer counted; `BudgetExceeded` with the
+/// least room a candidate named otherwise, the flag left as it was. The same whether the verdict came from a task's asks
+/// ([`admit_then_ship`]) or there was no candidate to ask (`verbs::live_ship`).
+pub(crate) fn ship_after(
+  state: &mut ShardState,
+  volume: slates_ipc::protocol::VolumeId,
+  verdict: Asked,
+) -> slates_ipc::protocol::ReplyBody {
+  match verdict {
+    Asked::Admitted { unanswered } => {
+      if unanswered > 0 {
+        state.count(
+          LIVE_SHIP_UNANSWERED,
+          u64::try_from(unanswered).unwrap_or(u64::MAX),
+        );
+      }
+      crate::verbs::set_live_shipping(state, volume, true)
+    }
+    Asked::NoRoom(available) => {
+      state.count(LIVE_SHIP_NO_ROOM, 1);
+      slates_ipc::protocol::ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::BudgetExceeded { available },
+      }
+    }
+  }
+}
+
 /// The task a `live-ship` that turns a volume's live shipping on runs (§4.2, A-401; `verbs::live_ship`): on its owner
 /// shard `origin`, it asks every candidate of the volume's placement to make the claim's admission, from the control
 /// shard `control`, which holds the sessions ([`ask_admissions`]), then completes the request as one atom
 /// (`image::complete`): the flag recorded when no candidate refused, else `BudgetExceeded` with the least room a
-/// candidate named, nothing recorded but the outcome. So nothing is published before every candidate that answered
-/// holds its claim. With no candidates (a laptop, `f = 0`) nothing is asked and the flag is recorded, the same path.
+/// candidate named, nothing recorded but the outcome ([`ship_after`]). So nothing is published before every candidate
+/// that answered holds its claim.
 pub(crate) async fn admit_then_ship(
   (origin, control): (u16, u16),
   request: (u64, slates_wire::request::RequestId),
@@ -5284,42 +5312,21 @@ pub(crate) async fn admit_then_ship(
   admit: slates_db::live::Admit,
   candidates: Vec<HostId>,
 ) {
-  let answers = if candidates.is_empty() {
-    Vec::new()
-  } else {
-    let asked = candidates.clone();
-    let deadline = crate::fleet::live_budget()
-      .max_deadline_ns()
-      .saturating_mul(2);
-    crate::xshard::task_within(
-      origin,
-      control,
-      move || ask_admissions(admit, asked),
-      deadline,
-    )
-    .await
-    .unwrap_or_default()
-  };
+  let asked = candidates.clone();
+  let deadline = crate::fleet::live_budget()
+    .max_deadline_ns()
+    .saturating_mul(2);
+  let answers = crate::xshard::task_within(
+    origin,
+    control,
+    move || ask_admissions(admit, asked),
+    deadline,
+  )
+  .await
+  .unwrap_or_default();
   let verdict = admission_verdict(&candidates, &answers);
-  let completed = state::with_state(|s| {
-    crate::image::complete(s, request, |s| match verdict {
-      Asked::Admitted { unanswered } => {
-        if unanswered > 0 {
-          s.count(
-            LIVE_SHIP_UNANSWERED,
-            u64::try_from(unanswered).unwrap_or(u64::MAX),
-          );
-        }
-        crate::verbs::set_live_shipping(s, volume, true)
-      }
-      Asked::NoRoom(available) => {
-        s.count(LIVE_SHIP_NO_ROOM, 1);
-        slates_ipc::protocol::ReplyBody::Refused {
-          refusal: slates_ipc::protocol::Refusal::BudgetExceeded { available },
-        }
-      }
-    })
-  });
+  let completed =
+    state::with_state(|s| crate::image::complete(s, request, |s| ship_after(s, volume, verdict)));
   if let Some((reply, route)) = completed {
     let _ = state::with_state_counted(|s| crate::image::deliver(s, reply, route));
   }
