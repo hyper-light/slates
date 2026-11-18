@@ -30,6 +30,7 @@ jobs:
           RUSTDOCFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc"
           TSAN_OPTIONS: "halt_on_error=0"
         run: |
+          set +e
           mkdir -p target/diag
           for i in $(seq 1 16); do
             for t in pollers_old pollers; do
