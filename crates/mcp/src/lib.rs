@@ -1520,6 +1520,16 @@ pub fn status_json(r: &StatusReport) -> Value {
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
     "takeover_kept": r.takeover_kept,
+    "loss": {
+      "at_risk_ns": r.loss.at_risk_ns,
+      "placed_sequence": r.loss.placed_sequence,
+      "live_shipped": r.loss.live_shipped,
+      "taken_over": r.loss.taken_over.as_ref().map(|taken| json!({
+        "epoch": taken.epoch,
+        "head_sequence": taken.head_sequence,
+        "from_live_log": taken.from_live_log,
+      })),
+    },
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
