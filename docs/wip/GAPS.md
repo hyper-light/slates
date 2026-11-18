@@ -11,9 +11,11 @@
 > **Owed, in order:**
 > - the starter handed the launcher's authority on every platform (Linux: the anchor passes the segment's descriptor
 >   back to its starter);
-> - the daemon's side (A-285's owner): the modes kept and enforced per consumer and volume, bypass landing at once,
->   forbid refused `PolicyRefusal`, approvals of merges, signed work verified, and the verbs that set a policy and hand
->   out the statement a signer signs; then `Instance::set_write_policy` / `write_policy`;
+> - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
+>   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3); owed: a consumer's own mode,
+>   merges under a mode and their approvals, a present-only verb (until then `plan_landing` refuses a bypass volume
+>   rather than write it), the MCP and SDK land verb under the mode, signed work verified with the statement a signer
+>   signs and the trusted signers a launcher registers;
 > - typed fields on the wire for an overlay's drift, a presentation's conflicts, a landing target's refusal and a
 >   merge's versions (the work's base beside the head), replacing the crate's reading of the status text;
 > - a paged volume listing; typed audit kinds and grant states;
@@ -154,7 +156,14 @@
 > `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
 > A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
 > 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
-> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane.
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane. It also fails on macOS whenever d, the node
+> the test deafens to every record, is the green's successor: d adopts the green but holds none of its chain, so it can
+> never rebuild it (GAP-A9-7's record half), and d's resend is answered `NotFound`. Seen twice on 2026-11-17
+> (adas-macbook-pro, debug, with A-288's change): at load 190 on 7c6faee27 (`merge.takeover_incomplete` 4,561, before
+> the give-up existed), and at load 42 to 47 merged with main 58a37794c (given up after 100 attempts, the last waiting
+> on its chain). In both, d owned the green, and no node retired a work route (`fleet.work_route.retired` absent). Host
+> ids are drawn fresh each run, so it passes whenever another survivor is the successor (5 s at load 104, merged with
+> b7c294959). **Owed:** a deafened node that cannot be the green's successor.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -235,16 +244,36 @@
 > - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
 > - the cross-region case is not yet tested;
 > - the 0.35 ms could be overlapped by a pipelined dispatch;
-> - **the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8).** Only a volume's
->   owner writes its tombstone, and a work never comes back to have one, so nothing retires its catalog record. The
->   adopter keeps it placed (`fleet::owed_adopted_work_catalogs`, which scans every adopted work catalog each record
->   period), its holders keep it in `holder_records`, and `pending_catalogs` drops an entry only at a materialization or
->   a tombstone, neither of which comes for a work. Every work alive when its owner dies is held so for as long as the
->   fleet runs. Found by reading on 2026-11-17, in the sibling sweep after A-255 landed; no test shows it yet. How the
->   route should end is a decision for Ada. One option: the adopter retires the record once the green's owner holds no
->   completion of the work's submits, which needs the work's id in the merge record beside the request key. The other:
->   a cap per adopter, derived from the fleet's outstanding-completion capacity, which retires the oldest record first,
->   and a resend past it is refused `NotFound`.
+> - ~~the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8)~~: **ended
+>   (2026-11-17, A-288).** Nothing retired a work's catalog record: only a volume's owner writes its tombstone, and a
+>   work never comes back, so every work alive at an owner's death was held, by its adopter and every holder, for as
+>   long as the fleet ran. Now the route is kept only while the green's owner holds a completion of the work's submits
+>   that the route can reach, one a client on another node than the work's owner made and has not acknowledged. A
+>   client of the owner's own node resends to that node, never through the route. The merge record (format 2) and
+>   chain entry (version 3) name such a submit's work, and the successor records the completion under it
+>   (`CompletionRecord::work`, `Partition::completions_routed_by`). The route's adopter asks the green's owner each
+>   period (`crate::work_route`, fleet stream 25), and a route answered "none" closes through the destroy's two
+>   tombstone stages. The owner also drops its own takeover copies when a tombstone retires, which a destroyed
+>   taken-over volume had kept too. Red first: on main 7c6faee27 the route was still held by both survivors after the
+>   acknowledgement (`retired false, counted 0`, 429 s on a loaded Mac).
+>   `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` now also holds a work its own owner's
+>   client submitted from, retired with nothing acknowledged. That form is red on main dbf53afa2 too (`its route
+>   retired false; ... retired false, counted 0; held at the end [Ok(true), Ok(true)]`, 860 s at load 57 to 91), and
+>   green with the fix on the same Mac (macOS arm64, debug): 6.91 s at load 11 to 37 on 7c6faee27, and 8.56 s at load
+>   108 merged with main b7c294959. Both routes retired on both survivors, counted twice. Still held, A-288's open list:
+>   - a route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is
+>     kept: the green has no owner to answer;
+>   - a route to a green its successor gave up on (the give-up after the failover SLO's attempts, d3f4ddbe2): the green
+>     is never served, so its shard answers no question and the route stays, though nothing it leads to can answer.
+>     The next piece answers such a green from its partition's count;
+>   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
+>     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
+>     either, and RIFL's client leases are not built;
+>   - a route kept by an adopter that restarts warm. Its holder copies come back with it, but the routes it kept
+>     (`pending_catalogs`) do not, so it neither re-places nor retires them. This is A-255's own gap, found by reading
+>     on 2026-11-17; no test shows it yet.
+>
+>   `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
 >
 > `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 
@@ -1299,7 +1328,11 @@
 > `docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`. Still open from it:
 > - **A kill the rule does not touch (open).** `rungs9/ab-clean-2`'s lapse came 6.4 s after its last wedged line and right
 >   after `shard 0 is spinning: 1045 ms of CPU without a step`, on a shard that had run 580 ms of CPU in the last 1.3 s.
->   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established.
+>   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established. Seen
+>   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
+>   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
+>   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
+>   at load 70 to 116, so it did not reproduce.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
