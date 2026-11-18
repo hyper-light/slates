@@ -526,7 +526,14 @@ impl Agent {
         self.step = Step::Submit;
         record(tally, kind, elapsed);
       }
-      (Step::Submit, ReplyBody::Submitted { version, conflicts }) => {
+      // An agent's work conflicts in its few slots, far under what one reply carries, so no window is ever counted past
+      // the reply (A-267's `conflicts_elided`).
+      (
+        Step::Submit,
+        ReplyBody::Submitted {
+          version, conflicts, ..
+        },
+      ) => {
         self.submitted(version, conflicts, (sent_ns, replied_ns), tally);
       }
       (Step::ResolveVersion, ReplyBody::Versions { head }) => {
@@ -550,7 +557,12 @@ impl Agent {
           Step::Rebase
         };
       }
-      (Step::Rebase, ReplyBody::Rebased { version, conflicts }) => {
+      (
+        Step::Rebase,
+        ReplyBody::Rebased {
+          version, conflicts, ..
+        },
+      ) => {
         record(tally, kind, elapsed);
         self.rebased(version, conflicts, tally);
       }
