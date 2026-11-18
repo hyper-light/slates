@@ -1,0 +1,45 @@
+name: diag-fs-server-red
+on:
+  push:
+    branches: [diag-fs-server-red]
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: never
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Red A -- the grant guard taken out; the agent's own grants must succeed and their tests fail
+        run: |
+          f=crates/server/src/landing.rs
+          sed -i '/A-285: an agent never approves its own landing, even holding a genuine proof/,/^  }$/d' "$f"
+          echo "guard lines left: $(grep -c 'grant_by_consumer' "$f" || true)"
+          set +e
+          cargo test --locked -p slates-server --test write_policy -- --nocapture an_agent_cannot_approve_its_own_landing > redA1.log 2>&1; a1=$?
+          SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test fs_server -- --nocapture an_ask_server > redA2.log 2>&1; a2=$?
+          grep -hE "test result:|panicked at|fs-server: the server node's agent granting" redA1.log redA2.log
+          echo "redA1 exit=$a1 redA2 exit=$a2"
+          git show HEAD:"$f" > "$f"
+          grep -E "^error(\[E[0-9]+\])?: could not compile|^error\[E[0-9]+\]" redA1.log redA2.log && { echo "a red run that does not compile proves nothing"; exit 1; }
+          test "$a1" -ne 0 && test "$a2" -ne 0 \
+            && grep -qE "^    an_agent_cannot_approve_its_own_landing$" redA1.log \
+            && grep -qE "^    an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest$" redA2.log \
+            && echo "RED A AS EXPECTED: both fail without the guard"
+      - name: Red B -- the bypass policy and the launcher's approval taken away; both landing tests must fail
+        run: |
+          f=crates/cli/tests/fs_server.rs
+          sed -i '/launcher_sets_land_mode(server, &launcher, volume, slates_api::WriteMode::Bypass);/d' "$f"
+          sed -i 's/approver\.approve_landing(approval, launcher)/approver.approve_landing(approval, \&slates_api::Issuer::from_launcher_secret(\&slates_api::LauncherSecret::generate().unwrap()))/' "$f"
+          echo "bypass policy calls left: $(grep -c 'WriteMode::Bypass);' "$f" || true); stranger approvals: $(grep -c 'LauncherSecret::generate().unwrap()))' "$f")"
+          set +e
+          SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test fs_server -- --nocapture a_bypass_server an_ask_server > redB.log 2>&1; rc=$?
+          grep -E "test result:|panicked at" redB.log
+          echo "redB exit=$rc"
+          grep -E "^error(\[E[0-9]+\])?: could not compile|^error\[E[0-9]+\]" redB.log && { echo "a red run that does not compile proves nothing"; exit 1; }
+          test "$rc" -ne 0 \
+            && grep -qE "^    a_bypass_server_lands_the_client_nodes_merge_in_one_call$" redB.log \
+            && grep -qE "^    an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest$" redB.log \
+            && echo "RED B AS EXPECTED: both mutated tests failed"

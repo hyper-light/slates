@@ -170,7 +170,17 @@
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
->   signed merge verified and an invalid signature reported.
+>   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
+>   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub
+>   run 44240968028, main 821d12f7d); signed work stays owed;
+> - **built (2026-11-18, found by the two-node filesystem-server flow):** an agent approves no landing of its own. A
+>   landing's grant verified its proof and manifest but not its channel, so a consumer-bound channel holding a genuine
+>   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
+>   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
+>   without the guard: granted) and `fs_server.rs`'s server-node agent
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
+>   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
+>   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
@@ -2613,7 +2623,16 @@
 >   (`crates/base/tests/host.rs`).
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
 >   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
->   presentation. Needs a decision on the Linux issuer surface (§4.13).
+>   presentation. **Closed for the launcher's path (2026-11-18, A-285, fs-server plan step 1):** the launcher (kiln,
+>   or this test acting as it) starts the server's anchor with its secret on standard input (A-299) and sets the
+>   volume's write policy through `slates-api`; bypass then lands in the one `slates land`, and ask lands once the
+>   launcher approves exactly the presented manifest. `crates/cli/tests/fs_server.rs`, two anchored nodes:
+>   `a_bypass_server_lands_the_client_nodes_merge_in_one_call` (4 entries written, the project exactly the merged
+>   files) and `an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest` (the approval
+>   request writes nothing; agents' channels set and approve nothing, `NotFound` on the client node, `Forbidden` on
+>   the server's; another manifest refused `GrantMismatch`; the approved one writes 4 entries). **Still open:** a
+>   person at a bare CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret
+>   from a descriptor the person passes, never an argument or the environment.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused

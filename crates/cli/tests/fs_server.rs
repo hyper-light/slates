@@ -1,11 +1,14 @@
 //! One binary as a filesystem server and its client (R8; §4.10 "Green volumes in a fleet", §4.16, A-201): two real
-//! `slates daemon --fleet` processes from one manifest, the server node holding an overlay of a project directory and
-//! a green over its snapshot, the client node reading the green and pushing increments of several files to it through
-//! the fleet's forward, and the server checking the merged head out and presenting its landing.
+//! `slates` fleet nodes from one manifest, the server node holding an overlay of a project directory and a green over
+//! its snapshot, the client node reading the green and pushing increments of several files to it through the fleet's
+//! forward, and the server checking the merged head out and landing it into the project directory.
 //!
-//! The grant is the human's at the server's anchor (R10) and is not taken here: on Linux no process but the anchor's
-//! children can issue one (GAPS, A-201). The granted landing is `crates/server/tests/checkout.rs`'s. The same flow ran
-//! across a Docker container and across two machines (adacachy and kiln-a094a12d) on 2026-11-05.
+//! The landing follows the write policy the server's launcher set (R10, D-22, A-285): bypass writes in the one
+//! `slates land`, ask answers the approval request and writes once the launcher approves exactly the presented manifest,
+//! and an unset policy asks. The launcher is this test, as kiln is in the field: it starts the server node's anchor with
+//! a launcher secret on its standard input (A-299) and sets the policy and approves through `slates-api` with that
+//! secret's authority. No approval is a human's. The same flow ran across a Docker container and across two machines
+//! (adacachy and kiln-a094a12d) on 2026-11-05, then up to a human's grant.
 #![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
@@ -94,13 +97,29 @@ fn eventually(instance: &str, args: &[&str]) -> String {
   }
 }
 
-/// A daemon process, killed and reaped when dropped, so a failed assertion leaves none behind.
+/// A node's process, killed and reaped when dropped, so a failed assertion leaves none behind: its daemon, or the anchor
+/// that supervises it. An anchor is asked to stop first (`SIGTERM`, as a host stops one), so it stops its daemon with it
+/// rather than leaving the daemon to notice its death a liveness budget later.
 struct Daemon {
   child: Child,
+  anchored: bool,
 }
 
 impl Drop for Daemon {
   fn drop(&mut self) {
+    if self.anchored
+      && let Ok(raw) = i32::try_from(self.child.id())
+      && let Some(pid) = rustix::process::Pid::from_raw(raw)
+      && rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+    {
+      let deadline = Instant::now() + FLEET_WAIT;
+      while Instant::now() < deadline {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+          return;
+        }
+        pause();
+      }
+    }
     let _ = self.child.kill();
     let _ = self.child.wait();
   }
@@ -197,26 +216,53 @@ fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
   duplicate
 }
 
-/// Starts `slates daemon --fleet MANIFEST --node NODE` at `instance` with the node's held sockets.
-fn start(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> Daemon {
+/// Starts the node `node` of `manifest` at `instance` with its held sockets: `slates daemon --fleet MANIFEST --node
+/// NODE`, or, with a launcher's secret, `slates anchor` with the secret on its standard input (A-299, the command
+/// `slates-api` builds for a host), whose daemon then verifies that launcher's proofs.
+fn start(
+  instance: &str,
+  manifest: &str,
+  (node, held): (&str, &HeldBlock),
+  launcher: Option<&slates_api::LauncherSecret>,
+) -> Daemon {
   use std::os::fd::AsRawFd;
   let [probe, record] = held.sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");
   };
   let (probe, record) = (inheritable(probe), inheritable(record));
-  let child = slates()
-    .args([
-      "--instance",
-      instance,
-      "daemon",
-      "--quick",
-      "--shards",
-      SHARDS,
-      "--fleet",
-      manifest,
-      "--node",
-      node,
-    ])
+  let mut command = match launcher {
+    None => {
+      let mut command = slates();
+      command.args([
+        "--instance",
+        instance,
+        "daemon",
+        "--quick",
+        "--shards",
+        SHARDS,
+        "--fleet",
+        manifest,
+        "--node",
+        node,
+      ]);
+      command
+    }
+    Some(secret) => {
+      let mut spec = slates_api::StartSpec::new(
+        instance,
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_slates")),
+        &[],
+      );
+      spec.quick = true;
+      spec.shards = Some(SHARDS.parse().unwrap());
+      spec.fleet = Some(slates_api::role::FleetSelection {
+        manifest: manifest.to_owned(),
+        node: node.to_owned(),
+      });
+      spec.with_launcher(secret.clone()).anchor_command().unwrap()
+    }
+  };
+  let child = command
     .env(
       slates_anchor::ENV_FLEET_SERVE,
       format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
@@ -225,7 +271,10 @@ fn start(instance: &str, manifest: &str, node: &str, held: &HeldBlock) -> Daemon
     .stderr(Stdio::inherit())
     .spawn()
     .unwrap();
-  Daemon { child }
+  Daemon {
+    child,
+    anchored: launcher.is_some(),
+  }
 }
 
 /// The server's project as its disk holds it before any agent works on it.
@@ -241,6 +290,17 @@ fn seed_project(dir: &str) {
 /// by `tag` so the tests of this file run side by side. The first node's instance bootstraps the root group, which forms
 /// when every member is configured.
 fn fleet(tag: &str, nodes: &[&str]) -> (Scratch, Vec<String>, Vec<Daemon>) {
+  let launchers: Vec<Option<&slates_api::LauncherSecret>> = nodes.iter().map(|_| None).collect();
+  fleet_with(tag, nodes, &launchers)
+}
+
+/// [`fleet`], each node started under its launcher's secret where `launchers` gives one (in `nodes`' order): that node
+/// runs under an anchor whose daemon verifies the launcher's proofs (A-299).
+fn fleet_with(
+  tag: &str,
+  nodes: &[&str],
+  launchers: &[Option<&slates_api::LauncherSecret>],
+) -> (Scratch, Vec<String>, Vec<Daemon>) {
   let dir = scratch(&format!("fs-server-{tag}"));
   for node in nodes {
     mint_identity(&dir.path, node);
@@ -264,7 +324,8 @@ fn fleet(tag: &str, nodes: &[&str]) -> (Scratch, Vec<String>, Vec<Daemon>) {
     .iter()
     .zip(&instances)
     .zip(&blocks)
-    .map(|((node, instance), held)| start(instance, &manifest, node, held))
+    .zip(launchers)
+    .map(|(((node, instance), held), launcher)| start(instance, &manifest, (node, held), *launcher))
     .collect();
   for instance in &instances {
     eventually(instance, &["volume", "list"]);
@@ -330,7 +391,8 @@ fn work_with(client: &str, green: &str, name: &str, edits: &[(&str, &str, &str, 
 /// overlay and present its landing. Expect: the client reads the server's bytes; the pushes are accepted as versions
 /// 1 and 2 and the server reads what they wrote; the late push is refused with the window `src/one.txt [0..3]`; the
 /// checkout writes 4 files at version 2; the presentation is 1 create and 3 replaces with no conflict; the disk is
-/// unchanged, since no grant was given. Gated like the other process flows (`SLATES_TEST_CLI=1`).
+/// unchanged, since the server's write policy is unset, which asks, and nobody approved (A-285). Gated like the other
+/// process flows (`SLATES_TEST_CLI=1`).
 #[test]
 fn a_client_node_pushes_files_to_a_server_nodes_green_and_the_server_presents_their_landing() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -414,32 +476,34 @@ fn the_client_pushes(client: &str, green: &str) {
   );
 }
 
-/// On the server node: checks the green's head out into its overlay and presents the landing, which waits for a
-/// grant, so the disk is unchanged.
+/// On the server node: checks the green's head out into its overlay and presents the landing, which the unset policy
+/// holds for an approval, so the disk is unchanged.
 fn the_server_checks_out_and_presents(
   server: &str,
   green: &str,
   (volume, snapshot): (&str, &str),
   project: &str,
 ) {
-  let (server, green, volume, snapshot) = (
-    server.to_owned(),
-    green.to_owned(),
-    volume.to_owned(),
-    snapshot.to_owned(),
-  );
+  the_server_checks_out(server, green, (volume, snapshot));
+  let presented = the_landing_asks(server, volume, project);
+  assert_eq!(presented["grant_required"], true);
+}
+
+/// On the server node: checks the green's head out into its overlay (`volume`, created from `snapshot`), and expects
+/// version 2 written as 4 files.
+fn the_server_checks_out(server: &str, green: &str, (volume, snapshot): (&str, &str)) {
   let attached: serde_json::Value =
-    serde_json::from_str(&ok(&server, &["attach", &volume, "--write", "--json"])).unwrap();
+    serde_json::from_str(&ok(server, &["attach", volume, "--write", "--json"])).unwrap();
   let attachment = attached["attachment"].to_string();
   let checkout: serde_json::Value = serde_json::from_str(&ok(
-    &server,
+    server,
     &[
       "checkout",
-      &green,
-      &volume,
+      green,
+      volume,
       &attachment,
       "--snapshot",
-      &snapshot,
+      snapshot,
       "--json",
     ],
   ))
@@ -448,20 +512,368 @@ fn the_server_checks_out_and_presents(
     checkout,
     serde_json::json!({"version": 2, "report": {"written": 4, "made": 0, "removed": 0, "moded": 0}})
   );
+}
+
+/// `slates land VOLUME PROJECT` on the server under a policy that asks: the presentation, 1 create and 3 replaces with
+/// no conflict, and the project still as it was seeded. Its JSON reply.
+fn the_landing_asks(server: &str, volume: &str, project: &str) -> serde_json::Value {
   let presented: serde_json::Value =
-    serde_json::from_str(&ok(&server, &["land", &volume, project, "--json"])).unwrap();
-  assert_eq!(presented["grant_required"], true);
+    serde_json::from_str(&ok(server, &["land", volume, project, "--json"])).unwrap();
+  assert_eq!(presented["grant_required"], true, "{presented}");
   assert_eq!(presented["conflicts"], serde_json::json!([]));
   assert_eq!(
     presented["summary"]["by_action"],
     serde_json::json!([{"action": "create", "count": 1}, {"action": "replace", "count": 3}])
   );
-  #[allow(clippy::disallowed_methods)]
-  let on_disk = std::fs::read_to_string(format!("{project}/src/one.txt")).unwrap();
   assert_eq!(
-    on_disk, "one: original line",
-    "nothing lands without a grant"
+    project_files(project),
+    seeded_files(),
+    "nothing lands before an approval"
   );
+  presented
+}
+
+/// The project's files as the seed wrote them: (path, bytes), in path order.
+fn seeded_files() -> Vec<(String, String)> {
+  [
+    ("README", "readme original"),
+    ("src/one.txt", "one: original line"),
+    ("src/two.txt", "two: original line"),
+  ]
+  .iter()
+  .map(|(path, bytes)| ((*path).to_owned(), (*bytes).to_owned()))
+  .collect()
+}
+
+/// The project's files once the client's two pushes are merged and landed: the seed's three replaced and the client's
+/// new file created.
+fn merged_files() -> Vec<(String, String)> {
+  [
+    ("README", "readme original + the client's line"),
+    ("src/new.txt", "created by the client"),
+    ("src/one.txt", "ONE: original line"),
+    ("src/two.txt", "TWO: original line"),
+  ]
+  .iter()
+  .map(|(path, bytes)| ((*path).to_owned(), (*bytes).to_owned()))
+  .collect()
+}
+
+/// Every regular file under `project` with its bytes, by path relative to it, in path order: what the disk holds.
+#[allow(clippy::disallowed_methods)]
+fn project_files(project: &str) -> Vec<(String, String)> {
+  let mut files = Vec::new();
+  let mut pending = vec![std::path::PathBuf::from(project)];
+  while let Some(dir) = pending.pop() {
+    for entry in std::fs::read_dir(&dir).unwrap() {
+      let path = entry.unwrap().path();
+      if path.is_dir() {
+        pending.push(path);
+      } else {
+        let relative = path
+          .strip_prefix(project)
+          .unwrap()
+          .to_string_lossy()
+          .into_owned();
+        files.push((relative, std::fs::read_to_string(&path).unwrap()));
+      }
+    }
+  }
+  files.sort();
+  files
+}
+
+/// The server node's write policy for `volume`, set as its launcher sets it (A-285, A-299): through `slates-api`, with
+/// the authority of the launcher's secret the server's anchor was started with. Merges stay at once, as unset.
+fn launcher_sets_land_mode(
+  server: &str,
+  launcher: &slates_api::Issuer,
+  volume: &str,
+  land: slates_api::WriteMode,
+) {
+  let mut instance = slates_api::Instance::attach(server).unwrap();
+  let subject = slates_api::PolicySubject::Volume(volume_id(volume));
+  let policy = slates_api::WritePolicy {
+    merge: slates_api::WriteMode::Bypass,
+    land,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(subject, &policy, launcher)
+    .unwrap();
+  assert_eq!(instance.write_policy(subject).unwrap(), Some(policy));
+}
+
+/// A two-node fleet whose nodes run under their launchers' secrets, the client's pushes merged into the server's green
+/// and checked out into the overlay of the server's project.
+struct Launched {
+  /// The nodes' processes, held for their drop; declared first, so they stop before the scratch directory goes.
+  _daemons: Vec<Daemon>,
+  /// The scratch directory holding the manifest, the identities and the project, held for its drop.
+  _scratch: Scratch,
+  /// The server node's instance.
+  server: String,
+  /// The client node's instance.
+  client: String,
+  /// The server's launcher's secret, then the client's.
+  secrets: [slates_api::LauncherSecret; 2],
+  /// The server's project directory: the landing's target.
+  project: String,
+  /// The overlay of the project the green's head was checked out into.
+  volume: String,
+}
+
+/// Each node's anchor started with its own launcher's secret, as two machines' kiln would start them; then the client's
+/// pushes merged into the server's green and checked out into the overlay.
+fn launched_and_checked_out(tag: &str) -> Launched {
+  let secrets = [
+    slates_api::LauncherSecret::generate().unwrap(),
+    slates_api::LauncherSecret::generate().unwrap(),
+  ];
+  let (dir, instances, daemons) = fleet_with(tag, &NODES, &[Some(&secrets[0]), Some(&secrets[1])]);
+  let [server, client] = <[String; 2]>::try_from(instances).unwrap();
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let (volume, snapshot, green) = server_green(&server, &project);
+  share_with_client(&server, &green, &client);
+  the_client_pushes(&client, &green);
+  the_server_checks_out(&server, &green, (&volume, &snapshot));
+  Launched {
+    _daemons: daemons,
+    _scratch: dir,
+    server,
+    client,
+    secrets,
+    project,
+    volume,
+  }
+}
+
+/// A-285, R10, R8, §4.15. Do: a server node and a client node, each anchored under its own launcher's secret; the client
+/// pushes two increments over four files into the server's green and the server checks the head out into the overlay of
+/// its project; the server's launcher sets the overlay's land mode to bypass; then `slates land VOLUME PROJECT` on the
+/// server, once. Expect: that one call lands, with 4 entries written (the merge's 1 create and 3 replaces) and nothing
+/// failed; the project directory then holds exactly the merged files; and no approval was asked or given. Gated like the
+/// other process flows (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_bypass_server_lands_the_client_nodes_merge_in_one_call() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the two-node bypass landing: set SLATES_TEST_CLI=1 to run it (two anchored nodes)"
+    );
+    return;
+  }
+  let launched = launched_and_checked_out("bypass");
+  let (server, project, volume) = (&launched.server, &launched.project, &launched.volume);
+  let launcher = slates_api::Issuer::from_launcher_secret(&launched.secrets[0]);
+  launcher_sets_land_mode(server, &launcher, volume, slates_api::WriteMode::Bypass);
+  let landed: serde_json::Value =
+    serde_json::from_str(&ok(server, &["land", volume, project, "--json"])).unwrap();
+  assert_eq!(landed["grant_required"], false, "{landed}");
+  assert_eq!(landed["outcome"]["written"], 4, "{landed}");
+  assert_eq!(landed["outcome"]["failed"], 0, "{landed}");
+  assert_eq!(landed["outcome"]["conflicts"], 0, "{landed}");
+  assert_eq!(project_files(project), merged_files());
+  drop(launched);
+}
+
+/// A-285, R10, R8, §4.15. Do: as the bypass flow up to the checkout, with the server's land mode set to ask; `slates
+/// land VOLUME PROJECT` on the server; then agents' channels on the client node and on the server node try to set the
+/// policy to bypass and to approve the presentation, holding the server launcher's genuine authority
+/// ([`no_agent_can_set_or_approve`]); then the server's launcher approves a manifest other than the presented one, and
+/// then the presented one. Expect: the land answers the approval request (1 create, 3 replaces, its manifest) and writes
+/// nothing; no agent sets, approves or writes anything (`NotFound` on the client node, `Forbidden` on the server's);
+/// the other manifest is refused `GrantMismatch` (`Stale::Approval`); the presented one is written, 4 entries, and the
+/// project holds exactly the merged files.
+#[test]
+fn an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the two-node ask landing: set SLATES_TEST_CLI=1 to run it (two anchored nodes)"
+    );
+    return;
+  }
+  let launched = launched_and_checked_out("ask");
+  let (server, client, project, volume) = (
+    &launched.server,
+    &launched.client,
+    &launched.project,
+    &launched.volume,
+  );
+  let launcher = slates_api::Issuer::from_launcher_secret(&launched.secrets[0]);
+  launcher_sets_land_mode(server, &launcher, volume, slates_api::WriteMode::Ask);
+  let presented = the_landing_asks(server, volume, project);
+  let mut approver = slates_api::Instance::attach(server).unwrap();
+  let approval = the_launcher_sees_the_presented_plan(
+    &mut approver,
+    (volume, project),
+    presented["manifest"].as_str().unwrap(),
+  );
+  no_agent_can_set_or_approve((server, client), &launched.secrets, (volume, &approval));
+  assert_eq!(
+    approver
+      .write_policy(slates_api::PolicySubject::Volume(volume_id(volume)))
+      .unwrap()
+      .map(|policy| policy.land),
+    Some(slates_api::WriteMode::Ask),
+    "no agent changed the policy"
+  );
+  assert_eq!(
+    project_files(project),
+    seeded_files(),
+    "nothing lands on an agent's own approval"
+  );
+  the_launcher_approves_exactly_the_presented_manifest(
+    &mut approver,
+    &launcher,
+    &approval,
+    project,
+  );
+  drop(approver);
+  drop(launched);
+}
+
+/// The launcher's own view of the landing `slates land` presented: its plan of `volume` into `project`, as an approval
+/// to make, whose manifest must be the one the land printed (`presented`, hexadecimal).
+fn the_launcher_sees_the_presented_plan(
+  approver: &mut slates_api::Instance,
+  (volume, project): (&str, &str),
+  presented: &str,
+) -> slates_api::LandingApproval {
+  let request = slates_api::LandingRequest {
+    volume: volume_id(volume),
+    snapshot: None,
+    target: project.to_owned(),
+    filter: slates_api::Filter::default(),
+  };
+  let approval = match approver.plan_landing(&request).unwrap() {
+    slates_api::LandOutcome::ApprovalRequired(approval) => approval,
+    other => panic!("an ask landing is an approval request: {other:?}"),
+  };
+  let hex: String = approval
+    .manifest
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  assert_eq!(
+    hex, presented,
+    "the launcher approves what the land presented"
+  );
+  approval
+}
+
+/// The launcher approves a manifest other than the presented one, then the presented one. Expect the other refused
+/// `GrantMismatch` (`Stale::Approval`) with nothing written, and the presented one written: 4 entries, none failed, the
+/// project exactly the merged files.
+fn the_launcher_approves_exactly_the_presented_manifest(
+  approver: &mut slates_api::Instance,
+  launcher: &slates_api::Issuer,
+  approval: &slates_api::LandingApproval,
+  project: &str,
+) {
+  let mut other = approval.manifest;
+  other[0] ^= 1;
+  let claim = slates_api::GrantClaim {
+    landing: approval.presentation,
+    manifest: other,
+    scope: slates_api::GrantScope::Once,
+    term_ns: slates_api::GRANT_TERM_NS,
+  };
+  let proof = slates_api::GrantAuthority::prove(launcher, &claim).unwrap();
+  assert_eq!(
+    approver.grant(&claim, &proof),
+    Err(slates_api::Error::Stale(slates_api::Stale::Approval)),
+    "an approval of a manifest other than the presented one"
+  );
+  assert_eq!(project_files(project), seeded_files());
+  match approver.approve_landing(approval, launcher).unwrap() {
+    slates_api::LandOutcome::Written(report) => {
+      assert_eq!(report.written, 4, "{report:?}");
+      assert_eq!(report.failed, 0, "{report:?}");
+    }
+    other => panic!("the approved landing is written: {other:?}"),
+  }
+  assert_eq!(project_files(project), merged_files());
+}
+
+/// An agent's channel at `instance`: bound to a consumer `launcher` enrolled there, as kiln binds every agent's session.
+fn agent_channel(instance: &str, launcher: &slates_api::LauncherSecret) -> slates_api::Instance {
+  let account = rustix::process::getuid().as_raw();
+  let mut enrolling = slates_api::Instance::attach(instance).unwrap();
+  let issuer = slates_api::Issuer::from_launcher_secret(launcher);
+  // A fleet node that has not imported its groups yet refuses a durable record `NoGroup` and imports them within a
+  // phase's wait (§4.8), as `eventually` waits out a verb's.
+  let deadline = Instant::now() + FLEET_WAIT;
+  let (consumer, capability) = loop {
+    match issuer.enroll(&mut enrolling, account) {
+      Err(slates_api::Error::Unusable(slates_api::Unusable::NoGroup))
+        if Instant::now() < deadline =>
+      {
+        pause();
+      }
+      enrolled => break enrolled.unwrap(),
+    }
+  };
+  let mut bound = sdk(instance);
+  bound.attest(consumer, &capability).unwrap();
+  slates_api::Instance::from_client(instance, bound)
+}
+
+/// No agent sets the server's policy or approves its landing, even holding the server launcher's genuine authority (its
+/// secret leaked, the worst case). Do: from the client node, an agent's channel (enrolled by the client's own launcher)
+/// sets the server volume's land mode to bypass and approves the server's presentation; then, from an agent's channel on
+/// the server node itself (enrolled by the server's launcher), sets the policy and issues the grant of exactly the
+/// presented manifest. Expect: the client node holds neither the volume nor its presentations, so both are refused
+/// `NotFound` there; on the server node both are refused `Forbidden` (`Denied::Rights`), since a consumer-bound channel
+/// sets no policy and approves no landing (A-285).
+fn no_agent_can_set_or_approve(
+  (server, client): (&str, &str),
+  [server_secret, client_secret]: &[slates_api::LauncherSecret; 2],
+  (volume, approval): (&str, &slates_api::LandingApproval),
+) {
+  let subject = slates_api::PolicySubject::Volume(volume_id(volume));
+  let bypass = slates_api::WritePolicy {
+    merge: slates_api::WriteMode::Bypass,
+    land: slates_api::WriteMode::Bypass,
+    require_signed_merges: false,
+  };
+  let genuine = slates_api::Issuer::from_launcher_secret(server_secret);
+  let mut remote = agent_channel(client, client_secret);
+  let raised = remote.set_write_policy(subject, &bypass, &genuine);
+  eprintln!("fs-server: the client node's agent setting the server's policy: {raised:?}");
+  assert!(absent(&raised, volume), "{raised:?}");
+  let approved = remote.approve_landing(approval, &genuine);
+  eprintln!("fs-server: the client node's agent approving the server's landing: {approved:?}");
+  assert!(absent(&approved, volume), "{approved:?}");
+  let mut local = agent_channel(server, server_secret);
+  let raised = local.set_write_policy(subject, &bypass, &genuine);
+  eprintln!("fs-server: the server node's agent setting the policy: {raised:?}");
+  assert!(forbidden(&raised), "{raised:?}");
+  // The grant itself, of exactly the presented manifest under a genuine proof: what an approval issues.
+  let claim = slates_api::GrantClaim {
+    landing: approval.presentation,
+    manifest: approval.manifest,
+    scope: slates_api::GrantScope::Once,
+    term_ns: slates_api::GRANT_TERM_NS,
+  };
+  let proof = slates_api::GrantAuthority::prove(&genuine, &claim).unwrap();
+  let granted = local.grant(&claim, &proof);
+  eprintln!("fs-server: the server node's agent granting the landing: {granted:?}");
+  assert!(forbidden(&granted), "{granted:?}");
+}
+
+/// Whether `result` is the refusal of a node that does not hold `volume`: `NotFound` naming it.
+fn absent<T>(result: &Result<T, slates_api::Error>, volume: &str) -> bool {
+  matches!(result, Err(slates_api::Error::NotFound(slates_api::Missing::Volume(missing)))
+    if *missing == volume_id(volume))
+}
+
+/// Whether `result` is a refusal by rights (`Forbidden`, `Denied::Rights`): a consumer-bound channel's.
+fn forbidden<T>(result: &Result<T, slates_api::Error>) -> bool {
+  matches!(
+    result,
+    Err(slates_api::Error::Denied(slates_api::Denied::Rights { .. }))
+  )
 }
 
 /// Runs a verb at `instance` with `input` on its stdin; (exit code, stdout, stderr).
