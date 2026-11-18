@@ -7051,6 +7051,26 @@ reconstruction budget are derived, never fixed (D-O6).
 > archive's layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first
 > publication's live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
 >
+> **Status (2026-11-18, A-397, g251: a takeover's volume made in turns, live log or placed seal).** After the fetch, a
+> live volume's layout as an archive, its restore and its making were still a turn each (0.14 to 0.32 s at 300 MB),
+> and a placed seal's whole takeover (the held archive copied out on the control shard, the restore, the volume made
+> and its tree laid) ran in two turns, the second behind a call whose deadline was a period, so the 1.99 GB, 97,254-file
+> kernel base volume held its owner shard for seconds and the next period's attempt began again (g232). Now one task
+> of the owner shard makes either (`fleet::make_taken`, joined by later attempts as A-374's live one was): the control
+> shard copies a placed seal's held archive out a copy slice a turn (`fleet::held_archive_in_turns`, counted
+> `fleet.materialize.archive_slices`) and opens an envelope in turns (A-347); the task restores the archive a slice a
+> turn (`fleet::restore_in_turns` over A-391's `Planning` and `Restoring`, admitted by `verbs::restore_admitted` once
+> its need is known, counted `fleet.materialize.restore_slices`), begins the volume (`verbs::begin_making`: the
+> admission and the create), lays its tree a slice a turn with writes of a copy slice (`verbs::Populating`, the hard
+> links' bytes compared a slice at a time too; counted `fleet.materialize.populate_slices`), and finishes it
+> (`verbs::finish_making`) and publishes it before it is served, each a turn. The volume being made lives in
+> `ShardState::making_volumes` between turns; a refusal, a give-up (the control shard forgetting the record:
+> `fleet.materialize.forgotten`) or a task that ends any way but made discards it, its credits put back as this node's
+> candidate claim (`verbs::discard_making`; A-401's claims). Held by `a_placed_seals_takeover_is_restored_and_laid_in_turns`
+> (`crates/server/tests/fleet.rs`) and `a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once` (`crates/server/src/verbs.rs`).
+> Owed: a live volume's layout as an archive (`live_ship::archive_of`, a turn), the held manifest's decode and its chunk
+> list (a turn of the control shard, metadata-sized), and the first publication (g230's item).
+>
 > **Status (2026-11-18, A-386, g251: a takeover's fetch of a live log in turns).** The fetch the rebuild starts from was
 > still one turn on each end: the candidate the successor adopted cloned every entry it held and copied them all into
 > one answer grown as it went, in a turn of its control shard, and the successor copied every payload back out of the
@@ -11931,6 +11951,8 @@ Recipes to copy verbatim:
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
+- Windows binaries are built with MSVC toolset 14.44 and Windows SDK 10.0.26100.0, pinned (A-411), not the image's
+  default toolset, so a runner image update leaves a tag's bytes alone.
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
   process-isolated Nano Server container, which has no Visual C++ runtime (A-210). Every push starts CI's debug build
   there too, the runtime's DLLs beside it, so an import Nano Server lacks fails the push that adds it (A-357); one
@@ -29172,7 +29194,7 @@ Applied in the same change to: `xtask/src/release.rs` (`runner_image`, `checked_
   runner reproduced. So it is still refused, but the refusal names both images (from each copy's smoke record,
   `ImageOS` and `ImageVersion`) and says to run one copy again until both share an image. A pair from one image that
   differs keeps the plain refusal: that is a reproducibility bug.
-- **Owed.** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
+- **Owed (settled by A-411, the same day).** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
   image a runner has (GAPS).
 
 ### A-400 — A work lives on the shard that serves its creation, its client's own; its name is held where the name hashes to, by an alias (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Where a work lives")
@@ -29245,3 +29267,63 @@ Applied in the same change to: §4.16's failure matrix (a green holder's restart
   wait, the room probe's heartbeat, the reaper's deadline, the Shards route's exchange) are their own items.
 
 Applied in the same change to: `crates/server/src/{green_adopt,nfs,remote_attach,verbs}.rs`.
+
+### A-397 — A taken-over volume is made by one owner-shard task in turns, from a live log or a placed seal
+
+*2026-11-18, g251 (the coordinator's order: archive, restore and population in turns; g232's handoff of the kernel base
+volume's takeover).* §4.8 "Promotion and takeover" and §4.10: A-374 made a live volume in turns of its owner shard but
+left its archive layout, restore and making a turn each, and a placed seal's takeover was made in one owner-shard turn
+behind `xshard::call_within` with a period's deadline, the held archive copied out whole on the control shard before it,
+every period's attempt again. The 1.99 GB, 97,254-file kernel base volume (g232) held its owner shard for seconds.
+**Now:** one task of the owner shard (`fleet::make_taken`, generalizing A-374's `make_live`) makes either source
+(`fleet::Source::Live` or `Source::Archive`), claiming the volume's record (`ShardState::making_taken_over`) so every
+later attempt joins it (`fleet::making_of` for both sources). Before the task, the control shard copies a placed seal's
+held archive out of the held store a copy slice of chunks a turn (`fleet::held_archive_in_turns`: `held_manifest`, then
+`held_chunk` for each chunk it names) and opens an envelope in turns (A-347). The task: a live log rebuilt in turns
+(A-374, `fleet::rebuild_in_turns`) and laid out as an archive, or a placed seal's lineage key adopted; then, unless the
+volume is made already, the archive restored a slice a turn (`fleet::restore_in_turns`: A-391's `Planning`, then
+`verbs::restore_admitted` at the known need under the pressure hold, this node's candidate claim's bytes counted as
+the volume's own (A-401), then `Restoring`); the volume begun (`verbs::begin_making`: this node's candidate claim taken
+over, else the admission a create makes, A-401, and the create); its tree laid a
+slice a turn (`verbs::Populating`, `verbs::populate_making`: each file checked and each hard link's bytes compared a slice
+at a time before the volume is touched, the links counted, the directories made, each file made and its data written a
+copy slice of the quantum, a page at least, a write, then the attributes, owners and times, files then directories
+deepest first, then the root); then finished (`verbs::finish_making`: the versions hold, the record, the sealed head)
+and published before it is served, each a turn. Each turn is held to the seal turns' share of the quantum
+(`fleet::making_slice_ns`). The volume being made is held in `ShardState::making_volumes`, not by the task, and a
+refusal, a give-up (`fleet.materialize.forgotten`: a turn finds the record the control shard forgot) or any end but its
+making discards it and puts its credits back as the candidate claim (`verbs::discard_making`, A-401's
+`return_to_claim`), so the next attempt finds the room this one had; a later `begin_making` discards one left over
+first.
+`verbs::materialize_taken_over`, `restore_taken_over` and `populate_restored` remain, test-only, as the pieces run to
+their ends in one call.
+
+Tests: `a_placed_seals_takeover_is_restored_and_laid_in_turns` (three nodes, a sealed volume of 24 distinct files, the
+survivors' turns cut to a piece; the held archive copied in turns, more restore turns and more laying turns than files,
+one materialization begun and none twice, both survivors' longest steps under the window, every file read back),
+`a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once` (a sparse file around a hole, hard links, a symlink, a FIFO,
+nested directories and an attribute laid a piece a step and a byte a write equal the tree laid in one call), the live
+takeover test and the envelope test unchanged.
+
+Applied in the same change to: §4.10's status (A-397), GAPS (A-347's one-turn walks: the takeover's restore and
+population, both sources), `crates/server/src/{fleet,verbs,state,daemon}.rs`, `crates/server/tests/fleet.rs`.
+
+### A-411 — The Windows release builds pin MSVC toolset 14.44 and Windows SDK 10.0.26100.0, so a tag's Windows bytes do not depend on the runner image (2026-11-18, the release goals g236 and g237; settles A-407's owed item)
+Applied in the same change to: `.github/workflows/release.yml` (the step "MSVC toolset 14.44 and Windows SDK
+10.0.26100.0, pinned", through `ilammy/msvc-dev-cmd`, and the matrix's `msvc_arch`), Appendix B.2 (its recipes),
+GAPS (the binary release lane's entry) and `docs/publish.md` ("The binary release").
+- **The evidence.** The tag `v0.1.0`'s two x86_64 binaries, from `windows-2025` 20261103.298.1 (871a057d) and
+  20261116.315.1 (d3498b4f), differ in 2,559,679 bytes. Their Rich headers, which list every tool build that made
+  their objects, differ only in Visual Studio's default toolset: the linker (14.51 build 36260 against 14.52 build
+  37029, one entry each), its C runtime objects (build 35721 against 36815: 10 assembled, 16 and 17 C, 40 C++) and the
+  objects that toolset compiled (build 36260 against 37029: 4 assembled, 91 C). The Windows SDK's 204 objects are the
+  same (build 33145) in both.
+- **The decision.** Build with VS 2022 17.14's toolset 14.44, which both `windows-2025` images and the `windows-11-arm`
+  image carry beside the default (`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64` and `.ARM64`, version
+  18.11 and 18.12 of the component on the two images; actions/runner-images' readmes and release notes, 2026-11-18),
+  and the one Windows SDK the images carry. A side-by-side toolset is a frozen release serviced apart from the
+  default, which moves with every image. Rejected: comparing the two copies' toolsets instead of their bytes, which
+  would ship bytes no second runner reproduced; and building both copies in one job, which gives up the separate
+  runner AC-9.5 asks for.
+- **Owed.** The proof is a release run (a tag or a dry run) whose two copies of a Windows target land on two images
+  and match; filed for main. clang-cl, which compiles AWS-LC's C on arm64, still comes from the image.

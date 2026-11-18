@@ -520,8 +520,12 @@
 >   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
 >   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
 >   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
->   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
->   owner-shard task follow (g251's next change).
+>   piece). **Used by both takeover paths (A-397, the same day):** one owner-shard task makes a live log's or a placed
+>   seal's volume, its archive copied out (on the control shard), restored and its tree laid each a slice a turn, the
+>   volume being made held in `ShardState::making_volumes` and discarded on any end but its making; later attempts join
+>   it. Still owed: a live volume's layout as an archive (`live_ship::archive_of`, a turn: 0.05 to 0.16 s at 300 MB), the
+>   held manifest's decode and chunk list (a turn of the control shard, metadata-sized), and the first publication's
+>   whole entry (the item above).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -4179,8 +4183,12 @@
 >   20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s two x86_64 copies landed on
 >   different images and differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time
 >   (d3498b4f twice, 871a057d three times, test 4's included; run 44347535833). The artifacts task now names both images
->   in its refusal, and one copy is run again until the pair shares an image. Owed: pin the MSVC toolset and the
->   Windows SDK the Windows binaries link, so a tag's bytes do not depend on which image a runner has.
+>   in its refusal, and one copy is run again until the pair shares an image. Since A-411 (2026-11-18) the release's
+>   Windows builds pin MSVC toolset 14.44 and Windows SDK 10.0.26100.0, which both images and the arm64 one carry: the
+>   two binaries' Rich headers differed only in the default toolset's tools (linker 14.51.36260 against 14.52.37029,
+>   its runtime objects 35721 against 36815), the SDK's 204 objects alike. Owed: the first release run across two
+>   images with the pin (run request of 2026-11-18); clang-cl, which builds AWS-LC's C on arm64, still comes from
+>   the image.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
