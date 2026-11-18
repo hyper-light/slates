@@ -9,6 +9,16 @@
 //! whole slab, so one volume holding 54 bytes committed 7,456,539 of its shard's 7,456,540 version slots. The review's
 //! snapshot then left no unpromised slot to retain the directory that a first read of an untouched base file
 //! materializes its entry into, and the read was refused `NoSpace`.
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
+// A real overlay base on the host's disk: macOS and Linux.
+#![cfg(unix)]
 
 mod common;
 
