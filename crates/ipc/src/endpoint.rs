@@ -555,6 +555,15 @@ impl ClientEnd {
         *given_up = None;
       }
       self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
+      // A running completion bridge waits where this park does: the mark, raised before the flag, has it pass on a wake
+      // it takes while this park waits (see `crate::completion`).
+      #[cfg(any(target_os = "macos", windows))]
+      let _passed_on = SyncPark::raise(
+        self
+          .bridge
+          .as_ref()
+          .map(crate::completion::CompletionBridge::sync_parked),
+      );
       self
         .region
         .client_parked()?
@@ -599,6 +608,31 @@ impl ClientEnd {
         }
         return Err(IpcError::DeadlineExceeded);
       }
+    }
+  }
+}
+
+/// A synchronous park's mark for a running completion bridge (`CompletionBridge::sync_parked`): raised before the park's
+/// flag, lowered when the park's turn ends, so a wake the bridge takes meanwhile is passed on to the parked call.
+#[cfg(any(target_os = "macos", windows))]
+struct SyncPark(Option<&'static std::sync::atomic::AtomicBool>);
+
+#[cfg(any(target_os = "macos", windows))]
+impl SyncPark {
+  /// Raises `mark`, when the client has a bridge.
+  fn raise(mark: Option<&'static std::sync::atomic::AtomicBool>) -> SyncPark {
+    if let Some(mark) = mark {
+      mark.store(true, Ordering::SeqCst);
+    }
+    SyncPark(mark)
+  }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl Drop for SyncPark {
+  fn drop(&mut self) {
+    if let Some(mark) = self.0 {
+      mark.store(false, Ordering::SeqCst);
     }
   }
 }
@@ -1067,6 +1101,81 @@ mod tests {
 
     // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
     drop(client);
+  }
+
+  /// Shape: the synchronous calls the bridge-beside-a-park test makes, each parking at once.
+  #[cfg(target_os = "macos")]
+  const PARKED_ROUNDS: u64 = 20;
+  /// Shape: each parked call's deadline in that test, in nanoseconds: half a second, far past a woken reply and short
+  /// enough that a park slept to it fails the test at once.
+  #[cfg(target_os = "macos")]
+  const PARKED_DEADLINE_NS: u64 = 500_000_000;
+
+  /// §4.7, D-19: a synchronous call parked beside a running completion bridge is woken by its reply, though the bridge
+  /// waits on the same wake word. Do: start the bridge; then twenty times send a request and wait for its reply
+  /// synchronously, the client spinning for none of it so it parks, while another thread, once the client is parked,
+  /// replies as the daemon. Expect every reply taken within half its deadline, and every wait parked. Before
+  /// 2026-11-18 the daemon's one wake per reply went to the bridge or to the parked call, whichever the kernel picked,
+  /// and a parked call the bridge's wait beat slept to its deadline: 16 to 19 of 20 did on the Mac Studio.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply() {
+    let region = ClientRegion::create(
+      &unique_name("slates-endpoint-park-beside-bridge"),
+      7,
+      0,
+      geometry(),
+    )
+    .unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+    client.enable_async_completion().unwrap();
+    client.set_spin_ns(Some(0));
+    let replier = std::thread::spawn(move || {
+      let mut daemon = DaemonEnd::new(ClientRegion::open(&handoff, len).unwrap());
+      for _ in 0..PARKED_ROUNDS {
+        let request = loop {
+          if let Some(request) = daemon.try_take().unwrap() {
+            break request;
+          }
+          std::thread::yield_now();
+        };
+        while daemon
+          .region()
+          .client_parked()
+          .unwrap()
+          .load(Ordering::Acquire)
+          == 0
+        {
+          std::thread::yield_now();
+        }
+        daemon
+          .reply(&Slot::inline(request.request, b"ok").unwrap())
+          .unwrap();
+      }
+    });
+    let (parks_before, _) = client.park_ratio();
+    let deadline = std::time::Duration::from_nanos(PARKED_DEADLINE_NS);
+    for round in 0..PARKED_ROUNDS {
+      client
+        .send(&Slot::inline(round.saturating_add(1), b"hi").unwrap())
+        .unwrap();
+      let asked = std::time::Instant::now();
+      let reply = client.wait(Some(PARKED_DEADLINE_NS)).unwrap();
+      let took = asked.elapsed();
+      assert_eq!(reply.payload, b"ok");
+      assert!(
+        took < deadline / 2,
+        "round {round}: a parked call took {took:?} of its {deadline:?} deadline: the bridge kept its wake"
+      );
+    }
+    replier.join().unwrap();
+    let (parks_after, _) = client.park_ratio();
+    assert!(
+      parks_after.saturating_sub(parks_before) >= PARKED_ROUNDS,
+      "every wait parked: {parks_before} parks before, {parks_after} after"
+    );
+    drop(region);
   }
 
   /// On Linux the descriptor an fd-adopting SDK receives (`enable_async_completion_dup`) is a **pipe**

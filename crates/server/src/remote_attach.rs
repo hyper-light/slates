@@ -315,7 +315,7 @@ pub(crate) async fn sweep_departed() {
   let mut settled = true;
   for shard in shards {
     let anchors = gone.clone();
-    let ended = crate::xshard::call_within(
+    let ended = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |state| end_hosts(state, &anchors),
