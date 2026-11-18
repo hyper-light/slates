@@ -3074,6 +3074,7 @@ impl Daemon {
       // too, and their recovery would read as this one's.
       s.dead_session_dropped_at.clear();
       s.dead_session_recovered_ns = None;
+      s.dead_session_recovered_periods = None;
     })
   }
 
@@ -4120,6 +4121,7 @@ async fn init_shard(
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
     dead_session_recovered_ns: None,
+    dead_session_recovered_periods: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,

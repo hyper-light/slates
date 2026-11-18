@@ -849,12 +849,16 @@ pub struct ShardState {
   /// hold the one rescue that does not depend on a borrower (`Daemon::inject_discovery_hold`). `None` in production.
   pub injected_discovery_hold: Option<slates_db::HostId>,
   /// When each peer's record session was last dropped as failed or silent (a peer's reset, the transport's silence rule,
-  /// a discovery page that failed), until the forward lane's first reply on its replacement logs and counts the gap. One
-  /// entry a peer, so bounded by the roster.
-  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, u64>,
+  /// a discovery page that failed), on the wall clock and in the fleet coordinator's periods, until the forward lane's
+  /// first reply on its replacement logs and counts the gap. One entry a peer, so bounded by the roster.
+  pub dead_session_dropped_at: BTreeMap<slates_db::HostId, SessionDrop>,
   /// How long after the last silent session's drop the forward lane's first reply on its replacement came (logged too):
   /// what a test or an operator reads to see the lane back on a live session. `None` until it has happened.
   pub dead_session_recovered_ns: Option<u64>,
+  /// The same gap in the fleet coordinator's own periods (`slates_rt::registry::Pulse::progress`), which a busy machine
+  /// stretches in wall time but not in number: the measure a recovery's bound is held to (A-65's rule, a node judged in
+  /// its own time). `None` until it has happened.
+  pub dead_session_recovered_periods: Option<u64>,
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
@@ -1084,7 +1088,31 @@ impl std::fmt::Debug for PendingForward {
   }
 }
 
+/// A record session's drop, as the forward lane's recovery measures from it: when, on the wall clock and in the fleet
+/// coordinator's periods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionDrop {
+  /// The wall clock at the drop, nanoseconds.
+  pub at_ns: u64,
+  /// The coordinator's periods completed at the drop.
+  pub period: u64,
+}
+
 impl ShardState {
+  /// Records that the record session to `peer` was dropped as failed or silent, now: the start of the forward lane's
+  /// recovery, which its first reply on the replacement measures ([`ShardState::dead_session_dropped_at`]).
+  pub(crate) fn note_session_drop(&mut self, peer: slates_db::HostId) {
+    let period =
+      slates_rt::registry::with_entry(self.shard, |entry| entry.pulse.progress()).unwrap_or(0);
+    self.dead_session_dropped_at.insert(
+      peer,
+      SessionDrop {
+        at_ns: slates_rt::futures::now_ns(),
+        period,
+      },
+    );
+  }
+
   /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
   /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
   /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the

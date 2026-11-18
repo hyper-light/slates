@@ -569,8 +569,12 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
     if answered.any_reply
       && let Some(dropped) = s.dead_session_dropped_at.remove(&peer)
     {
-      let recovered = futures::now_ns().saturating_sub(dropped);
+      let recovered = futures::now_ns().saturating_sub(dropped.at_ns);
+      let periods = slates_rt::registry::with_entry(s.shard, |entry| entry.pulse.progress())
+        .unwrap_or(dropped.period)
+        .saturating_sub(dropped.period);
       s.dead_session_recovered_ns = Some(recovered);
+      s.dead_session_recovered_periods = Some(periods);
       s.count(
         if recovered <= crate::daemon::LIVENESS_BUDGET_NS {
           REPLACED_ANSWERED_IN_BUDGET
@@ -580,7 +584,8 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
         1,
       );
       slates_machine::log_line!(
-        "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped",
+        "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped, {periods} of \
+         the coordinator's periods",
         recovered / NS_PER_MS
       );
     }

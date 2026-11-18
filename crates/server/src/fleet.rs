@@ -5630,9 +5630,7 @@ async fn refresh_discovery(
         if session.peer_reset() {
           state.count(LINK_PEER_RESET, 1);
         }
-        state
-          .dead_session_dropped_at
-          .insert(peer_host, futures::now_ns());
+        state.note_session_drop(peer_host);
       }
     });
   }
@@ -8681,7 +8679,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          s.note_session_drop(host);
         }
         Some(link)
           if link.endpoint.is_none()
@@ -8699,7 +8697,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
               .max(crate::daemon::LIVENESS_BUDGET_NS)
               / NS_PER_MS
           );
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          s.note_session_drop(host);
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));

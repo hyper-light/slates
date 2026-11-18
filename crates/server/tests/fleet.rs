@@ -5840,6 +5840,11 @@ const DEAD_SESSION_WATCH_PERIODS: u64 =
 /// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
 /// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
 const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon::HEARTBEAT_NS;
+/// Shape: [`DEAD_SESSION_RECOVERY_NS`] in the fleet coordinator's own periods, one a heartbeat: what the recovery is held
+/// to, since a busy machine stretches the periods' wall time but not their number (A-65's rule, a node judged in its own
+/// time). At load 52 on a 15-CPU Mac the wall-time bound failed once, the answer 1.339 s after the drop (2026-11-17).
+const DEAD_SESSION_RECOVERY_PERIODS: u64 =
+  DEAD_SESSION_RECOVERY_NS / slates_server::daemon::HEARTBEAT_NS;
 /// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
 /// returns it and the link never finds it in its slot, as the rung's thousand clients did. Measured 2026-11-08: at 32
 /// the link's own discovery refresh found the deaf session in its slot and replaced it, and the read was served in
@@ -5931,7 +5936,10 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
         .observation(
           Some(daemons[1].shards()[0]),
           slates_server::daemon::OBSERVE_BUDGET_NS,
-          |s: &mut slates_server::state::ShardState| s.dead_session_recovered_ns,
+          |s: &mut slates_server::state::ShardState| {
+            s.dead_session_recovered_ns
+              .zip(s.dead_session_recovered_periods)
+          },
         )?
         .wait()?;
       Ok(recovered.is_some())
@@ -5953,9 +5961,10 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     daemon.stop();
   }
   eprintln!(
-    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; burst rounds {rounds}; b's \
-     counters {counters:?}",
-    recovered.map(Duration::from_nanos)
+    "b's deaf session to a: the lane answered on its replacement {:?} after the drop, {:?} of b's periods; burst rounds \
+     {rounds}; b's counters {counters:?}",
+    recovered.map(|(ns, _)| Duration::from_nanos(ns)),
+    recovered.map(|(_, periods)| periods)
   );
   assert!(routed, "b routed the volume to a: {last:?}");
   assert_eq!(held, Ok(()), "b's discovery to a was held");
@@ -5967,10 +5976,12 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
        session going deaf: no borrower judged it silent (counters {counters:?})"
     )
   });
+  let (recovered_ns, recovered_periods) = recovered;
   assert!(
-    recovered <= DEAD_SESSION_RECOVERY_NS,
-    "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
-    Duration::from_nanos(recovered),
+    recovered_periods <= DEAD_SESSION_RECOVERY_PERIODS,
+    "the lane's first answer on the replacement came {recovered_periods} of b's periods after the drop ({:?} of wall \
+     time), past {DEAD_SESSION_RECOVERY_PERIODS} ({:?})",
+    Duration::from_nanos(recovered_ns),
     Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
   );
 }
