@@ -10994,11 +10994,13 @@ client is the leading suspect, not proven: the kernel run under A-113 (no reconn
 > | FUSE mounts (Linux) | the write log in anchor memory, replayed by the successor (A-63) | `a_closed_files_writes_survive_a_kill_from_the_write_log_alone` |
 > | Shards streams (Linux, macOS), where a VM outlives its daemon (A-316, A-339, A-365) | the write log, before the reply (`shards::log_write`) | `a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once` |
 > | WinFsp drives (Windows) | the barrier, before every write's reply (A-379) | `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused` |
-> | Shards streams (Windows) | nothing; the stream ends with its daemon, so no successor serves it | owed with "Windows streams have no write log" (g268) |
-> | vhost-user (crosvm, QEMU; Linux) | nothing; the VM ends with its device's daemon | owed with "a VM that outlives its device's daemon" (Phase 8 step 4) |
+> | Shards streams (Windows) | the write log, before the reply (A-402); the stream itself still ends with its daemon (its resync is g268's) | `a_streams_acknowledged_write_outlives_its_daemon_through_the_write_log` |
+> | vhost-user (crosvm, QEMU; Linux) and the in-process guest seam | the write log, before the used element; a write the log cannot keep waits for the barrier (A-410); the VM still ends with its device's daemon | `a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log` |
 >
-> - **Owed.** The cost of A-379: a publication per paging write, measured through a WinFsp drive before and after. For
->   the last two routes: the work that lets a guest outlive its daemon must bring the write log or A-358's rule first.
+> - **Owed.** The cost of A-379: a publication per paging write, measured through a WinFsp drive before and after. The
+>   last two routes log since A-402 and A-410 (2026-11-18), so a guest that outlives its daemon there meets its
+>   acknowledged writes in the successor; what each still owes is the successor serving that guest (a Windows stream's
+>   resync; a vhost-user device the anchor holds).
 > - **Record.** `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
 
 
@@ -18090,10 +18092,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     as in step 3; `guest_dax.rs` 3 of 3 beside them. **Found:** the A-170 bug below, in 2 rounds of 3 before the fix.
   - **Owed, a later goal:** a VM that outlives its device's daemon. The anchor would have to hold the device's socket
     end and its state (vrings, memory table, back-end channel, windows) across the restart, as A-61 holds a FUSE device.
-    This vhost-user route answers a guest's write before any publication and does not log it. That is safe only because
-    the VM dies with the daemon here. Work that lets a VM outlive its device's daemon on this route must publish each
-    write before its reply (A-358) or log it. The Shards stream route already lets a VM outlive its daemon, and it logs:
-    see the route table in GAPS 2026-11-18, "a WinFsp write answered before its publication was lost".
+    This vhost-user route logs each guest write in the shard's write log before its used element since A-410
+    (2026-11-18; before, it answered a write with neither a log record nor a publication, safe only because the VM died
+    with the daemon), so that precondition is met. The Shards stream route already lets a VM outlive its daemon, and it
+    logs: see the route table in GAPS 2026-11-18, "a WinFsp write answered before its publication was lost".
 - **Fixed 2026-10-25 (A-170), found by step 4: a clone's copy-up sealed its origin's open extent behind the origin's
   image, so a crash lost the shard.** `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
   - **Symptom:** the daemon-kill test failed 2 rounds of 3, then 3 of 4, always the fastest rounds. The successor logged

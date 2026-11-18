@@ -2399,6 +2399,14 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > daemon restart (`crates/server/tests/virtiofs.rs`). Group commit across a pass's chains is not built: one
 > publication per held chain, as the FUSE and NFS paths do.
 
+> **Status (2026-11-18, A-410: a guest's acknowledged write outlives its daemon through the write log).** A plain
+> `WRITE` is not held for the barrier: the bridge hands each one to the shard's write log in the anchor's content
+> object before its used element is published (`VolumeBridge::logging_writes`, given the log by `ShardBridge`), as a
+> FUSE mount and a Shards stream do (A-63, A-316), and a successor replays it. A write the log cannot keep makes the
+> bridge owe a publication (`Bridge::awaits_publication`), so the device holds that reply for the barrier and answers
+> `EIO` if it does not capture the volume (A-358's rule). Before, a write acknowledged after the last publication was
+> lost at a daemon's death (`a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log`).
+
 > **Status (2026-10-01, AUD-29-83 and AUD-29-87: the guest and FUSE paths answer to the owner lease; a busy
 > guest cannot postpone revocation).** Before every pass the guest loop asks the owner whether it may serve the
 > volume's latest state — the NFS live tree's gate, `verbs::live_tree_fenced`: configuration group ready and the
@@ -29521,6 +29529,40 @@ Appendix B.2, GAPS and `docs/publish.md`.
   addressing another asset, an archive format, and a crate with no repository, each as its own finding.
 - **Owed.** An install against a published release (run request); publishing the crate to crates.io would let
   `cargo binstall slates-cli` drop `--git`.
+
+### A-410 — Slates' own virtio-fs device keeps each guest write in the write log before its used element: A-358's rule on the vhost-user route (2026-11-18, goal g268; g079's route table, "the vhost-user device neither saves nor logs a write before replying"; §4.6 virtio-fs, §4.8 barrier, D-18; A-63, A-316, A-358, A-379, A-402)
+Applied in the same change to:
+- `crates/bridge-core`: `VolumeBridge::logging_writes` (a transport's write log, handed each write the volume took;
+  one it did not keep makes `awaits_publication` true); `Bridge::awaits_publication`'s doc; the unit test
+  `a_bridge_hands_each_write_to_its_log_and_owes_a_publication_for_one_it_did_not_keep`
+  (`crates/bridge-core/tests/volume_bridge.rs`).
+- `crates/server/src/virtiofs.rs`: `ShardBridge::with_bridge` gives each pass's bridge the shard's write log and
+  content object; the module doc. `crates/bridge-fuse/src/bridge.rs`: `needs_barrier`'s doc.
+- The test `a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log` (`crates/server/tests/virtiofs.rs`).
+- §4.6 (the virtio-fs status after AUD-29-82's); GAPS: the route table in the WinFsp write's entry (2026-11-18), with
+  the Windows streams' row brought to A-402, and Phase 8 step 4's owed line.
+
+- **What was there.** The virtio-fs device held a request's used element for the owner's barrier only when
+  `needs_barrier` named it (namespace and attribute changes, `fsync`, the `flush` a close sends) or the volume owed a
+  publication. A plain `WRITE` was answered with neither a publication nor a log record, so a write acknowledged after
+  the last publication was lost at a daemon's death. g079's sibling sweep (A-379) found it; it was safe only while the
+  VM died with its device's daemon (crosvm ends the VM at a back end's hangup), and the volume itself outlives the
+  daemon, so a write the guest was told succeeded was missing from it afterwards.
+- **The rule.** A-358's: a write a client is told succeeded survives the daemon's death before the reply. Here it is
+  kept as a FUSE mount and a Shards stream keep it: the bridge appends each write the volume took to the shard's write
+  log before the device publishes the used element, and a successor replays the log at recovery. A write the log does
+  not keep (no room, or a span the content object refused) makes the bridge owe a publication; the device then holds
+  the reply for the owner's barrier, which publishes and answers `EIO` if the publication did not capture the volume. A
+  device with no anchor's content object (no log) is a daemon nothing outlives, and owes nothing for its writes.
+- **Why not the barrier per write.** A-379 publishes every WinFsp write because Windows had no write log. The log is
+  on every platform since A-402, and a logged write costs an append into anchor-held memory, where a publication writes
+  the shard's whole recovery image; A-399 measured a stream's close publishing nothing the log held at 15.7-16.0 µs p50
+  against 17.5-20.0 µs.
+- **Evidence.** The unit test drives a bridge with a keeping log, a refusing log and none. The integration test runs
+  the in-process guest seam under a daemon whose anchor the test holds: a guest creates a file (its barrier publishes
+  it) and writes into it, the daemon is killed by a fenced stop that publishes nothing, and a successor over the same
+  segment reads the bytes back over NFS. Without the change the file comes back empty, as its create's publication left
+  it. The vhost-user front end's run on Linux is main's (`run-requests.md`, 2026-11-18).
 
 ### A-416 — The many-client bound judges every request and the cycle, and reports the round; the load test's hot set is a set (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-297's "The judgment")
 Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry),
