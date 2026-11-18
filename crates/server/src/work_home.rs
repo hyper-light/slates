@@ -296,11 +296,6 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
-    RequestBody::Read {
-      path,
-      at: ReadAt::Head,
-      ..
-    } => file_if_unheld(path),
     RequestBody::ReadRange {
       path,
       at: ReadAt::Head,

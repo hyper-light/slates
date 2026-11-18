@@ -469,9 +469,9 @@ impl ClientEnd {
   }
 
   /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
-  /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell
-  /// when the daemon's shard has announced it is going idle — read after the doorbell protocol's
-  /// fence ([`crate::doorbell`]), so a shard that missed this request on its re-check is always rung.
+  /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell for this region's shard
+  /// when that shard has announced it is going idle — read after the doorbell protocol's fence ([`crate::doorbell`]), so
+  /// a shard that missed this request on its re-check is always rung, and only that shard is woken (A-381).
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
     let cmd = self.region.cmd();
     cmd.push(self.region.object_mut(), self.next_request, slot)?;
@@ -482,7 +482,7 @@ impl ClientEnd {
     if parked {
       self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
       if let Some(bell) = &self.doorbell {
-        bell.ring()?;
+        bell.ring(self.region.shard())?;
       }
     }
     Ok(())

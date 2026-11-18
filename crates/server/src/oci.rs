@@ -220,6 +220,7 @@ mod tests {
     timers: 4,
     tick_ns: 1,
     green_chain_bytes: 1,
+    audit_records: 4,
   };
   /// Shape: the mounting user and another.
   const OWNER: Principal = Principal::Uid {

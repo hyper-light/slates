@@ -641,6 +641,28 @@ fn host_facts() -> (String, Option<String>) {
   (std::env::consts::OS.to_owned(), None)
 }
 
+/// Format: the most bytes a host fact, `uname`'s system name or release, is reported at: the widest field a supported
+/// platform's `uname` fills, macOS's `_SYS_NAMELEN` (256, `<sys/utsname.h>`; Linux's `__NEW_UTS_LEN` + 1 is 65) less
+/// its terminating NUL. A fact past it (the lossy conversion widens an invalid byte to three) is cut at a character
+/// boundary, so a status, which carries the facts beside a volume's name, has a widest a create can leave room for
+/// (A-267).
+pub(crate) const HOST_FACT_BYTES: usize = 255;
+
+/// `fact`, cut to [`HOST_FACT_BYTES`] at a character boundary.
+fn cut_fact(fact: String) -> String {
+  if fact.len() <= HOST_FACT_BYTES {
+    return fact;
+  }
+  let mut cut = String::with_capacity(HOST_FACT_BYTES);
+  for character in fact.chars() {
+    if cut.len().saturating_add(character.len_utf8()) > HOST_FACT_BYTES {
+      break;
+    }
+    cut.push(character);
+  }
+  cut
+}
+
 /// The host facts a report carries, read **once per process** and kept: `uname`'s system name and
 /// release, and whether FUSE is available. They are facts of the boot, not of the
 /// verb — the kernel and the `PATH` do not change under a running daemon — and reading them per
@@ -659,8 +681,8 @@ fn host_facts_once() -> &'static HostFacts {
   FACTS.get_or_init(|| {
     let (os, kernel) = host_facts();
     HostFacts {
-      os,
-      kernel,
+      os: cut_fact(os),
+      kernel: kernel.map(cut_fact),
       fuse_available: probe_fuse(),
       winfsp_installed: probe_winfsp(),
     }
@@ -677,6 +699,61 @@ fn probe_winfsp() -> bool {
 #[cfg(not(windows))]
 fn probe_winfsp() -> bool {
   false
+}
+
+/// Shape: the yes-or-no facts of a [`Situation`] (the NFS listener, the right to write, FUSE, WinFsp, the stream
+/// route): a platform's situations are every combination of them, two to this power.
+const SITUATION_FLAGS: u32 = 5;
+
+/// Every platform a build reports for. A platform added to [`Platform`] is added here, as [`platform`] names it.
+const fn every_platform() -> [Platform; 4] {
+  [
+    Platform::MacOs,
+    Platform::Linux,
+    Platform::Windows,
+    Platform::Other,
+  ]
+}
+
+/// Every situation a daemon can report from: each platform, with each listener bound or not, each right, each host
+/// fact.
+fn every_situation() -> impl Iterator<Item = Situation> {
+  every_platform().into_iter().flat_map(|platform| {
+    (0..1u32 << SITUATION_FLAGS).map(move |flags| {
+      let flag = |bit: u32| flags & (1 << bit) != 0;
+      Situation {
+        platform,
+        nfs_listener_bound: flag(0),
+        may_write: flag(1),
+        fuse_available: flag(2),
+        winfsp_installed: flag(3),
+        stream_route_bound: flag(4),
+      }
+    })
+  })
+}
+
+/// The widest report any daemon could give (A-267): each host fact at [`HOST_FACT_BYTES`], and the transports of the
+/// situation that encodes widest, every entry refused with a reason. Another build differs only in its guest entries,
+/// which it may refuse where this one offers them: wider by a reason, never by more, since an entry's other facts are
+/// the same tags in every build. What a create leaves room for beside a volume's name, so every status of the volume,
+/// on any host of a fleet, holds the name.
+pub(crate) fn widest_report() -> TransportReport {
+  let fact = "f".repeat(HOST_FACT_BYTES);
+  let mut widest = every_situation()
+    .map(|situation| capabilities(&situation))
+    .max_by_key(crate::verbs::encoded_len)
+    .unwrap_or_default();
+  for entry in &mut widest {
+    entry.unsupported_reason = entry
+      .unsupported_reason
+      .or(Some(UnsupportedReason::HostPlatform));
+  }
+  TransportReport {
+    os: fact.clone(),
+    kernel: Some(fact),
+    capabilities: widest,
+  }
 }
 
 /// The report for `situation`: the host facts (read once per process), then every transport.
