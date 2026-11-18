@@ -137,24 +137,7 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
   let trusted = TestSigner::fresh();
   let stranger = TestSigner::fresh();
   trust(&mut client, &secret, green, &[&trusted]);
-  let first = work_with(&mut client, green, "first", b"signed by the trusted key");
-  let statement = client.merge_statement(first, &[]).unwrap();
-  let text = String::from_utf8(statement.statement.clone()).unwrap();
-  assert!(
-    text.starts_with("slates merge v1\nwork "),
-    "a person reads what they sign: {text}"
-  );
-  let signature = trusted.sign(&statement.statement);
-  assert_eq!(
-    client
-      .submit_with_signature(first, &[], Some(&signature))
-      .unwrap(),
-    (Submitted::Accepted(1), signer_of(&trusted))
-  );
-  assert_eq!(
-    client.merge_record(green, 1).unwrap().verification,
-    signer_of(&trusted)
-  );
+  expect_a_trusted_merge_verified(&mut client, green, &trusted);
   let second = work_with(&mut client, green, "second", b"signed by a stranger");
   let by_stranger = signed(&mut client, second, &stranger);
   let unregistered = Verification::Invalid {
@@ -183,19 +166,48 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
     ),
     "a version not yet committed has no record"
   );
-  // Non-vacuity: checkpoints folded the chain entries that carried the verdicts, and every verdict was the verifier's.
-  assert!(counter(&daemon, "merge.checkpoint.taken") > 0);
+  expect_the_verdicts_were_the_verifiers(&daemon);
+  drop(client);
+  daemon.stop();
+}
+
+/// The trusted merge of `a_signed_merge_is_judged_recorded_and_read_back`. Do: write a work, read its merge statement,
+/// sign it with the trusted key and submit it. Expect the statement to read as a person reads it, and the merge
+/// accepted at version 1 and verified naming the trusted key, as its record reads back.
+fn expect_a_trusted_merge_verified(client: &mut Client, green: VolumeId, trusted: &TestSigner) {
+  let first = work_with(client, green, "first", b"signed by the trusted key");
+  let statement = client.merge_statement(first, &[]).unwrap();
+  let text = String::from_utf8(statement.statement.clone()).unwrap();
+  assert!(
+    text.starts_with("slates merge v1\nwork "),
+    "a person reads what they sign: {text}"
+  );
+  let signature = trusted.sign(&statement.statement);
+  assert_eq!(
+    client
+      .submit_with_signature(first, &[], Some(&signature))
+      .unwrap(),
+    (Submitted::Accepted(1), signer_of(trusted))
+  );
+  assert_eq!(
+    client.merge_record(green, 1).unwrap().verification,
+    signer_of(trusted)
+  );
+}
+
+/// Non-vacuity for `a_signed_merge_is_judged_recorded_and_read_back`: checkpoints folded the chain entries that carried
+/// the verdicts, and every verdict was the verifier's (one verified, one unregistered key, one bad signature).
+fn expect_the_verdicts_were_the_verifiers(daemon: &Daemon) {
+  assert!(counter(daemon, "merge.checkpoint.taken") > 0);
   assert_eq!(
     [
       "signed_work.verified",
       "signed_work.invalid.unregistered_key",
       "signed_work.invalid.bad_signature",
     ]
-    .map(|name| counter(&daemon, name)),
+    .map(|name| counter(daemon, name)),
     [1, 1, 1]
   );
-  drop(client);
-  daemon.stop();
 }
 
 /// The stale and unsigned merges of `a_signed_merge_is_judged_recorded_and_read_back`. Do: sign a work's statement with

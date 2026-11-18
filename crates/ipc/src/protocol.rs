@@ -3573,6 +3573,69 @@ pub enum Refusal {
     /// How the merge's signature was judged.
     verification: Verification,
   },
+  /// The volume core refused the verb for a reason the variants before this one do not name (A-299): until
+  /// 2026-11-18 each reached a client as `BadRequest` carrying the reason's name, which a consumer could only read as
+  /// words. Appended.
+  Volume {
+    /// Why, typed.
+    refusal: VolumeRefusal,
+  },
+}
+
+/// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
+/// class of a volume-core error (`slates_vfs::VfsError`) by the same name. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeRefusal {
+  /// `ENOTDIR`: not a directory where one was needed.
+  NotDirectory,
+  /// `EISDIR`: a directory where a file was needed.
+  IsDirectory,
+  /// `ENOTEMPTY`: a directory that must be empty is not.
+  NotEmpty,
+  /// `EINVAL`: an argument the operation does not take.
+  Invalid,
+  /// `ENODATA`: no such extended attribute.
+  NoAttribute,
+  /// `EPERM`: the volume's rules forbid the operation.
+  NotPermitted,
+  /// A link protected against the operation (a sticky directory's, a hard link's).
+  LinkProtected,
+  /// An operation a special file (a FIFO, a socket name) does not support.
+  SpecialFileOperation,
+  /// `EMLINK`: a file at its link bound.
+  TooManyLinks,
+  /// `EFBIG`: past a file's largest size.
+  FileTooLarge,
+  /// `EXDEV`: a move across volumes.
+  CrossVolumeMove,
+  /// A handle or number that no longer names anything (a freed inode, a destroyed snapshot).
+  StaleHandle,
+  /// The snapshot is pinned by a live clone, or the volume is a green's origin: destroy the clone first.
+  Pinned,
+  /// A guest maps the file in a way the change cannot keep its map equal to, so the change waits for the map's end.
+  DaxMapped,
+  /// A witnessed base entry changed on the disk beneath an unpinned range: the read refuses rather than mix states.
+  BaseDrift,
+  /// The verb names an overlay's base, and the volume has none.
+  NotOverlay,
+  /// The digest cache is at its bound.
+  DigestCacheFull,
+  /// A memory refusal the variants before [`Refusal::Volume`] do not name.
+  Memory,
+  /// A journal reader asked for records retention has dropped.
+  JournalIncomplete {
+    /// The record it needed.
+    needed: u64,
+    /// The oldest record retained.
+    oldest: u64,
+  },
+  /// A recovery image of another format version.
+  RecoveryVersion {
+    /// The version found.
+    found: u16,
+    /// The version this build reads.
+    expected: u16,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
