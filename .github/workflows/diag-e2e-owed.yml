@@ -1,0 +1,77 @@
+name: diag-e2e-owed
+on:
+  push:
+    branches: [diag-e2e-owed]
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  # g260 (Ada's #85): the guest's mount of slates' own device runs no set-id file as its owner and opens no device node.
+  guest:
+    name: QEMU guest over slates' own device (guest_vhost, g260's test included)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: slates' own device in QEMU, every guest_vhost test
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/mnt/src -w /mnt/src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/mnt/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+          if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+          grep -E "^test .* (ok|FAILED)$|test result:" guest-vhost.log | tail -15
+          grep -q "test a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node ... ok" guest-vhost.log && echo "G260 GUEST TEST PASSED"
+  # g244: no healthy fsync on a live volume answers EIO, on Linux FUSE, under load (CPU hogs on every core).
+  # g240: the takeover flows on merged main.
+  fleet:
+    name: live fsync flows (g244) and takeover flows (g240) under load
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build the CLI's live test binaries (release)
+        run: cargo test --release --locked -p slates-cli --test live_fleet --test live_chaos --no-run
+      - name: g244's two FUSE fsync flows, three rounds each, with every core busy
+        shell: bash
+        run: |
+          set -o pipefail
+          n=$(nproc); for i in $(seq 1 "$n"); do ( while :; do :; done ) & done; hogs=$(jobs -p)
+          status=0
+          for round in 1 2 3; do
+            SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 \
+              a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it \
+              a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly 2>&1 | tee -a fsync.log || status=1
+          done
+          kill $hogs 2>/dev/null || true
+          grep -E "^test .* (ok|FAILED)$|test result:|a held fsync gave up" fsync.log | tail -20
+          exit $status
+      - name: g240's takeover flows (A-271 / A-295 on merged main)
+        shell: bash
+        run: |
+          set -o pipefail
+          SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 \
+            serves_a_takeover 2>&1 | tee takeover.log
+          grep -E "^test .* (ok|FAILED)$|test result:" takeover.log | tail -20
