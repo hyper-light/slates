@@ -7754,11 +7754,11 @@ it builds against the contract and adds to it rather than around it.
 > reached a client as `BadRequest` carrying its name, a pinned snapshot's destroy among them (A-310's
 > seam found it). The contract puts each in the class a consumer acts on (`Busy::Volume` for `Pinned`
 > and `DaxMapped`, `Stale`, `Denied`, `Exhausted`, `Unusable` or `Invalid` `::Volume` for the rest).
-> **`CONTRACT` = 16:** `Instance::unmount` answers `Unmounted { unreported }`. A Windows unmount that releases a drive
-> another volume reported now names each volume it could not ask (until then only a drive no volume reported named
-> them), and the CLI names them on standard error either way. `HostFault` renders in words, the daemon's
-> `TargetUnavailable` by that name: both were lost when the CLI moved onto the library (A-278), and the integrator's
-> Windows lane found them (run 44257181904,
+> **`CONTRACT` = 16:** `Instance::unmount` answers `Unmounted { unreported }`, as does the `Volumes` seam's (the
+> simulator's is always empty). A Windows unmount that releases a drive another volume reported now names each volume
+> it could not ask; until then only a drive no volume reported named them. The CLI names them on standard error either
+> way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
+> onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
 > `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
@@ -22842,8 +22842,8 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
 
   `HostFault` and `Unreported` now render in words (`TargetUnavailable` named). `Instance::unmount` answers
   `Unmounted { unreported }`, empty on macOS and Linux, whose unmount asks no volume. The CLI's Windows unmount names
-  the unasked on standard error whether the drive was released or not. Applied to `crates/api/src/{error,mount,lib}.rs`
-  and `crates/cli/src/verbs.rs`. The rendering tests are unit tests (`a_host_refusal_is_named_by_its_kind_in_words`,
+  the unasked on standard error whether the drive was released or not. Applied to
+  `crates/api/src/{error,mount,seam,sim,lib}.rs` and `crates/cli/src/verbs.rs`. The rendering tests are unit tests (`a_host_refusal_is_named_by_its_kind_in_words`,
   red first; `an_unreported_volume_is_named_with_its_refusals_kind`). The two live tests run on CI's Windows runner
   only (jupiter has no WinFsp).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on

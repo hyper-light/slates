@@ -142,7 +142,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// --scope`), the launcher's standard input kept (A-299; the same day). 15: the volume core's refusals typed
 /// (`VolumeRefusal`, each in the class a consumer acts on as `Busy`, `Stale`, `Denied`, `Exhausted`, `Unusable` or
 /// `Invalid` `::Volume`): until then each reached a consumer as an invalid request carrying a word, a pinned snapshot's
-/// destroy among them (A-299; the same day). 16: `Instance::unmount` answers what it removed ([`Unmounted`]): on
+/// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
 /// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
 /// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
 /// day).
