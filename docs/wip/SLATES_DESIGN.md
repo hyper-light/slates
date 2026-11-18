@@ -7365,7 +7365,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > every host: a macOS shard, whose `kevent` naps, declines). Counted `fleet.live.hold.{answer,exchange,dispatches,
 > entries}` (asked) and `fleet.live.hold.declined`; held by
 > `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`. Prototype and first A/B figures
-> in A-396; the supervisor's A/B (main, these holds, the answer holds alone) decides the landing.
+> in A-396. Landed before its A/B under Ada's rule of 2026-11-18 (an agent implements, unit-tests, merges and ends): the
+> supervisor's A/B, main before the holds against main with them, decides whether they stay.
 >
 > **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
 > live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
@@ -29569,5 +29570,7 @@ answer window learned in `count_hops`; `LiveVolume::answers`, `Held::arrivals`, 
   bound begins a new run). `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`: a
   closed loop of 32 writes, every one answered at durability, and every site asked its shard to hold with a learned
   window: the owner, its control shard (through an exchange and for a dispatch) and a holder; whether each shard kept
-  its holds is A-387's decision, printed with the declines. Owed: the supervisor's A/B (main, these holds, the answer
-  holds alone; quiet and loaded; Linux and the Studio) with the units' `nr_throttled`, which decides the landing.
+  its holds is A-387's decision, printed with the declines. Landed before its A/B (Ada's rule of 2026-11-18: an agent
+  implements, unit-tests, merges and ends). Owed, filed for the supervisor: that test on Linux and macOS, and the A/B
+  (main before the holds against main with them; quiet and loaded; Linux and the Studio) with the units'
+  `nr_throttled`, which decides whether the holds stay; the answer holds alone are a second arm not built.
