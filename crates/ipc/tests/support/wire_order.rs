@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Every wire enum a guard holds, by name: its variants in tag order.
-pub type Enums = BTreeMap<String, Vec<String>>;
+pub(crate) type Enums = BTreeMap<String, Vec<String>>;
 
 /// An enum's name and its variants in tag order, read from its schema: the variants are the schema's parts at depth
 /// zero, each a name and its fields in braces.
@@ -47,12 +47,12 @@ fn variant_name(part: &str) -> String {
 }
 
 /// Every enum among `schemas` as this build numbers it.
-pub fn current(schemas: &[&str]) -> Enums {
+pub(crate) fn current(schemas: &[&str]) -> Enums {
   schemas.iter().map(|schema| variants_of(schema)).collect()
 }
 
 /// Every enum as `text` publishes it, one `Enum tag Variant` a line, each enum's tags from 0 in order.
-pub fn published(text: &str) -> Enums {
+pub(crate) fn published(text: &str) -> Enums {
   let mut enums = Enums::new();
   for line in text.lines().filter(|line| !line.trim().is_empty()) {
     let mut words = line.split_whitespace();
@@ -123,7 +123,7 @@ fn differences(current: &Enums, published: &Enums) -> (Vec<String>, Vec<String>)
 
 /// The guard: `schemas` against the `published` text, for `package` (named in the writer's command). Fails for a moved
 /// tag, then for an unpublished append.
-pub fn assert_published(package: &str, schemas: &[&str], published_text: &str) {
+pub(crate) fn assert_published(package: &str, schemas: &[&str], published_text: &str) {
   let (appended, moved) = differences(&current(schemas), &published(published_text));
   assert!(
     moved.is_empty(),
@@ -181,7 +181,7 @@ fn declared_in(source: &str) -> Vec<String> {
 
 /// The coverage: every enum the sources under `source_dir` derive `Wire` for is among `schemas`, and only those, so a
 /// new wire enum cannot go unpublished.
-pub fn assert_held(source_dir: &Path, schemas: &[&str]) {
+pub(crate) fn assert_held(source_dir: &Path, schemas: &[&str]) {
   let mut declared: Vec<String> = sources_under(source_dir)
     .iter()
     .flat_map(|path| declared_in(&std::fs::read_to_string(path).expect("a source is readable")))
@@ -197,7 +197,7 @@ pub fn assert_held(source_dir: &Path, schemas: &[&str]) {
 
 /// The writer's text: `schemas` as published, after refusing while any published tag moved, so a move is never
 /// published by running the writer.
-pub fn publication(schemas: &[&str], published_text: &str) -> String {
+pub(crate) fn publication(schemas: &[&str], published_text: &str) -> String {
   let current = current(schemas);
   let (_, moved) = differences(&current, &published(published_text));
   assert!(
