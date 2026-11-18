@@ -28,6 +28,12 @@
 //! `verbs::materialize_taken_over`). Until then the copy's memory stays held (released with GAP-A9-7's ledger
 //! transfer).
 //!
+//! **Its live logs (A-409).** A yielded volume's live log ships nothing more and does no period work, as a fenced one
+//! does (A-349), and every verb waiting on its durability is answered `DurabilityPending` at the yield
+//! (`live_ship::yielded`): its node knows the loss before any holder can tell it, and a holder that refused the log as
+//! not the volume's acting owner had never fenced it, so it shipped on, an install of its whole volume 1,714 times in
+//! one run.
+//!
 //! **The holder's side (A-382).** The host also held register copies, as a candidate, of the objects it took over
 //! before it was retired, and they still named it as their owner. At the same install it lets them go
 //! ([`let_go_own_registers`]), so the successor's next record makes it a holder again, as it makes any new candidate
@@ -121,6 +127,10 @@ fn yield_catalogued(state: &mut ShardState) {
     .collect();
   state.yielded.extend(newly.iter().copied());
   state.count(YIELDED, u64::try_from(newly.len()).unwrap_or(u64::MAX));
+  for volume in &newly {
+    // Its live log ships nothing more and its writers are answered now (A-409).
+    crate::live_ship::yielded(state, *volume);
+  }
   #[cfg(target_os = "linux")]
   for volume in newly {
     crate::fuse::superseded(state, volume);

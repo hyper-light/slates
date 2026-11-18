@@ -1078,8 +1078,18 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       offset,
       length,
     } => {
+      // Answered whole up to the file's end, in as many bridge reads as its cap takes. A bridge answers at most its cap a
+      // call (the volume bridge's, 256 KiB), and one call was once the whole reply: a read past the cap came back short
+      // mid-file, which a program takes for the file's end and Windows zero-fills on a paging read
+      // (docs/bugs/2026-11-18-a-winfsp-read-past-the-bridges-cap-came-back-short.md).
       let mut out = Vec::new();
-      bridge.read(object.object, cx, offset, length, &mut out)?;
+      slates_bridge_core::dax_backing::read_whole(
+        bridge,
+        cx,
+        object.object,
+        (offset, u64::from(length)),
+        &mut out,
+      )?;
       Reply::Data { bytes: out }
     }
     Op::Write {

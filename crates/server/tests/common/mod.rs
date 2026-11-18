@@ -8,10 +8,8 @@ pub(crate) mod client;
 pub(crate) mod fuse_map;
 #[cfg(unix)]
 pub(crate) mod guest;
-// The landing plane's fixtures drive the Unix landing (the daemon lands nothing on Windows yet).
-#[cfg(unix)]
+// The landing plane's fixtures, on every platform since the Windows writer (A-185).
 pub(crate) mod landing;
-#[cfg(unix)]
 pub(crate) mod lease;
 pub(crate) mod nfs;
 // The NFSv4.2 client speaks TCP alone, and the daemon serves NFS on Windows too (A-184).
