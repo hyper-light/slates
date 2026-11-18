@@ -32,7 +32,9 @@
 //! the changed range, which makes WinFsp purge coherently. A private restricting-SID marker distinguishes these opens
 //! from ordinary I/O by an embedding application. They address the held file by identity at its original cached name,
 //! even after another attachment renamed it; ordinary callers still resolve the namespace. The purge's write is an
-//! echo. A separate event carries Begin/End progress even when Windows refuses an open without calling the host.
+//! echo. Its cleanup is not always its own: WinFsp hands a pending delete to the file's last handle's cleanup, so a
+//! purge's handle can carry another caller's delete, which is made (A-360). A separate event carries Begin/End
+//! progress even when Windows refuses an open without calling the host.
 //!
 //! **Verification.** Every struct and export is hand-transcribed from winfsp's headers (`crate::ffi`) and cross-lints
 //! on the Windows target from any host; the live mount runs on the native Windows CI runner through the CLI
@@ -516,7 +518,7 @@ impl Request {
       context_of(&self.op).and_then(|context| names.name_of(context).map(str::to_owned));
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
-      op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
+      op.needs_barrier() && !matches!(op, Op::Cleanup { object, delete: None } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
     let change = bound.as_ref().ok().and_then(|op| change_of(op, bridge, cx));
@@ -623,7 +625,8 @@ fn context_of(op: &Op<u64>) -> Option<u64> {
 
 /// The [`Change`] `op` makes: a write's bytes (from where it lands, when it appends), a size's or an overwrite's whole
 /// file, a time's or a link's information alone; their replies carry the link count. A delete reads the file's link
-/// count first, since its reply carries none. A purge's own echo is no change.
+/// count first, since its reply carries none, and is a change whichever handle's cleanup carried it, a purge's too. A
+/// purge's own echo is no change.
 fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<Change> {
   let (object, bytes, count) = match op {
     Op::Write { object, .. } if object.purge => return None,
@@ -652,7 +655,7 @@ fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<C
     Op::Cleanup {
       object,
       delete: Some(_),
-    } if !object.purge => {
+    } => {
       let attr = bridge.getattr(object.object, cx).ok()?;
       if attr.kind == Kind::Dir {
         return None;
@@ -1178,16 +1181,13 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
     }
     Op::FlushVolume => Reply::Ok,
-    Op::Cleanup { object, delete } => {
-      if object.purge {
-        Reply::Ok
-      } else {
-        match delete {
-          Some(path) => op_delete(bridge, cx, &path, object.object)?,
-          None => Reply::Ok,
-        }
-      }
-    }
+    // WinFsp hands a pending delete to the cleanup of the file's last handle, whoever made it (v2.1 `src/sys/file.c`
+    // `FspFileNodeCleanup`), so a purge's handle can carry another caller's delete; it is made as theirs, or the name
+    // the deleter was told is gone stays (docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md).
+    Op::Cleanup { object, delete } => match delete {
+      Some(path) => op_delete(bridge, cx, &path, object.object)?,
+      None => Reply::Ok,
+    },
     Op::Release { object } => {
       bridge.release(object.object, cx, object.fh)?;
       Reply::Ok

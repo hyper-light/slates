@@ -1061,7 +1061,10 @@ Same code, zero modes.
 > volume's records are reserved from a per-shard metadata ledger laid out against the metadata
 > class. The effective capacity is total RAM clamped to the tightest OS/job/cgroup bound; `slates
 > status` reports mapped, usable, committed, retained and metadata bytes per shard. Credits are
-> re-taken on recovery ahead of new claims; shrink refuses below use. Not yet: a pressure signal that
+> re-taken on recovery ahead of new claims; shrink refuses below use. A recovered snapshot holds what the live one held:
+> the directories the head has not changed since it was taken are the head's, as its unchanged files are, so recovery
+> charges the version slab no slot the live volume did not hold (A-395; until then each was rebuilt privately, a
+> retained slot a directory, and a volume promised the whole slab was refused at its restart). Not yet: a pressure signal that
 > stops admission (the design: sample PSI / `MemAvailable` at the profile refresh cadence on the
 > control shard and apply a hold above `committed`, never below it), the Windows job-object bound,
 > guest request buffers and open-reference maps in the same ledger, and a boot-time refusal of a
@@ -7196,8 +7199,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
 > twice (g232's finding). Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
-> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
-> in `defer`, after its commit (GAPS, OPEN).
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome that may wait so (a mapped file's write-back, a checkout)
+> takes a seat among the held replies as its task begins (`live_ship::take_seat`), refused `Overloaded` at the bound
+> before it writes anything; its wait fills the seat (`defer`, which no longer refuses for room), or it gives the seat
+> back when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back
+> answers, so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no
+> seat (that release, or one whose volume turned live-shipped while it ran) is held past the bound, counted
+> (`fleet.live.held_past_bound`), rather than refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`: before, the sync was
+> refused `Overloaded` with its stores already in the file.
 >
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
@@ -27600,6 +27609,19 @@ Applied in the same change to:
   that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted. A reader of another
   name still can be, while that name's purge lasts, as after any change A-190 purges for (once in the VM's check,
   against none in 51 reads of the writer's own name).
+- **A delete a purge's handle carried was dropped (found by this entry's live test on the VM, 2026-11-18; bug record
+  `docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md`).** WinFsp hands a pending delete to
+  the cleanup of the file node's last handle, whoever's (v2.1 `src/sys/file.c` `FspFileNodeCleanup`; this volume
+  takes no POSIX delete). When a program deletes a file while A-190's purge holds it open, the purge's cleanup
+  carries the delete, and the shard answered a purge's cleanup without making it: Windows was told the name was
+  gone, and the volume kept it. One live run of three saw the other name count two links for good. The delete is
+  now made whoever's cleanup carries it, behind the publication barrier, and it owes the other names their count
+  (`a_delete_a_purges_last_handle_carries_is_made`, red at the reversed change and green with it on both Windows
+  runners, diagnostics run 44359955657). The window predates hard links (A-190, any purged file); hard links widen it,
+  since a write through one name purges the others. On the VM a race of a write through one name and the other
+  name's delete lost 21 of 28 and 2 of 16 deletes before the change, 0 of 59 after it. The same race also hangs the
+  deleter in its cleanup, before the change and after it: open, GAPS ("A delete racing a coherent purge can hang its
+  caller").
 - **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
   both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
   Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,
@@ -28838,6 +28860,43 @@ Applied in the same change to:
   save and a restore, and the write log's unit tests. The guard removed alone fails it (the counter 0). Measured on a
   Mac Studio (r286), three interleaved passes: a `FLUSH` after a logged page write took 17.5–20.0 µs p50 before and
   15.7–16.0 µs after, and every one of 1,000 published nothing (BENCHMARKS, this date).
+
+### A-395 — A recovered snapshot shares the directories the head still holds, as live copy-on-write does (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.2 accounting through recovery, §4.8; the bug record of 2026-11-05; image version 31)
+
+Applied in the same change to: §4.2's status, GAPS (the load test's ledger),
+`docs/bugs/2026-11-05-a-volume-promised-the-whole-version-slab-is-refused-at-recovery.md` (closed),
+`crates/vfs/src/recover.rs` (`capture_snapshot_tree`, `rebuild_snapshot`, `rebuild_snapshot_tree`, `held_directory`,
+`rebuild_entries` and `child_for`, `rebuild_deadlists`, `IMAGE_VERSION` 31), `crates/vfs/src/dir.rs`
+(`DirNode::restamp`), `crates/vfs/src/dirtree.rs` (`Tree::restamp`), and the tests below.
+- **What was there.** The live volume's copy-on-write copies a directory, with every ancestor, only when the head
+  changes it, so a snapshot shares with the head every directory the head has not changed since. A recovery image
+  carried every directory of a snapshot in full, and recovery rebuilt each privately: an inode version on the
+  snapshot's deadlist that the live volume never held, charged to the version slab as retention. A restart therefore
+  took a slot a directory more than the live daemon held, and a volume promised the whole slab was refused: the whole
+  kernel's base volume at the primary's restart, 648,393 slots requested and 642,045 available, 6,348 short, the
+  count of linux-v7.4-rc1's directories (`find -type d`, 6,348), which fenced the green over it.
+- **The rule.** A snapshot's directory whose inode handle is the head's is captured as shared with the head, by
+  number, as an unchanged file is (a clone's snapshots keep their directories: A-64's origin rules are their own).
+  Recovery maps it to the head's node, the snapshot's root included, and stamps that node and every block of its
+  entries at the directory inode's own birth epoch, so the head copies it, and a block of it, before changing it, as
+  live copy-on-write did, and the copy's retirement reaches the deadlist of the snapshot that holds it. A private
+  directory naming a shared one checks, and never writes, the shared node's parent and name. The global deadlist pass
+  claims everything the head reaches, so no shared node or block lands on a snapshot's deadlist. Recovery charges
+  the version slab exactly what the live volume held.
+- **Tests.** `a_snapshots_unchanged_directories_take_no_version_slot_after_a_restart` (`crates/server/tests/recovery.rs`:
+  an overlay over `f` and `d1/d2/g`, pinned, snapshotted, restarted; every shard's committed and retained version
+  slots equal before and after, both files read back); `a_head_change_after_recovery_copies_a_directory_the_snapshot_shares`
+  (`crates/vfs/tests/recover.rs`: recovery holds the live volume's inodes; a post-recovery change to a shared
+  directory never reaches the snapshot, which retains as many versions as the live volume's after the same change);
+  four recovery tests of `crates/vfs/tests/recover.rs` corrected to the live volume's counts, each of which had held
+  the private roots: a snapshot whose tree the head never changed holds nothing of its own to drop; the sharing test
+  holds four inodes, the cross-snapshot test three and the newest-first drop test three, the root shared too.
+- **Measured.** Kiln r279, the Mac Studio, 2026-11-18, debug build: the server test passed, (committed, retained)
+  slots by shard (0, 0) and (454, 0) before and after the restart; red with the change's vfs code reverted, (457, 3)
+  after, the snapshot's three directories, and the test failed. The vfs model oracle 12 of 12, the vfs recovery,
+  directory and snapshot unit tests 17 of 17, and the server's recovery tests 58 of 58 passed on the same tree; kiln
+  r340: the vfs image, retained-bytes, retention, clone, content-in-place and chunk-ownership tests passed (45), and
+  with the vfs change reverted the new vfs test held 5 inodes where the live volume held 3.
 
 ### A-403 — The recovery's cross-shard passes and the image's alias steps wait in their target's own time: the liveness window's floor for them is the target's measured progress, never a boot snapshot (2026-11-18, built for goal g255; item 1's "W's floor from the running wake estimate"; A-65, A-228, A-359)
 

@@ -5014,6 +5014,84 @@ fn a_created_and_pinned_overlay_survives_a_restart() {
   second.stop();
 }
 
+/// §4.2 accounting through recovery, §4.8 (A-395; `docs/bugs/2026-11-05-a-volume-promised-the-whole-version-slab-is-refused-at-recovery.md`).
+/// A snapshot shares with the head every directory the head has not changed since, as it shares the files; recovery
+/// rebuilt each of a snapshot's directories privately, an inode version on its deadlist the live daemon never held,
+/// charged to the version slab, so a restart took a slot a directory more than the live daemon had, and a volume
+/// promised the whole slab was refused (the whole kernel's base volume: 6,348 slots short, its 6,348 directories). Do:
+/// create an overlay over a directory holding `f` and `d1/d2/g`, pin its whole base, snapshot it, read every shard's
+/// committed and snapshot-retained version slots, and restart the daemon over the same segment. Expect the overlay
+/// served after the restart with both files read back over the mount, and every shard's committed and retained version
+/// slots what they were before the restart.
+#[test]
+fn a_snapshots_unchanged_directories_take_no_version_slot_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-helddirs-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("helddirs", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  // The base's nested directories: the test's own temporary directory, which it removes.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(format!("{}/d1/d2", target.path)).unwrap();
+  target.seed("f", BEFORE);
+  target.seed("d1/d2/g", BEFORE);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("held-dirs")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    2,
+    "both base files pinned"
+  );
+  client.snapshot(overlay).unwrap();
+  let versions = |client: &mut Client| -> Vec<(u64, u64)> {
+    client
+      .daemon_status()
+      .unwrap()
+      .shards
+      .iter()
+      .map(|shard| (shard.committed_versions, shard.retained_versions))
+      .collect()
+  };
+  let before = versions(&mut client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let served = client.status(overlay).is_ok();
+  let after = versions(&mut client);
+  let read_back = served.then(|| {
+    let (mut stream, root) = mounted_on(&second, "held-dirs");
+    let f = lookup(&mut stream, &root, "f", 2);
+    let d1 = lookup(&mut stream, &root, "d1", 3);
+    let d2 = lookup(&mut stream, &d1, "d2", 4);
+    let g = lookup(&mut stream, &d2, "g", 5);
+    (read(&mut stream, &f, 6), read(&mut stream, &g, 7))
+  });
+  drop(client);
+  second.stop();
+  eprintln!(
+    "version slots (committed, retained) by shard: before the restart {before:?}, after {after:?}"
+  );
+  assert!(served, "the overlay is served after the restart");
+  assert_eq!(
+    read_back,
+    Some((BEFORE.to_vec(), BEFORE.to_vec())),
+    "both pinned files read back"
+  );
+  assert_eq!(
+    after, before,
+    "recovery takes the version slots the live daemon held, no slot for a directory the snapshot shares"
+  );
+}
+
 /// A clone name for an origin named `origin_name` that hashes to a partition other than the origin's (A-236's alias
 /// path), or `stem` itself when every candidate lands on the origin's.
 fn clone_name_on_another_partition(origin_name: &str, stem: &str) -> String {
